@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 
 use crate::{
     codex::{CodexBridge, ThreadSyncData},
@@ -28,6 +28,7 @@ const THREAD_SCAN_LIMIT: usize = 200;
 pub struct AppState {
     relay: Arc<RwLock<RelayState>>,
     codex: Arc<CodexBridge>,
+    change_tx: watch::Sender<u64>,
 }
 
 impl AppState {
@@ -36,14 +37,23 @@ impl AppState {
             .map_err(|error| format!("failed to resolve current directory: {error}"))?
             .display()
             .to_string();
-        let relay = Arc::new(RwLock::new(RelayState::new(cwd)));
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(cwd, change_tx.clone())));
         let codex = Arc::new(CodexBridge::spawn(relay.clone()).await?);
 
-        Ok(Self { relay, codex })
+        Ok(Self {
+            relay,
+            codex,
+            change_tx,
+        })
     }
 
     pub async fn snapshot(&self) -> SessionSnapshot {
         self.relay.read().await.snapshot()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.change_tx.subscribe()
     }
 
     pub async fn list_threads(
@@ -61,6 +71,7 @@ impl AppState {
         let response_threads = filter_threads(threads.clone(), cwd.as_deref(), limit);
         let mut relay = self.relay.write().await;
         relay.threads = threads;
+        relay.notify();
         Ok(ThreadsResponse {
             threads: response_threads,
         })
@@ -83,6 +94,7 @@ impl AppState {
             let mut relay = self.relay.write().await;
             relay.activate_thread(thread, &cwd, &model, &approval_policy, &sandbox, &effort);
             relay.push_log("info", format!("Started a new Codex thread in {cwd}."));
+            relay.notify();
         }
 
         if let Some(initial_prompt) = non_empty(input.initial_prompt) {
@@ -116,6 +128,7 @@ impl AppState {
             let mut relay = self.relay.write().await;
             relay.load_thread_data(thread_data, &approval_policy, &sandbox, &effort);
             relay.push_log("info", format!("Resumed thread {}.", input.thread_id));
+            relay.notify();
         }
 
         let _ = self.list_threads(20, None).await;
@@ -144,6 +157,7 @@ impl AppState {
                 "info",
                 format!("Sent a prompt to thread {thread_id} with {effort} effort."),
             );
+            relay.notify();
         }
 
         Ok(self.snapshot().await)
@@ -177,6 +191,7 @@ impl AppState {
                 input.decision
             ),
         );
+        relay.notify();
 
         Ok(ApprovalReceipt {
             request_id: request_id.to_string(),
@@ -314,6 +329,8 @@ impl TranscriptRecord {
 }
 
 pub struct RelayState {
+    change_tx: watch::Sender<u64>,
+    revision: u64,
     pub codex_connected: bool,
     pub active_thread_id: Option<String>,
     pub active_turn_id: Option<String>,
@@ -331,8 +348,10 @@ pub struct RelayState {
 }
 
 impl RelayState {
-    pub fn new(current_cwd: String) -> Self {
+    pub fn new(current_cwd: String, change_tx: watch::Sender<u64>) -> Self {
         let mut state = Self {
+            change_tx,
+            revision: 0,
             codex_connected: false,
             active_thread_id: None,
             active_turn_id: None,
@@ -350,6 +369,11 @@ impl RelayState {
         };
         state.push_log("info", "Relay booted. Waiting for Codex app-server.");
         state
+    }
+
+    pub fn notify(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        let _ = self.change_tx.send(self.revision);
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {

@@ -1,9 +1,15 @@
 const state = {
   currentApprovalId: null,
   defaultsSeeded: false,
+  newSessionPanelOpen: false,
   selectedCwd: "",
   session: null,
+  sessionStream: null,
+  streamConnected: false,
+  streamReconnectTimer: null,
+  sessionPollTimer: null,
   threads: [],
+  threadsPollTimer: null,
 };
 
 const transcript = document.querySelector("#transcript");
@@ -16,8 +22,11 @@ const messageInput = document.querySelector("#message-input");
 const messageEffort = document.querySelector("#message-effort");
 const directoryForm = document.querySelector("#directory-form");
 const loadDirectoryButton = document.querySelector("#load-directory-button");
-const startButton = document.querySelector("#start-button");
+const newSessionToggleButton = document.querySelector("#new-session-toggle");
+const newSessionPanel = document.querySelector("#new-session-panel");
+const startSessionButton = document.querySelector("#start-session-button");
 const cwdInput = document.querySelector("#cwd-input");
+const currentWorkspace = document.querySelector("#current-workspace");
 const startPromptInput = document.querySelector("#start-prompt");
 const modelInput = document.querySelector("#model-input");
 const approvalPolicyInput = document.querySelector("#approval-policy-input");
@@ -44,7 +53,11 @@ directoryForm.addEventListener("submit", (event) => {
   void loadThreads("directory change");
 });
 
-startButton.addEventListener("click", () => {
+newSessionToggleButton.addEventListener("click", () => {
+  setNewSessionPanelOpen(!state.newSessionPanelOpen);
+});
+
+startSessionButton.addEventListener("click", () => {
   void startSession();
 });
 
@@ -68,20 +81,15 @@ transcript.addEventListener("click", (event) => {
 void boot();
 
 async function boot() {
+  setNewSessionPanelOpen(false);
   await loadSession("initial boot");
   if (state.selectedCwd) {
     await loadThreads("initial boot");
   } else {
     renderThreads([]);
   }
-
-  setInterval(() => {
-    void loadSession("poll");
-  }, 2000);
-
-  setInterval(() => {
-    void loadThreads("poll");
-  }, 10000);
+  connectSessionStream();
+  scheduleThreadsPoll();
 }
 
 async function loadSession(reason) {
@@ -108,6 +116,10 @@ async function loadSession(reason) {
       </div>
     `;
     logLine(`Session fetch failed: ${error.message}`);
+  } finally {
+    if (!state.streamConnected) {
+      scheduleSessionPoll();
+    }
   }
 }
 
@@ -141,6 +153,8 @@ async function loadThreads(reason) {
     threadsCount.textContent = "Error";
     threadsList.innerHTML = `<p class="sidebar-empty">${escapeHtml(error.message)}</p>`;
     logLine(`Thread fetch failed: ${error.message}`);
+  } finally {
+    scheduleThreadsPoll();
   }
 }
 
@@ -183,6 +197,7 @@ async function startSession() {
     seedDefaults(payload.data);
     renderSession(payload.data);
     await loadThreads("post-start refresh");
+    setNewSessionPanelOpen(false);
     logLine("Started a new Codex thread");
   } catch (error) {
     logLine(`Session start failed: ${error.message}`);
@@ -213,6 +228,7 @@ async function resumeSession(threadId) {
     seedDefaults(payload.data);
     renderSession(payload.data);
     await loadThreads("post-resume refresh");
+    setNewSessionPanelOpen(false);
     logLine(`Resumed thread ${threadId}`);
   } catch (error) {
     logLine(`Resume failed: ${error.message}`);
@@ -321,8 +337,6 @@ function renderSession(session) {
   messageInput.placeholder = session.active_thread_id
     ? "Message Codex..."
     : "Start or resume a session first.";
-
-  logLine(`Session updated. Status: ${session.current_status}`);
 }
 
 function renderSessionMeta(session) {
@@ -531,6 +545,8 @@ function seedDefaults(session) {
 function setSelectedCwd(cwd) {
   state.selectedCwd = cwd;
   cwdInput.value = cwd;
+  currentWorkspace.textContent = cwd || "No workspace selected";
+  currentWorkspace.title = cwd || "";
 }
 
 function resolveActiveThread(threadId) {
@@ -544,7 +560,7 @@ function resolveActiveThread(threadId) {
 function setStartControlsBusy(busy) {
   [
     loadDirectoryButton,
-    startButton,
+    startSessionButton,
     cwdInput,
     startPromptInput,
     modelInput,
@@ -554,6 +570,133 @@ function setStartControlsBusy(busy) {
   ].forEach((element) => {
     element.disabled = busy;
   });
+}
+
+function setNewSessionPanelOpen(open) {
+  state.newSessionPanelOpen = open;
+  newSessionPanel.hidden = !open;
+  newSessionToggleButton.setAttribute("aria-expanded", String(open));
+  newSessionToggleButton.textContent = open ? "Close Session Setup" : "New Session";
+}
+
+function scheduleSessionPoll() {
+  if (state.streamConnected) {
+    return;
+  }
+
+  if (state.sessionPollTimer) {
+    window.clearTimeout(state.sessionPollTimer);
+  }
+
+  state.sessionPollTimer = window.setTimeout(() => {
+    void loadSession("poll");
+  }, nextSessionPollDelay());
+}
+
+function scheduleThreadsPoll() {
+  if (state.threadsPollTimer) {
+    window.clearTimeout(state.threadsPollTimer);
+  }
+
+  state.threadsPollTimer = window.setTimeout(() => {
+    void loadThreads("poll");
+  }, 12000);
+}
+
+function connectSessionStream() {
+  if (!("EventSource" in window)) {
+    logLine("EventSource is unavailable. Falling back to polling.");
+    state.streamConnected = false;
+    scheduleSessionPoll();
+    return;
+  }
+
+  if (state.sessionStream) {
+    state.sessionStream.close();
+  }
+
+  const stream = new EventSource("/api/stream");
+  state.sessionStream = stream;
+
+  stream.addEventListener("session", (event) => {
+    try {
+      const snapshot = JSON.parse(event.data);
+      state.streamConnected = true;
+      cancelSessionPoll();
+      seedDefaults(snapshot);
+      renderSession(snapshot);
+    } catch (error) {
+      logLine(`Stream payload failed: ${error.message}`);
+    }
+  });
+
+  stream.onopen = () => {
+    if (!state.streamConnected) {
+      logLine("Session stream connected.");
+    }
+    state.streamConnected = true;
+    cancelSessionPoll();
+    cancelStreamReconnect();
+  };
+
+  stream.onerror = () => {
+    if (state.sessionStream !== stream) {
+      return;
+    }
+
+    logLine("Session stream disconnected. Falling back to polling.");
+    state.streamConnected = false;
+    state.sessionStream.close();
+    state.sessionStream = null;
+    scheduleSessionPoll();
+    scheduleStreamReconnect();
+  };
+}
+
+function cancelSessionPoll() {
+  if (!state.sessionPollTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.sessionPollTimer);
+  state.sessionPollTimer = null;
+}
+
+function scheduleStreamReconnect() {
+  cancelStreamReconnect();
+  state.streamReconnectTimer = window.setTimeout(() => {
+    connectSessionStream();
+  }, 1500);
+}
+
+function cancelStreamReconnect() {
+  if (!state.streamReconnectTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.streamReconnectTimer);
+  state.streamReconnectTimer = null;
+}
+
+function nextSessionPollDelay() {
+  const session = state.session;
+  if (!session || !session.active_thread_id) {
+    return 2200;
+  }
+
+  if (session.pending_approvals?.length) {
+    return 700;
+  }
+
+  if (session.active_turn_id) {
+    return 700;
+  }
+
+  if (session.current_status && session.current_status !== "idle") {
+    return 1100;
+  }
+
+  return 2200;
 }
 
 function metaChip(label, value) {

@@ -29,6 +29,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -56,6 +60,7 @@ select {
 }
 
 .sidebar {
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -66,6 +71,7 @@ select {
 }
 
 .new-chat-button,
+.start-session-button,
 .load-button,
 .header-button,
 .send-button,
@@ -77,6 +83,7 @@ select {
 }
 
 .new-chat-button:hover,
+.start-session-button:hover,
 .load-button:hover,
 .header-button:hover,
 .send-button:hover,
@@ -87,6 +94,7 @@ select {
 }
 
 .new-chat-button:disabled,
+.start-session-button:disabled,
 .load-button:disabled,
 .header-button:disabled,
 .send-button:disabled,
@@ -107,10 +115,30 @@ select {
   text-align: left;
 }
 
+.workspace-summary,
+.new-session-panel,
 .workspace-form,
 .settings-grid {
   display: grid;
   gap: 10px;
+}
+
+.workspace-summary {
+  padding: 2px 2px 0;
+}
+
+.workspace-current {
+  margin: 0;
+  color: var(--sidebar-text);
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.new-session-panel {
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid var(--sidebar-border);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .sidebar-label,
@@ -168,6 +196,14 @@ select {
 
 .load-button {
   padding: 0 14px;
+  font-weight: 600;
+}
+
+.start-session-button {
+  width: 100%;
+  padding: 11px 14px;
+  color: var(--accent-contrast);
+  background: var(--accent);
   font-weight: 600;
 }
 
@@ -630,14 +666,43 @@ select {
   white-space: pre-wrap;
 }
 
+@media (min-width: 961px) {
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .app-shell {
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .sidebar,
+  .chat-shell {
+    min-height: 0;
+    height: 100vh;
+    overflow: hidden;
+  }
+}
+
 @media (max-width: 960px) {
   .app-shell {
     grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
   }
 
   .sidebar {
     border-right: 0;
     border-bottom: 1px solid var(--sidebar-border);
+    height: auto;
+    overflow: visible;
+  }
+
+  .chat-shell {
+    height: auto;
+    overflow: visible;
   }
 
   .chat-header {

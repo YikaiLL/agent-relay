@@ -83,6 +83,7 @@ impl CodexBridge {
             let mut relay = bridge.state.write().await;
             relay.set_connection(true);
             relay.push_log("info", "Connected to Codex app-server.");
+            relay.notify();
         }
 
         Ok(bridge)
@@ -283,12 +284,14 @@ fn spawn_stdout_reader(
                     let mut relay = state.write().await;
                     relay.set_connection(false);
                     relay.push_log("error", "Codex app-server stdout closed.");
+                    relay.notify();
                     break;
                 }
                 Err(error) => {
                     let mut relay = state.write().await;
                     relay.set_connection(false);
                     relay.push_log("error", format!("Failed to read Codex stdout: {error}"));
+                    relay.notify();
                     break;
                 }
             }
@@ -305,11 +308,13 @@ fn spawn_stderr_reader(stderr: ChildStderr, state: Arc<RwLock<RelayState>>) {
                 Ok(Some(line)) => {
                     let mut relay = state.write().await;
                     relay.push_log("codex", line);
+                    relay.notify();
                 }
                 Ok(None) => break,
                 Err(error) => {
                     let mut relay = state.write().await;
                     relay.push_log("error", format!("Failed to read Codex stderr: {error}"));
+                    relay.notify();
                     break;
                 }
             }
@@ -327,6 +332,7 @@ async fn handle_stdout_line(
         Err(_) => {
             let mut relay = state.write().await;
             relay.push_log("codex", line.to_string());
+            relay.notify();
             return;
         }
     };
@@ -362,6 +368,7 @@ async fn handle_stdout_line(
 
     let mut relay = state.write().await;
     relay.push_log("codex", line.to_string());
+    relay.notify();
 }
 
 async fn handle_server_request(payload: Value, state: &Arc<RwLock<RelayState>>) {
@@ -434,6 +441,7 @@ async fn handle_server_request(payload: Value, state: &Arc<RwLock<RelayState>>) 
             "approval",
             format!("Approval requested for {}.", pending.kind.as_str()),
         );
+        relay.notify();
     }
 }
 
@@ -444,6 +452,7 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
         .unwrap_or_default();
     let params = payload.get("params").cloned().unwrap_or(Value::Null);
     let mut relay = state.write().await;
+    let mut changed = false;
 
     match method {
         "thread/started" => {
@@ -451,24 +460,29 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
                 value_at(&params, &["thread"]).and_then(|value| parse_thread_summary(value).ok())
             {
                 relay.upsert_thread(thread);
+                changed = true;
             }
         }
         "thread/status/changed" => {
             let thread_id = string_at(&params, &["threadId"]).unwrap_or_default();
             let (status, active_flags) = parse_status(value_at(&params, &["status"]));
             relay.set_thread_status(&thread_id, status, active_flags);
+            changed = true;
         }
         "turn/started" => {
             if let Some(turn_id) = string_at(&params, &["turn", "id"]) {
                 relay.set_active_turn(Some(turn_id));
+                changed = true;
             }
         }
         "turn/completed" => {
             relay.set_active_turn(None);
+            changed = true;
             if let Some(turn_error) =
                 value_at(&params, &["turn", "error", "message"]).and_then(Value::as_str)
             {
                 relay.push_log("error", turn_error.to_string());
+                changed = true;
             }
         }
         "item/started" => match string_at(&params, &["item", "type"]).as_deref() {
@@ -478,11 +492,13 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     string_at(&params, &["turnId"]),
                 ) {
                     relay.start_agent_message(item_id, turn_id);
+                    changed = true;
                 }
             }
             Some("commandExecution") => {
                 if let Some(command) = string_at(&params, &["item", "command"]) {
                     relay.push_log("command", format!("Command started: {command}"));
+                    changed = true;
                 }
             }
             _ => {}
@@ -494,6 +510,7 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
                 string_at(&params, &["delta"]),
             ) {
                 relay.append_agent_delta(&item_id, &delta, &turn_id);
+                changed = true;
             }
         }
         "item/completed" => match string_at(&params, &["item", "type"]).as_deref() {
@@ -504,6 +521,7 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     parse_user_text(value_at(&params, &["item"])),
                 ) {
                     relay.upsert_user_message(item_id, text, turn_id);
+                    changed = true;
                 }
             }
             Some("agentMessage") => {
@@ -513,6 +531,7 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     string_at(&params, &["item", "text"]),
                 ) {
                     relay.complete_agent_message(item_id, text, turn_id);
+                    changed = true;
                 }
             }
             Some("commandExecution") => {
@@ -529,6 +548,7 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
                             .unwrap_or_else(|| "completed".to_string()),
                         turn_id,
                     );
+                    changed = true;
                 }
             }
             _ => {}
@@ -536,22 +556,26 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
         "serverRequest/resolved" => {
             if let Some(request_id) = params.get("requestId") {
                 relay.pending_approvals.remove(&normalize_id(request_id));
+                changed = true;
             }
         }
         "error" => {
             if let Some(message) = value_at(&params, &["error", "message"]).and_then(Value::as_str)
             {
                 relay.push_log("error", message.to_string());
+                changed = true;
             }
         }
         "item/commandExecution/outputDelta" => {
             if let Some(delta) = string_at(&params, &["delta"]) {
                 relay.push_log("command", delta);
+                changed = true;
             }
         }
         "item/fileChange/outputDelta" => {
             if let Some(delta) = string_at(&params, &["delta"]) {
                 relay.push_log("file_change", delta);
+                changed = true;
             }
         }
         "item/commandExecution/terminalInteraction" => {
@@ -560,9 +584,14 @@ async fn handle_notification(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     "terminal",
                     format!("Command is requesting terminal input: {stdin}"),
                 );
+                changed = true;
             }
         }
         _ => {}
+    }
+
+    if changed {
+        relay.notify();
     }
 }
 

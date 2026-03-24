@@ -35,7 +35,7 @@ Then run:
 cargo run -p relay-server
 ```
 
-Open `http://127.0.0.1:8787`.
+Open `http://localhost:8787`.
 
 ## Current status
 

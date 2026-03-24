@@ -9,15 +9,66 @@
   <body>
     <div class="app-shell">
       <aside class="sidebar">
-        <button id="start-button" class="new-chat-button" type="button">New Session</button>
+        <button id="new-session-toggle" class="new-chat-button" type="button" aria-expanded="false">
+          New Session
+        </button>
 
-        <form id="directory-form" class="workspace-form">
-          <label class="sidebar-label" for="cwd-input">Workspace</label>
-          <div class="workspace-picker">
-            <input id="cwd-input" type="text" placeholder="/path/to/project">
-            <button id="load-directory-button" class="load-button" type="submit">Load</button>
-          </div>
-        </form>
+        <section id="new-session-panel" class="new-session-panel" hidden>
+          <form id="directory-form" class="workspace-form">
+            <label class="sidebar-label" for="cwd-input">Workspace</label>
+            <div class="workspace-picker">
+              <input id="cwd-input" type="text" placeholder="/path/to/project">
+              <button id="load-directory-button" class="load-button" type="submit">Load</button>
+            </div>
+          </form>
+
+          <button id="start-session-button" class="start-session-button" type="button">
+            Start Session
+          </button>
+
+          <details class="sidebar-settings">
+            <summary>Launch settings</summary>
+            <div class="settings-grid">
+              <label class="field">
+                <span>Model</span>
+                <input id="model-input" type="text" value="gpt-5-codex">
+              </label>
+              <label class="field">
+                <span>Approval</span>
+                <select id="approval-policy-input">
+                  <option value="untrusted">untrusted</option>
+                  <option value="on-request">on-request</option>
+                  <option value="never">never</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Sandbox</span>
+                <select id="sandbox-input">
+                  <option value="workspace-write">workspace-write</option>
+                  <option value="read-only">read-only</option>
+                  <option value="danger-full-access">danger-full-access</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Default Effort</span>
+                <select id="start-effort">
+                  <option value="medium">medium</option>
+                  <option value="low">low</option>
+                  <option value="high">high</option>
+                </select>
+              </label>
+              <label class="field field-full">
+                <span>Initial Prompt</span>
+                <textarea id="start-prompt" rows="4" placeholder="Optional first task for the new session."></textarea>
+              </label>
+            </div>
+          </details>
+        </section>
+
+        <section class="workspace-summary">
+          <span class="sidebar-label">Current workspace</span>
+          <p id="current-workspace" class="workspace-current">No workspace selected</p>
+        </section>
 
         <div class="sidebar-row">
           <p id="threads-count" class="sidebar-caption">Choose a directory</p>
@@ -29,44 +80,6 @@
         <div id="threads-list" class="conversation-list">
           <p class="sidebar-empty">Choose a directory to load history sessions.</p>
         </div>
-
-        <details class="sidebar-settings">
-          <summary>Launch settings</summary>
-          <div class="settings-grid">
-            <label class="field">
-              <span>Model</span>
-              <input id="model-input" type="text" value="gpt-5-codex">
-            </label>
-            <label class="field">
-              <span>Approval</span>
-              <select id="approval-policy-input">
-                <option value="untrusted">untrusted</option>
-                <option value="on-request">on-request</option>
-                <option value="never">never</option>
-              </select>
-            </label>
-            <label class="field">
-              <span>Sandbox</span>
-              <select id="sandbox-input">
-                <option value="workspace-write">workspace-write</option>
-                <option value="read-only">read-only</option>
-                <option value="danger-full-access">danger-full-access</option>
-              </select>
-            </label>
-            <label class="field">
-              <span>Default Effort</span>
-              <select id="start-effort">
-                <option value="medium">medium</option>
-                <option value="low">low</option>
-                <option value="high">high</option>
-              </select>
-            </label>
-            <label class="field field-full">
-              <span>Initial Prompt</span>
-              <textarea id="start-prompt" rows="4" placeholder="Optional first task for the new session."></textarea>
-            </label>
-          </div>
-        </details>
       </aside>
 
       <main class="chat-shell">
