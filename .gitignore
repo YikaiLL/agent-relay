@@ -1,0 +1,24 @@
+# Rust
+/target
+
+# Frontend
+/dist
+/node_modules
+
+# Local config
+.env
+.env.*
+.envrc
+*.local
+
+# Temporary files
+/tmp
+*.log
+*.pid
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/

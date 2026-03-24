@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Relay</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <p class="eyebrow">Codex Remote Relay</p>
+        <h1>Start, resume, and approve Codex from the browser.</h1>
+        <p class="lede">
+          This client talks to a Rust relay, and the relay talks to the official
+          Codex app-server protocol. Sessions persist through Codex itself, so
+          the browser can resume them later.
+        </p>
+      </header>
+
+      <main class="dashboard">
+        <section class="panel panel-threads">
+          <div class="panel-head">
+            <h2>Saved Sessions</h2>
+            <button id="threads-refresh-button" class="ghost-button" type="button">Refresh</button>
+          </div>
+          <div id="threads-list" class="threads-list">
+            <p class="muted">Loading thread list.</p>
+          </div>
+        </section>
+
+        <section class="panel panel-session">
+          <div class="panel-head">
+            <h2>Active Session</h2>
+            <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
+          </div>
+          <dl id="session-facts" class="fact-grid"></dl>
+          <form id="message-form" class="stack-form">
+            <label class="field">
+              <span>Message to Codex</span>
+              <textarea id="message-input" rows="4" placeholder="Ask Codex to inspect files, edit code, or continue the active task."></textarea>
+            </label>
+            <div class="inline-fields">
+              <label class="field">
+                <span>Effort</span>
+                <select id="message-effort">
+                  <option value="medium">medium</option>
+                  <option value="low">low</option>
+                  <option value="high">high</option>
+                </select>
+              </label>
+              <button id="send-button" class="action-button action-approve" type="submit">
+                Send
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel panel-launch">
+          <div class="panel-head">
+            <h2>New Session</h2>
+          </div>
+          <form id="start-form" class="stack-form">
+            <label class="field">
+              <span>Working Directory</span>
+              <input id="cwd-input" type="text" placeholder="/path/to/project">
+            </label>
+            <label class="field">
+              <span>Initial Prompt</span>
+              <textarea id="start-prompt" rows="4" placeholder="Start a new Codex thread with this first task."></textarea>
+            </label>
+            <div class="inline-fields inline-fields-three">
+              <label class="field">
+                <span>Model</span>
+                <input id="model-input" type="text" value="gpt-5-codex">
+              </label>
+              <label class="field">
+                <span>Approval</span>
+                <select id="approval-policy-input">
+                  <option value="untrusted">untrusted</option>
+                  <option value="on-request">on-request</option>
+                  <option value="never">never</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Sandbox</span>
+                <select id="sandbox-input">
+                  <option value="workspace-write">workspace-write</option>
+                  <option value="read-only">read-only</option>
+                  <option value="danger-full-access">danger-full-access</option>
+                </select>
+              </label>
+            </div>
+            <div class="inline-fields">
+              <label class="field">
+                <span>Default Effort</span>
+                <select id="start-effort">
+                  <option value="medium">medium</option>
+                  <option value="low">low</option>
+                  <option value="high">high</option>
+                </select>
+              </label>
+              <button id="start-button" class="action-button action-approve" type="submit">
+                Start Codex
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel panel-approval">
+          <div class="panel-head">
+            <h2>Pending Approval</h2>
+            <span id="approval-badge" class="badge badge-idle">Checking</span>
+          </div>
+          <div id="approval-card" class="approval-card">
+            <p class="muted">Loading current relay state.</p>
+          </div>
+          <div class="action-row">
+            <button id="approve-button" class="action-button action-approve" type="button" disabled>
+              Approve
+            </button>
+            <button id="approve-session-button" class="action-button ghost-button" type="button" disabled>
+              Approve Session
+            </button>
+            <button id="deny-button" class="action-button action-deny" type="button" disabled>
+              Deny
+            </button>
+          </div>
+        </section>
+      </main>
+
+      <section class="panel panel-transcript">
+        <div class="panel-head">
+          <h2>Transcript</h2>
+        </div>
+        <div id="transcript" class="transcript">
+          <p class="muted">No active transcript yet.</p>
+        </div>
+      </section>
+
+      <section class="panel panel-log">
+        <div class="panel-head">
+          <h2>Client Log</h2>
+        </div>
+        <pre id="client-log" class="client-log">Booting web client…</pre>
+      </section>
+    </div>
+
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>
