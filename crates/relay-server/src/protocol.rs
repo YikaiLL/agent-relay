@@ -138,6 +138,12 @@ pub struct ThreadsResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ThreadsQuery {
+    pub cwd: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct StartSessionInput {
     pub cwd: Option<String>,
     pub initial_prompt: Option<String>,

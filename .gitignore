@@ -16,6 +16,9 @@
 *.log
 *.pid
 
+# Local planning docs
+/markdown
+
 # macOS
 .DS_Store
 

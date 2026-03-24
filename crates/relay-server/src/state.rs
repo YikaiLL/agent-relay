@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -21,6 +22,7 @@ pub const DEFAULT_APPROVAL_POLICY: &str = "untrusted";
 pub const DEFAULT_SANDBOX: &str = "workspace-write";
 pub const DEFAULT_EFFORT: &str = "medium";
 const MAX_LOG_LINES: usize = 200;
+const THREAD_SCAN_LIMIT: usize = 200;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,11 +46,24 @@ impl AppState {
         self.relay.read().await.snapshot()
     }
 
-    pub async fn list_threads(&self, limit: usize) -> Result<ThreadsResponse, String> {
-        let threads = self.codex.list_threads(limit).await?;
+    pub async fn list_threads(
+        &self,
+        limit: usize,
+        cwd: Option<String>,
+    ) -> Result<ThreadsResponse, String> {
+        let cwd = non_empty(cwd);
+        let scan_limit = if cwd.is_some() {
+            limit.max(THREAD_SCAN_LIMIT)
+        } else {
+            limit
+        };
+        let threads = self.codex.list_threads(scan_limit).await?;
+        let response_threads = filter_threads(threads.clone(), cwd.as_deref(), limit);
         let mut relay = self.relay.write().await;
-        relay.threads = threads.clone();
-        Ok(ThreadsResponse { threads })
+        relay.threads = threads;
+        Ok(ThreadsResponse {
+            threads: response_threads,
+        })
     }
 
     pub async fn start_session(&self, input: StartSessionInput) -> Result<SessionSnapshot, String> {
@@ -79,7 +94,7 @@ impl AppState {
                 .await;
         }
 
-        let _ = self.list_threads(20).await;
+        let _ = self.list_threads(20, None).await;
         Ok(self.snapshot().await)
     }
 
@@ -103,7 +118,7 @@ impl AppState {
             relay.push_log("info", format!("Resumed thread {}.", input.thread_id));
         }
 
-        let _ = self.list_threads(20).await;
+        let _ = self.list_threads(20, None).await;
         Ok(self.snapshot().await)
     }
 
@@ -588,6 +603,29 @@ fn non_empty(value: Option<String>) -> Option<String> {
             Some(trimmed)
         }
     })
+}
+
+fn filter_threads(
+    threads: Vec<ThreadSummaryView>,
+    cwd: Option<&str>,
+    limit: usize,
+) -> Vec<ThreadSummaryView> {
+    let mut filtered = threads
+        .into_iter()
+        .filter(|thread| thread_matches_cwd_scope(&thread.cwd, cwd))
+        .collect::<Vec<_>>();
+    filtered.truncate(limit);
+    filtered
+}
+
+fn thread_matches_cwd_scope(thread_cwd: &str, cwd: Option<&str>) -> bool {
+    let Some(cwd) = cwd else {
+        return true;
+    };
+
+    let thread_path = Path::new(thread_cwd);
+    let selected_path = Path::new(cwd);
+    thread_path == selected_path || thread_path.starts_with(selected_path)
 }
 
 fn unix_now() -> u64 {

@@ -5,7 +5,7 @@ mod state;
 use std::{net::SocketAddr, path::PathBuf};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -13,7 +13,8 @@ use axum::{
 };
 use protocol::{
     ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, HealthResponse,
-    ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, ThreadsResponse,
+    ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, ThreadsQuery,
+    ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -80,9 +81,11 @@ async fn session_snapshot(State(state): State<AppState>) -> Json<ApiEnvelope<Ses
 
 async fn list_threads(
     State(state): State<AppState>,
+    Query(query): Query<ThreadsQuery>,
 ) -> Result<Json<ApiEnvelope<ThreadsResponse>>, (StatusCode, Json<ApiError>)> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
     state
-        .list_threads(20)
+        .list_threads(limit, query.cwd)
         .await
         .map(|threads| Json(ApiEnvelope::ok(threads)))
         .map_err(bad_gateway)

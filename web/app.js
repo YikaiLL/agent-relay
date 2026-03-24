@@ -1,27 +1,34 @@
-const sessionFacts = document.querySelector("#session-facts");
-const approvalCard = document.querySelector("#approval-card");
-const approvalBadge = document.querySelector("#approval-badge");
+const state = {
+  currentApprovalId: null,
+  defaultsSeeded: false,
+  selectedCwd: "",
+  session: null,
+  threads: [],
+};
+
+const transcript = document.querySelector("#transcript");
 const clientLog = document.querySelector("#client-log");
 const refreshButton = document.querySelector("#refresh-button");
 const threadsRefreshButton = document.querySelector("#threads-refresh-button");
-const approveButton = document.querySelector("#approve-button");
-const approveSessionButton = document.querySelector("#approve-session-button");
-const denyButton = document.querySelector("#deny-button");
 const sendButton = document.querySelector("#send-button");
 const messageForm = document.querySelector("#message-form");
 const messageInput = document.querySelector("#message-input");
 const messageEffort = document.querySelector("#message-effort");
-const startForm = document.querySelector("#start-form");
+const directoryForm = document.querySelector("#directory-form");
+const loadDirectoryButton = document.querySelector("#load-directory-button");
+const startButton = document.querySelector("#start-button");
 const cwdInput = document.querySelector("#cwd-input");
 const startPromptInput = document.querySelector("#start-prompt");
 const modelInput = document.querySelector("#model-input");
 const approvalPolicyInput = document.querySelector("#approval-policy-input");
 const sandboxInput = document.querySelector("#sandbox-input");
 const startEffortInput = document.querySelector("#start-effort");
-const transcript = document.querySelector("#transcript");
 const threadsList = document.querySelector("#threads-list");
-
-let currentApprovalId = null;
+const threadsCount = document.querySelector("#threads-count");
+const workspaceTitle = document.querySelector("#workspace-title");
+const workspaceSubtitle = document.querySelector("#workspace-subtitle");
+const statusBadge = document.querySelector("#status-badge");
+const sessionMeta = document.querySelector("#session-meta");
 
 refreshButton.addEventListener("click", () => {
   void loadSession("manual refresh");
@@ -31,16 +38,14 @@ threadsRefreshButton.addEventListener("click", () => {
   void loadThreads("manual refresh");
 });
 
-approveButton.addEventListener("click", () => {
-  void submitDecision("approve", "once");
+directoryForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  setSelectedCwd(cwdInput.value.trim());
+  void loadThreads("directory change");
 });
 
-approveSessionButton.addEventListener("click", () => {
-  void submitDecision("approve", "session");
-});
-
-denyButton.addEventListener("click", () => {
-  void submitDecision("deny", "once");
+startButton.addEventListener("click", () => {
+  void startSession();
 });
 
 messageForm.addEventListener("submit", (event) => {
@@ -48,19 +53,36 @@ messageForm.addEventListener("submit", (event) => {
   void sendMessage();
 });
 
-startForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  void startSession();
+transcript.addEventListener("click", (event) => {
+  const approvalButton = event.target.closest("[data-approval-decision]");
+  if (!approvalButton) {
+    return;
+  }
+
+  void submitDecision(
+    approvalButton.dataset.approvalDecision,
+    approvalButton.dataset.approvalScope || "once"
+  );
 });
 
-void loadSession("initial boot");
-void loadThreads("initial boot");
-setInterval(() => {
-  void loadSession("poll");
-}, 2000);
-setInterval(() => {
-  void loadThreads("poll");
-}, 10000);
+void boot();
+
+async function boot() {
+  await loadSession("initial boot");
+  if (state.selectedCwd) {
+    await loadThreads("initial boot");
+  } else {
+    renderThreads([]);
+  }
+
+  setInterval(() => {
+    void loadSession("poll");
+  }, 2000);
+
+  setInterval(() => {
+    void loadThreads("poll");
+  }, 10000);
+}
 
 async function loadSession(reason) {
   logLine(`Fetching session snapshot (${reason})`);
@@ -73,47 +95,67 @@ async function loadSession(reason) {
       throw new Error(payload?.error?.message || "Failed to load session");
     }
 
-    hydrateFormDefaults(payload.data);
+    seedDefaults(payload.data);
     renderSession(payload.data);
   } catch (error) {
-    approvalBadge.textContent = "Offline";
-    approvalBadge.className = "badge badge-pending";
-    approvalCard.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
-    toggleDecisionButtons(false, false);
+    statusBadge.textContent = "Offline";
+    statusBadge.className = "status-badge status-badge-offline";
+    sessionMeta.innerHTML = `<span class="meta-empty">${escapeHtml(error.message)}</span>`;
+    transcript.innerHTML = `
+      <div class="thread-empty">
+        <h2>Relay unavailable</h2>
+        <p>${escapeHtml(error.message)}</p>
+      </div>
+    `;
     logLine(`Session fetch failed: ${error.message}`);
   }
 }
 
 async function loadThreads(reason) {
-  logLine(`Fetching thread list (${reason})`);
+  if (!state.selectedCwd) {
+    state.threads = [];
+    renderThreads([]);
+    logLine("History skipped because no directory is selected.");
+    return;
+  }
+
+  threadsCount.textContent = "Loading...";
+  threadsCount.title = state.selectedCwd;
+  logLine(`Fetching thread list for ${state.selectedCwd} (${reason})`);
 
   try {
-    const response = await fetch("/api/threads");
+    const url = new URL("/api/threads", window.location.origin);
+    url.searchParams.set("cwd", state.selectedCwd);
+    url.searchParams.set("limit", "80");
+
+    const response = await fetch(url);
     const payload = await response.json();
 
     if (!response.ok || !payload.ok) {
       throw new Error(payload?.error?.message || "Failed to load threads");
     }
 
+    state.threads = payload.data.threads;
     renderThreads(payload.data.threads);
   } catch (error) {
-    threadsList.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+    threadsCount.textContent = "Error";
+    threadsList.innerHTML = `<p class="sidebar-empty">${escapeHtml(error.message)}</p>`;
     logLine(`Thread fetch failed: ${error.message}`);
   }
 }
 
 async function startSession() {
-  const body = {
-    cwd: cwdInput.value.trim() || null,
-    initial_prompt: startPromptInput.value.trim() || null,
-    model: modelInput.value.trim() || null,
-    approval_policy: approvalPolicyInput.value,
-    sandbox: sandboxInput.value,
-    effort: startEffortInput.value,
-  };
+  const cwd = cwdInput.value.trim();
 
-  setBusy(startForm, true);
-  logLine("Starting a new Codex thread");
+  if (!cwd) {
+    logLine("Choose a directory before starting a session.");
+    cwdInput.focus();
+    return;
+  }
+
+  setSelectedCwd(cwd);
+  setStartControlsBusy(true);
+  logLine(`Starting a new Codex thread in ${cwd}`);
 
   try {
     const response = await fetch("/api/session/start", {
@@ -121,7 +163,14 @@ async function startSession() {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        cwd,
+        initial_prompt: startPromptInput.value.trim() || null,
+        model: modelInput.value.trim() || null,
+        approval_policy: approvalPolicyInput.value,
+        sandbox: sandboxInput.value,
+        effort: startEffortInput.value,
+      }),
     });
     const payload = await response.json();
 
@@ -129,13 +178,16 @@ async function startSession() {
       throw new Error(payload?.error?.message || "Failed to start session");
     }
 
+    state.defaultsSeeded = false;
+    setSelectedCwd(payload.data.current_cwd || cwd);
+    seedDefaults(payload.data);
     renderSession(payload.data);
     await loadThreads("post-start refresh");
     logLine("Started a new Codex thread");
   } catch (error) {
     logLine(`Session start failed: ${error.message}`);
   } finally {
-    setBusy(startForm, false);
+    setStartControlsBusy(false);
   }
 }
 
@@ -156,7 +208,11 @@ async function resumeSession(threadId) {
       throw new Error(payload?.error?.message || "Failed to resume session");
     }
 
+    state.defaultsSeeded = false;
+    setSelectedCwd(payload.data.current_cwd || state.selectedCwd);
+    seedDefaults(payload.data);
     renderSession(payload.data);
+    await loadThreads("post-resume refresh");
     logLine(`Resumed thread ${threadId}`);
   } catch (error) {
     logLine(`Resume failed: ${error.message}`);
@@ -202,16 +258,15 @@ async function sendMessage() {
 }
 
 async function submitDecision(decision, scope) {
-  if (!currentApprovalId) {
+  if (!state.currentApprovalId) {
     logLine("No pending approval to submit.");
     return;
   }
 
-  toggleDecisionButtons(false, false);
-  logLine(`Submitting ${decision} for ${currentApprovalId}`);
+  logLine(`Submitting ${decision} for ${state.currentApprovalId}`);
 
   try {
-    const response = await fetch(`/api/approvals/${encodeURIComponent(currentApprovalId)}`, {
+    const response = await fetch(`/api/approvals/${encodeURIComponent(state.currentApprovalId)}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -228,80 +283,216 @@ async function submitDecision(decision, scope) {
     await loadSession("post-decision refresh");
   } catch (error) {
     logLine(`Approval failed: ${error.message}`);
-    approvalCard.insertAdjacentHTML(
-      "beforeend",
-      `<p class="muted">${escapeHtml(error.message)}</p>`
-    );
   }
 }
 
 function renderSession(session) {
+  state.session = session;
+
   const approval = session.pending_approvals[0] || null;
-  currentApprovalId = approval?.request_id || null;
+  const activeThread = resolveActiveThread(session.active_thread_id);
+  state.currentApprovalId = approval?.request_id || null;
 
-  sessionFacts.innerHTML = [
-    fact("Provider", session.provider),
-    fact("Codex", session.codex_connected ? "Connected" : "Offline"),
-    fact("Thread", session.active_thread_id || "None"),
-    fact("Turn", session.active_turn_id || "None"),
-    fact("Status", session.current_status),
-    fact("Flags", session.active_flags.join(", ") || "none"),
-    fact("CWD", session.current_cwd),
-    fact("Model", session.model),
-    fact("Approval", session.approval_policy),
-    fact("Sandbox", session.sandbox),
-    fact("Effort", session.reasoning_effort),
-  ].join("");
-
-  renderTranscript(session.transcript);
-  renderLogs(session.logs);
+  workspaceTitle.textContent = session.active_thread_id
+    ? activeThread?.name || activeThread?.preview || shortId(session.active_thread_id)
+    : "New session";
+  workspaceSubtitle.textContent = session.active_thread_id
+    ? session.current_cwd
+    : "Pick a workspace on the left and start or resume a session.";
 
   if (approval) {
-    approvalBadge.textContent = "Approval Needed";
-    approvalBadge.className = "badge badge-pending";
-    approvalCard.innerHTML = `
-      <h3>${escapeHtml(approval.summary)}</h3>
-      <p class="muted">Kind: ${escapeHtml(approval.kind)}</p>
-      ${approval.detail ? `<p class="muted">${escapeHtml(approval.detail)}</p>` : ""}
-      ${approval.cwd ? `<p class="muted">cwd: ${escapeHtml(approval.cwd)}</p>` : ""}
-      ${approval.command ? `<div class="approval-command">${escapeHtml(approval.command)}</div>` : ""}
-      ${approval.requested_permissions ? `<pre class="approval-command">${escapeHtml(JSON.stringify(approval.requested_permissions, null, 2))}</pre>` : ""}
-    `;
-    toggleDecisionButtons(true, approval.supports_session_scope);
+    statusBadge.textContent = "Approval required";
+    statusBadge.className = "status-badge status-badge-alert";
+  } else if (!session.codex_connected) {
+    statusBadge.textContent = "Offline";
+    statusBadge.className = "status-badge status-badge-offline";
   } else {
-    approvalBadge.textContent = "No Pending Action";
-    approvalBadge.className = "badge badge-idle";
-    approvalCard.innerHTML = `
-      <h3>Queue is clear.</h3>
-      <p class="muted">
-        The relay is ready for the next Codex event. Approval prompts from commands, file changes,
-        and extra permissions will appear here.
-      </p>
-    `;
-    toggleDecisionButtons(false, false);
+    statusBadge.textContent = session.current_status || "Ready";
+    statusBadge.className = "status-badge status-badge-ready";
   }
 
+  renderSessionMeta(session);
+  renderTranscript(session.transcript, approval);
+  renderLogs(session.logs);
+  renderThreads(state.threads);
+
   sendButton.disabled = !session.active_thread_id;
+  messageInput.disabled = !session.active_thread_id;
+  messageInput.placeholder = session.active_thread_id
+    ? "Message Codex..."
+    : "Start or resume a session first.";
+
   logLine(`Session updated. Status: ${session.current_status}`);
 }
 
+function renderSessionMeta(session) {
+  if (!session.active_thread_id) {
+    sessionMeta.innerHTML = `<span class="meta-empty">Session details will appear here.</span>`;
+    return;
+  }
+
+  sessionMeta.innerHTML = [
+    metaChip("Directory", session.current_cwd || "None"),
+    metaChip("Model", session.model),
+    metaChip("Approval", session.approval_policy),
+    metaChip("Sandbox", session.sandbox),
+    metaChip("Effort", session.reasoning_effort),
+    metaChip("Thread", shortId(session.active_thread_id)),
+  ].join("");
+}
+
+function renderTranscript(entries, approval) {
+  if (!entries.length && !approval) {
+    transcript.innerHTML = `
+      <div class="thread-empty">
+        <h2>No active conversation yet</h2>
+        <p>Start a new session or resume one from the sidebar.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const items = entries.map(renderEntry);
+  if (approval) {
+    items.push(renderApprovalCard(approval));
+  }
+
+  transcript.innerHTML = `<div class="thread-content">${items.join("")}</div>`;
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function renderEntry(entry) {
+  const role = entry.role || "system";
+
+  if (role === "user") {
+    return `
+      <article class="chat-message chat-message-user">
+        <div class="message-card">
+          <div class="message-meta">
+            <strong>You</strong>
+            <span>${escapeHtml(entry.status || "completed")}</span>
+          </div>
+          <div class="message-body">${escapeHtml(entry.text || "(empty)")}</div>
+        </div>
+      </article>
+    `;
+  }
+
+  if (role === "assistant") {
+    return `
+      <article class="chat-message chat-message-assistant">
+        <div class="message-avatar">C</div>
+        <div class="message-card">
+          <div class="message-meta">
+            <strong>Codex</strong>
+            <span>${escapeHtml(entry.status || "completed")}</span>
+            <span>${escapeHtml(shortId(entry.turn_id || ""))}</span>
+          </div>
+          <div class="message-body">${escapeHtml(entry.text || "(empty)")}</div>
+        </div>
+      </article>
+    `;
+  }
+
+  return `
+    <article class="chat-message chat-message-system">
+      <div class="message-card message-card-system">
+        <div class="message-meta">
+          <strong>${escapeHtml(roleLabel(role))}</strong>
+          <span>${escapeHtml(entry.status || "completed")}</span>
+        </div>
+        <pre class="message-pre">${escapeHtml(entry.text || "(empty)")}</pre>
+      </div>
+    </article>
+  `;
+}
+
+function renderApprovalCard(approval) {
+  return `
+    <article class="chat-message chat-message-system">
+      <div class="message-card message-card-approval">
+        <div class="message-meta">
+          <strong>Approval required</strong>
+          <span>${escapeHtml(approval.kind)}</span>
+        </div>
+        <h3 class="approval-title">${escapeHtml(approval.summary)}</h3>
+        <p class="approval-copy">${escapeHtml(approval.detail || "Codex is waiting for a remote approval.")}</p>
+        ${approval.cwd ? `<p class="approval-copy">cwd: ${escapeHtml(approval.cwd)}</p>` : ""}
+        ${approval.command ? `<pre class="message-pre">${escapeHtml(approval.command)}</pre>` : ""}
+        ${
+          approval.requested_permissions
+            ? `<pre class="message-pre">${escapeHtml(JSON.stringify(approval.requested_permissions, null, 2))}</pre>`
+            : ""
+        }
+        <div class="approval-actions">
+          <button
+            class="approval-button approval-button-primary"
+            type="button"
+            data-approval-decision="approve"
+            data-approval-scope="once"
+          >
+            Approve
+          </button>
+          ${
+            approval.supports_session_scope
+              ? `
+                <button
+                  class="approval-button"
+                  type="button"
+                  data-approval-decision="approve"
+                  data-approval-scope="session"
+                >
+                  Approve Session
+                </button>
+              `
+              : ""
+          }
+          <button
+            class="approval-button approval-button-danger"
+            type="button"
+            data-approval-decision="deny"
+            data-approval-scope="once"
+          >
+            Deny
+          </button>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
 function renderThreads(threads) {
+  const selectedCwd = state.selectedCwd;
+  const activeThreadId = state.session?.active_thread_id || null;
+
+  if (!selectedCwd) {
+    threadsCount.textContent = "Choose a directory";
+    threadsCount.title = "";
+    threadsList.innerHTML = `<p class="sidebar-empty">Choose a directory to load history sessions.</p>`;
+    return;
+  }
+
+  threadsCount.textContent = `${threads.length} ${threads.length === 1 ? "session" : "sessions"}`;
+  threadsCount.title = selectedCwd;
+
   if (!threads.length) {
-    threadsList.innerHTML = `<p class="muted">No saved threads found.</p>`;
+    threadsList.innerHTML = `<p class="sidebar-empty">No saved sessions found for this workspace.</p>`;
     return;
   }
 
   threadsList.innerHTML = threads
-    .map(
-      (thread) => `
-        <article class="thread-card">
-          <h3>${escapeHtml(thread.name || thread.preview || thread.id)}</h3>
-          <p>${escapeHtml(thread.preview || "No preview yet.")}</p>
-          <p class="meta">${escapeHtml(thread.cwd)} · ${escapeHtml(thread.status)} · ${escapeHtml(thread.source)}</p>
-          <button class="ghost-button" type="button" data-thread-id="${escapeHtml(thread.id)}">Resume</button>
-        </article>
-      `
-    )
+    .map((thread) => {
+      const title = thread.name || thread.preview || shortId(thread.id);
+      const activeClass = activeThreadId === thread.id ? " is-active" : "";
+
+      return `
+        <button class="conversation-item${activeClass}" type="button" data-thread-id="${escapeHtml(thread.id)}">
+          <span class="conversation-title">${escapeHtml(title)}</span>
+          <span class="conversation-preview">${escapeHtml(thread.preview || "No preview yet.")}</span>
+          <span class="conversation-meta">${escapeHtml(formatTimestamp(thread.updated_at))}</span>
+        </button>
+      `;
+    })
     .join("");
 
   threadsList.querySelectorAll("[data-thread-id]").forEach((button) => {
@@ -311,61 +502,96 @@ function renderThreads(threads) {
   });
 }
 
-function renderTranscript(entries) {
-  if (!entries.length) {
-    transcript.innerHTML = `<p class="muted">No transcript yet. Start or resume a Codex session first.</p>`;
-    return;
-  }
-
-  transcript.innerHTML = entries
-    .map(
-      (entry) => `
-        <article class="transcript-entry" data-role="${escapeHtml(entry.role)}">
-          <h3>${escapeHtml(entry.role)} · ${escapeHtml(entry.status)}</h3>
-          <p class="transcript-body">${escapeHtml(entry.text || "(empty)")}</p>
-          <p class="meta">${escapeHtml(entry.turn_id || "no turn id")}</p>
-        </article>
-      `
-    )
-    .join("");
-}
-
 function renderLogs(entries) {
   clientLog.textContent = entries
-    .map((entry) => `${new Date(entry.created_at * 1000).toLocaleTimeString()}  [${entry.kind}] ${entry.message}`)
+    .map(
+      (entry) =>
+        `${new Date(entry.created_at * 1000).toLocaleTimeString()}  [${entry.kind}] ${entry.message}`
+    )
     .join("\n");
 }
 
-function toggleDecisionButtons(enabled, sessionEnabled) {
-  approveButton.disabled = !enabled;
-  approveSessionButton.disabled = !enabled || !sessionEnabled;
-  denyButton.disabled = !enabled;
+function seedDefaults(session) {
+  if (!state.defaultsSeeded) {
+    if (!modelInput.value) {
+      modelInput.value = session.model || "gpt-5-codex";
+    }
+    approvalPolicyInput.value = session.approval_policy;
+    sandboxInput.value = session.sandbox;
+    startEffortInput.value = session.reasoning_effort;
+    messageEffort.value = session.reasoning_effort;
+    state.defaultsSeeded = true;
+  }
+
+  if (!state.selectedCwd && session.current_cwd) {
+    setSelectedCwd(session.current_cwd);
+  }
 }
 
-function fact(label, value) {
-  return `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`;
+function setSelectedCwd(cwd) {
+  state.selectedCwd = cwd;
+  cwdInput.value = cwd;
+}
+
+function resolveActiveThread(threadId) {
+  if (!threadId) {
+    return null;
+  }
+
+  return state.threads.find((thread) => thread.id === threadId) || null;
+}
+
+function setStartControlsBusy(busy) {
+  [
+    loadDirectoryButton,
+    startButton,
+    cwdInput,
+    startPromptInput,
+    modelInput,
+    approvalPolicyInput,
+    sandboxInput,
+    startEffortInput,
+  ].forEach((element) => {
+    element.disabled = busy;
+  });
+}
+
+function metaChip(label, value) {
+  return `
+    <span class="meta-chip">
+      <strong>${escapeHtml(label)}:</strong>
+      <span>${escapeHtml(value)}</span>
+    </span>
+  `;
+}
+
+function formatTimestamp(seconds) {
+  if (!seconds) {
+    return "unknown";
+  }
+
+  return new Date(seconds * 1000).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function roleLabel(role) {
+  if (role === "command") {
+    return "Command";
+  }
+  return role;
+}
+
+function shortId(value) {
+  return value ? value.slice(0, 8) : "unknown";
 }
 
 function logLine(message) {
   const time = new Date().toLocaleTimeString();
   clientLog.textContent = `${time}  ${message}\n${clientLog.textContent}`.trim();
-}
-
-function hydrateFormDefaults(session) {
-  if (!cwdInput.value) {
-    cwdInput.value = session.current_cwd || "";
-  }
-
-  approvalPolicyInput.value = session.approval_policy;
-  sandboxInput.value = session.sandbox;
-  startEffortInput.value = session.reasoning_effort;
-  messageEffort.value = session.reasoning_effort;
-}
-
-function setBusy(form, busy) {
-  form.querySelectorAll("input, textarea, select, button").forEach((element) => {
-    element.disabled = busy;
-  });
 }
 
 function escapeHtml(value) {
