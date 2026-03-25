@@ -43,6 +43,7 @@ The backend currently exposes:
 
 - `GET /api/health`
 - `GET /api/session`
+- `GET /api/stream`
 - `GET /api/threads`
 - `POST /api/session/start`
 - `POST /api/session/resume`

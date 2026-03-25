@@ -1,5 +1,8 @@
+const DEVICE_STORAGE_KEY = "agent-relay.device-id";
+
 const state = {
   currentApprovalId: null,
+  deviceId: loadOrCreateDeviceId(),
   defaultsSeeded: false,
   newSessionPanelOpen: false,
   selectedCwd: "",
@@ -26,7 +29,6 @@ const newSessionToggleButton = document.querySelector("#new-session-toggle");
 const newSessionPanel = document.querySelector("#new-session-panel");
 const startSessionButton = document.querySelector("#start-session-button");
 const cwdInput = document.querySelector("#cwd-input");
-const currentWorkspace = document.querySelector("#current-workspace");
 const startPromptInput = document.querySelector("#start-prompt");
 const modelInput = document.querySelector("#model-input");
 const approvalPolicyInput = document.querySelector("#approval-policy-input");
@@ -38,6 +40,10 @@ const workspaceTitle = document.querySelector("#workspace-title");
 const workspaceSubtitle = document.querySelector("#workspace-subtitle");
 const statusBadge = document.querySelector("#status-badge");
 const sessionMeta = document.querySelector("#session-meta");
+const controlBanner = document.querySelector("#control-banner");
+const controlSummary = document.querySelector("#control-summary");
+const controlHint = document.querySelector("#control-hint");
+const takeOverButton = document.querySelector("#take-over-button");
 
 refreshButton.addEventListener("click", () => {
   void loadSession("manual refresh");
@@ -59,6 +65,10 @@ newSessionToggleButton.addEventListener("click", () => {
 
 startSessionButton.addEventListener("click", () => {
   void startSession();
+});
+
+takeOverButton.addEventListener("click", () => {
+  void takeOverControl();
 });
 
 messageForm.addEventListener("submit", (event) => {
@@ -184,6 +194,7 @@ async function startSession() {
         approval_policy: approvalPolicyInput.value,
         sandbox: sandboxInput.value,
         effort: startEffortInput.value,
+        device_id: state.deviceId,
       }),
     });
     const payload = await response.json();
@@ -215,7 +226,10 @@ async function resumeSession(threadId) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ thread_id: threadId }),
+      body: JSON.stringify({
+        thread_id: threadId,
+        device_id: state.deviceId,
+      }),
     });
     const payload = await response.json();
 
@@ -255,6 +269,7 @@ async function sendMessage() {
       body: JSON.stringify({
         text,
         effort: messageEffort.value,
+        device_id: state.deviceId,
       }),
     });
     const payload = await response.json();
@@ -273,6 +288,41 @@ async function sendMessage() {
   }
 }
 
+async function takeOverControl() {
+  if (!state.session?.active_thread_id) {
+    logLine("There is no active session to take over.");
+    return;
+  }
+
+  takeOverButton.disabled = true;
+  logLine(`Taking control from device ${shortId(state.deviceId)}`);
+
+  try {
+    const response = await fetch("/api/session/take-over", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        device_id: state.deviceId,
+      }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to take control");
+    }
+
+    renderSession(payload.data);
+    messageInput.focus();
+    logLine("This device now has control.");
+  } catch (error) {
+    logLine(`Take over failed: ${error.message}`);
+  } finally {
+    takeOverButton.disabled = false;
+  }
+}
+
 async function submitDecision(decision, scope) {
   if (!state.currentApprovalId) {
     logLine("No pending approval to submit.");
@@ -287,7 +337,11 @@ async function submitDecision(decision, scope) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ decision, scope }),
+      body: JSON.stringify({
+        decision,
+        scope,
+        device_id: state.deviceId,
+      }),
     });
     const payload = await response.json();
 
@@ -307,6 +361,8 @@ function renderSession(session) {
 
   const approval = session.pending_approvals[0] || null;
   const activeThread = resolveActiveThread(session.active_thread_id);
+  const hasActiveSession = Boolean(session.active_thread_id);
+  const hasControl = isCurrentDeviceActiveController(session);
   state.currentApprovalId = approval?.request_id || null;
 
   workspaceTitle.textContent = session.active_thread_id
@@ -328,15 +384,18 @@ function renderSession(session) {
   }
 
   renderSessionMeta(session);
+  renderControlBanner(session);
   renderTranscript(session.transcript, approval);
   renderLogs(session.logs);
   renderThreads(state.threads);
 
-  sendButton.disabled = !session.active_thread_id;
-  messageInput.disabled = !session.active_thread_id;
-  messageInput.placeholder = session.active_thread_id
-    ? "Message Codex..."
-    : "Start or resume a session first.";
+  sendButton.disabled = !hasActiveSession || !hasControl;
+  messageInput.disabled = !hasActiveSession || !hasControl;
+  messageInput.placeholder = !hasActiveSession
+    ? "Start or resume a session first."
+    : hasControl
+      ? "Message Codex..."
+      : "Another device has control. Take over to reply.";
 }
 
 function renderSessionMeta(session) {
@@ -351,8 +410,37 @@ function renderSessionMeta(session) {
     metaChip("Approval", session.approval_policy),
     metaChip("Sandbox", session.sandbox),
     metaChip("Effort", session.reasoning_effort),
+    metaChip(
+      "Control",
+      session.active_controller_device_id
+        ? controllerLabel(session.active_controller_device_id)
+        : "Unclaimed"
+    ),
     metaChip("Thread", shortId(session.active_thread_id)),
   ].join("");
+}
+
+function renderControlBanner(session) {
+  if (!session.active_thread_id) {
+    controlBanner.hidden = true;
+    takeOverButton.hidden = true;
+    return;
+  }
+
+  controlBanner.hidden = false;
+
+  if (isCurrentDeviceActiveController(session)) {
+    controlSummary.textContent = "This device has control";
+    controlHint.textContent = "You can type here. Other owner devices can still approve pending actions.";
+    takeOverButton.hidden = true;
+    return;
+  }
+
+  controlSummary.textContent = session.active_controller_device_id
+    ? `Another device has control (${controllerLabel(session.active_controller_device_id)})`
+    : "No device currently has control";
+  controlHint.textContent = "You can still approve from this device. Take over when you want to type or continue the session.";
+  takeOverButton.hidden = false;
 }
 
 function renderTranscript(entries, approval) {
@@ -545,8 +633,6 @@ function seedDefaults(session) {
 function setSelectedCwd(cwd) {
   state.selectedCwd = cwd;
   cwdInput.value = cwd;
-  currentWorkspace.textContent = cwd || "No workspace selected";
-  currentWorkspace.title = cwd || "";
 }
 
 function resolveActiveThread(threadId) {
@@ -728,8 +814,41 @@ function roleLabel(role) {
   return role;
 }
 
+function isCurrentDeviceActiveController(session) {
+  if (!session?.active_thread_id) {
+    return false;
+  }
+
+  return !session.active_controller_device_id || session.active_controller_device_id === state.deviceId;
+}
+
+function controllerLabel(deviceId) {
+  if (!deviceId) {
+    return "Unclaimed";
+  }
+
+  if (deviceId === state.deviceId) {
+    return `This device (${shortId(deviceId)})`;
+  }
+
+  return shortId(deviceId);
+}
+
 function shortId(value) {
   return value ? value.slice(0, 8) : "unknown";
+}
+
+function loadOrCreateDeviceId() {
+  const existing = window.localStorage.getItem(DEVICE_STORAGE_KEY);
+  if (existing) {
+    return existing;
+  }
+
+  const generated = window.crypto?.randomUUID?.()
+    ? window.crypto.randomUUID()
+    : `device-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  window.localStorage.setItem(DEVICE_STORAGE_KEY, generated);
+  return generated;
 }
 
 function logLine(message) {

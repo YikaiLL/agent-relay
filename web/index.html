@@ -65,11 +65,6 @@
           </details>
         </section>
 
-        <section class="workspace-summary">
-          <span class="sidebar-label">Current workspace</span>
-          <p id="current-workspace" class="workspace-current">No workspace selected</p>
-        </section>
-
         <div class="sidebar-row">
           <p id="threads-count" class="sidebar-caption">Choose a directory</p>
           <button id="threads-refresh-button" class="sidebar-link-button" type="button">
@@ -103,6 +98,16 @@
             <span class="meta-empty">Session details will appear here.</span>
           </section>
         </details>
+
+        <section id="control-banner" class="control-banner" hidden>
+          <div>
+            <p id="control-summary" class="control-summary">This device has control</p>
+            <p id="control-hint" class="control-hint">Only the active device can type, but any owner device can approve.</p>
+          </div>
+          <button id="take-over-button" class="header-button control-button" type="button">
+            Take over
+          </button>
+        </section>
 
         <section class="thread-shell">
           <div id="transcript" class="chat-thread">

@@ -115,23 +115,11 @@ select {
   text-align: left;
 }
 
-.workspace-summary,
 .new-session-panel,
 .workspace-form,
 .settings-grid {
   display: grid;
   gap: 10px;
-}
-
-.workspace-summary {
-  padding: 2px 2px 0;
-}
-
-.workspace-current {
-  margin: 0;
-  color: var(--sidebar-text);
-  line-height: 1.45;
-  word-break: break-word;
 }
 
 .new-session-panel {
@@ -420,6 +408,39 @@ select {
 .meta-empty {
   color: var(--muted);
   line-height: 1.6;
+}
+
+.control-banner {
+  width: min(880px, calc(100% - 32px));
+  margin: 16px auto 0;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.82);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  box-shadow: var(--shadow);
+}
+
+.control-summary,
+.control-hint {
+  margin: 0;
+}
+
+.control-summary {
+  font-weight: 600;
+}
+
+.control-hint {
+  margin-top: 4px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.control-button {
+  flex-shrink: 0;
 }
 
 .thread-shell {
@@ -713,6 +734,12 @@ select {
 
   .meta-drawer {
     padding: 0 20px 14px;
+  }
+
+  .control-banner {
+    width: calc(100% - 28px);
+    flex-direction: column;
+    align-items: flex-start;
   }
 
   .composer-shell {

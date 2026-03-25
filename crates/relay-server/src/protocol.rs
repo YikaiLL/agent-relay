@@ -50,6 +50,7 @@ pub struct SessionSnapshot {
     pub service_ready: bool,
     pub codex_connected: bool,
     pub active_thread_id: Option<String>,
+    pub active_controller_device_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub current_status: String,
     pub active_flags: Vec<String>,
@@ -80,6 +81,7 @@ pub struct ApprovalRequestView {
 pub struct ApprovalDecisionInput {
     pub decision: ApprovalDecision,
     pub scope: Option<ApprovalScope>,
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -151,6 +153,7 @@ pub struct StartSessionInput {
     pub approval_policy: Option<String>,
     pub sandbox: Option<String>,
     pub effort: Option<String>,
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,10 +162,17 @@ pub struct ResumeSessionInput {
     pub approval_policy: Option<String>,
     pub sandbox: Option<String>,
     pub effort: Option<String>,
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SendMessageInput {
     pub text: String,
     pub effort: Option<String>,
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TakeOverInput {
+    pub device_id: Option<String>,
 }

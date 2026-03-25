@@ -13,7 +13,7 @@ use crate::{
     protocol::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, ApprovalRequestView,
         ApprovalScope, LogEntryView, ResumeSessionInput, SendMessageInput, SessionSnapshot,
-        StartSessionInput, ThreadSummaryView, ThreadsResponse, TranscriptEntryView,
+        StartSessionInput, TakeOverInput, ThreadSummaryView, ThreadsResponse, TranscriptEntryView,
     },
 };
 
@@ -78,6 +78,7 @@ impl AppState {
     }
 
     pub async fn start_session(&self, input: StartSessionInput) -> Result<SessionSnapshot, String> {
+        let device_id = require_device_id(input.device_id)?;
         let defaults = self.defaults().await;
         let cwd = non_empty(input.cwd).unwrap_or(defaults.current_cwd);
         let model = non_empty(input.model).unwrap_or(defaults.model);
@@ -92,8 +93,22 @@ impl AppState {
 
         {
             let mut relay = self.relay.write().await;
-            relay.activate_thread(thread, &cwd, &model, &approval_policy, &sandbox, &effort);
-            relay.push_log("info", format!("Started a new Codex thread in {cwd}."));
+            relay.activate_thread(
+                thread,
+                &cwd,
+                &model,
+                &approval_policy,
+                &sandbox,
+                &effort,
+                &device_id,
+            );
+            relay.push_log(
+                "info",
+                format!(
+                    "Started a new Codex thread in {cwd}. Control is now on {}.",
+                    short_device_id(&device_id)
+                ),
+            );
             relay.notify();
         }
 
@@ -102,6 +117,7 @@ impl AppState {
                 .send_message(SendMessageInput {
                     text: initial_prompt,
                     effort: Some(effort),
+                    device_id: Some(device_id),
                 })
                 .await;
         }
@@ -114,6 +130,7 @@ impl AppState {
         &self,
         input: ResumeSessionInput,
     ) -> Result<SessionSnapshot, String> {
+        let device_id = require_device_id(input.device_id)?;
         let defaults = self.defaults().await;
         let approval_policy = non_empty(input.approval_policy).unwrap_or(defaults.approval_policy);
         let sandbox = non_empty(input.sandbox).unwrap_or(defaults.sandbox);
@@ -126,8 +143,15 @@ impl AppState {
         let thread_data = self.codex.read_thread(&input.thread_id).await?;
         {
             let mut relay = self.relay.write().await;
-            relay.load_thread_data(thread_data, &approval_policy, &sandbox, &effort);
-            relay.push_log("info", format!("Resumed thread {}.", input.thread_id));
+            relay.load_thread_data(thread_data, &approval_policy, &sandbox, &effort, &device_id);
+            relay.push_log(
+                "info",
+                format!(
+                    "Resumed thread {}. Control is now on {}.",
+                    input.thread_id,
+                    short_device_id(&device_id)
+                ),
+            );
             relay.notify();
         }
 
@@ -136,21 +160,37 @@ impl AppState {
     }
 
     pub async fn send_message(&self, input: SendMessageInput) -> Result<SessionSnapshot, String> {
+        let device_id = require_device_id(input.device_id)?;
         let defaults = self.defaults().await;
         let text = non_empty(Some(input.text))
             .ok_or_else(|| "message text cannot be empty".to_string())?;
         let effort = non_empty(input.effort).unwrap_or(defaults.reasoning_effort);
-        let thread_id = self
-            .relay
-            .read()
-            .await
-            .active_thread_id
-            .clone()
-            .ok_or_else(|| "there is no active Codex thread to send to".to_string())?;
+        let thread_id = {
+            let relay = self.relay.read().await;
+            let thread_id = relay
+                .active_thread_id
+                .clone()
+                .ok_or_else(|| "there is no active Codex thread to send to".to_string())?;
+
+            if let Some(active_controller_device_id) = relay.active_controller_device_id.as_deref()
+            {
+                if active_controller_device_id != device_id.as_str() {
+                    return Err(
+                        "another device currently has control. Take over on this device before sending a message."
+                            .to_string(),
+                    );
+                }
+            }
+
+            thread_id
+        };
 
         let turn_id = self.codex.start_turn(&thread_id, &text, &effort).await?;
         {
             let mut relay = self.relay.write().await;
+            if relay.active_controller_device_id.is_none() {
+                relay.active_controller_device_id = Some(device_id.clone());
+            }
             relay.active_turn_id = turn_id;
             relay.reasoning_effort = effort.clone();
             relay.push_log(
@@ -161,6 +201,25 @@ impl AppState {
         }
 
         Ok(self.snapshot().await)
+    }
+
+    pub async fn take_over_control(&self, input: TakeOverInput) -> Result<SessionSnapshot, String> {
+        let device_id = require_device_id(input.device_id)?;
+        let mut relay = self.relay.write().await;
+        if relay.active_thread_id.is_none() {
+            return Err("there is no active session to take over".to_string());
+        }
+
+        let changed = relay.set_active_controller(&device_id);
+        if changed {
+            relay.push_log(
+                "info",
+                format!("Control moved to {}.", short_device_id(&device_id)),
+            );
+            relay.notify();
+        }
+
+        Ok(relay.snapshot())
     }
 
     pub async fn decide_approval(
@@ -187,8 +246,9 @@ impl AppState {
         relay.push_log(
             "info",
             format!(
-                "Responded to approval {request_id} with {:?}.",
-                input.decision
+                "Responded to approval {request_id} with {:?} from {}.",
+                input.decision,
+                short_device_id(input.device_id.as_deref().unwrap_or("unknown-device"))
             ),
         );
         relay.notify();
@@ -333,6 +393,7 @@ pub struct RelayState {
     revision: u64,
     pub codex_connected: bool,
     pub active_thread_id: Option<String>,
+    pub active_controller_device_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub current_status: String,
     pub active_flags: Vec<String>,
@@ -354,6 +415,7 @@ impl RelayState {
             revision: 0,
             codex_connected: false,
             active_thread_id: None,
+            active_controller_device_id: None,
             active_turn_id: None,
             current_status: "idle".to_string(),
             active_flags: Vec::new(),
@@ -382,6 +444,7 @@ impl RelayState {
             service_ready: true,
             codex_connected: self.codex_connected,
             active_thread_id: self.active_thread_id.clone(),
+            active_controller_device_id: self.active_controller_device_id.clone(),
             active_turn_id: self.active_turn_id.clone(),
             current_status: self.current_status.clone(),
             active_flags: self.active_flags.clone(),
@@ -413,8 +476,10 @@ impl RelayState {
         approval_policy: &str,
         sandbox: &str,
         effort: &str,
+        device_id: &str,
     ) {
         self.active_thread_id = Some(thread.id.clone());
+        self.active_controller_device_id = Some(device_id.to_string());
         self.active_turn_id = None;
         self.current_status = thread.status.clone();
         self.active_flags.clear();
@@ -434,8 +499,10 @@ impl RelayState {
         approval_policy: &str,
         sandbox: &str,
         effort: &str,
+        device_id: &str,
     ) {
         self.active_thread_id = Some(data.thread.id.clone());
+        self.active_controller_device_id = Some(device_id.to_string());
         self.active_turn_id = None;
         self.current_status = data.status;
         self.active_flags = data.active_flags;
@@ -473,6 +540,15 @@ impl RelayState {
 
     pub fn set_active_turn(&mut self, turn_id: Option<String>) {
         self.active_turn_id = turn_id;
+    }
+
+    pub fn set_active_controller(&mut self, device_id: &str) -> bool {
+        if self.active_controller_device_id.as_deref() == Some(device_id) {
+            return false;
+        }
+
+        self.active_controller_device_id = Some(device_id.to_string());
+        true
     }
 
     pub fn set_thread_status(
@@ -627,6 +703,19 @@ fn non_empty(value: Option<String>) -> Option<String> {
             Some(trimmed)
         }
     })
+}
+
+fn require_device_id(device_id: Option<String>) -> Result<String, String> {
+    non_empty(device_id).ok_or_else(|| "device_id is required".to_string())
+}
+
+fn short_device_id(device_id: &str) -> String {
+    let compact = device_id.trim();
+    if compact.len() <= 8 {
+        compact.to_string()
+    } else {
+        compact[..8].to_string()
+    }
 }
 
 fn filter_threads(
