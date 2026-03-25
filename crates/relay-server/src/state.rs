@@ -1,12 +1,14 @@
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{watch, RwLock};
+use tracing::warn;
 
 use crate::{
     codex::{CodexBridge, ThreadSyncData},
@@ -25,6 +27,8 @@ pub const DEFAULT_EFFORT: &str = "medium";
 pub const CONTROLLER_LEASE_SECS: u64 = 15;
 const MAX_LOG_LINES: usize = 200;
 const THREAD_SCAN_LIMIT: usize = 200;
+const PERSISTED_STATE_VERSION: u32 = 1;
+const DEFAULT_STATE_FILE: &str = ".agent-relay/session.json";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -37,17 +41,53 @@ impl AppState {
     pub async fn new() -> Result<Self, String> {
         let cwd = std::env::current_dir()
             .map_err(|error| format!("failed to resolve current directory: {error}"))?
-            .display()
-            .to_string();
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize current directory: {error}"))?;
+        let persistence = PersistenceStore::resolve(&cwd);
+        let restored_state = match persistence.load().await {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    "failed to load relay state from {}: {}",
+                    persistence.path().display(),
+                    error
+                );
+                None
+            }
+        };
         let (change_tx, _) = watch::channel(0_u64);
-        let relay = Arc::new(RwLock::new(RelayState::new(cwd, change_tx.clone())));
-        let codex = Arc::new(CodexBridge::spawn(relay.clone()).await?);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.display().to_string(),
+            change_tx.clone(),
+        )));
 
-        Ok(Self {
+        if let Some(ref persisted) = restored_state {
+            let mut relay = relay.write().await;
+            relay.apply_persisted(persisted);
+            relay.push_log(
+                "info",
+                format!(
+                    "Loaded persisted relay state from {}.",
+                    persistence.path().display()
+                ),
+            );
+            relay.notify();
+        }
+
+        let codex = Arc::new(CodexBridge::spawn(relay.clone()).await?);
+        spawn_persistence_task(relay.clone(), change_tx.subscribe(), persistence.clone());
+
+        let state = Self {
             relay,
             codex,
             change_tx,
-        })
+        };
+
+        if let Some(persisted) = restored_state {
+            state.restore_persisted_session(persisted).await;
+        }
+
+        Ok(state)
     }
 
     pub async fn snapshot(&self) -> SessionSnapshot {
@@ -289,6 +329,43 @@ impl AppState {
         let mut relay = self.relay.write().await;
         expire_controller_if_needed(&mut relay);
     }
+
+    async fn restore_persisted_session(&self, persisted: PersistedRelayState) {
+        let Some(thread_id) = persisted.active_thread_id.clone() else {
+            return;
+        };
+
+        let restore_result = match self
+            .codex
+            .resume_thread(&thread_id, &persisted.approval_policy, &persisted.sandbox)
+            .await
+        {
+            Ok(()) => self.codex.read_thread(&thread_id).await,
+            Err(error) => Err(error),
+        };
+
+        match restore_result {
+            Ok(thread_data) => {
+                let mut relay = self.relay.write().await;
+                relay.restore_thread_data(thread_data, &persisted);
+                expire_controller_if_needed(&mut relay);
+                relay.push_log(
+                    "info",
+                    format!("Restored persisted session for thread {thread_id}."),
+                );
+                relay.notify();
+            }
+            Err(error) => {
+                let mut relay = self.relay.write().await;
+                relay.clear_active_session();
+                relay.push_log(
+                    "warn",
+                    format!("Failed to restore persisted session for thread {thread_id}: {error}"),
+                );
+                relay.notify();
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -382,7 +459,7 @@ impl ApprovalKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TranscriptRecord {
     item_id: String,
     role: String,
@@ -529,6 +606,34 @@ impl RelayState {
         self.approval_policy = approval_policy.to_string();
         self.sandbox = sandbox.to_string();
         self.reasoning_effort = effort.to_string();
+        self.pending_approvals.clear();
+        self.transcript = data
+            .transcript
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| TranscriptRecord {
+                item_id: format!("history-{index}"),
+                role: entry.role,
+                text: entry.text,
+                status: entry.status,
+                turn_id: entry.turn_id,
+            })
+            .collect();
+        self.upsert_thread(data.thread);
+    }
+
+    fn restore_thread_data(&mut self, data: ThreadSyncData, persisted: &PersistedRelayState) {
+        self.active_thread_id = Some(data.thread.id.clone());
+        self.active_controller_device_id = persisted.active_controller_device_id.clone();
+        self.active_controller_last_seen_at = persisted.active_controller_last_seen_at;
+        self.active_turn_id = None;
+        self.current_status = data.status;
+        self.active_flags = data.active_flags;
+        self.current_cwd = data.thread.cwd.clone();
+        self.model = persisted.model.clone();
+        self.approval_policy = persisted.approval_policy.clone();
+        self.sandbox = persisted.sandbox.clone();
+        self.reasoning_effort = persisted.reasoning_effort.clone();
         self.pending_approvals.clear();
         self.transcript = data
             .transcript
@@ -778,6 +883,33 @@ impl RelayState {
         });
     }
 
+    fn apply_persisted(&mut self, persisted: &PersistedRelayState) {
+        self.active_thread_id = persisted.active_thread_id.clone();
+        self.active_controller_device_id = persisted.active_controller_device_id.clone();
+        self.active_controller_last_seen_at = persisted.active_controller_last_seen_at;
+        self.active_turn_id = None;
+        self.current_status = persisted.current_status.clone();
+        self.active_flags = persisted.active_flags.clone();
+        self.current_cwd = persisted.current_cwd.clone();
+        self.model = persisted.model.clone();
+        self.approval_policy = persisted.approval_policy.clone();
+        self.sandbox = persisted.sandbox.clone();
+        self.reasoning_effort = persisted.reasoning_effort.clone();
+        self.pending_approvals.clear();
+        self.transcript = persisted.transcript.clone();
+        self.logs = persisted.logs.clone();
+    }
+
+    pub fn clear_active_session(&mut self) {
+        self.active_thread_id = None;
+        self.active_controller_device_id = None;
+        self.active_controller_last_seen_at = None;
+        self.active_turn_id = None;
+        self.current_status = "idle".to_string();
+        self.active_flags.clear();
+        self.pending_approvals.clear();
+    }
+
     fn assign_active_controller(&mut self, device_id: &str, now: u64) -> bool {
         let changed = self.active_controller_device_id.as_deref() != Some(device_id)
             || self.active_controller_last_seen_at != Some(now);
@@ -794,6 +926,104 @@ struct SessionDefaults {
     approval_policy: String,
     sandbox: String,
     reasoning_effort: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedRelayState {
+    schema_version: u32,
+    active_thread_id: Option<String>,
+    active_controller_device_id: Option<String>,
+    active_controller_last_seen_at: Option<u64>,
+    current_status: String,
+    active_flags: Vec<String>,
+    current_cwd: String,
+    model: String,
+    approval_policy: String,
+    sandbox: String,
+    reasoning_effort: String,
+    transcript: Vec<TranscriptRecord>,
+    logs: Vec<LogEntryView>,
+}
+
+impl PersistedRelayState {
+    fn from_relay(relay: &RelayState) -> Self {
+        Self {
+            schema_version: PERSISTED_STATE_VERSION,
+            active_thread_id: relay.active_thread_id.clone(),
+            active_controller_device_id: relay.active_controller_device_id.clone(),
+            active_controller_last_seen_at: relay.active_controller_last_seen_at,
+            current_status: relay.current_status.clone(),
+            active_flags: relay.active_flags.clone(),
+            current_cwd: relay.current_cwd.clone(),
+            model: relay.model.clone(),
+            approval_policy: relay.approval_policy.clone(),
+            sandbox: relay.sandbox.clone(),
+            reasoning_effort: relay.reasoning_effort.clone(),
+            transcript: relay.transcript.clone(),
+            logs: relay.logs.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PersistenceStore {
+    path: PathBuf,
+}
+
+impl PersistenceStore {
+    fn resolve(cwd: &Path) -> Self {
+        let path = std::env::var_os("RELAY_STATE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.join(DEFAULT_STATE_FILE));
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    async fn load(&self) -> Result<Option<PersistedRelayState>, String> {
+        let contents = match tokio::fs::read(&self.path).await {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!("failed to read persisted state file: {error}"));
+            }
+        };
+
+        let state: PersistedRelayState = serde_json::from_slice(&contents)
+            .map_err(|error| format!("failed to decode persisted state: {error}"))?;
+        if state.schema_version != PERSISTED_STATE_VERSION {
+            return Err(format!(
+                "unsupported persisted state version: {}",
+                state.schema_version
+            ));
+        }
+
+        Ok(Some(state))
+    }
+
+    async fn save(&self, state: &PersistedRelayState) -> Result<(), String> {
+        let Some(parent) = self.path.parent() else {
+            return Err("persisted state path must have a parent directory".to_string());
+        };
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("failed to create persisted state directory: {error}"))?;
+
+        let serialized = serde_json::to_vec_pretty(state)
+            .map_err(|error| format!("failed to encode persisted state: {error}"))?;
+        let temporary_path = self.path.with_extension("tmp");
+
+        tokio::fs::write(&temporary_path, serialized)
+            .await
+            .map_err(|error| format!("failed to write temporary persisted state file: {error}"))?;
+        tokio::fs::rename(&temporary_path, &self.path)
+            .await
+            .map_err(|error| format!("failed to replace persisted state file: {error}"))?;
+
+        Ok(())
+    }
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -866,9 +1096,60 @@ fn expire_controller_if_needed(relay: &mut RelayState) -> bool {
     true
 }
 
+fn spawn_persistence_task(
+    relay: Arc<RwLock<RelayState>>,
+    mut receiver: watch::Receiver<u64>,
+    persistence: PersistenceStore,
+) {
+    tokio::spawn(async move {
+        while receiver.changed().await.is_ok() {
+            let state = {
+                let relay = relay.read().await;
+                PersistedRelayState::from_relay(&relay)
+            };
+
+            if let Err(error) = persistence.save(&state).await {
+                warn!(
+                    "failed to persist relay state to {}: {}",
+                    persistence.path().display(),
+                    error
+                );
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_persisted_state() -> PersistedRelayState {
+        PersistedRelayState {
+            schema_version: PERSISTED_STATE_VERSION,
+            active_thread_id: Some("thread-1".to_string()),
+            active_controller_device_id: Some("device-a".to_string()),
+            active_controller_last_seen_at: Some(123),
+            current_status: "running".to_string(),
+            active_flags: vec!["busy".to_string()],
+            current_cwd: "/tmp/project".to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+            sandbox: DEFAULT_SANDBOX.to_string(),
+            reasoning_effort: DEFAULT_EFFORT.to_string(),
+            transcript: vec![TranscriptRecord {
+                item_id: "history-0".to_string(),
+                role: "assistant".to_string(),
+                text: "hello".to_string(),
+                status: "completed".to_string(),
+                turn_id: Some("turn-1".to_string()),
+            }],
+            logs: vec![LogEntryView {
+                kind: "info".to_string(),
+                message: "persisted".to_string(),
+                created_at: 1,
+            }],
+        }
+    }
 
     fn test_state() -> RelayState {
         let (change_tx, _) = watch::channel(0_u64);
@@ -1037,8 +1318,14 @@ mod tests {
         relay.active_controller_last_seen_at = Some(100);
 
         assert!(relay.refresh_controller_lease("device-a", 112));
-        assert_eq!(relay.controller_lease_expires_at(), Some(112 + CONTROLLER_LEASE_SECS));
-        assert_eq!(relay.expire_stale_controller(100 + CONTROLLER_LEASE_SECS), None);
+        assert_eq!(
+            relay.controller_lease_expires_at(),
+            Some(112 + CONTROLLER_LEASE_SECS)
+        );
+        assert_eq!(
+            relay.expire_stale_controller(100 + CONTROLLER_LEASE_SECS),
+            None
+        );
         assert_eq!(
             relay.active_controller_device_id.as_deref(),
             Some("device-a")
@@ -1081,5 +1368,113 @@ mod tests {
             require_device_id(Some("device-a".to_string())).unwrap(),
             "device-a"
         );
+    }
+
+    #[test]
+    fn persisted_state_round_trip_drops_ephemeral_fields() {
+        let mut relay = test_state();
+        relay.activate_thread(
+            test_thread("thread-1", "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "device-a",
+        );
+        relay.active_controller_last_seen_at = Some(99);
+        relay.active_turn_id = Some("turn-ephemeral".to_string());
+        relay.transcript.push(TranscriptRecord {
+            item_id: "history-0".to_string(),
+            role: "assistant".to_string(),
+            text: "hello".to_string(),
+            status: "completed".to_string(),
+            turn_id: Some("turn-1".to_string()),
+        });
+        relay
+            .pending_approvals
+            .insert("req-1".to_string(), test_pending_approval("thread-1"));
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let (change_tx, _) = watch::channel(0_u64);
+        let mut restored = RelayState::new("/tmp/other".to_string(), change_tx);
+        restored.apply_persisted(&persisted);
+
+        assert_eq!(restored.active_thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            restored.active_controller_device_id.as_deref(),
+            Some("device-a")
+        );
+        assert_eq!(restored.active_controller_last_seen_at, Some(99));
+        assert_eq!(restored.active_turn_id, None);
+        assert_eq!(restored.pending_approvals.len(), 0);
+        assert_eq!(restored.transcript.len(), 1);
+        assert_eq!(restored.logs.len(), persisted.logs.len());
+        assert_eq!(restored.logs[0].message, persisted.logs[0].message);
+    }
+
+    #[test]
+    fn restore_thread_data_keeps_persisted_controller_and_settings() {
+        let mut relay = test_state();
+        relay
+            .pending_approvals
+            .insert("req-1".to_string(), test_pending_approval("thread-1"));
+
+        let persisted = test_persisted_state();
+        relay.restore_thread_data(
+            ThreadSyncData {
+                thread: test_thread("thread-1", "/tmp/project"),
+                status: "running".to_string(),
+                active_flags: vec!["busy".to_string()],
+                transcript: vec![TranscriptEntryView {
+                    role: "user".to_string(),
+                    text: "ping".to_string(),
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-2".to_string()),
+                }],
+            },
+            &persisted,
+        );
+
+        assert_eq!(relay.active_thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            relay.active_controller_device_id.as_deref(),
+            Some("device-a")
+        );
+        assert_eq!(relay.active_controller_last_seen_at, Some(123));
+        assert_eq!(relay.model, DEFAULT_MODEL);
+        assert_eq!(relay.approval_policy, DEFAULT_APPROVAL_POLICY);
+        assert_eq!(relay.sandbox, DEFAULT_SANDBOX);
+        assert_eq!(relay.reasoning_effort, DEFAULT_EFFORT);
+        assert_eq!(relay.pending_approvals.len(), 0);
+        assert_eq!(relay.transcript.len(), 1);
+        assert_eq!(relay.transcript[0].text, "ping");
+    }
+
+    #[tokio::test]
+    async fn persistence_store_round_trips_to_disk() {
+        let unique = format!("agent-relay-test-{}-{}", std::process::id(), unix_now());
+        let directory = std::env::temp_dir().join(unique);
+        let path = directory.join("session.json");
+        let store = PersistenceStore { path: path.clone() };
+        let persisted = test_persisted_state();
+
+        store.save(&persisted).await.expect("state should save");
+        let loaded = store
+            .load()
+            .await
+            .expect("state should load")
+            .expect("state should exist");
+
+        assert_eq!(loaded.active_thread_id, persisted.active_thread_id);
+        assert_eq!(
+            loaded.active_controller_device_id,
+            persisted.active_controller_device_id
+        );
+        assert_eq!(loaded.transcript.len(), 1);
+
+        tokio::fs::remove_dir_all(&directory)
+            .await
+            .expect("temp persisted state directory should be removable");
     }
 }

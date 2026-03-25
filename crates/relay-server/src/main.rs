@@ -17,9 +17,9 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use protocol::{
-    ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, HealthResponse,
-    HeartbeatInput, ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput,
-    TakeOverInput, ThreadsQuery, ThreadsResponse,
+    ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, HealthResponse, HeartbeatInput,
+    ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
+    ThreadsQuery, ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{

@@ -118,7 +118,7 @@ pub struct TranscriptEntryView {
     pub turn_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntryView {
     pub kind: String,
     pub message: String,

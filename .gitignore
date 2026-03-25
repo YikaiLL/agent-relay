@@ -18,6 +18,7 @@
 
 # Local planning docs
 /markdown
+/.agent-relay
 
 # macOS
 .DS_Store
