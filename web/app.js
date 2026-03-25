@@ -1,6 +1,10 @@
 const DEVICE_STORAGE_KEY = "agent-relay.device-id";
+const CONTROL_HEARTBEAT_MS = 5000;
+const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
 
 const state = {
+  controllerHeartbeatTimer: null,
+  controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
   deviceId: loadOrCreateDeviceId(),
   defaultsSeeded: false,
@@ -116,6 +120,9 @@ async function loadSession(reason) {
     seedDefaults(payload.data);
     renderSession(payload.data);
   } catch (error) {
+    state.session = null;
+    cancelControllerHeartbeat();
+    cancelControllerLeaseRefresh();
     statusBadge.textContent = "Offline";
     statusBadge.className = "status-badge status-badge-offline";
     sessionMeta.innerHTML = `<span class="meta-empty">${escapeHtml(error.message)}</span>`;
@@ -362,7 +369,7 @@ function renderSession(session) {
   const approval = session.pending_approvals[0] || null;
   const activeThread = resolveActiveThread(session.active_thread_id);
   const hasActiveSession = Boolean(session.active_thread_id);
-  const hasControl = isCurrentDeviceActiveController(session);
+  const canWrite = canCurrentDeviceWrite(session);
   state.currentApprovalId = approval?.request_id || null;
 
   workspaceTitle.textContent = session.active_thread_id
@@ -388,12 +395,14 @@ function renderSession(session) {
   renderTranscript(session.transcript, approval);
   renderLogs(session.logs);
   renderThreads(state.threads);
+  scheduleControllerHeartbeat(session);
+  scheduleControllerLeaseRefresh(session);
 
-  sendButton.disabled = !hasActiveSession || !hasControl;
-  messageInput.disabled = !hasActiveSession || !hasControl;
+  sendButton.disabled = !hasActiveSession || !canWrite;
+  messageInput.disabled = !hasActiveSession || !canWrite;
   messageInput.placeholder = !hasActiveSession
     ? "Start or resume a session first."
-    : hasControl
+    : canWrite
       ? "Message Codex..."
       : "Another device has control. Take over to reply.";
 }
@@ -428,6 +437,13 @@ function renderControlBanner(session) {
   }
 
   controlBanner.hidden = false;
+
+  if (!session.active_controller_device_id) {
+    controlSummary.textContent = "No device currently has control";
+    controlHint.textContent = "The next device to send a message will claim control.";
+    takeOverButton.hidden = true;
+    return;
+  }
 
   if (isCurrentDeviceActiveController(session)) {
     controlSummary.textContent = "This device has control";
@@ -689,6 +705,87 @@ function scheduleThreadsPoll() {
   }, 12000);
 }
 
+function scheduleControllerHeartbeat(session) {
+  cancelControllerHeartbeat();
+
+  if (!session?.active_thread_id || !isCurrentDeviceActiveController(session)) {
+    return;
+  }
+
+  state.controllerHeartbeatTimer = window.setTimeout(() => {
+    void sendSessionHeartbeat();
+  }, CONTROL_HEARTBEAT_MS);
+}
+
+async function sendSessionHeartbeat() {
+  if (!state.session?.active_thread_id || !isCurrentDeviceActiveController(state.session)) {
+    return;
+  }
+
+  try {
+    const response = await fetch("/api/session/heartbeat", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        device_id: state.deviceId,
+      }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to refresh control lease");
+    }
+  } catch (error) {
+    logLine(`Control heartbeat failed: ${error.message}`);
+  } finally {
+    if (state.session?.active_thread_id && isCurrentDeviceActiveController(state.session)) {
+      scheduleControllerHeartbeat(state.session);
+    }
+  }
+}
+
+function cancelControllerHeartbeat() {
+  if (!state.controllerHeartbeatTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.controllerHeartbeatTimer);
+  state.controllerHeartbeatTimer = null;
+}
+
+function scheduleControllerLeaseRefresh(session) {
+  cancelControllerLeaseRefresh();
+
+  if (
+    !session?.active_thread_id ||
+    !session.active_controller_device_id ||
+    isCurrentDeviceActiveController(session) ||
+    !session.controller_lease_expires_at
+  ) {
+    return;
+  }
+
+  const delayMs = Math.max(
+    LEASE_EXPIRY_REFRESH_SKEW_MS,
+    session.controller_lease_expires_at * 1000 - Date.now() + LEASE_EXPIRY_REFRESH_SKEW_MS
+  );
+
+  state.controllerLeaseRefreshTimer = window.setTimeout(() => {
+    void loadSession("controller lease expiry");
+  }, delayMs);
+}
+
+function cancelControllerLeaseRefresh() {
+  if (!state.controllerLeaseRefreshTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.controllerLeaseRefreshTimer);
+  state.controllerLeaseRefreshTimer = null;
+}
+
 function connectSessionStream() {
   if (!("EventSource" in window)) {
     logLine("EventSource is unavailable. Falling back to polling.");
@@ -815,6 +912,14 @@ function roleLabel(role) {
 }
 
 function isCurrentDeviceActiveController(session) {
+  if (!session?.active_thread_id || !session.active_controller_device_id) {
+    return false;
+  }
+
+  return session.active_controller_device_id === state.deviceId;
+}
+
+function canCurrentDeviceWrite(session) {
   if (!session?.active_thread_id) {
     return false;
   }

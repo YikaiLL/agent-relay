@@ -51,6 +51,9 @@ pub struct SessionSnapshot {
     pub codex_connected: bool,
     pub active_thread_id: Option<String>,
     pub active_controller_device_id: Option<String>,
+    pub active_controller_last_seen_at: Option<u64>,
+    pub controller_lease_expires_at: Option<u64>,
+    pub controller_lease_seconds: u64,
     pub active_turn_id: Option<String>,
     pub current_status: String,
     pub active_flags: Vec<String>,
@@ -174,5 +177,10 @@ pub struct SendMessageInput {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TakeOverInput {
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeartbeatInput {
     pub device_id: Option<String>,
 }

@@ -18,8 +18,8 @@ use axum::{
 use futures_util::stream::{self, StreamExt};
 use protocol::{
     ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, HealthResponse,
-    ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
-    ThreadsQuery, ThreadsResponse,
+    HeartbeatInput, ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput,
+    TakeOverInput, ThreadsQuery, ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -49,6 +49,7 @@ async fn main() {
         .route("/api/threads", get(list_threads))
         .route("/api/session/start", post(start_session))
         .route("/api/session/resume", post(resume_session))
+        .route("/api/session/heartbeat", post(session_heartbeat))
         .route("/api/session/take-over", post(take_over_session))
         .route("/api/session/message", post(send_message))
         .route("/api/approvals/:request_id", post(decide_approval))
@@ -161,6 +162,17 @@ async fn send_message(
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
     state
         .send_message(input)
+        .await
+        .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
+        .map_err(bad_request)
+}
+
+async fn session_heartbeat(
+    State(state): State<AppState>,
+    Json(input): Json<HeartbeatInput>,
+) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
+    state
+        .heartbeat_session(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
         .map_err(bad_request)

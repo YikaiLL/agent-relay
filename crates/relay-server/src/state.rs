@@ -12,8 +12,9 @@ use crate::{
     codex::{CodexBridge, ThreadSyncData},
     protocol::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, ApprovalRequestView,
-        ApprovalScope, LogEntryView, ResumeSessionInput, SendMessageInput, SessionSnapshot,
-        StartSessionInput, TakeOverInput, ThreadSummaryView, ThreadsResponse, TranscriptEntryView,
+        ApprovalScope, HeartbeatInput, LogEntryView, ResumeSessionInput, SendMessageInput,
+        SessionSnapshot, StartSessionInput, TakeOverInput, ThreadSummaryView, ThreadsResponse,
+        TranscriptEntryView,
     },
 };
 
@@ -21,6 +22,7 @@ pub const DEFAULT_MODEL: &str = "gpt-5-codex";
 pub const DEFAULT_APPROVAL_POLICY: &str = "untrusted";
 pub const DEFAULT_SANDBOX: &str = "workspace-write";
 pub const DEFAULT_EFFORT: &str = "medium";
+pub const CONTROLLER_LEASE_SECS: u64 = 15;
 const MAX_LOG_LINES: usize = 200;
 const THREAD_SCAN_LIMIT: usize = 200;
 
@@ -49,7 +51,9 @@ impl AppState {
     }
 
     pub async fn snapshot(&self) -> SessionSnapshot {
-        self.relay.read().await.snapshot()
+        let mut relay = self.relay.write().await;
+        expire_controller_if_needed(&mut relay);
+        relay.snapshot()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -161,36 +165,24 @@ impl AppState {
 
     pub async fn send_message(&self, input: SendMessageInput) -> Result<SessionSnapshot, String> {
         let device_id = require_device_id(input.device_id)?;
+        self.expire_stale_controller_if_needed().await;
         let defaults = self.defaults().await;
         let text = non_empty(Some(input.text))
             .ok_or_else(|| "message text cannot be empty".to_string())?;
         let effort = non_empty(input.effort).unwrap_or(defaults.reasoning_effort);
         let thread_id = {
             let relay = self.relay.read().await;
-            let thread_id = relay
+            relay.ensure_device_can_send_message(&device_id)?;
+            relay
                 .active_thread_id
                 .clone()
-                .ok_or_else(|| "there is no active Codex thread to send to".to_string())?;
-
-            if let Some(active_controller_device_id) = relay.active_controller_device_id.as_deref()
-            {
-                if active_controller_device_id != device_id.as_str() {
-                    return Err(
-                        "another device currently has control. Take over on this device before sending a message."
-                            .to_string(),
-                    );
-                }
-            }
-
-            thread_id
+                .ok_or_else(|| "there is no active Codex thread to send to".to_string())?
         };
 
         let turn_id = self.codex.start_turn(&thread_id, &text, &effort).await?;
         {
             let mut relay = self.relay.write().await;
-            if relay.active_controller_device_id.is_none() {
-                relay.active_controller_device_id = Some(device_id.clone());
-            }
+            relay.assign_active_controller(&device_id, unix_now());
             relay.active_turn_id = turn_id;
             relay.reasoning_effort = effort.clone();
             relay.push_log(
@@ -203,9 +195,21 @@ impl AppState {
         Ok(self.snapshot().await)
     }
 
+    pub async fn heartbeat_session(
+        &self,
+        input: HeartbeatInput,
+    ) -> Result<SessionSnapshot, String> {
+        let device_id = require_device_id(input.device_id)?;
+        let mut relay = self.relay.write().await;
+        expire_controller_if_needed(&mut relay);
+        relay.refresh_controller_lease(&device_id, unix_now());
+        Ok(relay.snapshot())
+    }
+
     pub async fn take_over_control(&self, input: TakeOverInput) -> Result<SessionSnapshot, String> {
         let device_id = require_device_id(input.device_id)?;
         let mut relay = self.relay.write().await;
+        expire_controller_if_needed(&mut relay);
         if relay.active_thread_id.is_none() {
             return Err("there is no active session to take over".to_string());
         }
@@ -227,14 +231,19 @@ impl AppState {
         request_id: &str,
         input: ApprovalDecisionInput,
     ) -> Result<ApprovalReceipt, ApprovalError> {
-        let pending = self
-            .relay
-            .read()
-            .await
-            .pending_approvals
-            .get(request_id)
-            .cloned()
-            .ok_or(ApprovalError::NoPendingRequest)?;
+        let device_id =
+            require_device_id(input.device_id.clone()).map_err(ApprovalError::Bridge)?;
+        let pending = {
+            let relay = self.relay.read().await;
+            relay
+                .ensure_device_can_approve(&device_id)
+                .map_err(ApprovalError::Bridge)?;
+            relay
+                .pending_approvals
+                .get(request_id)
+                .cloned()
+                .ok_or(ApprovalError::NoPendingRequest)?
+        };
 
         self.codex
             .respond_to_approval(&pending, &input)
@@ -248,7 +257,7 @@ impl AppState {
             format!(
                 "Responded to approval {request_id} with {:?} from {}.",
                 input.decision,
-                short_device_id(input.device_id.as_deref().unwrap_or("unknown-device"))
+                short_device_id(&device_id)
             ),
         );
         relay.notify();
@@ -274,6 +283,11 @@ impl AppState {
             sandbox: relay.sandbox.clone(),
             reasoning_effort: relay.reasoning_effort.clone(),
         }
+    }
+
+    async fn expire_stale_controller_if_needed(&self) {
+        let mut relay = self.relay.write().await;
+        expire_controller_if_needed(&mut relay);
     }
 }
 
@@ -394,6 +408,7 @@ pub struct RelayState {
     pub codex_connected: bool,
     pub active_thread_id: Option<String>,
     pub active_controller_device_id: Option<String>,
+    pub active_controller_last_seen_at: Option<u64>,
     pub active_turn_id: Option<String>,
     pub current_status: String,
     pub active_flags: Vec<String>,
@@ -416,6 +431,7 @@ impl RelayState {
             codex_connected: false,
             active_thread_id: None,
             active_controller_device_id: None,
+            active_controller_last_seen_at: None,
             active_turn_id: None,
             current_status: "idle".to_string(),
             active_flags: Vec::new(),
@@ -445,6 +461,9 @@ impl RelayState {
             codex_connected: self.codex_connected,
             active_thread_id: self.active_thread_id.clone(),
             active_controller_device_id: self.active_controller_device_id.clone(),
+            active_controller_last_seen_at: self.active_controller_last_seen_at,
+            controller_lease_expires_at: self.controller_lease_expires_at(),
+            controller_lease_seconds: CONTROLLER_LEASE_SECS,
             active_turn_id: self.active_turn_id.clone(),
             current_status: self.current_status.clone(),
             active_flags: self.active_flags.clone(),
@@ -479,7 +498,7 @@ impl RelayState {
         device_id: &str,
     ) {
         self.active_thread_id = Some(thread.id.clone());
-        self.active_controller_device_id = Some(device_id.to_string());
+        self.assign_active_controller(device_id, unix_now());
         self.active_turn_id = None;
         self.current_status = thread.status.clone();
         self.active_flags.clear();
@@ -502,7 +521,7 @@ impl RelayState {
         device_id: &str,
     ) {
         self.active_thread_id = Some(data.thread.id.clone());
-        self.active_controller_device_id = Some(device_id.to_string());
+        self.assign_active_controller(device_id, unix_now());
         self.active_turn_id = None;
         self.current_status = data.status;
         self.active_flags = data.active_flags;
@@ -542,13 +561,88 @@ impl RelayState {
         self.active_turn_id = turn_id;
     }
 
-    pub fn set_active_controller(&mut self, device_id: &str) -> bool {
-        if self.active_controller_device_id.as_deref() == Some(device_id) {
+    pub fn can_device_send_message(&self, device_id: &str) -> bool {
+        if self.active_thread_id.is_none() {
             return false;
         }
 
-        self.active_controller_device_id = Some(device_id.to_string());
+        match self.active_controller_device_id.as_deref() {
+            Some(active_device_id) => active_device_id == device_id,
+            None => true,
+        }
+    }
+
+    pub fn ensure_device_can_send_message(&self, device_id: &str) -> Result<(), String> {
+        if self.active_thread_id.is_none() {
+            return Err("there is no active Codex thread to send to".to_string());
+        }
+
+        if self.can_device_send_message(device_id) {
+            Ok(())
+        } else {
+            Err("another device currently has control. Take over on this device before sending a message.".to_string())
+        }
+    }
+
+    pub fn can_device_approve(&self, _device_id: &str) -> bool {
+        self.active_thread_id.is_some()
+    }
+
+    pub fn ensure_device_can_approve(&self, device_id: &str) -> Result<(), String> {
+        if self.can_device_approve(device_id) {
+            Ok(())
+        } else {
+            Err("there is no active session to approve for".to_string())
+        }
+    }
+
+    pub fn set_active_controller(&mut self, device_id: &str) -> bool {
+        self.assign_active_controller(device_id, unix_now())
+    }
+
+    pub fn refresh_controller_lease(&mut self, device_id: &str, now: u64) -> bool {
+        if self.active_thread_id.is_none() {
+            return false;
+        }
+
+        if self.active_controller_device_id.as_deref() != Some(device_id) {
+            return false;
+        }
+
+        if self.active_controller_last_seen_at == Some(now) {
+            return false;
+        }
+
+        self.active_controller_last_seen_at = Some(now);
         true
+    }
+
+    pub fn controller_lease_expires_at(&self) -> Option<u64> {
+        self.active_controller_last_seen_at
+            .map(|last_seen| last_seen.saturating_add(CONTROLLER_LEASE_SECS))
+    }
+
+    pub fn expire_stale_controller(&mut self, now: u64) -> Option<String> {
+        if self.active_thread_id.is_none() {
+            self.active_controller_device_id = None;
+            self.active_controller_last_seen_at = None;
+            return None;
+        }
+
+        let active_device_id = self.active_controller_device_id.clone()?;
+        let Some(expires_at) = self.controller_lease_expires_at() else {
+            self.active_controller_device_id = None;
+            self.active_controller_last_seen_at = None;
+            return Some(active_device_id);
+        };
+
+        if now < expires_at {
+            return None;
+        }
+
+        self.active_controller_device_id = None;
+        self.active_controller_last_seen_at = None;
+        Some(active_device_id)
     }
 
     pub fn set_thread_status(
@@ -683,6 +777,14 @@ impl RelayState {
             turn_id: Some(turn_id),
         });
     }
+
+    fn assign_active_controller(&mut self, device_id: &str, now: u64) -> bool {
+        let changed = self.active_controller_device_id.as_deref() != Some(device_id)
+            || self.active_controller_last_seen_at != Some(now);
+        self.active_controller_device_id = Some(device_id.to_string());
+        self.active_controller_last_seen_at = Some(now);
+        changed
+    }
 }
 
 #[derive(Clone)]
@@ -746,4 +848,238 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn expire_controller_if_needed(relay: &mut RelayState) -> bool {
+    let Some(expired_device_id) = relay.expire_stale_controller(unix_now()) else {
+        return false;
+    };
+
+    relay.push_log(
+        "info",
+        format!(
+            "Control lease expired for {}. Session is now unclaimed.",
+            short_device_id(&expired_device_id)
+        ),
+    );
+    relay.notify();
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> RelayState {
+        let (change_tx, _) = watch::channel(0_u64);
+        RelayState::new("/tmp/project".to_string(), change_tx)
+    }
+
+    fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
+        ThreadSummaryView {
+            id: id.to_string(),
+            name: Some("Test Thread".to_string()),
+            preview: "Test preview".to_string(),
+            cwd: cwd.to_string(),
+            updated_at: 1,
+            source: "codex".to_string(),
+            status: "idle".to_string(),
+            model_provider: "openai".to_string(),
+        }
+    }
+
+    fn test_pending_approval(thread_id: &str) -> PendingApproval {
+        PendingApproval {
+            request_id: "req-1".to_string(),
+            raw_request_id: json!(1),
+            kind: ApprovalKind::Command,
+            thread_id: thread_id.to_string(),
+            summary: "Need approval".to_string(),
+            detail: Some("Test command".to_string()),
+            command: Some("ls".to_string()),
+            cwd: Some("/tmp/project".to_string()),
+            requested_permissions: None,
+            available_decisions: vec!["approve".to_string(), "deny".to_string()],
+            supports_session_scope: true,
+        }
+    }
+
+    #[test]
+    fn activate_thread_sets_active_controller_on_start() {
+        let mut relay = test_state();
+
+        relay.activate_thread(
+            test_thread("thread-1", "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "device-a",
+        );
+
+        assert_eq!(relay.active_thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            relay.active_controller_device_id.as_deref(),
+            Some("device-a")
+        );
+        assert!(relay.can_device_send_message("device-a"));
+        assert!(!relay.can_device_send_message("device-b"));
+    }
+
+    #[test]
+    fn passive_device_cannot_send_message_until_takeover() {
+        let mut relay = test_state();
+        relay.activate_thread(
+            test_thread("thread-1", "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "device-a",
+        );
+
+        let error = relay
+            .ensure_device_can_send_message("device-b")
+            .expect_err("passive device should be blocked from sending");
+
+        assert!(error.contains("another device currently has control"));
+
+        assert!(relay.set_active_controller("device-b"));
+        assert_eq!(
+            relay.active_controller_device_id.as_deref(),
+            Some("device-b")
+        );
+        assert!(relay.ensure_device_can_send_message("device-b").is_ok());
+    }
+
+    #[test]
+    fn approval_is_allowed_from_passive_owner_device() {
+        let mut relay = test_state();
+        relay.activate_thread(
+            test_thread("thread-1", "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "device-a",
+        );
+        relay
+            .pending_approvals
+            .insert("req-1".to_string(), test_pending_approval("thread-1"));
+
+        assert!(relay.can_device_approve("device-a"));
+        assert!(relay.can_device_approve("device-b"));
+        assert!(relay.ensure_device_can_approve("device-b").is_ok());
+        assert!(!relay.can_device_send_message("device-b"));
+    }
+
+    #[test]
+    fn load_thread_data_sets_active_controller_on_resume() {
+        let mut relay = test_state();
+        relay.load_thread_data(
+            ThreadSyncData {
+                thread: test_thread("thread-9", "/tmp/project"),
+                status: "running".to_string(),
+                active_flags: vec!["busy".to_string()],
+                transcript: Vec::new(),
+            },
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "phone-device",
+        );
+
+        assert_eq!(relay.active_thread_id.as_deref(), Some("thread-9"));
+        assert_eq!(
+            relay.active_controller_device_id.as_deref(),
+            Some("phone-device")
+        );
+        assert_eq!(relay.current_status, "running");
+    }
+
+    #[test]
+    fn stale_controller_lease_expires_and_releases_session() {
+        let mut relay = test_state();
+        relay.activate_thread(
+            test_thread("thread-1", "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "device-a",
+        );
+        relay.active_controller_last_seen_at = Some(100);
+
+        let expired = relay.expire_stale_controller(100 + CONTROLLER_LEASE_SECS);
+
+        assert_eq!(expired.as_deref(), Some("device-a"));
+        assert_eq!(relay.active_controller_device_id, None);
+        assert_eq!(relay.active_controller_last_seen_at, None);
+        assert!(relay.can_device_send_message("device-b"));
+    }
+
+    #[test]
+    fn active_controller_heartbeat_extends_lease() {
+        let mut relay = test_state();
+        relay.activate_thread(
+            test_thread("thread-1", "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "device-a",
+        );
+        relay.active_controller_last_seen_at = Some(100);
+
+        assert!(relay.refresh_controller_lease("device-a", 112));
+        assert_eq!(relay.controller_lease_expires_at(), Some(112 + CONTROLLER_LEASE_SECS));
+        assert_eq!(relay.expire_stale_controller(100 + CONTROLLER_LEASE_SECS), None);
+        assert_eq!(
+            relay.active_controller_device_id.as_deref(),
+            Some("device-a")
+        );
+    }
+
+    #[test]
+    fn passive_device_cannot_refresh_another_devices_lease() {
+        let mut relay = test_state();
+        relay.activate_thread(
+            test_thread("thread-1", "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            "device-a",
+        );
+        relay.active_controller_last_seen_at = Some(100);
+
+        assert!(!relay.refresh_controller_lease("device-b", 112));
+        assert_eq!(relay.active_controller_last_seen_at, Some(100));
+        assert_eq!(
+            relay.active_controller_device_id.as_deref(),
+            Some("device-a")
+        );
+    }
+
+    #[test]
+    fn require_device_id_rejects_empty_values() {
+        assert_eq!(
+            require_device_id(Some("   ".to_string())).unwrap_err(),
+            "device_id is required"
+        );
+        assert_eq!(
+            require_device_id(None).unwrap_err(),
+            "device_id is required"
+        );
+        assert_eq!(
+            require_device_id(Some("device-a".to_string())).unwrap(),
+            "device-a"
+        );
+    }
 }
