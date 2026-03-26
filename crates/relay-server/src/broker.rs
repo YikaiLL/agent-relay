@@ -15,6 +15,7 @@ use crate::{
     protocol::{
         ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput, PairedDeviceView,
         ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
+        ThreadsQuery, ThreadsResponse,
     },
     state::{AppState, ApprovalError},
 };
@@ -62,6 +63,9 @@ enum RemoteActionRequest {
     Heartbeat {
         input: HeartbeatInput,
     },
+    ListThreads {
+        query: ThreadsQuery,
+    },
     DecideApproval {
         request_id: String,
         input: ApprovalDecisionInput,
@@ -76,6 +80,7 @@ impl RemoteActionRequest {
             Self::SendMessage { .. } => RemoteActionKind::SendMessage,
             Self::TakeOver { .. } => RemoteActionKind::TakeOver,
             Self::Heartbeat { .. } => RemoteActionKind::Heartbeat,
+            Self::ListThreads { .. } => RemoteActionKind::ListThreads,
             Self::DecideApproval { .. } => RemoteActionKind::DecideApproval,
         }
     }
@@ -102,6 +107,7 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::Heartbeat { input }
             }
+            Self::ListThreads { query } => Self::ListThreads { query },
             Self::DecideApproval {
                 request_id,
                 mut input,
@@ -121,6 +127,7 @@ enum RemoteActionKind {
     SendMessage,
     TakeOver,
     Heartbeat,
+    ListThreads,
     DecideApproval,
 }
 
@@ -132,6 +139,7 @@ impl RemoteActionKind {
             Self::SendMessage => "send_message",
             Self::TakeOver => "take_over",
             Self::Heartbeat => "heartbeat",
+            Self::ListThreads => "list_threads",
             Self::DecideApproval => "decide_approval",
         }
     }
@@ -169,6 +177,7 @@ enum OutboundBrokerPayload {
         ok: bool,
         snapshot: SessionSnapshot,
         receipt: Option<ApprovalReceipt>,
+        threads: Option<ThreadsResponse>,
         error: Option<String>,
     },
     EncryptedSessionSnapshot {
@@ -203,7 +212,14 @@ struct RemoteActionResultPlaintext {
     ok: bool,
     snapshot: SessionSnapshot,
     receipt: Option<ApprovalReceipt>,
+    threads: Option<ThreadsResponse>,
     error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteActionOutcome {
+    receipt: Option<ApprovalReceipt>,
+    threads: Option<ThreadsResponse>,
 }
 
 impl BrokerConfig {
@@ -568,8 +584,8 @@ async fn handle_remote_action(
     };
     let snapshot = state.snapshot().await;
 
-    let (ok, receipt, error) = match result {
-        Ok(receipt) => (true, receipt, None),
+    let (ok, receipt, threads, error) = match result {
+        Ok(outcome) => (true, outcome.receipt, outcome.threads, None),
         Err(error) => {
             state
                 .push_runtime_log(
@@ -581,7 +597,7 @@ async fn handle_remote_action(
                     ),
                 )
                 .await;
-            (false, None, Some(error))
+            (false, None, None, Some(error))
         }
     };
 
@@ -595,6 +611,7 @@ async fn handle_remote_action(
                 ok,
                 snapshot,
                 receipt,
+                threads,
                 error,
             },
         )
@@ -610,6 +627,7 @@ async fn handle_remote_action(
             action_kind,
             snapshot,
             receipt,
+            threads,
             error,
             ok,
         )
@@ -647,8 +665,8 @@ async fn handle_encrypted_remote_action(
         Err(error) => Err(error),
     };
     let snapshot = state.snapshot().await;
-    let (ok, receipt, error) = match result {
-        Ok(receipt) => (true, receipt, None),
+    let (ok, receipt, threads, error) = match result {
+        Ok(outcome) => (true, outcome.receipt, outcome.threads, None),
         Err(error) => {
             state
                 .push_runtime_log(
@@ -660,7 +678,7 @@ async fn handle_encrypted_remote_action(
                     ),
                 )
                 .await;
-            (false, None, Some(error))
+            (false, None, None, Some(error))
         }
     };
 
@@ -673,6 +691,7 @@ async fn handle_encrypted_remote_action(
         action_kind,
         snapshot,
         receipt,
+        threads,
         error,
         ok,
     )
@@ -682,25 +701,42 @@ async fn handle_encrypted_remote_action(
 async fn execute_remote_action(
     state: &AppState,
     request: RemoteActionRequest,
-) -> Result<Option<ApprovalReceipt>, String> {
+) -> Result<RemoteActionOutcome, String> {
     match request {
-        RemoteActionRequest::StartSession { input } => {
-            state.start_session(input).await.map(|_| None)
-        }
-        RemoteActionRequest::ResumeSession { input } => {
-            state.resume_session(input).await.map(|_| None)
-        }
-        RemoteActionRequest::SendMessage { input } => state.send_message(input).await.map(|_| None),
-        RemoteActionRequest::TakeOver { input } => {
-            state.take_over_control(input).await.map(|_| None)
-        }
-        RemoteActionRequest::Heartbeat { input } => {
-            state.heartbeat_session(input).await.map(|_| None)
-        }
+        RemoteActionRequest::StartSession { input } => state
+            .start_session(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::ResumeSession { input } => state
+            .resume_session(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::SendMessage { input } => state
+            .send_message(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::TakeOver { input } => state
+            .take_over_control(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::Heartbeat { input } => state
+            .heartbeat_session(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::ListThreads { query } => state
+            .list_threads(query.limit.unwrap_or(80).clamp(1, 200), query.cwd)
+            .await
+            .map(|threads| RemoteActionOutcome {
+                receipt: None,
+                threads: Some(threads),
+            }),
         RemoteActionRequest::DecideApproval { request_id, input } => state
             .decide_approval(&request_id, input)
             .await
-            .map(Some)
+            .map(|receipt| RemoteActionOutcome {
+                receipt: Some(receipt),
+                threads: None,
+            })
             .map_err(approval_error_message),
     }
 }
@@ -732,6 +768,7 @@ async fn publish_remote_action_result_private(
     action: RemoteActionKind,
     snapshot: SessionSnapshot,
     receipt: Option<ApprovalReceipt>,
+    threads: Option<ThreadsResponse>,
     error: Option<String>,
     ok: bool,
 ) -> Result<(), String> {
@@ -743,6 +780,7 @@ async fn publish_remote_action_result_private(
             ok,
             snapshot,
             receipt,
+            threads,
             error,
         },
     )?;
@@ -917,6 +955,41 @@ mod tests {
                 assert_eq!(auth.device_id, "phone-1");
                 assert_eq!(auth.device_token, "token-1");
                 assert_eq!(input.text, "hello");
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_inbound_payload_parses_list_threads_requests() {
+        let payload = serde_json::json!({
+            "kind": "remote_action",
+            "action_id": "act-threads",
+            "auth": {
+                "device_id": "phone-1",
+                "device_token": "token-1"
+            },
+            "request": {
+                "type": "list_threads",
+                "query": {
+                    "cwd": "/tmp/project",
+                    "limit": 40
+                }
+            }
+        });
+
+        let action = parse_inbound_payload(payload)
+            .expect("payload should parse")
+            .expect("payload should be handled");
+        match action {
+            InboundBrokerPayload::RemoteAction {
+                action_id,
+                request: RemoteActionRequest::ListThreads { query },
+                ..
+            } => {
+                assert_eq!(action_id, "act-threads");
+                assert_eq!(query.cwd.as_deref(), Some("/tmp/project"));
+                assert_eq!(query.limit, Some(40));
             }
             other => panic!("unexpected request: {other:?}"),
         }

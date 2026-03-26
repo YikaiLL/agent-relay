@@ -17,6 +17,7 @@ const state = {
   socketConnected: false,
   socketReconnectTimer: null,
   surfacePeerId: loadOrCreateSurfacePeerId(),
+  threads: [],
 };
 
 const pairingForm = document.querySelector("#pairing-form");
@@ -33,6 +34,10 @@ const remoteModelInput = document.querySelector("#remote-model-input");
 const remoteApprovalPolicyInput = document.querySelector("#remote-approval-policy-input");
 const remoteSandboxInput = document.querySelector("#remote-sandbox-input");
 const remoteStartEffortInput = document.querySelector("#remote-start-effort");
+const remoteThreadsRefreshButton = document.querySelector("#remote-threads-refresh-button");
+const remoteThreadsCount = document.querySelector("#remote-threads-count");
+const remoteThreadsCwdInput = document.querySelector("#remote-threads-cwd-input");
+const remoteThreadsList = document.querySelector("#remote-threads-list");
 const deviceMeta = document.querySelector("#device-meta");
 const remoteWorkspaceTitle = document.querySelector("#remote-workspace-title");
 const remoteWorkspaceSubtitle = document.querySelector("#remote-workspace-subtitle");
@@ -64,6 +69,10 @@ remoteSessionToggle.addEventListener("click", () => {
 
 remoteStartSessionButton.addEventListener("click", () => {
   void startRemoteSession();
+});
+
+remoteThreadsRefreshButton.addEventListener("click", () => {
+  void refreshRemoteThreads("manual refresh");
 });
 
 remoteTakeOverButton.addEventListener("click", () => {
@@ -99,6 +108,7 @@ async function boot() {
   applyPairingQuery();
   renderDeviceMeta();
   renderEmptyState();
+  renderThreads([]);
 
   if (state.remoteAuth || state.pairingTicket) {
     connectBroker("initial boot");
@@ -131,9 +141,11 @@ async function beginPairing(rawValue) {
   try {
     state.pairingTicket = parsePairingPayload(raw);
     state.remoteAuth = null;
+    state.threads = [];
     saveRemoteAuth(null);
     saveDeviceLabel(deviceLabelInput.value);
     renderDeviceMeta();
+    renderThreads([]);
     connectBroker("pairing request");
   } catch (error) {
     logLine(`Pairing input is invalid: ${error.message}`);
@@ -393,6 +405,11 @@ function handleRemoteActionResult(result) {
     renderSession(result.snapshot);
   }
 
+  if (result.threads?.threads) {
+    state.threads = result.threads.threads;
+    renderThreads(state.threads);
+  }
+
   if (result.ok) {
     if (result.receipt?.message) {
       logLine(result.receipt.message);
@@ -413,6 +430,7 @@ async function syncRemoteSnapshot() {
   await sendRemoteAction("heartbeat", {
     input: {},
   });
+  await refreshRemoteThreads("snapshot sync");
 }
 
 async function startRemoteSession() {
@@ -438,10 +456,59 @@ async function startRemoteSession() {
       },
     });
     setRemoteSessionPanelOpen(false);
+    await refreshRemoteThreads("post-start refresh");
   } catch (error) {
     logLine(`Remote start failed: ${error.message}`);
   } finally {
     remoteStartSessionButton.disabled = false;
+  }
+}
+
+async function refreshRemoteThreads(reason) {
+  if (!state.remoteAuth) {
+    renderThreads([]);
+    return;
+  }
+
+  remoteThreadsRefreshButton.disabled = true;
+  remoteThreadsCount.textContent = "Loading...";
+  logLine(`Fetching remote thread list (${reason}).`);
+
+  try {
+    await sendRemoteAction("list_threads", {
+      query: {
+        cwd: remoteThreadsCwdInput.value.trim() || null,
+        limit: 80,
+      },
+    });
+  } catch (error) {
+    remoteThreadsCount.textContent = "Error";
+    remoteThreadsList.innerHTML = `<p class="sidebar-empty">${escapeHtml(error.message)}</p>`;
+    logLine(`Remote thread refresh failed: ${error.message}`);
+  } finally {
+    remoteThreadsRefreshButton.disabled = false;
+  }
+}
+
+async function resumeRemoteSession(threadId) {
+  if (!threadId) {
+    return;
+  }
+
+  logLine(`Resuming remote thread ${threadId}.`);
+
+  try {
+    await sendRemoteAction("resume_session", {
+      input: {
+        thread_id: threadId,
+        approval_policy: remoteApprovalPolicyInput.value,
+        sandbox: remoteSandboxInput.value,
+        effort: remoteStartEffortInput.value,
+      },
+    });
+    await refreshRemoteThreads("post-resume refresh");
+  } catch (error) {
+    logLine(`Remote resume failed: ${error.message}`);
   }
 }
 
@@ -556,6 +623,10 @@ function renderSession(session) {
   const canWrite = canCurrentDeviceWrite(session);
   state.currentApprovalId = approval?.request_id || null;
 
+  if (session.current_cwd && !remoteThreadsCwdInput.value.trim()) {
+    remoteThreadsCwdInput.value = session.current_cwd;
+  }
+
   remoteWorkspaceTitle.textContent = hasActiveSession
     ? shortId(session.active_thread_id)
     : "Remote surface ready";
@@ -578,6 +649,7 @@ function renderSession(session) {
   renderControlBanner(session);
   renderTranscript(session.transcript || [], approval);
   renderLogs(session.logs || []);
+  renderThreads(state.threads);
   scheduleControllerHeartbeat(session);
   scheduleControllerLeaseRefresh(session);
 
@@ -588,6 +660,47 @@ function renderSession(session) {
     : canWrite
       ? "Message Codex remotely..."
       : "Another device has control. Take over to reply.";
+}
+
+function renderThreads(threads) {
+  const filterValue = remoteThreadsCwdInput.value.trim();
+  const activeThreadId = state.session?.active_thread_id || null;
+
+  if (!state.remoteAuth) {
+    remoteThreadsCount.textContent = "Remote session history";
+    remoteThreadsList.innerHTML = `<p class="sidebar-empty">Pair a device, then refresh remote history.</p>`;
+    return;
+  }
+
+  remoteThreadsCount.textContent = `${threads.length} ${threads.length === 1 ? "session" : "sessions"}`;
+
+  if (!threads.length) {
+    remoteThreadsList.innerHTML = filterValue
+      ? `<p class="sidebar-empty">No remote sessions found for this workspace filter.</p>`
+      : `<p class="sidebar-empty">No remote sessions found yet.</p>`;
+    return;
+  }
+
+  remoteThreadsList.innerHTML = threads
+    .map((thread) => {
+      const title = thread.name || thread.preview || shortId(thread.id);
+      const activeClass = activeThreadId === thread.id ? " is-active" : "";
+
+      return `
+        <button class="conversation-item${activeClass}" type="button" data-thread-id="${escapeHtml(thread.id)}">
+          <span class="conversation-title">${escapeHtml(title)}</span>
+          <span class="conversation-preview">${escapeHtml(thread.preview || "No preview yet.")}</span>
+          <span class="conversation-meta">${escapeHtml(formatTimestamp(thread.updated_at))}</span>
+        </button>
+      `;
+    })
+    .join("");
+
+  remoteThreadsList.querySelectorAll("[data-thread-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      void resumeRemoteSession(button.dataset.threadId);
+    });
+  });
 }
 
 function renderSessionMeta(session) {
@@ -794,12 +907,14 @@ function forgetCurrentDevice() {
   state.remoteAuth = null;
   state.session = null;
   state.currentApprovalId = null;
+  state.threads = [];
   saveRemoteAuth(null);
   clearPairingQueryFromUrl();
   cancelControllerHeartbeat();
   cancelControllerLeaseRefresh();
   closeBrokerSocket();
   renderDeviceMeta();
+  renderThreads([]);
   renderEmptyState();
   remoteSessionMeta.innerHTML = `<span class="meta-empty">Pair a remote device to start streaming session details.</span>`;
   remoteControlBanner.hidden = true;

@@ -92,6 +92,25 @@
             </div>
           </details>
         </section>
+
+        <section class="remote-access-shell remote-history-shell">
+          <div class="sidebar-row">
+            <div>
+              <p id="remote-threads-count" class="sidebar-caption">Remote session history</p>
+              <p class="sidebar-hint">Refresh over broker and resume a previous thread from this browser.</p>
+            </div>
+            <button id="remote-threads-refresh-button" class="sidebar-link-button" type="button">
+              Refresh
+            </button>
+          </div>
+          <label class="sidebar-label" for="remote-threads-cwd-input">Workspace Filter</label>
+          <div class="workspace-picker">
+            <input id="remote-threads-cwd-input" type="text" placeholder="Optional cwd filter">
+          </div>
+          <div id="remote-threads-list" class="conversation-list">
+            <p class="sidebar-empty">Pair a device, then refresh remote history.</p>
+          </div>
+        </section>
       </aside>
 
       <main class="chat-shell">
