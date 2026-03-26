@@ -1,6 +1,7 @@
 mod app;
 mod persistence;
 mod relay;
+mod security;
 #[cfg(test)]
 mod tests;
 
@@ -12,6 +13,7 @@ use std::{
 pub use self::app::{AppState, ApprovalError};
 use self::relay::TranscriptRecord;
 pub(crate) use self::relay::{ApprovalKind, PendingApproval, RelayState};
+pub(crate) use self::security::SecurityProfile;
 
 use crate::protocol::ThreadSummaryView;
 

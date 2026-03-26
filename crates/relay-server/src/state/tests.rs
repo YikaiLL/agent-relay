@@ -41,7 +41,11 @@ fn test_persisted_state() -> PersistedRelayState {
 
 fn test_state() -> RelayState {
     let (change_tx, _) = watch::channel(0_u64);
-    RelayState::new("/tmp/project".to_string(), change_tx)
+    RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )
 }
 
 fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
@@ -94,6 +98,20 @@ fn activate_thread_sets_active_controller_on_start() {
     );
     assert!(relay.can_device_send_message("device-a"));
     assert!(!relay.can_device_send_message("device-b"));
+}
+
+#[test]
+fn snapshot_exposes_private_security_mode_defaults() {
+    let relay = test_state();
+    let snapshot = relay.snapshot();
+
+    assert_eq!(
+        snapshot.security_mode,
+        crate::protocol::SecurityMode::Private
+    );
+    assert!(snapshot.e2ee_enabled);
+    assert!(!snapshot.broker_can_read_content);
+    assert!(!snapshot.audit_enabled);
 }
 
 #[test]
@@ -285,7 +303,11 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
 
     let persisted = PersistedRelayState::from_relay(&relay);
     let (change_tx, _) = watch::channel(0_u64);
-    let mut restored = RelayState::new("/tmp/other".to_string(), change_tx);
+    let mut restored = RelayState::new(
+        "/tmp/other".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
     restored.apply_persisted(&persisted);
 
     assert_eq!(restored.active_thread_id.as_deref(), Some("thread-1"));

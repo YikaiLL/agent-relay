@@ -1,130 +1,27 @@
+mod approval;
+mod transcript;
+
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use tokio::sync::watch;
 
 use crate::{
     codex::ThreadSyncData,
-    protocol::{
-        ApprovalDecision, ApprovalDecisionInput, ApprovalRequestView, ApprovalScope, LogEntryView,
-        SessionSnapshot, ThreadSummaryView, TranscriptEntryView,
-    },
+    protocol::{LogEntryView, SessionSnapshot, ThreadSummaryView},
 };
 
 use super::{
-    persistence::PersistedRelayState, unix_now, CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY,
-    DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX, MAX_LOG_LINES,
+    persistence::PersistedRelayState, unix_now, SecurityProfile, CONTROLLER_LEASE_SECS,
+    DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
 };
 
-#[derive(Clone, Debug)]
-pub struct PendingApproval {
-    pub request_id: String,
-    pub raw_request_id: Value,
-    pub kind: ApprovalKind,
-    pub thread_id: String,
-    pub summary: String,
-    pub detail: Option<String>,
-    pub command: Option<String>,
-    pub cwd: Option<String>,
-    pub requested_permissions: Option<Value>,
-    pub available_decisions: Vec<String>,
-    pub supports_session_scope: bool,
-}
-
-impl PendingApproval {
-    pub fn to_view(&self) -> ApprovalRequestView {
-        ApprovalRequestView {
-            request_id: self.request_id.clone(),
-            kind: self.kind.as_str().to_string(),
-            summary: self.summary.clone(),
-            detail: self.detail.clone(),
-            command: self.command.clone(),
-            cwd: self.cwd.clone(),
-            requested_permissions: self.requested_permissions.clone(),
-            available_decisions: self.available_decisions.clone(),
-            supports_session_scope: self.supports_session_scope,
-        }
-    }
-
-    pub fn decision_payload(&self, input: &ApprovalDecisionInput) -> Value {
-        match self.kind {
-            ApprovalKind::Command => json!({
-                "decision": match (input.decision, input.scope.unwrap_or(ApprovalScope::Once)) {
-                    (ApprovalDecision::Approve, ApprovalScope::Session) => "acceptForSession",
-                    (ApprovalDecision::Approve, ApprovalScope::Once) => "accept",
-                    (ApprovalDecision::Deny, _) => "decline",
-                    (ApprovalDecision::Cancel, _) => "cancel",
-                }
-            }),
-            ApprovalKind::FileChange => json!({
-                "decision": match (input.decision, input.scope.unwrap_or(ApprovalScope::Once)) {
-                    (ApprovalDecision::Approve, ApprovalScope::Session) => "acceptForSession",
-                    (ApprovalDecision::Approve, ApprovalScope::Once) => "accept",
-                    (ApprovalDecision::Deny, _) => "decline",
-                    (ApprovalDecision::Cancel, _) => "cancel",
-                }
-            }),
-            ApprovalKind::Permissions => {
-                if matches!(input.decision, ApprovalDecision::Approve) {
-                    json!({
-                        "permissions": self.requested_permissions.clone().unwrap_or_else(|| json!({})),
-                        "scope": match input.scope.unwrap_or(ApprovalScope::Once) {
-                            ApprovalScope::Once => "turn",
-                            ApprovalScope::Session => "session",
-                        }
-                    })
-                } else {
-                    json!({
-                        "permissions": {},
-                        "scope": "turn"
-                    })
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ApprovalKind {
-    Command,
-    FileChange,
-    Permissions,
-}
-
-impl ApprovalKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            ApprovalKind::Command => "command_execution",
-            ApprovalKind::FileChange => "file_change",
-            ApprovalKind::Permissions => "permissions",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct TranscriptRecord {
-    pub(super) item_id: String,
-    pub(super) role: String,
-    pub(super) text: String,
-    pub(super) status: String,
-    pub(super) turn_id: Option<String>,
-}
-
-impl TranscriptRecord {
-    fn to_view(&self) -> TranscriptEntryView {
-        TranscriptEntryView {
-            role: self.role.clone(),
-            text: self.text.clone(),
-            status: self.status.clone(),
-            turn_id: self.turn_id.clone(),
-        }
-    }
-}
+pub use self::approval::{ApprovalKind, PendingApproval};
+pub(crate) use self::transcript::TranscriptRecord;
 
 pub struct RelayState {
     change_tx: watch::Sender<u64>,
     revision: u64,
+    security: SecurityProfile,
     pub codex_connected: bool,
     pub active_thread_id: Option<String>,
     pub active_controller_device_id: Option<String>,
@@ -144,10 +41,15 @@ pub struct RelayState {
 }
 
 impl RelayState {
-    pub fn new(current_cwd: String, change_tx: watch::Sender<u64>) -> Self {
+    pub fn new(
+        current_cwd: String,
+        change_tx: watch::Sender<u64>,
+        security: SecurityProfile,
+    ) -> Self {
         let mut state = Self {
             change_tx,
             revision: 0,
+            security,
             codex_connected: false,
             active_thread_id: None,
             active_controller_device_id: None,
@@ -179,6 +81,10 @@ impl RelayState {
             provider: "codex",
             service_ready: true,
             codex_connected: self.codex_connected,
+            security_mode: self.security.mode(),
+            e2ee_enabled: self.security.e2ee_enabled(),
+            broker_can_read_content: self.security.broker_can_read_content(),
+            audit_enabled: self.security.audit_enabled(),
             active_thread_id: self.active_thread_id.clone(),
             active_controller_device_id: self.active_controller_device_id.clone(),
             active_controller_last_seen_at: self.active_controller_last_seen_at,
@@ -411,123 +317,6 @@ impl RelayState {
         if let Some(thread) = self.threads.iter_mut().find(|item| item.id == thread_id) {
             thread.status = status;
         }
-    }
-
-    pub fn push_log(&mut self, kind: &str, message: impl Into<String>) {
-        self.logs.insert(
-            0,
-            LogEntryView {
-                kind: kind.to_string(),
-                message: message.into(),
-                created_at: unix_now(),
-            },
-        );
-        if self.logs.len() > MAX_LOG_LINES {
-            self.logs.truncate(MAX_LOG_LINES);
-        }
-    }
-
-    pub fn start_agent_message(&mut self, item_id: String, turn_id: String) {
-        self.transcript.push(TranscriptRecord {
-            item_id,
-            role: "assistant".to_string(),
-            text: String::new(),
-            status: "streaming".to_string(),
-            turn_id: Some(turn_id),
-        });
-    }
-
-    pub fn append_agent_delta(&mut self, item_id: &str, delta: &str, turn_id: &str) {
-        if let Some(entry) = self
-            .transcript
-            .iter_mut()
-            .find(|entry| entry.item_id == item_id)
-        {
-            entry.text.push_str(delta);
-            entry.status = "streaming".to_string();
-            return;
-        }
-
-        self.transcript.push(TranscriptRecord {
-            item_id: item_id.to_string(),
-            role: "assistant".to_string(),
-            text: delta.to_string(),
-            status: "streaming".to_string(),
-            turn_id: Some(turn_id.to_string()),
-        });
-    }
-
-    pub fn upsert_user_message(&mut self, item_id: String, text: String, turn_id: String) {
-        if let Some(entry) = self
-            .transcript
-            .iter_mut()
-            .find(|entry| entry.item_id == item_id)
-        {
-            entry.text = text;
-            entry.status = "completed".to_string();
-            return;
-        }
-
-        self.transcript.push(TranscriptRecord {
-            item_id,
-            role: "user".to_string(),
-            text,
-            status: "completed".to_string(),
-            turn_id: Some(turn_id),
-        });
-    }
-
-    pub fn complete_agent_message(&mut self, item_id: String, text: String, turn_id: String) {
-        if let Some(entry) = self
-            .transcript
-            .iter_mut()
-            .find(|entry| entry.item_id == item_id)
-        {
-            entry.text = text;
-            entry.status = "completed".to_string();
-            return;
-        }
-
-        self.transcript.push(TranscriptRecord {
-            item_id,
-            role: "assistant".to_string(),
-            text,
-            status: "completed".to_string(),
-            turn_id: Some(turn_id),
-        });
-    }
-
-    pub fn add_command_result(
-        &mut self,
-        item_id: String,
-        command: String,
-        output: Option<String>,
-        status: String,
-        turn_id: String,
-    ) {
-        let mut text = command;
-        if let Some(output) = super::non_empty(Some(output.unwrap_or_default())) {
-            text.push_str("\n");
-            text.push_str(&output);
-        }
-
-        if let Some(entry) = self
-            .transcript
-            .iter_mut()
-            .find(|entry| entry.item_id == item_id)
-        {
-            entry.text = text;
-            entry.status = status;
-            return;
-        }
-
-        self.transcript.push(TranscriptRecord {
-            item_id,
-            role: "command".to_string(),
-            text,
-            status,
-            turn_id: Some(turn_id),
-        });
     }
 
     pub(super) fn apply_persisted(&mut self, persisted: &PersistedRelayState) {

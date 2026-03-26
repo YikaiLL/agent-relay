@@ -61,6 +61,7 @@ impl PersistenceStore {
         Self { path }
     }
 
+    #[cfg(test)]
     pub(super) fn from_path(path: PathBuf) -> Self {
         Self { path }
     }

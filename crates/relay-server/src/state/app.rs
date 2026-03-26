@@ -15,7 +15,7 @@ use crate::{
 use super::persistence::{spawn_persistence_task, PersistedRelayState, PersistenceStore};
 use super::{
     expire_controller_if_needed, filter_threads, non_empty, require_device_id, short_device_id,
-    unix_now, RelayState, THREAD_SCAN_LIMIT,
+    unix_now, RelayState, SecurityProfile, THREAD_SCAN_LIMIT,
 };
 
 #[derive(Clone)]
@@ -27,6 +27,7 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new() -> Result<Self, String> {
+        let security = SecurityProfile::from_env()?;
         let cwd = std::env::current_dir()
             .map_err(|error| format!("failed to resolve current directory: {error}"))?
             .canonicalize()
@@ -47,6 +48,7 @@ impl AppState {
         let relay = Arc::new(RwLock::new(RelayState::new(
             cwd.display().to_string(),
             change_tx.clone(),
+            security,
         )));
 
         if let Some(ref persisted) = restored_state {
@@ -60,6 +62,11 @@ impl AppState {
                 ),
             );
             relay.notify();
+        }
+
+        {
+            let mut relay = relay.write().await;
+            relay.push_log("info", security.summary());
         }
 
         let codex = Arc::new(CodexBridge::spawn(relay.clone()).await?);

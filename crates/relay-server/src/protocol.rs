@@ -44,11 +44,22 @@ pub struct HealthResponse {
     pub provider: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityMode {
+    Private,
+    Managed,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSnapshot {
     pub provider: &'static str,
     pub service_ready: bool,
     pub codex_connected: bool,
+    pub security_mode: SecurityMode,
+    pub e2ee_enabled: bool,
+    pub broker_can_read_content: bool,
+    pub audit_enabled: bool,
     pub active_thread_id: Option<String>,
     pub active_controller_device_id: Option<String>,
     pub active_controller_last_seen_at: Option<u64>,

@@ -408,12 +408,21 @@ function renderSession(session) {
 }
 
 function renderSessionMeta(session) {
+  const securityChips = [
+    metaChip("Security", securityModeLabel(session)),
+    metaChip("Visibility", contentVisibilityLabel(session)),
+  ];
+
   if (!session.active_thread_id) {
-    sessionMeta.innerHTML = `<span class="meta-empty">Session details will appear here.</span>`;
+    sessionMeta.innerHTML = [
+      ...securityChips,
+      `<span class="meta-empty">Session details will appear here.</span>`,
+    ].join("");
     return;
   }
 
   sessionMeta.innerHTML = [
+    ...securityChips,
     metaChip("Directory", session.current_cwd || "None"),
     metaChip("Model", session.model),
     metaChip("Approval", session.approval_policy),
@@ -889,6 +898,20 @@ function metaChip(label, value) {
       <span>${escapeHtml(value)}</span>
     </span>
   `;
+}
+
+function securityModeLabel(session) {
+  if (session?.security_mode === "managed") {
+    return "Managed";
+  }
+  return "Private";
+}
+
+function contentVisibilityLabel(session) {
+  if (session?.broker_can_read_content) {
+    return session.audit_enabled ? "Org-readable + audit" : "Readable";
+  }
+  return session?.e2ee_enabled ? "E2EE broker-blind" : "Broker-blind";
 }
 
 function formatTimestamp(seconds) {
