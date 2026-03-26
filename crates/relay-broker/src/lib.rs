@@ -1,4 +1,4 @@
-mod protocol;
+pub mod protocol;
 mod state;
 
 pub use state::BrokerState;
@@ -227,10 +227,12 @@ mod tests {
         match relayed {
             ServerMessage::Message {
                 from_peer_id,
+                from_role,
                 payload,
                 ..
             } => {
                 assert_eq!(from_peer_id, "relay-1");
+                assert_eq!(from_role, protocol::PeerRole::Relay);
                 assert_eq!(payload, json!({"ciphertext":"abc"}));
             }
             other => panic!("unexpected relayed frame: {other:?}"),

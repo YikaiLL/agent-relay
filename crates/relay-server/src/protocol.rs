@@ -94,7 +94,7 @@ pub struct ApprovalRequestView {
     pub supports_session_scope: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalDecisionInput {
     pub decision: ApprovalDecision,
     pub scope: Option<ApprovalScope>,
@@ -162,7 +162,7 @@ pub struct ThreadsQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionInput {
     pub cwd: Option<String>,
     pub initial_prompt: Option<String>,
@@ -173,7 +173,7 @@ pub struct StartSessionInput {
     pub device_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeSessionInput {
     pub thread_id: String,
     pub approval_policy: Option<String>,
@@ -182,19 +182,19 @@ pub struct ResumeSessionInput {
     pub device_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageInput {
     pub text: String,
     pub effort: Option<String>,
     pub device_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TakeOverInput {
     pub device_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatInput {
     pub device_id: Option<String>,
 }

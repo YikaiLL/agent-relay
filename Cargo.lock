@@ -708,6 +708,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "relay-broker",
  "serde",
  "serde_json",
  "tokio",

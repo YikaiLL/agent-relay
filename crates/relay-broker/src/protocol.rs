@@ -43,6 +43,7 @@ pub enum ServerMessage {
     Message {
         channel_id: String,
         from_peer_id: String,
+        from_role: PeerRole,
         payload: Value,
     },
     Error {

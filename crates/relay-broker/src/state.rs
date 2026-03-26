@@ -124,6 +124,12 @@ impl BrokerState {
             ));
         }
 
+        let sender_role = room
+            .peers
+            .get(from_peer_id)
+            .expect("sender should exist in room")
+            .role;
+
         for (peer_id, handle) in &room.peers {
             if peer_id == from_peer_id {
                 continue;
@@ -132,6 +138,7 @@ impl BrokerState {
             let _ = handle.tx.send(ServerMessage::Message {
                 channel_id: channel_id.to_string(),
                 from_peer_id: from_peer_id.to_string(),
+                from_role: sender_role,
                 payload: payload.clone(),
             });
         }
@@ -206,6 +213,7 @@ mod tests {
             ServerMessage::Message {
                 channel_id: "room-a".to_string(),
                 from_peer_id: "relay-1".to_string(),
+                from_role: PeerRole::Relay,
                 payload: json!({"ciphertext":"abc"}),
             }
         );

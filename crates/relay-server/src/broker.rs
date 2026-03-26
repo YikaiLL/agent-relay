@@ -1,13 +1,21 @@
 use std::time::Duration;
 
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use serde_json::json;
+use relay_broker::protocol::{ClientMessage, PeerRole, PresenceKind, ServerMessage};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::{protocol::SessionSnapshot, state::AppState};
+use crate::{
+    protocol::{
+        ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput, ResumeSessionInput,
+        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
+    },
+    state::{AppState, ApprovalError},
+};
 
 const RECONNECT_DELAY_SECS: u64 = 2;
 type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -17,6 +25,89 @@ pub struct BrokerConfig {
     url: Url,
     pub channel_id: String,
     pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RemoteActionRequest {
+    StartSession {
+        input: StartSessionInput,
+    },
+    ResumeSession {
+        input: ResumeSessionInput,
+    },
+    SendMessage {
+        input: SendMessageInput,
+    },
+    TakeOver {
+        input: TakeOverInput,
+    },
+    Heartbeat {
+        input: HeartbeatInput,
+    },
+    DecideApproval {
+        request_id: String,
+        input: ApprovalDecisionInput,
+    },
+}
+
+impl RemoteActionRequest {
+    fn kind(&self) -> RemoteActionKind {
+        match self {
+            Self::StartSession { .. } => RemoteActionKind::StartSession,
+            Self::ResumeSession { .. } => RemoteActionKind::ResumeSession,
+            Self::SendMessage { .. } => RemoteActionKind::SendMessage,
+            Self::TakeOver { .. } => RemoteActionKind::TakeOver,
+            Self::Heartbeat { .. } => RemoteActionKind::Heartbeat,
+            Self::DecideApproval { .. } => RemoteActionKind::DecideApproval,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RemoteActionKind {
+    StartSession,
+    ResumeSession,
+    SendMessage,
+    TakeOver,
+    Heartbeat,
+    DecideApproval,
+}
+
+impl RemoteActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StartSession => "start_session",
+            Self::ResumeSession => "resume_session",
+            Self::SendMessage => "send_message",
+            Self::TakeOver => "take_over",
+            Self::Heartbeat => "heartbeat",
+            Self::DecideApproval => "decide_approval",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteActionEnvelope {
+    action_id: String,
+    request: RemoteActionRequest,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OutboundBrokerPayload {
+    SessionSnapshot {
+        snapshot: SessionSnapshot,
+    },
+    RemoteActionResult {
+        action_id: String,
+        action: RemoteActionKind,
+        ok: bool,
+        snapshot: SessionSnapshot,
+        receipt: Option<ApprovalReceipt>,
+        error: Option<String>,
+    },
 }
 
 impl BrokerConfig {
@@ -148,7 +239,17 @@ async fn run_broker_session(
         .await
         .ok_or_else(|| "broker closed before welcome".to_string())?
         .map_err(|error| format!("broker welcome read failed: {error}"))?;
-    handle_server_frame(welcome)?;
+    match decode_server_frame(welcome)? {
+        Some(ServerMessage::Welcome { .. }) => {}
+        Some(ServerMessage::Error { message, .. }) => return Err(message),
+        Some(other) => {
+            return Err(format!(
+                "expected broker welcome frame, got {}",
+                server_message_name(&other)
+            ))
+        }
+        None => return Err("broker did not send a welcome frame".to_string()),
+    }
 
     state.set_broker_connection(true).await;
     state
@@ -174,30 +275,183 @@ async fn run_broker_session(
                     return Err("broker socket closed".to_string());
                 };
                 let frame = frame.map_err(|error| format!("broker receive failed: {error}"))?;
-                handle_server_frame(frame)?;
+                if let Some(message) = decode_server_frame(frame)? {
+                    handle_server_message(state, &mut sender, message).await?;
+                }
             }
         }
     }
 }
 
-fn handle_server_frame(frame: Message) -> Result<(), String> {
+fn decode_server_frame(frame: Message) -> Result<Option<ServerMessage>, String> {
     match frame {
-        Message::Text(text) => {
-            let payload = serde_json::from_str::<serde_json::Value>(&text)
-                .map_err(|error| format!("invalid broker frame: {error}"))?;
-            if payload.get("type").and_then(|value| value.as_str()) == Some("error") {
-                let message = payload
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown broker error");
-                return Err(message.to_string());
+        Message::Text(text) => serde_json::from_str::<ServerMessage>(&text)
+            .map(Some)
+            .map_err(|error| format!("invalid broker frame: {error}")),
+        Message::Ping(_) | Message::Pong(_) => Ok(None),
+        Message::Close(_) => Err("broker closed the socket".to_string()),
+        Message::Binary(_) => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+async fn handle_server_message(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    message: ServerMessage,
+) -> Result<(), String> {
+    match message {
+        ServerMessage::Welcome { .. } => Ok(()),
+        ServerMessage::Presence {
+            channel_id,
+            kind,
+            peer,
+        } => {
+            if peer.role == PeerRole::Surface {
+                let status = match kind {
+                    PresenceKind::Joined => "joined",
+                    PresenceKind::Left => "left",
+                };
+                state
+                    .push_runtime_log(
+                        "info",
+                        format!(
+                            "Broker surface {} {status} channel {channel_id}.",
+                            peer.peer_id
+                        ),
+                    )
+                    .await;
             }
             Ok(())
         }
-        Message::Ping(_) | Message::Pong(_) => Ok(()),
-        Message::Close(_) => Err("broker closed the socket".to_string()),
-        Message::Binary(_) => Ok(()),
-        _ => Ok(()),
+        ServerMessage::Message {
+            from_peer_id,
+            from_role,
+            payload,
+            ..
+        } => {
+            if from_role != PeerRole::Surface {
+                debug!(
+                    from_peer_id,
+                    ?from_role,
+                    "ignoring broker message from non-surface peer"
+                );
+                return Ok(());
+            }
+
+            let Some(action) = extract_remote_action(payload)? else {
+                return Ok(());
+            };
+            handle_remote_action(state, sender, from_peer_id, action).await
+        }
+        ServerMessage::Error { message, .. } => Err(message),
+    }
+}
+
+async fn handle_remote_action(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    from_peer_id: String,
+    action: RemoteActionEnvelope,
+) -> Result<(), String> {
+    let action_kind = action.request.kind();
+    state
+        .push_runtime_log(
+            "info",
+            format!(
+                "Broker action `{}` received from {}.",
+                action_kind.as_str(),
+                from_peer_id
+            ),
+        )
+        .await;
+
+    let result = execute_remote_action(state, action.request).await;
+    let snapshot = state.snapshot().await;
+
+    let (ok, receipt, error) = match result {
+        Ok(receipt) => (true, receipt, None),
+        Err(error) => {
+            state
+                .push_runtime_log(
+                    "warn",
+                    format!(
+                        "Broker action `{}` from {} failed: {error}",
+                        action_kind.as_str(),
+                        from_peer_id
+                    ),
+                )
+                .await;
+            (false, None, Some(error))
+        }
+    };
+
+    publish_payload(
+        sender,
+        OutboundBrokerPayload::RemoteActionResult {
+            action_id: action.action_id,
+            action: action_kind,
+            ok,
+            snapshot,
+            receipt,
+            error,
+        },
+    )
+    .await
+    .map_err(|error| format!("broker action result publish failed: {error}"))
+}
+
+async fn execute_remote_action(
+    state: &AppState,
+    request: RemoteActionRequest,
+) -> Result<Option<ApprovalReceipt>, String> {
+    match request {
+        RemoteActionRequest::StartSession { input } => {
+            state.start_session(input).await.map(|_| None)
+        }
+        RemoteActionRequest::ResumeSession { input } => {
+            state.resume_session(input).await.map(|_| None)
+        }
+        RemoteActionRequest::SendMessage { input } => state.send_message(input).await.map(|_| None),
+        RemoteActionRequest::TakeOver { input } => {
+            state.take_over_control(input).await.map(|_| None)
+        }
+        RemoteActionRequest::Heartbeat { input } => {
+            state.heartbeat_session(input).await.map(|_| None)
+        }
+        RemoteActionRequest::DecideApproval { request_id, input } => state
+            .decide_approval(&request_id, input)
+            .await
+            .map(Some)
+            .map_err(approval_error_message),
+    }
+}
+
+fn approval_error_message(error: ApprovalError) -> String {
+    match error {
+        ApprovalError::NoPendingRequest => {
+            "there is no approval request waiting for a remote decision".to_string()
+        }
+        ApprovalError::Bridge(message) => message,
+    }
+}
+
+fn extract_remote_action(payload: Value) -> Result<Option<RemoteActionEnvelope>, String> {
+    if payload.get("kind").and_then(Value::as_str) != Some("remote_action") {
+        return Ok(None);
+    }
+
+    serde_json::from_value(payload)
+        .map(Some)
+        .map_err(|error| format!("invalid remote action payload: {error}"))
+}
+
+fn server_message_name(message: &ServerMessage) -> &'static str {
+    match message {
+        ServerMessage::Welcome { .. } => "welcome",
+        ServerMessage::Presence { .. } => "presence",
+        ServerMessage::Message { .. } => "message",
+        ServerMessage::Error { .. } => "error",
     }
 }
 
@@ -205,14 +459,21 @@ async fn publish_snapshot(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     snapshot: SessionSnapshot,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-    let payload = json!({
-        "type": "publish",
-        "payload": {
-            "kind": "session_snapshot",
-            "snapshot": snapshot,
-        }
-    });
-    sender.send(Message::Text(payload.to_string())).await
+    publish_payload(sender, OutboundBrokerPayload::SessionSnapshot { snapshot }).await
+}
+
+async fn publish_payload(
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    payload: OutboundBrokerPayload,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    let frame = ClientMessage::Publish {
+        payload: serde_json::to_value(payload).expect("broker payload should serialize"),
+    };
+    sender
+        .send(Message::Text(
+            serde_json::to_string(&frame).expect("broker client frame should serialize"),
+        ))
+        .await
 }
 
 fn trimmed(value: Option<String>) -> Option<String> {
@@ -264,5 +525,45 @@ mod tests {
         let config = BrokerConfig::from_parts(None, Some("demo-room".to_string()), None)
             .expect("missing url should be accepted");
         assert!(config.is_none());
+    }
+
+    #[test]
+    fn extract_remote_action_parses_send_message_requests() {
+        let payload = serde_json::json!({
+            "kind": "remote_action",
+            "action_id": "act-1",
+            "request": {
+                "type": "send_message",
+                "input": {
+                    "text": "hello",
+                    "device_id": "phone-1"
+                }
+            }
+        });
+
+        let action = extract_remote_action(payload)
+            .expect("payload should parse")
+            .expect("payload should be handled");
+        assert_eq!(action.action_id, "act-1");
+        match action.request {
+            RemoteActionRequest::SendMessage { input } => {
+                assert_eq!(input.text, "hello");
+                assert_eq!(input.device_id.as_deref(), Some("phone-1"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_remote_action_ignores_non_action_payloads() {
+        let payload = serde_json::json!({
+            "kind": "session_snapshot",
+            "snapshot": {
+                "current_status": "idle"
+            }
+        });
+
+        let action = extract_remote_action(payload).expect("non-action payload should be ignored");
+        assert!(action.is_none());
     }
 }
