@@ -1,3 +1,4 @@
+mod auth;
 mod codex;
 mod protocol;
 mod state;
@@ -5,9 +6,11 @@ mod state;
 use std::{convert::Infallible, time::Duration};
 use std::{net::SocketAddr, path::PathBuf};
 
+use auth::AuthConfig;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    http::{HeaderMap, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -28,6 +31,12 @@ use tower_http::{
 };
 use tracing::info;
 
+#[derive(Clone)]
+struct AppContext {
+    app: AppState,
+    auth: AuthConfig,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -40,7 +49,12 @@ async fn main() {
     let state = AppState::new()
         .await
         .expect("failed to initialize Codex app-server bridge");
+    let auth = AuthConfig::from_env();
+    if auth.enabled() {
+        info!("relay-server API token auth is enabled for protected /api routes");
+    }
     let web_root = workspace_root().join("web");
+    let context = AppContext { app: state, auth };
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -55,7 +69,7 @@ async fn main() {
         .route("/api/approvals/:request_id", post(decide_approval))
         .route_service("/", ServeFile::new(web_root.join("index.html")))
         .nest_service("/static", ServeDir::new(web_root))
-        .with_state(state)
+        .with_state(context)
         .layer(TraceLayer::new_for_http());
 
     let port = std::env::var("PORT")
@@ -86,16 +100,27 @@ async fn health() -> Json<ApiEnvelope<HealthResponse>> {
     }))
 }
 
-async fn session_snapshot(State(state): State<AppState>) -> Json<ApiEnvelope<SessionSnapshot>> {
-    Json(ApiEnvelope::ok(state.snapshot().await))
+async fn session_snapshot(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.snapshot().await)))
 }
 
 async fn session_stream(
-    State(state): State<AppState>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let initial_state = state.clone();
-    let updates_state = state.clone();
-    let receiver = state.subscribe();
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    authorize_api(&context, &headers, &uri)?;
+    let initial_state = context.app.clone();
+    let updates_state = context.app.clone();
+    let receiver = context.app.subscribe();
 
     let initial = stream::once(async move {
         Ok::<Event, Infallible>(snapshot_event(initial_state.snapshot().await))
@@ -115,19 +140,23 @@ async fn session_stream(
         },
     );
 
-    Sse::new(initial.chain(updates)).keep_alive(
+    Ok(Sse::new(initial.chain(updates)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
-    )
+    ))
 }
 
 async fn list_threads(
-    State(state): State<AppState>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
     Query(query): Query<ThreadsQuery>,
 ) -> Result<Json<ApiEnvelope<ThreadsResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
-    state
+    context
+        .app
         .list_threads(limit, query.cwd)
         .await
         .map(|threads| Json(ApiEnvelope::ok(threads)))
@@ -135,10 +164,14 @@ async fn list_threads(
 }
 
 async fn start_session(
-    State(state): State<AppState>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(input): Json<StartSessionInput>,
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
-    state
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
         .start_session(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
@@ -146,10 +179,14 @@ async fn start_session(
 }
 
 async fn resume_session(
-    State(state): State<AppState>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(input): Json<ResumeSessionInput>,
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
-    state
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
         .resume_session(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
@@ -157,10 +194,14 @@ async fn resume_session(
 }
 
 async fn send_message(
-    State(state): State<AppState>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(input): Json<SendMessageInput>,
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
-    state
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
         .send_message(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
@@ -168,10 +209,14 @@ async fn send_message(
 }
 
 async fn session_heartbeat(
-    State(state): State<AppState>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(input): Json<HeartbeatInput>,
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
-    state
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
         .heartbeat_session(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
@@ -179,10 +224,14 @@ async fn session_heartbeat(
 }
 
 async fn take_over_session(
-    State(state): State<AppState>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(input): Json<TakeOverInput>,
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
-    state
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
         .take_over_control(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
@@ -191,10 +240,14 @@ async fn take_over_session(
 
 async fn decide_approval(
     Path(request_id): Path<String>,
-    State(state): State<AppState>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(input): Json<ApprovalDecisionInput>,
 ) -> Result<Json<ApiEnvelope<ApprovalReceipt>>, impl IntoResponse> {
-    state
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
         .decide_approval(&request_id, input)
         .await
         .map(|receipt| Json(ApiEnvelope::ok(receipt)))
@@ -211,6 +264,14 @@ async fn decide_approval(
                 Json(ApiError::new("approval_failed", message)),
             ),
         })
+}
+
+fn authorize_api(
+    context: &AppContext,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    context.auth.authorize(headers, uri)
 }
 
 fn workspace_root() -> PathBuf {

@@ -1,8 +1,10 @@
 const DEVICE_STORAGE_KEY = "agent-relay.device-id";
+const API_TOKEN_STORAGE_KEY = "agent-relay.api-token";
 const CONTROL_HEARTBEAT_MS = 5000;
 const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
 
 const state = {
+  apiToken: loadApiToken(),
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
@@ -21,6 +23,8 @@ const state = {
 
 const transcript = document.querySelector("#transcript");
 const clientLog = document.querySelector("#client-log");
+const connectionForm = document.querySelector("#connection-form");
+const apiTokenInput = document.querySelector("#api-token-input");
 const refreshButton = document.querySelector("#refresh-button");
 const threadsRefreshButton = document.querySelector("#threads-refresh-button");
 const sendButton = document.querySelector("#send-button");
@@ -48,6 +52,11 @@ const controlBanner = document.querySelector("#control-banner");
 const controlSummary = document.querySelector("#control-summary");
 const controlHint = document.querySelector("#control-hint");
 const takeOverButton = document.querySelector("#take-over-button");
+
+connectionForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  applyApiToken(apiTokenInput.value);
+});
 
 refreshButton.addEventListener("click", () => {
   void loadSession("manual refresh");
@@ -95,6 +104,7 @@ transcript.addEventListener("click", (event) => {
 void boot();
 
 async function boot() {
+  apiTokenInput.value = state.apiToken;
   setNewSessionPanelOpen(false);
   await loadSession("initial boot");
   if (state.selectedCwd) {
@@ -110,7 +120,7 @@ async function loadSession(reason) {
   logLine(`Fetching session snapshot (${reason})`);
 
   try {
-    const response = await fetch("/api/session");
+    const response = await apiFetch("/api/session");
     const payload = await response.json();
 
     if (!response.ok || !payload.ok) {
@@ -157,7 +167,7 @@ async function loadThreads(reason) {
     url.searchParams.set("cwd", state.selectedCwd);
     url.searchParams.set("limit", "80");
 
-    const response = await fetch(url);
+    const response = await apiFetch(url);
     const payload = await response.json();
 
     if (!response.ok || !payload.ok) {
@@ -189,7 +199,7 @@ async function startSession() {
   logLine(`Starting a new Codex thread in ${cwd}`);
 
   try {
-    const response = await fetch("/api/session/start", {
+    const response = await apiFetch("/api/session/start", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -228,7 +238,7 @@ async function resumeSession(threadId) {
   logLine(`Resuming thread ${threadId}`);
 
   try {
-    const response = await fetch("/api/session/resume", {
+    const response = await apiFetch("/api/session/resume", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -268,7 +278,7 @@ async function sendMessage() {
   logLine("Sending prompt to Codex");
 
   try {
-    const response = await fetch("/api/session/message", {
+    const response = await apiFetch("/api/session/message", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -305,7 +315,7 @@ async function takeOverControl() {
   logLine(`Taking control from device ${shortId(state.deviceId)}`);
 
   try {
-    const response = await fetch("/api/session/take-over", {
+    const response = await apiFetch("/api/session/take-over", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -339,7 +349,7 @@ async function submitDecision(decision, scope) {
   logLine(`Submitting ${decision} for ${state.currentApprovalId}`);
 
   try {
-    const response = await fetch(`/api/approvals/${encodeURIComponent(state.currentApprovalId)}`, {
+    const response = await apiFetch(`/api/approvals/${encodeURIComponent(state.currentApprovalId)}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -732,7 +742,7 @@ async function sendSessionHeartbeat() {
   }
 
   try {
-    const response = await fetch("/api/session/heartbeat", {
+    const response = await apiFetch("/api/session/heartbeat", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -807,7 +817,7 @@ function connectSessionStream() {
     state.sessionStream.close();
   }
 
-  const stream = new EventSource("/api/stream");
+  const stream = new EventSource(sessionStreamUrl());
   state.sessionStream = stream;
 
   stream.addEventListener("session", (event) => {
@@ -852,6 +862,52 @@ function cancelSessionPoll() {
 
   window.clearTimeout(state.sessionPollTimer);
   state.sessionPollTimer = null;
+}
+
+function apiFetch(input, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (state.apiToken) {
+    headers.set("Authorization", `Bearer ${state.apiToken}`);
+  }
+
+  return fetch(input, {
+    ...init,
+    headers,
+  });
+}
+
+function sessionStreamUrl() {
+  const url = new URL("/api/stream", window.location.origin);
+  if (state.apiToken) {
+    url.searchParams.set("access_token", state.apiToken);
+  }
+  return url.toString();
+}
+
+function applyApiToken(rawValue) {
+  const nextToken = rawValue.trim();
+  state.apiToken = nextToken;
+  apiTokenInput.value = nextToken;
+
+  if (nextToken) {
+    window.localStorage.setItem(API_TOKEN_STORAGE_KEY, nextToken);
+    logLine("Stored API token for this device.");
+  } else {
+    window.localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+    logLine("Cleared API token for this device.");
+  }
+
+  state.streamConnected = false;
+  cancelStreamReconnect();
+  if (state.sessionStream) {
+    state.sessionStream.close();
+    state.sessionStream = null;
+  }
+  connectSessionStream();
+  void loadSession("auth change");
+  if (state.selectedCwd) {
+    void loadThreads("auth change");
+  }
 }
 
 function scheduleStreamReconnect() {
@@ -977,6 +1033,10 @@ function loadOrCreateDeviceId() {
     : `device-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   window.localStorage.setItem(DEVICE_STORAGE_KEY, generated);
   return generated;
+}
+
+function loadApiToken() {
+  return window.localStorage.getItem(API_TOKEN_STORAGE_KEY)?.trim() || "";
 }
 
 function logLine(message) {
