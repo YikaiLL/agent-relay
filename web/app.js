@@ -8,6 +8,7 @@ const state = {
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
+  currentPairing: null,
   deviceId: loadOrCreateDeviceId(),
   defaultsSeeded: false,
   newSessionPanelOpen: false,
@@ -25,6 +26,12 @@ const transcript = document.querySelector("#transcript");
 const clientLog = document.querySelector("#client-log");
 const connectionForm = document.querySelector("#connection-form");
 const apiTokenInput = document.querySelector("#api-token-input");
+const startPairingButton = document.querySelector("#start-pairing-button");
+const pairingPanel = document.querySelector("#pairing-panel");
+const pairingQr = document.querySelector("#pairing-qr");
+const pairingExpiry = document.querySelector("#pairing-expiry");
+const pairingLinkInput = document.querySelector("#pairing-link-input");
+const copyPairingLinkButton = document.querySelector("#copy-pairing-link-button");
 const refreshButton = document.querySelector("#refresh-button");
 const threadsRefreshButton = document.querySelector("#threads-refresh-button");
 const sendButton = document.querySelector("#send-button");
@@ -44,6 +51,7 @@ const sandboxInput = document.querySelector("#sandbox-input");
 const startEffortInput = document.querySelector("#start-effort");
 const threadsList = document.querySelector("#threads-list");
 const threadsCount = document.querySelector("#threads-count");
+const pairedDevicesList = document.querySelector("#paired-devices-list");
 const workspaceTitle = document.querySelector("#workspace-title");
 const workspaceSubtitle = document.querySelector("#workspace-subtitle");
 const statusBadge = document.querySelector("#status-badge");
@@ -56,6 +64,14 @@ const takeOverButton = document.querySelector("#take-over-button");
 connectionForm.addEventListener("submit", (event) => {
   event.preventDefault();
   applyApiToken(apiTokenInput.value);
+});
+
+startPairingButton.addEventListener("click", () => {
+  void startPairing();
+});
+
+copyPairingLinkButton.addEventListener("click", () => {
+  void copyPairingLink();
 });
 
 refreshButton.addEventListener("click", () => {
@@ -99,6 +115,15 @@ transcript.addEventListener("click", (event) => {
     approvalButton.dataset.approvalDecision,
     approvalButton.dataset.approvalScope || "once"
   );
+});
+
+pairedDevicesList.addEventListener("click", (event) => {
+  const revokeButton = event.target.closest("[data-revoke-device-id]");
+  if (!revokeButton) {
+    return;
+  }
+
+  void revokePairedDevice(revokeButton.dataset.revokeDeviceId);
 });
 
 void boot();
@@ -305,6 +330,75 @@ async function sendMessage() {
   }
 }
 
+async function startPairing() {
+  startPairingButton.disabled = true;
+  logLine("Creating a broker pairing ticket.");
+
+  try {
+    const response = await apiFetch("/api/pairing/start", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to start pairing");
+    }
+
+    state.currentPairing = payload.data;
+    renderPairingPanel();
+    logLine(`Pairing ticket ${payload.data.pairing_id} is ready.`);
+  } catch (error) {
+    logLine(`Pairing failed: ${error.message}`);
+  } finally {
+    startPairingButton.disabled = false;
+  }
+}
+
+async function copyPairingLink() {
+  const pairingUrl = state.currentPairing?.pairing_url;
+  if (!pairingUrl) {
+    logLine("No pairing link is available yet.");
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(pairingUrl);
+    logLine("Copied pairing link to clipboard.");
+  } catch (error) {
+    pairingLinkInput.focus();
+    pairingLinkInput.select();
+    logLine(`Clipboard copy failed: ${error.message}`);
+  }
+}
+
+async function revokePairedDevice(deviceId) {
+  if (!deviceId) {
+    return;
+  }
+
+  logLine(`Revoking paired device ${shortId(deviceId)}.`);
+
+  try {
+    const response = await apiFetch(`/api/devices/${encodeURIComponent(deviceId)}/revoke`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to revoke paired device");
+    }
+
+    await loadSession("post-device-revoke refresh");
+    logLine(`Revoked paired device ${shortId(deviceId)}.`);
+  } catch (error) {
+    logLine(`Revoke failed: ${error.message}`);
+  }
+}
+
 async function takeOverControl() {
   if (!state.session?.active_thread_id) {
     logLine("There is no active session to take over.");
@@ -401,6 +495,8 @@ function renderSession(session) {
   }
 
   renderSessionMeta(session);
+  renderPairingPanel();
+  renderPairedDevices(session.paired_devices || []);
   renderControlBanner(session);
   renderTranscript(session.transcript, approval);
   renderLogs(session.logs);
@@ -415,6 +511,53 @@ function renderSession(session) {
     : canWrite
       ? "Message Codex..."
       : "Another device has control. Take over to reply.";
+}
+
+function renderPairingPanel() {
+  const pairing = state.currentPairing;
+  pairingPanel.hidden = !pairing;
+
+  if (!pairing) {
+    pairingQr.innerHTML = "";
+    pairingLinkInput.value = "";
+    pairingExpiry.textContent = "Pairing ticket not created yet.";
+    return;
+  }
+
+  pairingQr.innerHTML = pairing.pairing_qr_svg;
+  pairingLinkInput.value = pairing.pairing_url;
+  pairingExpiry.textContent = `Expires ${formatTimestamp(pairing.expires_at)}`;
+}
+
+function renderPairedDevices(devices) {
+  if (!devices.length) {
+    pairedDevicesList.innerHTML = `<p class="sidebar-empty">No remote devices paired yet.</p>`;
+    return;
+  }
+
+  pairedDevicesList.innerHTML = devices
+    .map((device) => {
+      const lastSeen = device.last_seen_at
+        ? `Seen ${formatTimestamp(device.last_seen_at)}`
+        : "Never seen";
+
+      return `
+        <article class="paired-device-card">
+          <div class="paired-device-copy">
+            <strong>${escapeHtml(device.label)}</strong>
+            <p class="paired-device-meta">${escapeHtml(shortId(device.device_id))} · ${escapeHtml(lastSeen)}</p>
+          </div>
+          <button
+            class="sidebar-link-button"
+            type="button"
+            data-revoke-device-id="${escapeHtml(device.device_id)}"
+          >
+            Revoke
+          </button>
+        </article>
+      `;
+    })
+    .join("");
 }
 
 function renderSessionMeta(session) {

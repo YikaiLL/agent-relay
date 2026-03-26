@@ -1,8 +1,8 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chacha20poly1305::{
+use aes_gcm::{
     aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Key, Nonce,
+    Aes256Gcm, Key, Nonce,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -64,10 +64,10 @@ fn decrypt_bytes(secret: &str, envelope: &EncryptedEnvelope) -> Result<Vec<u8>, 
         .map_err(|error| format!("decryption failed: {error}"))
 }
 
-fn cipher(secret: &str) -> ChaCha20Poly1305 {
+fn cipher(secret: &str) -> Aes256Gcm {
     let digest = Sha256::digest(secret.as_bytes());
-    let key = Key::from_slice(&digest);
-    ChaCha20Poly1305::new(key)
+    let key = Key::<Aes256Gcm>::from_slice(&digest);
+    Aes256Gcm::new(key)
 }
 
 #[cfg(test)]

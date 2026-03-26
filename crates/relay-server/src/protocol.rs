@@ -180,6 +180,9 @@ pub struct PairingTicketView {
     pub broker_channel_id: String,
     pub relay_peer_id: String,
     pub security_mode: SecurityMode,
+    pub pairing_payload: String,
+    pub pairing_url: String,
+    pub pairing_qr_svg: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,7 +191,7 @@ pub struct RevokeDeviceReceipt {
     pub revoked: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadsQuery {
     pub cwd: Option<String>,
     pub limit: Option<usize>,

@@ -687,6 +687,99 @@ select {
   white-space: pre-wrap;
 }
 
+.sidebar-hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.remote-access-shell {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(14px);
+}
+
+.remote-surface-shell {
+  margin-bottom: 18px;
+}
+
+.pairing-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px dashed var(--border-strong);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.pairing-qr {
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  border-radius: 16px;
+  background: #f7f4ea;
+}
+
+.pairing-qr svg {
+  width: min(240px, 100%);
+  height: auto;
+}
+
+.pairing-copy {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.paired-devices-list {
+  display: grid;
+  gap: 10px;
+}
+
+.paired-device-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.paired-device-copy {
+  min-width: 0;
+}
+
+.paired-device-copy strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.paired-device-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.workspace-form textarea {
+  width: 100%;
+  min-height: 92px;
+  resize: vertical;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.84);
+  color: var(--text);
+  font: inherit;
+}
+
 @media (min-width: 961px) {
   html,
   body {

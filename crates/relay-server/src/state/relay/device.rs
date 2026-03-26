@@ -1,6 +1,10 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use qrcode::{render::svg, QrCode};
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::protocol::{PairedDeviceView, PairingTicketView};
 
@@ -70,6 +74,18 @@ impl RelayState {
             },
         );
 
+        let pairing_payload = pairing_payload(
+            &pairing_id,
+            &pairing_secret,
+            expires_at,
+            broker_url,
+            broker_channel_id,
+            relay_peer_id,
+            self.security.mode(),
+        );
+        let pairing_url = pairing_url(broker_url, &pairing_payload);
+        let pairing_qr_svg = pairing_qr_svg(&pairing_url);
+
         PairingTicketView {
             pairing_id,
             pairing_secret,
@@ -78,6 +94,9 @@ impl RelayState {
             broker_channel_id: broker_channel_id.to_string(),
             relay_peer_id: relay_peer_id.to_string(),
             security_mode: self.security.mode(),
+            pairing_payload,
+            pairing_url,
+            pairing_qr_svg,
         }
     }
 
@@ -260,4 +279,59 @@ fn sha256_hex(value: &str) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+fn pairing_payload(
+    pairing_id: &str,
+    pairing_secret: &str,
+    expires_at: u64,
+    broker_url: &str,
+    broker_channel_id: &str,
+    relay_peer_id: &str,
+    security_mode: crate::protocol::SecurityMode,
+) -> String {
+    let payload = json!({
+        "version": 1,
+        "pairing_id": pairing_id,
+        "pairing_secret": pairing_secret,
+        "expires_at": expires_at,
+        "broker_url": broker_url,
+        "broker_channel_id": broker_channel_id,
+        "relay_peer_id": relay_peer_id,
+        "security_mode": security_mode,
+    });
+
+    URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("pairing payload should serialize"))
+}
+
+fn pairing_url(broker_url: &str, pairing_payload: &str) -> String {
+    let mut url = browser_url(broker_url);
+    url.query_pairs_mut()
+        .clear()
+        .append_pair("pairing", pairing_payload);
+    url.to_string()
+}
+
+fn pairing_qr_svg(pairing_url: &str) -> String {
+    QrCode::new(pairing_url.as_bytes())
+        .expect("pairing url should always encode as qr")
+        .render::<svg::Color<'_>>()
+        .min_dimensions(240, 240)
+        .dark_color(svg::Color("#10211b"))
+        .light_color(svg::Color("#f7f4ea"))
+        .build()
+}
+
+fn browser_url(broker_url: &str) -> Url {
+    let mut url = Url::parse(broker_url).expect("broker url should parse");
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
+    }
+    .to_string();
+    let _ = url.set_scheme(&scheme);
+    url.set_path("/");
+    url.set_query(None);
+    url
 }

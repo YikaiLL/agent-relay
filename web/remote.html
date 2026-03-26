@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Relay Remote</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <section class="remote-access-shell remote-surface-shell">
+          <div class="sidebar-row">
+            <div>
+              <p class="sidebar-caption">Remote Surface</p>
+              <p class="sidebar-hint">Scan a pairing QR or paste a pairing link from your local relay.</p>
+            </div>
+          </div>
+
+          <form id="pairing-form" class="workspace-form">
+            <label class="sidebar-label" for="pairing-input">Pairing Link Or Code</label>
+            <textarea
+              id="pairing-input"
+              rows="4"
+              placeholder="Paste the full pairing URL, or only the pairing payload."
+            ></textarea>
+            <label class="sidebar-label" for="device-label-input">Device Label</label>
+            <div class="workspace-picker">
+              <input id="device-label-input" type="text" placeholder="iPhone, Pixel, Safari on iPad">
+              <button id="connect-button" class="load-button" type="submit">Pair</button>
+            </div>
+          </form>
+
+          <div class="sidebar-row">
+            <p class="sidebar-caption">Current Device</p>
+            <button id="forget-device-button" class="sidebar-link-button" type="button">Forget</button>
+          </div>
+          <div id="device-meta" class="paired-devices-list">
+            <p class="sidebar-empty">No paired remote device stored in this browser.</p>
+          </div>
+        </section>
+
+        <button id="remote-session-toggle" class="new-chat-button" type="button" aria-expanded="false">
+          Start Remote Session
+        </button>
+
+        <section id="remote-session-panel" class="new-session-panel" hidden>
+          <label class="sidebar-label" for="remote-cwd-input">Workspace</label>
+          <div class="workspace-picker">
+            <input id="remote-cwd-input" type="text" placeholder="/path/to/project">
+          </div>
+
+          <button id="remote-start-session-button" class="start-session-button" type="button">
+            Start Session
+          </button>
+
+          <details class="sidebar-settings">
+            <summary>Launch settings</summary>
+            <div class="settings-grid">
+              <label class="field">
+                <span>Model</span>
+                <input id="remote-model-input" type="text" value="gpt-5-codex">
+              </label>
+              <label class="field">
+                <span>Approval</span>
+                <select id="remote-approval-policy-input">
+                  <option value="untrusted">untrusted</option>
+                  <option value="on-request">on-request</option>
+                  <option value="never">never</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Sandbox</span>
+                <select id="remote-sandbox-input">
+                  <option value="workspace-write">workspace-write</option>
+                  <option value="read-only">read-only</option>
+                  <option value="danger-full-access">danger-full-access</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Default Effort</span>
+                <select id="remote-start-effort">
+                  <option value="medium">medium</option>
+                  <option value="low">low</option>
+                  <option value="high">high</option>
+                </select>
+              </label>
+              <label class="field field-full">
+                <span>Initial Prompt</span>
+                <textarea id="remote-start-prompt" rows="4" placeholder="Optional first task for the new remote session."></textarea>
+              </label>
+            </div>
+          </details>
+        </section>
+      </aside>
+
+      <main class="chat-shell">
+        <header class="chat-header">
+          <div class="chat-heading">
+            <span class="chat-heading-label">Remote Broker Surface</span>
+            <h1 id="remote-workspace-title">Pair this browser</h1>
+            <p id="remote-workspace-subtitle" class="chat-subtitle">
+              Open a pairing QR from your local relay to control Codex remotely.
+            </p>
+          </div>
+          <div class="chat-header-actions">
+            <span id="remote-status-badge" class="status-badge status-badge-offline">Offline</span>
+          </div>
+        </header>
+
+        <details class="meta-drawer">
+          <summary>Session details</summary>
+          <section id="remote-session-meta" class="session-meta">
+            <span class="meta-empty">Pair a remote device to start streaming session details.</span>
+          </section>
+        </details>
+
+        <section id="remote-control-banner" class="control-banner" hidden>
+          <div>
+            <p id="remote-control-summary" class="control-summary">This device has control</p>
+            <p id="remote-control-hint" class="control-hint">Only the active device can type, but any paired owner device can approve.</p>
+          </div>
+          <button id="remote-take-over-button" class="header-button control-button" type="button">
+            Take over
+          </button>
+        </section>
+
+        <section class="thread-shell">
+          <div id="remote-transcript" class="chat-thread">
+            <div class="thread-empty">
+              <h2>No remote session yet</h2>
+              <p>After pairing, this page will stream the live relay transcript through the broker.</p>
+            </div>
+          </div>
+        </section>
+
+        <form id="remote-message-form" class="composer-shell">
+          <div class="composer-inner">
+            <textarea
+              id="remote-message-input"
+              rows="3"
+              placeholder="Pair this browser and take control before sending messages."
+            ></textarea>
+            <div class="composer-actions">
+              <label class="composer-select" for="remote-message-effort">
+                <span>Effort</span>
+                <select id="remote-message-effort">
+                  <option value="medium">medium</option>
+                  <option value="low">low</option>
+                  <option value="high">high</option>
+                </select>
+              </label>
+              <button id="remote-send-button" class="send-button" type="submit">Send</button>
+            </div>
+          </div>
+        </form>
+
+        <details class="log-drawer">
+          <summary>Remote log</summary>
+          <pre id="remote-client-log" class="client-log">Booting broker remote surface...</pre>
+        </details>
+      </main>
+    </div>
+
+    <script src="/static/remote.js" type="module"></script>
+  </body>
+</html>

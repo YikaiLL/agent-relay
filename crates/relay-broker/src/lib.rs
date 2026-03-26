@@ -3,6 +3,8 @@ mod state;
 
 pub use state::BrokerState;
 
+use std::path::PathBuf;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -14,13 +16,19 @@ use axum::{
 };
 use futures_util::{sink::SinkExt, StreamExt};
 use protocol::{ClientMessage, ConnectQuery, HealthResponse, ServerMessage};
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{debug, warn};
 
 pub fn app(state: BrokerState) -> Router {
+    let web_root = workspace_root().join("web");
     Router::new()
         .route("/api/health", get(health))
         .route("/ws/:channel_id", get(websocket))
+        .route_service("/", ServeFile::new(web_root.join("remote.html")))
+        .nest_service("/static", ServeDir::new(web_root))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -137,6 +145,14 @@ async fn reject_socket(socket: WebSocket, code: &str, message: &str) {
     let _ = sender.close().await;
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("workspace root should resolve")
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -175,6 +191,35 @@ mod tests {
             .expect("frame should decode");
         let text = frame.into_text().expect("frame should be text");
         serde_json::from_str(&text).expect("server message should parse")
+    }
+
+    async fn http_get(address: SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("tcp stream should connect");
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("request should write");
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("response should read");
+        response
+    }
+
+    #[tokio::test]
+    async fn root_serves_remote_surface_html() {
+        let address = spawn_app().await;
+        let response = http_get(address, "/").await;
+
+        assert!(response.contains("200 OK"));
+        assert!(response.contains("Remote Broker Surface"));
+        assert!(response.contains("/static/remote.js"));
     }
 
     #[tokio::test]

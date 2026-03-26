@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -413,6 +414,33 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
             .and_then(|device| device.last_peer_id.as_deref()),
         Some("surface-b")
     );
+}
+
+#[test]
+fn pairing_ticket_includes_scannable_broker_link() {
+    let mut relay = test_state();
+    let ticket =
+        relay.issue_pairing_ticket("wss://relay.example.com", "room-a", "relay-a", Some(60));
+
+    assert!(ticket
+        .pairing_url
+        .starts_with("https://relay.example.com/?pairing="));
+    assert!(ticket.pairing_qr_svg.contains("<svg"));
+
+    let encoded = ticket
+        .pairing_url
+        .split("pairing=")
+        .nth(1)
+        .expect("pairing url should include pairing param");
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .expect("pairing payload should decode");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("pairing payload should be valid json");
+
+    assert_eq!(payload["pairing_id"], ticket.pairing_id);
+    assert_eq!(payload["pairing_secret"], ticket.pairing_secret);
+    assert_eq!(payload["broker_url"], "wss://relay.example.com");
 }
 
 #[test]

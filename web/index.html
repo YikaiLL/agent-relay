@@ -17,6 +17,35 @@
           </div>
         </form>
 
+        <section class="remote-access-shell">
+          <div class="sidebar-row">
+            <div>
+              <p class="sidebar-caption">Remote Pairing</p>
+              <p class="sidebar-hint">Create a QR link for the broker-hosted mobile surface.</p>
+            </div>
+            <button id="start-pairing-button" class="sidebar-link-button" type="button">
+              New QR
+            </button>
+          </div>
+
+          <section id="pairing-panel" class="pairing-panel" hidden>
+            <div id="pairing-qr" class="pairing-qr" aria-live="polite"></div>
+            <p id="pairing-expiry" class="pairing-copy">Pairing ticket not created yet.</p>
+            <label class="sidebar-label" for="pairing-link-input">Pairing Link</label>
+            <div class="workspace-picker">
+              <input id="pairing-link-input" type="text" readonly>
+              <button id="copy-pairing-link-button" class="load-button" type="button">Copy</button>
+            </div>
+          </section>
+
+          <div class="sidebar-row">
+            <p class="sidebar-caption">Paired Devices</p>
+          </div>
+          <div id="paired-devices-list" class="paired-devices-list">
+            <p class="sidebar-empty">No remote devices paired yet.</p>
+          </div>
+        </section>
+
         <button id="new-session-toggle" class="new-chat-button" type="button" aria-expanded="false">
           New Session
         </button>
