@@ -1,0 +1,367 @@
+use serde_json::json;
+use tokio::sync::watch;
+
+use crate::{
+    codex::ThreadSyncData,
+    protocol::{LogEntryView, ThreadSummaryView, TranscriptEntryView},
+};
+
+use super::{
+    persistence::{PersistedRelayState, PersistenceStore},
+    *,
+};
+
+fn test_persisted_state() -> PersistedRelayState {
+    PersistedRelayState {
+        schema_version: PERSISTED_STATE_VERSION,
+        active_thread_id: Some("thread-1".to_string()),
+        active_controller_device_id: Some("device-a".to_string()),
+        active_controller_last_seen_at: Some(123),
+        current_status: "running".to_string(),
+        active_flags: vec!["busy".to_string()],
+        current_cwd: "/tmp/project".to_string(),
+        model: DEFAULT_MODEL.to_string(),
+        approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+        sandbox: DEFAULT_SANDBOX.to_string(),
+        reasoning_effort: DEFAULT_EFFORT.to_string(),
+        transcript: vec![TranscriptRecord {
+            item_id: "history-0".to_string(),
+            role: "assistant".to_string(),
+            text: "hello".to_string(),
+            status: "completed".to_string(),
+            turn_id: Some("turn-1".to_string()),
+        }],
+        logs: vec![LogEntryView {
+            kind: "info".to_string(),
+            message: "persisted".to_string(),
+            created_at: 1,
+        }],
+    }
+}
+
+fn test_state() -> RelayState {
+    let (change_tx, _) = watch::channel(0_u64);
+    RelayState::new("/tmp/project".to_string(), change_tx)
+}
+
+fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
+    ThreadSummaryView {
+        id: id.to_string(),
+        name: Some("Test Thread".to_string()),
+        preview: "Test preview".to_string(),
+        cwd: cwd.to_string(),
+        updated_at: 1,
+        source: "codex".to_string(),
+        status: "idle".to_string(),
+        model_provider: "openai".to_string(),
+    }
+}
+
+fn test_pending_approval(thread_id: &str) -> PendingApproval {
+    PendingApproval {
+        request_id: "req-1".to_string(),
+        raw_request_id: json!(1),
+        kind: ApprovalKind::Command,
+        thread_id: thread_id.to_string(),
+        summary: "Need approval".to_string(),
+        detail: Some("Test command".to_string()),
+        command: Some("ls".to_string()),
+        cwd: Some("/tmp/project".to_string()),
+        requested_permissions: None,
+        available_decisions: vec!["approve".to_string(), "deny".to_string()],
+        supports_session_scope: true,
+    }
+}
+
+#[test]
+fn activate_thread_sets_active_controller_on_start() {
+    let mut relay = test_state();
+
+    relay.activate_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        DEFAULT_MODEL,
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "device-a",
+    );
+
+    assert_eq!(relay.active_thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(
+        relay.active_controller_device_id.as_deref(),
+        Some("device-a")
+    );
+    assert!(relay.can_device_send_message("device-a"));
+    assert!(!relay.can_device_send_message("device-b"));
+}
+
+#[test]
+fn passive_device_cannot_send_message_until_takeover() {
+    let mut relay = test_state();
+    relay.activate_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        DEFAULT_MODEL,
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "device-a",
+    );
+
+    let error = relay
+        .ensure_device_can_send_message("device-b")
+        .expect_err("passive device should be blocked from sending");
+
+    assert!(error.contains("another device currently has control"));
+
+    assert!(relay.set_active_controller("device-b"));
+    assert_eq!(
+        relay.active_controller_device_id.as_deref(),
+        Some("device-b")
+    );
+    assert!(relay.ensure_device_can_send_message("device-b").is_ok());
+}
+
+#[test]
+fn approval_is_allowed_from_passive_owner_device() {
+    let mut relay = test_state();
+    relay.activate_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        DEFAULT_MODEL,
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "device-a",
+    );
+    relay
+        .pending_approvals
+        .insert("req-1".to_string(), test_pending_approval("thread-1"));
+
+    assert!(relay.can_device_approve("device-a"));
+    assert!(relay.can_device_approve("device-b"));
+    assert!(relay.ensure_device_can_approve("device-b").is_ok());
+    assert!(!relay.can_device_send_message("device-b"));
+}
+
+#[test]
+fn load_thread_data_sets_active_controller_on_resume() {
+    let mut relay = test_state();
+    relay.load_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-9", "/tmp/project"),
+            status: "running".to_string(),
+            active_flags: vec!["busy".to_string()],
+            transcript: Vec::new(),
+        },
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "phone-device",
+    );
+
+    assert_eq!(relay.active_thread_id.as_deref(), Some("thread-9"));
+    assert_eq!(
+        relay.active_controller_device_id.as_deref(),
+        Some("phone-device")
+    );
+    assert_eq!(relay.current_status, "running");
+}
+
+#[test]
+fn stale_controller_lease_expires_and_releases_session() {
+    let mut relay = test_state();
+    relay.activate_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        DEFAULT_MODEL,
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "device-a",
+    );
+    relay.active_controller_last_seen_at = Some(100);
+
+    let expired = relay.expire_stale_controller(100 + CONTROLLER_LEASE_SECS);
+
+    assert_eq!(expired.as_deref(), Some("device-a"));
+    assert_eq!(relay.active_controller_device_id, None);
+    assert_eq!(relay.active_controller_last_seen_at, None);
+    assert!(relay.can_device_send_message("device-b"));
+}
+
+#[test]
+fn active_controller_heartbeat_extends_lease() {
+    let mut relay = test_state();
+    relay.activate_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        DEFAULT_MODEL,
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "device-a",
+    );
+    relay.active_controller_last_seen_at = Some(100);
+
+    assert!(relay.refresh_controller_lease("device-a", 112));
+    assert_eq!(
+        relay.controller_lease_expires_at(),
+        Some(112 + CONTROLLER_LEASE_SECS)
+    );
+    assert_eq!(
+        relay.expire_stale_controller(100 + CONTROLLER_LEASE_SECS),
+        None
+    );
+    assert_eq!(
+        relay.active_controller_device_id.as_deref(),
+        Some("device-a")
+    );
+}
+
+#[test]
+fn passive_device_cannot_refresh_another_devices_lease() {
+    let mut relay = test_state();
+    relay.activate_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        DEFAULT_MODEL,
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "device-a",
+    );
+    relay.active_controller_last_seen_at = Some(100);
+
+    assert!(!relay.refresh_controller_lease("device-b", 112));
+    assert_eq!(relay.active_controller_last_seen_at, Some(100));
+    assert_eq!(
+        relay.active_controller_device_id.as_deref(),
+        Some("device-a")
+    );
+}
+
+#[test]
+fn require_device_id_rejects_empty_values() {
+    assert_eq!(
+        require_device_id(Some("   ".to_string())).unwrap_err(),
+        "device_id is required"
+    );
+    assert_eq!(
+        require_device_id(None).unwrap_err(),
+        "device_id is required"
+    );
+    assert_eq!(
+        require_device_id(Some("device-a".to_string())).unwrap(),
+        "device-a"
+    );
+}
+
+#[test]
+fn persisted_state_round_trip_drops_ephemeral_fields() {
+    let mut relay = test_state();
+    relay.activate_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        DEFAULT_MODEL,
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        "device-a",
+    );
+    relay.active_controller_last_seen_at = Some(99);
+    relay.active_turn_id = Some("turn-ephemeral".to_string());
+    relay.transcript.push(TranscriptRecord {
+        item_id: "history-0".to_string(),
+        role: "assistant".to_string(),
+        text: "hello".to_string(),
+        status: "completed".to_string(),
+        turn_id: Some("turn-1".to_string()),
+    });
+    relay
+        .pending_approvals
+        .insert("req-1".to_string(), test_pending_approval("thread-1"));
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new("/tmp/other".to_string(), change_tx);
+    restored.apply_persisted(&persisted);
+
+    assert_eq!(restored.active_thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(
+        restored.active_controller_device_id.as_deref(),
+        Some("device-a")
+    );
+    assert_eq!(restored.active_controller_last_seen_at, Some(99));
+    assert_eq!(restored.active_turn_id, None);
+    assert_eq!(restored.pending_approvals.len(), 0);
+    assert_eq!(restored.transcript.len(), 1);
+    assert_eq!(restored.logs.len(), persisted.logs.len());
+    assert_eq!(restored.logs[0].message, persisted.logs[0].message);
+}
+
+#[test]
+fn restore_thread_data_keeps_persisted_controller_and_settings() {
+    let mut relay = test_state();
+    relay
+        .pending_approvals
+        .insert("req-1".to_string(), test_pending_approval("thread-1"));
+
+    let persisted = test_persisted_state();
+    relay.restore_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-1", "/tmp/project"),
+            status: "running".to_string(),
+            active_flags: vec!["busy".to_string()],
+            transcript: vec![TranscriptEntryView {
+                role: "user".to_string(),
+                text: "ping".to_string(),
+                status: "completed".to_string(),
+                turn_id: Some("turn-2".to_string()),
+            }],
+        },
+        &persisted,
+    );
+
+    assert_eq!(relay.active_thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(
+        relay.active_controller_device_id.as_deref(),
+        Some("device-a")
+    );
+    assert_eq!(relay.active_controller_last_seen_at, Some(123));
+    assert_eq!(relay.model, DEFAULT_MODEL);
+    assert_eq!(relay.approval_policy, DEFAULT_APPROVAL_POLICY);
+    assert_eq!(relay.sandbox, DEFAULT_SANDBOX);
+    assert_eq!(relay.reasoning_effort, DEFAULT_EFFORT);
+    assert_eq!(relay.pending_approvals.len(), 0);
+    assert_eq!(relay.transcript.len(), 1);
+    assert_eq!(relay.transcript[0].text, "ping");
+}
+
+#[tokio::test]
+async fn persistence_store_round_trips_to_disk() {
+    let unique = format!("agent-relay-test-{}-{}", std::process::id(), unix_now());
+    let directory = std::env::temp_dir().join(unique);
+    let path = directory.join("session.json");
+    let store = PersistenceStore::from_path(path);
+    let persisted = test_persisted_state();
+
+    store.save(&persisted).await.expect("state should save");
+    let loaded = store
+        .load()
+        .await
+        .expect("state should load")
+        .expect("state should exist");
+
+    assert_eq!(loaded.active_thread_id, persisted.active_thread_id);
+    assert_eq!(
+        loaded.active_controller_device_id,
+        persisted.active_controller_device_id
+    );
+    assert_eq!(loaded.transcript.len(), 1);
+
+    tokio::fs::remove_dir_all(&directory)
+        .await
+        .expect("temp persisted state directory should be removable");
+}
