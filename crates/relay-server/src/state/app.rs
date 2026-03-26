@@ -469,6 +469,47 @@ impl AppState {
         relay.notify();
         Ok(device_id)
     }
+
+    pub(crate) async fn pending_pairing_secret(&self, pairing_id: &str) -> Result<String, String> {
+        let mut relay = self.relay.write().await;
+        relay.pending_pairing_secret(pairing_id, unix_now())
+    }
+
+    pub(crate) async fn paired_device_secret(&self, device_id: &str) -> Result<String, String> {
+        let relay = self.relay.read().await;
+        relay.paired_device_shared_secret(device_id)
+    }
+
+    pub(crate) async fn mark_remote_device_seen(
+        &self,
+        device_id: &str,
+        peer_id: &str,
+    ) -> Result<(), String> {
+        let mut relay = self.relay.write().await;
+        relay.mark_paired_device_seen(device_id, peer_id, unix_now())?;
+        relay.notify();
+        Ok(())
+    }
+
+    pub(crate) async fn broker_can_read_content(&self) -> bool {
+        let relay = self.relay.read().await;
+        relay.snapshot().broker_can_read_content
+    }
+
+    pub(crate) async fn broker_targets(&self) -> Vec<BrokerTarget> {
+        let relay = self.relay.read().await;
+        relay
+            .paired_devices
+            .values()
+            .filter_map(|device| {
+                device.last_peer_id.as_ref().map(|peer_id| BrokerTarget {
+                    device_id: device.device_id.clone(),
+                    peer_id: peer_id.clone(),
+                    shared_secret: device.shared_secret.clone(),
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -484,4 +525,11 @@ struct SessionDefaults {
     approval_policy: String,
     sandbox: String,
     reasoning_effort: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrokerTarget {
+    pub(crate) device_id: String,
+    pub(crate) peer_id: String,
+    pub(crate) shared_secret: String,
 }

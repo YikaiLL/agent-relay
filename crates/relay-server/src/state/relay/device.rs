@@ -12,6 +12,7 @@ const MAX_PAIRING_TTL_SECS: u64 = 600;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PendingPairing {
     pub(crate) pairing_id: String,
+    pub(crate) pairing_secret: String,
     pub(crate) secret_hash: String,
     pub(crate) created_at: u64,
     pub(crate) expires_at: u64,
@@ -21,6 +22,7 @@ pub(crate) struct PendingPairing {
 pub(crate) struct PairedDevice {
     pub(crate) device_id: String,
     pub(crate) label: String,
+    pub(crate) shared_secret: String,
     pub(crate) token_hash: String,
     pub(crate) created_at: u64,
     pub(crate) last_seen_at: Option<u64>,
@@ -61,6 +63,7 @@ impl RelayState {
             pairing_id.clone(),
             PendingPairing {
                 pairing_id: pairing_id.clone(),
+                pairing_secret: pairing_secret.clone(),
                 secret_hash: sha256_hex(&pairing_secret),
                 created_at: now,
                 expires_at,
@@ -116,6 +119,7 @@ impl RelayState {
             .or_insert_with(|| PairedDevice {
                 device_id: device_id.clone(),
                 label: label.clone(),
+                shared_secret: device_token.clone(),
                 token_hash: token_hash.clone(),
                 created_at: now,
                 last_seen_at: Some(now),
@@ -123,6 +127,7 @@ impl RelayState {
             });
 
         device.label = label;
+        device.shared_secret = device_token.clone();
         device.token_hash = token_hash;
         device.last_seen_at = Some(now);
         device.last_peer_id = Some(peer_id.to_string());
@@ -152,6 +157,36 @@ impl RelayState {
 
     pub fn revoke_paired_device(&mut self, device_id: &str) -> bool {
         self.paired_devices.remove(device_id).is_some()
+    }
+
+    pub fn pending_pairing_secret(&mut self, pairing_id: &str, now: u64) -> Result<String, String> {
+        self.prune_expired_pairings(now);
+        self.pending_pairings
+            .get(pairing_id)
+            .map(|pairing| pairing.pairing_secret.clone())
+            .ok_or_else(|| "pairing request is missing or expired".to_string())
+    }
+
+    pub fn paired_device_shared_secret(&self, device_id: &str) -> Result<String, String> {
+        self.paired_devices
+            .get(device_id)
+            .map(|device| device.shared_secret.clone())
+            .ok_or_else(|| "device is not paired".to_string())
+    }
+
+    pub fn mark_paired_device_seen(
+        &mut self,
+        device_id: &str,
+        peer_id: &str,
+        now: u64,
+    ) -> Result<(), String> {
+        let device = self
+            .paired_devices
+            .get_mut(device_id)
+            .ok_or_else(|| "device is not paired".to_string())?;
+        device.last_seen_at = Some(now);
+        device.last_peer_id = Some(peer_id.to_string());
+        Ok(())
     }
 
     pub fn prune_expired_pairings(&mut self, now: u64) {

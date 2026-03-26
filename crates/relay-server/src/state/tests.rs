@@ -18,6 +18,7 @@ fn test_persisted_state() -> PersistedRelayState {
         PairedDevice {
             device_id: "phone-1".to_string(),
             label: "Primary Phone".to_string(),
+            shared_secret: "shared-secret".to_string(),
             token_hash: "token-hash".to_string(),
             created_at: 7,
             last_seen_at: Some(9),

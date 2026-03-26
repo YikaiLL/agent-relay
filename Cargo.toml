@@ -9,6 +9,8 @@ version = "0.1.0"
 
 [workspace.dependencies]
 axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
+chacha20poly1305 = "0.10"
 futures-util = "0.3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

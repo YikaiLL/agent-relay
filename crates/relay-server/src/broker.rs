@@ -1,3 +1,5 @@
+mod crypto;
+
 use std::time::Duration;
 
 use futures_util::{sink::SinkExt, stream::StreamExt};
@@ -17,6 +19,8 @@ use crate::{
     state::{AppState, ApprovalError},
 };
 
+use self::crypto::{decrypt_json, encrypt_json, EncryptedEnvelope};
+
 const RECONNECT_DELAY_SECS: u64 = 2;
 type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -34,7 +38,13 @@ struct RemoteDeviceAuth {
     device_token: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairingRequestPlaintext {
+    device_id: Option<String>,
+    device_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RemoteActionRequest {
     StartSession {
@@ -132,14 +142,17 @@ impl RemoteActionKind {
 enum InboundBrokerPayload {
     PairingRequest {
         pairing_id: String,
-        pairing_secret: String,
-        device_id: Option<String>,
-        device_label: Option<String>,
+        envelope: EncryptedEnvelope,
     },
     RemoteAction {
         action_id: String,
         auth: RemoteDeviceAuth,
         request: RemoteActionRequest,
+    },
+    EncryptedRemoteAction {
+        action_id: String,
+        device_id: String,
+        envelope: EncryptedEnvelope,
     },
 }
 
@@ -158,14 +171,39 @@ enum OutboundBrokerPayload {
         receipt: Option<ApprovalReceipt>,
         error: Option<String>,
     },
-    PairingResult {
+    EncryptedSessionSnapshot {
+        target_peer_id: String,
+        device_id: String,
+        envelope: EncryptedEnvelope,
+    },
+    EncryptedRemoteActionResult {
+        action_id: String,
+        target_peer_id: String,
+        device_id: String,
+        envelope: EncryptedEnvelope,
+    },
+    EncryptedPairingResult {
         pairing_id: String,
         target_peer_id: String,
-        ok: bool,
-        device: Option<PairedDeviceView>,
-        device_token: Option<String>,
-        error: Option<String>,
+        envelope: EncryptedEnvelope,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PairingResultPlaintext {
+    ok: bool,
+    device: Option<PairedDeviceView>,
+    device_token: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemoteActionResultPlaintext {
+    action: RemoteActionKind,
+    ok: bool,
+    snapshot: SessionSnapshot,
+    receipt: Option<ApprovalReceipt>,
+    error: Option<String>,
 }
 
 impl BrokerConfig {
@@ -325,7 +363,7 @@ async fn run_broker_session(
             format!("Connected to broker channel {}.", config.channel_id),
         )
         .await;
-    publish_snapshot(&mut sender, state.snapshot().await)
+    publish_snapshot(&mut sender, state)
         .await
         .map_err(|error| format!("initial broker publish failed: {error}"))?;
 
@@ -333,7 +371,7 @@ async fn run_broker_session(
         tokio::select! {
             changed = change_rx.changed() => {
                 changed.map_err(|_| "relay change channel closed".to_string())?;
-                publish_snapshot(&mut sender, state.snapshot().await)
+                publish_snapshot(&mut sender, state)
                     .await
                     .map_err(|error| format!("broker publish failed: {error}"))?;
             }
@@ -409,20 +447,9 @@ async fn handle_server_message(
             match parse_inbound_payload(payload)? {
                 Some(InboundBrokerPayload::PairingRequest {
                     pairing_id,
-                    pairing_secret,
-                    device_id,
-                    device_label,
+                    envelope,
                 }) => {
-                    handle_pairing_request(
-                        state,
-                        sender,
-                        from_peer_id,
-                        pairing_id,
-                        pairing_secret,
-                        device_id,
-                        device_label,
-                    )
-                    .await
+                    handle_pairing_request(state, sender, from_peer_id, pairing_id, envelope).await
                 }
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
@@ -431,6 +458,21 @@ async fn handle_server_message(
                 }) => {
                     handle_remote_action(state, sender, from_peer_id, action_id, auth, request)
                         .await
+                }
+                Some(InboundBrokerPayload::EncryptedRemoteAction {
+                    action_id,
+                    device_id,
+                    envelope,
+                }) => {
+                    handle_encrypted_remote_action(
+                        state,
+                        sender,
+                        from_peer_id,
+                        action_id,
+                        device_id,
+                        envelope,
+                    )
+                    .await
                 }
                 None => Ok(()),
             }
@@ -444,22 +486,27 @@ async fn handle_pairing_request(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     from_peer_id: String,
     pairing_id: String,
-    pairing_secret: String,
-    device_id: Option<String>,
-    device_label: Option<String>,
+    envelope: EncryptedEnvelope,
 ) -> Result<(), String> {
+    let pairing_secret = state.pending_pairing_secret(&pairing_id).await?;
+    let pairing_request: PairingRequestPlaintext = decrypt_json(&pairing_secret, &envelope)?;
     let result = state
         .complete_pairing(
             &pairing_id,
             &pairing_secret,
-            device_id,
-            device_label,
+            pairing_request.device_id,
+            pairing_request.device_label,
             &from_peer_id,
         )
         .await;
 
-    let (ok, device, device_token, error) = match result {
-        Ok((device, token)) => (true, Some(device), Some(token), None),
+    let payload = match result {
+        Ok((device, token)) => PairingResultPlaintext {
+            ok: true,
+            device: Some(device),
+            device_token: Some(token),
+            error: None,
+        },
         Err(error) => {
             state
                 .push_runtime_log(
@@ -467,19 +514,22 @@ async fn handle_pairing_request(
                     format!("Broker pairing from {} failed: {error}", from_peer_id),
                 )
                 .await;
-            (false, None, None, Some(error))
+            PairingResultPlaintext {
+                ok: false,
+                device: None,
+                device_token: None,
+                error: Some(error),
+            }
         }
     };
+    let encrypted = encrypt_json(&pairing_secret, &payload)?;
 
     publish_payload(
         sender,
-        OutboundBrokerPayload::PairingResult {
+        OutboundBrokerPayload::EncryptedPairingResult {
             pairing_id,
             target_peer_id: from_peer_id,
-            ok,
-            device,
-            device_token,
-            error,
+            envelope: encrypted,
         },
     )
     .await
@@ -494,6 +544,9 @@ async fn handle_remote_action(
     auth: RemoteDeviceAuth,
     request: RemoteActionRequest,
 ) -> Result<(), String> {
+    if !state.broker_can_read_content().await {
+        return Err("plaintext remote actions are disabled in private mode".to_string());
+    }
     let action_kind = request.kind();
     state
         .push_runtime_log(
@@ -532,20 +585,98 @@ async fn handle_remote_action(
         }
     };
 
-    publish_payload(
-        sender,
-        OutboundBrokerPayload::RemoteActionResult {
+    if state.broker_can_read_content().await {
+        publish_payload(
+            sender,
+            OutboundBrokerPayload::RemoteActionResult {
+                action_id,
+                target_peer_id: from_peer_id,
+                action: action_kind,
+                ok,
+                snapshot,
+                receipt,
+                error,
+            },
+        )
+        .await
+        .map_err(|error| format!("broker action result publish failed: {error}"))
+    } else {
+        publish_remote_action_result_private(
+            state,
+            sender,
+            from_peer_id,
+            auth.device_id,
             action_id,
-            target_peer_id: from_peer_id,
-            action: action_kind,
-            ok,
+            action_kind,
             snapshot,
             receipt,
             error,
-        },
+            ok,
+        )
+        .await
+    }
+}
+
+async fn handle_encrypted_remote_action(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    from_peer_id: String,
+    action_id: String,
+    device_id: String,
+    envelope: EncryptedEnvelope,
+) -> Result<(), String> {
+    let action_kind = decrypt_remote_action_kind(state, &device_id, &envelope).await?;
+    state
+        .push_runtime_log(
+            "info",
+            format!(
+                "Encrypted broker action `{}` received from {}.",
+                action_kind.as_str(),
+                from_peer_id
+            ),
+        )
+        .await;
+
+    let result = match decrypt_remote_action(state, &device_id, &envelope).await {
+        Ok(request) => {
+            state
+                .mark_remote_device_seen(&device_id, &from_peer_id)
+                .await?;
+            execute_remote_action(state, request.bind_device(device_id.clone())).await
+        }
+        Err(error) => Err(error),
+    };
+    let snapshot = state.snapshot().await;
+    let (ok, receipt, error) = match result {
+        Ok(receipt) => (true, receipt, None),
+        Err(error) => {
+            state
+                .push_runtime_log(
+                    "warn",
+                    format!(
+                        "Encrypted broker action `{}` from {} failed: {error}",
+                        action_kind.as_str(),
+                        from_peer_id
+                    ),
+                )
+                .await;
+            (false, None, Some(error))
+        }
+    };
+
+    publish_remote_action_result_private(
+        state,
+        sender,
+        from_peer_id,
+        device_id,
+        action_id,
+        action_kind,
+        snapshot,
+        receipt,
+        error,
+        ok,
     )
     .await
-    .map_err(|error| format!("broker action result publish failed: {error}"))
 }
 
 async fn execute_remote_action(
@@ -574,6 +705,61 @@ async fn execute_remote_action(
     }
 }
 
+async fn decrypt_remote_action_kind(
+    state: &AppState,
+    device_id: &str,
+    envelope: &EncryptedEnvelope,
+) -> Result<RemoteActionKind, String> {
+    let request = decrypt_remote_action(state, device_id, envelope).await?;
+    Ok(request.kind())
+}
+
+async fn decrypt_remote_action(
+    state: &AppState,
+    device_id: &str,
+    envelope: &EncryptedEnvelope,
+) -> Result<RemoteActionRequest, String> {
+    let secret = state.paired_device_secret(device_id).await?;
+    decrypt_json(&secret, envelope)
+}
+
+async fn publish_remote_action_result_private(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    target_peer_id: String,
+    device_id: String,
+    action_id: String,
+    action: RemoteActionKind,
+    snapshot: SessionSnapshot,
+    receipt: Option<ApprovalReceipt>,
+    error: Option<String>,
+    ok: bool,
+) -> Result<(), String> {
+    let secret = state.paired_device_secret(&device_id).await?;
+    let envelope = encrypt_json(
+        &secret,
+        &RemoteActionResultPlaintext {
+            action,
+            ok,
+            snapshot,
+            receipt,
+            error,
+        },
+    )?;
+
+    publish_payload(
+        sender,
+        OutboundBrokerPayload::EncryptedRemoteActionResult {
+            action_id,
+            target_peer_id,
+            device_id,
+            envelope,
+        },
+    )
+    .await
+    .map_err(|error| format!("encrypted broker action result publish failed: {error}"))
+}
+
 fn approval_error_message(error: ApprovalError) -> String {
     match error {
         ApprovalError::NoPendingRequest => {
@@ -585,7 +771,10 @@ fn approval_error_message(error: ApprovalError) -> String {
 
 fn parse_inbound_payload(payload: Value) -> Result<Option<InboundBrokerPayload>, String> {
     let kind = payload.get("kind").and_then(Value::as_str);
-    if !matches!(kind, Some("remote_action" | "pairing_request")) {
+    if !matches!(
+        kind,
+        Some("remote_action" | "pairing_request" | "encrypted_remote_action")
+    ) {
         return Ok(None);
     }
     serde_json::from_value(payload)
@@ -604,9 +793,32 @@ fn server_message_name(message: &ServerMessage) -> &'static str {
 
 async fn publish_snapshot(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
-    snapshot: SessionSnapshot,
-) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-    publish_payload(sender, OutboundBrokerPayload::SessionSnapshot { snapshot }).await
+    state: &AppState,
+) -> Result<(), String> {
+    let snapshot = state.snapshot().await;
+    if state.broker_can_read_content().await {
+        publish_payload(sender, OutboundBrokerPayload::SessionSnapshot { snapshot })
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let targets = state.broker_targets().await;
+    for target in targets {
+        let envelope = encrypt_json(&target.shared_secret, &snapshot)?;
+        publish_payload(
+            sender,
+            OutboundBrokerPayload::EncryptedSessionSnapshot {
+                target_peer_id: target.peer_id,
+                device_id: target.device_id,
+                envelope,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
 
 async fn publish_payload(
@@ -712,12 +924,18 @@ mod tests {
 
     #[test]
     fn parse_inbound_payload_parses_pairing_requests() {
+        let envelope = encrypt_json(
+            "pairing-secret",
+            &PairingRequestPlaintext {
+                device_id: Some("phone-1".to_string()),
+                device_label: Some("My Phone".to_string()),
+            },
+        )
+        .expect("pairing request should encrypt");
         let payload = serde_json::json!({
             "kind": "pairing_request",
             "pairing_id": "pair-1",
-            "pairing_secret": "secret-1",
-            "device_id": "phone-1",
-            "device_label": "My Phone"
+            "envelope": envelope
         });
 
         let request = parse_inbound_payload(payload)
@@ -726,14 +944,57 @@ mod tests {
         match request {
             InboundBrokerPayload::PairingRequest {
                 pairing_id,
-                pairing_secret,
-                device_id,
-                device_label,
+                envelope,
             } => {
                 assert_eq!(pairing_id, "pair-1");
-                assert_eq!(pairing_secret, "secret-1");
-                assert_eq!(device_id.as_deref(), Some("phone-1"));
-                assert_eq!(device_label.as_deref(), Some("My Phone"));
+                let decrypted: PairingRequestPlaintext =
+                    decrypt_json("pairing-secret", &envelope).expect("payload should decrypt");
+                assert_eq!(decrypted.device_id.as_deref(), Some("phone-1"));
+                assert_eq!(decrypted.device_label.as_deref(), Some("My Phone"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_inbound_payload_parses_encrypted_remote_actions() {
+        let envelope = encrypt_json(
+            "device-secret",
+            &RemoteActionRequest::SendMessage {
+                input: SendMessageInput {
+                    text: "encrypted hello".to_string(),
+                    effort: None,
+                    device_id: None,
+                },
+            },
+        )
+        .expect("encrypted action should encrypt");
+        let payload = serde_json::json!({
+            "kind": "encrypted_remote_action",
+            "action_id": "act-2",
+            "device_id": "phone-1",
+            "envelope": envelope
+        });
+
+        let action = parse_inbound_payload(payload)
+            .expect("payload should parse")
+            .expect("payload should be handled");
+        match action {
+            InboundBrokerPayload::EncryptedRemoteAction {
+                action_id,
+                device_id,
+                envelope,
+            } => {
+                assert_eq!(action_id, "act-2");
+                assert_eq!(device_id, "phone-1");
+                let request: RemoteActionRequest =
+                    decrypt_json("device-secret", &envelope).expect("payload should decrypt");
+                match request {
+                    RemoteActionRequest::SendMessage { input } => {
+                        assert_eq!(input.text, "encrypted hello");
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
             }
             other => panic!("unexpected request: {other:?}"),
         }
