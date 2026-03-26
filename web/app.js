@@ -421,6 +421,7 @@ function renderSessionMeta(session) {
   const securityChips = [
     metaChip("Security", securityModeLabel(session)),
     metaChip("Visibility", contentVisibilityLabel(session)),
+    metaChip("Broker", brokerStatusLabel(session)),
   ];
 
   if (!session.active_thread_id) {
@@ -968,6 +969,18 @@ function contentVisibilityLabel(session) {
     return session.audit_enabled ? "Org-readable + audit" : "Readable";
   }
   return session?.e2ee_enabled ? "E2EE broker-blind" : "Broker-blind";
+}
+
+function brokerStatusLabel(session) {
+  if (!session?.broker_channel_id) {
+    return "Disabled";
+  }
+
+  const state = session.broker_connected ? "Connected" : "Offline";
+  const channel = shortId(session.broker_channel_id);
+  return session.broker_peer_id
+    ? `${state} · ${channel} · ${shortId(session.broker_peer_id)}`
+    : `${state} · ${channel}`;
 }
 
 function formatTimestamp(seconds) {

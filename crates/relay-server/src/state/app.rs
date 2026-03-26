@@ -4,6 +4,7 @@ use tokio::sync::{watch, RwLock};
 use tracing::warn;
 
 use crate::{
+    broker,
     codex::CodexBridge,
     protocol::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput,
@@ -77,6 +78,8 @@ impl AppState {
             codex,
             change_tx,
         };
+
+        broker::spawn_broker_task(state.clone())?;
 
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
@@ -360,6 +363,31 @@ impl AppState {
                 relay.notify();
             }
         }
+    }
+
+    pub(crate) async fn set_broker_channel(
+        &self,
+        channel_id: Option<String>,
+        peer_id: Option<String>,
+    ) {
+        let mut relay = self.relay.write().await;
+        relay.set_broker_target(channel_id, peer_id);
+        relay.notify();
+    }
+
+    pub(crate) async fn set_broker_connection(&self, connected: bool) {
+        let mut relay = self.relay.write().await;
+        if relay.broker_connected == connected {
+            return;
+        }
+        relay.set_broker_connection(connected);
+        relay.notify();
+    }
+
+    pub(crate) async fn push_runtime_log(&self, kind: &'static str, message: String) {
+        let mut relay = self.relay.write().await;
+        relay.push_log(kind, message);
+        relay.notify();
     }
 }
 

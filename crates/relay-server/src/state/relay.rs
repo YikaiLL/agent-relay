@@ -23,6 +23,9 @@ pub struct RelayState {
     revision: u64,
     security: SecurityProfile,
     pub codex_connected: bool,
+    pub broker_connected: bool,
+    pub broker_channel_id: Option<String>,
+    pub broker_peer_id: Option<String>,
     pub active_thread_id: Option<String>,
     pub active_controller_device_id: Option<String>,
     pub active_controller_last_seen_at: Option<u64>,
@@ -51,6 +54,9 @@ impl RelayState {
             revision: 0,
             security,
             codex_connected: false,
+            broker_connected: false,
+            broker_channel_id: None,
+            broker_peer_id: None,
             active_thread_id: None,
             active_controller_device_id: None,
             active_controller_last_seen_at: None,
@@ -81,6 +87,9 @@ impl RelayState {
             provider: "codex",
             service_ready: true,
             codex_connected: self.codex_connected,
+            broker_connected: self.broker_connected,
+            broker_channel_id: self.broker_channel_id.clone(),
+            broker_peer_id: self.broker_peer_id.clone(),
             security_mode: self.security.mode(),
             e2ee_enabled: self.security.e2ee_enabled(),
             broker_can_read_content: self.security.broker_can_read_content(),
@@ -213,6 +222,15 @@ impl RelayState {
 
     pub fn set_connection(&mut self, connected: bool) {
         self.codex_connected = connected;
+    }
+
+    pub fn set_broker_connection(&mut self, connected: bool) {
+        self.broker_connected = connected;
+    }
+
+    pub fn set_broker_target(&mut self, channel_id: Option<String>, peer_id: Option<String>) {
+        self.broker_channel_id = channel_id;
+        self.broker_peer_id = peer_id;
     }
 
     pub fn set_active_turn(&mut self, turn_id: Option<String>) {

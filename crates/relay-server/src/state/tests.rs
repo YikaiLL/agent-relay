@@ -109,6 +109,9 @@ fn snapshot_exposes_private_security_mode_defaults() {
         snapshot.security_mode,
         crate::protocol::SecurityMode::Private
     );
+    assert!(!snapshot.broker_connected);
+    assert_eq!(snapshot.broker_channel_id, None);
+    assert_eq!(snapshot.broker_peer_id, None);
     assert!(snapshot.e2ee_enabled);
     assert!(!snapshot.broker_can_read_content);
     assert!(!snapshot.audit_enabled);

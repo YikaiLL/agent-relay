@@ -1,4 +1,5 @@
 mod auth;
+mod broker;
 mod codex;
 mod protocol;
 mod state;
