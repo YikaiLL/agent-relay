@@ -9,7 +9,9 @@ use tracing::warn;
 
 use crate::protocol::LogEntryView;
 
-use super::{RelayState, TranscriptRecord, DEFAULT_STATE_FILE, PERSISTED_STATE_VERSION};
+use super::{
+    PairedDevice, RelayState, TranscriptRecord, DEFAULT_STATE_FILE, PERSISTED_STATE_VERSION,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct PersistedRelayState {
@@ -24,6 +26,8 @@ pub(super) struct PersistedRelayState {
     pub(super) approval_policy: String,
     pub(super) sandbox: String,
     pub(super) reasoning_effort: String,
+    #[serde(default)]
+    pub(super) paired_devices: std::collections::HashMap<String, PairedDevice>,
     pub(super) transcript: Vec<TranscriptRecord>,
     pub(super) logs: Vec<LogEntryView>,
 }
@@ -42,6 +46,7 @@ impl PersistedRelayState {
             approval_policy: relay.approval_policy.clone(),
             sandbox: relay.sandbox.clone(),
             reasoning_effort: relay.reasoning_effort.clone(),
+            paired_devices: relay.paired_devices.clone(),
             transcript: relay.transcript.clone(),
             logs: relay.logs.clone(),
         }

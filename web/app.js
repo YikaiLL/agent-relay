@@ -422,6 +422,7 @@ function renderSessionMeta(session) {
     metaChip("Security", securityModeLabel(session)),
     metaChip("Visibility", contentVisibilityLabel(session)),
     metaChip("Broker", brokerStatusLabel(session)),
+    metaChip("Devices", pairedDeviceCountLabel(session)),
   ];
 
   if (!session.active_thread_id) {
@@ -981,6 +982,13 @@ function brokerStatusLabel(session) {
   return session.broker_peer_id
     ? `${state} · ${channel} · ${shortId(session.broker_peer_id)}`
     : `${state} · ${channel}`;
+}
+
+function pairedDeviceCountLabel(session) {
+  const count = Array.isArray(session?.paired_devices)
+    ? session.paired_devices.length
+    : 0;
+  return count === 0 ? "None" : `${count} paired`;
 }
 
 function formatTimestamp(seconds) {

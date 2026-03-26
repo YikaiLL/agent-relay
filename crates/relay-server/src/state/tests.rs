@@ -12,6 +12,18 @@ use super::{
 };
 
 fn test_persisted_state() -> PersistedRelayState {
+    let mut paired_devices = std::collections::HashMap::new();
+    paired_devices.insert(
+        "phone-1".to_string(),
+        PairedDevice {
+            device_id: "phone-1".to_string(),
+            label: "Primary Phone".to_string(),
+            token_hash: "token-hash".to_string(),
+            created_at: 7,
+            last_seen_at: Some(9),
+            last_peer_id: Some("surface-1".to_string()),
+        },
+    );
     PersistedRelayState {
         schema_version: PERSISTED_STATE_VERSION,
         active_thread_id: Some("thread-1".to_string()),
@@ -24,6 +36,7 @@ fn test_persisted_state() -> PersistedRelayState {
         approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
         sandbox: DEFAULT_SANDBOX.to_string(),
         reasoning_effort: DEFAULT_EFFORT.to_string(),
+        paired_devices,
         transcript: vec![TranscriptRecord {
             item_id: "history-0".to_string(),
             role: "assistant".to_string(),
@@ -115,6 +128,7 @@ fn snapshot_exposes_private_security_mode_defaults() {
     assert!(snapshot.e2ee_enabled);
     assert!(!snapshot.broker_can_read_content);
     assert!(!snapshot.audit_enabled);
+    assert!(snapshot.paired_devices.is_empty());
 }
 
 #[test]
@@ -321,6 +335,7 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
     assert_eq!(restored.active_controller_last_seen_at, Some(99));
     assert_eq!(restored.active_turn_id, None);
     assert_eq!(restored.pending_approvals.len(), 0);
+    assert_eq!(restored.paired_devices.len(), 0);
     assert_eq!(restored.transcript.len(), 1);
     assert_eq!(restored.logs.len(), persisted.logs.len());
     assert_eq!(restored.logs[0].message, persisted.logs[0].message);
@@ -359,9 +374,100 @@ fn restore_thread_data_keeps_persisted_controller_and_settings() {
     assert_eq!(relay.approval_policy, DEFAULT_APPROVAL_POLICY);
     assert_eq!(relay.sandbox, DEFAULT_SANDBOX);
     assert_eq!(relay.reasoning_effort, DEFAULT_EFFORT);
+    assert_eq!(relay.paired_devices.len(), 1);
     assert_eq!(relay.pending_approvals.len(), 0);
     assert_eq!(relay.transcript.len(), 1);
     assert_eq!(relay.transcript[0].text, "ping");
+}
+
+#[test]
+fn pairing_ticket_registers_and_authenticates_remote_device() {
+    let mut relay = test_state();
+    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+
+    let (device, token) = relay
+        .consume_pairing_ticket(
+            &ticket.pairing_id,
+            &ticket.pairing_secret,
+            Some("My Phone".to_string()),
+            Some("Primary Phone".to_string()),
+            "surface-a",
+            100,
+        )
+        .expect("pairing should succeed");
+
+    assert_eq!(device.device_id, "my-phone");
+    assert_eq!(device.label, "Primary Phone");
+    assert_eq!(relay.pending_pairings.len(), 0);
+    assert_eq!(relay.paired_devices.len(), 1);
+
+    let authenticated = relay
+        .authenticate_paired_device(&device.device_id, &token, "surface-b", 101)
+        .expect("device token should authenticate");
+    assert_eq!(authenticated, "my-phone");
+    assert_eq!(
+        relay
+            .paired_devices
+            .get("my-phone")
+            .and_then(|device| device.last_peer_id.as_deref()),
+        Some("surface-b")
+    );
+}
+
+#[test]
+fn pairing_rejects_invalid_secret_and_bad_device_token() {
+    let mut relay = test_state();
+    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+
+    let error = relay
+        .consume_pairing_ticket(
+            &ticket.pairing_id,
+            "wrong-secret",
+            Some("phone-2".to_string()),
+            None,
+            "surface-a",
+            100,
+        )
+        .expect_err("invalid pairing secret should fail");
+    assert!(error.contains("invalid"));
+
+    let replacement =
+        relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let (device, token) = relay
+        .consume_pairing_ticket(
+            &replacement.pairing_id,
+            &replacement.pairing_secret,
+            Some("phone-2".to_string()),
+            None,
+            "surface-a",
+            100,
+        )
+        .expect("replacement ticket should pair");
+    let auth_error = relay
+        .authenticate_paired_device(&device.device_id, "bad-token", "surface-a", 101)
+        .expect_err("bad device token should fail");
+    assert!(auth_error.contains("invalid"));
+    assert_ne!(token, "bad-token");
+}
+
+#[test]
+fn revoking_paired_device_removes_it() {
+    let mut relay = test_state();
+    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let (device, _token) = relay
+        .consume_pairing_ticket(
+            &ticket.pairing_id,
+            &ticket.pairing_secret,
+            Some("tablet".to_string()),
+            Some("Tablet".to_string()),
+            "surface-tablet",
+            100,
+        )
+        .expect("pairing should succeed");
+
+    assert!(relay.revoke_paired_device(&device.device_id));
+    assert!(!relay.revoke_paired_device(&device.device_id));
+    assert!(relay.paired_devices.is_empty());
 }
 
 #[tokio::test]

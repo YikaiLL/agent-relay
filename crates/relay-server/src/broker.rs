@@ -11,8 +11,8 @@ use url::Url;
 
 use crate::{
     protocol::{
-        ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput, ResumeSessionInput,
-        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
+        ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput, PairedDeviceView,
+        ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
     },
     state::{AppState, ApprovalError},
 };
@@ -22,9 +22,16 @@ type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
+    base_url: String,
     url: Url,
     pub channel_id: String,
     pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteDeviceAuth {
+    device_id: String,
+    device_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +69,38 @@ impl RemoteActionRequest {
             Self::DecideApproval { .. } => RemoteActionKind::DecideApproval,
         }
     }
+
+    fn bind_device(self, device_id: String) -> Self {
+        match self {
+            Self::StartSession { mut input } => {
+                input.device_id = Some(device_id);
+                Self::StartSession { input }
+            }
+            Self::ResumeSession { mut input } => {
+                input.device_id = Some(device_id);
+                Self::ResumeSession { input }
+            }
+            Self::SendMessage { mut input } => {
+                input.device_id = Some(device_id);
+                Self::SendMessage { input }
+            }
+            Self::TakeOver { mut input } => {
+                input.device_id = Some(device_id);
+                Self::TakeOver { input }
+            }
+            Self::Heartbeat { mut input } => {
+                input.device_id = Some(device_id);
+                Self::Heartbeat { input }
+            }
+            Self::DecideApproval {
+                request_id,
+                mut input,
+            } => {
+                input.device_id = Some(device_id);
+                Self::DecideApproval { request_id, input }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,9 +128,19 @@ impl RemoteActionKind {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RemoteActionEnvelope {
-    action_id: String,
-    request: RemoteActionRequest,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InboundBrokerPayload {
+    PairingRequest {
+        pairing_id: String,
+        pairing_secret: String,
+        device_id: Option<String>,
+        device_label: Option<String>,
+    },
+    RemoteAction {
+        action_id: String,
+        auth: RemoteDeviceAuth,
+        request: RemoteActionRequest,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,10 +151,19 @@ enum OutboundBrokerPayload {
     },
     RemoteActionResult {
         action_id: String,
+        target_peer_id: String,
         action: RemoteActionKind,
         ok: bool,
         snapshot: SessionSnapshot,
         receipt: Option<ApprovalReceipt>,
+        error: Option<String>,
+    },
+    PairingResult {
+        pairing_id: String,
+        target_peer_id: String,
+        ok: bool,
+        device: Option<PairedDeviceView>,
+        device_token: Option<String>,
         error: Option<String>,
     },
 }
@@ -138,6 +196,10 @@ impl BrokerConfig {
         if scheme != "ws" && scheme != "wss" {
             return Err("RELAY_BROKER_URL must use ws:// or wss://".to_string());
         }
+        let mut base_url = url.clone();
+        base_url.set_path("");
+        base_url.set_query(None);
+        let base_url = base_url.as_str().trim_end_matches('/').to_string();
 
         {
             let mut segments = url.path_segments_mut().map_err(|_| {
@@ -153,10 +215,15 @@ impl BrokerConfig {
             .append_pair("role", "relay");
 
         Ok(Some(Self {
+            base_url,
             url,
             channel_id,
             peer_id,
         }))
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 }
 
@@ -339,22 +406,95 @@ async fn handle_server_message(
                 return Ok(());
             }
 
-            let Some(action) = extract_remote_action(payload)? else {
-                return Ok(());
-            };
-            handle_remote_action(state, sender, from_peer_id, action).await
+            match parse_inbound_payload(payload)? {
+                Some(InboundBrokerPayload::PairingRequest {
+                    pairing_id,
+                    pairing_secret,
+                    device_id,
+                    device_label,
+                }) => {
+                    handle_pairing_request(
+                        state,
+                        sender,
+                        from_peer_id,
+                        pairing_id,
+                        pairing_secret,
+                        device_id,
+                        device_label,
+                    )
+                    .await
+                }
+                Some(InboundBrokerPayload::RemoteAction {
+                    action_id,
+                    auth,
+                    request,
+                }) => {
+                    handle_remote_action(state, sender, from_peer_id, action_id, auth, request)
+                        .await
+                }
+                None => Ok(()),
+            }
         }
         ServerMessage::Error { message, .. } => Err(message),
     }
+}
+
+async fn handle_pairing_request(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    from_peer_id: String,
+    pairing_id: String,
+    pairing_secret: String,
+    device_id: Option<String>,
+    device_label: Option<String>,
+) -> Result<(), String> {
+    let result = state
+        .complete_pairing(
+            &pairing_id,
+            &pairing_secret,
+            device_id,
+            device_label,
+            &from_peer_id,
+        )
+        .await;
+
+    let (ok, device, device_token, error) = match result {
+        Ok((device, token)) => (true, Some(device), Some(token), None),
+        Err(error) => {
+            state
+                .push_runtime_log(
+                    "warn",
+                    format!("Broker pairing from {} failed: {error}", from_peer_id),
+                )
+                .await;
+            (false, None, None, Some(error))
+        }
+    };
+
+    publish_payload(
+        sender,
+        OutboundBrokerPayload::PairingResult {
+            pairing_id,
+            target_peer_id: from_peer_id,
+            ok,
+            device,
+            device_token,
+            error,
+        },
+    )
+    .await
+    .map_err(|error| format!("broker pairing result publish failed: {error}"))
 }
 
 async fn handle_remote_action(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     from_peer_id: String,
-    action: RemoteActionEnvelope,
+    action_id: String,
+    auth: RemoteDeviceAuth,
+    request: RemoteActionRequest,
 ) -> Result<(), String> {
-    let action_kind = action.request.kind();
+    let action_kind = request.kind();
     state
         .push_runtime_log(
             "info",
@@ -366,7 +506,13 @@ async fn handle_remote_action(
         )
         .await;
 
-    let result = execute_remote_action(state, action.request).await;
+    let result = match state
+        .authenticate_remote_device(&auth.device_id, &auth.device_token, &from_peer_id)
+        .await
+    {
+        Ok(device_id) => execute_remote_action(state, request.bind_device(device_id)).await,
+        Err(error) => Err(error),
+    };
     let snapshot = state.snapshot().await;
 
     let (ok, receipt, error) = match result {
@@ -389,7 +535,8 @@ async fn handle_remote_action(
     publish_payload(
         sender,
         OutboundBrokerPayload::RemoteActionResult {
-            action_id: action.action_id,
+            action_id,
+            target_peer_id: from_peer_id,
             action: action_kind,
             ok,
             snapshot,
@@ -436,14 +583,14 @@ fn approval_error_message(error: ApprovalError) -> String {
     }
 }
 
-fn extract_remote_action(payload: Value) -> Result<Option<RemoteActionEnvelope>, String> {
-    if payload.get("kind").and_then(Value::as_str) != Some("remote_action") {
+fn parse_inbound_payload(payload: Value) -> Result<Option<InboundBrokerPayload>, String> {
+    let kind = payload.get("kind").and_then(Value::as_str);
+    if !matches!(kind, Some("remote_action" | "pairing_request")) {
         return Ok(None);
     }
-
     serde_json::from_value(payload)
         .map(Some)
-        .map_err(|error| format!("invalid remote action payload: {error}"))
+        .map_err(|error| format!("invalid broker payload: {error}"))
 }
 
 fn server_message_name(message: &ServerMessage) -> &'static str {
@@ -503,6 +650,7 @@ mod tests {
         .expect("config should parse")
         .expect("config should be enabled");
 
+        assert_eq!(config.base_url(), "ws://127.0.0.1:8788");
         assert_eq!(
             config.url.as_str(),
             "ws://127.0.0.1:8788/ws/demo-room?peer_id=relay-1&role=relay"
@@ -528,34 +676,71 @@ mod tests {
     }
 
     #[test]
-    fn extract_remote_action_parses_send_message_requests() {
+    fn parse_inbound_payload_parses_remote_action_requests() {
         let payload = serde_json::json!({
             "kind": "remote_action",
             "action_id": "act-1",
+            "auth": {
+                "device_id": "phone-1",
+                "device_token": "token-1"
+            },
             "request": {
                 "type": "send_message",
                 "input": {
-                    "text": "hello",
-                    "device_id": "phone-1"
+                    "text": "hello"
                 }
             }
         });
 
-        let action = extract_remote_action(payload)
+        let action = parse_inbound_payload(payload)
             .expect("payload should parse")
             .expect("payload should be handled");
-        assert_eq!(action.action_id, "act-1");
-        match action.request {
-            RemoteActionRequest::SendMessage { input } => {
+        match action {
+            InboundBrokerPayload::RemoteAction {
+                action_id,
+                auth,
+                request: RemoteActionRequest::SendMessage { input },
+            } => {
+                assert_eq!(action_id, "act-1");
+                assert_eq!(auth.device_id, "phone-1");
+                assert_eq!(auth.device_token, "token-1");
                 assert_eq!(input.text, "hello");
-                assert_eq!(input.device_id.as_deref(), Some("phone-1"));
             }
             other => panic!("unexpected request: {other:?}"),
         }
     }
 
     #[test]
-    fn extract_remote_action_ignores_non_action_payloads() {
+    fn parse_inbound_payload_parses_pairing_requests() {
+        let payload = serde_json::json!({
+            "kind": "pairing_request",
+            "pairing_id": "pair-1",
+            "pairing_secret": "secret-1",
+            "device_id": "phone-1",
+            "device_label": "My Phone"
+        });
+
+        let request = parse_inbound_payload(payload)
+            .expect("payload should parse")
+            .expect("pairing request should be handled");
+        match request {
+            InboundBrokerPayload::PairingRequest {
+                pairing_id,
+                pairing_secret,
+                device_id,
+                device_label,
+            } => {
+                assert_eq!(pairing_id, "pair-1");
+                assert_eq!(pairing_secret, "secret-1");
+                assert_eq!(device_id.as_deref(), Some("phone-1"));
+                assert_eq!(device_label.as_deref(), Some("My Phone"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_inbound_payload_ignores_non_action_payloads() {
         let payload = serde_json::json!({
             "kind": "session_snapshot",
             "snapshot": {
@@ -563,7 +748,7 @@ mod tests {
             }
         });
 
-        let action = extract_remote_action(payload).expect("non-action payload should be ignored");
+        let action = parse_inbound_payload(payload).expect("non-action payload should be ignored");
         assert!(action.is_none());
     }
 }

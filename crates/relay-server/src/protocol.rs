@@ -76,9 +76,19 @@ pub struct SessionSnapshot {
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
+    pub paired_devices: Vec<PairedDeviceView>,
     pub pending_approvals: Vec<ApprovalRequestView>,
     pub transcript: Vec<TranscriptEntryView>,
     pub logs: Vec<LogEntryView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairedDeviceView {
+    pub device_id: String,
+    pub label: String,
+    pub created_at: u64,
+    pub last_seen_at: Option<u64>,
+    pub last_peer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +164,28 @@ pub struct ThreadSummaryView {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadsResponse {
     pub threads: Vec<ThreadSummaryView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairingStartInput {
+    pub expires_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingTicketView {
+    pub pairing_id: String,
+    pub pairing_secret: String,
+    pub expires_at: u64,
+    pub broker_url: String,
+    pub broker_channel_id: String,
+    pub relay_peer_id: String,
+    pub security_mode: SecurityMode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevokeDeviceReceipt {
+    pub device_id: String,
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

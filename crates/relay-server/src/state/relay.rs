@@ -1,4 +1,5 @@
 mod approval;
+mod device;
 mod transcript;
 
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use super::{
 };
 
 pub use self::approval::{ApprovalKind, PendingApproval};
+pub(crate) use self::device::{PairedDevice, PendingPairing};
 pub(crate) use self::transcript::TranscriptRecord;
 
 pub struct RelayState {
@@ -37,6 +39,8 @@ pub struct RelayState {
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
+    pub paired_devices: HashMap<String, PairedDevice>,
+    pub pending_pairings: HashMap<String, PendingPairing>,
     pub threads: Vec<ThreadSummaryView>,
     pub pending_approvals: HashMap<String, PendingApproval>,
     pub(super) transcript: Vec<TranscriptRecord>,
@@ -68,6 +72,8 @@ impl RelayState {
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
             sandbox: DEFAULT_SANDBOX.to_string(),
             reasoning_effort: DEFAULT_EFFORT.to_string(),
+            paired_devices: HashMap::new(),
+            pending_pairings: HashMap::new(),
             threads: Vec::new(),
             pending_approvals: HashMap::new(),
             transcript: Vec::new(),
@@ -83,6 +89,14 @@ impl RelayState {
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
+        let mut paired_devices = self
+            .paired_devices
+            .values()
+            .cloned()
+            .map(|device| device.to_view())
+            .collect::<Vec<_>>();
+        paired_devices.sort_by(|left, right| left.label.cmp(&right.label));
+
         SessionSnapshot {
             provider: "codex",
             service_ready: true,
@@ -107,6 +121,7 @@ impl RelayState {
             approval_policy: self.approval_policy.clone(),
             sandbox: self.sandbox.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            paired_devices,
             pending_approvals: self
                 .pending_approvals
                 .values()
@@ -196,6 +211,8 @@ impl RelayState {
         self.approval_policy = persisted.approval_policy.clone();
         self.sandbox = persisted.sandbox.clone();
         self.reasoning_effort = persisted.reasoning_effort.clone();
+        self.paired_devices = persisted.paired_devices.clone();
+        self.pending_pairings.clear();
         self.pending_approvals.clear();
         self.transcript = data
             .transcript
@@ -349,6 +366,8 @@ impl RelayState {
         self.approval_policy = persisted.approval_policy.clone();
         self.sandbox = persisted.sandbox.clone();
         self.reasoning_effort = persisted.reasoning_effort.clone();
+        self.paired_devices = persisted.paired_devices.clone();
+        self.pending_pairings.clear();
         self.pending_approvals.clear();
         self.transcript = persisted.transcript.clone();
         self.logs = persisted.logs.clone();

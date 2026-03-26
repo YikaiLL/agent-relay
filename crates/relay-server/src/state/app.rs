@@ -4,12 +4,12 @@ use tokio::sync::{watch, RwLock};
 use tracing::warn;
 
 use crate::{
-    broker,
+    broker::BrokerConfig,
     codex::CodexBridge,
     protocol::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput,
-        ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
-        ThreadsResponse,
+        PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
+        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsResponse,
     },
 };
 
@@ -79,7 +79,7 @@ impl AppState {
             change_tx,
         };
 
-        broker::spawn_broker_task(state.clone())?;
+        crate::broker::spawn_broker_task(state.clone())?;
 
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
@@ -312,6 +312,45 @@ impl AppState {
         })
     }
 
+    pub async fn start_pairing(
+        &self,
+        input: PairingStartInput,
+    ) -> Result<PairingTicketView, String> {
+        let broker = BrokerConfig::from_env()?.ok_or_else(|| {
+            "broker pairing is unavailable because RELAY_BROKER_URL is not configured".to_string()
+        })?;
+
+        let mut relay = self.relay.write().await;
+        let ticket = relay.issue_pairing_ticket(
+            broker.base_url(),
+            &broker.channel_id,
+            &broker.peer_id,
+            input.expires_in_seconds,
+        );
+        relay.push_log(
+            "info",
+            format!(
+                "Started pairing ticket {} for broker channel {}.",
+                ticket.pairing_id, ticket.broker_channel_id
+            ),
+        );
+        relay.notify();
+        Ok(ticket)
+    }
+
+    pub async fn revoke_device(&self, device_id: &str) -> Result<RevokeDeviceReceipt, String> {
+        let mut relay = self.relay.write().await;
+        let revoked = relay.revoke_paired_device(device_id);
+        if revoked {
+            relay.push_log("info", format!("Revoked paired device {device_id}."));
+            relay.notify();
+        }
+        Ok(RevokeDeviceReceipt {
+            device_id: device_id.to_string(),
+            revoked,
+        })
+    }
+
     async fn defaults(&self) -> SessionDefaults {
         let relay = self.relay.read().await;
         SessionDefaults {
@@ -388,6 +427,47 @@ impl AppState {
         let mut relay = self.relay.write().await;
         relay.push_log(kind, message);
         relay.notify();
+    }
+
+    pub(crate) async fn complete_pairing(
+        &self,
+        pairing_id: &str,
+        pairing_secret: &str,
+        requested_device_id: Option<String>,
+        device_label: Option<String>,
+        peer_id: &str,
+    ) -> Result<(crate::protocol::PairedDeviceView, String), String> {
+        let mut relay = self.relay.write().await;
+        let (device, token) = relay.consume_pairing_ticket(
+            pairing_id,
+            pairing_secret,
+            requested_device_id,
+            device_label,
+            peer_id,
+            unix_now(),
+        )?;
+        relay.push_log(
+            "info",
+            format!(
+                "Paired remote device {} from broker peer {}.",
+                device.device_id, peer_id
+            ),
+        );
+        relay.notify();
+        Ok((device, token))
+    }
+
+    pub(crate) async fn authenticate_remote_device(
+        &self,
+        device_id: &str,
+        device_token: &str,
+        peer_id: &str,
+    ) -> Result<String, String> {
+        let mut relay = self.relay.write().await;
+        let device_id =
+            relay.authenticate_paired_device(device_id, device_token, peer_id, unix_now())?;
+        relay.notify();
+        Ok(device_id)
     }
 }
 

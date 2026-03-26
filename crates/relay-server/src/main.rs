@@ -22,8 +22,9 @@ use axum::{
 use futures_util::stream::{self, StreamExt};
 use protocol::{
     ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, HealthResponse, HeartbeatInput,
-    ResumeSessionInput, SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput,
-    ThreadsQuery, ThreadsResponse,
+    PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
+    SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsQuery,
+    ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -67,6 +68,8 @@ async fn main() {
         .route("/api/session/heartbeat", post(session_heartbeat))
         .route("/api/session/take-over", post(take_over_session))
         .route("/api/session/message", post(send_message))
+        .route("/api/pairing/start", post(start_pairing))
+        .route("/api/devices/:device_id/revoke", post(revoke_device))
         .route("/api/approvals/:request_id", post(decide_approval))
         .route_service("/", ServeFile::new(web_root.join("index.html")))
         .nest_service("/static", ServeDir::new(web_root))
@@ -265,6 +268,36 @@ async fn decide_approval(
                 Json(ApiError::new("approval_failed", message)),
             ),
         })
+}
+
+async fn start_pairing(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<PairingStartInput>,
+) -> Result<Json<ApiEnvelope<PairingTicketView>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .start_pairing(input)
+        .await
+        .map(|ticket| Json(ApiEnvelope::ok(ticket)))
+        .map_err(bad_request)
+}
+
+async fn revoke_device(
+    Path(device_id): Path<String>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<RevokeDeviceReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .revoke_device(&device_id)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
 }
 
 fn authorize_api(
