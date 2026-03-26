@@ -9,6 +9,7 @@ aes-gcm.workspace = true
 axum.workspace = true
 base64.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 qrcode.workspace = true
 rand.workspace = true
 relay-broker = { path = "../relay-broker" }

@@ -39,6 +39,8 @@ const remoteThreadsCount = document.querySelector("#remote-threads-count");
 const remoteThreadsCwdInput = document.querySelector("#remote-threads-cwd-input");
 const remoteThreadsList = document.querySelector("#remote-threads-list");
 const deviceMeta = document.querySelector("#device-meta");
+const remoteDeviceOverview = document.querySelector("#remote-device-overview");
+const remoteSessionOverview = document.querySelector("#remote-session-overview");
 const remoteWorkspaceTitle = document.querySelector("#remote-workspace-title");
 const remoteWorkspaceSubtitle = document.querySelector("#remote-workspace-subtitle");
 const remoteStatusBadge = document.querySelector("#remote-status-badge");
@@ -107,6 +109,7 @@ async function boot() {
   setRemoteSessionPanelOpen(false);
   applyPairingQuery();
   renderDeviceMeta();
+  renderOverviewCards();
   renderEmptyState();
   renderThreads([]);
 
@@ -186,7 +189,7 @@ function connectBroker(reason) {
     }
 
     if (state.remoteAuth) {
-      void syncRemoteSnapshot();
+      void claimRemoteDevice();
     }
   });
 
@@ -366,6 +369,8 @@ async function handleEncryptedPairingResult(payload) {
     deviceId: device.device_id,
     deviceLabel: device.label,
     deviceToken: result.device_token,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
   };
   saveRemoteAuth(state.remoteAuth);
   state.pairingTicket = null;
@@ -373,7 +378,7 @@ async function handleEncryptedPairingResult(payload) {
   clearPairingQueryFromUrl();
   renderDeviceMeta();
   logLine(`Paired remote device ${device.label} (${shortId(device.device_id)}).`);
-  await syncRemoteSnapshot();
+  await claimRemoteDevice();
 }
 
 async function handleEncryptedSessionSnapshot(payload) {
@@ -401,6 +406,13 @@ async function handleEncryptedRemoteActionResult(payload) {
 }
 
 function handleRemoteActionResult(result) {
+  if (result.session_claim && state.remoteAuth) {
+    state.remoteAuth.sessionClaim = result.session_claim;
+    state.remoteAuth.sessionClaimExpiresAt = result.session_claim_expires_at || null;
+    saveRemoteAuth(state.remoteAuth);
+    renderDeviceMeta();
+  }
+
   if (result.snapshot) {
     renderSession(result.snapshot);
   }
@@ -411,6 +423,11 @@ function handleRemoteActionResult(result) {
   }
 
   if (result.ok) {
+    if (result.action === "claim_device") {
+      logLine("Remote device claim is active.");
+      void syncRemoteSnapshot();
+      return;
+    }
     if (result.receipt?.message) {
       logLine(result.receipt.message);
     } else {
@@ -419,7 +436,26 @@ function handleRemoteActionResult(result) {
     return;
   }
 
+  if (result.error?.includes("session claim") && state.remoteAuth) {
+    state.remoteAuth.sessionClaim = null;
+    state.remoteAuth.sessionClaimExpiresAt = null;
+    saveRemoteAuth(state.remoteAuth);
+    renderDeviceMeta();
+  }
+
   logLine(`Remote ${result.action} failed: ${result.error || "unknown error"}`);
+}
+
+async function claimRemoteDevice() {
+  if (!state.remoteAuth) {
+    return;
+  }
+
+  try {
+    await sendRemoteAction("claim_device", {});
+  } catch (error) {
+    logLine(`Device claim failed: ${error.message}`);
+  }
 }
 
 async function syncRemoteSnapshot() {
@@ -575,14 +611,44 @@ async function sendRemoteAction(actionType, request) {
 
   const actionId = `act-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 
+  if (actionType === "claim_device") {
+    if (state.remoteAuth.securityMode === "managed") {
+      sendBrokerFrame({
+        kind: "remote_action",
+        action_id: actionId,
+        auth: {
+          device_id: state.remoteAuth.deviceId,
+          device_token: state.remoteAuth.deviceToken,
+        },
+        request: {
+          type: actionType,
+          ...request,
+        },
+      });
+      return actionId;
+    }
+
+    sendBrokerFrame({
+      kind: "encrypted_remote_action",
+      action_id: actionId,
+      device_id: state.remoteAuth.deviceId,
+      envelope: await encryptJson(state.remoteAuth.deviceToken, {
+        type: actionType,
+        ...request,
+      }),
+    });
+    return actionId;
+  }
+
+  if (!state.remoteAuth.sessionClaim) {
+    throw new Error("device is not claimed yet");
+  }
+
   if (state.remoteAuth.securityMode === "managed") {
     sendBrokerFrame({
       kind: "remote_action",
       action_id: actionId,
-      auth: {
-        device_id: state.remoteAuth.deviceId,
-        device_token: state.remoteAuth.deviceToken,
-      },
+      session_claim: state.remoteAuth.sessionClaim,
       request: {
         type: actionType,
         ...request,
@@ -594,7 +660,7 @@ async function sendRemoteAction(actionType, request) {
   sendBrokerFrame({
     kind: "encrypted_remote_action",
     action_id: actionId,
-    device_id: state.remoteAuth.deviceId,
+    session_claim: state.remoteAuth.sessionClaim,
     envelope: await encryptJson(state.remoteAuth.deviceToken, {
       type: actionType,
       ...request,
@@ -646,6 +712,7 @@ function renderSession(session) {
   }
 
   renderSessionMeta(session);
+  renderOverviewCards();
   renderControlBanner(session);
   renderTranscript(session.transcript || [], approval);
   renderLogs(session.logs || []);
@@ -709,6 +776,7 @@ function renderSessionMeta(session) {
     metaChip("Visibility", contentVisibilityLabel(session)),
     metaChip("Broker", brokerStatusLabel(session)),
     metaChip("Device", state.remoteAuth?.deviceLabel || "Unpaired"),
+    metaChip("Claim", sessionClaimLabel()),
     metaChip(
       "Control",
       session.active_controller_device_id
@@ -856,6 +924,7 @@ function renderLogs(entries) {
 function renderDeviceMeta() {
   if (!state.remoteAuth && !state.pairingTicket) {
     deviceMeta.innerHTML = `<p class="sidebar-empty">No paired remote device stored in this browser.</p>`;
+    renderOverviewCards();
     return;
   }
 
@@ -877,14 +946,21 @@ function renderDeviceMeta() {
       <article class="paired-device-card">
         <div class="paired-device-copy">
           <strong>${escapeHtml(state.remoteAuth.deviceLabel)}</strong>
-          <p class="paired-device-meta">${escapeHtml(shortId(state.remoteAuth.deviceId))} · ${escapeHtml(state.remoteAuth.securityMode)}</p>
-          <p class="paired-device-meta">${escapeHtml(state.remoteAuth.brokerChannelId)} · ${escapeHtml(shortId(state.remoteAuth.relayPeerId))}</p>
+          <div class="paired-device-badges">
+            ${statusBadgeMarkup("Paired", "ready")}
+            ${statusBadgeMarkup(securityModeLabel(state.session), state.remoteAuth.securityMode === "managed" ? "alert" : "ready")}
+            ${statusBadgeMarkup(sessionClaimStatusText(), sessionClaimBadgeTone())}
+          </div>
+          <p class="paired-device-meta">Device ${escapeHtml(shortId(state.remoteAuth.deviceId))}</p>
+          <p class="paired-device-meta">Broker ${escapeHtml(state.remoteAuth.brokerChannelId)} via ${escapeHtml(shortId(state.remoteAuth.relayPeerId))}</p>
+          <p class="paired-device-meta">${escapeHtml(sessionClaimLabel())}</p>
         </div>
       </article>
     `);
   }
 
   deviceMeta.innerHTML = rows.join("");
+  renderOverviewCards();
 }
 
 function renderEmptyState() {
@@ -916,6 +992,7 @@ function forgetCurrentDevice() {
   renderDeviceMeta();
   renderThreads([]);
   renderEmptyState();
+  renderOverviewCards();
   remoteSessionMeta.innerHTML = `<span class="meta-empty">Pair a remote device to start streaming session details.</span>`;
   remoteControlBanner.hidden = true;
   remoteWorkspaceTitle.textContent = "Pair this browser";
@@ -1007,28 +1084,33 @@ function updateStatusBadge() {
     if (state.session.pending_approvals?.length) {
       remoteStatusBadge.textContent = "Approval required";
       remoteStatusBadge.className = "status-badge status-badge-alert";
+      renderOverviewCards();
       return;
     }
 
     if (!state.socketConnected || !state.session.codex_connected) {
       remoteStatusBadge.textContent = "Offline";
       remoteStatusBadge.className = "status-badge status-badge-offline";
+      renderOverviewCards();
       return;
     }
 
     remoteStatusBadge.textContent = state.session.current_status || "Ready";
     remoteStatusBadge.className = "status-badge status-badge-ready";
+    renderOverviewCards();
     return;
   }
 
   if (state.socketConnected) {
     remoteStatusBadge.textContent = "Connected";
     remoteStatusBadge.className = "status-badge status-badge-ready";
+    renderOverviewCards();
     return;
   }
 
   remoteStatusBadge.textContent = connectionTarget() ? "Connecting" : "Offline";
   remoteStatusBadge.className = "status-badge status-badge-offline";
+  renderOverviewCards();
 }
 
 function connectionTarget() {
@@ -1078,7 +1160,12 @@ function loadRemoteAuth() {
   }
 
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return {
+      ...parsed,
+      sessionClaim: parsed.sessionClaim || null,
+      sessionClaimExpiresAt: parsed.sessionClaimExpiresAt || null,
+    };
   } catch {
     window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
     return null;
@@ -1226,7 +1313,8 @@ function metaChip(label, value) {
 }
 
 function securityModeLabel(session) {
-  return session?.security_mode === "managed" ? "Managed" : "Private";
+  const mode = session?.security_mode || state.remoteAuth?.securityMode || "private";
+  return mode === "managed" ? "Managed" : "Private";
 }
 
 function contentVisibilityLabel(session) {
@@ -1246,6 +1334,126 @@ function brokerStatusLabel(session) {
   return session.broker_peer_id
     ? `${brokerState} · ${channel} · ${shortId(session.broker_peer_id)}`
     : `${brokerState} · ${channel}`;
+}
+
+function sessionClaimLabel() {
+  if (!state.remoteAuth) {
+    return "Unpaired";
+  }
+
+  if (!state.remoteAuth.sessionClaim) {
+    return "Pending";
+  }
+
+  if (!state.remoteAuth.sessionClaimExpiresAt) {
+    return "Active";
+  }
+
+  return `Active until ${formatTimestamp(state.remoteAuth.sessionClaimExpiresAt)}`;
+}
+
+function renderOverviewCards() {
+  renderDeviceOverview();
+  renderSessionOverview();
+}
+
+function renderDeviceOverview() {
+  if (!state.remoteAuth && !state.pairingTicket) {
+    remoteDeviceOverview.innerHTML = `
+      <p class="overview-title">Not paired</p>
+      <p class="overview-copy">Pair this browser from your local relay to receive an owner device claim.</p>
+      <div class="overview-badges">
+        ${statusBadgeMarkup("Unpaired", "offline")}
+      </div>
+    `;
+    return;
+  }
+
+  if (state.pairingTicket) {
+    remoteDeviceOverview.innerHTML = `
+      <p class="overview-title">Pairing pending</p>
+      <p class="overview-copy">${escapeHtml(shortId(state.pairingTicket.pairing_id))} expires ${escapeHtml(formatTimestamp(state.pairingTicket.expires_at))}</p>
+      <div class="overview-badges">
+        ${statusBadgeMarkup("Waiting for device", "alert")}
+      </div>
+    `;
+    return;
+  }
+
+  remoteDeviceOverview.innerHTML = `
+    <p class="overview-title">${escapeHtml(state.remoteAuth.deviceLabel)}</p>
+    <p class="overview-copy">${escapeHtml(shortId(state.remoteAuth.deviceId))} on broker ${escapeHtml(state.remoteAuth.brokerChannelId)}</p>
+    <div class="overview-badges">
+      ${statusBadgeMarkup("Paired", "ready")}
+      ${statusBadgeMarkup(securityModeLabel(state.session), state.remoteAuth.securityMode === "managed" ? "alert" : "ready")}
+      ${statusBadgeMarkup(sessionClaimStatusText(), sessionClaimBadgeTone())}
+    </div>
+  `;
+}
+
+function renderSessionOverview() {
+  if (!state.session?.active_thread_id) {
+    remoteSessionOverview.innerHTML = `
+      <p class="overview-title">No live session</p>
+      <p class="overview-copy">Start or resume a remote thread to see the active workspace and control owner.</p>
+      <div class="overview-badges">
+        ${statusBadgeMarkup(state.socketConnected ? "Connected" : "Idle", state.socketConnected ? "ready" : "offline")}
+      </div>
+    `;
+    return;
+  }
+
+  remoteSessionOverview.innerHTML = `
+    <p class="overview-title">${escapeHtml(shortId(state.session.active_thread_id))}</p>
+    <p class="overview-copy">${escapeHtml(state.session.current_cwd || "No workspace")}</p>
+    <div class="overview-badges">
+      ${statusBadgeMarkup(controlStatusText(state.session), controlStatusTone(state.session))}
+      ${statusBadgeMarkup(brokerStatusText(state.session), state.session.broker_connected ? "ready" : "offline")}
+      ${statusBadgeMarkup(state.session.pending_approvals?.length ? "Approval waiting" : "Live", state.session.pending_approvals?.length ? "alert" : "ready")}
+    </div>
+  `;
+}
+
+function statusBadgeMarkup(label, tone = "ready") {
+  return `<span class="status-badge status-badge-${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
+}
+
+function sessionClaimStatusText() {
+  if (!state.remoteAuth) {
+    return "Unpaired";
+  }
+  if (!state.remoteAuth.sessionClaim) {
+    return "Claim pending";
+  }
+  return "Claim active";
+}
+
+function sessionClaimBadgeTone() {
+  if (!state.remoteAuth) {
+    return "offline";
+  }
+  return state.remoteAuth.sessionClaim ? "ready" : "alert";
+}
+
+function controlStatusText(session) {
+  if (!session.active_controller_device_id) {
+    return "Control unclaimed";
+  }
+  if (isCurrentDeviceActiveController(session)) {
+    return "You have control";
+  }
+  return `Controlled by ${controllerLabel(session.active_controller_device_id)}`;
+}
+
+function controlStatusTone(session) {
+  if (!session.active_controller_device_id) {
+    return "alert";
+  }
+  return isCurrentDeviceActiveController(session) ? "ready" : "offline";
+}
+
+function brokerStatusText(session) {
+  return session.broker_connected ? "Broker linked" : "Broker offline";
 }
 
 function canCurrentDeviceWrite(session) {

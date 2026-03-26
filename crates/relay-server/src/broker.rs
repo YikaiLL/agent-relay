@@ -1,11 +1,18 @@
 mod crypto;
 
-use std::time::Duration;
+use std::{
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use hmac::{Hmac, Mac};
+use rand::RngCore;
 use relay_broker::protocol::{ClientMessage, PeerRole, PresenceKind, ServerMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
@@ -23,7 +30,10 @@ use crate::{
 use self::crypto::{decrypt_json, encrypt_json, EncryptedEnvelope};
 
 const RECONNECT_DELAY_SECS: u64 = 2;
+const SESSION_CLAIM_TTL_SECS: u64 = 3600;
 type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+type HmacSha256 = Hmac<Sha256>;
+static SESSION_CLAIM_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
@@ -48,6 +58,7 @@ struct PairingRequestPlaintext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RemoteActionRequest {
+    ClaimDevice,
     StartSession {
         input: StartSessionInput,
     },
@@ -75,6 +86,7 @@ enum RemoteActionRequest {
 impl RemoteActionRequest {
     fn kind(&self) -> RemoteActionKind {
         match self {
+            Self::ClaimDevice => RemoteActionKind::ClaimDevice,
             Self::StartSession { .. } => RemoteActionKind::StartSession,
             Self::ResumeSession { .. } => RemoteActionKind::ResumeSession,
             Self::SendMessage { .. } => RemoteActionKind::SendMessage,
@@ -87,6 +99,7 @@ impl RemoteActionRequest {
 
     fn bind_device(self, device_id: String) -> Self {
         match self {
+            Self::ClaimDevice => Self::ClaimDevice,
             Self::StartSession { mut input } => {
                 input.device_id = Some(device_id);
                 Self::StartSession { input }
@@ -122,6 +135,7 @@ impl RemoteActionRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RemoteActionKind {
+    ClaimDevice,
     StartSession,
     ResumeSession,
     SendMessage,
@@ -134,6 +148,7 @@ enum RemoteActionKind {
 impl RemoteActionKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::ClaimDevice => "claim_device",
             Self::StartSession => "start_session",
             Self::ResumeSession => "resume_session",
             Self::SendMessage => "send_message",
@@ -154,12 +169,14 @@ enum InboundBrokerPayload {
     },
     RemoteAction {
         action_id: String,
-        auth: RemoteDeviceAuth,
+        session_claim: Option<String>,
+        auth: Option<RemoteDeviceAuth>,
         request: RemoteActionRequest,
     },
     EncryptedRemoteAction {
         action_id: String,
-        device_id: String,
+        session_claim: Option<String>,
+        device_id: Option<String>,
         envelope: EncryptedEnvelope,
     },
 }
@@ -178,6 +195,8 @@ enum OutboundBrokerPayload {
         snapshot: SessionSnapshot,
         receipt: Option<ApprovalReceipt>,
         threads: Option<ThreadsResponse>,
+        session_claim: Option<String>,
+        session_claim_expires_at: Option<u64>,
         error: Option<String>,
     },
     EncryptedSessionSnapshot {
@@ -213,6 +232,8 @@ struct RemoteActionResultPlaintext {
     snapshot: SessionSnapshot,
     receipt: Option<ApprovalReceipt>,
     threads: Option<ThreadsResponse>,
+    session_claim: Option<String>,
+    session_claim_expires_at: Option<u64>,
     error: Option<String>,
 }
 
@@ -220,6 +241,22 @@ struct RemoteActionResultPlaintext {
 struct RemoteActionOutcome {
     receipt: Option<ApprovalReceipt>,
     threads: Option<ThreadsResponse>,
+    session_claim: Option<String>,
+    session_claim_expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionClaimPayload {
+    version: u8,
+    device_id: String,
+    peer_id: String,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IssuedSessionClaim {
+    token: String,
+    expires_at: u64,
 }
 
 impl BrokerConfig {
@@ -469,14 +506,24 @@ async fn handle_server_message(
                 }
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
+                    session_claim,
                     auth,
                     request,
                 }) => {
-                    handle_remote_action(state, sender, from_peer_id, action_id, auth, request)
-                        .await
+                    handle_remote_action(
+                        state,
+                        sender,
+                        from_peer_id,
+                        action_id,
+                        session_claim,
+                        auth,
+                        request,
+                    )
+                    .await
                 }
                 Some(InboundBrokerPayload::EncryptedRemoteAction {
                     action_id,
+                    session_claim,
                     device_id,
                     envelope,
                 }) => {
@@ -485,6 +532,7 @@ async fn handle_server_message(
                         sender,
                         from_peer_id,
                         action_id,
+                        session_claim,
                         device_id,
                         envelope,
                     )
@@ -557,7 +605,8 @@ async fn handle_remote_action(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     from_peer_id: String,
     action_id: String,
-    auth: RemoteDeviceAuth,
+    session_claim: Option<String>,
+    auth: Option<RemoteDeviceAuth>,
     request: RemoteActionRequest,
 ) -> Result<(), String> {
     if !state.broker_can_read_content().await {
@@ -575,17 +624,16 @@ async fn handle_remote_action(
         )
         .await;
 
-    let result = match state
-        .authenticate_remote_device(&auth.device_id, &auth.device_token, &from_peer_id)
-        .await
+    let resolved_device_id = match resolve_plain_remote_device(
+        state,
+        &from_peer_id,
+        session_claim.as_deref(),
+        auth.as_ref(),
+        &request,
+    )
+    .await
     {
-        Ok(device_id) => execute_remote_action(state, request.bind_device(device_id)).await,
-        Err(error) => Err(error),
-    };
-    let snapshot = state.snapshot().await;
-
-    let (ok, receipt, threads, error) = match result {
-        Ok(outcome) => (true, outcome.receipt, outcome.threads, None),
+        Ok(device_id) => device_id,
         Err(error) => {
             state
                 .push_runtime_log(
@@ -597,42 +645,60 @@ async fn handle_remote_action(
                     ),
                 )
                 .await;
-            (false, None, None, Some(error))
+            let snapshot = state.snapshot().await;
+            let result_device_id = auth
+                .as_ref()
+                .map(|auth| auth.device_id.clone())
+                .unwrap_or_else(|| "unknown-device".to_string());
+            return publish_plain_remote_action_result(
+                sender,
+                from_peer_id,
+                action_id,
+                action_kind,
+                snapshot,
+                RemoteActionOutcome::default(),
+                Some(error),
+                false,
+                result_device_id,
+            )
+            .await;
         }
     };
-
-    if state.broker_can_read_content().await {
-        publish_payload(
-            sender,
-            OutboundBrokerPayload::RemoteActionResult {
-                action_id,
-                target_peer_id: from_peer_id,
-                action: action_kind,
-                ok,
-                snapshot,
-                receipt,
-                threads,
-                error,
-            },
-        )
-        .await
-        .map_err(|error| format!("broker action result publish failed: {error}"))
+    let result = if matches!(request, RemoteActionRequest::ClaimDevice) {
+        issue_claim_outcome(state, &resolved_device_id, &from_peer_id).await
     } else {
-        publish_remote_action_result_private(
-            state,
-            sender,
-            from_peer_id,
-            auth.device_id,
-            action_id,
-            action_kind,
-            snapshot,
-            receipt,
-            threads,
-            error,
-            ok,
-        )
-        .await
-    }
+        execute_remote_action(state, request.bind_device(resolved_device_id.clone())).await
+    };
+    let snapshot = state.snapshot().await;
+
+    let (ok, outcome, error) = match result {
+        Ok(outcome) => (true, outcome, None),
+        Err(error) => {
+            state
+                .push_runtime_log(
+                    "warn",
+                    format!(
+                        "Broker action `{}` from {} failed: {error}",
+                        action_kind.as_str(),
+                        from_peer_id
+                    ),
+                )
+                .await;
+            (false, RemoteActionOutcome::default(), Some(error))
+        }
+    };
+    publish_plain_remote_action_result(
+        sender,
+        from_peer_id,
+        action_id,
+        action_kind,
+        snapshot,
+        outcome,
+        error,
+        ok,
+        resolved_device_id,
+    )
+    .await
 }
 
 async fn handle_encrypted_remote_action(
@@ -640,10 +706,18 @@ async fn handle_encrypted_remote_action(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     from_peer_id: String,
     action_id: String,
-    device_id: String,
+    session_claim: Option<String>,
+    device_id: Option<String>,
     envelope: EncryptedEnvelope,
 ) -> Result<(), String> {
-    let action_kind = decrypt_remote_action_kind(state, &device_id, &envelope).await?;
+    let (device_id, action_kind) = resolve_encrypted_action_context(
+        state,
+        &from_peer_id,
+        session_claim.as_deref(),
+        device_id.as_deref(),
+        &envelope,
+    )
+    .await?;
     state
         .push_runtime_log(
             "info",
@@ -660,13 +734,24 @@ async fn handle_encrypted_remote_action(
             state
                 .mark_remote_device_seen(&device_id, &from_peer_id)
                 .await?;
-            execute_remote_action(state, request.bind_device(device_id.clone())).await
+            if matches!(request, RemoteActionRequest::ClaimDevice) {
+                issue_claim_outcome(state, &device_id, &from_peer_id).await
+            } else {
+                execute_remote_action(state, request.bind_device(device_id.clone())).await
+            }
         }
         Err(error) => Err(error),
     };
     let snapshot = state.snapshot().await;
-    let (ok, receipt, threads, error) = match result {
-        Ok(outcome) => (true, outcome.receipt, outcome.threads, None),
+    let (ok, receipt, threads, issued_claim, issued_claim_expires_at, error) = match result {
+        Ok(outcome) => (
+            true,
+            outcome.receipt,
+            outcome.threads,
+            outcome.session_claim,
+            outcome.session_claim_expires_at,
+            None,
+        ),
         Err(error) => {
             state
                 .push_runtime_log(
@@ -678,7 +763,7 @@ async fn handle_encrypted_remote_action(
                     ),
                 )
                 .await;
-            (false, None, None, Some(error))
+            (false, None, None, None, None, Some(error))
         }
     };
 
@@ -692,6 +777,8 @@ async fn handle_encrypted_remote_action(
         snapshot,
         receipt,
         threads,
+        issued_claim,
+        issued_claim_expires_at,
         error,
         ok,
     )
@@ -703,6 +790,9 @@ async fn execute_remote_action(
     request: RemoteActionRequest,
 ) -> Result<RemoteActionOutcome, String> {
     match request {
+        RemoteActionRequest::ClaimDevice => {
+            Err("claim_device must be handled before generic action execution".to_string())
+        }
         RemoteActionRequest::StartSession { input } => state
             .start_session(input)
             .await
@@ -729,6 +819,8 @@ async fn execute_remote_action(
             .map(|threads| RemoteActionOutcome {
                 receipt: None,
                 threads: Some(threads),
+                session_claim: None,
+                session_claim_expires_at: None,
             }),
         RemoteActionRequest::DecideApproval { request_id, input } => state
             .decide_approval(&request_id, input)
@@ -736,6 +828,8 @@ async fn execute_remote_action(
             .map(|receipt| RemoteActionOutcome {
                 receipt: Some(receipt),
                 threads: None,
+                session_claim: None,
+                session_claim_expires_at: None,
             })
             .map_err(approval_error_message),
     }
@@ -759,6 +853,177 @@ async fn decrypt_remote_action(
     decrypt_json(&secret, envelope)
 }
 
+async fn resolve_plain_remote_device(
+    state: &AppState,
+    from_peer_id: &str,
+    session_claim: Option<&str>,
+    auth: Option<&RemoteDeviceAuth>,
+    request: &RemoteActionRequest,
+) -> Result<String, String> {
+    if let Some(claim) = session_claim {
+        return verify_session_claim(state, claim, from_peer_id).await;
+    }
+
+    let auth = auth.ok_or_else(|| match request {
+        RemoteActionRequest::ClaimDevice => "claim_device requires device auth".to_string(),
+        _ => "session claim is missing or expired".to_string(),
+    })?;
+
+    state
+        .authenticate_remote_device(&auth.device_id, &auth.device_token, from_peer_id)
+        .await
+}
+
+async fn resolve_encrypted_action_context(
+    state: &AppState,
+    from_peer_id: &str,
+    session_claim: Option<&str>,
+    device_id: Option<&str>,
+    envelope: &EncryptedEnvelope,
+) -> Result<(String, RemoteActionKind), String> {
+    if let Some(claim) = session_claim {
+        let device_id = verify_session_claim(state, claim, from_peer_id).await?;
+        let action_kind = decrypt_remote_action_kind(state, &device_id, envelope).await?;
+        return Ok((device_id, action_kind));
+    }
+
+    let device_id = device_id
+        .map(str::to_string)
+        .ok_or_else(|| "encrypted remote action is missing device_id".to_string())?;
+    let action_kind = decrypt_remote_action_kind(state, &device_id, envelope).await?;
+    if !matches!(action_kind, RemoteActionKind::ClaimDevice) {
+        return Err("session claim is missing or expired".to_string());
+    }
+    Ok((device_id, action_kind))
+}
+
+async fn issue_claim_outcome(
+    state: &AppState,
+    device_id: &str,
+    peer_id: &str,
+) -> Result<RemoteActionOutcome, String> {
+    state.mark_remote_device_seen(device_id, peer_id).await?;
+    let claim = issue_session_claim(device_id, peer_id)?;
+    Ok(RemoteActionOutcome {
+        receipt: None,
+        threads: None,
+        session_claim: Some(claim.token),
+        session_claim_expires_at: Some(claim.expires_at),
+    })
+}
+
+fn issue_session_claim(device_id: &str, peer_id: &str) -> Result<IssuedSessionClaim, String> {
+    let payload = SessionClaimPayload {
+        version: 1,
+        device_id: device_id.to_string(),
+        peer_id: peer_id.to_string(),
+        expires_at: unix_now().saturating_add(SESSION_CLAIM_TTL_SECS),
+    };
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|error| format!("failed to encode session claim: {error}"))?;
+    let payload_part = URL_SAFE_NO_PAD.encode(&payload_bytes);
+    let signature_part = URL_SAFE_NO_PAD.encode(sign_bytes(payload_part.as_bytes()));
+
+    Ok(IssuedSessionClaim {
+        token: format!("{payload_part}.{signature_part}"),
+        expires_at: payload.expires_at,
+    })
+}
+
+async fn verify_session_claim(
+    state: &AppState,
+    token: &str,
+    peer_id: &str,
+) -> Result<String, String> {
+    let payload = decode_and_verify_session_claim(token, peer_id)?;
+    state.paired_device_secret(&payload.device_id).await?;
+    Ok(payload.device_id)
+}
+
+fn decode_and_verify_session_claim(
+    token: &str,
+    peer_id: &str,
+) -> Result<SessionClaimPayload, String> {
+    let (payload_part, signature_part) = token
+        .split_once('.')
+        .ok_or_else(|| "session claim is invalid".to_string())?;
+    let expected_signature = sign_bytes(payload_part.as_bytes());
+    let actual_signature = URL_SAFE_NO_PAD
+        .decode(signature_part)
+        .map_err(|_| "session claim is invalid".to_string())?;
+    if actual_signature != expected_signature {
+        return Err("session claim is invalid".to_string());
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_part)
+        .map_err(|_| "session claim is invalid".to_string())?;
+    let payload: SessionClaimPayload = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| "session claim is invalid".to_string())?;
+    if payload.version != 1 {
+        return Err("session claim version is unsupported".to_string());
+    }
+    if payload.peer_id != peer_id {
+        return Err("session claim is bound to a different broker peer".to_string());
+    }
+    if payload.expires_at <= unix_now() {
+        return Err("session claim has expired".to_string());
+    }
+    Ok(payload)
+}
+
+fn sign_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(session_claim_signing_key())
+        .expect("session claim signing key should be valid");
+    mac.update(payload);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn session_claim_signing_key() -> &'static [u8; 32] {
+    SESSION_CLAIM_SIGNING_KEY.get_or_init(|| {
+        let mut key = [0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        key
+    })
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn publish_plain_remote_action_result(
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    target_peer_id: String,
+    action_id: String,
+    action: RemoteActionKind,
+    snapshot: SessionSnapshot,
+    outcome: RemoteActionOutcome,
+    error: Option<String>,
+    ok: bool,
+    _device_id: String,
+) -> Result<(), String> {
+    publish_payload(
+        sender,
+        OutboundBrokerPayload::RemoteActionResult {
+            action_id,
+            target_peer_id,
+            action,
+            ok,
+            snapshot,
+            receipt: outcome.receipt,
+            threads: outcome.threads,
+            session_claim: outcome.session_claim,
+            session_claim_expires_at: outcome.session_claim_expires_at,
+            error,
+        },
+    )
+    .await
+    .map_err(|error| format!("broker action result publish failed: {error}"))
+}
+
 async fn publish_remote_action_result_private(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
@@ -769,6 +1034,8 @@ async fn publish_remote_action_result_private(
     snapshot: SessionSnapshot,
     receipt: Option<ApprovalReceipt>,
     threads: Option<ThreadsResponse>,
+    session_claim: Option<String>,
+    session_claim_expires_at: Option<u64>,
     error: Option<String>,
     ok: bool,
 ) -> Result<(), String> {
@@ -781,6 +1048,8 @@ async fn publish_remote_action_result_private(
             snapshot,
             receipt,
             threads,
+            session_claim,
+            session_claim_expires_at,
             error,
         },
     )?;
@@ -950,10 +1219,13 @@ mod tests {
                 action_id,
                 auth,
                 request: RemoteActionRequest::SendMessage { input },
+                session_claim,
             } => {
                 assert_eq!(action_id, "act-1");
+                let auth = auth.expect("auth should be present");
                 assert_eq!(auth.device_id, "phone-1");
                 assert_eq!(auth.device_token, "token-1");
+                assert!(session_claim.is_none());
                 assert_eq!(input.text, "hello");
             }
             other => panic!("unexpected request: {other:?}"),
@@ -1056,10 +1328,12 @@ mod tests {
             InboundBrokerPayload::EncryptedRemoteAction {
                 action_id,
                 device_id,
+                session_claim,
                 envelope,
             } => {
                 assert_eq!(action_id, "act-2");
-                assert_eq!(device_id, "phone-1");
+                assert_eq!(device_id.as_deref(), Some("phone-1"));
+                assert!(session_claim.is_none());
                 let request: RemoteActionRequest =
                     decrypt_json("device-secret", &envelope).expect("payload should decrypt");
                 match request {
@@ -1084,5 +1358,25 @@ mod tests {
 
         let action = parse_inbound_payload(payload).expect("non-action payload should be ignored");
         assert!(action.is_none());
+    }
+
+    #[test]
+    fn session_claim_round_trips_for_same_peer() {
+        let claim = issue_session_claim("device-a", "peer-a").expect("claim should issue");
+
+        let payload =
+            decode_and_verify_session_claim(&claim.token, "peer-a").expect("claim should verify");
+
+        assert_eq!(payload.device_id, "device-a");
+        assert!(claim.expires_at > unix_now());
+    }
+
+    #[test]
+    fn session_claim_rejects_different_peer() {
+        let claim = issue_session_claim("device-a", "peer-a").expect("claim should issue");
+        let error = decode_and_verify_session_claim(&claim.token, "peer-b")
+            .expect_err("claim should reject a different peer");
+
+        assert!(error.contains("different broker peer"));
     }
 }

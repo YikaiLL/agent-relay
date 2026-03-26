@@ -127,6 +127,30 @@
           </div>
         </header>
 
+        <section class="overview-strip" aria-label="Remote state overview">
+          <article class="overview-card">
+            <p class="overview-label">Paired Device</p>
+            <div id="remote-device-overview" class="overview-body">
+              <p class="overview-title">Not paired</p>
+              <p class="overview-copy">Pair this browser from your local relay to receive an owner device claim.</p>
+              <div class="overview-badges">
+                <span class="status-badge status-badge-offline">Unpaired</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="overview-card">
+            <p class="overview-label">Session State</p>
+            <div id="remote-session-overview" class="overview-body">
+              <p class="overview-title">No live session</p>
+              <p class="overview-copy">Once a remote session is started or resumed, the active thread and control owner will appear here.</p>
+              <div class="overview-badges">
+                <span class="status-badge status-badge-offline">Idle</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
         <details class="meta-drawer">
           <summary>Session details</summary>
           <section id="remote-session-meta" class="session-meta">

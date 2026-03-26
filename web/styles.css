@@ -366,6 +366,58 @@ select {
   border-bottom: 1px solid rgba(229, 229, 232, 0.9);
 }
 
+.overview-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  padding: 16px 32px 0;
+}
+
+.overview-card {
+  padding: 16px 18px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.84);
+  box-shadow: var(--shadow);
+}
+
+.overview-label {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.overview-body {
+  display: grid;
+  gap: 10px;
+}
+
+.overview-title,
+.overview-copy {
+  margin: 0;
+}
+
+.overview-title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.overview-copy {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.overview-badges,
+.paired-device-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .meta-drawer summary {
   cursor: pointer;
   color: var(--muted);
@@ -761,6 +813,10 @@ select {
   margin-bottom: 4px;
 }
 
+.paired-device-badges {
+  margin: 8px 0;
+}
+
 .paired-device-meta {
   margin: 0;
   color: var(--muted);
@@ -827,6 +883,11 @@ select {
 
   .meta-drawer {
     padding: 0 20px 14px;
+  }
+
+  .overview-strip {
+    grid-template-columns: 1fr;
+    padding: 14px 20px 0;
   }
 
   .control-banner {
