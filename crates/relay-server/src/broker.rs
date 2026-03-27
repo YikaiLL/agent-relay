@@ -170,6 +170,7 @@ enum InboundBrokerPayload {
     RemoteAction {
         action_id: String,
         session_claim: Option<String>,
+        device_id: Option<String>,
         auth: Option<RemoteDeviceAuth>,
         request: RemoteActionRequest,
     },
@@ -507,6 +508,7 @@ async fn handle_server_message(
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
                     session_claim,
+                    device_id,
                     auth,
                     request,
                 }) => {
@@ -516,6 +518,7 @@ async fn handle_server_message(
                         from_peer_id,
                         action_id,
                         session_claim,
+                        device_id,
                         auth,
                         request,
                     )
@@ -606,6 +609,7 @@ async fn handle_remote_action(
     from_peer_id: String,
     action_id: String,
     session_claim: Option<String>,
+    device_id: Option<String>,
     auth: Option<RemoteDeviceAuth>,
     request: RemoteActionRequest,
 ) -> Result<(), String> {
@@ -649,6 +653,7 @@ async fn handle_remote_action(
             let result_device_id = auth
                 .as_ref()
                 .map(|auth| auth.device_id.clone())
+                .or(device_id)
                 .unwrap_or_else(|| "unknown-device".to_string());
             return publish_plain_remote_action_result(
                 sender,
@@ -710,14 +715,54 @@ async fn handle_encrypted_remote_action(
     device_id: Option<String>,
     envelope: EncryptedEnvelope,
 ) -> Result<(), String> {
-    let (device_id, action_kind) = resolve_encrypted_action_context(
+    let hinted_device_id = device_id.clone();
+    let (device_id, action_kind) = match resolve_encrypted_action_context(
         state,
         &from_peer_id,
         session_claim.as_deref(),
         device_id.as_deref(),
         &envelope,
     )
-    .await?;
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            let Some(device_id) = hinted_device_id else {
+                return Err(error);
+            };
+            let action_kind = decrypt_remote_action_kind(state, &device_id, &envelope)
+                .await
+                .unwrap_or(RemoteActionKind::ClaimDevice);
+            state
+                .push_runtime_log(
+                    "warn",
+                    format!(
+                        "Encrypted broker action `{}` from {} failed: {error}",
+                        action_kind.as_str(),
+                        from_peer_id
+                    ),
+                )
+                .await;
+            let snapshot = state.snapshot().await;
+            publish_remote_action_result_private(
+                state,
+                sender,
+                from_peer_id,
+                device_id,
+                action_id,
+                action_kind,
+                snapshot,
+                None,
+                None,
+                None,
+                None,
+                Some(error),
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     state
         .push_runtime_log(
             "info",
@@ -1217,11 +1262,13 @@ mod tests {
         match action {
             InboundBrokerPayload::RemoteAction {
                 action_id,
+                device_id,
                 auth,
                 request: RemoteActionRequest::SendMessage { input },
                 session_claim,
             } => {
                 assert_eq!(action_id, "act-1");
+                assert!(device_id.is_none());
                 let auth = auth.expect("auth should be present");
                 assert_eq!(auth.device_id, "phone-1");
                 assert_eq!(auth.device_token, "token-1");
