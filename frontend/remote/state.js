@@ -1,4 +1,3 @@
-const SURFACE_PEER_STORAGE_KEY = "agent-relay.remote-peer-id";
 const REMOTE_AUTH_STORAGE_KEY = "agent-relay.remote-auth";
 const REMOTE_DEVICE_LABEL_STORAGE_KEY = "agent-relay.remote-device-label";
 const REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY = "agent-relay.remote-device-id";
@@ -22,9 +21,9 @@ export const state = {
   requestedDeviceId: loadOrCreateRequestedDeviceId(),
   session: null,
   socket: null,
+  socketPeerId: null,
   socketConnected: false,
   socketReconnectTimer: null,
-  surfacePeerId: loadOrCreateSurfacePeerId(),
   threads: [],
 };
 
@@ -64,6 +63,14 @@ export function setSessionClaim(claim, expiresAt) {
   state.remoteAuth.sessionClaim = claim;
   state.remoteAuth.sessionClaimExpiresAt = expiresAt || null;
   saveRemoteAuth(state.remoteAuth);
+}
+
+export function setSocketPeerId(value) {
+  state.socketPeerId = value || null;
+}
+
+export function clearSocketPeerId() {
+  state.socketPeerId = null;
 }
 
 export function hasUsableSessionClaim(skewMs = 0) {
@@ -108,26 +115,28 @@ function defaultDeviceLabel() {
   return `${platform} Remote`;
 }
 
-function loadOrCreateSurfacePeerId() {
-  const existing = window.localStorage.getItem(SURFACE_PEER_STORAGE_KEY);
-  if (existing) {
-    return existing;
-  }
-
-  const generated = `surface-${window.crypto.randomUUID()}`;
-  window.localStorage.setItem(SURFACE_PEER_STORAGE_KEY, generated);
-  return generated;
-}
-
 function loadOrCreateRequestedDeviceId() {
   const existing = window.localStorage.getItem(REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY);
   if (existing) {
     return existing;
   }
 
-  const generated = `mobile-${window.crypto.randomUUID().slice(0, 12)}`;
+  const generated = `mobile-${generateStableId().slice(0, 12)}`;
   window.localStorage.setItem(REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY, generated);
   return generated;
+}
+
+function generateStableId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+
+  if (window.crypto?.getRandomValues) {
+    const bytes = window.crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function loadRemoteAuth() {

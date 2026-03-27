@@ -147,6 +147,41 @@ async fn websocket_relays_messages_between_peers() {
 }
 
 #[tokio::test]
+async fn surface_connections_can_use_broker_assigned_peer_ids() {
+    let address = spawn_app().await;
+    let relay_url = format!("ws://{address}/ws/room-a?peer_id=relay-1&role=relay");
+    let surface_url = format!("ws://{address}/ws/room-a?role=surface");
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    let (mut surface, _) = connect_async(&surface_url)
+        .await
+        .expect("surface should connect");
+    let welcome = next_server_message(&mut surface).await;
+    let assigned_peer_id = match welcome {
+        ServerMessage::Welcome { peer_id, peers, .. } => {
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].peer_id, "relay-1");
+            assert!(peer_id.starts_with("surface-"));
+            peer_id
+        }
+        other => panic!("unexpected welcome frame: {other:?}"),
+    };
+
+    let presence = next_server_message(&mut relay).await;
+    match presence {
+        ServerMessage::Presence { kind, peer, .. } => {
+            assert_eq!(kind, protocol::PresenceKind::Joined);
+            assert_eq!(peer.peer_id, assigned_peer_id);
+        }
+        other => panic!("unexpected presence frame: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn duplicate_peers_get_error_frame() {
     let address = spawn_app().await;
     let url = format!("ws://{address}/ws/room-a?peer_id=dup-1&role=surface");

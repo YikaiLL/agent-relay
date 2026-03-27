@@ -1,13 +1,13 @@
 import { renderLog, updateStatusBadge } from "./render.js";
-import { connectionTarget, state } from "./state.js";
+import { clearSocketPeerId, connectionTarget, setSocketPeerId, state } from "./state.js";
 
-let onBrokerOpen = () => {};
+let onBrokerReady = () => {};
 let onBrokerPayload = async () => {};
 let onBrokerDisconnect = () => {};
 let onRelayPresence = () => {};
 
 export function configureBrokerClient(handlers) {
-  onBrokerOpen = handlers.onBrokerOpen || onBrokerOpen;
+  onBrokerReady = handlers.onBrokerReady || onBrokerReady;
   onBrokerPayload = handlers.onBrokerPayload || onBrokerPayload;
   onBrokerDisconnect = handlers.onBrokerDisconnect || onBrokerDisconnect;
   onRelayPresence = handlers.onRelayPresence || onRelayPresence;
@@ -25,12 +25,12 @@ export function connectBroker(reason) {
 
   const url = new URL(target.brokerUrl);
   url.pathname = `/ws/${encodeURIComponent(target.brokerChannelId)}`;
-  url.searchParams.set("peer_id", state.surfacePeerId);
   url.searchParams.set("role", "surface");
 
-  renderLog(`Connecting to broker (${reason}).`);
+  renderLog(`Connecting to broker (${reason}) via ${url.host}.`);
   const socket = new WebSocket(url.toString());
   state.socket = socket;
+  clearSocketPeerId();
 
   socket.addEventListener("open", () => {
     if (state.socket !== socket) {
@@ -40,7 +40,6 @@ export function connectBroker(reason) {
     state.socketConnected = true;
     updateStatusBadge();
     renderLog("Broker websocket connected.");
-    void onBrokerOpen(reason);
   });
 
   socket.addEventListener("message", (event) => {
@@ -48,19 +47,22 @@ export function connectBroker(reason) {
       return;
     }
 
-    void handleSocketMessage(event.data);
+    void handleSocketMessage(event.data, reason);
   });
 
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
     if (state.socket !== socket) {
       return;
     }
 
     state.socket = null;
     state.socketConnected = false;
+    clearSocketPeerId();
     void onBrokerDisconnect();
     updateStatusBadge();
-    renderLog("Broker websocket closed.");
+    renderLog(
+      `Broker websocket closed${event.code ? ` (${event.code}${event.reason ? `: ${event.reason}` : ""})` : ""}.`
+    );
     scheduleSocketReconnect();
   });
 
@@ -77,6 +79,7 @@ export function closeBrokerSocket(resetConnectionState = true) {
   if (!state.socket) {
     if (resetConnectionState) {
       state.socketConnected = false;
+      clearSocketPeerId();
       updateStatusBadge();
     }
     return;
@@ -88,6 +91,7 @@ export function closeBrokerSocket(resetConnectionState = true) {
 
   if (resetConnectionState) {
     state.socketConnected = false;
+    clearSocketPeerId();
     updateStatusBadge();
   }
 }
@@ -105,7 +109,7 @@ export function sendBrokerFrame(payload) {
   );
 }
 
-async function handleSocketMessage(rawData) {
+async function handleSocketMessage(rawData, connectReason) {
   let frame;
   try {
     frame = JSON.parse(rawData);
@@ -115,7 +119,11 @@ async function handleSocketMessage(rawData) {
   }
 
   if (frame.type === "welcome") {
-    renderLog(`Joined broker channel ${frame.channel_id}.`);
+    setSocketPeerId(frame.peer_id || null);
+    renderLog(
+      `Joined broker channel ${frame.channel_id} as ${frame.peer_id || "unknown-peer"}.`
+    );
+    void onBrokerReady(frame, connectReason);
     return;
   }
 

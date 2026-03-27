@@ -1,0 +1,307 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { setTimeout as delay } from "node:timers/promises";
+
+import { chromium } from "playwright";
+
+const ROOT = process.cwd();
+const PAIRING_TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
+const PROMPT = process.env.BROWSER_E2E_PROMPT || "Reply with exactly: browser-pairing-e2e";
+
+const managedProcesses = [];
+
+process.on("exit", () => {
+  for (const child of managedProcesses) {
+    if (!child.killed && child.exitCode === null) {
+      child.kill("SIGTERM");
+    }
+  }
+});
+
+async function main() {
+  const lanIp = resolvePrivateIpv4();
+  const brokerPort = await getFreePort();
+  const relayPort = await getFreePort();
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-relay-browser-e2e-"));
+  const statePath = path.join(stateDir, "session.json");
+
+  const broker = spawnManagedProcess(
+    "broker",
+    "cargo",
+    ["run", "-p", "relay-broker"],
+    {
+      BIND_HOST: "0.0.0.0",
+      PORT: String(brokerPort),
+    }
+  );
+  await waitForHealth(`http://127.0.0.1:${brokerPort}/api/health`);
+
+  const relay = spawnManagedProcess(
+    "relay",
+    "cargo",
+    ["run", "-p", "relay-server"],
+    {
+      PORT: String(relayPort),
+      RELAY_STATE_PATH: statePath,
+      RELAY_BROKER_URL: `ws://127.0.0.1:${brokerPort}`,
+      RELAY_BROKER_PUBLIC_URL: `ws://${lanIp}:${brokerPort}`,
+      RELAY_BROKER_CHANNEL_ID: "browser-e2e-room",
+      RELAY_BROKER_PEER_ID: "browser-e2e-relay",
+    }
+  );
+  await waitForHealth(`http://127.0.0.1:${relayPort}/api/health`);
+  await waitForBrokerConnection(`http://127.0.0.1:${relayPort}/api/session`);
+
+  let browser;
+  let context;
+  let localPage;
+  let remotePage;
+
+  try {
+    browser = await chromium.launch({ headless: true });
+    context = await browser.newContext();
+
+    localPage = await context.newPage();
+    await localPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await localPage.click("#start-pairing-button");
+    await localPage.waitForFunction(() => {
+      const input = document.querySelector("#pairing-link-input");
+      return Boolean(input && input.value.startsWith("http"));
+    });
+    const pairingUrl = await localPage.inputValue("#pairing-link-input");
+    assert.ok(
+      pairingUrl.startsWith(`http://${lanIp}:${brokerPort}/?pairing=`),
+      `pairing url should use broker public url, got: ${pairingUrl}`
+    );
+
+    remotePage = await context.newPage();
+    await remotePage.goto(pairingUrl, { waitUntil: "domcontentloaded" });
+    await remotePage.waitForFunction(() => {
+      const overview = document.querySelector("#remote-device-overview")?.textContent || "";
+      const meta = document.querySelector("#device-meta")?.textContent || "";
+      return overview.includes("Paired") || meta.includes("Paired");
+    }, null, { timeout: PAIRING_TIMEOUT_MS });
+
+    await remotePage.click("#remote-session-toggle");
+    await remotePage.waitForFunction(() => {
+      const panel = document.querySelector("#remote-session-panel");
+      return Boolean(panel && !panel.hidden);
+    });
+    await remotePage.fill("#remote-cwd-input", ROOT);
+    await remotePage.click("#remote-session-panel summary");
+    await remotePage.waitForFunction(() => {
+      const details = document.querySelector("#remote-session-panel details");
+      return Boolean(details && details.open);
+    });
+    await remotePage.selectOption("#remote-approval-policy-input", "never");
+    await remotePage.fill("#remote-start-prompt", PROMPT);
+    await remotePage.click("#remote-start-session-button");
+
+    const expectedReply = PROMPT.replace("Reply with exactly: ", "");
+    await remotePage.waitForFunction(
+      (expected) => {
+        const transcript = document.querySelector("#remote-transcript")?.textContent || "";
+        return transcript.includes(expected);
+      },
+      expectedReply,
+      { timeout: PAIRING_TIMEOUT_MS }
+    );
+
+    const remoteStatus = await remotePage.textContent("#remote-status-badge");
+    const remoteDeviceOverview = await remotePage.textContent("#remote-device-overview");
+    const relaySession = await fetch(`http://127.0.0.1:${relayPort}/api/session`)
+      .then((response) => response.json())
+      .then((response) => response.data);
+
+    console.log(
+      JSON.stringify(
+        {
+          brokerPort,
+          relayPort,
+          lanIp,
+          pairingUrl,
+          remoteStatus,
+          remoteDeviceOverview,
+          activeThreadId: relaySession.active_thread_id,
+          pairedDevices: relaySession.paired_devices?.map((device) => ({
+            deviceId: device.device_id,
+            label: device.label,
+            lastPeerId: device.last_peer_id,
+          })),
+          lastAssistant: [...relaySession.transcript]
+            .reverse()
+            .find((entry) => entry.role === "assistant")?.text,
+        },
+        null,
+        2
+      )
+    );
+  } catch (error) {
+    await dumpBrowserState(localPage, remotePage);
+    dumpProcessLogs(broker);
+    dumpProcessLogs(relay);
+    throw error;
+  } finally {
+    await context?.close().catch(() => {});
+    await browser?.close().catch(() => {});
+    await stopManagedProcess(relay);
+    await stopManagedProcess(broker);
+    await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function spawnManagedProcess(name, command, args, extraEnv) {
+  const child = spawn(command, args, {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      ...extraEnv,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  child._logName = name;
+  child._logBuffer = [];
+  child.stdout.on("data", (chunk) => appendLog(child, chunk));
+  child.stderr.on("data", (chunk) => appendLog(child, chunk));
+  managedProcesses.push(child);
+  return child;
+}
+
+function appendLog(child, chunk) {
+  const text = chunk.toString("utf8");
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  child._logBuffer.push(...lines);
+  if (child._logBuffer.length > 120) {
+    child._logBuffer.splice(0, child._logBuffer.length - 120);
+  }
+}
+
+async function stopManagedProcess(child) {
+  if (!child || child.killed || child.exitCode !== null) {
+    return;
+  }
+
+  child.kill("SIGTERM");
+  await Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    delay(3000).then(() => {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+    }),
+  ]);
+}
+
+function dumpProcessLogs(child) {
+  const lines = child?._logBuffer || [];
+  if (!lines.length) {
+    return;
+  }
+
+  console.error(`\n[${child._logName} logs]`);
+  console.error(lines.join("\n"));
+}
+
+async function dumpBrowserState(localPage, remotePage) {
+  if (localPage) {
+    console.error("\n[local page]");
+    console.error(await safeText(localPage, "#client-log"));
+  }
+  if (remotePage) {
+    console.error("\n[remote page]");
+    console.error(await safeText(remotePage, "#remote-client-log"));
+  }
+}
+
+async function safeText(page, selector) {
+  try {
+    return (await page.textContent(selector)) || "";
+  } catch {
+    return "";
+  }
+}
+
+async function waitForHealth(url, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        return;
+      }
+    } catch {}
+    await delay(300);
+  }
+  throw new Error(`timed out waiting for health endpoint: ${url}`);
+}
+
+async function waitForBrokerConnection(sessionUrl, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(sessionUrl);
+      if (!response.ok) {
+        throw new Error(`unexpected status ${response.status}`);
+      }
+      const payload = await response.json();
+      if (payload?.data?.broker_connected) {
+        return;
+      }
+    } catch {}
+    await delay(300);
+  }
+  throw new Error("timed out waiting for relay broker connection");
+}
+
+async function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("failed to allocate free port"));
+        return;
+      }
+      const { port } = address;
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
+}
+
+function resolvePrivateIpv4() {
+  const interfaces = os.networkInterfaces();
+  for (const addresses of Object.values(interfaces)) {
+    for (const address of addresses || []) {
+      if (address.family !== "IPv4" || address.internal) {
+        continue;
+      }
+      if (
+        address.address.startsWith("10.") ||
+        address.address.startsWith("192.168.") ||
+        /^172\.(1[6-9]|2\\d|3[0-1])\\./.test(address.address)
+      ) {
+        return address.address;
+      }
+    }
+  }
+  return "127.0.0.1";
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.stack || error.message : String(error));
+  process.exitCode = 1;
+});

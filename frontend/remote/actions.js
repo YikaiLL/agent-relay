@@ -164,7 +164,7 @@ export function rejectPendingActions(message) {
 
 async function handleEncryptedSessionSnapshot(payload) {
   if (
-    payload.target_peer_id !== state.surfacePeerId ||
+    payload.target_peer_id !== state.socketPeerId ||
     payload.device_id !== state.remoteAuth?.deviceId
   ) {
     return;
@@ -176,7 +176,7 @@ async function handleEncryptedSessionSnapshot(payload) {
 
 async function handleEncryptedRemoteActionResult(payload) {
   if (
-    payload.target_peer_id !== state.surfacePeerId ||
+    payload.target_peer_id !== state.socketPeerId ||
     payload.device_id !== state.remoteAuth?.deviceId
   ) {
     return;

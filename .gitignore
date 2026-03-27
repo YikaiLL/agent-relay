@@ -4,6 +4,7 @@
 # Frontend
 /dist
 /node_modules
+/web
 
 # Local config
 .env

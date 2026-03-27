@@ -108,7 +108,7 @@ export async function handleEncryptedPairingResult(payload) {
 
   if (
     payload.pairing_id !== state.pairingTicket.pairing_id ||
-    payload.target_peer_id !== state.surfacePeerId
+    payload.target_peer_id !== state.socketPeerId
   ) {
     return;
   }

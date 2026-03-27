@@ -16,6 +16,7 @@ use axum::{
 };
 use futures_util::{sink::SinkExt, StreamExt};
 use protocol::{ClientMessage, ConnectQuery, HealthResponse, ServerMessage};
+use rand::{distributions::Alphanumeric, Rng};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -61,24 +62,31 @@ async fn handle_socket(
     channel_id: String,
     query: ConnectQuery,
 ) {
-    let peer_id = query.peer_id.trim().to_string();
-    if channel_id.trim().is_empty() || peer_id.is_empty() {
-        reject_socket(
-            socket,
-            "invalid_connection",
-            "channel_id and peer_id are required",
-        )
-        .await;
+    if channel_id.trim().is_empty() {
+        reject_socket(socket, "invalid_connection", "channel_id is required").await;
         return;
     }
 
-    let join = match state.join(&channel_id, &peer_id, query.role).await {
-        Ok(join) => join,
-        Err(message) => {
-            reject_socket(socket, "join_rejected", &message).await;
-            return;
+    let mut peer_id = trimmed(query.peer_id);
+    let join = loop {
+        let candidate = peer_id
+            .clone()
+            .unwrap_or_else(|| generated_peer_id(query.role));
+        match state.join(&channel_id, &candidate, query.role).await {
+            Ok(join) => {
+                peer_id = Some(candidate);
+                break join;
+            }
+            Err(message) => {
+                if peer_id.is_none() && message.contains("is already connected") {
+                    continue;
+                }
+                reject_socket(socket, "join_rejected", &message).await;
+                return;
+            }
         }
     };
+    let peer_id = peer_id.expect("broker should assign a peer id");
 
     let (mut sender, mut receiver) = socket.split();
     let welcome = ServerMessage::Welcome {
@@ -157,6 +165,31 @@ fn workspace_root() -> PathBuf {
         .join("..")
         .canonicalize()
         .expect("workspace root should resolve")
+}
+
+fn trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn generated_peer_id(role: protocol::PeerRole) -> String {
+    let prefix = match role {
+        protocol::PeerRole::Relay => "relay",
+        protocol::PeerRole::Surface => "surface",
+    };
+    let suffix = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("{prefix}-{suffix}")
 }
 
 #[cfg(test)]

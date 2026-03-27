@@ -23,9 +23,7 @@ use self::remote_actions::{
     handle_encrypted_remote_action, handle_remote_action, RemoteActionKind, RemoteActionRequest,
     RemoteDeviceAuth,
 };
-use self::session_claim::{
-    issue_session_claim, verify_session_claim,
-};
+use self::session_claim::{issue_session_claim, verify_session_claim};
 
 const RECONNECT_DELAY_SECS: u64 = 2;
 type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -144,9 +142,8 @@ impl BrokerConfig {
             return Err("RELAY_BROKER_URL must use ws:// or wss://".to_string());
         }
 
-        let mut public_url = Url::parse(&public_url).map_err(|error| {
-            format!("invalid RELAY_BROKER_PUBLIC_URL `{public_url}`: {error}")
-        })?;
+        let mut public_url = Url::parse(&public_url)
+            .map_err(|error| format!("invalid RELAY_BROKER_PUBLIC_URL `{public_url}`: {error}"))?;
         let public_scheme = public_url.scheme().to_ascii_lowercase();
         if public_scheme != "ws" && public_scheme != "wss" {
             return Err("RELAY_BROKER_PUBLIC_URL must use ws:// or wss://".to_string());
@@ -418,6 +415,15 @@ async fn handle_pairing_request(
     pairing_id: String,
     envelope: EncryptedEnvelope,
 ) -> Result<(), String> {
+    state
+        .push_runtime_log(
+            "info",
+            format!(
+                "Broker pairing request {} received from {}.",
+                pairing_id, from_peer_id
+            ),
+        )
+        .await;
     let pairing_secret = state.pending_pairing_secret(&pairing_id).await?;
     let pairing_request: PairingRequestPlaintext = decrypt_json(&pairing_secret, &envelope)?;
     let result = state
@@ -431,17 +437,31 @@ async fn handle_pairing_request(
         .await;
 
     let payload = match result {
-        Ok((device, token)) => PairingResultPlaintext {
-            ok: true,
-            device: Some(device),
-            device_token: Some(token),
-            error: None,
-        },
+        Ok((device, token)) => {
+            state
+                .push_runtime_log(
+                    "info",
+                    format!(
+                        "Broker pairing {} succeeded for {} as {}.",
+                        pairing_id, from_peer_id, device.device_id
+                    ),
+                )
+                .await;
+            PairingResultPlaintext {
+                ok: true,
+                device: Some(device),
+                device_token: Some(token),
+                error: None,
+            }
+        }
         Err(error) => {
             state
                 .push_runtime_log(
                     "warn",
-                    format!("Broker pairing from {} failed: {error}", from_peer_id),
+                    format!(
+                        "Broker pairing {} from {} failed: {error}",
+                        pairing_id, from_peer_id
+                    ),
                 )
                 .await;
             PairingResultPlaintext {

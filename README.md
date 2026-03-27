@@ -28,7 +28,8 @@ The repository currently includes:
 
 - `crates/relay-server`: Rust API server, Codex bridge, session state, and static web hosting
 - `crates/relay-broker`: early Rust broker service for future remote transport
-- `web/`: plain JavaScript web client
+- `frontend/`: Vite-based web client source
+- `web/`: generated static build output for Rust to serve locally
 
 The current implementation supports:
 
@@ -99,6 +100,12 @@ npm install
 npm run build
 ```
 
+Remote broker smoke test:
+
+```bash
+npm run smoke:pairing
+```
+
 Then run:
 
 ```bash
@@ -110,6 +117,7 @@ Open `http://localhost:8787`.
 Notes:
 
 - the server binds to `127.0.0.1` by default
+- `web/` is generated and gitignored, so build the frontend before running the Rust web servers
 - set `BIND_HOST=0.0.0.0` only when you intentionally want network reachability
 - set `RELAY_API_TOKEN` to protect `/api` routes
 - set `RELAY_SECURITY_MODE=private` or `RELAY_SECURITY_MODE=managed` to switch visibility mode

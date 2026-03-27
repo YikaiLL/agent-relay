@@ -42,7 +42,7 @@ configureRenderHandlers({
 });
 
 configureBrokerClient({
-  onBrokerOpen(reason) {
+  onBrokerReady(_frame, reason) {
     if (state.pairingTicket) {
       void sendPairingRequest();
       return;
