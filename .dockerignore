@@ -1,0 +1,13 @@
+.git
+.gitignore
+target
+tmp
+markdown
+.agent-relay
+.env
+.env.*
+node_modules
+dist
+.DS_Store
+.idea
+.vscode

@@ -27,6 +27,12 @@ pub fn app(state: BrokerState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/ws/:channel_id", get(websocket))
+        .route_service(
+            "/manifest.webmanifest",
+            ServeFile::new(web_root.join("remote-manifest.webmanifest")),
+        )
+        .route_service("/sw.js", ServeFile::new(web_root.join("remote-sw.js")))
+        .route_service("/icon.svg", ServeFile::new(web_root.join("icon.svg")))
         .route_service("/", ServeFile::new(web_root.join("remote.html")))
         .nest_service("/static", ServeDir::new(web_root))
         .with_state(state)

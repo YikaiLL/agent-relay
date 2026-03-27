@@ -14,6 +14,7 @@ import {
   handleEncryptedPairingResult,
   sendPairingRequest,
 } from "./pairing.js";
+import { registerRemotePwa } from "./pwa.js";
 import {
   configureRenderHandlers,
   renderDeviceMeta,
@@ -115,18 +116,24 @@ dom.remoteTranscript.addEventListener("click", (event) => {
 void boot();
 
 async function boot() {
-  if (!window.crypto?.subtle) {
-    renderLog("Secure browser crypto is unavailable. Use HTTPS or localhost for remote pairing.");
+  if (!window.crypto?.getRandomValues) {
+    renderLog("Secure random bytes are unavailable in this browser. Remote pairing cannot start here.");
   }
+  void registerRemotePwa();
 
   dom.deviceLabelInput.value = loadDeviceLabel();
   setRemoteSessionPanelOpen(false);
-  applyPairingQuery();
+  const pairingQuery = applyPairingQuery();
   renderDeviceMeta();
   renderEmptyState();
   renderThreads([]);
 
-  if (state.remoteAuth || state.pairingTicket) {
+  if (pairingQuery) {
+    await beginPairing(pairingQuery, { auto: true });
+    return;
+  }
+
+  if (state.remoteAuth) {
     connectBroker("initial boot");
   }
 }

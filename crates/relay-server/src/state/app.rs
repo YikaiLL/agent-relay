@@ -322,7 +322,7 @@ impl AppState {
 
         let mut relay = self.relay.write().await;
         let ticket = relay.issue_pairing_ticket(
-            broker.base_url(),
+            broker.public_base_url(),
             &broker.channel_id,
             &broker.peer_id,
             input.expires_in_seconds,

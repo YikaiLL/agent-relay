@@ -9,10 +9,10 @@ export function renderSessionChrome(session) {
 
   dom.remoteWorkspaceTitle.textContent = hasActiveSession
     ? shortId(session.active_thread_id)
-    : "Remote surface ready";
+    : workspaceTitle();
   dom.remoteWorkspaceSubtitle.textContent = hasActiveSession
     ? session.current_cwd
-    : "Pair this browser and either wait for a live session or start one from the sidebar.";
+    : workspaceSubtitle();
 
   if (approval) {
     dom.remoteStatusBadge.textContent = "Approval required";
@@ -33,6 +33,8 @@ export function renderSessionChrome(session) {
 export function renderDeviceMeta() {
   if (!state.remoteAuth && !state.pairingTicket) {
     dom.deviceMeta.innerHTML = `<p class="sidebar-empty">No paired remote device stored in this browser.</p>`;
+    syncWorkspaceHeading();
+    updatePairingControls();
     renderOverviewCards();
     return;
   }
@@ -43,8 +45,12 @@ export function renderDeviceMeta() {
     rows.push(`
       <article class="paired-device-card">
         <div class="paired-device-copy">
-          <strong>Pending Pairing</strong>
+          <strong>${escapeHtml(pairingHeading())}</strong>
+          <div class="paired-device-badges">
+            ${statusBadgeMarkup(pairingBadgeText(), pairingBadgeTone())}
+          </div>
           <p class="paired-device-meta">${escapeHtml(shortId(state.pairingTicket.pairing_id))} · expires ${escapeHtml(formatTimestamp(state.pairingTicket.expires_at))}</p>
+          <p class="paired-device-meta">${escapeHtml(pairingCopy())}</p>
         </div>
       </article>
     `);
@@ -69,6 +75,8 @@ export function renderDeviceMeta() {
   }
 
   dom.deviceMeta.innerHTML = rows.join("");
+  syncWorkspaceHeading();
+  updatePairingControls();
   renderOverviewCards();
 }
 
@@ -101,7 +109,14 @@ export function updateStatusBadge() {
     return;
   }
 
-  dom.remoteStatusBadge.textContent = state.remoteAuth || state.pairingTicket ? "Connecting" : "Offline";
+  if (state.pairingTicket) {
+    dom.remoteStatusBadge.textContent = pairingBadgeText();
+    dom.remoteStatusBadge.className = `status-badge status-badge-${pairingBadgeTone()}`;
+    renderOverviewCards();
+    return;
+  }
+
+  dom.remoteStatusBadge.textContent = state.remoteAuth ? "Connecting" : "Offline";
   dom.remoteStatusBadge.className = "status-badge status-badge-offline";
   renderOverviewCards();
 }
@@ -111,8 +126,8 @@ export function resetRemoteSurfaceChrome() {
   renderOverviewCards();
   dom.remoteSessionMeta.innerHTML = `<span class="meta-empty">Pair a remote device to start streaming session details.</span>`;
   dom.remoteControlBanner.hidden = true;
-  dom.remoteWorkspaceTitle.textContent = "Pair this browser";
-  dom.remoteWorkspaceSubtitle.textContent = "Open a pairing QR from your local relay to control Codex remotely.";
+  dom.remoteWorkspaceTitle.textContent = workspaceTitle();
+  dom.remoteWorkspaceSubtitle.textContent = workspaceSubtitle();
   renderEmptyState();
   updateStatusBadge();
 }
@@ -201,10 +216,10 @@ function renderDeviceOverview() {
 
   if (state.pairingTicket) {
     dom.remoteDeviceOverview.innerHTML = `
-      <p class="overview-title">Pairing pending</p>
-      <p class="overview-copy">${escapeHtml(shortId(state.pairingTicket.pairing_id))} expires ${escapeHtml(formatTimestamp(state.pairingTicket.expires_at))}</p>
+      <p class="overview-title">${escapeHtml(pairingHeading())}</p>
+      <p class="overview-copy">${escapeHtml(pairingCopy())}</p>
       <div class="overview-badges">
-        ${statusBadgeMarkup("Waiting for device", "alert")}
+        ${statusBadgeMarkup(pairingBadgeText(), pairingBadgeTone())}
       </div>
     `;
     return;
@@ -345,4 +360,87 @@ function controllerLabel(deviceId) {
 
 function statusBadgeMarkup(label, tone = "ready") {
   return `<span class="status-badge status-badge-${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
+}
+
+function updatePairingControls() {
+  const pairingBusy = Boolean(state.pairingTicket) && state.pairingPhase !== "error";
+  dom.connectButton.disabled = pairingBusy;
+  dom.connectButton.textContent = pairingBusy ? pairingButtonLabel() : "Pair";
+  dom.pairingInput.readOnly = pairingBusy;
+}
+
+function syncWorkspaceHeading() {
+  if (state.session?.active_thread_id) {
+    return;
+  }
+
+  dom.remoteWorkspaceTitle.textContent = workspaceTitle();
+  dom.remoteWorkspaceSubtitle.textContent = workspaceSubtitle();
+}
+
+function workspaceTitle() {
+  if (state.remoteAuth) {
+    return "Remote surface ready";
+  }
+  if (state.pairingTicket) {
+    return state.pairingPhase === "error" ? "Pairing failed" : "Pairing this browser";
+  }
+  return "Pair this browser";
+}
+
+function workspaceSubtitle() {
+  if (state.remoteAuth) {
+    return "Remote device paired. Start a session, resume one from history, or wait for a live thread.";
+  }
+  if (state.pairingTicket) {
+    return pairingCopy();
+  }
+  return "Open a pairing QR from your local relay to control Codex remotely.";
+}
+
+function pairingHeading() {
+  if (state.pairingPhase === "error") {
+    return "Pairing needs attention";
+  }
+  if (state.pairingPhase === "requesting") {
+    return "Pairing request sent";
+  }
+  return "Pairing this browser";
+}
+
+function pairingCopy() {
+  if (state.pairingPhase === "error") {
+    return state.pairingError || "Pairing could not complete. Retry from this page or rescan the QR.";
+  }
+  if (state.pairingPhase === "requesting") {
+    return "This page is waiting for the local relay to accept the scanned pairing ticket.";
+  }
+  return "This page is connecting to the broker with the scanned pairing ticket. You should not need to press Pair again.";
+}
+
+function pairingBadgeText() {
+  if (state.pairingPhase === "error") {
+    return "Pairing failed";
+  }
+  if (state.pairingPhase === "requesting") {
+    return "Waiting for relay";
+  }
+  return "Pairing…";
+}
+
+function pairingBadgeTone() {
+  if (state.pairingPhase === "error") {
+    return "alert";
+  }
+  if (state.pairingPhase === "requesting") {
+    return "ready";
+  }
+  return "alert";
+}
+
+function pairingButtonLabel() {
+  if (state.pairingPhase === "requesting") {
+    return "Waiting...";
+  }
+  return "Pairing...";
 }

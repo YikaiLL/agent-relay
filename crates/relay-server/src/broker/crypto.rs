@@ -1,11 +1,11 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
-};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use xsalsa20poly1305::{
+    aead::{Aead, KeyInit},
+    Key, Nonce, XSalsa20Poly1305,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct EncryptedEnvelope {
@@ -33,7 +33,7 @@ pub(crate) fn decrypt_json<T: DeserializeOwned>(
 
 fn encrypt_bytes(secret: &str, plaintext: &[u8]) -> Result<EncryptedEnvelope, String> {
     let cipher = cipher(secret);
-    let mut nonce_bytes = [0_u8; 12];
+    let mut nonce_bytes = [0_u8; 24];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
@@ -51,7 +51,7 @@ fn decrypt_bytes(secret: &str, envelope: &EncryptedEnvelope) -> Result<Vec<u8>, 
     let nonce_bytes = STANDARD
         .decode(&envelope.nonce)
         .map_err(|error| format!("invalid envelope nonce: {error}"))?;
-    if nonce_bytes.len() != 12 {
+    if nonce_bytes.len() != 24 {
         return Err("invalid envelope nonce length".to_string());
     }
     let ciphertext = STANDARD
@@ -64,10 +64,10 @@ fn decrypt_bytes(secret: &str, envelope: &EncryptedEnvelope) -> Result<Vec<u8>, 
         .map_err(|error| format!("decryption failed: {error}"))
 }
 
-fn cipher(secret: &str) -> Aes256Gcm {
+fn cipher(secret: &str) -> XSalsa20Poly1305 {
     let digest = Sha256::digest(secret.as_bytes());
-    let key = Key::<Aes256Gcm>::from_slice(&digest);
-    Aes256Gcm::new(key)
+    let key = Key::from_slice(&digest);
+    XSalsa20Poly1305::new(key)
 }
 
 #[cfg(test)]

@@ -24,19 +24,24 @@ import { shortId } from "./utils.js";
 export function applyPairingQuery() {
   const raw = new URL(window.location.href).searchParams.get("pairing");
   if (!raw) {
-    return;
+    return null;
   }
 
   try {
-    state.pairingTicket = parsePairingPayload(raw);
     dom.pairingInput.value = raw;
-    renderLog(`Loaded pairing ticket ${state.pairingTicket.pairing_id} from URL.`);
+    const pairingTicket = parsePairingPayload(raw);
+    renderLog(`Loaded pairing ticket ${pairingTicket.pairing_id} from URL.`);
+    return raw;
   } catch (error) {
+    state.pairingPhase = "error";
+    state.pairingError = error.message;
     renderLog(`Invalid pairing URL: ${error.message}`);
+    renderDeviceMeta();
+    return null;
   }
 }
 
-export async function beginPairing(rawValue) {
+export async function beginPairing(rawValue, { auto = false } = {}) {
   const raw = rawValue.trim();
   if (!raw) {
     renderLog("Paste a pairing link or code first.");
@@ -46,6 +51,8 @@ export async function beginPairing(rawValue) {
 
   try {
     state.pairingTicket = parsePairingPayload(raw);
+    state.pairingPhase = "connecting";
+    state.pairingError = null;
     state.remoteAuth = null;
     state.session = null;
     state.threads = [];
@@ -57,8 +64,16 @@ export async function beginPairing(rawValue) {
     saveDeviceLabel(dom.deviceLabelInput.value);
     renderDeviceMeta();
     renderThreads([]);
+    renderLog(
+      auto
+        ? `Starting pairing for ${state.pairingTicket.pairing_id} from scanned link.`
+        : `Starting pairing for ${state.pairingTicket.pairing_id}.`
+    );
     connectBroker("pairing request");
   } catch (error) {
+    state.pairingPhase = "error";
+    state.pairingError = error.message;
+    renderDeviceMeta();
     renderLog(`Pairing input is invalid: ${error.message}`);
   }
 }
@@ -68,6 +83,10 @@ export async function sendPairingRequest() {
   if (!ticket) {
     return;
   }
+
+  state.pairingPhase = "requesting";
+  state.pairingError = null;
+  renderDeviceMeta();
 
   const payload = {
     kind: "pairing_request",
@@ -96,6 +115,9 @@ export async function handleEncryptedPairingResult(payload) {
 
   const result = await decryptJson(state.pairingTicket.pairing_secret, payload.envelope);
   if (!result.ok) {
+    state.pairingPhase = "error";
+    state.pairingError = result.error || "unknown pairing error";
+    renderDeviceMeta();
     renderLog(`Pairing failed: ${result.error || "unknown pairing error"}`);
     return;
   }
@@ -114,6 +136,8 @@ export async function handleEncryptedPairingResult(payload) {
   };
   saveRemoteAuth(state.remoteAuth);
   state.pairingTicket = null;
+  state.pairingPhase = null;
+  state.pairingError = null;
   dom.pairingInput.value = "";
   clearPairingQueryFromUrl();
   renderDeviceMeta();
@@ -126,6 +150,8 @@ export async function handleEncryptedPairingResult(payload) {
 }
 
 export function forgetCurrentDevice() {
+  state.pairingError = null;
+  state.pairingPhase = null;
   state.pairingTicket = null;
   state.remoteAuth = null;
   state.session = null;

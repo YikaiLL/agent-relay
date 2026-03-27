@@ -44,6 +44,7 @@ The current implementation supports:
 - optional API token auth with `RELAY_API_TOKEN`
 - local session persistence for refresh and resume
 - security mode plumbing for `private` and `managed`
+- broker-served remote PWA shell with installable manifest and service worker
 
 The current web UI is intentionally simple:
 
@@ -91,6 +92,13 @@ Requirements:
 - Rust toolchain
 - `codex` CLI installed and logged in
 
+Frontend workflow:
+
+```bash
+npm install
+npm run build
+```
+
 Then run:
 
 ```bash
@@ -102,8 +110,55 @@ Open `http://localhost:8787`.
 Notes:
 
 - the server binds to `127.0.0.1` by default
+- set `BIND_HOST=0.0.0.0` only when you intentionally want network reachability
 - set `RELAY_API_TOKEN` to protect `/api` routes
 - set `RELAY_SECURITY_MODE=private` or `RELAY_SECURITY_MODE=managed` to switch visibility mode
+- use `npm run dev` when iterating on the web UI, then `npm run build` to refresh the
+  Rust-served assets under `web/`
+
+## Remote broker deploy
+
+The broker is the easiest piece to deploy first because it does not run Codex
+or touch your workspace directly.
+
+Build and run it with Docker Compose:
+
+```bash
+docker compose up --build relay-broker
+```
+
+Or directly with Docker:
+
+```bash
+docker build -f docker/broker.Dockerfile -t agent-relay-broker .
+docker run --rm -p 8788:8788 -e BIND_HOST=0.0.0.0 agent-relay-broker
+```
+
+Then point your local relay-server at that broker:
+
+```bash
+RELAY_BROKER_URL=ws://127.0.0.1:8788 \
+RELAY_BROKER_PUBLIC_URL=ws://192.168.1.105:8788 \
+RELAY_BROKER_CHANNEL_ID=dev-room \
+RELAY_BROKER_PEER_ID=local-relay \
+cargo run -p relay-server
+```
+
+Notes:
+
+- `relay-server` still expects local Codex access and a real workspace, so it is
+  usually better to run it on the workstation, VM, or jump host that already
+  owns the repo and CLI session.
+- when the broker is only locally reachable from the relay host, set
+  `RELAY_BROKER_PUBLIC_URL` to the LAN or public `ws://` / `wss://` address that
+  remote phones and browsers should use for pairing
+- `RELAY_BROKER_URL` and `RELAY_BROKER_PUBLIC_URL` should still point at the same
+  broker instance; they only differ in how the relay host versus remote devices
+  reach that broker
+- The broker remote surface is now installable as a PWA. Open the broker root,
+  then use your browser's install action to pin it on a phone or desktop.
+- pairing and encrypted broker traffic now work on plain LAN `http://` pages, but
+  service worker registration still only works on `https://` origins or `localhost`.
 
 ## Current API surface
 

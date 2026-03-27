@@ -8,7 +8,6 @@ license = "Elastic-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-aes-gcm = "0.10"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 futures-util = "0.3"
@@ -24,3 +23,4 @@ tower-http = { version = "0.6", features = ["fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+xsalsa20poly1305 = "0.9.1"

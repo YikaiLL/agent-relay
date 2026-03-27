@@ -1,16 +1,20 @@
 use super::*;
+use crate::protocol::SendMessageInput;
+
+use super::session_claim::{decode_and_verify_session_claim, unix_now};
 
 #[test]
 fn broker_config_builds_websocket_url() {
     let config = BrokerConfig::from_parts(
         Some("ws://127.0.0.1:8788".to_string()),
+        None,
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
     )
     .expect("config should parse")
     .expect("config should be enabled");
 
-    assert_eq!(config.base_url(), "ws://127.0.0.1:8788");
+    assert_eq!(config.public_base_url(), "ws://127.0.0.1:8788");
     assert_eq!(
         config.url.as_str(),
         "ws://127.0.0.1:8788/ws/demo-room?peer_id=relay-1&role=relay"
@@ -18,9 +22,24 @@ fn broker_config_builds_websocket_url() {
 }
 
 #[test]
+fn broker_config_supports_distinct_public_url_for_pairing() {
+    let config = BrokerConfig::from_parts(
+        Some("ws://127.0.0.1:8788".to_string()),
+        Some("ws://192.168.1.105:8788".to_string()),
+        Some("demo-room".to_string()),
+        Some("relay-1".to_string()),
+    )
+    .expect("config should parse")
+    .expect("config should be enabled");
+
+    assert_eq!(config.public_base_url(), "ws://192.168.1.105:8788");
+}
+
+#[test]
 fn broker_config_requires_channel() {
     let error = BrokerConfig::from_parts(
         Some("ws://127.0.0.1:8788".to_string()),
+        None,
         None,
         Some("relay-1".to_string()),
     )
@@ -30,9 +49,21 @@ fn broker_config_requires_channel() {
 
 #[test]
 fn broker_config_disables_when_url_is_missing() {
-    let config = BrokerConfig::from_parts(None, Some("demo-room".to_string()), None)
+    let config = BrokerConfig::from_parts(None, None, Some("demo-room".to_string()), None)
         .expect("missing url should be accepted");
     assert!(config.is_none());
+}
+
+#[test]
+fn broker_config_rejects_invalid_public_url_scheme() {
+    let error = BrokerConfig::from_parts(
+        Some("ws://127.0.0.1:8788".to_string()),
+        Some("http://192.168.1.105:8788".to_string()),
+        Some("demo-room".to_string()),
+        Some("relay-1".to_string()),
+    )
+    .expect_err("invalid public url scheme should fail");
+    assert!(error.contains("RELAY_BROKER_PUBLIC_URL"));
 }
 
 #[test]

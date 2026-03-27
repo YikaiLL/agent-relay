@@ -5,7 +5,10 @@ mod protocol;
 mod state;
 
 use std::{convert::Infallible, time::Duration};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+};
 
 use auth::AuthConfig;
 use axum::{
@@ -80,12 +83,13 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(8787);
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let host = std::env::var("BIND_HOST")
+        .ok()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    let address = SocketAddr::from((host, port));
 
-    info!(
-        "relay-server listening on http://localhost:{} (bound to {})",
-        port, address
-    );
+    info!("relay-server listening on http://{}:{}", host, port);
 
     let listener = tokio::net::TcpListener::bind(address)
         .await

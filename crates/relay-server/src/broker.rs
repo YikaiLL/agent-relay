@@ -14,9 +14,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
-    protocol::{
-        ApprovalReceipt, PairedDeviceView, SendMessageInput, SessionSnapshot, ThreadsResponse,
-    },
+    protocol::{ApprovalReceipt, PairedDeviceView, SessionSnapshot, ThreadsResponse},
     state::AppState,
 };
 
@@ -26,7 +24,7 @@ use self::remote_actions::{
     RemoteDeviceAuth,
 };
 use self::session_claim::{
-    decode_and_verify_session_claim, issue_session_claim, unix_now, verify_session_claim,
+    issue_session_claim, verify_session_claim,
 };
 
 const RECONNECT_DELAY_SECS: u64 = 2;
@@ -34,7 +32,7 @@ type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
-    base_url: String,
+    public_base_url: String,
     url: Url,
     pub channel_id: String,
     pub peer_id: String,
@@ -116,6 +114,7 @@ impl BrokerConfig {
     pub fn from_env() -> Result<Option<Self>, String> {
         Self::from_parts(
             std::env::var("RELAY_BROKER_URL").ok(),
+            std::env::var("RELAY_BROKER_PUBLIC_URL").ok(),
             std::env::var("RELAY_BROKER_CHANNEL_ID").ok(),
             std::env::var("RELAY_BROKER_PEER_ID").ok(),
         )
@@ -123,6 +122,7 @@ impl BrokerConfig {
 
     fn from_parts(
         url: Option<String>,
+        public_url: Option<String>,
         channel_id: Option<String>,
         peer_id: Option<String>,
     ) -> Result<Option<Self>, String> {
@@ -133,6 +133,9 @@ impl BrokerConfig {
             "RELAY_BROKER_CHANNEL_ID is required when RELAY_BROKER_URL is set".to_string()
         })?;
         let peer_id = trimmed(peer_id).unwrap_or_else(|| "local-relay".to_string());
+        let public_url = public_url
+            .and_then(trimmed_string)
+            .unwrap_or_else(|| url.clone());
 
         let mut url = Url::parse(&url)
             .map_err(|error| format!("invalid RELAY_BROKER_URL `{url}`: {error}"))?;
@@ -140,10 +143,18 @@ impl BrokerConfig {
         if scheme != "ws" && scheme != "wss" {
             return Err("RELAY_BROKER_URL must use ws:// or wss://".to_string());
         }
-        let mut base_url = url.clone();
-        base_url.set_path("");
-        base_url.set_query(None);
-        let base_url = base_url.as_str().trim_end_matches('/').to_string();
+
+        let mut public_url = Url::parse(&public_url).map_err(|error| {
+            format!("invalid RELAY_BROKER_PUBLIC_URL `{public_url}`: {error}")
+        })?;
+        let public_scheme = public_url.scheme().to_ascii_lowercase();
+        if public_scheme != "ws" && public_scheme != "wss" {
+            return Err("RELAY_BROKER_PUBLIC_URL must use ws:// or wss://".to_string());
+        }
+
+        public_url.set_path("");
+        public_url.set_query(None);
+        let public_base_url = public_url.as_str().trim_end_matches('/').to_string();
 
         {
             let mut segments = url.path_segments_mut().map_err(|_| {
@@ -159,15 +170,15 @@ impl BrokerConfig {
             .append_pair("role", "relay");
 
         Ok(Some(Self {
-            base_url,
+            public_base_url,
             url,
             channel_id,
             peer_id,
         }))
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    pub fn public_base_url(&self) -> &str {
+        &self.public_base_url
     }
 }
 

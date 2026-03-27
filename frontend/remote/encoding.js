@@ -4,7 +4,15 @@ export function base64UrlToBytes(value) {
   return base64ToBytes(normalized);
 }
 
-function base64ToBytes(value) {
+export function base64ToBytes(value) {
   const binary = window.atob(value);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+export function bytesToBase64(bytes) {
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return window.btoa(binary);
 }

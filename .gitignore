@@ -10,6 +10,7 @@
 .env.*
 .envrc
 *.local
+!.env.example
 
 # Temporary files
 /tmp

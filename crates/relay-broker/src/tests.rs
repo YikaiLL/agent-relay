@@ -61,7 +61,27 @@ async fn root_serves_remote_surface_html() {
 
     assert!(response.contains("200 OK"));
     assert!(response.contains("Remote Broker Surface"));
-    assert!(response.contains("/static/remote.js"));
+    assert!(response.contains("/static/assets/remote-"));
+}
+
+#[tokio::test]
+async fn manifest_route_serves_remote_pwa_manifest() {
+    let address = spawn_app().await;
+    let response = http_get(address, "/manifest.webmanifest").await;
+
+    assert!(response.contains("200 OK"));
+    assert!(response.contains("\"display\": \"standalone\""));
+    assert!(response.contains("\"src\": \"/icon.svg\""));
+}
+
+#[tokio::test]
+async fn service_worker_route_serves_remote_cache_script() {
+    let address = spawn_app().await;
+    let response = http_get(address, "/sw.js").await;
+
+    assert!(response.contains("200 OK"));
+    assert!(response.contains("agent-relay-remote-v1"));
+    assert!(response.contains("self.addEventListener(\"install\""));
 }
 
 #[tokio::test]

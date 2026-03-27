@@ -1,0 +1,12 @@
+services:
+  relay-broker:
+    build:
+      context: .
+      dockerfile: docker/broker.Dockerfile
+    environment:
+      BIND_HOST: 0.0.0.0
+      PORT: 8788
+      RUST_LOG: relay_broker=info,tower_http=info
+    ports:
+      - "8788:8788"
+    restart: unless-stopped

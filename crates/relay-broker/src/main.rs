@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tokio::net::TcpListener;
 use tracing::info;
@@ -16,12 +16,19 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(8788);
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let host = std::env::var("BIND_HOST")
+        .ok()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    let address = SocketAddr::from((host, port));
     let listener = TcpListener::bind(address)
         .await
         .expect("failed to bind broker tcp listener");
 
-    info!("relay-broker listening on ws://localhost:{port}/ws/:channel_id");
+    info!(
+        "relay-broker listening on http://{}:{} and ws://{}:{}/ws/:channel_id",
+        host, port, host, port
+    );
     axum::serve(
         listener,
         relay_broker::app(relay_broker::BrokerState::default()),

@@ -44,6 +44,7 @@ body {
   color: var(--text);
   background: var(--app-bg);
   font-family: "Soehne", "SF Pro Text", "Helvetica Neue", sans-serif;
+  overscroll-behavior-y: none;
 }
 
 button,
@@ -300,6 +301,7 @@ select {
   background: rgba(247, 247, 248, 0.92);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid rgba(229, 229, 232, 0.9);
+  z-index: 3;
 }
 
 .chat-heading h1 {
@@ -662,6 +664,7 @@ select {
   bottom: 0;
   padding: 16px 24px 24px;
   background: linear-gradient(180deg, rgba(247, 247, 248, 0), rgba(247, 247, 248, 0.86) 24%, rgba(247, 247, 248, 1) 58%);
+  z-index: 2;
 }
 
 .composer-inner {
@@ -684,6 +687,7 @@ select {
   background: transparent;
   outline: none;
   line-height: 1.6;
+  font-size: 16px;
 }
 
 .composer-actions {
@@ -868,6 +872,7 @@ select {
     border-bottom: 1px solid var(--sidebar-border);
     height: auto;
     overflow: visible;
+    padding: max(14px, env(safe-area-inset-top)) 14px 14px;
   }
 
   .chat-shell {
@@ -876,9 +881,28 @@ select {
   }
 
   .chat-header {
+    position: sticky;
+    top: 0;
     padding: 18px 20px 10px;
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .remote-access-shell,
+  .new-session-panel {
+    border-radius: 16px;
+  }
+
+  .workspace-picker {
+    grid-template-columns: 1fr;
+  }
+
+  .load-button,
+  .start-session-button,
+  .header-button,
+  .send-button,
+  .approval-button {
+    min-height: 44px;
   }
 
   .meta-drawer {
@@ -896,7 +920,46 @@ select {
     align-items: flex-start;
   }
 
+  .chat-thread {
+    padding: 20px 0 28px;
+  }
+
+  .thread-content,
+  .thread-empty,
+  .log-drawer {
+    width: calc(100% - 20px);
+  }
+
+  .chat-message {
+    gap: 10px;
+  }
+
+  .message-card,
+  .message-card-system,
+  .message-card-approval {
+    max-width: 100%;
+  }
+
   .composer-shell {
-    padding: 14px 14px 18px;
+    padding: 12px 12px calc(16px + env(safe-area-inset-bottom));
+  }
+
+  .composer-inner {
+    width: 100%;
+    border-radius: 22px;
+  }
+
+  .composer-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .composer-select {
+    justify-content: space-between;
+  }
+
+  .send-button,
+  .control-button {
+    width: 100%;
   }
 }

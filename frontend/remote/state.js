@@ -14,6 +14,8 @@ export const state = {
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
+  pairingError: null,
+  pairingPhase: null,
   pairingTicket: null,
   pendingActions: new Map(),
   remoteAuth: loadRemoteAuth(),
