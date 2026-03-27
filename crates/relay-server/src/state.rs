@@ -13,7 +13,8 @@ use std::{
 pub use self::app::{AppState, ApprovalError};
 use self::relay::TranscriptRecord;
 pub(crate) use self::relay::{
-    ApprovalKind, BrokerPendingMessage, PairedDevice, PendingApproval, RelayState,
+    ApprovalKind, BrokerPendingMessage, PairedDevice, PendingApproval, PendingPairingResult,
+    RelayState,
 };
 pub(crate) use self::security::SecurityProfile;
 

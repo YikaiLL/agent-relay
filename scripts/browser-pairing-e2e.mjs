@@ -84,6 +84,13 @@ async function main() {
     await localPage.waitForFunction(() => {
       return Boolean(document.querySelector("[data-pairing-id][data-pairing-decision='approve']"));
     }, null, { timeout: PAIRING_TIMEOUT_MS });
+
+    // Regression coverage: the first remote surface disconnects before local approval,
+    // then reconnects on a new broker peer. Approval must still reach the new peer.
+    await remotePage.close();
+    remotePage = await context.newPage();
+    await remotePage.goto(pairingUrl, { waitUntil: "domcontentloaded" });
+
     await localPage.click("[data-pairing-id][data-pairing-decision='approve']");
     await remotePage.waitForFunction(() => {
       const overview = document.querySelector("#remote-device-overview")?.textContent || "";

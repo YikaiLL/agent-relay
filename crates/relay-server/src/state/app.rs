@@ -530,6 +530,16 @@ impl AppState {
         relay.pending_pairing_secret(pairing_id, unix_now())
     }
 
+    pub(crate) async fn completed_pairing_result(
+        &self,
+        pairing_id: &str,
+        device_verify_key: &str,
+        peer_id: &str,
+    ) -> Result<Option<super::PendingPairingResult>, String> {
+        let mut relay = self.relay.write().await;
+        relay.completed_pairing_result(pairing_id, device_verify_key, peer_id, unix_now())
+    }
+
     pub(crate) async fn paired_device_secret(&self, device_id: &str) -> Result<String, String> {
         let relay = self.relay.read().await;
         relay.paired_device_shared_secret(device_id)

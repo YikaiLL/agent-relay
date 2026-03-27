@@ -70,6 +70,17 @@ impl PendingPairingRequest {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct CompletedPairing {
+    pub(crate) pairing_id: String,
+    pub(crate) pairing_secret: String,
+    pub(crate) expires_at: u64,
+    pub(crate) device_verify_key: String,
+    pub(crate) device: Option<PairedDeviceView>,
+    pub(crate) device_token: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum BrokerPendingMessage {
     PairingResult(PendingPairingResult),
 }
@@ -209,8 +220,20 @@ impl RelayState {
         if !self.pending_pairings.contains_key(pairing_id) {
             return Err("pairing request is missing or expired".to_string());
         }
-        if self.pending_pairing_requests.contains_key(pairing_id) {
-            return Err("pairing request is already waiting for approval".to_string());
+        if let Some(existing) = self.pending_pairing_requests.get_mut(pairing_id) {
+            let label_fallback = requested_device_id
+                .as_deref()
+                .or(Some(peer_id))
+                .unwrap_or("Remote Device");
+            if let Some(device_id) = normalize_remote_device_id(requested_device_id.as_deref())
+                .filter(|candidate| !candidate.is_empty())
+            {
+                existing.device_id = device_id;
+            }
+            existing.label = normalize_device_label(device_label, label_fallback);
+            existing.broker_peer_id = peer_id.to_string();
+            existing.device_verify_key = device_verify_key;
+            return Ok(existing.to_view());
         }
 
         let device_id = normalize_remote_device_id(requested_device_id.as_deref())
@@ -254,15 +277,28 @@ impl RelayState {
             .ok_or_else(|| "pairing request is missing or expired".to_string())?;
 
         if approved {
+            let device_verify_key = request.device_verify_key.clone();
             let (device, token) = self.consume_pairing_ticket(
                 pairing_id,
                 &pending.pairing_secret,
                 Some(request.device_id),
                 Some(request.label),
-                Some(request.device_verify_key),
+                Some(device_verify_key.clone()),
                 &request.broker_peer_id,
                 now,
             )?;
+            self.completed_pairings.insert(
+                pairing_id.to_string(),
+                CompletedPairing {
+                    pairing_id: pairing_id.to_string(),
+                    pairing_secret: pending.pairing_secret.clone(),
+                    expires_at: pending.expires_at,
+                    device_verify_key,
+                    device: Some(device.clone()),
+                    device_token: Some(token.clone()),
+                    error: None,
+                },
+            );
             return Ok(PendingPairingResult {
                 pairing_id: pairing_id.to_string(),
                 target_peer_id: request.broker_peer_id,
@@ -274,6 +310,18 @@ impl RelayState {
         }
 
         self.pending_pairings.remove(pairing_id);
+        self.completed_pairings.insert(
+            pairing_id.to_string(),
+            CompletedPairing {
+                pairing_id: pairing_id.to_string(),
+                pairing_secret: pending.pairing_secret.clone(),
+                expires_at: pending.expires_at,
+                device_verify_key: request.device_verify_key,
+                device: None,
+                device_token: None,
+                error: Some("pairing request was rejected on the local relay".to_string()),
+            },
+        );
         Ok(PendingPairingResult {
             pairing_id: pairing_id.to_string(),
             target_peer_id: request.broker_peer_id,
@@ -282,6 +330,32 @@ impl RelayState {
             device_token: None,
             error: Some("pairing request was rejected on the local relay".to_string()),
         })
+    }
+
+    pub fn completed_pairing_result(
+        &mut self,
+        pairing_id: &str,
+        device_verify_key: &str,
+        peer_id: &str,
+        now: u64,
+    ) -> Result<Option<PendingPairingResult>, String> {
+        self.prune_expired_pairings(now);
+        let Some(completed) = self.completed_pairings.get(pairing_id).cloned() else {
+            return Ok(None);
+        };
+
+        if completed.device_verify_key != device_verify_key {
+            return Err("pairing request does not match the approved device".to_string());
+        }
+
+        Ok(Some(PendingPairingResult {
+            pairing_id: completed.pairing_id,
+            target_peer_id: peer_id.to_string(),
+            pairing_secret: completed.pairing_secret,
+            device: completed.device,
+            device_token: completed.device_token,
+            error: completed.error,
+        }))
     }
 
     pub fn authenticate_paired_device(
@@ -313,6 +387,11 @@ impl RelayState {
         self.pending_pairings
             .get(pairing_id)
             .map(|pairing| pairing.pairing_secret.clone())
+            .or_else(|| {
+                self.completed_pairings
+                    .get(pairing_id)
+                    .map(|pairing| pairing.pairing_secret.clone())
+            })
             .ok_or_else(|| "pairing request is missing or expired".to_string())
     }
 
@@ -343,6 +422,8 @@ impl RelayState {
             .retain(|_, pairing| pairing.expires_at > now);
         self.pending_pairing_requests
             .retain(|pairing_id, _| self.pending_pairings.contains_key(pairing_id));
+        self.completed_pairings
+            .retain(|_, pairing| pairing.expires_at > now);
     }
 }
 

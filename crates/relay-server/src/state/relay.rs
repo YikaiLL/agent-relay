@@ -18,7 +18,8 @@ use super::{
 
 pub use self::approval::{ApprovalKind, PendingApproval};
 pub(crate) use self::device::{
-    BrokerPendingMessage, PairedDevice, PendingPairing, PendingPairingRequest,
+    BrokerPendingMessage, CompletedPairing, PairedDevice, PendingPairing, PendingPairingRequest,
+    PendingPairingResult,
 };
 pub(crate) use self::transcript::TranscriptRecord;
 
@@ -44,6 +45,7 @@ pub struct RelayState {
     pub paired_devices: HashMap<String, PairedDevice>,
     pub pending_pairings: HashMap<String, PendingPairing>,
     pub pending_pairing_requests: HashMap<String, PendingPairingRequest>,
+    pub completed_pairings: HashMap<String, CompletedPairing>,
     pub pending_broker_messages: Vec<BrokerPendingMessage>,
     pub threads: Vec<ThreadSummaryView>,
     pub pending_approvals: HashMap<String, PendingApproval>,
@@ -79,6 +81,7 @@ impl RelayState {
             paired_devices: HashMap::new(),
             pending_pairings: HashMap::new(),
             pending_pairing_requests: HashMap::new(),
+            completed_pairings: HashMap::new(),
             pending_broker_messages: Vec::new(),
             threads: Vec::new(),
             pending_approvals: HashMap::new(),
@@ -228,6 +231,7 @@ impl RelayState {
         self.paired_devices = persisted.paired_devices.clone();
         self.pending_pairings.clear();
         self.pending_pairing_requests.clear();
+        self.completed_pairings.clear();
         self.pending_broker_messages.clear();
         self.pending_approvals.clear();
         self.transcript = data
@@ -389,6 +393,7 @@ impl RelayState {
         self.paired_devices = persisted.paired_devices.clone();
         self.pending_pairings.clear();
         self.pending_pairing_requests.clear();
+        self.completed_pairings.clear();
         self.pending_broker_messages.clear();
         self.pending_approvals.clear();
         self.transcript = persisted.transcript.clone();

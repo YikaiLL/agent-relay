@@ -593,3 +593,70 @@ fn rejecting_pairing_request_returns_error_without_creating_device() {
         Some("pairing request was rejected on the local relay")
     );
 }
+
+#[test]
+fn repeated_pairing_request_rebinds_to_latest_broker_peer() {
+    let mut relay = test_state();
+    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-rebind".to_string()),
+            Some("Rebind Phone".to_string()),
+            "surface-old",
+            "verify-key-3".to_string(),
+            100,
+        )
+        .expect("initial pairing request should register");
+
+    let rebound = relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-rebind".to_string()),
+            Some("Rebind Phone".to_string()),
+            "surface-new",
+            "verify-key-3".to_string(),
+            101,
+        )
+        .expect("retry should rebind to the latest broker peer");
+
+    assert_eq!(rebound.broker_peer_id, "surface-new");
+
+    let result = relay
+        .decide_pairing_request(&ticket.pairing_id, true, 102)
+        .expect("approval should use the rebound broker peer");
+    assert_eq!(result.target_peer_id, "surface-new");
+}
+
+#[test]
+fn completed_pairing_can_replay_result_to_reconnected_peer() {
+    let mut relay = test_state();
+    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-replay".to_string()),
+            Some("Replay Phone".to_string()),
+            "surface-a",
+            "verify-key-4".to_string(),
+            100,
+        )
+        .expect("pairing request should register");
+    relay
+        .decide_pairing_request(&ticket.pairing_id, true, 101)
+        .expect("approval should complete pairing");
+
+    let replay = relay
+        .completed_pairing_result(&ticket.pairing_id, "verify-key-4", "surface-b", 102)
+        .expect("completed pairing lookup should succeed")
+        .expect("completed pairing should be replayable");
+
+    assert_eq!(replay.target_peer_id, "surface-b");
+    assert_eq!(
+        replay.device.as_ref().map(|device| device.device_id.as_str()),
+        Some("phone-replay")
+    );
+    assert!(replay.device_token.is_some());
+}
