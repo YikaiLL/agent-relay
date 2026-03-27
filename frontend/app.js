@@ -32,6 +32,7 @@ const pairingQr = document.querySelector("#pairing-qr");
 const pairingExpiry = document.querySelector("#pairing-expiry");
 const pairingLinkInput = document.querySelector("#pairing-link-input");
 const copyPairingLinkButton = document.querySelector("#copy-pairing-link-button");
+const pendingPairingsList = document.querySelector("#pending-pairings-list");
 const refreshButton = document.querySelector("#refresh-button");
 const threadsRefreshButton = document.querySelector("#threads-refresh-button");
 const sendButton = document.querySelector("#send-button");
@@ -124,6 +125,18 @@ pairedDevicesList.addEventListener("click", (event) => {
   }
 
   void revokePairedDevice(revokeButton.dataset.revokeDeviceId);
+});
+
+pendingPairingsList.addEventListener("click", (event) => {
+  const decisionButton = event.target.closest("[data-pairing-id][data-pairing-decision]");
+  if (!decisionButton) {
+    return;
+  }
+
+  void decidePairingRequest(
+    decisionButton.dataset.pairingId,
+    decisionButton.dataset.pairingDecision
+  );
 });
 
 void boot();
@@ -399,6 +412,37 @@ async function revokePairedDevice(deviceId) {
   }
 }
 
+async function decidePairingRequest(pairingId, decision) {
+  if (!pairingId || !decision) {
+    return;
+  }
+
+  logLine(`Submitting ${decision} for pairing ${shortId(pairingId)}.`);
+
+  try {
+    const response = await apiFetch(
+      `/api/pairings/${encodeURIComponent(pairingId)}/decision`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ decision }),
+      }
+    );
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Pairing decision failed");
+    }
+
+    logLine(payload.data.message);
+    await loadSession("post-pairing-decision refresh");
+  } catch (error) {
+    logLine(`Pairing decision failed: ${error.message}`);
+  }
+}
+
 async function takeOverControl() {
   if (!state.session?.active_thread_id) {
     logLine("There is no active session to take over.");
@@ -497,6 +541,7 @@ function renderSession(session) {
   renderSessionMeta(session);
   renderPairingPanel();
   renderPairedDevices(session.paired_devices || []);
+  renderPendingPairingRequests(session.pending_pairing_requests || []);
   renderControlBanner(session);
   renderTranscript(session.transcript, approval);
   renderLogs(session.logs);
@@ -554,6 +599,46 @@ function renderPairedDevices(devices) {
           >
             Revoke
           </button>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderPendingPairingRequests(requests) {
+  if (!requests.length) {
+    pendingPairingsList.innerHTML =
+      `<p class="sidebar-empty">No devices are waiting for local approval.</p>`;
+    return;
+  }
+
+  pendingPairingsList.innerHTML = requests
+    .map((request) => {
+      return `
+        <article class="paired-device-card">
+          <div class="paired-device-copy">
+            <strong>${escapeHtml(request.label)}</strong>
+            <p class="paired-device-meta">${escapeHtml(shortId(request.device_id))} · requested ${escapeHtml(formatTimestamp(request.requested_at))}</p>
+            <p class="paired-device-meta">Broker peer ${escapeHtml(shortId(request.broker_peer_id))}</p>
+          </div>
+          <div class="paired-device-actions">
+            <button
+              class="approval-button approval-button-primary"
+              type="button"
+              data-pairing-id="${escapeHtml(request.pairing_id)}"
+              data-pairing-decision="approve"
+            >
+              Approve
+            </button>
+            <button
+              class="approval-button approval-button-danger"
+              type="button"
+              data-pairing-id="${escapeHtml(request.pairing_id)}"
+              data-pairing-decision="reject"
+            >
+              Reject
+            </button>
+          </div>
         </article>
       `;
     })

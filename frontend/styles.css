@@ -817,6 +817,12 @@ select {
   margin-bottom: 4px;
 }
 
+.paired-device-actions {
+  display: grid;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .paired-device-badges {
   margin: 8px 0;
 }

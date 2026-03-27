@@ -21,6 +21,7 @@ fn test_persisted_state() -> PersistedRelayState {
             label: "Primary Phone".to_string(),
             shared_secret: "shared-secret".to_string(),
             token_hash: "token-hash".to_string(),
+            device_verify_key: None,
             created_at: 7,
             last_seen_at: Some(9),
             last_peer_id: Some("surface-1".to_string()),
@@ -393,6 +394,7 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
             &ticket.pairing_secret,
             Some("My Phone".to_string()),
             Some("Primary Phone".to_string()),
+            None,
             "surface-a",
             100,
         )
@@ -454,6 +456,7 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
             "wrong-secret",
             Some("phone-2".to_string()),
             None,
+            None,
             "surface-a",
             100,
         )
@@ -467,6 +470,7 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
             &replacement.pairing_id,
             &replacement.pairing_secret,
             Some("phone-2".to_string()),
+            None,
             None,
             "surface-a",
             100,
@@ -489,6 +493,7 @@ fn revoking_paired_device_removes_it() {
             &ticket.pairing_secret,
             Some("tablet".to_string()),
             Some("Tablet".to_string()),
+            None,
             "surface-tablet",
             100,
         )
@@ -524,4 +529,67 @@ async fn persistence_store_round_trips_to_disk() {
     tokio::fs::remove_dir_all(&directory)
         .await
         .expect("temp persisted state directory should be removable");
+}
+
+#[test]
+fn pairing_request_waits_for_local_approval_before_device_is_created() {
+    let mut relay = test_state();
+    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+
+    let request = relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-approve".to_string()),
+            Some("Approve Phone".to_string()),
+            "surface-a",
+            "verify-key-1".to_string(),
+            100,
+        )
+        .expect("pairing request should register");
+
+    assert_eq!(request.device_id, "phone-approve");
+    assert_eq!(relay.paired_devices.len(), 0);
+    assert_eq!(relay.pending_pairing_requests.len(), 1);
+
+    let result = relay
+        .decide_pairing_request(&ticket.pairing_id, true, 101)
+        .expect("approval should complete pairing");
+
+    assert_eq!(relay.pending_pairing_requests.len(), 0);
+    assert_eq!(relay.pending_pairings.len(), 0);
+    assert_eq!(relay.paired_devices.len(), 1);
+    assert_eq!(result.target_peer_id, "surface-a");
+    assert!(result.device_token.is_some());
+    assert_eq!(result.device.as_ref().map(|device| device.device_id.as_str()), Some("phone-approve"));
+}
+
+#[test]
+fn rejecting_pairing_request_returns_error_without_creating_device() {
+    let mut relay = test_state();
+    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-reject".to_string()),
+            Some("Reject Phone".to_string()),
+            "surface-b",
+            "verify-key-2".to_string(),
+            100,
+        )
+        .expect("pairing request should register");
+
+    let result = relay
+        .decide_pairing_request(&ticket.pairing_id, false, 101)
+        .expect("rejection should succeed");
+
+    assert_eq!(relay.pending_pairing_requests.len(), 0);
+    assert_eq!(relay.pending_pairings.len(), 0);
+    assert!(relay.paired_devices.is_empty());
+    assert!(result.device.is_none());
+    assert!(result.device_token.is_none());
+    assert_eq!(
+        result.error.as_deref(),
+        Some("pairing request was rejected on the local relay")
+    );
 }

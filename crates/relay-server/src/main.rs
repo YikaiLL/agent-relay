@@ -25,9 +25,9 @@ use axum::{
 use futures_util::stream::{self, StreamExt};
 use protocol::{
     ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, HealthResponse, HeartbeatInput,
-    PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
-    SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsQuery,
-    ThreadsResponse,
+    PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
+    ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput,
+    TakeOverInput, ThreadsQuery, ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -78,6 +78,7 @@ async fn main() {
         .route("/api/session/take-over", post(take_over_session))
         .route("/api/session/message", post(send_message))
         .route("/api/pairing/start", post(start_pairing))
+        .route("/api/pairings/:pairing_id/decision", post(decide_pairing_request))
         .route("/api/devices/:device_id/revoke", post(revoke_device))
         .route("/api/approvals/:request_id", post(decide_approval))
         .route_service("/", ServeFile::new(web_root.join("index.html")))
@@ -305,6 +306,22 @@ async fn revoke_device(
     context
         .app
         .revoke_device(&device_id)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+async fn decide_pairing_request(
+    Path(pairing_id): Path<String>,
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<PairingDecisionInput>,
+) -> Result<Json<ApiEnvelope<PairingDecisionReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .decide_pairing_request(&pairing_id, input)
         .await
         .map(|receipt| Json(ApiEnvelope::ok(receipt)))
         .map_err(bad_request)

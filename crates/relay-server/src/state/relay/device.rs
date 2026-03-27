@@ -6,7 +6,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::protocol::{PairedDeviceView, PairingTicketView};
+use crate::protocol::{PairedDeviceView, PairingTicketView, PendingPairingRequestView};
 
 use super::RelayState;
 
@@ -28,6 +28,8 @@ pub(crate) struct PairedDevice {
     pub(crate) label: String,
     pub(crate) shared_secret: String,
     pub(crate) token_hash: String,
+    #[serde(default)]
+    pub(crate) device_verify_key: Option<String>,
     pub(crate) created_at: u64,
     pub(crate) last_seen_at: Option<u64>,
     pub(crate) last_peer_id: Option<String>,
@@ -43,6 +45,43 @@ impl PairedDevice {
             last_peer_id: self.last_peer_id.clone(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPairingRequest {
+    pub(crate) pairing_id: String,
+    pub(crate) device_id: String,
+    pub(crate) label: String,
+    pub(crate) requested_at: u64,
+    pub(crate) broker_peer_id: String,
+    pub(crate) device_verify_key: String,
+}
+
+impl PendingPairingRequest {
+    pub(crate) fn to_view(&self) -> PendingPairingRequestView {
+        PendingPairingRequestView {
+            pairing_id: self.pairing_id.clone(),
+            device_id: self.device_id.clone(),
+            label: self.label.clone(),
+            requested_at: self.requested_at,
+            broker_peer_id: self.broker_peer_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BrokerPendingMessage {
+    PairingResult(PendingPairingResult),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPairingResult {
+    pub(crate) pairing_id: String,
+    pub(crate) target_peer_id: String,
+    pub(crate) pairing_secret: String,
+    pub(crate) device: Option<PairedDeviceView>,
+    pub(crate) device_token: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 impl RelayState {
@@ -106,6 +145,7 @@ impl RelayState {
         pairing_secret: &str,
         requested_device_id: Option<String>,
         device_label: Option<String>,
+        device_verify_key: Option<String>,
         peer_id: &str,
         now: u64,
     ) -> Result<(PairedDeviceView, String), String> {
@@ -140,6 +180,7 @@ impl RelayState {
                 label: label.clone(),
                 shared_secret: device_token.clone(),
                 token_hash: token_hash.clone(),
+                device_verify_key: device_verify_key.clone(),
                 created_at: now,
                 last_seen_at: Some(now),
                 last_peer_id: Some(peer_id.to_string()),
@@ -148,10 +189,99 @@ impl RelayState {
         device.label = label;
         device.shared_secret = device_token.clone();
         device.token_hash = token_hash;
+        device.device_verify_key = device_verify_key;
         device.last_seen_at = Some(now);
         device.last_peer_id = Some(peer_id.to_string());
 
         Ok((device.to_view(), device_token))
+    }
+
+    pub fn register_pairing_request(
+        &mut self,
+        pairing_id: &str,
+        requested_device_id: Option<String>,
+        device_label: Option<String>,
+        peer_id: &str,
+        device_verify_key: String,
+        now: u64,
+    ) -> Result<PendingPairingRequestView, String> {
+        self.prune_expired_pairings(now);
+        if !self.pending_pairings.contains_key(pairing_id) {
+            return Err("pairing request is missing or expired".to_string());
+        }
+        if self.pending_pairing_requests.contains_key(pairing_id) {
+            return Err("pairing request is already waiting for approval".to_string());
+        }
+
+        let device_id = normalize_remote_device_id(requested_device_id.as_deref())
+            .filter(|candidate| !candidate.is_empty())
+            .unwrap_or_else(|| format!("device-{}", random_token(8).to_ascii_lowercase()));
+        let label_fallback = requested_device_id
+            .as_deref()
+            .or(Some(peer_id))
+            .unwrap_or("Remote Device");
+        let label = normalize_device_label(device_label, label_fallback);
+
+        let request = PendingPairingRequest {
+            pairing_id: pairing_id.to_string(),
+            device_id,
+            label,
+            requested_at: now,
+            broker_peer_id: peer_id.to_string(),
+            device_verify_key,
+        };
+        let view = request.to_view();
+        self.pending_pairing_requests
+            .insert(pairing_id.to_string(), request);
+        Ok(view)
+    }
+
+    pub fn decide_pairing_request(
+        &mut self,
+        pairing_id: &str,
+        approved: bool,
+        now: u64,
+    ) -> Result<PendingPairingResult, String> {
+        self.prune_expired_pairings(now);
+        let request = self
+            .pending_pairing_requests
+            .remove(pairing_id)
+            .ok_or_else(|| "pairing request is not waiting for approval".to_string())?;
+        let pending = self
+            .pending_pairings
+            .get(pairing_id)
+            .cloned()
+            .ok_or_else(|| "pairing request is missing or expired".to_string())?;
+
+        if approved {
+            let (device, token) = self.consume_pairing_ticket(
+                pairing_id,
+                &pending.pairing_secret,
+                Some(request.device_id),
+                Some(request.label),
+                Some(request.device_verify_key),
+                &request.broker_peer_id,
+                now,
+            )?;
+            return Ok(PendingPairingResult {
+                pairing_id: pairing_id.to_string(),
+                target_peer_id: request.broker_peer_id,
+                pairing_secret: pending.pairing_secret,
+                device: Some(device),
+                device_token: Some(token),
+                error: None,
+            });
+        }
+
+        self.pending_pairings.remove(pairing_id);
+        Ok(PendingPairingResult {
+            pairing_id: pairing_id.to_string(),
+            target_peer_id: request.broker_peer_id,
+            pairing_secret: pending.pairing_secret,
+            device: None,
+            device_token: None,
+            error: Some("pairing request was rejected on the local relay".to_string()),
+        })
     }
 
     pub fn authenticate_paired_device(
@@ -211,6 +341,8 @@ impl RelayState {
     pub fn prune_expired_pairings(&mut self, now: u64) {
         self.pending_pairings
             .retain(|_, pairing| pairing.expires_at > now);
+        self.pending_pairing_requests
+            .retain(|pairing_id, _| self.pending_pairings.contains_key(pairing_id));
     }
 }
 

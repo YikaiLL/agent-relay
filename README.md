@@ -97,8 +97,11 @@ Frontend workflow:
 
 ```bash
 npm install
-npm run build
+npm test
 ```
+
+The default `npm test` target runs the production Vite build, which is what CI
+uses to catch frontend regressions.
 
 Browser pairing e2e:
 

@@ -81,6 +81,10 @@ async function main() {
 
     remotePage = await context.newPage();
     await remotePage.goto(pairingUrl, { waitUntil: "domcontentloaded" });
+    await localPage.waitForFunction(() => {
+      return Boolean(document.querySelector("[data-pairing-id][data-pairing-decision='approve']"));
+    }, null, { timeout: PAIRING_TIMEOUT_MS });
+    await localPage.click("[data-pairing-id][data-pairing-decision='approve']");
     await remotePage.waitForFunction(() => {
       const overview = document.querySelector("#remote-device-overview")?.textContent || "";
       const meta = document.querySelector("#device-meta")?.textContent || "";

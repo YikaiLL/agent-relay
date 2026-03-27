@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::SendMessageInput;
+use ed25519_dalek::{Signer, SigningKey};
 
 use super::session_claim::{decode_and_verify_session_claim, unix_now};
 
@@ -143,11 +144,19 @@ fn parse_inbound_payload_parses_list_threads_requests() {
 
 #[test]
 fn parse_inbound_payload_parses_pairing_requests() {
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let device_id = "phone-1";
     let envelope = encrypt_json(
         "pairing-secret",
         &PairingRequestPlaintext {
-            device_id: Some("phone-1".to_string()),
+            device_id: Some(device_id.to_string()),
             device_label: Some("My Phone".to_string()),
+            device_verify_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+            pairing_proof: STANDARD.encode(
+                signing_key
+                    .sign(pairing_proof_message("pair-1", Some(device_id)).as_bytes())
+                    .to_bytes(),
+            ),
         },
     )
     .expect("pairing request should encrypt");
@@ -170,6 +179,13 @@ fn parse_inbound_payload_parses_pairing_requests() {
                 decrypt_json("pairing-secret", &envelope).expect("payload should decrypt");
             assert_eq!(decrypted.device_id.as_deref(), Some("phone-1"));
             assert_eq!(decrypted.device_label.as_deref(), Some("My Phone"));
+            verify_pairing_request_proof(
+                "pair-1",
+                decrypted.device_id.as_deref(),
+                &decrypted.device_verify_key,
+                &decrypted.pairing_proof,
+            )
+            .expect("pairing proof should verify");
         }
         other => panic!("unexpected request: {other:?}"),
     }

@@ -403,7 +403,7 @@ function pairingHeading() {
     return "Pairing needs attention";
   }
   if (state.pairingPhase === "requesting") {
-    return "Pairing request sent";
+    return "Waiting for local approval";
   }
   return "Pairing this browser";
 }
@@ -413,7 +413,7 @@ function pairingCopy() {
     return state.pairingError || "Pairing could not complete. Retry from this page or rescan the QR.";
   }
   if (state.pairingPhase === "requesting") {
-    return "This page is waiting for the local relay to accept the scanned pairing ticket.";
+    return "This browser sent its device key to the local relay and is waiting for local approval.";
   }
   return "This page is connecting to the broker with the scanned pairing ticket. You should not need to press Pair again.";
 }
@@ -423,7 +423,7 @@ function pairingBadgeText() {
     return "Pairing failed";
   }
   if (state.pairingPhase === "requesting") {
-    return "Waiting for relay";
+    return "Approval pending";
   }
   return "Pairing…";
 }

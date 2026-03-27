@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
+    "test": "vite build",
     "build": "vite build",
     "preview": "vite preview --host",
     "smoke:pairing": "node scripts/pairing-smoke.mjs",

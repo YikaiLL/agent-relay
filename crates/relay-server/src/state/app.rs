@@ -8,8 +8,9 @@ use crate::{
     codex::CodexBridge,
     protocol::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput,
-        PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
-        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsResponse,
+        PairingDecision, PairingDecisionInput, PairingDecisionReceipt, PairingStartInput,
+        PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput,
+        SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsResponse,
     },
 };
 
@@ -351,6 +352,55 @@ impl AppState {
         })
     }
 
+    pub async fn decide_pairing_request(
+        &self,
+        pairing_id: &str,
+        input: PairingDecisionInput,
+    ) -> Result<PairingDecisionReceipt, String> {
+        let mut relay = self.relay.write().await;
+        let result = relay.decide_pairing_request(
+            pairing_id,
+            matches!(input.decision, PairingDecision::Approve),
+            unix_now(),
+        )?;
+        let message = match input.decision {
+            PairingDecision::Approve => {
+                relay.push_log(
+                    "info",
+                    format!(
+                        "Approved pairing request {pairing_id} for {}.",
+                        result
+                            .device
+                            .as_ref()
+                            .map(|device| device.device_id.as_str())
+                            .unwrap_or("unknown-device")
+                    ),
+                );
+                "Pairing request approved on the local relay.".to_string()
+            }
+            PairingDecision::Reject => {
+                relay.push_log(
+                    "info",
+                    format!("Rejected pairing request {pairing_id}."),
+                );
+                "Pairing request rejected on the local relay.".to_string()
+            }
+        };
+        relay
+            .pending_broker_messages
+            .push(super::BrokerPendingMessage::PairingResult(result));
+        relay.notify();
+        Ok(PairingDecisionReceipt {
+            pairing_id: pairing_id.to_string(),
+            decision: input.decision,
+            resulting_state: match input.decision {
+                PairingDecision::Approve => "approved".to_string(),
+                PairingDecision::Reject => "rejected".to_string(),
+            },
+            message,
+        })
+    }
+
     async fn defaults(&self) -> SessionDefaults {
         let relay = self.relay.read().await;
         SessionDefaults {
@@ -432,29 +482,34 @@ impl AppState {
     pub(crate) async fn complete_pairing(
         &self,
         pairing_id: &str,
-        pairing_secret: &str,
         requested_device_id: Option<String>,
         device_label: Option<String>,
+        device_verify_key: String,
         peer_id: &str,
-    ) -> Result<(crate::protocol::PairedDeviceView, String), String> {
+    ) -> Result<crate::protocol::PendingPairingRequestView, String> {
         let mut relay = self.relay.write().await;
-        let (device, token) = relay.consume_pairing_ticket(
+        let request = relay.register_pairing_request(
             pairing_id,
-            pairing_secret,
             requested_device_id,
             device_label,
             peer_id,
+            device_verify_key,
             unix_now(),
         )?;
         relay.push_log(
             "info",
             format!(
-                "Paired remote device {} from broker peer {}.",
-                device.device_id, peer_id
+                "Registered pending pairing request {} from broker peer {}.",
+                pairing_id, peer_id
             ),
         );
         relay.notify();
-        Ok((device, token))
+        Ok(request)
+    }
+
+    pub(crate) async fn drain_pending_broker_messages(&self) -> Vec<super::BrokerPendingMessage> {
+        let mut relay = self.relay.write().await;
+        relay.drain_pending_broker_messages()
     }
 
     pub(crate) async fn authenticate_remote_device(

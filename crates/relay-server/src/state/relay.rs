@@ -17,7 +17,9 @@ use super::{
 };
 
 pub use self::approval::{ApprovalKind, PendingApproval};
-pub(crate) use self::device::{PairedDevice, PendingPairing};
+pub(crate) use self::device::{
+    BrokerPendingMessage, PairedDevice, PendingPairing, PendingPairingRequest,
+};
 pub(crate) use self::transcript::TranscriptRecord;
 
 pub struct RelayState {
@@ -41,6 +43,8 @@ pub struct RelayState {
     pub reasoning_effort: String,
     pub paired_devices: HashMap<String, PairedDevice>,
     pub pending_pairings: HashMap<String, PendingPairing>,
+    pub pending_pairing_requests: HashMap<String, PendingPairingRequest>,
+    pub pending_broker_messages: Vec<BrokerPendingMessage>,
     pub threads: Vec<ThreadSummaryView>,
     pub pending_approvals: HashMap<String, PendingApproval>,
     pub(super) transcript: Vec<TranscriptRecord>,
@@ -74,6 +78,8 @@ impl RelayState {
             reasoning_effort: DEFAULT_EFFORT.to_string(),
             paired_devices: HashMap::new(),
             pending_pairings: HashMap::new(),
+            pending_pairing_requests: HashMap::new(),
+            pending_broker_messages: Vec::new(),
             threads: Vec::new(),
             pending_approvals: HashMap::new(),
             transcript: Vec::new(),
@@ -96,6 +102,13 @@ impl RelayState {
             .map(|device| device.to_view())
             .collect::<Vec<_>>();
         paired_devices.sort_by(|left, right| left.label.cmp(&right.label));
+        let mut pending_pairing_requests = self
+            .pending_pairing_requests
+            .values()
+            .cloned()
+            .map(|request| request.to_view())
+            .collect::<Vec<_>>();
+        pending_pairing_requests.sort_by(|left, right| left.requested_at.cmp(&right.requested_at));
 
         SessionSnapshot {
             provider: "codex",
@@ -122,6 +135,7 @@ impl RelayState {
             sandbox: self.sandbox.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             paired_devices,
+            pending_pairing_requests,
             pending_approvals: self
                 .pending_approvals
                 .values()
@@ -213,6 +227,8 @@ impl RelayState {
         self.reasoning_effort = persisted.reasoning_effort.clone();
         self.paired_devices = persisted.paired_devices.clone();
         self.pending_pairings.clear();
+        self.pending_pairing_requests.clear();
+        self.pending_broker_messages.clear();
         self.pending_approvals.clear();
         self.transcript = data
             .transcript
@@ -252,6 +268,10 @@ impl RelayState {
 
     pub fn set_active_turn(&mut self, turn_id: Option<String>) {
         self.active_turn_id = turn_id;
+    }
+
+    pub fn drain_pending_broker_messages(&mut self) -> Vec<BrokerPendingMessage> {
+        std::mem::take(&mut self.pending_broker_messages)
     }
 
     pub fn can_device_send_message(&self, device_id: &str) -> bool {
@@ -368,6 +388,8 @@ impl RelayState {
         self.reasoning_effort = persisted.reasoning_effort.clone();
         self.paired_devices = persisted.paired_devices.clone();
         self.pending_pairings.clear();
+        self.pending_pairing_requests.clear();
+        self.pending_broker_messages.clear();
         self.pending_approvals.clear();
         self.transcript = persisted.transcript.clone();
         self.logs = persisted.logs.clone();

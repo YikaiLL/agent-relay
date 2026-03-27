@@ -77,6 +77,7 @@ pub struct SessionSnapshot {
     pub sandbox: String,
     pub reasoning_effort: String,
     pub paired_devices: Vec<PairedDeviceView>,
+    pub pending_pairing_requests: Vec<PendingPairingRequestView>,
     pub pending_approvals: Vec<ApprovalRequestView>,
     pub transcript: Vec<TranscriptEntryView>,
     pub logs: Vec<LogEntryView>,
@@ -89,6 +90,15 @@ pub struct PairedDeviceView {
     pub created_at: u64,
     pub last_seen_at: Option<u64>,
     pub last_peer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingPairingRequestView {
+    pub pairing_id: String,
+    pub device_id: String,
+    pub label: String,
+    pub requested_at: u64,
+    pub broker_peer_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +193,26 @@ pub struct PairingTicketView {
     pub pairing_payload: String,
     pub pairing_url: String,
     pub pairing_qr_svg: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingDecisionInput {
+    pub decision: PairingDecision,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingDecisionReceipt {
+    pub pairing_id: String,
+    pub decision: PairingDecision,
+    pub resulting_state: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

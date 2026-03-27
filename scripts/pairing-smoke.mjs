@@ -40,6 +40,28 @@ function decryptJson(secret, envelope) {
   return JSON.parse(decoder.decode(plaintext));
 }
 
+function pairingProofMessage(pairingId, deviceId) {
+  return `agent-relay:pairing:${pairingId}:${deviceId || ""}`;
+}
+
+async function waitForPendingPairing(pairingId) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const session = await fetch(`${relayBase}/api/session`)
+      .then((response) => response.json())
+      .then((response) => response.data);
+    const request = session.pending_pairing_requests?.find(
+      (entry) => entry.pairing_id === pairingId
+    );
+    if (request) {
+      return request;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error("timed out waiting for pending pairing approval");
+}
+
 function createFrameQueue(ws) {
   const frames = [];
   const waiters = [];
@@ -101,6 +123,8 @@ async function main() {
   if (!peerId) {
     throw new Error("broker welcome did not include an assigned peer_id");
   }
+  const signingKeyPair = nacl.sign.keyPair();
+  const requestedDeviceId = "smoke-phone";
 
   ws.send(
     JSON.stringify({
@@ -109,12 +133,32 @@ async function main() {
         kind: "pairing_request",
         pairing_id: ticket.pairing_id,
         envelope: encryptJson(ticket.pairing_secret, {
-          device_id: "smoke-phone",
+          device_id: requestedDeviceId,
           device_label: "Smoke Phone",
+          device_verify_key: bytesToBase64(signingKeyPair.publicKey),
+          pairing_proof: bytesToBase64(
+            nacl.sign.detached(
+              encoder.encode(pairingProofMessage(ticket.pairing_id, requestedDeviceId)),
+              signingKeyPair.secretKey
+            )
+          ),
         }),
       },
     })
   );
+
+  await waitForPendingPairing(ticket.pairing_id);
+  const approveEnvelope = await fetch(
+    `${relayBase}/api/pairings/${encodeURIComponent(ticket.pairing_id)}/decision`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approve" }),
+    }
+  ).then((response) => response.json());
+  if (!approveEnvelope.ok) {
+    throw new Error(`pairing approval failed: ${JSON.stringify(approveEnvelope)}`);
+  }
 
   const pairingFrame = await nextFrame(
     (frame) =>

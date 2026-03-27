@@ -4,6 +4,8 @@ mod session_claim;
 
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use relay_broker::protocol::{ClientMessage, PeerRole, PresenceKind, ServerMessage};
 use serde::{Deserialize, Serialize};
@@ -15,7 +17,7 @@ use url::Url;
 
 use crate::{
     protocol::{ApprovalReceipt, PairedDeviceView, SessionSnapshot, ThreadsResponse},
-    state::AppState,
+    state::{AppState, BrokerPendingMessage},
 };
 
 use self::crypto::{decrypt_json, encrypt_json, EncryptedEnvelope};
@@ -40,6 +42,8 @@ pub struct BrokerConfig {
 struct PairingRequestPlaintext {
     device_id: Option<String>,
     device_label: Option<String>,
+    device_verify_key: String,
+    pairing_proof: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +281,9 @@ async fn run_broker_session(
             format!("Connected to broker channel {}.", config.channel_id),
         )
         .await;
+    publish_pending_broker_messages(&mut sender, state)
+        .await
+        .map_err(|error| format!("initial broker direct publish failed: {error}"))?;
     publish_snapshot(&mut sender, state)
         .await
         .map_err(|error| format!("initial broker publish failed: {error}"))?;
@@ -285,6 +292,9 @@ async fn run_broker_session(
         tokio::select! {
             changed = change_rx.changed() => {
                 changed.map_err(|_| "relay change channel closed".to_string())?;
+                publish_pending_broker_messages(&mut sender, state)
+                    .await
+                    .map_err(|error| format!("broker direct publish failed: {error}"))?;
                 publish_snapshot(&mut sender, state)
                     .await
                     .map_err(|error| format!("broker publish failed: {error}"))?;
@@ -362,9 +372,7 @@ async fn handle_server_message(
                 Some(InboundBrokerPayload::PairingRequest {
                     pairing_id,
                     envelope,
-                }) => {
-                    handle_pairing_request(state, sender, from_peer_id, pairing_id, envelope).await
-                }
+                }) => handle_pairing_request(state, from_peer_id, pairing_id, envelope).await,
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
                     session_claim,
@@ -410,7 +418,6 @@ async fn handle_server_message(
 
 async fn handle_pairing_request(
     state: &AppState,
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     from_peer_id: String,
     pairing_id: String,
     envelope: EncryptedEnvelope,
@@ -426,33 +433,33 @@ async fn handle_pairing_request(
         .await;
     let pairing_secret = state.pending_pairing_secret(&pairing_id).await?;
     let pairing_request: PairingRequestPlaintext = decrypt_json(&pairing_secret, &envelope)?;
+    verify_pairing_request_proof(
+        &pairing_id,
+        pairing_request.device_id.as_deref(),
+        &pairing_request.device_verify_key,
+        &pairing_request.pairing_proof,
+    )?;
     let result = state
         .complete_pairing(
             &pairing_id,
-            &pairing_secret,
             pairing_request.device_id,
             pairing_request.device_label,
+            pairing_request.device_verify_key,
             &from_peer_id,
         )
         .await;
-
-    let payload = match result {
-        Ok((device, token)) => {
+    match result {
+        Ok(request) => {
             state
                 .push_runtime_log(
                     "info",
                     format!(
-                        "Broker pairing {} succeeded for {} as {}.",
-                        pairing_id, from_peer_id, device.device_id
+                        "Broker pairing {} from {} is waiting for local approval as {}.",
+                        pairing_id, from_peer_id, request.device_id
                     ),
                 )
                 .await;
-            PairingResultPlaintext {
-                ok: true,
-                device: Some(device),
-                device_token: Some(token),
-                error: None,
-            }
+            Ok(())
         }
         Err(error) => {
             state
@@ -464,26 +471,9 @@ async fn handle_pairing_request(
                     ),
                 )
                 .await;
-            PairingResultPlaintext {
-                ok: false,
-                device: None,
-                device_token: None,
-                error: Some(error),
-            }
+            Err(error)
         }
-    };
-    let encrypted = encrypt_json(&pairing_secret, &payload)?;
-
-    publish_payload(
-        sender,
-        OutboundBrokerPayload::EncryptedPairingResult {
-            pairing_id,
-            target_peer_id: from_peer_id,
-            envelope: encrypted,
-        },
-    )
-    .await
-    .map_err(|error| format!("broker pairing result publish failed: {error}"))
+    }
 }
 
 fn parse_inbound_payload(payload: Value) -> Result<Option<InboundBrokerPayload>, String> {
@@ -538,6 +528,38 @@ async fn publish_snapshot(
     Ok(())
 }
 
+async fn publish_pending_broker_messages(
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    state: &AppState,
+) -> Result<(), String> {
+    for message in state.drain_pending_broker_messages().await {
+        match message {
+            BrokerPendingMessage::PairingResult(result) => {
+                let encrypted = encrypt_json(
+                    &result.pairing_secret,
+                    &PairingResultPlaintext {
+                        ok: result.error.is_none(),
+                        device: result.device,
+                        device_token: result.device_token,
+                        error: result.error,
+                    },
+                )?;
+                publish_payload(
+                    sender,
+                    OutboundBrokerPayload::EncryptedPairingResult {
+                        pairing_id: result.pairing_id,
+                        target_peer_id: result.target_peer_id,
+                        envelope: encrypted,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn publish_payload(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     payload: OutboundBrokerPayload,
@@ -563,6 +585,38 @@ fn trimmed_string(value: String) -> Option<String> {
     } else {
         Some(trimmed)
     }
+}
+
+fn verify_pairing_request_proof(
+    pairing_id: &str,
+    device_id: Option<&str>,
+    verify_key_b64: &str,
+    signature_b64: &str,
+) -> Result<(), String> {
+    let verify_key_bytes: [u8; 32] = STANDARD
+        .decode(verify_key_b64)
+        .map_err(|_| "pairing verify key is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "pairing verify key is invalid".to_string())?;
+    let signature_bytes: [u8; 64] = STANDARD
+        .decode(signature_b64)
+        .map_err(|_| "pairing proof is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "pairing proof is invalid".to_string())?;
+    let verify_key = VerifyingKey::from_bytes(&verify_key_bytes)
+        .map_err(|_| "pairing verify key is invalid".to_string())?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verify_key
+        .verify(pairing_proof_message(pairing_id, device_id).as_bytes(), &signature)
+        .map_err(|_| "pairing proof is invalid".to_string())
+}
+
+fn pairing_proof_message(pairing_id: &str, device_id: Option<&str>) -> String {
+    format!(
+        "agent-relay:pairing:{}:{}",
+        pairing_id,
+        device_id.unwrap_or_default()
+    )
 }
 
 #[cfg(test)]

@@ -3,6 +3,8 @@ import nacl from "tweetnacl";
 
 import { base64ToBytes, base64UrlToBytes, bytesToBase64 } from "./encoding.js";
 
+const REMOTE_DEVICE_KEYPAIR_STORAGE_KEY = "agent-relay.remote-device-keypair";
+
 export function parsePairingPayload(rawInput) {
   let raw = rawInput.trim();
 
@@ -59,6 +61,38 @@ export async function decryptJson(secret, envelope) {
   }
 
   return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+export function loadOrCreateDeviceKeypair() {
+  const raw = window.localStorage.getItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed?.verifyKey && parsed?.signSecretKey) {
+        return parsed;
+      }
+    } catch {
+      window.localStorage.removeItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
+    }
+  }
+
+  const keypair = nacl.sign.keyPair();
+  const stored = {
+    verifyKey: bytesToBase64(keypair.publicKey),
+    signSecretKey: bytesToBase64(keypair.secretKey),
+  };
+  window.localStorage.setItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY, JSON.stringify(stored));
+  return stored;
+}
+
+export function pairingProofMessage(pairingId, deviceId) {
+  return `agent-relay:pairing:${pairingId}:${deviceId || ""}`;
+}
+
+export function signPairingProof(pairingId, deviceId, keypair = loadOrCreateDeviceKeypair()) {
+  const message = new TextEncoder().encode(pairingProofMessage(pairingId, deviceId));
+  const signature = nacl.sign.detached(message, base64ToBytes(keypair.signSecretKey));
+  return bytesToBase64(signature);
 }
 
 function deriveSecretKey(secret) {

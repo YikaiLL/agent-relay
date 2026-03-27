@@ -1,6 +1,10 @@
+import { loadOrCreateDeviceKeypair } from "./crypto.js";
+
 const REMOTE_AUTH_STORAGE_KEY = "agent-relay.remote-auth";
 const REMOTE_DEVICE_LABEL_STORAGE_KEY = "agent-relay.remote-device-label";
 const REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY = "agent-relay.remote-device-id";
+
+const deviceKeypair = loadOrCreateDeviceKeypair();
 
 export const CONTROL_HEARTBEAT_MS = 5000;
 export const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
@@ -13,6 +17,7 @@ export const state = {
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
+  deviceKeypair,
   pairingError: null,
   pairingPhase: null,
   pairingTicket: null,
@@ -121,22 +126,14 @@ function loadOrCreateRequestedDeviceId() {
     return existing;
   }
 
-  const generated = `mobile-${generateStableId().slice(0, 12)}`;
+  const fingerprint = deviceKeypair.verifyKey
+    .replaceAll("/", "")
+    .replaceAll("+", "")
+    .replaceAll("=", "")
+    .toLowerCase();
+  const generated = `mobile-${fingerprint.slice(0, 12)}`;
   window.localStorage.setItem(REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY, generated);
   return generated;
-}
-
-function generateStableId() {
-  if (window.crypto?.randomUUID) {
-    return window.crypto.randomUUID();
-  }
-
-  if (window.crypto?.getRandomValues) {
-    const bytes = window.crypto.getRandomValues(new Uint8Array(16));
-    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  }
-
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function loadRemoteAuth() {

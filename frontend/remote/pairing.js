@@ -1,5 +1,11 @@
 import * as dom from "./dom.js";
-import { clearPairingQueryFromUrl, decryptJson, encryptJson, parsePairingPayload } from "./crypto.js";
+import {
+  clearPairingQueryFromUrl,
+  decryptJson,
+  encryptJson,
+  parsePairingPayload,
+  signPairingProof,
+} from "./crypto.js";
 import { closeBrokerSocket, connectBroker, sendBrokerFrame } from "./broker-client.js";
 import {
   clearClaimLifecycle,
@@ -94,11 +100,17 @@ export async function sendPairingRequest() {
     envelope: await encryptJson(ticket.pairing_secret, {
       device_id: state.requestedDeviceId,
       device_label: normalizedDeviceLabel(dom.deviceLabelInput.value),
+      device_verify_key: state.deviceKeypair.verifyKey,
+      pairing_proof: signPairingProof(
+        ticket.pairing_id,
+        state.requestedDeviceId,
+        state.deviceKeypair
+      ),
     }),
   };
 
   sendBrokerFrame(payload);
-  renderLog(`Sent pairing request for ${ticket.pairing_id}.`);
+  renderLog(`Sent pairing request for ${ticket.pairing_id}; waiting for local approval.`);
 }
 
 export async function handleEncryptedPairingResult(payload) {

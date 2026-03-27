@@ -289,7 +289,7 @@ pub(super) async fn handle_encrypted_remote_action(
                 )
                 .await;
             let snapshot = state.snapshot().await;
-            publish_remote_action_result_private(
+            if let Err(publish_error) = publish_remote_action_result_private(
                 state,
                 sender,
                 from_peer_id,
@@ -304,7 +304,20 @@ pub(super) async fn handle_encrypted_remote_action(
                 Some(error),
                 false,
             )
-            .await?;
+            .await
+            {
+                if publish_error.contains("device is not paired") {
+                    state
+                        .push_runtime_log(
+                            "warn",
+                            "Skipped encrypted broker error reply because the device is no longer paired."
+                                .to_string(),
+                        )
+                        .await;
+                    return Ok(());
+                }
+                return Err(publish_error);
+            }
             return Ok(());
         }
     };
@@ -357,7 +370,7 @@ pub(super) async fn handle_encrypted_remote_action(
         }
     };
 
-    publish_remote_action_result_private(
+    match publish_remote_action_result_private(
         state,
         sender,
         from_peer_id,
@@ -373,6 +386,20 @@ pub(super) async fn handle_encrypted_remote_action(
         ok,
     )
     .await
+    {
+        Ok(()) => Ok(()),
+        Err(publish_error) if publish_error.contains("device is not paired") => {
+            state
+                .push_runtime_log(
+                    "warn",
+                    "Skipped encrypted broker action result because the device is no longer paired."
+                        .to_string(),
+                )
+                .await;
+            Ok(())
+        }
+        Err(publish_error) => Err(publish_error),
+    }
 }
 
 async fn execute_remote_action(
