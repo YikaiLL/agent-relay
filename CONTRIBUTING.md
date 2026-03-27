@@ -23,3 +23,13 @@ that:
 
 If you do not agree to these terms, do not submit a pull request or patch.
 Issues and design feedback are still welcome.
+
+## Code Organization
+
+- Default to keeping production code and tests in separate files once a module
+  is non-trivial. Prefer sibling test modules such as `foo/tests.rs` or a
+  crate-level `tests.rs` over growing inline `mod tests` blocks inside the main
+  implementation file.
+- Small leaf helpers can still keep a tiny inline test block when it is the
+  clearest option, but larger files should move tests out before they become a
+  second concern mixed into the main code path.
