@@ -1,4 +1,9 @@
-use std::net::SocketAddr;
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -13,7 +18,7 @@ async fn spawn_app() -> SocketAddr {
         .await
         .expect("listener should bind");
     let address = listener.local_addr().expect("listener should have address");
-    let app = app(BrokerState::default());
+    let app = app_with_web_root(BrokerState::default(), test_web_root());
     tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -54,6 +59,38 @@ async fn http_get(address: SocketAddr, path: &str) -> String {
     response
 }
 
+fn test_web_root() -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic enough for tests")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("agent-relay-broker-web-{unique}"));
+    let assets = root.join("assets");
+    fs::create_dir_all(&assets).expect("test asset directory should be created");
+    fs::write(
+        root.join("remote.html"),
+        r#"<!doctype html><html><body>Remote Broker Surface<script type="module" src="/static/assets/remote-test.js"></script></body></html>"#,
+    )
+    .expect("remote html should write");
+    fs::write(
+        root.join("remote-manifest.webmanifest"),
+        r#"{"display":"standalone","src":"/icon.svg"}"#,
+    )
+    .expect("manifest should write");
+    fs::write(
+        root.join("remote-sw.js"),
+        r#"self.addEventListener("install", () => {}); const CACHE = "agent-relay-remote-v1";"#,
+    )
+    .expect("service worker should write");
+    fs::write(
+        root.join("icon.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
+    )
+    .expect("icon should write");
+    fs::write(assets.join("remote-test.js"), "console.log('remote');").expect("asset should write");
+    root
+}
+
 #[tokio::test]
 async fn root_serves_remote_surface_html() {
     let address = spawn_app().await;
@@ -70,8 +107,8 @@ async fn manifest_route_serves_remote_pwa_manifest() {
     let response = http_get(address, "/manifest.webmanifest").await;
 
     assert!(response.contains("200 OK"));
-    assert!(response.contains("\"display\": \"standalone\""));
-    assert!(response.contains("\"src\": \"/icon.svg\""));
+    assert!(response.contains("\"display\":\"standalone\""));
+    assert!(response.contains("\"src\":\"/icon.svg\""));
 }
 
 #[tokio::test]

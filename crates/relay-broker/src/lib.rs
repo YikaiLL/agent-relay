@@ -24,7 +24,16 @@ use tower_http::{
 use tracing::{debug, warn};
 
 pub fn app(state: BrokerState) -> Router {
-    let web_root = workspace_root().join("web");
+    app_with_web_root(state, default_web_root())
+}
+
+fn app_with_web_root(state: BrokerState, web_root: PathBuf) -> Router {
+    if !web_root.join("remote.html").exists() {
+        warn!(
+            path = %web_root.join("remote.html").display(),
+            "broker web assets are missing; run `npm run build` before serving the remote UI"
+        );
+    }
     Router::new()
         .route("/api/health", get(health))
         .route("/ws/:channel_id", get(websocket))
@@ -157,6 +166,10 @@ async fn reject_socket(socket: WebSocket, code: &str, message: &str) {
     .expect("error message should serialize");
     let _ = sender.send(Message::Text(payload)).await;
     let _ = sender.close().await;
+}
+
+fn default_web_root() -> PathBuf {
+    workspace_root().join("web")
 }
 
 fn workspace_root() -> PathBuf {

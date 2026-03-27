@@ -34,7 +34,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 struct AppContext {
@@ -59,6 +59,12 @@ async fn main() {
         info!("relay-server API token auth is enabled for protected /api routes");
     }
     let web_root = workspace_root().join("web");
+    if !web_root.join("index.html").exists() {
+        warn!(
+            path = %web_root.join("index.html").display(),
+            "relay web assets are missing; run `npm run build` before opening the local UI"
+        );
+    }
     let context = AppContext { app: state, auth };
 
     let app = Router::new()

@@ -100,6 +100,12 @@ npm install
 npm run build
 ```
 
+Browser pairing e2e:
+
+```bash
+npm run test:browser:pairing
+```
+
 Remote broker smoke test:
 
 ```bash
