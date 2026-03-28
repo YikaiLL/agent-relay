@@ -51,6 +51,16 @@ async function main() {
     page = await context.newPage();
 
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    assert.match(
+      (await page.textContent("#overview-session-title")) || "",
+      /^(Pick a workspace to launch|Launch from .+)$/,
+      "overview should show either the empty launch prompt or the preselected workspace"
+    );
+    assert.equal(
+      await page.textContent("#overview-security-title"),
+      "Private by default",
+      "overview should describe the default private posture"
+    );
     await page.click("#new-session-toggle");
     await page.waitForFunction(() => {
       const panel = document.querySelector("#new-session-panel");
@@ -69,6 +79,34 @@ async function main() {
       const transcript = document.querySelector("#transcript")?.textContent || "";
       return transcript.includes("Session ready");
     }, null, { timeout: LOCAL_TIMEOUT_MS });
+    await page.waitForFunction(
+      (expectedWorkspace) => {
+        const title = document.querySelector("#overview-session-title")?.textContent || "";
+        const badges = document.querySelector("#overview-session-badges")?.textContent || "";
+        const securityBadges = document.querySelector("#overview-security-badges")?.textContent || "";
+        return (
+          title.includes(`Ready in ${expectedWorkspace}`) &&
+          badges.includes("Status") &&
+          badges.includes("Model") &&
+          badges.includes("Approval") &&
+          badges.includes("Control") &&
+          securityBadges.includes("Security") &&
+          securityBadges.includes("Visibility")
+        );
+      },
+      path.basename(ROOT),
+      { timeout: LOCAL_TIMEOUT_MS }
+    );
+    assert.match(
+      (await page.textContent("#overview-session-copy")) || "",
+      /controls/i,
+      "overview should describe that this device owns the live session"
+    );
+    assert.match(
+      (await page.textContent("#overview-session-badges")) || "",
+      /never/i,
+      "overview badges should reflect the selected approval policy"
+    );
 
     const messageInput = page.locator("#message-input");
     await assertEnabled(messageInput);

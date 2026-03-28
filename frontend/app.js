@@ -57,6 +57,12 @@ const workspaceTitle = document.querySelector("#workspace-title");
 const workspaceSubtitle = document.querySelector("#workspace-subtitle");
 const statusBadge = document.querySelector("#status-badge");
 const sessionMeta = document.querySelector("#session-meta");
+const overviewSessionTitle = document.querySelector("#overview-session-title");
+const overviewSessionCopy = document.querySelector("#overview-session-copy");
+const overviewSessionBadges = document.querySelector("#overview-session-badges");
+const overviewSecurityTitle = document.querySelector("#overview-security-title");
+const overviewSecurityCopy = document.querySelector("#overview-security-copy");
+const overviewSecurityBadges = document.querySelector("#overview-security-badges");
 const controlBanner = document.querySelector("#control-banner");
 const controlSummary = document.querySelector("#control-summary");
 const controlHint = document.querySelector("#control-hint");
@@ -177,6 +183,7 @@ async function loadSession(reason) {
     state.session = null;
     cancelControllerHeartbeat();
     cancelControllerLeaseRefresh();
+    renderOverview(null, null, null, error.message);
     statusBadge.textContent = "Offline";
     statusBadge.className = "status-badge status-badge-offline";
     sessionMeta.innerHTML = `<span class="meta-empty">${escapeHtml(error.message)}</span>`;
@@ -198,6 +205,11 @@ async function loadThreads(reason) {
   if (!state.selectedCwd) {
     state.threads = [];
     renderThreads([]);
+    renderOverview(
+      state.session,
+      resolveActiveThread(state.session?.active_thread_id),
+      state.session?.pending_approvals?.[0] || null
+    );
     logLine("History skipped because no directory is selected.");
     return;
   }
@@ -220,6 +232,11 @@ async function loadThreads(reason) {
 
     state.threads = payload.data.threads;
     renderThreads(payload.data.threads);
+    renderOverview(
+      state.session,
+      resolveActiveThread(state.session?.active_thread_id),
+      state.session?.pending_approvals?.[0] || null
+    );
   } catch (error) {
     threadsCount.textContent = "Error";
     threadsList.innerHTML = `<p class="sidebar-empty">${escapeHtml(error.message)}</p>`;
@@ -589,6 +606,7 @@ function renderSession(session) {
     statusBadge.className = "status-badge status-badge-ready";
   }
 
+  renderOverview(session, activeThread, approval);
   renderSessionMeta(session);
   renderPairingPanel();
   renderDeviceRecords(session.device_records || []);
@@ -776,6 +794,107 @@ function renderSessionMeta(session) {
     ),
     metaChip("Thread", shortId(session.active_thread_id)),
   ].join("");
+}
+
+function renderOverview(session, activeThread, approval, errorMessage = null) {
+  const workspace = session?.current_cwd || state.selectedCwd || "";
+  const workspaceName = workspaceBasename(workspace);
+  const historyCount = state.threads.length;
+  const pendingPairings = session?.pending_pairing_requests?.length || 0;
+  const approvedDevices = approvedDeviceCount(session);
+
+  let sessionTitle = workspace ? `Launch from ${workspaceName}` : "Pick a workspace to launch";
+  let sessionCopy = workspace
+    ? "History is scoped to this workspace. Start a fresh session or reopen a previous thread."
+    : "Load a workspace, review prior threads, and start a fresh Codex relay session.";
+  let sessionBadges = [];
+
+  if (errorMessage) {
+    sessionTitle = "Relay unavailable";
+    sessionCopy = errorMessage;
+    sessionBadges = [
+      overviewBadge("Status", "Offline"),
+      ...(workspace ? [overviewBadge("Workspace", workspaceName)] : []),
+    ];
+  } else if (session?.active_thread_id) {
+    const threadTitle = activeThread?.name || activeThread?.preview || shortId(session.active_thread_id);
+
+    if (approval) {
+      sessionTitle = workspace ? `Approval needed in ${workspaceName}` : "Approval required";
+      sessionCopy = approval.summary || "Codex is blocked on a decision before it can continue.";
+    } else if (canCurrentDeviceWrite(session)) {
+      sessionTitle = workspace ? `Ready in ${workspaceName}` : "Session ready";
+      sessionCopy = `This device controls ${threadTitle}. Use the composer below to continue the live thread.`;
+    } else {
+      sessionTitle = workspace ? `Watching ${workspaceName}` : "Session active elsewhere";
+      sessionCopy = `Another paired device controls ${threadTitle}. Review context here or take over when you want to continue.`;
+    }
+
+    sessionBadges = [
+      overviewBadge("Status", sessionStatusLabel(session, approval)),
+      overviewBadge("Thread", shortId(session.active_thread_id)),
+      overviewBadge("Model", session.model || "Unknown"),
+      overviewBadge("Approval", session.approval_policy || "Unknown"),
+      overviewBadge(
+        "Control",
+        session.active_controller_device_id
+          ? controllerLabel(session.active_controller_device_id)
+          : "Open"
+      ),
+    ];
+
+    if (session.reasoning_effort) {
+      sessionBadges.push(overviewBadge("Effort", session.reasoning_effort));
+    }
+  } else {
+    sessionBadges = [
+      ...(workspace ? [overviewBadge("Workspace", workspaceName)] : []),
+      overviewBadge(
+        "History",
+        historyCount > 0 ? `${historyCount} saved thread${historyCount === 1 ? "" : "s"}` : "No saved threads"
+      ),
+      overviewBadge("Status", sessionStatusLabel(session, approval)),
+    ];
+  }
+
+  let securityTitle = "Private by default";
+  let securityCopy =
+    "Create a QR ticket when you want remote access. Broker visibility and trusted devices will surface here.";
+
+  if (errorMessage) {
+    securityTitle = "Last known relay posture";
+    securityCopy =
+      "The session snapshot could not be refreshed, so broker and device state may be stale.";
+  } else if (pendingPairings > 0) {
+    securityTitle = `${pendingPairings} pairing request${pendingPairings === 1 ? "" : "s"} waiting`;
+    securityCopy =
+      "New devices are waiting for local approval before they can join the relay.";
+  } else if (approvedDevices > 0) {
+    securityTitle = `${approvedDevices} trusted device${approvedDevices === 1 ? "" : "s"}`;
+    securityCopy = session?.broker_connected
+      ? "Remote access is live and approved devices can reconnect quickly."
+      : "Approved devices are remembered, but the broker link is currently offline.";
+  } else if (session?.broker_channel_id) {
+    securityTitle = session.broker_connected ? "Remote access ready" : "Broker link configured";
+    securityCopy = session.broker_connected
+      ? "The relay is reachable through the broker, but no extra devices are trusted yet."
+      : "A broker channel is configured, but it is not connected right now.";
+  }
+
+  const securityBadges = [
+    ...(pendingPairings > 0 ? [overviewBadge("Pending", String(pendingPairings))] : []),
+    overviewBadge("Security", securityModeLabel(session)),
+    overviewBadge("Visibility", contentVisibilityLabel(session)),
+    overviewBadge("Broker", brokerStatusLabel(session)),
+    overviewBadge("Devices", pairedDeviceCountLabel(session)),
+  ];
+
+  overviewSessionTitle.textContent = sessionTitle;
+  overviewSessionCopy.textContent = sessionCopy;
+  overviewSessionBadges.innerHTML = sessionBadges.join("");
+  overviewSecurityTitle.textContent = securityTitle;
+  overviewSecurityCopy.textContent = securityCopy;
+  overviewSecurityBadges.innerHTML = securityBadges.join("");
 }
 
 function renderControlBanner(session) {
@@ -1064,7 +1183,7 @@ function setNewSessionPanelOpen(open) {
   state.newSessionPanelOpen = open;
   newSessionPanel.hidden = !open;
   newSessionToggleButton.setAttribute("aria-expanded", String(open));
-  newSessionToggleButton.textContent = open ? "Close Session Setup" : "New Session";
+  newSessionToggleButton.textContent = open ? "Hide Launch Pad" : "Launch Session";
 }
 
 function scheduleSessionPoll() {
@@ -1323,6 +1442,31 @@ function metaChip(label, value) {
   `;
 }
 
+function overviewBadge(label, value) {
+  return `
+    <span class="overview-badge">
+      <strong>${escapeHtml(label)}</strong>
+      <span>${escapeHtml(value)}</span>
+    </span>
+  `;
+}
+
+function sessionStatusLabel(session, approval) {
+  if (approval) {
+    return "Approval required";
+  }
+
+  if (!session?.codex_connected) {
+    return "Offline";
+  }
+
+  if (!session?.active_thread_id) {
+    return "Standby";
+  }
+
+  return humanizeLabel(session.current_status || "ready");
+}
+
 function securityModeLabel(session) {
   if (session?.security_mode === "managed") {
     return "Managed";
@@ -1350,10 +1494,20 @@ function brokerStatusLabel(session) {
 }
 
 function pairedDeviceCountLabel(session) {
-  const count = Array.isArray(session?.paired_devices)
-    ? session.paired_devices.length
-    : 0;
+  const count = approvedDeviceCount(session);
   return count === 0 ? "None" : `${count} paired`;
+}
+
+function approvedDeviceCount(session) {
+  if (Array.isArray(session?.paired_devices)) {
+    return session.paired_devices.length;
+  }
+
+  if (!Array.isArray(session?.device_records)) {
+    return 0;
+  }
+
+  return session.device_records.filter((record) => record.lifecycle_state === "approved").length;
 }
 
 function deviceLifecycleLabel(state) {
@@ -1418,6 +1572,12 @@ function roleLabel(role) {
   return role;
 }
 
+function humanizeLabel(value) {
+  return String(value)
+    .replaceAll(/[_-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
 function isCurrentDeviceActiveController(session) {
   if (!session?.active_thread_id || !session.active_controller_device_id) {
     return false;
@@ -1444,6 +1604,16 @@ function controllerLabel(deviceId) {
   }
 
   return shortId(deviceId);
+}
+
+function workspaceBasename(cwd) {
+  if (!cwd) {
+    return "workspace";
+  }
+
+  const trimmed = String(cwd).replace(/[\\/]+$/, "");
+  const parts = trimmed.split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) || trimmed || "workspace";
 }
 
 function shortId(value) {

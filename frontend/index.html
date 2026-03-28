@@ -60,7 +60,7 @@
         </section>
 
         <button id="new-session-toggle" class="new-chat-button" type="button" aria-expanded="false">
-          New Session
+          Launch Session
         </button>
 
         <section id="new-session-panel" class="new-session-panel" hidden>
@@ -148,6 +148,35 @@
             <span class="meta-empty">Session details will appear here.</span>
           </section>
         </details>
+
+        <section id="overview-strip" class="overview-strip" aria-label="Relay overview">
+          <article class="overview-card overview-card-primary">
+            <p class="overview-label">Session Pulse</p>
+            <div class="overview-body">
+              <div>
+                <h2 id="overview-session-title" class="overview-title">Pick a workspace to launch</h2>
+                <p id="overview-session-copy" class="overview-copy">
+                  Load a workspace, review prior threads, and start a fresh relay session.
+                </p>
+              </div>
+              <div id="overview-session-badges" class="overview-badges"></div>
+            </div>
+          </article>
+
+          <article class="overview-card overview-card-secondary">
+            <p class="overview-label">Relay Posture</p>
+            <div class="overview-body">
+              <div>
+                <h2 id="overview-security-title" class="overview-title">Private by default</h2>
+                <p id="overview-security-copy" class="overview-copy">
+                  Pair devices only when you need remote access. Broker visibility and trust
+                  state stay visible here.
+                </p>
+              </div>
+              <div id="overview-security-badges" class="overview-badges"></div>
+            </div>
+          </article>
+        </section>
 
         <section id="control-banner" class="control-banner" hidden>
           <div>

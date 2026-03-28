@@ -42,13 +42,19 @@ configureRenderHandlers({
 });
 
 configureBrokerClient({
-  onBrokerReady(_frame, reason) {
+  onBrokerReady(frame, reason) {
     if (state.pairingTicket) {
       void sendPairingRequest();
       return;
     }
 
     if (state.remoteAuth) {
+      const relayPresent = Array.isArray(frame?.peers)
+        && frame.peers.some((peer) => peer?.role === "relay");
+      if (!relayPresent) {
+        renderLog("Broker is ready; waiting for the relay peer before recovering this session.");
+        return;
+      }
       void recoverRemoteSession(`broker ${reason}`);
     }
   },
