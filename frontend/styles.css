@@ -42,7 +42,9 @@ body {
 body {
   min-height: 100vh;
   color: var(--text);
-  background: var(--app-bg);
+  background:
+    radial-gradient(circle at top left, rgba(17, 17, 17, 0.05), transparent 26%),
+    linear-gradient(180deg, #fbfbfc 0%, #f4f4f6 100%);
   font-family: "Soehne", "SF Pro Text", "Helvetica Neue", sans-serif;
   overscroll-behavior-y: none;
 }
@@ -67,7 +69,9 @@ select {
   gap: 14px;
   padding: 14px;
   color: var(--sidebar-text);
-  background: var(--sidebar-bg);
+  background:
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.06), transparent 28%),
+    var(--sidebar-bg);
   border-right: 1px solid var(--sidebar-border);
 }
 
@@ -519,6 +523,11 @@ select {
   width: min(760px, calc(100% - 32px));
   margin: 88px auto 0;
   text-align: center;
+  padding: 28px 30px;
+  border-radius: 28px;
+  border: 1px solid rgba(17, 17, 17, 0.06);
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: var(--shadow);
 }
 
 .thread-empty h2 {
@@ -530,6 +539,29 @@ select {
   margin: 10px 0 0;
   color: var(--muted);
   line-height: 1.6;
+}
+
+.thread-empty-ready {
+  margin-top: 56px;
+}
+
+.thread-empty-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--ready);
+  color: var(--ready-text);
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.thread-empty-detail {
+  font-size: 0.92rem;
 }
 
 .chat-message {
@@ -862,6 +894,20 @@ select {
   .chat-shell {
     min-height: 0;
     height: 100vh;
+  }
+
+  .sidebar {
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-bottom: 24px;
+  }
+
+  .conversation-list {
+    flex: 0 0 auto;
+    overflow: visible;
+  }
+
+  .chat-shell {
     overflow: hidden;
   }
 }

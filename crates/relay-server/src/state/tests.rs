@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::json;
+use std::{env, path::PathBuf};
 use tokio::sync::watch;
 
 use crate::{
@@ -256,6 +257,39 @@ fn active_controller_heartbeat_extends_lease() {
         relay.active_controller_device_id.as_deref(),
         Some("device-a")
     );
+}
+
+#[test]
+fn normalize_cwd_expands_home_directory() {
+    let home = env::var("HOME").expect("HOME should be set for tests");
+    let normalized = normalize_cwd("~/git/agent-relay");
+
+    assert_eq!(
+        normalized,
+        PathBuf::from(home)
+            .join("git/agent-relay")
+            .display()
+            .to_string()
+    );
+}
+
+#[test]
+fn filter_threads_matches_tilde_scoped_workspace() {
+    let home = env::var("HOME").expect("HOME should be set for tests");
+    let project_root = PathBuf::from(home).join("git/agent-relay");
+    let nested_root = project_root.join("crates/relay-server");
+
+    let threads = vec![
+        test_thread("thread-1", &project_root.display().to_string()),
+        test_thread("thread-2", &nested_root.display().to_string()),
+        test_thread("thread-3", "/tmp/other-project"),
+    ];
+
+    let filtered = filter_threads(threads, Some("~/git/agent-relay"), 20);
+
+    assert_eq!(filtered.len(), 2);
+    assert_eq!(filtered[0].id, "thread-1");
+    assert_eq!(filtered[1].id, "thread-2");
 }
 
 #[test]
@@ -560,7 +594,13 @@ fn pairing_request_waits_for_local_approval_before_device_is_created() {
     assert_eq!(relay.paired_devices.len(), 1);
     assert_eq!(result.target_peer_id, "surface-a");
     assert!(result.device_token.is_some());
-    assert_eq!(result.device.as_ref().map(|device| device.device_id.as_str()), Some("phone-approve"));
+    assert_eq!(
+        result
+            .device
+            .as_ref()
+            .map(|device| device.device_id.as_str()),
+        Some("phone-approve")
+    );
 }
 
 #[test]
@@ -655,7 +695,10 @@ fn completed_pairing_can_replay_result_to_reconnected_peer() {
 
     assert_eq!(replay.target_peer_id, "surface-b");
     assert_eq!(
-        replay.device.as_ref().map(|device| device.device_id.as_str()),
+        replay
+            .device
+            .as_ref()
+            .map(|device| device.device_id.as_str()),
         Some("phone-replay")
     );
     assert!(replay.device_token.is_some());

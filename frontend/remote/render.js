@@ -34,7 +34,7 @@ export function renderSession(session) {
   }
 
   renderSessionChrome(session);
-  renderTranscriptPanel(session.transcript || [], approval);
+  renderTranscriptPanel(session, approval, canWrite);
   renderLogs(session.logs || []);
   renderThreads(state.threads);
 

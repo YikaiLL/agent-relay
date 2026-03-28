@@ -78,7 +78,10 @@ async fn main() {
         .route("/api/session/take-over", post(take_over_session))
         .route("/api/session/message", post(send_message))
         .route("/api/pairing/start", post(start_pairing))
-        .route("/api/pairings/:pairing_id/decision", post(decide_pairing_request))
+        .route(
+            "/api/pairings/:pairing_id/decision",
+            post(decide_pairing_request),
+        )
         .route("/api/devices/:device_id/revoke", post(revoke_device))
         .route("/api/approvals/:request_id", post(decide_approval))
         .route_service("/", ServeFile::new(web_root.join("index.html")))

@@ -7,17 +7,17 @@ use crate::{
     broker::BrokerConfig,
     codex::CodexBridge,
     protocol::{
-        ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput,
-        PairingDecision, PairingDecisionInput, PairingDecisionReceipt, PairingStartInput,
-        PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput,
-        SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsResponse,
+        ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput, PairingDecision,
+        PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
+        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+        StartSessionInput, TakeOverInput, ThreadsResponse,
     },
 };
 
 use super::persistence::{spawn_persistence_task, PersistedRelayState, PersistenceStore};
 use super::{
-    expire_controller_if_needed, filter_threads, non_empty, require_device_id, short_device_id,
-    unix_now, RelayState, SecurityProfile, THREAD_SCAN_LIMIT,
+    expire_controller_if_needed, filter_threads, non_empty, normalize_cwd, require_device_id,
+    short_device_id, unix_now, RelayState, SecurityProfile, THREAD_SCAN_LIMIT,
 };
 
 #[derive(Clone)]
@@ -104,7 +104,7 @@ impl AppState {
         limit: usize,
         cwd: Option<String>,
     ) -> Result<ThreadsResponse, String> {
-        let cwd = non_empty(cwd);
+        let cwd = non_empty(cwd).map(|path| normalize_cwd(&path));
         let scan_limit = if cwd.is_some() {
             limit.max(THREAD_SCAN_LIMIT)
         } else {
@@ -123,7 +123,7 @@ impl AppState {
     pub async fn start_session(&self, input: StartSessionInput) -> Result<SessionSnapshot, String> {
         let device_id = require_device_id(input.device_id)?;
         let defaults = self.defaults().await;
-        let cwd = non_empty(input.cwd).unwrap_or(defaults.current_cwd);
+        let cwd = normalize_cwd(&non_empty(input.cwd).unwrap_or(defaults.current_cwd));
         let model = non_empty(input.model).unwrap_or(defaults.model);
         let approval_policy = non_empty(input.approval_policy).unwrap_or(defaults.approval_policy);
         let sandbox = non_empty(input.sandbox).unwrap_or(defaults.sandbox);
@@ -379,10 +379,7 @@ impl AppState {
                 "Pairing request approved on the local relay.".to_string()
             }
             PairingDecision::Reject => {
-                relay.push_log(
-                    "info",
-                    format!("Rejected pairing request {pairing_id}."),
-                );
+                relay.push_log("info", format!("Rejected pairing request {pairing_id}."));
                 "Pairing request rejected on the local relay.".to_string()
             }
         };

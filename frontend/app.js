@@ -262,6 +262,9 @@ async function startSession() {
     setSelectedCwd(payload.data.current_cwd || cwd);
     seedDefaults(payload.data);
     renderSession(payload.data);
+    if (canCurrentDeviceWrite(payload.data)) {
+      messageInput.focus();
+    }
     await loadThreads("post-start refresh");
     setNewSessionPanelOpen(false);
     logLine("Started a new Codex thread");
@@ -296,6 +299,9 @@ async function resumeSession(threadId) {
     setSelectedCwd(payload.data.current_cwd || state.selectedCwd);
     seedDefaults(payload.data);
     renderSession(payload.data);
+    if (canCurrentDeviceWrite(payload.data)) {
+      messageInput.focus();
+    }
     await loadThreads("post-resume refresh");
     setNewSessionPanelOpen(false);
     logLine(`Resumed thread ${threadId}`);
@@ -543,7 +549,7 @@ function renderSession(session) {
   renderPairedDevices(session.paired_devices || []);
   renderPendingPairingRequests(session.pending_pairing_requests || []);
   renderControlBanner(session);
-  renderTranscript(session.transcript, approval);
+  renderTranscript(session, approval);
   renderLogs(session.logs);
   renderThreads(state.threads);
   scheduleControllerHeartbeat(session);
@@ -708,12 +714,49 @@ function renderControlBanner(session) {
   takeOverButton.hidden = false;
 }
 
-function renderTranscript(entries, approval) {
+function renderTranscript(session, approval) {
+  const entries = session.transcript || [];
+
   if (!entries.length && !approval) {
+    if (session.active_thread_id) {
+      const hasControl = canCurrentDeviceWrite(session);
+      const title = hasControl ? "Session ready" : "Session active on another device";
+      const copy = hasControl
+        ? "Codex is connected. Send the first prompt below when you're ready."
+        : "This thread is open, but another device currently has control. Take over to send the first prompt from here.";
+      const detailParts = [];
+
+      if (session.current_cwd) {
+        detailParts.push(`Workspace: ${escapeHtml(session.current_cwd)}`);
+      }
+      if (session.active_thread_id) {
+        detailParts.push(`Thread: ${escapeHtml(shortId(session.active_thread_id))}`);
+      }
+
+      transcript.innerHTML = `
+        <div class="thread-empty thread-empty-ready">
+          <span class="thread-empty-badge">${hasControl ? "Ready" : "Waiting"}</span>
+          <h2>${title}</h2>
+          <p>${copy}</p>
+          ${
+            detailParts.length
+              ? `<p class="thread-empty-detail">${detailParts.join(" · ")}</p>`
+              : ""
+          }
+        </div>
+      `;
+      return;
+    }
+
     transcript.innerHTML = `
       <div class="thread-empty">
         <h2>No active conversation yet</h2>
         <p>Start a new session or resume one from the sidebar.</p>
+        ${
+          state.selectedCwd
+            ? `<p class="thread-empty-detail">Selected workspace: ${escapeHtml(state.selectedCwd)}</p>`
+            : ""
+        }
       </div>
     `;
     return;

@@ -15,8 +15,39 @@ export function renderLog(message) {
   dom.remoteClientLog.textContent = `${time}  ${message}\n${dom.remoteClientLog.textContent}`.trim();
 }
 
-export function renderTranscriptPanel(entries, approval) {
+export function renderTranscriptPanel(session, approval, canWrite) {
+  const entries = session.transcript || [];
+
   if (!entries.length && !approval) {
+    if (session.active_thread_id) {
+      const title = canWrite ? "Session ready" : "Session active on another device";
+      const copy = canWrite
+        ? "The remote session is live. Send the first prompt below when you're ready."
+        : "This thread is already open, but another device currently has control. Take over to send the first prompt from here.";
+      const detailParts = [];
+
+      if (session.current_cwd) {
+        detailParts.push(`Workspace: ${escapeHtml(session.current_cwd)}`);
+      }
+      if (session.active_thread_id) {
+        detailParts.push(`Thread: ${escapeHtml(shortId(session.active_thread_id))}`);
+      }
+
+      dom.remoteTranscript.innerHTML = `
+        <div class="thread-empty thread-empty-ready">
+          <span class="thread-empty-badge">${canWrite ? "Ready" : "Waiting"}</span>
+          <h2>${title}</h2>
+          <p>${copy}</p>
+          ${
+            detailParts.length
+              ? `<p class="thread-empty-detail">${detailParts.join(" · ")}</p>`
+              : ""
+          }
+        </div>
+      `;
+      return;
+    }
+
     renderEmptyState();
     return;
   }

@@ -468,7 +468,11 @@ async fn handle_pairing_request(
         return Ok(());
     }
     let replay_result = match state
-        .completed_pairing_result(&pairing_id, &pairing_request.device_verify_key, &from_peer_id)
+        .completed_pairing_result(
+            &pairing_id,
+            &pairing_request.device_verify_key,
+            &from_peer_id,
+        )
         .await
     {
         Ok(result) => result,
@@ -673,7 +677,10 @@ fn verify_pairing_request_proof(
         .map_err(|_| "pairing verify key is invalid".to_string())?;
     let signature = Signature::from_bytes(&signature_bytes);
     verify_key
-        .verify(pairing_proof_message(pairing_id, device_id).as_bytes(), &signature)
+        .verify(
+            pairing_proof_message(pairing_id, device_id).as_bytes(),
+            &signature,
+        )
         .map_err(|_| "pairing proof is invalid".to_string())
 }
 

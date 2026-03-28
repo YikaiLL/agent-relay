@@ -29,6 +29,7 @@ async function main() {
   const relayPort = await getFreePort();
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-relay-browser-e2e-"));
   const statePath = path.join(stateDir, "session.json");
+  const cwdInput = toTildePath(ROOT);
 
   const broker = spawnManagedProcess(
     "broker",
@@ -103,15 +104,35 @@ async function main() {
       const panel = document.querySelector("#remote-session-panel");
       return Boolean(panel && !panel.hidden);
     });
-    await remotePage.fill("#remote-cwd-input", ROOT);
     await remotePage.click("#remote-session-panel summary");
     await remotePage.waitForFunction(() => {
       const details = document.querySelector("#remote-session-panel details");
       return Boolean(details && details.open);
     });
     await remotePage.selectOption("#remote-approval-policy-input", "never");
-    await remotePage.fill("#remote-start-prompt", PROMPT);
+    await remotePage.fill("#remote-cwd-input", cwdInput);
     await remotePage.click("#remote-start-session-button");
+
+    await remotePage.waitForFunction(() => {
+      const input = document.querySelector("#remote-message-input");
+      return Boolean(input && !input.disabled);
+    }, null, { timeout: PAIRING_TIMEOUT_MS });
+    await remotePage.waitForFunction(() => {
+      const transcript = document.querySelector("#remote-transcript")?.textContent || "";
+      return transcript.includes("Session ready");
+    }, null, { timeout: PAIRING_TIMEOUT_MS });
+
+    const relaySessionAfterStart = await fetch(`http://127.0.0.1:${relayPort}/api/session`)
+      .then((response) => response.json())
+      .then((response) => response.data);
+    assert.equal(
+      relaySessionAfterStart.current_cwd,
+      ROOT,
+      `remote start should normalize cwd to ${ROOT}, got ${relaySessionAfterStart.current_cwd}`
+    );
+
+    await remotePage.fill("#remote-message-input", PROMPT);
+    await remotePage.click("#remote-send-button");
 
     const expectedReply = PROMPT.replace("Reply with exactly: ", "");
     await remotePage.waitForFunction(
@@ -135,10 +156,12 @@ async function main() {
           brokerPort,
           relayPort,
           lanIp,
+          cwdInput,
           pairingUrl,
           remoteStatus,
           remoteDeviceOverview,
           activeThreadId: relaySession.active_thread_id,
+          currentCwd: relaySession.current_cwd,
           pairedDevices: relaySession.paired_devices?.map((device) => ({
             deviceId: device.device_id,
             label: device.label,
@@ -268,6 +291,17 @@ async function waitForBrokerConnection(sessionUrl, timeoutMs = 30000) {
     await delay(300);
   }
   throw new Error("timed out waiting for relay broker connection");
+}
+
+function toTildePath(absolutePath) {
+  const home = os.homedir();
+  if (absolutePath === home) {
+    return "~";
+  }
+  if (absolutePath.startsWith(`${home}${path.sep}`)) {
+    return `~/${path.relative(home, absolutePath)}`;
+  }
+  return absolutePath;
 }
 
 async function getFreePort() {

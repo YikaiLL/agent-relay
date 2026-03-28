@@ -6,7 +6,8 @@ mod security;
 mod tests;
 
 use std::{
-    path::Path,
+    env,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -59,9 +60,10 @@ fn filter_threads(
     cwd: Option<&str>,
     limit: usize,
 ) -> Vec<ThreadSummaryView> {
+    let normalized_cwd = cwd.map(normalize_cwd);
     let mut filtered = threads
         .into_iter()
-        .filter(|thread| thread_matches_cwd_scope(&thread.cwd, cwd))
+        .filter(|thread| thread_matches_cwd_scope(&thread.cwd, normalized_cwd.as_deref()))
         .collect::<Vec<_>>();
     filtered.truncate(limit);
     filtered
@@ -72,9 +74,48 @@ fn thread_matches_cwd_scope(thread_cwd: &str, cwd: Option<&str>) -> bool {
         return true;
     };
 
-    let thread_path = Path::new(thread_cwd);
+    let normalized_thread_cwd = normalize_cwd(thread_cwd);
+    let thread_path = Path::new(&normalized_thread_cwd);
     let selected_path = Path::new(cwd);
     thread_path == selected_path || thread_path.starts_with(selected_path)
+}
+
+pub(super) fn normalize_cwd(cwd: &str) -> String {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let expanded = expand_home_dir(trimmed)
+        .or_else(|| make_absolute(trimmed))
+        .unwrap_or_else(|| PathBuf::from(trimmed));
+
+    expanded
+        .canonicalize()
+        .unwrap_or(expanded)
+        .display()
+        .to_string()
+}
+
+fn expand_home_dir(path: &str) -> Option<PathBuf> {
+    if path == "~" {
+        return env::var_os("HOME").map(PathBuf::from);
+    }
+
+    if let Some(stripped) = path.strip_prefix("~/") {
+        return env::var_os("HOME").map(|home| PathBuf::from(home).join(stripped));
+    }
+
+    None
+}
+
+fn make_absolute(path: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        return Some(candidate);
+    }
+
+    env::current_dir().ok().map(|cwd| cwd.join(candidate))
 }
 
 fn unix_now() -> u64 {
