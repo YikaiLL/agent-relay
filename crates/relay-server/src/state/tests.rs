@@ -65,6 +65,35 @@ fn test_state() -> RelayState {
     )
 }
 
+fn test_broker_config(
+    broker_url: &str,
+    channel_id: &str,
+    peer_id: &str,
+) -> crate::broker::BrokerConfig {
+    crate::broker::BrokerConfig::from_parts(
+        Some(broker_url.to_string()),
+        None,
+        Some(channel_id.to_string()),
+        Some(peer_id.to_string()),
+        Some("test-broker-ticket-secret".to_string()),
+    )
+    .expect("broker config should parse")
+    .expect("broker config should be enabled")
+}
+
+fn issue_test_pairing_ticket(
+    relay: &mut RelayState,
+    broker_url: &str,
+    channel_id: &str,
+    peer_id: &str,
+    expires_in_seconds: Option<u64>,
+) -> crate::protocol::PairingTicketView {
+    let broker = test_broker_config(broker_url, channel_id, peer_id);
+    relay
+        .issue_pairing_ticket(&broker, expires_in_seconds)
+        .expect("pairing ticket should issue")
+}
+
 fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
     ThreadSummaryView {
         id: id.to_string(),
@@ -420,7 +449,13 @@ fn restore_thread_data_keeps_persisted_controller_and_settings() {
 #[test]
 fn pairing_ticket_registers_and_authenticates_remote_device() {
     let mut relay = test_state();
-    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
 
     let (device, token) = relay
         .consume_pairing_ticket(
@@ -455,8 +490,13 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
 #[test]
 fn pairing_ticket_includes_scannable_broker_link() {
     let mut relay = test_state();
-    let ticket =
-        relay.issue_pairing_ticket("wss://relay.example.com", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "wss://relay.example.com",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
 
     assert!(ticket
         .pairing_url
@@ -477,12 +517,19 @@ fn pairing_ticket_includes_scannable_broker_link() {
     assert_eq!(payload["pairing_id"], ticket.pairing_id);
     assert_eq!(payload["pairing_secret"], ticket.pairing_secret);
     assert_eq!(payload["broker_url"], "wss://relay.example.com");
+    assert_eq!(payload["pairing_join_ticket"], ticket.pairing_join_ticket);
 }
 
 #[test]
 fn pairing_rejects_invalid_secret_and_bad_device_token() {
     let mut relay = test_state();
-    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
 
     let error = relay
         .consume_pairing_ticket(
@@ -497,8 +544,13 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
         .expect_err("invalid pairing secret should fail");
     assert!(error.contains("invalid"));
 
-    let replacement =
-        relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let replacement = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
     let (device, token) = relay
         .consume_pairing_ticket(
             &replacement.pairing_id,
@@ -520,7 +572,13 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
 #[test]
 fn revoking_paired_device_removes_it() {
     let mut relay = test_state();
-    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
     let (device, _token) = relay
         .consume_pairing_ticket(
             &ticket.pairing_id,
@@ -568,7 +626,13 @@ async fn persistence_store_round_trips_to_disk() {
 #[test]
 fn pairing_request_waits_for_local_approval_before_device_is_created() {
     let mut relay = test_state();
-    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
 
     let request = relay
         .register_pairing_request(
@@ -606,7 +670,13 @@ fn pairing_request_waits_for_local_approval_before_device_is_created() {
 #[test]
 fn rejecting_pairing_request_returns_error_without_creating_device() {
     let mut relay = test_state();
-    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
 
     relay
         .register_pairing_request(
@@ -637,7 +707,13 @@ fn rejecting_pairing_request_returns_error_without_creating_device() {
 #[test]
 fn repeated_pairing_request_rebinds_to_latest_broker_peer() {
     let mut relay = test_state();
-    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
 
     relay
         .register_pairing_request(
@@ -672,7 +748,13 @@ fn repeated_pairing_request_rebinds_to_latest_broker_peer() {
 #[test]
 fn completed_pairing_can_replay_result_to_reconnected_peer() {
     let mut relay = test_state();
-    let ticket = relay.issue_pairing_ticket("ws://127.0.0.1:8789", "room-a", "relay-a", Some(60));
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
 
     relay
         .register_pairing_request(

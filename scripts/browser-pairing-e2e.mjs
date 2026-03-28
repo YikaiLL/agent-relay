@@ -12,6 +12,8 @@ import { chromium } from "playwright";
 const ROOT = process.cwd();
 const PAIRING_TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
 const PROMPT = process.env.BROWSER_E2E_PROMPT || "Reply with exactly: browser-pairing-e2e";
+const BROKER_TICKET_SECRET =
+  process.env.BROWSER_E2E_BROKER_TICKET_SECRET || "browser-e2e-broker-secret";
 
 const managedProcesses = [];
 
@@ -38,6 +40,7 @@ async function main() {
     {
       BIND_HOST: "0.0.0.0",
       PORT: String(brokerPort),
+      RELAY_BROKER_TICKET_SECRET: BROKER_TICKET_SECRET,
     }
   );
   await waitForHealth(`http://127.0.0.1:${brokerPort}/api/health`);
@@ -53,6 +56,7 @@ async function main() {
       RELAY_BROKER_PUBLIC_URL: `ws://${lanIp}:${brokerPort}`,
       RELAY_BROKER_CHANNEL_ID: "browser-e2e-room",
       RELAY_BROKER_PEER_ID: "browser-e2e-relay",
+      RELAY_BROKER_TICKET_SECRET: BROKER_TICKET_SECRET,
     }
   );
   await waitForHealth(`http://127.0.0.1:${relayPort}/api/health`);

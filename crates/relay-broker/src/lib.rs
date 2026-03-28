@@ -1,3 +1,4 @@
+pub mod join_ticket;
 pub mod protocol;
 mod state;
 
@@ -15,6 +16,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{sink::SinkExt, StreamExt};
+use join_ticket::{JoinTicketClaims, JoinTicketKey, JoinTicketKind, JOIN_TICKET_SECRET_ENV};
 use protocol::{ClientMessage, ConnectQuery, HealthResponse, ServerMessage};
 use rand::{distributions::Alphanumeric, Rng};
 use tower_http::{
@@ -24,14 +26,37 @@ use tower_http::{
 use tracing::{debug, warn};
 
 pub fn app(state: BrokerState) -> Router {
-    app_with_web_root(state, default_web_root())
+    let join_ticket_key = match JoinTicketKey::from_env_var(JOIN_TICKET_SECRET_ENV) {
+        Ok(key) => key,
+        Err(error) => {
+            warn!(%error, "broker join-ticket auth is misconfigured");
+            None
+        }
+    };
+    app_with_web_root_and_key(state, default_web_root(), join_ticket_key)
 }
 
-fn app_with_web_root(state: BrokerState, web_root: PathBuf) -> Router {
+#[derive(Clone)]
+struct BrokerAppState {
+    broker: BrokerState,
+    join_ticket_key: Option<JoinTicketKey>,
+}
+
+fn app_with_web_root_and_key(
+    state: BrokerState,
+    web_root: PathBuf,
+    join_ticket_key: Option<JoinTicketKey>,
+) -> Router {
     if !web_root.join("remote.html").exists() {
         warn!(
             path = %web_root.join("remote.html").display(),
             "broker web assets are missing; run `npm run build` before serving the remote UI"
+        );
+    }
+    if join_ticket_key.is_none() {
+        warn!(
+            env = JOIN_TICKET_SECRET_ENV,
+            "broker websocket joins will be rejected until a join-ticket secret is configured"
         );
     }
     Router::new()
@@ -45,7 +70,10 @@ fn app_with_web_root(state: BrokerState, web_root: PathBuf) -> Router {
         .route_service("/icon.svg", ServeFile::new(web_root.join("icon.svg")))
         .route_service("/", ServeFile::new(web_root.join("remote.html")))
         .nest_service("/static", ServeDir::new(web_root))
-        .with_state(state)
+        .with_state(BrokerAppState {
+            broker: state,
+            join_ticket_key,
+        })
         .layer(TraceLayer::new_for_http())
 }
 
@@ -60,13 +88,13 @@ async fn websocket(
     ws: WebSocketUpgrade,
     Path(channel_id): Path<String>,
     Query(query): Query<ConnectQuery>,
-    State(state): State<BrokerState>,
+    State(state): State<BrokerAppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(state, socket, channel_id, query))
 }
 
 async fn handle_socket(
-    state: BrokerState,
+    state: BrokerAppState,
     socket: WebSocket,
     channel_id: String,
     query: ConnectQuery,
@@ -76,12 +104,45 @@ async fn handle_socket(
         return;
     }
 
-    let mut peer_id = trimmed(query.peer_id);
+    let Some(join_ticket_key) = state.join_ticket_key.as_ref() else {
+        reject_socket(
+            socket,
+            "join_rejected",
+            "broker join auth is not configured",
+        )
+        .await;
+        return;
+    };
+    let claims = match verify_join_ticket_for_connection(
+        join_ticket_key,
+        query.join_ticket.as_deref(),
+        &channel_id,
+        query.role,
+    ) {
+        Ok(claims) => claims,
+        Err(message) => {
+            reject_socket(socket, "join_rejected", &message).await;
+            return;
+        }
+    };
+
+    let mut peer_id = trimmed(query.peer_id).or_else(|| claims.peer_id.clone());
     let join = loop {
         let candidate = peer_id
             .clone()
             .unwrap_or_else(|| generated_peer_id(query.role));
-        match state.join(&channel_id, &candidate, query.role).await {
+        if let Some(expected_peer_id) = claims.peer_id.as_deref() {
+            if candidate != expected_peer_id {
+                reject_socket(
+                    socket,
+                    "join_rejected",
+                    "join_ticket peer_id does not match the requested peer",
+                )
+                .await;
+                return;
+            }
+        }
+        match state.broker.join(&channel_id, &candidate, query.role).await {
             Ok(join) => {
                 peer_id = Some(candidate);
                 break join;
@@ -105,7 +166,7 @@ async fn handle_socket(
     };
 
     if send_message(&mut sender, &welcome).await.is_err() {
-        state.leave(&channel_id, &peer_id).await;
+        state.broker.leave(&channel_id, &peer_id).await;
         return;
     }
 
@@ -124,7 +185,9 @@ async fn handle_socket(
                 let parsed = serde_json::from_str::<ClientMessage>(&text);
                 match parsed {
                     Ok(ClientMessage::Publish { payload }) => {
-                        if let Err(error) = state.publish(&channel_id, &peer_id, payload).await {
+                        if let Err(error) =
+                            state.broker.publish(&channel_id, &peer_id, payload).await
+                        {
                             warn!(channel_id, peer_id, %error, "failed to publish message");
                         }
                     }
@@ -146,7 +209,7 @@ async fn handle_socket(
     }
 
     send_task.abort();
-    state.leave(&channel_id, &peer_id).await;
+    state.broker.leave(&channel_id, &peer_id).await;
 }
 
 async fn send_message(
@@ -203,6 +266,36 @@ fn generated_peer_id(role: protocol::PeerRole) -> String {
         .collect::<String>()
         .to_ascii_lowercase();
     format!("{prefix}-{suffix}")
+}
+
+fn verify_join_ticket_for_connection(
+    key: &JoinTicketKey,
+    join_ticket: Option<&str>,
+    channel_id: &str,
+    role: protocol::PeerRole,
+) -> Result<JoinTicketClaims, String> {
+    let join_ticket = join_ticket
+        .map(str::trim)
+        .filter(|ticket| !ticket.is_empty())
+        .ok_or_else(|| "join_ticket is required".to_string())?;
+    let claims = key.verify(join_ticket)?;
+    if claims.channel_id != channel_id {
+        return Err("join_ticket channel does not match this broker room".to_string());
+    }
+    if claims.role != role {
+        return Err("join_ticket role does not match this connection".to_string());
+    }
+    match (role, claims.kind) {
+        (protocol::PeerRole::Relay, JoinTicketKind::RelayJoin) => Ok(claims),
+        (
+            protocol::PeerRole::Surface,
+            JoinTicketKind::PairingSurfaceJoin | JoinTicketKind::DeviceSurfaceJoin,
+        ) => Ok(claims),
+        (protocol::PeerRole::Relay, _) => Err("join_ticket kind is invalid for relay".to_string()),
+        (protocol::PeerRole::Surface, _) => {
+            Err("join_ticket kind is invalid for surface".to_string())
+        }
+    }
 }
 
 #[cfg(test)]

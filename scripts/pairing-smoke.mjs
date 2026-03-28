@@ -107,7 +107,9 @@ async function main() {
   }
 
   const ticket = pairingEnvelope.data;
-  const wsUrl = `${ticket.broker_url}/ws/${encodeURIComponent(ticket.broker_channel_id)}?role=surface`;
+  const wsUrl =
+    `${ticket.broker_url}/ws/${encodeURIComponent(ticket.broker_channel_id)}` +
+    `?role=surface&join_ticket=${encodeURIComponent(ticket.pairing_join_ticket)}`;
   const ws = new WebSocket(wsUrl);
   const nextFrame = createFrameQueue(ws);
 

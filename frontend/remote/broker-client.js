@@ -26,6 +26,11 @@ export function connectBroker(reason) {
   const url = new URL(target.brokerUrl);
   url.pathname = `/ws/${encodeURIComponent(target.brokerChannelId)}`;
   url.searchParams.set("role", "surface");
+  if (!target.joinTicket) {
+    renderLog("Broker connect skipped because no join ticket is stored for this device.");
+    return;
+  }
+  url.searchParams.set("join_ticket", target.joinTicket);
 
   renderLog(`Connecting to broker (${reason}) via ${url.host}.`);
   const socket = new WebSocket(url.toString());

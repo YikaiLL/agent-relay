@@ -135,6 +135,13 @@ export async function handleEncryptedPairingResult(payload) {
   }
 
   const device = result.device;
+  if (!device || !result.device_token || !result.device_join_ticket) {
+    state.pairingPhase = "error";
+    state.pairingError = "pairing result is incomplete";
+    renderDeviceMeta();
+    renderLog("Pairing failed: relay returned an incomplete device credential bundle.");
+    return;
+  }
   state.remoteAuth = {
     brokerUrl: state.pairingTicket.broker_url,
     brokerChannelId: state.pairingTicket.broker_channel_id,
@@ -143,6 +150,8 @@ export async function handleEncryptedPairingResult(payload) {
     deviceId: device.device_id,
     deviceLabel: device.label,
     deviceToken: result.device_token,
+    deviceJoinTicket: result.device_join_ticket,
+    deviceJoinTicketExpiresAt: result.device_join_ticket_expires_at || null,
     sessionClaim: null,
     sessionClaimExpiresAt: null,
   };

@@ -158,6 +158,7 @@ RELAY_BROKER_URL=ws://127.0.0.1:8788 \
 RELAY_BROKER_PUBLIC_URL=ws://192.168.1.105:8788 \
 RELAY_BROKER_CHANNEL_ID=dev-room \
 RELAY_BROKER_PEER_ID=local-relay \
+RELAY_BROKER_TICKET_SECRET=change-me \
 cargo run -p relay-server
 ```
 
@@ -172,6 +173,8 @@ Notes:
 - `RELAY_BROKER_URL` and `RELAY_BROKER_PUBLIC_URL` should still point at the same
   broker instance; they only differ in how the relay host versus remote devices
   reach that broker
+- `RELAY_BROKER_TICKET_SECRET` must be set to the same value on both the broker
+  and the relay-server, otherwise all websocket joins are rejected
 - The broker remote surface is now installable as a PWA. Open the broker root,
   then use your browser's install action to pin it on a phone or desktop.
 - pairing and encrypted broker traffic now work on plain LAN `http://` pages, but

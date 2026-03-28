@@ -11,15 +11,19 @@ fn broker_config_builds_websocket_url() {
         None,
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
+        Some("test-broker-ticket-secret".to_string()),
     )
     .expect("config should parse")
     .expect("config should be enabled");
 
     assert_eq!(config.public_base_url(), "ws://127.0.0.1:8788");
-    assert_eq!(
-        config.url.as_str(),
-        "ws://127.0.0.1:8788/ws/demo-room?peer_id=relay-1&role=relay"
-    );
+    assert!(config
+        .url
+        .as_str()
+        .starts_with("ws://127.0.0.1:8788/ws/demo-room?"));
+    assert!(config.url.as_str().contains("peer_id=relay-1"));
+    assert!(config.url.as_str().contains("role=relay"));
+    assert!(config.url.as_str().contains("join_ticket="));
 }
 
 #[test]
@@ -29,6 +33,7 @@ fn broker_config_supports_distinct_public_url_for_pairing() {
         Some("ws://192.168.1.105:8788".to_string()),
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
+        Some("test-broker-ticket-secret".to_string()),
     )
     .expect("config should parse")
     .expect("config should be enabled");
@@ -43,6 +48,7 @@ fn broker_config_requires_channel() {
         None,
         None,
         Some("relay-1".to_string()),
+        Some("test-broker-ticket-secret".to_string()),
     )
     .expect_err("missing channel should fail");
     assert!(error.contains("RELAY_BROKER_CHANNEL_ID"));
@@ -50,8 +56,14 @@ fn broker_config_requires_channel() {
 
 #[test]
 fn broker_config_disables_when_url_is_missing() {
-    let config = BrokerConfig::from_parts(None, None, Some("demo-room".to_string()), None)
-        .expect("missing url should be accepted");
+    let config = BrokerConfig::from_parts(
+        None,
+        None,
+        Some("demo-room".to_string()),
+        None,
+        Some("test-broker-ticket-secret".to_string()),
+    )
+    .expect("missing url should be accepted");
     assert!(config.is_none());
 }
 
@@ -62,9 +74,23 @@ fn broker_config_rejects_invalid_public_url_scheme() {
         Some("http://192.168.1.105:8788".to_string()),
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
+        Some("test-broker-ticket-secret".to_string()),
     )
     .expect_err("invalid public url scheme should fail");
     assert!(error.contains("RELAY_BROKER_PUBLIC_URL"));
+}
+
+#[test]
+fn broker_config_requires_join_ticket_secret() {
+    let error = BrokerConfig::from_parts(
+        Some("ws://127.0.0.1:8788".to_string()),
+        None,
+        Some("demo-room".to_string()),
+        Some("relay-1".to_string()),
+        None,
+    )
+    .expect_err("missing ticket secret should fail");
+    assert!(error.contains(JOIN_TICKET_SECRET_ENV));
 }
 
 #[test]

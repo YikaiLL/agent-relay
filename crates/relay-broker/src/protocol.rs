@@ -56,6 +56,7 @@ pub enum ServerMessage {
 pub struct ConnectQuery {
     pub peer_id: Option<String>,
     pub role: PeerRole,
+    pub join_ticket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

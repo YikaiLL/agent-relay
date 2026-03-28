@@ -20,7 +20,12 @@ export function parsePairingPayload(rawInput) {
   const json = new TextDecoder().decode(base64UrlToBytes(raw));
   const payload = JSON.parse(json);
 
-  if (!payload.pairing_id || !payload.pairing_secret || !payload.broker_url) {
+  if (
+    !payload.pairing_id ||
+    !payload.pairing_secret ||
+    !payload.broker_url ||
+    !payload.pairing_join_ticket
+  ) {
     throw new Error("pairing payload is missing required fields");
   }
 

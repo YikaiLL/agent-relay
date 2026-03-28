@@ -7,6 +7,7 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use relay_broker::join_ticket::{JoinTicketClaims, JoinTicketKey, JOIN_TICKET_SECRET_ENV};
 use relay_broker::protocol::{ClientMessage, PeerRole, PresenceKind, ServerMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +37,7 @@ pub struct BrokerConfig {
     url: Url,
     pub channel_id: String,
     pub peer_id: String,
+    join_ticket_key: JoinTicketKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +111,8 @@ struct PairingResultPlaintext {
     ok: bool,
     device: Option<PairedDeviceView>,
     device_token: Option<String>,
+    device_join_ticket: Option<String>,
+    device_join_ticket_expires_at: Option<u64>,
     error: Option<String>,
 }
 
@@ -119,14 +123,16 @@ impl BrokerConfig {
             std::env::var("RELAY_BROKER_PUBLIC_URL").ok(),
             std::env::var("RELAY_BROKER_CHANNEL_ID").ok(),
             std::env::var("RELAY_BROKER_PEER_ID").ok(),
+            std::env::var(JOIN_TICKET_SECRET_ENV).ok(),
         )
     }
 
-    fn from_parts(
+    pub(crate) fn from_parts(
         url: Option<String>,
         public_url: Option<String>,
         channel_id: Option<String>,
         peer_id: Option<String>,
+        join_ticket_secret: Option<String>,
     ) -> Result<Option<Self>, String> {
         let Some(url) = url.and_then(trimmed_string) else {
             return Ok(None);
@@ -138,6 +144,10 @@ impl BrokerConfig {
         let public_url = public_url
             .and_then(trimmed_string)
             .unwrap_or_else(|| url.clone());
+        let join_ticket_secret = trimmed(join_ticket_secret).ok_or_else(|| {
+            format!("{JOIN_TICKET_SECRET_ENV} is required when RELAY_BROKER_URL is set")
+        })?;
+        let join_ticket_key = JoinTicketKey::from_secret(join_ticket_secret.as_bytes())?;
 
         let mut url = Url::parse(&url)
             .map_err(|error| format!("invalid RELAY_BROKER_URL `{url}`: {error}"))?;
@@ -168,18 +178,44 @@ impl BrokerConfig {
         url.query_pairs_mut()
             .clear()
             .append_pair("peer_id", &peer_id)
-            .append_pair("role", "relay");
+            .append_pair("role", "relay")
+            .append_pair(
+                "join_ticket",
+                &join_ticket_key.mint(&JoinTicketClaims::relay_join(&channel_id, &peer_id))?,
+            );
 
         Ok(Some(Self {
             public_base_url,
             url,
             channel_id,
             peer_id,
+            join_ticket_key,
         }))
     }
 
     pub fn public_base_url(&self) -> &str {
         &self.public_base_url
+    }
+
+    pub fn pairing_join_ticket(&self, pairing_id: &str, expires_at: u64) -> Result<String, String> {
+        self.join_ticket_key
+            .mint(&JoinTicketClaims::pairing_surface_join(
+                &self.channel_id,
+                pairing_id,
+                expires_at,
+            ))
+    }
+
+    pub fn device_join_ticket(&self, device_id: &str) -> Result<String, String> {
+        self.join_ticket_key
+            .mint(&JoinTicketClaims::device_surface_join(
+                &self.channel_id,
+                device_id,
+            ))
+    }
+
+    pub fn device_join_ticket_expires_at(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -281,7 +317,7 @@ async fn run_broker_session(
             format!("Connected to broker channel {}.", config.channel_id),
         )
         .await;
-    publish_pending_broker_messages(&mut sender, state)
+    publish_pending_broker_messages(&mut sender, state, config)
         .await
         .map_err(|error| format!("initial broker direct publish failed: {error}"))?;
     publish_snapshot(&mut sender, state)
@@ -292,7 +328,7 @@ async fn run_broker_session(
         tokio::select! {
             changed = change_rx.changed() => {
                 changed.map_err(|_| "relay change channel closed".to_string())?;
-                publish_pending_broker_messages(&mut sender, state)
+                publish_pending_broker_messages(&mut sender, state, config)
                     .await
                     .map_err(|error| format!("broker direct publish failed: {error}"))?;
                 publish_snapshot(&mut sender, state)
@@ -305,7 +341,7 @@ async fn run_broker_session(
                 };
                 let frame = frame.map_err(|error| format!("broker receive failed: {error}"))?;
                 if let Some(message) = decode_server_frame(frame)? {
-                    handle_server_message(state, &mut sender, message).await?;
+                    handle_server_message(state, &mut sender, message, config).await?;
                 }
             }
         }
@@ -328,6 +364,7 @@ async fn handle_server_message(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     message: ServerMessage,
+    config: &BrokerConfig,
 ) -> Result<(), String> {
     match message {
         ServerMessage::Welcome { .. } => Ok(()),
@@ -373,7 +410,15 @@ async fn handle_server_message(
                     pairing_id,
                     envelope,
                 }) => {
-                    handle_pairing_request(state, sender, from_peer_id, pairing_id, envelope).await
+                    handle_pairing_request(
+                        state,
+                        sender,
+                        from_peer_id,
+                        pairing_id,
+                        envelope,
+                        config,
+                    )
+                    .await
                 }
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
@@ -424,6 +469,7 @@ async fn handle_pairing_request(
     from_peer_id: String,
     pairing_id: String,
     envelope: EncryptedEnvelope,
+    config: &BrokerConfig,
 ) -> Result<(), String> {
     state
         .push_runtime_log(
@@ -490,7 +536,7 @@ async fn handle_pairing_request(
         }
     };
     if let Some(result) = replay_result {
-        publish_pairing_result(sender, result).await?;
+        publish_pairing_result(sender, result, config).await?;
         state
             .push_runtime_log(
                 "info",
@@ -594,11 +640,12 @@ async fn publish_snapshot(
 async fn publish_pending_broker_messages(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     state: &AppState,
+    config: &BrokerConfig,
 ) -> Result<(), String> {
     for message in state.drain_pending_broker_messages().await {
         match message {
             BrokerPendingMessage::PairingResult(result) => {
-                publish_pairing_result(sender, result).await?;
+                publish_pairing_result(sender, result, config).await?;
             }
         }
     }
@@ -608,13 +655,21 @@ async fn publish_pending_broker_messages(
 async fn publish_pairing_result(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     result: crate::state::PendingPairingResult,
+    config: &BrokerConfig,
 ) -> Result<(), String> {
+    let device_join_ticket = result
+        .device
+        .as_ref()
+        .map(|device| config.device_join_ticket(&device.device_id))
+        .transpose()?;
     let encrypted = encrypt_json(
         &result.pairing_secret,
         &PairingResultPlaintext {
             ok: result.error.is_none(),
             device: result.device,
             device_token: result.device_token,
+            device_join_ticket,
+            device_join_ticket_expires_at: config.device_join_ticket_expires_at(),
             error: result.error,
         },
     )?;

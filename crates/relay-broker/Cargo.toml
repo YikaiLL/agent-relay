@@ -6,10 +6,13 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tower-http.workspace = true

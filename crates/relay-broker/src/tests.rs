@@ -12,13 +12,18 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::*;
+use crate::join_ticket::{JoinTicketClaims, JoinTicketKey};
 
 async fn spawn_app() -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("listener should bind");
     let address = listener.local_addr().expect("listener should have address");
-    let app = app_with_web_root(BrokerState::default(), test_web_root());
+    let app = app_with_web_root_and_key(
+        BrokerState::default(),
+        test_web_root(),
+        Some(test_join_ticket_key()),
+    );
     tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -91,6 +96,33 @@ fn test_web_root() -> PathBuf {
     root
 }
 
+fn test_join_ticket_key() -> JoinTicketKey {
+    JoinTicketKey::from_secret("broker-test-secret".as_bytes())
+        .expect("test join-ticket key should construct")
+}
+
+fn websocket_url(
+    address: SocketAddr,
+    channel_id: &str,
+    role: protocol::PeerRole,
+    peer_id: Option<&str>,
+    claims: JoinTicketClaims,
+) -> String {
+    let role = match role {
+        protocol::PeerRole::Relay => "relay",
+        protocol::PeerRole::Surface => "surface",
+    };
+    let join_ticket = test_join_ticket_key()
+        .mint(&claims)
+        .expect("join ticket should mint");
+    let mut url = format!("ws://{address}/ws/{channel_id}?role={role}&join_ticket={join_ticket}");
+    if let Some(peer_id) = peer_id {
+        url.push_str("&peer_id=");
+        url.push_str(peer_id);
+    }
+    url
+}
+
 #[tokio::test]
 async fn root_serves_remote_surface_html() {
     let address = spawn_app().await;
@@ -124,8 +156,20 @@ async fn service_worker_route_serves_remote_cache_script() {
 #[tokio::test]
 async fn websocket_relays_messages_between_peers() {
     let address = spawn_app().await;
-    let relay_url = format!("ws://{address}/ws/room-a?peer_id=relay-1&role=relay");
-    let surface_url = format!("ws://{address}/ws/room-a?peer_id=phone-1&role=surface");
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let surface_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("phone-1"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-1", u64::MAX),
+    );
 
     let (mut relay, _) = connect_async(&relay_url)
         .await
@@ -186,8 +230,20 @@ async fn websocket_relays_messages_between_peers() {
 #[tokio::test]
 async fn surface_connections_can_use_broker_assigned_peer_ids() {
     let address = spawn_app().await;
-    let relay_url = format!("ws://{address}/ws/room-a?peer_id=relay-1&role=relay");
-    let surface_url = format!("ws://{address}/ws/room-a?role=surface");
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let surface_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-2", u64::MAX),
+    );
 
     let (mut relay, _) = connect_async(&relay_url)
         .await
@@ -221,7 +277,13 @@ async fn surface_connections_can_use_broker_assigned_peer_ids() {
 #[tokio::test]
 async fn duplicate_peers_get_error_frame() {
     let address = spawn_app().await;
-    let url = format!("ws://{address}/ws/room-a?peer_id=dup-1&role=surface");
+    let url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("dup-1"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-3", u64::MAX),
+    );
 
     let (_first, _) = connect_async(&url)
         .await
@@ -232,6 +294,91 @@ async fn duplicate_peers_get_error_frame() {
     match error {
         ServerMessage::Error { code, .. } => assert_eq!(code, "join_rejected"),
         other => panic!("unexpected error frame: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_join_ticket_gets_error_frame() {
+    let address = spawn_app().await;
+    let url = format!("ws://{address}/ws/room-a?role=surface");
+
+    let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
+    let error = next_server_message(&mut socket).await;
+    match error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "join_rejected");
+            assert!(message.contains("join_ticket"));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn expired_join_ticket_gets_error_frame() {
+    let address = spawn_app().await;
+    let url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-expired", 1),
+    );
+
+    let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
+    let error = next_server_message(&mut socket).await;
+    match error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "join_rejected");
+            assert!(message.contains("expired"));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn device_join_ticket_can_reconnect() {
+    let address = spawn_app().await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let surface_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::device_surface_join("room-a", "device-1"),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    let (mut first_surface, _) = connect_async(&surface_url)
+        .await
+        .expect("first surface should connect");
+    let _welcome = next_server_message(&mut first_surface).await;
+    first_surface
+        .close(None)
+        .await
+        .expect("surface should close");
+    let _left = next_server_message(&mut relay).await;
+
+    let (mut second_surface, _) = connect_async(&surface_url)
+        .await
+        .expect("second surface should connect");
+    let welcome = next_server_message(&mut second_surface).await;
+    match welcome {
+        ServerMessage::Welcome { peer_id, peers, .. } => {
+            assert!(peer_id.starts_with("surface-"));
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].peer_id, "relay-1");
+        }
+        other => panic!("unexpected welcome frame: {other:?}"),
     }
 }
 

@@ -37,6 +37,7 @@ export function connectionTarget() {
     return {
       brokerUrl: state.pairingTicket.broker_url,
       brokerChannelId: state.pairingTicket.broker_channel_id,
+      joinTicket: state.pairingTicket.pairing_join_ticket,
     };
   }
 
@@ -44,6 +45,7 @@ export function connectionTarget() {
     return {
       brokerUrl: state.remoteAuth.brokerUrl,
       brokerChannelId: state.remoteAuth.brokerChannelId,
+      joinTicket: state.remoteAuth.deviceJoinTicket,
     };
   }
 
@@ -144,8 +146,13 @@ function loadRemoteAuth() {
 
   try {
     const parsed = JSON.parse(raw);
+    if (!parsed?.deviceJoinTicket) {
+      window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
+      return null;
+    }
     return {
       ...parsed,
+      deviceJoinTicketExpiresAt: parsed.deviceJoinTicketExpiresAt || null,
       sessionClaim: parsed.sessionClaim || null,
       sessionClaimExpiresAt: parsed.sessionClaimExpiresAt || null,
     };

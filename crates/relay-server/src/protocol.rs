@@ -188,6 +188,7 @@ pub struct PairingTicketView {
     pub expires_at: u64,
     pub broker_url: String,
     pub broker_channel_id: String,
+    pub pairing_join_ticket: String,
     pub relay_peer_id: String,
     pub security_mode: SecurityMode,
     pub pairing_payload: String,

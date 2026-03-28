@@ -845,10 +845,13 @@ name = "relay-broker"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "futures-util",
+ "hmac",
  "rand",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
  "tower-http",

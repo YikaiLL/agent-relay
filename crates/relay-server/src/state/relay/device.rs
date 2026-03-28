@@ -6,6 +6,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::broker::BrokerConfig;
 use crate::protocol::{PairedDeviceView, PairingTicketView, PendingPairingRequestView};
 
 use super::RelayState;
@@ -98,11 +99,9 @@ pub(crate) struct PendingPairingResult {
 impl RelayState {
     pub fn issue_pairing_ticket(
         &mut self,
-        broker_url: &str,
-        broker_channel_id: &str,
-        relay_peer_id: &str,
+        broker: &BrokerConfig,
         requested_ttl_secs: Option<u64>,
-    ) -> PairingTicketView {
+    ) -> Result<PairingTicketView, String> {
         let now = super::super::unix_now();
         self.prune_expired_pairings(now);
 
@@ -123,31 +122,34 @@ impl RelayState {
                 expires_at,
             },
         );
+        let pairing_join_ticket = broker.pairing_join_ticket(&pairing_id, expires_at)?;
 
         let pairing_payload = pairing_payload(
             &pairing_id,
             &pairing_secret,
             expires_at,
-            broker_url,
-            broker_channel_id,
-            relay_peer_id,
+            broker.public_base_url(),
+            &broker.channel_id,
+            &pairing_join_ticket,
+            &broker.peer_id,
             self.security.mode(),
         );
-        let pairing_url = pairing_url(broker_url, &pairing_payload);
+        let pairing_url = pairing_url(broker.public_base_url(), &pairing_payload);
         let pairing_qr_svg = pairing_qr_svg(&pairing_url);
 
-        PairingTicketView {
+        Ok(PairingTicketView {
             pairing_id,
             pairing_secret,
             expires_at,
-            broker_url: broker_url.to_string(),
-            broker_channel_id: broker_channel_id.to_string(),
-            relay_peer_id: relay_peer_id.to_string(),
+            broker_url: broker.public_base_url().to_string(),
+            broker_channel_id: broker.channel_id.clone(),
+            pairing_join_ticket,
+            relay_peer_id: broker.peer_id.clone(),
             security_mode: self.security.mode(),
             pairing_payload,
             pairing_url,
             pairing_qr_svg,
-        }
+        })
     }
 
     pub fn consume_pairing_ticket(
@@ -500,6 +502,7 @@ fn pairing_payload(
     expires_at: u64,
     broker_url: &str,
     broker_channel_id: &str,
+    pairing_join_ticket: &str,
     relay_peer_id: &str,
     security_mode: crate::protocol::SecurityMode,
 ) -> String {
@@ -510,6 +513,7 @@ fn pairing_payload(
         "expires_at": expires_at,
         "broker_url": broker_url,
         "broker_channel_id": broker_channel_id,
+        "pairing_join_ticket": pairing_join_ticket,
         "relay_peer_id": relay_peer_id,
         "security_mode": security_mode,
     });
