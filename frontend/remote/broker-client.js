@@ -179,7 +179,7 @@ async function handleSocketMessage(rawData, connectReason) {
 }
 
 function scheduleSocketReconnect() {
-  if (!connectionTarget()) {
+  if (!connectionTarget() && !canRefreshDeviceJoinTicket()) {
     return;
   }
 

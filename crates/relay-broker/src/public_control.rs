@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -198,6 +199,12 @@ impl PublicControlPlane {
         }
 
         let state_path = trimmed(state_path).map(PathBuf::from);
+        if state_path.is_none() && public_mode_requires_persistent_state() {
+            return Err(format!(
+                "{PUBLIC_STATE_PATH_ENV} is required when {}=public and BIND_HOST is not loopback",
+                crate::auth::BROKER_AUTH_MODE_ENV
+            ));
+        }
         let device_grants = DeviceGrantStore::load(state_path.as_deref()).await?;
 
         Ok(Self {
@@ -222,6 +229,20 @@ impl PublicControlPlane {
 
     pub fn issuer_key(&self) -> &JoinTicketKey {
         &self.inner.issuer_key
+    }
+
+    pub fn has_persistent_state(&self) -> bool {
+        self.inner.state_path.is_some()
+    }
+
+    pub fn health_message(&self) -> Option<String> {
+        if self.has_persistent_state() {
+            return None;
+        }
+
+        Some(format!(
+            "public broker device grants are in-memory only; set {PUBLIC_STATE_PATH_ENV} before exposing this broker outside localhost"
+        ))
     }
 
     pub async fn issue_relay_ws_token(
@@ -589,4 +610,12 @@ fn trimmed(value: Option<String>) -> Option<String> {
             Some(trimmed)
         }
     })
+}
+
+fn public_mode_requires_persistent_state() -> bool {
+    std::env::var("BIND_HOST")
+        .ok()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .map(|addr| !addr.is_loopback())
+        .unwrap_or(false)
 }

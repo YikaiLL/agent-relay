@@ -8,7 +8,7 @@ use tokio::sync::watch;
 
 use crate::{
     codex::ThreadSyncData,
-    protocol::{LogEntryView, SessionSnapshot, ThreadSummaryView},
+    protocol::{ApprovalReceipt, LogEntryView, SessionSnapshot, ThreadSummaryView, ThreadsResponse},
 };
 
 use super::{
@@ -22,6 +22,40 @@ pub(crate) use self::device::{
     PendingPairingRequest, PendingPairingResult,
 };
 pub(crate) use self::transcript::TranscriptRecord;
+
+const REMOTE_ACTION_REPLAY_TTL_SECS: u64 = 600;
+const MAX_REMOTE_ACTION_REPLAY_ENTRIES: usize = 512;
+
+#[derive(Debug, Clone)]
+pub(crate) struct CachedRemoteActionResult {
+    pub(crate) action_kind: String,
+    pub(crate) ok: bool,
+    pub(crate) snapshot: SessionSnapshot,
+    pub(crate) receipt: Option<ApprovalReceipt>,
+    pub(crate) threads: Option<ThreadsResponse>,
+    pub(crate) session_claim: Option<String>,
+    pub(crate) session_claim_expires_at: Option<u64>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RemoteActionReplayDecision {
+    Execute,
+    Replay(CachedRemoteActionResult),
+    InFlight,
+}
+
+#[derive(Debug, Clone)]
+enum CachedRemoteActionState {
+    InFlight {
+        action_kind: String,
+        seen_at: u64,
+    },
+    Completed {
+        result: CachedRemoteActionResult,
+        seen_at: u64,
+    },
+}
 
 pub struct RelayState {
     change_tx: watch::Sender<u64>,
@@ -52,6 +86,7 @@ pub struct RelayState {
     pub pending_approvals: HashMap<String, PendingApproval>,
     pub(super) transcript: Vec<TranscriptRecord>,
     pub(super) logs: Vec<LogEntryView>,
+    recent_remote_actions: HashMap<String, CachedRemoteActionState>,
 }
 
 impl RelayState {
@@ -89,6 +124,7 @@ impl RelayState {
             pending_approvals: HashMap::new(),
             transcript: Vec::new(),
             logs: Vec::new(),
+            recent_remote_actions: HashMap::new(),
         };
         state.push_log("info", "Relay booted. Waiting for Codex app-server.");
         state
@@ -267,6 +303,7 @@ impl RelayState {
         self.completed_pairings.clear();
         self.pending_broker_messages.clear();
         self.pending_approvals.clear();
+        self.recent_remote_actions.clear();
         self.transcript = data
             .transcript
             .into_iter()
@@ -431,6 +468,7 @@ impl RelayState {
         self.completed_pairings.clear();
         self.pending_broker_messages.clear();
         self.pending_approvals.clear();
+        self.recent_remote_actions.clear();
         self.transcript = persisted.transcript.clone();
         self.logs = persisted.logs.clone();
     }
@@ -460,6 +498,105 @@ impl RelayState {
                 .or_insert_with(|| DeviceRecord::approved_from(device));
         }
     }
+
+    pub fn reserve_remote_action(
+        &mut self,
+        device_id: &str,
+        action_id: &str,
+        action_kind: &str,
+        now: u64,
+    ) -> Result<RemoteActionReplayDecision, String> {
+        self.prune_remote_action_replays(now);
+        let key = remote_action_cache_key(device_id, action_id);
+        let Some(entry) = self.recent_remote_actions.get(&key) else {
+            self.recent_remote_actions.insert(
+                key,
+                CachedRemoteActionState::InFlight {
+                    action_kind: action_kind.to_string(),
+                    seen_at: now,
+                },
+            );
+            return Ok(RemoteActionReplayDecision::Execute);
+        };
+
+        match entry {
+            CachedRemoteActionState::InFlight {
+                action_kind: existing_kind,
+                ..
+            } => {
+                if existing_kind != action_kind {
+                    return Err(
+                        "action_id is already in use for a different remote action".to_string()
+                    );
+                }
+                Ok(RemoteActionReplayDecision::InFlight)
+            }
+            CachedRemoteActionState::Completed { result, .. } => {
+                if result.action_kind != action_kind {
+                    return Err(
+                        "action_id has already been used for a different remote action"
+                            .to_string(),
+                    );
+                }
+                Ok(RemoteActionReplayDecision::Replay(result.clone()))
+            }
+        }
+    }
+
+    pub fn store_remote_action_result(
+        &mut self,
+        device_id: &str,
+        action_id: &str,
+        result: CachedRemoteActionResult,
+        now: u64,
+    ) {
+        self.prune_remote_action_replays(now);
+        self.recent_remote_actions.insert(
+            remote_action_cache_key(device_id, action_id),
+            CachedRemoteActionState::Completed {
+                result,
+                seen_at: now,
+            },
+        );
+        self.trim_remote_action_replays();
+    }
+
+    fn prune_remote_action_replays(&mut self, now: u64) {
+        self.recent_remote_actions.retain(|_, entry| match entry {
+            CachedRemoteActionState::InFlight { seen_at, .. }
+            | CachedRemoteActionState::Completed { seen_at, .. } => {
+                seen_at.saturating_add(REMOTE_ACTION_REPLAY_TTL_SECS) > now
+            }
+        });
+    }
+
+    fn trim_remote_action_replays(&mut self) {
+        if self.recent_remote_actions.len() <= MAX_REMOTE_ACTION_REPLAY_ENTRIES {
+            return;
+        }
+
+        let mut overflow = self.recent_remote_actions.len() - MAX_REMOTE_ACTION_REPLAY_ENTRIES;
+        let mut entries = self
+            .recent_remote_actions
+            .iter()
+            .map(|(key, entry)| {
+                let seen_at = match entry {
+                    CachedRemoteActionState::InFlight { seen_at, .. }
+                    | CachedRemoteActionState::Completed { seen_at, .. } => *seen_at,
+                };
+                (key.clone(), seen_at)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, seen_at)| *seen_at);
+        for (key, _) in entries {
+            if overflow == 0 {
+                break;
+            }
+            if self.recent_remote_actions.remove(&key).is_some() {
+                overflow -= 1;
+            }
+        }
+    }
 }
 
 fn device_state_sort_key(state: crate::protocol::DeviceLifecycleState) -> u8 {
@@ -469,4 +606,8 @@ fn device_state_sort_key(state: crate::protocol::DeviceLifecycleState) -> u8 {
         crate::protocol::DeviceLifecycleState::Rejected => 2,
         crate::protocol::DeviceLifecycleState::Revoked => 3,
     }
+}
+
+fn remote_action_cache_key(device_id: &str, action_id: &str) -> String {
+    format!("{device_id}:{action_id}")
 }

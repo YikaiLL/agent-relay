@@ -14,8 +14,8 @@ use std::{
 pub use self::app::{AppState, ApprovalError};
 use self::relay::TranscriptRecord;
 pub(crate) use self::relay::{
-    ApprovalKind, BrokerPendingMessage, DeviceRecord, PairedDevice, PendingApproval,
-    PendingPairingResult, RelayState,
+    ApprovalKind, BrokerPendingMessage, CachedRemoteActionResult, DeviceRecord, PairedDevice,
+    PendingApproval, PendingPairingResult, RelayState, RemoteActionReplayDecision,
 };
 pub(crate) use self::security::SecurityProfile;
 

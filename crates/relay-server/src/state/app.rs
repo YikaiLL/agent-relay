@@ -17,7 +17,8 @@ use crate::{
 use super::persistence::{spawn_persistence_task, PersistedRelayState, PersistenceStore};
 use super::{
     expire_controller_if_needed, filter_threads, non_empty, normalize_cwd, require_device_id,
-    short_device_id, unix_now, RelayState, SecurityProfile, THREAD_SCAN_LIMIT,
+    short_device_id, unix_now, CachedRemoteActionResult, RelayState, RemoteActionReplayDecision,
+    SecurityProfile, THREAD_SCAN_LIMIT,
 };
 
 #[derive(Clone)]
@@ -695,6 +696,27 @@ impl AppState {
             })
             .collect()
     }
+
+    pub(crate) async fn reserve_remote_action(
+        &self,
+        device_id: &str,
+        action_id: &str,
+        action_kind: &str,
+    ) -> Result<RemoteActionReplayDecision, String> {
+        let mut relay = self.relay.write().await;
+        relay.reserve_remote_action(device_id, action_id, action_kind, unix_now())
+    }
+
+    pub(crate) async fn store_remote_action_result(
+        &self,
+        device_id: &str,
+        action_id: &str,
+        result: CachedRemoteActionResult,
+    ) {
+        let mut relay = self.relay.write().await;
+        relay.store_remote_action_result(device_id, action_id, result, unix_now());
+    }
+
 }
 
 #[derive(Debug)]

@@ -8,7 +8,7 @@ use crate::{
         SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsQuery,
         ThreadsResponse,
     },
-    state::{AppState, ApprovalError},
+    state::{AppState, ApprovalError, CachedRemoteActionResult, RemoteActionReplayDecision},
 };
 
 use super::{
@@ -16,6 +16,9 @@ use super::{
     issue_session_claim, publish_payload, verify_session_claim, BrokerSocket,
     OutboundBrokerPayload,
 };
+
+const SESSION_CONTROL_REQUIRED_ERROR: &str =
+    "broker transport auth only grants room access; session claim is missing or expired";
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct RemoteDeviceAuth {
@@ -214,6 +217,57 @@ pub(super) async fn handle_remote_action(
             .await;
         }
     };
+    match state
+        .reserve_remote_action(&resolved_device_id, &action_id, action_kind.as_str())
+        .await
+    {
+        Ok(RemoteActionReplayDecision::Execute) => {}
+        Ok(RemoteActionReplayDecision::Replay(cached)) => {
+            return replay_plain_remote_action_result(
+                sender,
+                from_peer_id,
+                action_id,
+                action_kind,
+                cached,
+            )
+            .await;
+        }
+        Ok(RemoteActionReplayDecision::InFlight) => {
+            state
+                .push_runtime_log(
+                    "info",
+                    format!(
+                        "Ignored duplicate broker action `{}` from {} while the original request is still running.",
+                        action_kind.as_str(),
+                        from_peer_id
+                    ),
+                )
+                .await;
+            return Ok(());
+        }
+        Err(error) => {
+            let snapshot = state.snapshot().await;
+            let cached = cached_remote_action_result(
+                action_kind,
+                snapshot,
+                RemoteActionOutcome::default(),
+                Some(error),
+                false,
+            );
+            state
+                .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
+                .await;
+            return replay_plain_remote_action_result(
+                sender,
+                from_peer_id,
+                action_id,
+                action_kind,
+                cached,
+            )
+            .await;
+        }
+    }
+
     let result = if matches!(request, RemoteActionRequest::ClaimDevice) {
         issue_claim_outcome(state, &resolved_device_id, &from_peer_id).await
     } else {
@@ -237,18 +291,11 @@ pub(super) async fn handle_remote_action(
             (false, RemoteActionOutcome::default(), Some(error))
         }
     };
-    publish_plain_remote_action_result(
-        sender,
-        from_peer_id,
-        action_id,
-        action_kind,
-        snapshot,
-        outcome,
-        error,
-        ok,
-        resolved_device_id,
-    )
-    .await
+    let cached = cached_remote_action_result(action_kind, snapshot, outcome, error, ok);
+    state
+        .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
+        .await;
+    replay_plain_remote_action_result(sender, from_peer_id, action_id, action_kind, cached).await
 }
 
 pub(super) async fn handle_encrypted_remote_action(
@@ -332,6 +379,61 @@ pub(super) async fn handle_encrypted_remote_action(
         )
         .await;
 
+    match state
+        .reserve_remote_action(&device_id, &action_id, action_kind.as_str())
+        .await
+    {
+        Ok(RemoteActionReplayDecision::Execute) => {}
+        Ok(RemoteActionReplayDecision::Replay(cached)) => {
+            return replay_encrypted_remote_action_result(
+                state,
+                sender,
+                from_peer_id,
+                device_id,
+                action_id,
+                action_kind,
+                cached,
+            )
+            .await;
+        }
+        Ok(RemoteActionReplayDecision::InFlight) => {
+            state
+                .push_runtime_log(
+                    "info",
+                    format!(
+                        "Ignored duplicate encrypted broker action `{}` from {} while the original request is still running.",
+                        action_kind.as_str(),
+                        from_peer_id
+                    ),
+                )
+                .await;
+            return Ok(());
+        }
+        Err(error) => {
+            let snapshot = state.snapshot().await;
+            let cached = cached_remote_action_result(
+                action_kind,
+                snapshot,
+                RemoteActionOutcome::default(),
+                Some(error),
+                false,
+            );
+            state
+                .store_remote_action_result(&device_id, &action_id, cached.clone())
+                .await;
+            return replay_encrypted_remote_action_result(
+                state,
+                sender,
+                from_peer_id,
+                device_id,
+                action_id,
+                action_kind,
+                cached,
+            )
+            .await;
+        }
+    }
+
     let result = match decrypt_remote_action(state, &device_id, &envelope).await {
         Ok(request) => {
             state
@@ -369,24 +471,30 @@ pub(super) async fn handle_encrypted_remote_action(
             (false, None, None, None, None, Some(error))
         }
     };
+    let cached = CachedRemoteActionResult {
+        action_kind: action_kind.as_str().to_string(),
+        ok,
+        snapshot,
+        receipt,
+        threads,
+        session_claim: issued_claim,
+        session_claim_expires_at: issued_claim_expires_at,
+        error,
+    };
+    state
+        .store_remote_action_result(&device_id, &action_id, cached.clone())
+        .await;
 
-    match publish_remote_action_result_private(
+    match replay_encrypted_remote_action_result(
         state,
         sender,
         from_peer_id,
         device_id,
         action_id,
         action_kind,
-        snapshot,
-        receipt,
-        threads,
-        issued_claim,
-        issued_claim_expires_at,
-        error,
-        ok,
+        cached,
     )
-    .await
-    {
+    .await {
         Ok(()) => Ok(()),
         Err(publish_error) if publish_error.contains("device is not paired") => {
             state
@@ -483,7 +591,7 @@ async fn resolve_plain_remote_device(
 
     let auth = auth.ok_or_else(|| match request {
         RemoteActionRequest::ClaimDevice => "claim_device requires device auth".to_string(),
-        _ => "session claim is missing or expired".to_string(),
+        _ => SESSION_CONTROL_REQUIRED_ERROR.to_string(),
     })?;
 
     state
@@ -509,7 +617,7 @@ async fn resolve_encrypted_action_context(
         .ok_or_else(|| "encrypted remote action is missing device_id".to_string())?;
     let action_kind = decrypt_remote_action_kind(state, &device_id, envelope).await?;
     if !matches!(action_kind, RemoteActionKind::ClaimDevice) {
-        return Err("session claim is missing or expired".to_string());
+        return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
     }
     Ok((device_id, action_kind))
 }
@@ -568,6 +676,32 @@ async fn publish_plain_remote_action_result(
     .map_err(|error| format!("broker action result publish failed: {error}"))
 }
 
+async fn replay_plain_remote_action_result(
+    sender: &mut SplitSink<BrokerSocket, Message>,
+    target_peer_id: String,
+    action_id: String,
+    action: RemoteActionKind,
+    cached: CachedRemoteActionResult,
+) -> Result<(), String> {
+    publish_plain_remote_action_result(
+        sender,
+        target_peer_id,
+        action_id,
+        action,
+        cached.snapshot,
+        RemoteActionOutcome {
+            receipt: cached.receipt,
+            threads: cached.threads,
+            session_claim: cached.session_claim,
+            session_claim_expires_at: cached.session_claim_expires_at,
+        },
+        cached.error,
+        cached.ok,
+        "cached-device".to_string(),
+    )
+    .await
+}
+
 async fn publish_remote_action_result_private(
     state: &AppState,
     sender: &mut SplitSink<BrokerSocket, Message>,
@@ -609,4 +743,50 @@ async fn publish_remote_action_result_private(
     )
     .await
     .map_err(|error| format!("encrypted broker action result publish failed: {error}"))
+}
+
+async fn replay_encrypted_remote_action_result(
+    state: &AppState,
+    sender: &mut SplitSink<BrokerSocket, Message>,
+    target_peer_id: String,
+    device_id: String,
+    action_id: String,
+    action: RemoteActionKind,
+    cached: CachedRemoteActionResult,
+) -> Result<(), String> {
+    publish_remote_action_result_private(
+        state,
+        sender,
+        target_peer_id,
+        device_id,
+        action_id,
+        action,
+        cached.snapshot,
+        cached.receipt,
+        cached.threads,
+        cached.session_claim,
+        cached.session_claim_expires_at,
+        cached.error,
+        cached.ok,
+    )
+    .await
+}
+
+fn cached_remote_action_result(
+    action: RemoteActionKind,
+    snapshot: SessionSnapshot,
+    outcome: RemoteActionOutcome,
+    error: Option<String>,
+    ok: bool,
+) -> CachedRemoteActionResult {
+    CachedRemoteActionResult {
+        action_kind: action.as_str().to_string(),
+        ok,
+        snapshot,
+        receipt: outcome.receipt,
+        threads: outcome.threads,
+        session_claim: outcome.session_claim,
+        session_claim_expires_at: outcome.session_claim_expires_at,
+        error,
+    }
 }

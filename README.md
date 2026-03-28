@@ -190,9 +190,16 @@ Notes:
     - `RELAY_BROKER_AUTH_MODE=public`
     - `RELAY_BROKER_PUBLIC_ISSUER_SECRET`
     - `RELAY_BROKER_PUBLIC_RELAYS_JSON`
-    - optional `RELAY_BROKER_PUBLIC_STATE_PATH`
+    - `RELAY_BROKER_PUBLIC_STATE_PATH` in production or any non-loopback bind
+    - optional `RELAY_BROKER_PUBLIC_STATE_PATH` for localhost-only development
     - optional `RELAY_BROKER_PUBLIC_RELAY_WS_TTL_SECS`
     - optional `RELAY_BROKER_PUBLIC_DEVICE_WS_TTL_SECS`
+    - optional hardening env:
+      - `RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE`
+      - `RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE`
+      - `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE`
+      - `RELAY_BROKER_MAX_TEXT_FRAME_BYTES`
+      - `RELAY_BROKER_IDLE_TIMEOUT_SECS`
   - relay-server env:
     - `RELAY_BROKER_AUTH_MODE=public`
     - `RELAY_BROKER_RELAY_ID`
@@ -213,6 +220,10 @@ Notes:
   - a long-lived `device_refresh_token`
   - the remote web surface uses that refresh token to rotate broker access
     instead of forcing re-pairing on every ws token expiry
+- public-mode device refresh grants are persisted via
+  `RELAY_BROKER_PUBLIC_STATE_PATH`; when the broker binds to a non-loopback
+  host, startup now requires that path so refresh survives restart and revoke
+  remains effective
 - The broker remote surface is now installable as a PWA. Open the broker root,
   then use your browser's install action to pin it on a phone or desktop.
 - pairing and encrypted broker traffic now work on plain LAN `http://` pages, but

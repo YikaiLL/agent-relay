@@ -30,7 +30,7 @@ async fn main() {
         host, port, host, port
     );
     let app = relay_broker::app(relay_broker::BrokerState::default()).await;
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .expect("relay-broker exited unexpectedly");
 }

@@ -5,7 +5,10 @@ use tokio::sync::watch;
 
 use crate::{
     codex::ThreadSyncData,
-    protocol::{DeviceLifecycleState, LogEntryView, ThreadSummaryView, TranscriptEntryView},
+    protocol::{
+        ApprovalReceipt, DeviceLifecycleState, LogEntryView, SessionSnapshot, ThreadSummaryView,
+        ThreadsResponse, TranscriptEntryView,
+    },
 };
 
 use super::{
@@ -149,6 +152,60 @@ fn test_pending_approval(thread_id: &str) -> PendingApproval {
         requested_permissions: None,
         available_decisions: vec!["approve".to_string(), "deny".to_string()],
         supports_session_scope: true,
+    }
+}
+
+fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemoteActionResult {
+    CachedRemoteActionResult {
+        action_kind: action_kind.to_string(),
+        ok,
+        snapshot: SessionSnapshot {
+            provider: "codex",
+            service_ready: true,
+            codex_connected: true,
+            broker_connected: true,
+            broker_channel_id: Some("room-a".to_string()),
+            broker_peer_id: Some("relay-a".to_string()),
+            security_mode: crate::protocol::SecurityMode::Private,
+            e2ee_enabled: true,
+            broker_can_read_content: false,
+            audit_enabled: false,
+            active_thread_id: Some("thread-1".to_string()),
+            active_controller_device_id: Some("device-a".to_string()),
+            active_controller_last_seen_at: Some(100),
+            controller_lease_expires_at: Some(115),
+            controller_lease_seconds: CONTROLLER_LEASE_SECS,
+            active_turn_id: None,
+            current_status: "idle".to_string(),
+            active_flags: Vec::new(),
+            current_cwd: "/tmp/project".to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
+            sandbox: DEFAULT_SANDBOX.to_string(),
+            reasoning_effort: DEFAULT_EFFORT.to_string(),
+            device_records: Vec::new(),
+            paired_devices: Vec::new(),
+            pending_pairing_requests: Vec::new(),
+            pending_approvals: Vec::new(),
+            transcript: Vec::new(),
+            logs: Vec::new(),
+        },
+        receipt: Some(ApprovalReceipt {
+            request_id: "req-1".to_string(),
+            decision: crate::protocol::ApprovalDecision::Approve,
+            resulting_state: "approval_response_sent".to_string(),
+            message: "approved".to_string(),
+        }),
+        threads: Some(ThreadsResponse {
+            threads: vec![test_thread("thread-1", "/tmp/project")],
+        }),
+        session_claim: Some("claim-1".to_string()),
+        session_claim_expires_at: Some(120),
+        error: if ok {
+            None
+        } else {
+            Some("replayed failure".to_string())
+        },
     }
 }
 
@@ -1018,4 +1075,60 @@ fn completed_pairing_can_replay_result_to_reconnected_peer() {
         Some("phone-replay")
     );
     assert!(replay.device_token.is_some());
+}
+
+#[test]
+fn remote_action_replay_cache_replays_completed_results() {
+    let mut relay = test_state();
+    let cached = test_cached_remote_action_result("send_message", true);
+
+    let first = relay
+        .reserve_remote_action("device-a", "act-1", "send_message", 100)
+        .expect("first remote action should reserve");
+    assert!(matches!(first, RemoteActionReplayDecision::Execute));
+
+    relay.store_remote_action_result("device-a", "act-1", cached.clone(), 101);
+
+    let second = relay
+        .reserve_remote_action("device-a", "act-1", "send_message", 102)
+        .expect("completed action should replay");
+    match second {
+        RemoteActionReplayDecision::Replay(result) => {
+            assert!(result.ok);
+            assert_eq!(result.action_kind, "send_message");
+            assert_eq!(result.session_claim.as_deref(), Some("claim-1"));
+        }
+        other => panic!("unexpected replay decision: {other:?}"),
+    }
+}
+
+#[test]
+fn remote_action_replay_cache_blocks_inflight_duplicates() {
+    let mut relay = test_state();
+
+    let first = relay
+        .reserve_remote_action("device-a", "act-2", "send_message", 100)
+        .expect("first remote action should reserve");
+    assert!(matches!(first, RemoteActionReplayDecision::Execute));
+
+    let second = relay
+        .reserve_remote_action("device-a", "act-2", "send_message", 101)
+        .expect("duplicate inflight action should not re-execute");
+    assert!(matches!(second, RemoteActionReplayDecision::InFlight));
+}
+
+#[test]
+fn remote_action_replay_cache_expires_old_entries() {
+    let mut relay = test_state();
+    relay.store_remote_action_result(
+        "device-a",
+        "act-3",
+        test_cached_remote_action_result("send_message", false),
+        100,
+    );
+
+    let decision = relay
+        .reserve_remote_action("device-a", "act-3", "send_message", 100 + 601)
+        .expect("expired replay entry should allow a new execution");
+    assert!(matches!(decision, RemoteActionReplayDecision::Execute));
 }

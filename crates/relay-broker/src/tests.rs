@@ -22,17 +22,25 @@ use crate::public_control::{
 };
 
 async fn spawn_app() -> SocketAddr {
+    spawn_app_with(BrokerJoinVerifier::SelfHosted(test_join_ticket_key()), BrokerHardeningConfig::default()).await
+}
+
+async fn spawn_app_with(
+    join_verifier: BrokerJoinVerifier,
+    hardening: BrokerHardeningConfig,
+) -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("listener should bind");
     let address = listener.local_addr().expect("listener should have address");
-    let app = app_with_web_root_and_verifier(
+    let app = app_with_web_root_and_verifier_and_hardening(
         BrokerState::default(),
         test_web_root(),
-        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        join_verifier,
+        hardening,
     );
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .expect("broker should serve");
     });
@@ -40,18 +48,26 @@ async fn spawn_app() -> SocketAddr {
 }
 
 async fn spawn_public_mode_app() -> SocketAddr {
+    spawn_public_mode_app_with(test_public_control_plane().await, BrokerHardeningConfig::default())
+        .await
+}
+
+async fn spawn_public_mode_app_with(
+    public_control: PublicControlPlane,
+    hardening: BrokerHardeningConfig,
+) -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("listener should bind");
     let address = listener.local_addr().expect("listener should have address");
-    let public_control = test_public_control_plane().await;
-    let app = app_with_web_root_and_verifier(
+    let app = app_with_web_root_and_verifier_and_hardening(
         BrokerState::default(),
         test_web_root(),
         BrokerJoinVerifier::PublicControlPlane(public_control),
+        hardening,
     );
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .expect("broker should serve");
     });
@@ -173,6 +189,14 @@ fn test_join_ticket_key() -> JoinTicketKey {
 }
 
 async fn test_public_control_plane() -> PublicControlPlane {
+    test_public_control_plane_with_parts(None, Some("300"), Some("300")).await
+}
+
+async fn test_public_control_plane_with_parts(
+    state_path: Option<String>,
+    relay_ws_ttl_secs: Option<&str>,
+    device_ws_ttl_secs: Option<&str>,
+) -> PublicControlPlane {
     PublicControlPlane::from_parts(
         Some("public-broker-issuer-secret".to_string()),
         Some(
@@ -183,12 +207,23 @@ async fn test_public_control_plane() -> PublicControlPlane {
             })])
             .expect("relay registrations should encode"),
         ),
-        None,
-        Some("300".to_string()),
-        Some("300".to_string()),
+        state_path,
+        relay_ws_ttl_secs.map(str::to_string),
+        device_ws_ttl_secs.map(str::to_string),
     )
     .await
     .expect("public control plane should configure")
+}
+
+fn temp_state_path(prefix: &str) -> String {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic enough for tests")
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("{prefix}-{unique}.json"))
+        .display()
+        .to_string()
 }
 
 fn websocket_url(
@@ -518,7 +553,10 @@ async fn public_auth_plane_health_reports_ready() {
     assert_eq!(parsed.status, "ok");
     assert_eq!(parsed.broker_auth_mode, "public");
     assert!(parsed.join_auth_ready);
-    assert!(parsed.message.is_none());
+    assert!(parsed
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("RELAY_BROKER_PUBLIC_STATE_PATH")));
 }
 
 #[tokio::test]
@@ -728,4 +766,298 @@ async fn public_bulk_revoke_keeps_selected_device() {
     )
     .await;
     assert!(error_body.contains("invalid"));
+}
+
+#[tokio::test]
+async fn public_device_ws_tokens_can_refresh_after_expiry() {
+    let address = spawn_public_mode_app_with(
+        test_public_control_plane_with_parts(None, Some("300"), Some("1")).await,
+        BrokerHardeningConfig::default(),
+    )
+    .await;
+
+    let device_grant: DeviceGrantResponse = public_post(
+        address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-expiring".to_string(),
+        },
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let expired_url = format!(
+        "ws://{address}/ws/room-a?role=surface&join_ticket={}",
+        device_grant.device_ws_token
+    );
+    let (mut expired_socket, _) = connect_async(&expired_url)
+        .await
+        .expect("expired device surface should connect");
+    let expired_error = next_server_message(&mut expired_socket).await;
+    match expired_error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "join_rejected");
+            assert!(message.contains("expired"));
+        }
+        other => panic!("unexpected expired token response: {other:?}"),
+    }
+
+    let refreshed: DeviceWsTokenResponse = public_post(
+        address,
+        "/api/public/device/ws-token",
+        &device_grant.device_refresh_token,
+        &serde_json::json!({}),
+    )
+    .await;
+    let refreshed_url = format!(
+        "ws://{address}/ws/room-a?role=surface&join_ticket={}",
+        refreshed.device_ws_token
+    );
+    let (mut refreshed_socket, _) = connect_async(&refreshed_url)
+        .await
+        .expect("refreshed device surface should connect");
+    let welcome = next_server_message(&mut refreshed_socket).await;
+    match welcome {
+        ServerMessage::Welcome { peer_id, .. } => assert!(peer_id.starts_with("surface-")),
+        other => panic!("unexpected refreshed token response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn public_device_refresh_tokens_survive_control_plane_restart() {
+    let state_path = temp_state_path("agent-relay-public-control");
+    let first_address = spawn_public_mode_app_with(
+        test_public_control_plane_with_parts(Some(state_path.clone()), Some("300"), Some("300"))
+            .await,
+        BrokerHardeningConfig::default(),
+    )
+    .await;
+
+    let device_grant: DeviceGrantResponse = public_post(
+        first_address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-persisted".to_string(),
+        },
+    )
+    .await;
+
+    let restarted_address = spawn_public_mode_app_with(
+        test_public_control_plane_with_parts(Some(state_path), Some("300"), Some("300")).await,
+        BrokerHardeningConfig::default(),
+    )
+    .await;
+    let refreshed: DeviceWsTokenResponse = public_post(
+        restarted_address,
+        "/api/public/device/ws-token",
+        &device_grant.device_refresh_token,
+        &serde_json::json!({}),
+    )
+    .await;
+
+    assert_eq!(refreshed.device_id, "device-persisted");
+    let url = format!(
+        "ws://{restarted_address}/ws/room-a?role=surface&join_ticket={}",
+        refreshed.device_ws_token
+    );
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("refreshed device surface should connect after restart");
+    let welcome = next_server_message(&mut socket).await;
+    match welcome {
+        ServerMessage::Welcome { peer_id, .. } => assert!(peer_id.starts_with("surface-")),
+        other => panic!("unexpected restart refresh response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn public_device_refresh_tokens_fail_after_revoke() {
+    let address = spawn_public_mode_app().await;
+    let device_grant: DeviceGrantResponse = public_post(
+        address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-revoked".to_string(),
+        },
+    )
+    .await;
+
+    let _: DeviceGrantRevokeResponse = public_post(
+        address,
+        "/api/public/devices/device-revoked/revoke",
+        "relay-refresh-1",
+        &DeviceGrantRevokeRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+        },
+    )
+    .await;
+
+    let error_body = public_post_expect_status(
+        address,
+        "/api/public/device/ws-token",
+        &device_grant.device_refresh_token,
+        &serde_json::json!({}),
+        reqwest::StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    assert!(error_body.contains("invalid"));
+}
+
+#[tokio::test]
+async fn public_api_rate_limit_is_enforced() {
+    let address = spawn_public_mode_app_with(
+        test_public_control_plane().await,
+        BrokerHardeningConfig {
+            public_api_rate_limit_per_minute: 1,
+            ..BrokerHardeningConfig::default()
+        },
+    )
+    .await;
+
+    let _: RelayWsTokenResponse = public_post(
+        address,
+        "/api/public/relay/ws-token",
+        "relay-refresh-1",
+        &RelayWsTokenRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            relay_peer_id: "relay-1".to_string(),
+        },
+    )
+    .await;
+
+    let error_body = public_post_expect_status(
+        address,
+        "/api/public/relay/ws-token",
+        "relay-refresh-1",
+        &RelayWsTokenRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            relay_peer_id: "relay-2".to_string(),
+        },
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+    )
+    .await;
+    assert!(error_body.contains("rate limit"));
+}
+
+#[tokio::test]
+async fn websocket_join_rate_limit_is_enforced() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            join_rate_limit_per_minute: 1,
+            ..BrokerHardeningConfig::default()
+        },
+    )
+    .await;
+    let first_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-join-rate-1", u64::MAX),
+    );
+    let second_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-join-rate-2", u64::MAX),
+    );
+
+    let (mut first_socket, _) = connect_async(&first_url)
+        .await
+        .expect("first socket should connect");
+    let _welcome = next_server_message(&mut first_socket).await;
+
+    let (mut second_socket, _) = connect_async(&second_url)
+        .await
+        .expect("second socket should connect");
+    let error = next_server_message(&mut second_socket).await;
+    match error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "rate_limited");
+            assert!(message.contains("rate limit"));
+        }
+        other => panic!("unexpected join rate limit response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn oversized_client_frames_are_rejected() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            max_text_frame_bytes: 64,
+            ..BrokerHardeningConfig::default()
+        },
+    )
+    .await;
+    let url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-frame-limit", u64::MAX),
+    );
+
+    let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
+    let _welcome = next_server_message(&mut socket).await;
+    socket
+        .send(Message::Text("x".repeat(65)))
+        .await
+        .expect("oversized frame should send");
+
+    let error = next_server_message(&mut socket).await;
+    match error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "frame_too_large");
+            assert!(message.contains("64"));
+        }
+        other => panic!("unexpected oversized frame response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn idle_connections_are_closed() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            idle_timeout: std::time::Duration::from_millis(100),
+            ..BrokerHardeningConfig::default()
+        },
+    )
+    .await;
+    let url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-idle-timeout", u64::MAX),
+    );
+
+    let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
+    let _welcome = next_server_message(&mut socket).await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), next_server_message(&mut socket))
+        .await
+        .expect("socket should receive an idle-timeout frame");
+    match error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "idle_timeout");
+            assert!(message.contains("idle"));
+        }
+        other => panic!("unexpected idle-timeout response: {other:?}"),
+    }
 }

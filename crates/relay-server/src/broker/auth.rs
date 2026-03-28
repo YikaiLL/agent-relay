@@ -371,12 +371,10 @@ where
         let body = response.text().await.unwrap_or_default();
         if let Ok(parsed) = serde_json::from_str::<ControlPlaneErrorResponse>(&body) {
             if let Some(message) = parsed.message.or(parsed.error) {
-                return Err(message);
+                return Err(scrub_sensitive_control_plane_message(&message));
             }
         }
-        return Err(format!(
-            "broker control-plane {url} returned {status}: {body}"
-        ));
+        return Err(format!("broker control-plane {url} returned {status}"));
     }
 
     response.json::<TResp>().await.map_err(|error| {
@@ -430,4 +428,22 @@ fn parse_optional_u64_env(name: &str, value: Option<String>) -> Result<Option<u6
         .parse::<u64>()
         .map(Some)
         .map_err(|error| format!("{name} must be a positive integer: {error}"))
+}
+
+fn scrub_sensitive_control_plane_message(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "pairing_secret",
+        "refresh_token",
+        "join_ticket",
+        "ws_token",
+        "authorization",
+        "bearer ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return "broker control-plane request failed".to_string();
+    }
+    message.to_string()
 }
