@@ -1,9 +1,12 @@
 import { renderLog, updateStatusBadge } from "./render.js";
 import {
+  brokerControlUrl,
+  canRefreshDeviceJoinTicket,
   clearSocketPeerId,
   connectionTarget,
   hasExpiredDeviceJoinTicket,
   setSocketPeerId,
+  saveRemoteAuth,
   state,
 } from "./state.js";
 
@@ -19,11 +22,24 @@ export function configureBrokerClient(handlers) {
   onRelayPresence = handlers.onRelayPresence || onRelayPresence;
 }
 
-export function connectBroker(reason) {
+export async function connectBroker(reason) {
+  if (!state.pairingTicket && state.remoteAuth && !connectionTarget() && canRefreshDeviceJoinTicket()) {
+    try {
+      await refreshDeviceJoinTicket(reason);
+    } catch (error) {
+      renderLog(`Device broker token refresh failed: ${error.message}`);
+      return;
+    }
+  }
+
   const target = connectionTarget();
   if (!target) {
     if (hasExpiredDeviceJoinTicket()) {
-      renderLog("Saved device broker access has expired. Re-pair this device to reconnect.");
+      renderLog(
+        canRefreshDeviceJoinTicket()
+          ? "Saved device broker access could not be refreshed."
+          : "Saved device broker access has expired. Re-pair this device to reconnect."
+      );
       return;
     }
     renderLog("Broker connect skipped because no pairing or saved device is present.");
@@ -169,7 +185,7 @@ function scheduleSocketReconnect() {
 
   cancelSocketReconnect();
   state.socketReconnectTimer = window.setTimeout(() => {
-    connectBroker("reconnect");
+    void connectBroker("reconnect");
   }, 1500);
 }
 
@@ -180,4 +196,33 @@ function cancelSocketReconnect() {
 
   window.clearTimeout(state.socketReconnectTimer);
   state.socketReconnectTimer = null;
+}
+
+async function refreshDeviceJoinTicket(reason) {
+  if (!state.remoteAuth?.deviceRefreshToken) {
+    throw new Error("no device refresh token is stored");
+  }
+
+  const url = new URL("/api/public/device/ws-token", brokerControlUrl(state.remoteAuth.brokerUrl));
+  renderLog(`Refreshing broker access token (${reason}).`);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${state.remoteAuth.deviceRefreshToken}`,
+    },
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.message || payload?.error || "broker token refresh failed");
+  }
+
+  state.remoteAuth.deviceJoinTicket = payload.device_ws_token;
+  state.remoteAuth.deviceJoinTicketExpiresAt = payload.device_ws_token_expires_at || null;
+  saveRemoteAuth(state.remoteAuth);
+  renderLog("Refreshed broker access token for this device.");
 }

@@ -9,7 +9,6 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::broker::BrokerConfig;
 use crate::protocol::{
     DeviceLifecycleState, DeviceRecordView, PairedDeviceView, PairingTicketView,
     PendingPairingRequestView,
@@ -136,6 +135,8 @@ pub(crate) struct CompletedPairing {
     pub(crate) device_verify_key: String,
     pub(crate) device: Option<PairedDeviceView>,
     pub(crate) device_token: Option<String>,
+    pub(crate) device_refresh_token: Option<String>,
+    pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
     pub(crate) error: Option<String>,
 }
@@ -152,16 +153,24 @@ pub(crate) struct PendingPairingResult {
     pub(crate) pairing_secret: String,
     pub(crate) device: Option<PairedDeviceView>,
     pub(crate) device_token: Option<String>,
+    pub(crate) device_refresh_token: Option<String>,
+    pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
     pub(crate) error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedPairingTicket {
+    pub(crate) pairing_id: String,
+    pub(crate) pairing_secret: String,
+    pub(crate) expires_at: u64,
+}
+
 impl RelayState {
-    pub fn issue_pairing_ticket(
+    pub fn prepare_pairing_ticket(
         &mut self,
-        broker: &BrokerConfig,
         requested_ttl_secs: Option<u64>,
-    ) -> Result<PairingTicketView, String> {
+    ) -> Result<PreparedPairingTicket, String> {
         let now = super::super::unix_now();
         self.prune_expired_pairings(now);
 
@@ -182,36 +191,47 @@ impl RelayState {
                 expires_at,
             },
         );
-        let pairing_join_ticket = broker
-            .pairing_join_credential(&pairing_id, expires_at)?
-            .token;
-
-        let pairing_payload = pairing_payload(
-            &pairing_id,
-            &pairing_secret,
-            expires_at,
-            broker.public_base_url(),
-            broker.broker_room_id(),
-            &pairing_join_ticket,
-            broker.relay_peer_id(),
-            self.security.mode(),
-        );
-        let pairing_url = pairing_url(broker.public_base_url(), &pairing_payload);
-        let pairing_qr_svg = pairing_qr_svg(&pairing_url);
-
-        Ok(PairingTicketView {
+        Ok(PreparedPairingTicket {
             pairing_id,
             pairing_secret,
             expires_at,
-            broker_url: broker.public_base_url().to_string(),
-            broker_channel_id: broker.broker_room_id().to_string(),
+        })
+    }
+
+    pub fn render_pairing_ticket_view(
+        &self,
+        prepared: &PreparedPairingTicket,
+        broker_url: &str,
+        broker_room_id: &str,
+        pairing_join_ticket: &str,
+        relay_peer_id: &str,
+    ) -> PairingTicketView {
+        let pairing_payload = pairing_payload(
+            &prepared.pairing_id,
+            &prepared.pairing_secret,
+            prepared.expires_at,
+            broker_url,
+            broker_room_id,
             pairing_join_ticket,
-            relay_peer_id: broker.relay_peer_id().to_string(),
+            relay_peer_id,
+            self.security.mode(),
+        );
+        let pairing_url = pairing_url(broker_url, &pairing_payload);
+        let pairing_qr_svg = pairing_qr_svg(&pairing_url);
+
+        PairingTicketView {
+            pairing_id: prepared.pairing_id.clone(),
+            pairing_secret: prepared.pairing_secret.clone(),
+            expires_at: prepared.expires_at,
+            broker_url: broker_url.to_string(),
+            broker_channel_id: broker_room_id.to_string(),
+            pairing_join_ticket: pairing_join_ticket.to_string(),
+            relay_peer_id: relay_peer_id.to_string(),
             security_mode: self.security.mode(),
             pairing_payload,
             pairing_url,
             pairing_qr_svg,
-        })
+        }
     }
 
     pub fn consume_pairing_ticket(
@@ -369,6 +389,8 @@ impl RelayState {
                     device_verify_key,
                     device: Some(device.clone()),
                     device_token: Some(token.clone()),
+                    device_refresh_token: None,
+                    device_join_ticket: None,
                     device_join_ticket_expires_at,
                     error: None,
                 },
@@ -379,6 +401,8 @@ impl RelayState {
                 pairing_secret: pending.pairing_secret,
                 device: Some(device),
                 device_token: Some(token),
+                device_refresh_token: None,
+                device_join_ticket: None,
                 device_join_ticket_expires_at,
                 error: None,
             });
@@ -402,6 +426,8 @@ impl RelayState {
                 device_verify_key: request.device_verify_key,
                 device: None,
                 device_token: None,
+                device_refresh_token: None,
+                device_join_ticket: None,
                 device_join_ticket_expires_at: None,
                 error: Some("pairing request was rejected on the local relay".to_string()),
             },
@@ -412,6 +438,8 @@ impl RelayState {
             pairing_secret: pending.pairing_secret,
             device: None,
             device_token: None,
+            device_refresh_token: None,
+            device_join_ticket: None,
             device_join_ticket_expires_at: None,
             error: Some("pairing request was rejected on the local relay".to_string()),
         })
@@ -439,6 +467,8 @@ impl RelayState {
             pairing_secret: completed.pairing_secret,
             device: completed.device,
             device_token: completed.device_token,
+            device_refresh_token: completed.device_refresh_token,
+            device_join_ticket: completed.device_join_ticket,
             device_join_ticket_expires_at: completed.device_join_ticket_expires_at,
             error: completed.error,
         }))
@@ -535,6 +565,41 @@ impl RelayState {
         device.last_peer_id = Some(peer_id.to_string());
         let approved_device = device.clone();
         self.sync_device_record_from_approved_device(&approved_device, now);
+        Ok(())
+    }
+
+    pub fn attach_pairing_broker_credential(
+        &mut self,
+        pairing_id: &str,
+        device_refresh_token: Option<String>,
+        device_join_ticket: String,
+        device_join_ticket_expires_at: Option<u64>,
+        now: u64,
+    ) -> Result<(), String> {
+        let completed = self
+            .completed_pairings
+            .get_mut(pairing_id)
+            .ok_or_else(|| "completed pairing result is missing".to_string())?;
+        completed.device_refresh_token = device_refresh_token;
+        completed.device_join_ticket = Some(device_join_ticket);
+        completed.device_join_ticket_expires_at = device_join_ticket_expires_at;
+
+        if let Some(device_id) = completed
+            .device
+            .as_ref()
+            .map(|device| device.device_id.clone())
+        {
+            let approved_device = {
+                let device = self
+                    .paired_devices
+                    .get_mut(&device_id)
+                    .ok_or_else(|| "device is not paired".to_string())?;
+                device.broker_join_ticket_expires_at = device_join_ticket_expires_at;
+                device.clone()
+            };
+            self.sync_device_record_from_approved_device(&approved_device, now);
+        }
+
         Ok(())
     }
 

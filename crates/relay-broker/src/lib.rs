@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod join_ticket;
 pub mod protocol;
+pub mod public_control;
 mod state;
 
 pub use state::BrokerState;
@@ -13,14 +14,20 @@ use axum::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::{sink::SinkExt, StreamExt};
 use join_ticket::{JoinTicketClaims, JoinTicketKey, JoinTicketKind, JOIN_TICKET_SECRET_ENV};
 use protocol::{ClientMessage, ConnectQuery, HealthResponse, ServerMessage};
+use public_control::{
+    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
+    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
+    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
+    RelayWsTokenRequest, RelayWsTokenResponse,
+};
 use rand::{distributions::Alphanumeric, Rng};
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -28,8 +35,8 @@ use tower_http::{
 };
 use tracing::{debug, warn};
 
-pub fn app(state: BrokerState) -> Router {
-    let join_verifier = BrokerJoinVerifier::from_env();
+pub async fn app(state: BrokerState) -> Router {
+    let join_verifier = BrokerJoinVerifier::from_env().await;
     app_with_web_root_and_verifier(state, default_web_root(), join_verifier)
 }
 
@@ -42,7 +49,7 @@ struct BrokerAppState {
 #[derive(Clone)]
 enum BrokerJoinVerifier {
     SelfHosted(JoinTicketKey),
-    PublicControlPlane,
+    PublicControlPlane(PublicControlPlane),
     Misconfigured(String),
 }
 
@@ -52,7 +59,7 @@ struct VerifiedBrokerJoin {
 }
 
 impl BrokerJoinVerifier {
-    fn from_env() -> Self {
+    async fn from_env() -> Self {
         match BrokerAuthMode::from_env() {
             Ok(BrokerAuthMode::SelfHostedSharedSecret) => {
                 match JoinTicketKey::from_env_var(JOIN_TICKET_SECRET_ENV) {
@@ -63,7 +70,10 @@ impl BrokerJoinVerifier {
                     Err(error) => Self::Misconfigured(error),
                 }
             }
-            Ok(BrokerAuthMode::PublicControlPlane) => Self::PublicControlPlane,
+            Ok(BrokerAuthMode::PublicControlPlane) => match PublicControlPlane::from_env().await {
+                Ok(control_plane) => Self::PublicControlPlane(control_plane),
+                Err(error) => Self::Misconfigured(error),
+            },
             Err(error) => Self::Misconfigured(error),
         }
     }
@@ -84,11 +94,23 @@ impl BrokerJoinVerifier {
             .map(|claims| VerifiedBrokerJoin {
                 peer_id: claims.peer_id,
             }),
-            Self::PublicControlPlane => Err(
-                "public broker auth mode is only a boundary scaffold right now; hosted control-plane token verification is not wired yet"
-                    .to_string(),
-            ),
+            Self::PublicControlPlane(control_plane) => verify_join_ticket_for_connection(
+                control_plane.issuer_key(),
+                join_ticket,
+                broker_room_id,
+                role,
+            )
+            .map(|claims| VerifiedBrokerJoin {
+                peer_id: claims.peer_id,
+            }),
             Self::Misconfigured(error) => Err(error.clone()),
+        }
+    }
+
+    fn public_control_plane(&self) -> Option<PublicControlPlane> {
+        match self {
+            Self::PublicControlPlane(control_plane) => Some(control_plane.clone()),
+            _ => None,
         }
     }
 
@@ -99,24 +121,19 @@ impl BrokerJoinVerifier {
                 HealthResponse {
                     status: "ok".to_string(),
                     service: "relay-broker".to_string(),
-                    broker_auth_mode: BrokerAuthMode::SelfHostedSharedSecret
-                        .as_str()
-                        .to_string(),
+                    broker_auth_mode: BrokerAuthMode::SelfHostedSharedSecret.as_str().to_string(),
                     join_auth_ready: true,
                     message: None,
                 },
             ),
-            Self::PublicControlPlane => (
-                StatusCode::SERVICE_UNAVAILABLE,
+            Self::PublicControlPlane(_) => (
+                StatusCode::OK,
                 HealthResponse {
-                    status: "not_ready".to_string(),
+                    status: "ok".to_string(),
                     service: "relay-broker".to_string(),
                     broker_auth_mode: BrokerAuthMode::PublicControlPlane.as_str().to_string(),
-                    join_auth_ready: false,
-                    message: Some(
-                        "public auth plane boundary exists, but hosted token verification is not wired yet"
-                            .to_string(),
-                    ),
+                    join_auth_ready: true,
+                    message: None,
                 },
             ),
             Self::Misconfigured(error) => (
@@ -146,18 +163,34 @@ fn app_with_web_root_and_verifier(
     }
     match &join_verifier {
         BrokerJoinVerifier::SelfHosted(_) => {}
-        BrokerJoinVerifier::PublicControlPlane => {
-            warn!(
-                mode = BrokerAuthMode::PublicControlPlane.as_str(),
-                "public broker auth mode is boundary-only right now; hosted verifier integration is not wired yet"
-            );
-        }
+        BrokerJoinVerifier::PublicControlPlane(_) => {}
         BrokerJoinVerifier::Misconfigured(error) => {
             warn!(%error, "broker websocket joins will be rejected");
         }
     }
     Router::new()
         .route("/api/health", get(health))
+        .route(
+            "/api/public/relay/ws-token",
+            post(public_issue_relay_ws_token),
+        )
+        .route(
+            "/api/public/pairing/ws-token",
+            post(public_issue_pairing_ws_token),
+        )
+        .route("/api/public/devices", post(public_issue_device_grant))
+        .route(
+            "/api/public/device/ws-token",
+            post(public_issue_device_ws_token),
+        )
+        .route(
+            "/api/public/devices/:device_id/revoke",
+            post(public_revoke_device_grant),
+        )
+        .route(
+            "/api/public/devices/revoke-others",
+            post(public_revoke_other_device_grants),
+        )
         .route("/ws/:channel_id", get(websocket))
         .route_service(
             "/manifest.webmanifest",
@@ -177,6 +210,96 @@ fn app_with_web_root_and_verifier(
 async fn health(State(state): State<BrokerAppState>) -> impl IntoResponse {
     let (status, payload) = state.join_verifier.health_response();
     (status, Json(payload))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ApiErrorBody {
+    error: &'static str,
+    message: String,
+}
+
+async fn public_issue_relay_ws_token(
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+    Json(input): Json<RelayWsTokenRequest>,
+) -> Result<Json<RelayWsTokenResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .issue_relay_ws_token(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_issue_pairing_ws_token(
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+    Json(input): Json<PairingWsTokenRequest>,
+) -> Result<Json<PairingWsTokenResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .issue_pairing_ws_token(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_issue_device_grant(
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+    Json(input): Json<DeviceGrantRequest>,
+) -> Result<Json<DeviceGrantResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .issue_device_grant(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_issue_device_ws_token(
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceWsTokenResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .issue_device_ws_token(bearer)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_revoke_device_grant(
+    State(state): State<BrokerAppState>,
+    Path(device_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<DeviceGrantRevokeRequest>,
+) -> Result<Json<DeviceGrantRevokeResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .revoke_device_grant(bearer, &device_id, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_revoke_other_device_grants(
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+    Json(input): Json<DeviceGrantBulkRevokeRequest>,
+) -> Result<Json<DeviceGrantBulkRevokeResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .revoke_other_device_grants(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
 }
 
 async fn websocket(
@@ -359,6 +482,15 @@ fn verify_self_hosted_join_ticket_for_connection(
     broker_room_id: &str,
     role: protocol::PeerRole,
 ) -> Result<JoinTicketClaims, String> {
+    verify_join_ticket_for_connection(key, join_ticket, broker_room_id, role)
+}
+
+fn verify_join_ticket_for_connection(
+    key: &JoinTicketKey,
+    join_ticket: Option<&str>,
+    broker_room_id: &str,
+    role: protocol::PeerRole,
+) -> Result<JoinTicketClaims, String> {
     let join_ticket = join_ticket
         .map(str::trim)
         .filter(|ticket| !ticket.is_empty())
@@ -381,6 +513,59 @@ fn verify_self_hosted_join_ticket_for_connection(
             Err("join_ticket kind is invalid for surface".to_string())
         }
     }
+}
+
+fn require_public_control_plane(
+    state: &BrokerAppState,
+) -> Result<PublicControlPlane, (StatusCode, Json<ApiErrorBody>)> {
+    state.join_verifier.public_control_plane().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                error: "not_found",
+                message: "public control-plane endpoints are unavailable in this auth mode"
+                    .to_string(),
+            }),
+        )
+    })
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<ApiErrorBody>)> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiErrorBody {
+                    error: "unauthorized",
+                    message: "missing bearer token".to_string(),
+                }),
+            )
+        })?;
+    Ok(value)
+}
+
+fn public_api_error(message: String) -> (StatusCode, Json<ApiErrorBody>) {
+    let status = if message.contains("invalid") || message.contains("does not match") {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(ApiErrorBody {
+            error: if status == StatusCode::UNAUTHORIZED {
+                "unauthorized"
+            } else {
+                "bad_request"
+            },
+            message,
+        }),
+    )
 }
 
 #[cfg(test)]

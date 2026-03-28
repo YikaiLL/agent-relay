@@ -1,10 +1,19 @@
 use relay_broker::{
-    auth::{BrokerAuthMode, BROKER_AUTH_MODE_ENV},
+    auth::BrokerAuthMode,
     join_ticket::{unix_now, JoinTicketClaims, JoinTicketKey, JOIN_TICKET_SECRET_ENV},
+    public_control::{
+        DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
+        DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
+        PairingWsTokenRequest, PairingWsTokenResponse, RelayWsTokenRequest, RelayWsTokenResponse,
+    },
 };
+use reqwest::Client;
+use serde::de::DeserializeOwned;
 use url::Url;
 
-pub(crate) const RELAY_BROKER_RELAY_WS_TOKEN_ENV: &str = "RELAY_BROKER_RELAY_WS_TOKEN";
+pub(crate) const RELAY_BROKER_CONTROL_URL_ENV: &str = "RELAY_BROKER_CONTROL_URL";
+pub(crate) const RELAY_BROKER_RELAY_ID_ENV: &str = "RELAY_BROKER_RELAY_ID";
+pub(crate) const RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV: &str = "RELAY_BROKER_RELAY_REFRESH_TOKEN";
 pub(crate) const RELAY_BROKER_DEVICE_JOIN_TTL_SECS_ENV: &str = "RELAY_BROKER_DEVICE_JOIN_TTL_SECS";
 
 #[derive(Clone, Debug)]
@@ -14,13 +23,22 @@ pub(crate) struct BrokerJoinCredential {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct DeviceBrokerCredential {
+    pub(crate) join_credential: BrokerJoinCredential,
+    pub(crate) refresh_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum BrokerAuthConfig {
     SelfHostedSharedSecret {
         join_ticket_key: JoinTicketKey,
         device_join_ttl_secs: Option<u64>,
     },
     PublicControlPlane {
-        relay_ws_token: String,
+        control_url: Url,
+        relay_id: String,
+        relay_refresh_token: String,
+        client: Client,
     },
 }
 
@@ -28,7 +46,9 @@ impl BrokerAuthConfig {
     pub(crate) fn from_parts(
         auth_mode: Option<String>,
         join_ticket_secret: Option<String>,
-        relay_ws_token: Option<String>,
+        control_url: Option<String>,
+        relay_id: Option<String>,
+        relay_refresh_token: Option<String>,
         device_join_ttl_secs: Option<String>,
     ) -> Result<Self, String> {
         match BrokerAuthMode::parse(auth_mode)? {
@@ -46,12 +66,32 @@ impl BrokerAuthConfig {
                 })
             }
             BrokerAuthMode::PublicControlPlane => {
-                let relay_ws_token = trimmed(relay_ws_token).ok_or_else(|| {
+                let control_url = trimmed(control_url).ok_or_else(|| {
+                    format!("{RELAY_BROKER_CONTROL_URL_ENV} is required in public broker auth mode")
+                })?;
+                let relay_id = trimmed(relay_id).ok_or_else(|| {
+                    format!("{RELAY_BROKER_RELAY_ID_ENV} is required in public broker auth mode")
+                })?;
+                let relay_refresh_token = trimmed(relay_refresh_token).ok_or_else(|| {
                     format!(
-                        "{RELAY_BROKER_RELAY_WS_TOKEN_ENV} is required in public broker auth mode"
+                        "{RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV} is required in public broker auth mode"
                     )
                 })?;
-                Ok(Self::PublicControlPlane { relay_ws_token })
+                let control_url = Url::parse(&control_url).map_err(|error| {
+                    format!("invalid {RELAY_BROKER_CONTROL_URL_ENV} `{control_url}`: {error}")
+                })?;
+                let scheme = control_url.scheme().to_ascii_lowercase();
+                if scheme != "http" && scheme != "https" {
+                    return Err(format!(
+                        "{RELAY_BROKER_CONTROL_URL_ENV} must use http:// or https://"
+                    ));
+                }
+                Ok(Self::PublicControlPlane {
+                    control_url,
+                    relay_id,
+                    relay_refresh_token,
+                    client: Client::new(),
+                })
             }
         }
     }
@@ -63,29 +103,48 @@ impl BrokerAuthConfig {
         }
     }
 
-    pub(crate) fn apply_relay_connect_query(
+    pub(crate) async fn relay_connect_credential(
         &self,
-        url: &mut Url,
         broker_room_id: &str,
         relay_peer_id: &str,
-    ) -> Result<(), String> {
-        let relay_token = match self {
+    ) -> Result<BrokerJoinCredential, String> {
+        match self {
             Self::SelfHostedSharedSecret {
                 join_ticket_key, ..
-            } => join_ticket_key
-                .mint(&JoinTicketClaims::relay_join(broker_room_id, relay_peer_id))?,
-            Self::PublicControlPlane { relay_ws_token } => relay_ws_token.clone(),
-        };
-
-        url.query_pairs_mut()
-            .clear()
-            .append_pair("peer_id", relay_peer_id)
-            .append_pair("role", "relay")
-            .append_pair("join_ticket", &relay_token);
-        Ok(())
+            } => Ok(BrokerJoinCredential {
+                token: join_ticket_key
+                    .mint(&JoinTicketClaims::relay_join(broker_room_id, relay_peer_id))?,
+                expires_at: None,
+            }),
+            Self::PublicControlPlane {
+                control_url,
+                relay_id,
+                relay_refresh_token,
+                client,
+            } => {
+                let response: RelayWsTokenResponse = post_control_plane(
+                    client,
+                    control_url,
+                    "/api/public/relay/ws-token",
+                    relay_refresh_token,
+                    &RelayWsTokenRequest {
+                        relay_id: relay_id.clone(),
+                        broker_room_id: broker_room_id.to_string(),
+                        relay_peer_id: relay_peer_id.to_string(),
+                    },
+                )
+                .await?;
+                ensure_room_binding(broker_room_id, &response.broker_room_id)?;
+                ensure_relay_binding(relay_id, &response.relay_id)?;
+                Ok(BrokerJoinCredential {
+                    token: response.relay_ws_token,
+                    expires_at: Some(response.relay_ws_token_expires_at),
+                })
+            }
+        }
     }
 
-    pub(crate) fn pairing_join_credential(
+    pub(crate) async fn pairing_join_credential(
         &self,
         broker_room_id: &str,
         pairing_id: &str,
@@ -102,18 +161,41 @@ impl BrokerAuthConfig {
                 ))?,
                 expires_at: Some(expires_at),
             }),
-            Self::PublicControlPlane { .. } => Err(format!(
-                "public broker auth mode requires hosted pairing token issuance; set {BROKER_AUTH_MODE_ENV}=self_hosted for local pairing today"
-            )),
+            Self::PublicControlPlane {
+                control_url,
+                relay_id,
+                relay_refresh_token,
+                client,
+            } => {
+                let response: PairingWsTokenResponse = post_control_plane(
+                    client,
+                    control_url,
+                    "/api/public/pairing/ws-token",
+                    relay_refresh_token,
+                    &PairingWsTokenRequest {
+                        relay_id: relay_id.clone(),
+                        broker_room_id: broker_room_id.to_string(),
+                        pairing_id: pairing_id.to_string(),
+                        expires_at,
+                    },
+                )
+                .await?;
+                ensure_room_binding(broker_room_id, &response.broker_room_id)?;
+                ensure_relay_binding(relay_id, &response.relay_id)?;
+                Ok(BrokerJoinCredential {
+                    token: response.pairing_join_ticket,
+                    expires_at: Some(response.pairing_join_ticket_expires_at),
+                })
+            }
         }
     }
 
-    pub(crate) fn device_join_credential(
+    pub(crate) async fn device_broker_credential(
         &self,
         broker_room_id: &str,
         device_id: &str,
         expires_at_override: Option<u64>,
-    ) -> Result<BrokerJoinCredential, String> {
+    ) -> Result<DeviceBrokerCredential, String> {
         match self {
             Self::SelfHostedSharedSecret {
                 join_ticket_key,
@@ -121,21 +203,116 @@ impl BrokerAuthConfig {
             } => {
                 let expires_at = expires_at_override.or_else(|| {
                     device_join_ttl_secs
-                    .map(|ttl| unix_now().saturating_add(ttl))
-                    .filter(|expires_at| *expires_at > 0)
+                        .map(|ttl| unix_now().saturating_add(ttl))
+                        .filter(|expires_at| *expires_at > 0)
                 });
-                Ok(BrokerJoinCredential {
-                    token: join_ticket_key.mint(&JoinTicketClaims::device_surface_join(
-                        broker_room_id,
-                        device_id,
+                Ok(DeviceBrokerCredential {
+                    join_credential: BrokerJoinCredential {
+                        token: join_ticket_key.mint(&JoinTicketClaims::device_surface_join(
+                            broker_room_id,
+                            device_id,
+                            expires_at,
+                        ))?,
                         expires_at,
-                    ))?,
-                    expires_at,
+                    },
+                    refresh_token: None,
                 })
             }
-            Self::PublicControlPlane { .. } => Err(format!(
-                "public broker auth mode requires hosted device token issuance; set {BROKER_AUTH_MODE_ENV}=self_hosted for local pairing today"
-            )),
+            Self::PublicControlPlane {
+                control_url,
+                relay_id,
+                relay_refresh_token,
+                client,
+            } => {
+                let response: DeviceGrantResponse = post_control_plane(
+                    client,
+                    control_url,
+                    "/api/public/devices",
+                    relay_refresh_token,
+                    &DeviceGrantRequest {
+                        relay_id: relay_id.clone(),
+                        broker_room_id: broker_room_id.to_string(),
+                        device_id: device_id.to_string(),
+                    },
+                )
+                .await?;
+                ensure_room_binding(broker_room_id, &response.broker_room_id)?;
+                ensure_relay_binding(relay_id, &response.relay_id)?;
+                ensure_device_binding(device_id, &response.device_id)?;
+                Ok(DeviceBrokerCredential {
+                    join_credential: BrokerJoinCredential {
+                        token: response.device_ws_token,
+                        expires_at: Some(response.device_ws_token_expires_at),
+                    },
+                    refresh_token: Some(response.device_refresh_token),
+                })
+            }
+        }
+    }
+
+    pub(crate) async fn revoke_device_credential(
+        &self,
+        broker_room_id: &str,
+        device_id: &str,
+    ) -> Result<Option<DeviceGrantRevokeResponse>, String> {
+        match self {
+            Self::SelfHostedSharedSecret { .. } => Ok(None),
+            Self::PublicControlPlane {
+                control_url,
+                relay_id,
+                relay_refresh_token,
+                client,
+            } => {
+                let path = format!("/api/public/devices/{device_id}/revoke");
+                let response: DeviceGrantRevokeResponse = post_control_plane(
+                    client,
+                    control_url,
+                    &path,
+                    relay_refresh_token,
+                    &DeviceGrantRevokeRequest {
+                        relay_id: relay_id.clone(),
+                        broker_room_id: broker_room_id.to_string(),
+                    },
+                )
+                .await?;
+                ensure_room_binding(broker_room_id, &response.broker_room_id)?;
+                ensure_relay_binding(relay_id, &response.relay_id)?;
+                ensure_device_binding(device_id, &response.device_id)?;
+                Ok(Some(response))
+            }
+        }
+    }
+
+    pub(crate) async fn revoke_other_device_credentials(
+        &self,
+        broker_room_id: &str,
+        keep_device_id: &str,
+    ) -> Result<Option<DeviceGrantBulkRevokeResponse>, String> {
+        match self {
+            Self::SelfHostedSharedSecret { .. } => Ok(None),
+            Self::PublicControlPlane {
+                control_url,
+                relay_id,
+                relay_refresh_token,
+                client,
+            } => {
+                let response: DeviceGrantBulkRevokeResponse = post_control_plane(
+                    client,
+                    control_url,
+                    "/api/public/devices/revoke-others",
+                    relay_refresh_token,
+                    &DeviceGrantBulkRevokeRequest {
+                        relay_id: relay_id.clone(),
+                        broker_room_id: broker_room_id.to_string(),
+                        keep_device_id: keep_device_id.to_string(),
+                    },
+                )
+                .await?;
+                ensure_room_binding(broker_room_id, &response.broker_room_id)?;
+                ensure_relay_binding(relay_id, &response.relay_id)?;
+                ensure_device_binding(keep_device_id, &response.kept_device_id)?;
+                Ok(Some(response))
+            }
         }
     }
 
@@ -158,6 +335,80 @@ impl BrokerAuthConfig {
             Self::PublicControlPlane { .. } => None,
         }
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ControlPlaneErrorResponse {
+    message: Option<String>,
+    error: Option<String>,
+}
+
+async fn post_control_plane<TReq, TResp>(
+    client: &Client,
+    base_url: &Url,
+    path: &str,
+    bearer_token: &str,
+    request: &TReq,
+) -> Result<TResp, String>
+where
+    TReq: serde::Serialize + ?Sized,
+    TResp: DeserializeOwned,
+{
+    let mut url = base_url.clone();
+    url.set_path(path);
+    url.set_query(None);
+
+    let response = client
+        .post(url.clone())
+        .bearer_auth(bearer_token)
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| format!("failed to reach broker control-plane {url}: {error}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if let Ok(parsed) = serde_json::from_str::<ControlPlaneErrorResponse>(&body) {
+            if let Some(message) = parsed.message.or(parsed.error) {
+                return Err(message);
+            }
+        }
+        return Err(format!(
+            "broker control-plane {url} returned {status}: {body}"
+        ));
+    }
+
+    response.json::<TResp>().await.map_err(|error| {
+        format!("failed to decode broker control-plane response from {url}: {error}")
+    })
+}
+
+fn ensure_room_binding(expected: &str, actual: &str) -> Result<(), String> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "broker control-plane returned broker_room_id `{actual}`, expected `{expected}`"
+    ))
+}
+
+fn ensure_relay_binding(expected: &str, actual: &str) -> Result<(), String> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "broker control-plane returned relay_id `{actual}`, expected `{expected}`"
+    ))
+}
+
+fn ensure_device_binding(expected: &str, actual: &str) -> Result<(), String> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "broker control-plane returned device_id `{actual}`, expected `{expected}`"
+    ))
 }
 
 fn trimmed(value: Option<String>) -> Option<String> {

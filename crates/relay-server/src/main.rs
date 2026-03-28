@@ -24,10 +24,11 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use protocol::{
-    ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, HealthResponse, HeartbeatInput,
-    BulkRevokeDevicesReceipt, PairingDecisionInput, PairingDecisionReceipt, PairingStartInput,
-    PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-    StartSessionInput, TakeOverInput, ThreadsQuery, ThreadsResponse,
+    ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, BulkRevokeDevicesReceipt,
+    HealthResponse, HeartbeatInput, PairingDecisionInput, PairingDecisionReceipt,
+    PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
+    SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsQuery,
+    ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{

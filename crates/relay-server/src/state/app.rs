@@ -320,9 +320,29 @@ impl AppState {
         let broker = BrokerConfig::from_env()?.ok_or_else(|| {
             "broker pairing is unavailable because RELAY_BROKER_URL is not configured".to_string()
         })?;
-
+        let prepared = {
+            let mut relay = self.relay.write().await;
+            relay.prepare_pairing_ticket(input.expires_in_seconds)?
+        };
+        let pairing_credential = match broker
+            .pairing_join_credential(&prepared.pairing_id, prepared.expires_at)
+            .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                let mut relay = self.relay.write().await;
+                relay.pending_pairings.remove(&prepared.pairing_id);
+                return Err(error);
+            }
+        };
         let mut relay = self.relay.write().await;
-        let ticket = relay.issue_pairing_ticket(&broker, input.expires_in_seconds)?;
+        let ticket = relay.render_pairing_ticket_view(
+            &prepared,
+            broker.public_base_url(),
+            broker.broker_room_id(),
+            &pairing_credential.token,
+            broker.relay_peer_id(),
+        );
         relay.push_log(
             "info",
             format!(
@@ -335,11 +355,26 @@ impl AppState {
     }
 
     pub async fn revoke_device(&self, device_id: &str) -> Result<RevokeDeviceReceipt, String> {
+        let broker = BrokerConfig::from_env()?;
         let mut relay = self.relay.write().await;
         let revoked = relay.revoke_paired_device(device_id, unix_now());
         if revoked {
             relay.push_log("info", format!("Revoked paired device {device_id}."));
             relay.notify();
+        }
+        drop(relay);
+        if revoked {
+            if let Some(broker) = broker {
+                if let Err(error) = broker.revoke_device_credential(device_id).await {
+                    self.push_runtime_log(
+                        "warn",
+                        format!(
+                            "Local revoke for {device_id} succeeded, but broker credential revoke failed: {error}"
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
         Ok(RevokeDeviceReceipt {
             device_id: device_id.to_string(),
@@ -351,8 +386,10 @@ impl AppState {
         &self,
         keep_device_id: &str,
     ) -> Result<BulkRevokeDevicesReceipt, String> {
+        let broker = BrokerConfig::from_env()?;
         let mut relay = self.relay.write().await;
-        let revoked_device_ids = relay.revoke_all_other_paired_devices(keep_device_id, unix_now())?;
+        let revoked_device_ids =
+            relay.revoke_all_other_paired_devices(keep_device_id, unix_now())?;
         if !revoked_device_ids.is_empty() {
             relay.push_log(
                 "info",
@@ -363,6 +400,20 @@ impl AppState {
                 ),
             );
             relay.notify();
+        }
+        drop(relay);
+        if !revoked_device_ids.is_empty() {
+            if let Some(broker) = broker {
+                if let Err(error) = broker.revoke_other_device_credentials(keep_device_id).await {
+                    self.push_runtime_log(
+                        "warn",
+                        format!(
+                            "Local bulk revoke kept {keep_device_id}, but broker credential revoke failed: {error}"
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
         Ok(BulkRevokeDevicesReceipt {
             kept_device_id: keep_device_id.to_string(),
@@ -380,14 +431,61 @@ impl AppState {
             "broker pairing is unavailable because RELAY_BROKER_URL is not configured".to_string()
         })?;
         let now = unix_now();
-        let device_join_ticket_expires_at = broker.predicted_device_join_expires_at(now);
+        let approved = matches!(input.decision, PairingDecision::Approve);
+        let pending_device_id = if approved {
+            Some({
+                let relay = self.relay.read().await;
+                relay
+                    .pending_pairing_requests
+                    .get(pairing_id)
+                    .map(|request| request.device_id.clone())
+                    .ok_or_else(|| "pairing request is not waiting for approval".to_string())?
+            })
+        } else {
+            None
+        };
+        let broker_credential = if let Some(device_id) = pending_device_id.as_deref() {
+            Some(
+                broker
+                    .device_broker_credential(
+                        device_id,
+                        broker.predicted_device_join_expires_at(now),
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut relay = self.relay.write().await;
-        let result = relay.decide_pairing_request(
+        let mut result = match relay.decide_pairing_request(
             pairing_id,
-            matches!(input.decision, PairingDecision::Approve),
-            device_join_ticket_expires_at,
+            approved,
+            broker_credential
+                .as_ref()
+                .and_then(|credential| credential.join_credential.expires_at),
             now,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(relay);
+                if let Some(device_id) = pending_device_id.as_deref() {
+                    let _ = broker.revoke_device_credential(device_id).await;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(credential) = broker_credential {
+            relay.attach_pairing_broker_credential(
+                pairing_id,
+                credential.refresh_token.clone(),
+                credential.join_credential.token.clone(),
+                credential.join_credential.expires_at,
+                now,
+            )?;
+            result.device_refresh_token = credential.refresh_token;
+            result.device_join_ticket = Some(credential.join_credential.token);
+            result.device_join_ticket_expires_at = credential.join_credential.expires_at;
+        }
         let message = match input.decision {
             PairingDecision::Approve => {
                 relay.push_log(

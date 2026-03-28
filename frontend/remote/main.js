@@ -134,7 +134,7 @@ async function boot() {
   }
 
   if (state.remoteAuth) {
-    connectBroker("initial boot");
+    void connectBroker("initial boot");
   }
 }
 

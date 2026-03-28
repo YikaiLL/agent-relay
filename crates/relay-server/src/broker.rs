@@ -22,7 +22,10 @@ use crate::{
     state::{AppState, BrokerPendingMessage},
 };
 
-use self::auth::{BrokerAuthConfig, BrokerJoinCredential, RELAY_BROKER_RELAY_WS_TOKEN_ENV};
+use self::auth::{
+    BrokerAuthConfig, BrokerJoinCredential, DeviceBrokerCredential, RELAY_BROKER_CONTROL_URL_ENV,
+    RELAY_BROKER_RELAY_ID_ENV, RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV,
+};
 use self::crypto::{decrypt_json, encrypt_json, EncryptedEnvelope};
 use self::remote_actions::{
     handle_encrypted_remote_action, handle_remote_action, RemoteActionKind, RemoteActionRequest,
@@ -113,6 +116,7 @@ struct PairingResultPlaintext {
     ok: bool,
     device: Option<PairedDeviceView>,
     device_token: Option<String>,
+    device_refresh_token: Option<String>,
     device_join_ticket: Option<String>,
     device_join_ticket_expires_at: Option<u64>,
     error: Option<String>,
@@ -123,11 +127,13 @@ impl BrokerConfig {
         Self::from_parts(
             std::env::var("RELAY_BROKER_URL").ok(),
             std::env::var("RELAY_BROKER_PUBLIC_URL").ok(),
+            std::env::var(RELAY_BROKER_CONTROL_URL_ENV).ok(),
             std::env::var("RELAY_BROKER_CHANNEL_ID").ok(),
             std::env::var("RELAY_BROKER_PEER_ID").ok(),
             std::env::var(BROKER_AUTH_MODE_ENV).ok(),
             std::env::var(relay_broker::join_ticket::JOIN_TICKET_SECRET_ENV).ok(),
-            std::env::var(RELAY_BROKER_RELAY_WS_TOKEN_ENV).ok(),
+            std::env::var(RELAY_BROKER_RELAY_ID_ENV).ok(),
+            std::env::var(RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV).ok(),
             std::env::var(self::auth::RELAY_BROKER_DEVICE_JOIN_TTL_SECS_ENV).ok(),
         )
     }
@@ -135,11 +141,13 @@ impl BrokerConfig {
     pub(crate) fn from_parts(
         url: Option<String>,
         public_url: Option<String>,
+        control_url: Option<String>,
         broker_room_id: Option<String>,
         relay_peer_id: Option<String>,
         auth_mode: Option<String>,
         join_ticket_secret: Option<String>,
-        relay_ws_token: Option<String>,
+        relay_id: Option<String>,
+        relay_refresh_token: Option<String>,
         device_join_ttl_secs: Option<String>,
     ) -> Result<Option<Self>, String> {
         let Some(url) = url.and_then(trimmed_string) else {
@@ -155,7 +163,9 @@ impl BrokerConfig {
         let auth = BrokerAuthConfig::from_parts(
             auth_mode,
             join_ticket_secret,
-            relay_ws_token,
+            control_url.or_else(|| Some(http_control_url(&url))),
+            relay_id,
+            relay_refresh_token,
             device_join_ttl_secs,
         )?;
 
@@ -185,7 +195,6 @@ impl BrokerConfig {
             segments.push("ws");
             segments.push(&broker_room_id);
         }
-        auth.apply_relay_connect_query(&mut url, &broker_room_id, &relay_peer_id)?;
 
         Ok(Some(Self {
             public_base_url,
@@ -220,22 +229,55 @@ impl BrokerConfig {
         &self.relay_peer_id
     }
 
-    pub(crate) fn pairing_join_credential(
+    pub(crate) async fn relay_connect_url(&self) -> Result<Url, String> {
+        let credential = self
+            .auth
+            .relay_connect_credential(&self.broker_room_id, &self.relay_peer_id)
+            .await?;
+        let mut url = self.url.clone();
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("peer_id", &self.relay_peer_id)
+            .append_pair("role", "relay")
+            .append_pair("join_ticket", &credential.token);
+        Ok(url)
+    }
+
+    pub(crate) async fn pairing_join_credential(
         &self,
         pairing_id: &str,
         expires_at: u64,
     ) -> Result<BrokerJoinCredential, String> {
         self.auth
             .pairing_join_credential(&self.broker_room_id, pairing_id, expires_at)
+            .await
     }
 
-    pub(crate) fn device_join_credential(
+    pub(crate) async fn device_broker_credential(
         &self,
         device_id: &str,
         expires_at: Option<u64>,
-    ) -> Result<BrokerJoinCredential, String> {
+    ) -> Result<DeviceBrokerCredential, String> {
         self.auth
-            .device_join_credential(&self.broker_room_id, device_id, expires_at)
+            .device_broker_credential(&self.broker_room_id, device_id, expires_at)
+            .await
+    }
+
+    pub(crate) async fn revoke_device_credential(&self, device_id: &str) -> Result<(), String> {
+        self.auth
+            .revoke_device_credential(&self.broker_room_id, device_id)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn revoke_other_device_credentials(
+        &self,
+        keep_device_id: &str,
+    ) -> Result<(), String> {
+        self.auth
+            .revoke_other_device_credentials(&self.broker_room_id, keep_device_id)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -329,7 +371,8 @@ async fn run_broker_session(
     change_rx: &mut watch::Receiver<u64>,
     config: &BrokerConfig,
 ) -> Result<(), String> {
-    let (socket, _) = connect_async(config.url.as_str())
+    let connect_url = config.relay_connect_url().await?;
+    let (socket, _) = connect_async(connect_url.as_str())
         .await
         .map_err(|error| format!("failed to connect to broker: {error}"))?;
     let (mut sender, mut receiver) = socket.split();
@@ -358,7 +401,7 @@ async fn run_broker_session(
             format!("Connected to broker room {}.", config.broker_room_id()),
         )
         .await;
-    publish_pending_broker_messages(&mut sender, state, config)
+    publish_pending_broker_messages(&mut sender, state)
         .await
         .map_err(|error| format!("initial broker direct publish failed: {error}"))?;
     publish_snapshot(&mut sender, state)
@@ -369,7 +412,7 @@ async fn run_broker_session(
         tokio::select! {
             changed = change_rx.changed() => {
                 changed.map_err(|_| "relay change channel closed".to_string())?;
-                publish_pending_broker_messages(&mut sender, state, config)
+                publish_pending_broker_messages(&mut sender, state)
                     .await
                     .map_err(|error| format!("broker direct publish failed: {error}"))?;
                 publish_snapshot(&mut sender, state)
@@ -382,7 +425,7 @@ async fn run_broker_session(
                 };
                 let frame = frame.map_err(|error| format!("broker receive failed: {error}"))?;
                 if let Some(message) = decode_server_frame(frame)? {
-                    handle_server_message(state, &mut sender, message, config).await?;
+                    handle_server_message(state, &mut sender, message).await?;
                 }
             }
         }
@@ -405,7 +448,6 @@ async fn handle_server_message(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     message: ServerMessage,
-    config: &BrokerConfig,
 ) -> Result<(), String> {
     match message {
         ServerMessage::Welcome { .. } => Ok(()),
@@ -451,15 +493,7 @@ async fn handle_server_message(
                     pairing_id,
                     envelope,
                 }) => {
-                    handle_pairing_request(
-                        state,
-                        sender,
-                        from_peer_id,
-                        pairing_id,
-                        envelope,
-                        config,
-                    )
-                    .await
+                    handle_pairing_request(state, sender, from_peer_id, pairing_id, envelope).await
                 }
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
@@ -510,7 +544,6 @@ async fn handle_pairing_request(
     from_peer_id: String,
     pairing_id: String,
     envelope: EncryptedEnvelope,
-    config: &BrokerConfig,
 ) -> Result<(), String> {
     state
         .push_runtime_log(
@@ -577,7 +610,7 @@ async fn handle_pairing_request(
         }
     };
     if let Some(result) = replay_result {
-        publish_pairing_result(sender, result, config).await?;
+        publish_pairing_result(sender, result).await?;
         state
             .push_runtime_log(
                 "info",
@@ -681,12 +714,11 @@ async fn publish_snapshot(
 async fn publish_pending_broker_messages(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     state: &AppState,
-    config: &BrokerConfig,
 ) -> Result<(), String> {
     for message in state.drain_pending_broker_messages().await {
         match message {
             BrokerPendingMessage::PairingResult(result) => {
-                publish_pairing_result(sender, result, config).await?;
+                publish_pairing_result(sender, result).await?;
             }
         }
     }
@@ -696,27 +728,16 @@ async fn publish_pending_broker_messages(
 async fn publish_pairing_result(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     result: crate::state::PendingPairingResult,
-    config: &BrokerConfig,
 ) -> Result<(), String> {
-    let device_join_credential = result
-        .device
-        .as_ref()
-        .map(|device| {
-            config.device_join_credential(&device.device_id, result.device_join_ticket_expires_at)
-        })
-        .transpose()?;
     let encrypted = encrypt_json(
         &result.pairing_secret,
         &PairingResultPlaintext {
             ok: result.error.is_none(),
             device: result.device,
             device_token: result.device_token,
-            device_join_ticket: device_join_credential
-                .as_ref()
-                .map(|value| value.token.clone()),
-            device_join_ticket_expires_at: device_join_credential
-                .as_ref()
-                .and_then(|value| value.expires_at),
+            device_refresh_token: result.device_refresh_token,
+            device_join_ticket: result.device_join_ticket,
+            device_join_ticket_expires_at: result.device_join_ticket_expires_at,
             error: result.error,
         },
     )?;
@@ -757,6 +778,20 @@ fn trimmed_string(value: String) -> Option<String> {
     } else {
         Some(trimmed)
     }
+}
+
+fn http_control_url(broker_ws_url: &str) -> String {
+    let mut url = Url::parse(broker_ws_url).expect("broker url should already parse");
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
+    }
+    .to_string();
+    let _ = url.set_scheme(&scheme);
+    url.set_path("");
+    url.set_query(None);
+    url.as_str().trim_end_matches('/').to_string()
 }
 
 fn verify_pairing_request_proof(

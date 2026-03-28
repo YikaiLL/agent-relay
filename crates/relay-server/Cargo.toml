@@ -12,6 +12,7 @@ futures-util.workspace = true
 hmac.workspace = true
 qrcode.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 relay-broker = { path = "../relay-broker" }
 serde.workspace = true
 serde_json.workspace = true

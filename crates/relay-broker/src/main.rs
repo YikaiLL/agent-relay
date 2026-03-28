@@ -29,10 +29,8 @@ async fn main() {
         "relay-broker listening on http://{}:{} and ws://{}:{}/ws/:channel_id",
         host, port, host, port
     );
-    axum::serve(
-        listener,
-        relay_broker::app(relay_broker::BrokerState::default()),
-    )
-    .await
-    .expect("relay-broker exited unexpectedly");
+    let app = relay_broker::app(relay_broker::BrokerState::default()).await;
+    axum::serve(listener, app)
+        .await
+        .expect("relay-broker exited unexpectedly");
 }

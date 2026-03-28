@@ -75,7 +75,7 @@ export async function beginPairing(rawValue, { auto = false } = {}) {
         ? `Starting pairing for ${state.pairingTicket.pairing_id} from scanned link.`
         : `Starting pairing for ${state.pairingTicket.pairing_id}.`
     );
-    connectBroker("pairing request");
+    void connectBroker("pairing request");
   } catch (error) {
     state.pairingPhase = "error";
     state.pairingError = error.message;
@@ -150,6 +150,7 @@ export async function handleEncryptedPairingResult(payload) {
     deviceId: device.device_id,
     deviceLabel: device.label,
     deviceToken: result.device_token,
+    deviceRefreshToken: result.device_refresh_token || null,
     deviceJoinTicket: result.device_join_ticket,
     deviceJoinTicketExpiresAt: result.device_join_ticket_expires_at || null,
     sessionClaim: null,

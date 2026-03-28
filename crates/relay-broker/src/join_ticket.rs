@@ -111,6 +111,14 @@ impl JoinTicketKey {
 
 impl JoinTicketClaims {
     pub fn relay_join(channel_id: &str, peer_id: &str) -> Self {
+        Self::relay_join_with_expiry(channel_id, peer_id, None)
+    }
+
+    pub fn relay_join_with_expiry(
+        channel_id: &str,
+        peer_id: &str,
+        expires_at: Option<u64>,
+    ) -> Self {
         Self {
             version: JOIN_TICKET_VERSION,
             kind: JoinTicketKind::RelayJoin,
@@ -119,7 +127,7 @@ impl JoinTicketClaims {
             peer_id: Some(peer_id.to_string()),
             pairing_id: None,
             device_id: None,
-            expires_at: None,
+            expires_at,
             nonce: random_nonce(),
         }
     }

@@ -52,6 +52,10 @@ export function connectionTarget() {
   return null;
 }
 
+export function canRefreshDeviceJoinTicket() {
+  return Boolean(state.remoteAuth?.deviceRefreshToken);
+}
+
 export function hasUsableDeviceJoinTicket(skewMs = 0) {
   const ticket = state.remoteAuth?.deviceJoinTicket;
   if (!ticket) {
@@ -166,13 +170,15 @@ function loadRemoteAuth() {
 
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed?.deviceJoinTicket) {
+    if (!parsed?.deviceJoinTicket && !parsed?.deviceRefreshToken) {
       window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
       return null;
     }
     return {
       ...parsed,
+      deviceJoinTicket: parsed.deviceJoinTicket || null,
       deviceJoinTicketExpiresAt: parsed.deviceJoinTicketExpiresAt || null,
+      deviceRefreshToken: parsed.deviceRefreshToken || null,
       sessionClaim: parsed.sessionClaim || null,
       sessionClaimExpiresAt: parsed.sessionClaimExpiresAt || null,
     };
@@ -189,4 +195,12 @@ export function saveRemoteAuth(value) {
   }
 
   window.localStorage.setItem(REMOTE_AUTH_STORAGE_KEY, JSON.stringify(value));
+}
+
+export function brokerControlUrl(brokerUrl) {
+  const url = new URL(brokerUrl);
+  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+  url.pathname = "";
+  url.search = "";
+  return url.toString().replace(/\/$/, "");
 }

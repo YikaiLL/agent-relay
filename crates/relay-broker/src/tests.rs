@@ -14,6 +14,12 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use super::*;
 use crate::auth::BrokerAuthMode;
 use crate::join_ticket::{JoinTicketClaims, JoinTicketKey};
+use crate::public_control::{
+    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
+    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
+    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
+    RelayWsTokenRequest, RelayWsTokenResponse,
+};
 
 async fn spawn_app() -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -38,10 +44,11 @@ async fn spawn_public_mode_app() -> SocketAddr {
         .await
         .expect("listener should bind");
     let address = listener.local_addr().expect("listener should have address");
+    let public_control = test_public_control_plane().await;
     let app = app_with_web_root_and_verifier(
         BrokerState::default(),
         test_web_root(),
-        BrokerJoinVerifier::PublicControlPlane,
+        BrokerJoinVerifier::PublicControlPlane(public_control),
     );
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -83,6 +90,51 @@ async fn http_get(address: SocketAddr, path: &str) -> String {
     response
 }
 
+async fn public_post<TReq, TResp>(
+    address: SocketAddr,
+    path: &str,
+    bearer_token: &str,
+    request: &TReq,
+) -> TResp
+where
+    TReq: serde::Serialize + ?Sized,
+    TResp: serde::de::DeserializeOwned,
+{
+    reqwest::Client::new()
+        .post(format!("http://{address}{path}"))
+        .bearer_auth(bearer_token)
+        .json(request)
+        .send()
+        .await
+        .expect("request should succeed")
+        .error_for_status()
+        .expect("response should be successful")
+        .json::<TResp>()
+        .await
+        .expect("response should decode")
+}
+
+async fn public_post_expect_status<TReq>(
+    address: SocketAddr,
+    path: &str,
+    bearer_token: &str,
+    request: &TReq,
+    expected_status: reqwest::StatusCode,
+) -> String
+where
+    TReq: serde::Serialize + ?Sized,
+{
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}{path}"))
+        .bearer_auth(bearer_token)
+        .json(request)
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), expected_status);
+    response.text().await.expect("error body should read")
+}
+
 fn test_web_root() -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -118,6 +170,25 @@ fn test_web_root() -> PathBuf {
 fn test_join_ticket_key() -> JoinTicketKey {
     JoinTicketKey::from_secret("broker-test-secret".as_bytes())
         .expect("test join-ticket key should construct")
+}
+
+async fn test_public_control_plane() -> PublicControlPlane {
+    PublicControlPlane::from_parts(
+        Some("public-broker-issuer-secret".to_string()),
+        Some(
+            serde_json::to_string(&vec![serde_json::json!({
+                "relay_id": "relay-1",
+                "broker_room_id": "room-a",
+                "refresh_token": "relay-refresh-1"
+            })])
+            .expect("relay registrations should encode"),
+        ),
+        None,
+        Some("300".to_string()),
+        Some("300".to_string()),
+    )
+    .await
+    .expect("public control plane should configure")
 }
 
 fn websocket_url(
@@ -432,46 +503,229 @@ async fn health_route_reports_ok() {
 }
 
 #[tokio::test]
-async fn public_auth_plane_boundary_rejects_joins_until_hosted_verifier_exists() {
+async fn public_auth_plane_health_reports_ready() {
     assert_eq!(BrokerAuthMode::PublicControlPlane.as_str(), "public");
 
     let address = spawn_public_mode_app().await;
-    let url = websocket_url(
-        address,
-        "room-a",
-        protocol::PeerRole::Relay,
-        Some("relay-1"),
-        JoinTicketClaims::relay_join("room-a", "relay-1"),
-    );
-
-    let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
-    let error = next_server_message(&mut socket).await;
-    match error {
-        ServerMessage::Error { code, message } => {
-            assert_eq!(code, "join_rejected");
-            assert!(message.contains("control-plane"));
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn public_auth_plane_health_reports_not_ready() {
-    let address = spawn_public_mode_app().await;
     let response = http_get(address, "/api/health").await;
 
-    assert!(response.contains("503 Service Unavailable"));
+    assert!(response.contains("200 OK"));
     let (_, body) = response
         .split_once("\r\n\r\n")
         .expect("response should contain body");
     let parsed: HealthResponse =
         serde_json::from_str(body.trim()).expect("health body should parse");
-    assert_eq!(parsed.status, "not_ready");
+    assert_eq!(parsed.status, "ok");
     assert_eq!(parsed.broker_auth_mode, "public");
-    assert!(!parsed.join_auth_ready);
-    assert!(parsed
-        .message
-        .as_deref()
-        .unwrap_or_default()
-        .contains("boundary"));
+    assert!(parsed.join_auth_ready);
+    assert!(parsed.message.is_none());
+}
+
+#[tokio::test]
+async fn public_relay_ws_token_can_join_broker() {
+    let address = spawn_public_mode_app().await;
+    let relay_token: RelayWsTokenResponse = public_post(
+        address,
+        "/api/public/relay/ws-token",
+        "relay-refresh-1",
+        &RelayWsTokenRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            relay_peer_id: "relay-1".to_string(),
+        },
+    )
+    .await;
+
+    assert_eq!(relay_token.relay_id, "relay-1");
+    assert_eq!(relay_token.broker_room_id, "room-a");
+
+    let url = format!(
+        "ws://{address}/ws/room-a?role=relay&peer_id=relay-1&join_ticket={}",
+        relay_token.relay_ws_token
+    );
+    let (mut socket, _) = connect_async(&url).await.expect("relay should connect");
+    let welcome = next_server_message(&mut socket).await;
+    match welcome {
+        ServerMessage::Welcome { peer_id, .. } => assert_eq!(peer_id, "relay-1"),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn public_pairing_and_device_tokens_work_end_to_end() {
+    let address = spawn_public_mode_app().await;
+
+    let relay_token: RelayWsTokenResponse = public_post(
+        address,
+        "/api/public/relay/ws-token",
+        "relay-refresh-1",
+        &RelayWsTokenRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            relay_peer_id: "relay-1".to_string(),
+        },
+    )
+    .await;
+    let relay_url = format!(
+        "ws://{address}/ws/room-a?role=relay&peer_id=relay-1&join_ticket={}",
+        relay_token.relay_ws_token
+    );
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    let pairing_token: PairingWsTokenResponse = public_post(
+        address,
+        "/api/public/pairing/ws-token",
+        "relay-refresh-1",
+        &PairingWsTokenRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            pairing_id: "pair-1".to_string(),
+            expires_at: u64::MAX - 1,
+        },
+    )
+    .await;
+    let pairing_url = format!(
+        "ws://{address}/ws/room-a?role=surface&join_ticket={}",
+        pairing_token.pairing_join_ticket
+    );
+    let (mut pairing_surface, _) = connect_async(&pairing_url)
+        .await
+        .expect("pairing surface should connect");
+    let _welcome = next_server_message(&mut pairing_surface).await;
+    pairing_surface
+        .close(None)
+        .await
+        .expect("pairing surface should close");
+    let _left = next_server_message(&mut relay).await;
+
+    let device_grant: DeviceGrantResponse = public_post(
+        address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-1".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(device_grant.device_id, "device-1");
+
+    let first_device_url = format!(
+        "ws://{address}/ws/room-a?role=surface&join_ticket={}",
+        device_grant.device_ws_token
+    );
+    let (mut device_surface, _) = connect_async(&first_device_url)
+        .await
+        .expect("device surface should connect");
+    let _welcome = next_server_message(&mut device_surface).await;
+    device_surface
+        .close(None)
+        .await
+        .expect("device surface should close");
+    let _left = next_server_message(&mut relay).await;
+
+    let refreshed: DeviceWsTokenResponse = reqwest::Client::new()
+        .post(format!("http://{address}/api/public/device/ws-token"))
+        .bearer_auth(&device_grant.device_refresh_token)
+        .send()
+        .await
+        .expect("refresh request should send")
+        .error_for_status()
+        .expect("refresh should succeed")
+        .json()
+        .await
+        .expect("refresh response should parse");
+    assert_eq!(refreshed.device_id, "device-1");
+
+    let second_device_url = format!(
+        "ws://{address}/ws/room-a?role=surface&join_ticket={}",
+        refreshed.device_ws_token
+    );
+    let (mut second_surface, _) = connect_async(&second_device_url)
+        .await
+        .expect("refreshed surface should connect");
+    let _welcome = next_server_message(&mut second_surface).await;
+    second_surface
+        .close(None)
+        .await
+        .expect("refreshed surface should close");
+    let _left = next_server_message(&mut relay).await;
+
+    let revoke: DeviceGrantRevokeResponse = public_post(
+        address,
+        "/api/public/devices/device-1/revoke",
+        "relay-refresh-1",
+        &DeviceGrantRevokeRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+        },
+    )
+    .await;
+    assert!(revoke.revoked);
+
+    let error_body = public_post_expect_status(
+        address,
+        "/api/public/device/ws-token",
+        &device_grant.device_refresh_token,
+        &serde_json::json!({}),
+        reqwest::StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    assert!(error_body.contains("invalid"));
+}
+
+#[tokio::test]
+async fn public_bulk_revoke_keeps_selected_device() {
+    let address = spawn_public_mode_app().await;
+
+    let _keep: DeviceGrantResponse = public_post(
+        address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "keep-me".to_string(),
+        },
+    )
+    .await;
+    let revoked: DeviceGrantResponse = public_post(
+        address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "revoke-me".to_string(),
+        },
+    )
+    .await;
+
+    let response: DeviceGrantBulkRevokeResponse = public_post(
+        address,
+        "/api/public/devices/revoke-others",
+        "relay-refresh-1",
+        &DeviceGrantBulkRevokeRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            keep_device_id: "keep-me".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(response.kept_device_id, "keep-me");
+    assert_eq!(response.revoked_device_ids, vec!["revoke-me".to_string()]);
+
+    let error_body = public_post_expect_status(
+        address,
+        "/api/public/device/ws-token",
+        &revoked.device_refresh_token,
+        &serde_json::json!({}),
+        reqwest::StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    assert!(error_body.contains("invalid"));
 }

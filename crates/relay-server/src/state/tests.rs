@@ -90,10 +90,12 @@ fn test_broker_config(
     crate::broker::BrokerConfig::from_parts(
         Some(broker_url.to_string()),
         None,
+        None,
         Some(channel_id.to_string()),
         Some(peer_id.to_string()),
         None,
         Some("test-broker-ticket-secret".to_string()),
+        None,
         None,
         None,
     )
@@ -109,9 +111,16 @@ fn issue_test_pairing_ticket(
     expires_in_seconds: Option<u64>,
 ) -> crate::protocol::PairingTicketView {
     let broker = test_broker_config(broker_url, channel_id, peer_id);
-    relay
-        .issue_pairing_ticket(&broker, expires_in_seconds)
-        .expect("pairing ticket should issue")
+    let prepared = relay
+        .prepare_pairing_ticket(expires_in_seconds)
+        .expect("pairing ticket should prepare");
+    relay.render_pairing_ticket_view(
+        &prepared,
+        broker.public_base_url(),
+        broker.broker_room_id(),
+        "test-pairing-join-ticket",
+        broker.relay_peer_id(),
+    )
 }
 
 fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
@@ -921,7 +930,10 @@ fn revoke_all_other_devices_keeps_selected_device_and_marks_others_revoked() {
 
     assert_eq!(kept_record.lifecycle_state, DeviceLifecycleState::Approved);
     assert_eq!(kept_record.broker_join_ticket_expires_at, Some(300));
-    assert_eq!(revoked_record.lifecycle_state, DeviceLifecycleState::Revoked);
+    assert_eq!(
+        revoked_record.lifecycle_state,
+        DeviceLifecycleState::Revoked
+    );
     assert_eq!(revoked_record.broker_join_ticket_expires_at, Some(400));
     assert_eq!(revoked_record.last_peer_id.as_deref(), Some("surface-drop"));
 }
