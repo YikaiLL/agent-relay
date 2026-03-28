@@ -20,13 +20,26 @@ export function parsePairingPayload(rawInput) {
   const json = new TextDecoder().decode(base64UrlToBytes(raw));
   const payload = JSON.parse(json);
 
-  if (
-    !payload.pairing_id ||
-    !payload.pairing_secret ||
-    !payload.broker_url ||
-    !payload.pairing_join_ticket
-  ) {
-    throw new Error("pairing payload is missing required fields");
+  const missingFields = [];
+  if (!payload.pairing_id) {
+    missingFields.push("pairing_id");
+  }
+  if (!payload.pairing_secret) {
+    missingFields.push("pairing_secret");
+  }
+  if (!payload.broker_url) {
+    missingFields.push("broker_url");
+  }
+  if (!payload.pairing_join_ticket) {
+    missingFields.push("pairing_join_ticket");
+  }
+  if (missingFields.length > 0) {
+    if (missingFields.length === 1 && missingFields[0] === "pairing_join_ticket") {
+      throw new Error(
+        "pairing link is outdated and missing pairing_join_ticket; generate a new QR or pairing link from the local relay"
+      );
+    }
+    throw new Error(`pairing payload is missing required fields: ${missingFields.join(", ")}`);
   }
 
   return payload;

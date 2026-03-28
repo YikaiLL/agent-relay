@@ -1118,6 +1118,22 @@ fn remote_action_replay_cache_blocks_inflight_duplicates() {
 }
 
 #[test]
+fn remote_action_replay_cache_rejects_action_id_reuse_for_different_action_kind() {
+    let mut relay = test_state();
+    relay.store_remote_action_result(
+        "device-a",
+        "act-2",
+        test_cached_remote_action_result("send_message", true),
+        100,
+    );
+
+    let error = relay
+        .reserve_remote_action("device-a", "act-2", "list_threads", 101)
+        .expect_err("reusing an action_id for a different action should fail");
+    assert!(error.contains("different remote action"));
+}
+
+#[test]
 fn remote_action_replay_cache_expires_old_entries() {
     let mut relay = test_state();
     relay.store_remote_action_result(

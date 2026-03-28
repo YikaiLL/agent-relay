@@ -206,3 +206,23 @@ test("expired device broker access refreshes automatically during reconnect", as
   FakeWebSocket.instances[1].emit("open");
   assert.equal(state.socketConnected, true);
 });
+
+test("old pairing links without pairing_join_ticket are rejected with a clear error", async () => {
+  const { parsePairingPayload } = await import("./crypto.js");
+  const payload = {
+    broker_channel_id: "dev-room",
+    broker_url: "ws://192.168.1.105:8788",
+    expires_at: 1774731071,
+    pairing_id: "pair-z55kwjolad",
+    pairing_secret: "PdNAR62HZGWivFxf7Wo25rlGFxWH8PSD",
+    relay_peer_id: "local-relay",
+    security_mode: "private",
+    version: 1,
+  };
+  const raw = Buffer.from(JSON.stringify(payload)).toString("base64url");
+
+  assert.throws(
+    () => parsePairingPayload(raw),
+    /pairing link is outdated and missing pairing_join_ticket/
+  );
+});

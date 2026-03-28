@@ -9,8 +9,8 @@ pub use state::BrokerState;
 use std::path::PathBuf;
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
-    sync::Arc,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -47,12 +47,14 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const DEFAULT_PUBLIC_API_RATE_LIMIT_PER_MINUTE: usize = 120;
 const DEFAULT_JOIN_RATE_LIMIT_PER_MINUTE: usize = 40;
 const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 
 const PUBLIC_API_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE";
 const JOIN_RATE_LIMIT_ENV: &str = "RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE";
 const PUBLISH_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE";
+const MAX_CONNECTIONS_PER_IP_ENV: &str = "RELAY_BROKER_MAX_CONNECTIONS_PER_IP";
 const MAX_TEXT_FRAME_BYTES_ENV: &str = "RELAY_BROKER_MAX_TEXT_FRAME_BYTES";
 const IDLE_TIMEOUT_SECS_ENV: &str = "RELAY_BROKER_IDLE_TIMEOUT_SECS";
 
@@ -96,6 +98,7 @@ struct VerifiedBrokerJoin {
 struct BrokerHardeningState {
     config: BrokerHardeningConfig,
     rate_limiter: SlidingWindowRateLimiter,
+    connection_tracker: ActiveConnectionTracker,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +106,7 @@ struct BrokerHardeningConfig {
     public_api_rate_limit_per_minute: usize,
     join_rate_limit_per_minute: usize,
     publish_rate_limit_per_minute: usize,
+    max_connections_per_ip: usize,
     max_text_frame_bytes: usize,
     idle_timeout: Duration,
 }
@@ -112,12 +116,23 @@ struct SlidingWindowRateLimiter {
     buckets: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
 }
 
+#[derive(Clone, Default)]
+struct ActiveConnectionTracker {
+    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+}
+
+struct ActiveConnectionPermit {
+    tracker: ActiveConnectionTracker,
+    remote_ip: IpAddr,
+}
+
 impl Default for BrokerHardeningConfig {
     fn default() -> Self {
         Self {
             public_api_rate_limit_per_minute: DEFAULT_PUBLIC_API_RATE_LIMIT_PER_MINUTE,
             join_rate_limit_per_minute: DEFAULT_JOIN_RATE_LIMIT_PER_MINUTE,
             publish_rate_limit_per_minute: DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE,
+            max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
             max_text_frame_bytes: DEFAULT_MAX_TEXT_FRAME_BYTES,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         }
@@ -138,6 +153,10 @@ impl BrokerHardeningConfig {
             publish_rate_limit_per_minute: parse_usize_env(
                 PUBLISH_RATE_LIMIT_ENV,
                 DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE,
+            )?,
+            max_connections_per_ip: parse_usize_env(
+                MAX_CONNECTIONS_PER_IP_ENV,
+                DEFAULT_MAX_CONNECTIONS_PER_IP,
             )?,
             max_text_frame_bytes: parse_usize_env(
                 MAX_TEXT_FRAME_BYTES_ENV,
@@ -166,6 +185,45 @@ impl SlidingWindowRateLimiter {
         }
         bucket.push_back(now);
         true
+    }
+}
+
+impl ActiveConnectionTracker {
+    fn try_acquire(&self, remote_ip: IpAddr, limit: usize) -> Option<ActiveConnectionPermit> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("active broker connection tracker should not be poisoned");
+        let entry = counts.entry(remote_ip).or_insert(0);
+        if *entry >= limit {
+            return None;
+        }
+        *entry += 1;
+        Some(ActiveConnectionPermit {
+            tracker: self.clone(),
+            remote_ip,
+        })
+    }
+
+    fn release(&self, remote_ip: IpAddr) {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("active broker connection tracker should not be poisoned");
+        let Some(entry) = counts.get_mut(&remote_ip) else {
+            return;
+        };
+        if *entry <= 1 {
+            counts.remove(&remote_ip);
+        } else {
+            *entry -= 1;
+        }
+    }
+}
+
+impl Drop for ActiveConnectionPermit {
+    fn drop(&mut self) {
+        self.tracker.release(self.remote_ip);
     }
 }
 
@@ -222,6 +280,14 @@ impl BrokerJoinVerifier {
         match self {
             Self::PublicControlPlane(control_plane) => Some(control_plane.clone()),
             _ => None,
+        }
+    }
+
+    fn client_join_error_message(&self) -> &'static str {
+        match self {
+            Self::SelfHosted(_) | Self::PublicControlPlane(_) | Self::Misconfigured(_) => {
+                "broker join rejected"
+            }
         }
     }
 
@@ -320,6 +386,7 @@ fn app_with_web_root_and_verifier_and_hardening(
             hardening: BrokerHardeningState {
                 config: hardening_config,
                 rate_limiter: SlidingWindowRateLimiter::default(),
+                connection_tracker: ActiveConnectionTracker::default(),
             },
         })
         .layer(TraceLayer::new_for_http())
@@ -453,6 +520,18 @@ async fn handle_socket(
         reject_socket(socket, "invalid_connection", "channel_id is required").await;
         return;
     }
+    let Some(_connection_permit) = state.hardening.connection_tracker.try_acquire(
+        remote_addr.ip(),
+        state.hardening.config.max_connections_per_ip,
+    ) else {
+        reject_socket(
+            socket,
+            "rate_limited",
+            "too many broker connections from this client",
+        )
+        .await;
+        return;
+    };
     if !state
         .hardening
         .rate_limiter
@@ -478,7 +557,19 @@ async fn handle_socket(
     ) {
         Ok(verified_join) => verified_join,
         Err(message) => {
-            reject_socket(socket, "join_rejected", &message).await;
+            debug!(
+                remote_ip = %remote_addr.ip(),
+                broker_room_id = %channel_id,
+                role = ?query.role,
+                reason = %scrub_sensitive_message(&message),
+                "broker join rejected"
+            );
+            reject_socket(
+                socket,
+                "join_rejected",
+                state.join_verifier.client_join_error_message(),
+            )
+            .await;
             return;
         }
     };
@@ -490,10 +581,16 @@ async fn handle_socket(
             .unwrap_or_else(|| generated_peer_id(query.role));
         if let Some(expected_peer_id) = verified_join.peer_id.as_deref() {
             if candidate != expected_peer_id {
+                debug!(
+                    remote_ip = %remote_addr.ip(),
+                    broker_room_id = %channel_id,
+                    role = ?query.role,
+                    "broker join rejected because the requested peer_id did not match the verified ticket"
+                );
                 reject_socket(
                     socket,
                     "join_rejected",
-                    "join_ticket peer_id does not match the requested peer",
+                    state.join_verifier.client_join_error_message(),
                 )
                 .await;
                 return;
@@ -508,7 +605,19 @@ async fn handle_socket(
                 if peer_id.is_none() && message.contains("is already connected") {
                     continue;
                 }
-                reject_socket(socket, "join_rejected", &message).await;
+                debug!(
+                    remote_ip = %remote_addr.ip(),
+                    broker_room_id = %channel_id,
+                    role = ?query.role,
+                    reason = %scrub_sensitive_message(&message),
+                    "broker join failed"
+                );
+                reject_socket(
+                    socket,
+                    "join_rejected",
+                    state.join_verifier.client_join_error_message(),
+                )
+                .await;
                 return;
             }
         }
@@ -775,11 +884,15 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<ApiErrorB
 }
 
 fn public_api_error(message: String) -> (StatusCode, Json<ApiErrorBody>) {
-    let message = scrub_sensitive_message(&message);
-    let status = if message.contains("invalid") || message.contains("does not match") {
+    let status = if public_api_auth_failure(&message) {
         StatusCode::UNAUTHORIZED
     } else {
         StatusCode::BAD_REQUEST
+    };
+    let message = if status == StatusCode::UNAUTHORIZED {
+        "request failed".to_string()
+    } else {
+        scrub_sensitive_message(&message)
     };
     (
         status,
@@ -792,6 +905,13 @@ fn public_api_error(message: String) -> (StatusCode, Json<ApiErrorBody>) {
             message,
         }),
     )
+}
+
+fn public_api_auth_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid")
+        || lower.contains("does not match")
+        || lower.contains("missing bearer token")
 }
 
 async fn enforce_public_api_rate_limit(

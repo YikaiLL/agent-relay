@@ -445,7 +445,7 @@ async fn missing_join_ticket_gets_error_frame() {
     match error {
         ServerMessage::Error { code, message } => {
             assert_eq!(code, "join_rejected");
-            assert!(message.contains("join_ticket"));
+            assert_eq!(message, "broker join rejected");
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -467,7 +467,7 @@ async fn expired_join_ticket_gets_error_frame() {
     match error {
         ServerMessage::Error { code, message } => {
             assert_eq!(code, "join_rejected");
-            assert!(message.contains("expired"));
+            assert_eq!(message, "broker join rejected");
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -726,7 +726,7 @@ async fn public_pairing_and_device_tokens_work_end_to_end() {
         reqwest::StatusCode::UNAUTHORIZED,
     )
     .await;
-    assert!(error_body.contains("invalid"));
+    assert!(error_body.contains("request failed"));
 }
 
 #[tokio::test]
@@ -778,7 +778,7 @@ async fn public_bulk_revoke_keeps_selected_device() {
         reqwest::StatusCode::UNAUTHORIZED,
     )
     .await;
-    assert!(error_body.contains("invalid"));
+    assert!(error_body.contains("request failed"));
 }
 
 #[tokio::test]
@@ -814,7 +814,7 @@ async fn public_device_ws_tokens_can_refresh_after_expiry() {
     match expired_error {
         ServerMessage::Error { code, message } => {
             assert_eq!(code, "join_rejected");
-            assert!(message.contains("expired"));
+            assert_eq!(message, "broker join rejected");
         }
         other => panic!("unexpected expired token response: {other:?}"),
     }
@@ -924,7 +924,7 @@ async fn public_device_refresh_tokens_fail_after_revoke() {
         reqwest::StatusCode::UNAUTHORIZED,
     )
     .await;
-    assert!(error_body.contains("invalid"));
+    assert!(error_body.contains("request failed"));
 }
 
 #[tokio::test]
@@ -1005,6 +1005,49 @@ async fn websocket_join_rate_limit_is_enforced() {
             assert!(message.contains("rate limit"));
         }
         other => panic!("unexpected join rate limit response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn websocket_connection_limit_is_enforced_per_ip() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            max_connections_per_ip: 1,
+            ..BrokerHardeningConfig::default()
+        },
+    )
+    .await;
+    let first_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-connection-limit-1", u64::MAX),
+    );
+    let second_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-connection-limit-2", u64::MAX),
+    );
+
+    let (mut first_socket, _) = connect_async(&first_url)
+        .await
+        .expect("first socket should connect");
+    let _welcome = next_server_message(&mut first_socket).await;
+
+    let (mut second_socket, _) = connect_async(&second_url)
+        .await
+        .expect("second socket should connect");
+    let error = next_server_message(&mut second_socket).await;
+    match error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "rate_limited");
+            assert!(message.contains("too many broker connections"));
+        }
+        other => panic!("unexpected connection limit response: {other:?}"),
     }
 }
 

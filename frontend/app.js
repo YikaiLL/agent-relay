@@ -12,6 +12,7 @@ const state = {
   deviceId: loadOrCreateDeviceId(),
   defaultsSeeded: false,
   newSessionPanelOpen: false,
+  pendingPairingIds: [],
   selectedCwd: "",
   session: null,
   sessionStream: null,
@@ -583,6 +584,7 @@ function renderSession(session) {
   state.session = session;
 
   const approval = session.pending_approvals[0] || null;
+  const pendingPairings = session.pending_pairing_requests || [];
   const activeThread = resolveActiveThread(session.active_thread_id);
   const hasActiveSession = Boolean(session.active_thread_id);
   const canWrite = canCurrentDeviceWrite(session);
@@ -598,6 +600,10 @@ function renderSession(session) {
   if (approval) {
     statusBadge.textContent = "Approval required";
     statusBadge.className = "status-badge status-badge-alert";
+  } else if (pendingPairings.length > 0) {
+    statusBadge.textContent =
+      pendingPairings.length === 1 ? "Pairing request" : `${pendingPairings.length} pairing requests`;
+    statusBadge.className = "status-badge status-badge-alert";
   } else if (!session.codex_connected) {
     statusBadge.textContent = "Offline";
     statusBadge.className = "status-badge status-badge-offline";
@@ -610,7 +616,8 @@ function renderSession(session) {
   renderSessionMeta(session);
   renderPairingPanel();
   renderDeviceRecords(session.device_records || []);
-  renderPendingPairingRequests(session.pending_pairing_requests || []);
+  renderPendingPairingRequests(pendingPairings);
+  announceNewPendingPairings(pendingPairings);
   renderControlBanner(session);
   renderTranscript(session, approval);
   renderLogs(session.logs);
@@ -625,6 +632,21 @@ function renderSession(session) {
     : canWrite
       ? "Message Codex..."
       : "Another device has control. Take over to reply.";
+}
+
+function announceNewPendingPairings(requests) {
+  const pendingIds = requests.map((request) => request.pairing_id);
+  const newRequests = requests.filter((request) => !state.pendingPairingIds.includes(request.pairing_id));
+  state.pendingPairingIds = pendingIds;
+
+  if (!newRequests.length) {
+    return;
+  }
+
+  const labels = newRequests.map((request) => request.label || shortId(request.device_id));
+  const summary =
+    labels.length === 1 ? labels[0] : `${labels.length} devices`;
+  logLine(`Local pairing approval required for ${summary}.`);
 }
 
 function renderPairingPanel() {
