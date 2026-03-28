@@ -716,7 +716,6 @@ impl AppState {
         let mut relay = self.relay.write().await;
         relay.store_remote_action_result(device_id, action_id, result, unix_now());
     }
-
 }
 
 #[derive(Debug)]

@@ -8,7 +8,9 @@ use tokio::sync::watch;
 
 use crate::{
     codex::ThreadSyncData,
-    protocol::{ApprovalReceipt, LogEntryView, SessionSnapshot, ThreadSummaryView, ThreadsResponse},
+    protocol::{
+        ApprovalReceipt, LogEntryView, SessionSnapshot, ThreadSummaryView, ThreadsResponse,
+    },
 };
 
 use super::{
@@ -534,8 +536,7 @@ impl RelayState {
             CachedRemoteActionState::Completed { result, .. } => {
                 if result.action_kind != action_kind {
                     return Err(
-                        "action_id has already been used for a different remote action"
-                            .to_string(),
+                        "action_id has already been used for a different remote action".to_string(),
                     );
                 }
                 Ok(RemoteActionReplayDecision::Replay(result.clone()))

@@ -22,7 +22,11 @@ use crate::public_control::{
 };
 
 async fn spawn_app() -> SocketAddr {
-    spawn_app_with(BrokerJoinVerifier::SelfHosted(test_join_ticket_key()), BrokerHardeningConfig::default()).await
+    spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+    )
+    .await
 }
 
 async fn spawn_app_with(
@@ -40,16 +44,22 @@ async fn spawn_app_with(
         hardening,
     );
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .expect("broker should serve");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("broker should serve");
     });
     address
 }
 
 async fn spawn_public_mode_app() -> SocketAddr {
-    spawn_public_mode_app_with(test_public_control_plane().await, BrokerHardeningConfig::default())
-        .await
+    spawn_public_mode_app_with(
+        test_public_control_plane().await,
+        BrokerHardeningConfig::default(),
+    )
+    .await
 }
 
 async fn spawn_public_mode_app_with(
@@ -67,9 +77,12 @@ async fn spawn_public_mode_app_with(
         hardening,
     );
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .expect("broker should serve");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("broker should serve");
     });
     address
 }
@@ -1050,9 +1063,12 @@ async fn idle_connections_are_closed() {
 
     let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
     let _welcome = next_server_message(&mut socket).await;
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), next_server_message(&mut socket))
-        .await
-        .expect("socket should receive an idle-timeout frame");
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        next_server_message(&mut socket),
+    )
+    .await
+    .expect("socket should receive an idle-timeout frame");
     match error {
         ServerMessage::Error { code, message } => {
             assert_eq!(code, "idle_timeout");

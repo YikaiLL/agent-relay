@@ -23,6 +23,7 @@
 # Local planning docs
 /markdown
 /.agent-relay
+/.githooks
 
 # macOS
 .DS_Store

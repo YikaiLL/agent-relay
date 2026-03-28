@@ -494,7 +494,8 @@ pub(super) async fn handle_encrypted_remote_action(
         action_kind,
         cached,
     )
-    .await {
+    .await
+    {
         Ok(()) => Ok(()),
         Err(publish_error) if publish_error.contains("device is not paired") => {
             state
