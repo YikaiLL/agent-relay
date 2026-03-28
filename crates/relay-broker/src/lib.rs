@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod join_ticket;
 pub mod protocol;
 mod state;
@@ -6,11 +7,13 @@ pub use state::BrokerState;
 
 use std::path::PathBuf;
 
+use auth::BrokerAuthMode;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -26,26 +29,114 @@ use tower_http::{
 use tracing::{debug, warn};
 
 pub fn app(state: BrokerState) -> Router {
-    let join_ticket_key = match JoinTicketKey::from_env_var(JOIN_TICKET_SECRET_ENV) {
-        Ok(key) => key,
-        Err(error) => {
-            warn!(%error, "broker join-ticket auth is misconfigured");
-            None
-        }
-    };
-    app_with_web_root_and_key(state, default_web_root(), join_ticket_key)
+    let join_verifier = BrokerJoinVerifier::from_env();
+    app_with_web_root_and_verifier(state, default_web_root(), join_verifier)
 }
 
 #[derive(Clone)]
 struct BrokerAppState {
     broker: BrokerState,
-    join_ticket_key: Option<JoinTicketKey>,
+    join_verifier: BrokerJoinVerifier,
 }
 
-fn app_with_web_root_and_key(
+#[derive(Clone)]
+enum BrokerJoinVerifier {
+    SelfHosted(JoinTicketKey),
+    PublicControlPlane,
+    Misconfigured(String),
+}
+
+#[derive(Debug)]
+struct VerifiedBrokerJoin {
+    peer_id: Option<String>,
+}
+
+impl BrokerJoinVerifier {
+    fn from_env() -> Self {
+        match BrokerAuthMode::from_env() {
+            Ok(BrokerAuthMode::SelfHostedSharedSecret) => {
+                match JoinTicketKey::from_env_var(JOIN_TICKET_SECRET_ENV) {
+                    Ok(Some(key)) => Self::SelfHosted(key),
+                    Ok(None) => Self::Misconfigured(format!(
+                        "{JOIN_TICKET_SECRET_ENV} is required in self-hosted broker auth mode"
+                    )),
+                    Err(error) => Self::Misconfigured(error),
+                }
+            }
+            Ok(BrokerAuthMode::PublicControlPlane) => Self::PublicControlPlane,
+            Err(error) => Self::Misconfigured(error),
+        }
+    }
+
+    fn verify_connection(
+        &self,
+        join_ticket: Option<&str>,
+        broker_room_id: &str,
+        role: protocol::PeerRole,
+    ) -> Result<VerifiedBrokerJoin, String> {
+        match self {
+            Self::SelfHosted(key) => verify_self_hosted_join_ticket_for_connection(
+                key,
+                join_ticket,
+                broker_room_id,
+                role,
+            )
+            .map(|claims| VerifiedBrokerJoin {
+                peer_id: claims.peer_id,
+            }),
+            Self::PublicControlPlane => Err(
+                "public broker auth mode is only a boundary scaffold right now; hosted control-plane token verification is not wired yet"
+                    .to_string(),
+            ),
+            Self::Misconfigured(error) => Err(error.clone()),
+        }
+    }
+
+    fn health_response(&self) -> (StatusCode, HealthResponse) {
+        match self {
+            Self::SelfHosted(_) => (
+                StatusCode::OK,
+                HealthResponse {
+                    status: "ok".to_string(),
+                    service: "relay-broker".to_string(),
+                    broker_auth_mode: BrokerAuthMode::SelfHostedSharedSecret
+                        .as_str()
+                        .to_string(),
+                    join_auth_ready: true,
+                    message: None,
+                },
+            ),
+            Self::PublicControlPlane => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                HealthResponse {
+                    status: "not_ready".to_string(),
+                    service: "relay-broker".to_string(),
+                    broker_auth_mode: BrokerAuthMode::PublicControlPlane.as_str().to_string(),
+                    join_auth_ready: false,
+                    message: Some(
+                        "public auth plane boundary exists, but hosted token verification is not wired yet"
+                            .to_string(),
+                    ),
+                },
+            ),
+            Self::Misconfigured(error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                HealthResponse {
+                    status: "misconfigured".to_string(),
+                    service: "relay-broker".to_string(),
+                    broker_auth_mode: "unknown".to_string(),
+                    join_auth_ready: false,
+                    message: Some(error.clone()),
+                },
+            ),
+        }
+    }
+}
+
+fn app_with_web_root_and_verifier(
     state: BrokerState,
     web_root: PathBuf,
-    join_ticket_key: Option<JoinTicketKey>,
+    join_verifier: BrokerJoinVerifier,
 ) -> Router {
     if !web_root.join("remote.html").exists() {
         warn!(
@@ -53,11 +144,17 @@ fn app_with_web_root_and_key(
             "broker web assets are missing; run `npm run build` before serving the remote UI"
         );
     }
-    if join_ticket_key.is_none() {
-        warn!(
-            env = JOIN_TICKET_SECRET_ENV,
-            "broker websocket joins will be rejected until a join-ticket secret is configured"
-        );
+    match &join_verifier {
+        BrokerJoinVerifier::SelfHosted(_) => {}
+        BrokerJoinVerifier::PublicControlPlane => {
+            warn!(
+                mode = BrokerAuthMode::PublicControlPlane.as_str(),
+                "public broker auth mode is boundary-only right now; hosted verifier integration is not wired yet"
+            );
+        }
+        BrokerJoinVerifier::Misconfigured(error) => {
+            warn!(%error, "broker websocket joins will be rejected");
+        }
     }
     Router::new()
         .route("/api/health", get(health))
@@ -72,16 +169,14 @@ fn app_with_web_root_and_key(
         .nest_service("/static", ServeDir::new(web_root))
         .with_state(BrokerAppState {
             broker: state,
-            join_ticket_key,
+            join_verifier,
         })
         .layer(TraceLayer::new_for_http())
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        service: "relay-broker".to_string(),
-    })
+async fn health(State(state): State<BrokerAppState>) -> impl IntoResponse {
+    let (status, payload) = state.join_verifier.health_response();
+    (status, Json(payload))
 }
 
 async fn websocket(
@@ -104,34 +199,24 @@ async fn handle_socket(
         return;
     }
 
-    let Some(join_ticket_key) = state.join_ticket_key.as_ref() else {
-        reject_socket(
-            socket,
-            "join_rejected",
-            "broker join auth is not configured",
-        )
-        .await;
-        return;
-    };
-    let claims = match verify_join_ticket_for_connection(
-        join_ticket_key,
+    let verified_join = match state.join_verifier.verify_connection(
         query.join_ticket.as_deref(),
         &channel_id,
         query.role,
     ) {
-        Ok(claims) => claims,
+        Ok(verified_join) => verified_join,
         Err(message) => {
             reject_socket(socket, "join_rejected", &message).await;
             return;
         }
     };
 
-    let mut peer_id = trimmed(query.peer_id).or_else(|| claims.peer_id.clone());
+    let mut peer_id = trimmed(query.peer_id).or_else(|| verified_join.peer_id.clone());
     let join = loop {
         let candidate = peer_id
             .clone()
             .unwrap_or_else(|| generated_peer_id(query.role));
-        if let Some(expected_peer_id) = claims.peer_id.as_deref() {
+        if let Some(expected_peer_id) = verified_join.peer_id.as_deref() {
             if candidate != expected_peer_id {
                 reject_socket(
                     socket,
@@ -268,10 +353,10 @@ fn generated_peer_id(role: protocol::PeerRole) -> String {
     format!("{prefix}-{suffix}")
 }
 
-fn verify_join_ticket_for_connection(
+fn verify_self_hosted_join_ticket_for_connection(
     key: &JoinTicketKey,
     join_ticket: Option<&str>,
-    channel_id: &str,
+    broker_room_id: &str,
     role: protocol::PeerRole,
 ) -> Result<JoinTicketClaims, String> {
     let join_ticket = join_ticket
@@ -279,7 +364,7 @@ fn verify_join_ticket_for_connection(
         .filter(|ticket| !ticket.is_empty())
         .ok_or_else(|| "join_ticket is required".to_string())?;
     let claims = key.verify(join_ticket)?;
-    if claims.channel_id != channel_id {
+    if claims.channel_id != broker_room_id {
         return Err("join_ticket channel does not match this broker room".to_string());
     }
     if claims.role != role {

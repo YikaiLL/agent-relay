@@ -122,16 +122,18 @@ impl RelayState {
                 expires_at,
             },
         );
-        let pairing_join_ticket = broker.pairing_join_ticket(&pairing_id, expires_at)?;
+        let pairing_join_ticket = broker
+            .pairing_join_credential(&pairing_id, expires_at)?
+            .token;
 
         let pairing_payload = pairing_payload(
             &pairing_id,
             &pairing_secret,
             expires_at,
             broker.public_base_url(),
-            &broker.channel_id,
+            broker.broker_room_id(),
             &pairing_join_ticket,
-            &broker.peer_id,
+            broker.relay_peer_id(),
             self.security.mode(),
         );
         let pairing_url = pairing_url(broker.public_base_url(), &pairing_payload);
@@ -142,9 +144,9 @@ impl RelayState {
             pairing_secret,
             expires_at,
             broker_url: broker.public_base_url().to_string(),
-            broker_channel_id: broker.channel_id.clone(),
+            broker_channel_id: broker.broker_room_id().to_string(),
             pairing_join_ticket,
-            relay_peer_id: broker.peer_id.clone(),
+            relay_peer_id: broker.relay_peer_id().to_string(),
             security_mode: self.security.mode(),
             pairing_payload,
             pairing_url,

@@ -1,5 +1,11 @@
 import { renderLog, updateStatusBadge } from "./render.js";
-import { clearSocketPeerId, connectionTarget, setSocketPeerId, state } from "./state.js";
+import {
+  clearSocketPeerId,
+  connectionTarget,
+  hasExpiredDeviceJoinTicket,
+  setSocketPeerId,
+  state,
+} from "./state.js";
 
 let onBrokerReady = () => {};
 let onBrokerPayload = async () => {};
@@ -16,6 +22,10 @@ export function configureBrokerClient(handlers) {
 export function connectBroker(reason) {
   const target = connectionTarget();
   if (!target) {
+    if (hasExpiredDeviceJoinTicket()) {
+      renderLog("Saved device broker access has expired. Re-pair this device to reconnect.");
+      return;
+    }
     renderLog("Broker connect skipped because no pairing or saved device is present.");
     return;
   }

@@ -1,3 +1,4 @@
+mod auth;
 mod crypto;
 mod remote_actions;
 mod session_claim;
@@ -7,7 +8,7 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use relay_broker::join_ticket::{JoinTicketClaims, JoinTicketKey, JOIN_TICKET_SECRET_ENV};
+use relay_broker::auth::{BrokerAuthMode, BROKER_AUTH_MODE_ENV};
 use relay_broker::protocol::{ClientMessage, PeerRole, PresenceKind, ServerMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +22,7 @@ use crate::{
     state::{AppState, BrokerPendingMessage},
 };
 
+use self::auth::{BrokerAuthConfig, BrokerJoinCredential, RELAY_BROKER_RELAY_WS_TOKEN_ENV};
 use self::crypto::{decrypt_json, encrypt_json, EncryptedEnvelope};
 use self::remote_actions::{
     handle_encrypted_remote_action, handle_remote_action, RemoteActionKind, RemoteActionRequest,
@@ -35,9 +37,9 @@ type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 pub struct BrokerConfig {
     public_base_url: String,
     url: Url,
-    pub channel_id: String,
-    pub peer_id: String,
-    join_ticket_key: JoinTicketKey,
+    broker_room_id: String,
+    relay_peer_id: String,
+    auth: BrokerAuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,31 +125,39 @@ impl BrokerConfig {
             std::env::var("RELAY_BROKER_PUBLIC_URL").ok(),
             std::env::var("RELAY_BROKER_CHANNEL_ID").ok(),
             std::env::var("RELAY_BROKER_PEER_ID").ok(),
-            std::env::var(JOIN_TICKET_SECRET_ENV).ok(),
+            std::env::var(BROKER_AUTH_MODE_ENV).ok(),
+            std::env::var(relay_broker::join_ticket::JOIN_TICKET_SECRET_ENV).ok(),
+            std::env::var(RELAY_BROKER_RELAY_WS_TOKEN_ENV).ok(),
+            std::env::var(self::auth::RELAY_BROKER_DEVICE_JOIN_TTL_SECS_ENV).ok(),
         )
     }
 
     pub(crate) fn from_parts(
         url: Option<String>,
         public_url: Option<String>,
-        channel_id: Option<String>,
-        peer_id: Option<String>,
+        broker_room_id: Option<String>,
+        relay_peer_id: Option<String>,
+        auth_mode: Option<String>,
         join_ticket_secret: Option<String>,
+        relay_ws_token: Option<String>,
+        device_join_ttl_secs: Option<String>,
     ) -> Result<Option<Self>, String> {
         let Some(url) = url.and_then(trimmed_string) else {
             return Ok(None);
         };
-        let channel_id = trimmed(channel_id).ok_or_else(|| {
+        let broker_room_id = trimmed(broker_room_id).ok_or_else(|| {
             "RELAY_BROKER_CHANNEL_ID is required when RELAY_BROKER_URL is set".to_string()
         })?;
-        let peer_id = trimmed(peer_id).unwrap_or_else(|| "local-relay".to_string());
+        let relay_peer_id = trimmed(relay_peer_id).unwrap_or_else(|| "local-relay".to_string());
         let public_url = public_url
             .and_then(trimmed_string)
             .unwrap_or_else(|| url.clone());
-        let join_ticket_secret = trimmed(join_ticket_secret).ok_or_else(|| {
-            format!("{JOIN_TICKET_SECRET_ENV} is required when RELAY_BROKER_URL is set")
-        })?;
-        let join_ticket_key = JoinTicketKey::from_secret(join_ticket_secret.as_bytes())?;
+        let auth = BrokerAuthConfig::from_parts(
+            auth_mode,
+            join_ticket_secret,
+            relay_ws_token,
+            device_join_ttl_secs,
+        )?;
 
         let mut url = Url::parse(&url)
             .map_err(|error| format!("invalid RELAY_BROKER_URL `{url}`: {error}"))?;
@@ -173,23 +183,16 @@ impl BrokerConfig {
             })?;
             segments.clear();
             segments.push("ws");
-            segments.push(&channel_id);
+            segments.push(&broker_room_id);
         }
-        url.query_pairs_mut()
-            .clear()
-            .append_pair("peer_id", &peer_id)
-            .append_pair("role", "relay")
-            .append_pair(
-                "join_ticket",
-                &join_ticket_key.mint(&JoinTicketClaims::relay_join(&channel_id, &peer_id))?,
-            );
+        auth.apply_relay_connect_query(&mut url, &broker_room_id, &relay_peer_id)?;
 
         Ok(Some(Self {
             public_base_url,
             url,
-            channel_id,
-            peer_id,
-            join_ticket_key,
+            broker_room_id,
+            relay_peer_id,
+            auth,
         }))
     }
 
@@ -197,25 +200,37 @@ impl BrokerConfig {
         &self.public_base_url
     }
 
-    pub fn pairing_join_ticket(&self, pairing_id: &str, expires_at: u64) -> Result<String, String> {
-        self.join_ticket_key
-            .mint(&JoinTicketClaims::pairing_surface_join(
-                &self.channel_id,
-                pairing_id,
-                expires_at,
-            ))
+    pub(crate) fn auth_mode(&self) -> BrokerAuthMode {
+        self.auth.mode()
     }
 
-    pub fn device_join_ticket(&self, device_id: &str) -> Result<String, String> {
-        self.join_ticket_key
-            .mint(&JoinTicketClaims::device_surface_join(
-                &self.channel_id,
-                device_id,
-            ))
+    pub(crate) fn device_join_ttl_secs(&self) -> Option<u64> {
+        self.auth.device_join_ttl_secs()
     }
 
-    pub fn device_join_ticket_expires_at(&self) -> Option<u64> {
-        None
+    pub(crate) fn broker_room_id(&self) -> &str {
+        &self.broker_room_id
+    }
+
+    pub(crate) fn relay_peer_id(&self) -> &str {
+        &self.relay_peer_id
+    }
+
+    pub(crate) fn pairing_join_credential(
+        &self,
+        pairing_id: &str,
+        expires_at: u64,
+    ) -> Result<BrokerJoinCredential, String> {
+        self.auth
+            .pairing_join_credential(&self.broker_room_id, pairing_id, expires_at)
+    }
+
+    pub(crate) fn device_join_credential(
+        &self,
+        device_id: &str,
+    ) -> Result<BrokerJoinCredential, String> {
+        self.auth
+            .device_join_credential(&self.broker_room_id, device_id)
     }
 }
 
@@ -225,30 +240,51 @@ pub fn spawn_broker_task(state: AppState) -> Result<(), String> {
     };
 
     info!(
-        channel_id = config.channel_id,
-        peer_id = config.peer_id,
+        broker_room_id = config.broker_room_id(),
+        peer_id = config.relay_peer_id(),
+        broker_auth_mode = config.auth_mode().as_str(),
         broker_url = %config.url,
         "relay-server broker publishing is enabled"
     );
+    if config.auth_mode() == BrokerAuthMode::SelfHostedSharedSecret
+        && config.device_join_ttl_secs().is_none()
+    {
+        warn!(
+            "self-hosted device join tickets are configured as long-lived bearer credentials until revoke"
+        );
+    }
 
     let change_rx = state.subscribe();
     let broker_state = state.clone();
     tokio::spawn(async move {
         broker_state
             .set_broker_channel(
-                Some(config.channel_id.clone()),
-                Some(config.peer_id.clone()),
+                Some(config.broker_room_id().to_string()),
+                Some(config.relay_peer_id().to_string()),
             )
             .await;
         broker_state
             .push_runtime_log(
                 "info",
                 format!(
-                    "Broker publishing enabled for channel {} as {}.",
-                    config.channel_id, config.peer_id
+                    "Broker publishing enabled for room {} as {} using {} auth.",
+                    config.broker_room_id(),
+                    config.relay_peer_id(),
+                    config.auth_mode().as_str()
                 ),
             )
             .await;
+        if config.auth_mode() == BrokerAuthMode::SelfHostedSharedSecret
+            && config.device_join_ttl_secs().is_none()
+        {
+            broker_state
+                .push_runtime_log(
+                    "warn",
+                    "Device broker join tickets are long-lived bearer credentials until revoke."
+                        .to_string(),
+                )
+                .await;
+        }
         run_broker_loop(broker_state, change_rx, config).await;
     });
 
@@ -267,8 +303,8 @@ async fn run_broker_loop(
             }
             Err(error) => {
                 warn!(
-                    channel_id = config.channel_id,
-                    peer_id = config.peer_id,
+                    broker_room_id = config.broker_room_id(),
+                    peer_id = config.relay_peer_id(),
                     %error,
                     "broker session ended"
                 );
@@ -314,7 +350,7 @@ async fn run_broker_session(
     state
         .push_runtime_log(
             "info",
-            format!("Connected to broker channel {}.", config.channel_id),
+            format!("Connected to broker room {}.", config.broker_room_id()),
         )
         .await;
     publish_pending_broker_messages(&mut sender, state, config)
@@ -657,10 +693,10 @@ async fn publish_pairing_result(
     result: crate::state::PendingPairingResult,
     config: &BrokerConfig,
 ) -> Result<(), String> {
-    let device_join_ticket = result
+    let device_join_credential = result
         .device
         .as_ref()
-        .map(|device| config.device_join_ticket(&device.device_id))
+        .map(|device| config.device_join_credential(&device.device_id))
         .transpose()?;
     let encrypted = encrypt_json(
         &result.pairing_secret,
@@ -668,8 +704,12 @@ async fn publish_pairing_result(
             ok: result.error.is_none(),
             device: result.device,
             device_token: result.device_token,
-            device_join_ticket,
-            device_join_ticket_expires_at: config.device_join_ticket_expires_at(),
+            device_join_ticket: device_join_credential
+                .as_ref()
+                .map(|value| value.token.clone()),
+            device_join_ticket_expires_at: device_join_credential
+                .as_ref()
+                .and_then(|value| value.expires_at),
             error: result.error,
         },
     )?;

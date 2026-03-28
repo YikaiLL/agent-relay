@@ -41,7 +41,7 @@ export function connectionTarget() {
     };
   }
 
-  if (state.remoteAuth) {
+  if (state.remoteAuth && hasUsableDeviceJoinTicket()) {
     return {
       brokerUrl: state.remoteAuth.brokerUrl,
       brokerChannelId: state.remoteAuth.brokerChannelId,
@@ -50,6 +50,26 @@ export function connectionTarget() {
   }
 
   return null;
+}
+
+export function hasUsableDeviceJoinTicket(skewMs = 0) {
+  const ticket = state.remoteAuth?.deviceJoinTicket;
+  if (!ticket) {
+    return false;
+  }
+
+  const expiresAt = state.remoteAuth?.deviceJoinTicketExpiresAt;
+  if (!expiresAt) {
+    return true;
+  }
+
+  return expiresAt * 1000 > Date.now() + skewMs;
+}
+
+export function hasExpiredDeviceJoinTicket() {
+  const ticket = state.remoteAuth?.deviceJoinTicket;
+  const expiresAt = state.remoteAuth?.deviceJoinTicketExpiresAt;
+  return Boolean(ticket && expiresAt && expiresAt * 1000 <= Date.now());
 }
 
 export function clearSessionClaim() {

@@ -75,7 +75,10 @@ fn test_broker_config(
         None,
         Some(channel_id.to_string()),
         Some(peer_id.to_string()),
+        None,
         Some("test-broker-ticket-secret".to_string()),
+        None,
+        None,
     )
     .expect("broker config should parse")
     .expect("broker config should be enabled")

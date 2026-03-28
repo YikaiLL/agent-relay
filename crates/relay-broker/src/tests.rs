@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::*;
+use crate::auth::BrokerAuthMode;
 use crate::join_ticket::{JoinTicketClaims, JoinTicketKey};
 
 async fn spawn_app() -> SocketAddr {
@@ -19,10 +20,28 @@ async fn spawn_app() -> SocketAddr {
         .await
         .expect("listener should bind");
     let address = listener.local_addr().expect("listener should have address");
-    let app = app_with_web_root_and_key(
+    let app = app_with_web_root_and_verifier(
         BrokerState::default(),
         test_web_root(),
-        Some(test_join_ticket_key()),
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("broker should serve");
+    });
+    address
+}
+
+async fn spawn_public_mode_app() -> SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let app = app_with_web_root_and_verifier(
+        BrokerState::default(),
+        test_web_root(),
+        BrokerJoinVerifier::PublicControlPlane,
     );
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -350,7 +369,7 @@ async fn device_join_ticket_can_reconnect() {
         "room-a",
         protocol::PeerRole::Surface,
         None,
-        JoinTicketClaims::device_surface_join("room-a", "device-1"),
+        JoinTicketClaims::device_surface_join("room-a", "device-1", None),
     );
 
     let (mut relay, _) = connect_async(&relay_url)
@@ -407,4 +426,52 @@ async fn health_route_reports_ok() {
         serde_json::from_str(body.trim()).expect("health body should parse");
     assert_eq!(parsed.status, "ok");
     assert_eq!(parsed.service, "relay-broker");
+    assert_eq!(parsed.broker_auth_mode, "self_hosted");
+    assert!(parsed.join_auth_ready);
+    assert!(parsed.message.is_none());
+}
+
+#[tokio::test]
+async fn public_auth_plane_boundary_rejects_joins_until_hosted_verifier_exists() {
+    assert_eq!(BrokerAuthMode::PublicControlPlane.as_str(), "public");
+
+    let address = spawn_public_mode_app().await;
+    let url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
+    let error = next_server_message(&mut socket).await;
+    match error {
+        ServerMessage::Error { code, message } => {
+            assert_eq!(code, "join_rejected");
+            assert!(message.contains("control-plane"));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn public_auth_plane_health_reports_not_ready() {
+    let address = spawn_public_mode_app().await;
+    let response = http_get(address, "/api/health").await;
+
+    assert!(response.contains("503 Service Unavailable"));
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .expect("response should contain body");
+    let parsed: HealthResponse =
+        serde_json::from_str(body.trim()).expect("health body should parse");
+    assert_eq!(parsed.status, "not_ready");
+    assert_eq!(parsed.broker_auth_mode, "public");
+    assert!(!parsed.join_auth_ready);
+    assert!(parsed
+        .message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("boundary"));
 }

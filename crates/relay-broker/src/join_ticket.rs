@@ -138,7 +138,7 @@ impl JoinTicketClaims {
         }
     }
 
-    pub fn device_surface_join(channel_id: &str, device_id: &str) -> Self {
+    pub fn device_surface_join(channel_id: &str, device_id: &str, expires_at: Option<u64>) -> Self {
         Self {
             version: JOIN_TICKET_VERSION,
             kind: JoinTicketKind::DeviceSurfaceJoin,
@@ -147,7 +147,7 @@ impl JoinTicketClaims {
             peer_id: None,
             pairing_id: None,
             device_id: Some(device_id.to_string()),
-            expires_at: None,
+            expires_at,
             nonce: random_nonce(),
         }
     }

@@ -164,6 +164,8 @@ cargo run -p relay-server
 
 Notes:
 
+- `RELAY_BROKER_AUTH_MODE` defaults to `self_hosted`. That mode is the current
+  shared-secret join-ticket model for self-hosted or dedicated brokers.
 - `relay-server` still expects local Codex access and a real workspace, so it is
   usually better to run it on the workstation, VM, or jump host that already
   owns the repo and CLI session.
@@ -174,7 +176,15 @@ Notes:
   broker instance; they only differ in how the relay host versus remote devices
   reach that broker
 - `RELAY_BROKER_TICKET_SECRET` must be set to the same value on both the broker
-  and the relay-server, otherwise all websocket joins are rejected
+  and the relay-server in `self_hosted` mode, otherwise all websocket joins are
+  rejected
+- `RELAY_BROKER_DEVICE_JOIN_TTL_SECS` is optional in `self_hosted` mode. If it
+  is unset, paired-device broker join tickets stay valid until revoke; if it is
+  set, saved remote access expires after that many seconds and requires re-pairing.
+- `public` broker auth is a separate auth plane that will use hosted token
+  issuance and verification. The mode boundary now exists in code, but the
+  hosted verifier/token issuer is not wired yet, so `public` mode will reject
+  joins for now and `/api/health` will report the broker as not ready.
 - The broker remote surface is now installable as a PWA. Open the broker root,
   then use your browser's install action to pin it on a phone or desktop.
 - pairing and encrypted broker traffic now work on plain LAN `http://` pages, but

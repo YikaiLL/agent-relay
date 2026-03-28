@@ -63,4 +63,8 @@ pub struct ConnectQuery {
 pub struct HealthResponse {
     pub status: String,
     pub service: String,
+    pub broker_auth_mode: String,
+    pub join_auth_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }

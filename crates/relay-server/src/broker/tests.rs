@@ -11,7 +11,10 @@ fn broker_config_builds_websocket_url() {
         None,
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
+        None,
         Some("test-broker-ticket-secret".to_string()),
+        None,
+        None,
     )
     .expect("config should parse")
     .expect("config should be enabled");
@@ -24,6 +27,7 @@ fn broker_config_builds_websocket_url() {
     assert!(config.url.as_str().contains("peer_id=relay-1"));
     assert!(config.url.as_str().contains("role=relay"));
     assert!(config.url.as_str().contains("join_ticket="));
+    assert_eq!(config.auth_mode(), BrokerAuthMode::SelfHostedSharedSecret);
 }
 
 #[test]
@@ -33,7 +37,10 @@ fn broker_config_supports_distinct_public_url_for_pairing() {
         Some("ws://192.168.1.105:8788".to_string()),
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
+        None,
         Some("test-broker-ticket-secret".to_string()),
+        None,
+        None,
     )
     .expect("config should parse")
     .expect("config should be enabled");
@@ -48,7 +55,10 @@ fn broker_config_requires_channel() {
         None,
         None,
         Some("relay-1".to_string()),
+        None,
         Some("test-broker-ticket-secret".to_string()),
+        None,
+        None,
     )
     .expect_err("missing channel should fail");
     assert!(error.contains("RELAY_BROKER_CHANNEL_ID"));
@@ -61,7 +71,10 @@ fn broker_config_disables_when_url_is_missing() {
         None,
         Some("demo-room".to_string()),
         None,
+        None,
         Some("test-broker-ticket-secret".to_string()),
+        None,
+        None,
     )
     .expect("missing url should be accepted");
     assert!(config.is_none());
@@ -74,23 +87,90 @@ fn broker_config_rejects_invalid_public_url_scheme() {
         Some("http://192.168.1.105:8788".to_string()),
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
+        None,
         Some("test-broker-ticket-secret".to_string()),
+        None,
+        None,
     )
     .expect_err("invalid public url scheme should fail");
     assert!(error.contains("RELAY_BROKER_PUBLIC_URL"));
 }
 
 #[test]
-fn broker_config_requires_join_ticket_secret() {
+fn broker_config_requires_join_ticket_secret_in_self_hosted_mode() {
     let error = BrokerConfig::from_parts(
         Some("ws://127.0.0.1:8788".to_string()),
         None,
         Some("demo-room".to_string()),
         Some("relay-1".to_string()),
+        Some("self_hosted".to_string()),
+        None,
+        None,
         None,
     )
     .expect_err("missing ticket secret should fail");
-    assert!(error.contains(JOIN_TICKET_SECRET_ENV));
+    assert!(error.contains(relay_broker::join_ticket::JOIN_TICKET_SECRET_ENV));
+}
+
+#[test]
+fn broker_config_public_mode_uses_relay_ws_token_for_relay_connection() {
+    let config = BrokerConfig::from_parts(
+        Some("wss://broker.example.com".to_string()),
+        Some("wss://public-broker.example.com".to_string()),
+        Some("demo-room".to_string()),
+        Some("relay-1".to_string()),
+        Some("public".to_string()),
+        None,
+        Some("relay-ws-token".to_string()),
+        None,
+    )
+    .expect("config should parse")
+    .expect("config should be enabled");
+
+    assert_eq!(config.auth_mode(), BrokerAuthMode::PublicControlPlane);
+    assert!(config.url.as_str().contains("join_ticket=relay-ws-token"));
+    let error = config
+        .pairing_join_credential("pair-1", 123)
+        .expect_err("public mode pairing credentials are not wired yet");
+    assert!(error.contains("hosted pairing token issuance"));
+}
+
+#[test]
+fn broker_config_public_mode_requires_relay_ws_token() {
+    let error = BrokerConfig::from_parts(
+        Some("wss://broker.example.com".to_string()),
+        None,
+        Some("demo-room".to_string()),
+        Some("relay-1".to_string()),
+        Some("public".to_string()),
+        None,
+        None,
+        None,
+    )
+    .expect_err("public mode should require a relay ws token");
+    assert!(error.contains(RELAY_BROKER_RELAY_WS_TOKEN_ENV));
+}
+
+#[test]
+fn broker_config_self_hosted_can_issue_expiring_device_join_credentials() {
+    let config = BrokerConfig::from_parts(
+        Some("ws://127.0.0.1:8788".to_string()),
+        None,
+        Some("demo-room".to_string()),
+        Some("relay-1".to_string()),
+        Some("self_hosted".to_string()),
+        Some("test-broker-ticket-secret".to_string()),
+        None,
+        Some("3600".to_string()),
+    )
+    .expect("config should parse")
+    .expect("config should be enabled");
+
+    let credential = config
+        .device_join_credential("device-1")
+        .expect("device credential should mint");
+    assert!(credential.expires_at.is_some());
+    assert_eq!(config.device_join_ttl_secs(), Some(3600));
 }
 
 #[test]
