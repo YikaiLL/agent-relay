@@ -18,8 +18,8 @@ use super::{
 
 pub use self::approval::{ApprovalKind, PendingApproval};
 pub(crate) use self::device::{
-    BrokerPendingMessage, CompletedPairing, PairedDevice, PendingPairing, PendingPairingRequest,
-    PendingPairingResult,
+    BrokerPendingMessage, CompletedPairing, DeviceRecord, PairedDevice, PendingPairing,
+    PendingPairingRequest, PendingPairingResult,
 };
 pub(crate) use self::transcript::TranscriptRecord;
 
@@ -42,6 +42,7 @@ pub struct RelayState {
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
+    pub device_records: HashMap<String, DeviceRecord>,
     pub paired_devices: HashMap<String, PairedDevice>,
     pub pending_pairings: HashMap<String, PendingPairing>,
     pub pending_pairing_requests: HashMap<String, PendingPairingRequest>,
@@ -78,6 +79,7 @@ impl RelayState {
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
             sandbox: DEFAULT_SANDBOX.to_string(),
             reasoning_effort: DEFAULT_EFFORT.to_string(),
+            device_records: HashMap::new(),
             paired_devices: HashMap::new(),
             pending_pairings: HashMap::new(),
             pending_pairing_requests: HashMap::new(),
@@ -98,6 +100,34 @@ impl RelayState {
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
+        let mut device_records = self.device_records.clone();
+        for request in self.pending_pairing_requests.values() {
+            device_records.insert(
+                request.device_id.clone(),
+                DeviceRecord {
+                    device_id: request.device_id.clone(),
+                    label: request.label.clone(),
+                    lifecycle_state: crate::protocol::DeviceLifecycleState::Pending,
+                    created_at: request.requested_at,
+                    state_changed_at: request.requested_at,
+                    last_seen_at: None,
+                    last_peer_id: Some(request.broker_peer_id.clone()),
+                    device_verify_key: Some(request.device_verify_key.clone()),
+                    broker_join_ticket_expires_at: None,
+                },
+            );
+        }
+        let mut device_records = device_records
+            .values()
+            .cloned()
+            .map(|record| record.to_view())
+            .collect::<Vec<_>>();
+        device_records.sort_by(|left, right| {
+            device_state_sort_key(left.lifecycle_state)
+                .cmp(&device_state_sort_key(right.lifecycle_state))
+                .then_with(|| left.label.cmp(&right.label))
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        });
         let mut paired_devices = self
             .paired_devices
             .values()
@@ -137,6 +167,7 @@ impl RelayState {
             approval_policy: self.approval_policy.clone(),
             sandbox: self.sandbox.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            device_records,
             paired_devices,
             pending_pairing_requests,
             pending_approvals: self
@@ -228,7 +259,9 @@ impl RelayState {
         self.approval_policy = persisted.approval_policy.clone();
         self.sandbox = persisted.sandbox.clone();
         self.reasoning_effort = persisted.reasoning_effort.clone();
+        self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
+        self.backfill_device_records_from_paired_devices();
         self.pending_pairings.clear();
         self.pending_pairing_requests.clear();
         self.completed_pairings.clear();
@@ -390,7 +423,9 @@ impl RelayState {
         self.approval_policy = persisted.approval_policy.clone();
         self.sandbox = persisted.sandbox.clone();
         self.reasoning_effort = persisted.reasoning_effort.clone();
+        self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
+        self.backfill_device_records_from_paired_devices();
         self.pending_pairings.clear();
         self.pending_pairing_requests.clear();
         self.completed_pairings.clear();
@@ -416,5 +451,22 @@ impl RelayState {
         self.active_controller_device_id = Some(device_id.to_string());
         self.active_controller_last_seen_at = Some(now);
         changed
+    }
+
+    fn backfill_device_records_from_paired_devices(&mut self) {
+        for device in self.paired_devices.values() {
+            self.device_records
+                .entry(device.device_id.clone())
+                .or_insert_with(|| DeviceRecord::approved_from(device));
+        }
+    }
+}
+
+fn device_state_sort_key(state: crate::protocol::DeviceLifecycleState) -> u8 {
+    match state {
+        crate::protocol::DeviceLifecycleState::Pending => 0,
+        crate::protocol::DeviceLifecycleState::Approved => 1,
+        crate::protocol::DeviceLifecycleState::Rejected => 2,
+        crate::protocol::DeviceLifecycleState::Revoked => 3,
     }
 }

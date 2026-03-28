@@ -208,6 +208,10 @@ impl BrokerConfig {
         self.auth.device_join_ttl_secs()
     }
 
+    pub(crate) fn predicted_device_join_expires_at(&self, now: u64) -> Option<u64> {
+        self.auth.predicted_device_join_expires_at(now)
+    }
+
     pub(crate) fn broker_room_id(&self) -> &str {
         &self.broker_room_id
     }
@@ -228,9 +232,10 @@ impl BrokerConfig {
     pub(crate) fn device_join_credential(
         &self,
         device_id: &str,
+        expires_at: Option<u64>,
     ) -> Result<BrokerJoinCredential, String> {
         self.auth
-            .device_join_credential(&self.broker_room_id, device_id)
+            .device_join_credential(&self.broker_room_id, device_id, expires_at)
     }
 }
 
@@ -696,7 +701,9 @@ async fn publish_pairing_result(
     let device_join_credential = result
         .device
         .as_ref()
-        .map(|device| config.device_join_credential(&device.device_id))
+        .map(|device| {
+            config.device_join_credential(&device.device_id, result.device_join_ticket_expires_at)
+        })
         .transpose()?;
     let encrypted = encrypt_json(
         &result.pairing_secret,

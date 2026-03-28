@@ -844,19 +844,59 @@ select {
   min-width: 0;
 }
 
+.paired-device-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
 .paired-device-copy strong {
   display: block;
-  margin-bottom: 4px;
 }
 
 .paired-device-actions {
   display: grid;
   gap: 8px;
   flex-shrink: 0;
+  min-width: 136px;
 }
 
 .paired-device-badges {
   margin: 8px 0;
+}
+
+.paired-device-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px 12px;
+  margin: 10px 0 0;
+}
+
+.paired-device-field {
+  min-width: 0;
+}
+
+.paired-device-field dt {
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.paired-device-field dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.paired-device-id,
+.paired-device-fingerprint {
+  font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
 }
 
 .paired-device-meta {
@@ -864,6 +904,38 @@ select {
   color: var(--muted);
   font-size: 0.88rem;
   line-height: 1.45;
+}
+
+.device-state-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.device-state-approved {
+  background: rgba(32, 121, 78, 0.12);
+  color: #16653f;
+}
+
+.device-state-pending {
+  background: rgba(191, 122, 11, 0.14);
+  color: #9a5f00;
+}
+
+.device-state-rejected,
+.device-state-revoked {
+  background: rgba(180, 35, 24, 0.12);
+  color: var(--offline-text);
+}
+
+.device-state-neutral {
+  background: rgba(17, 17, 17, 0.06);
+  color: var(--text);
 }
 
 .workspace-form textarea {

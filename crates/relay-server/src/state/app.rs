@@ -7,10 +7,10 @@ use crate::{
     broker::BrokerConfig,
     codex::CodexBridge,
     protocol::{
-        ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, HeartbeatInput, PairingDecision,
-        PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
-        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-        StartSessionInput, TakeOverInput, ThreadsResponse,
+        ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, BulkRevokeDevicesReceipt,
+        HeartbeatInput, PairingDecision, PairingDecisionInput, PairingDecisionReceipt,
+        PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
+        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsResponse,
     },
 };
 
@@ -336,7 +336,7 @@ impl AppState {
 
     pub async fn revoke_device(&self, device_id: &str) -> Result<RevokeDeviceReceipt, String> {
         let mut relay = self.relay.write().await;
-        let revoked = relay.revoke_paired_device(device_id);
+        let revoked = relay.revoke_paired_device(device_id, unix_now());
         if revoked {
             relay.push_log("info", format!("Revoked paired device {device_id}."));
             relay.notify();
@@ -347,16 +347,46 @@ impl AppState {
         })
     }
 
+    pub async fn revoke_other_devices(
+        &self,
+        keep_device_id: &str,
+    ) -> Result<BulkRevokeDevicesReceipt, String> {
+        let mut relay = self.relay.write().await;
+        let revoked_device_ids = relay.revoke_all_other_paired_devices(keep_device_id, unix_now())?;
+        if !revoked_device_ids.is_empty() {
+            relay.push_log(
+                "info",
+                format!(
+                    "Revoked {} paired device(s) and kept {}.",
+                    revoked_device_ids.len(),
+                    keep_device_id
+                ),
+            );
+            relay.notify();
+        }
+        Ok(BulkRevokeDevicesReceipt {
+            kept_device_id: keep_device_id.to_string(),
+            revoked_count: revoked_device_ids.len(),
+            revoked_device_ids,
+        })
+    }
+
     pub async fn decide_pairing_request(
         &self,
         pairing_id: &str,
         input: PairingDecisionInput,
     ) -> Result<PairingDecisionReceipt, String> {
+        let broker = BrokerConfig::from_env()?.ok_or_else(|| {
+            "broker pairing is unavailable because RELAY_BROKER_URL is not configured".to_string()
+        })?;
+        let now = unix_now();
+        let device_join_ticket_expires_at = broker.predicted_device_join_expires_at(now);
         let mut relay = self.relay.write().await;
         let result = relay.decide_pairing_request(
             pairing_id,
             matches!(input.decision, PairingDecision::Approve),
-            unix_now(),
+            device_join_ticket_expires_at,
+            now,
         )?;
         let message = match input.decision {
             PairingDecision::Approve => {

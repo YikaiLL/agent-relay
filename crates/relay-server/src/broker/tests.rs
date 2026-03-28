@@ -167,7 +167,7 @@ fn broker_config_self_hosted_can_issue_expiring_device_join_credentials() {
     .expect("config should be enabled");
 
     let credential = config
-        .device_join_credential("device-1")
+        .device_join_credential("device-1", None)
         .expect("device credential should mint");
     assert!(credential.expires_at.is_some());
     assert_eq!(config.device_join_ttl_secs(), Some(3600));

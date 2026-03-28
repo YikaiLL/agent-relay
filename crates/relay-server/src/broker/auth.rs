@@ -112,15 +112,18 @@ impl BrokerAuthConfig {
         &self,
         broker_room_id: &str,
         device_id: &str,
+        expires_at_override: Option<u64>,
     ) -> Result<BrokerJoinCredential, String> {
         match self {
             Self::SelfHostedSharedSecret {
                 join_ticket_key,
                 device_join_ttl_secs,
             } => {
-                let expires_at = device_join_ttl_secs
+                let expires_at = expires_at_override.or_else(|| {
+                    device_join_ttl_secs
                     .map(|ttl| unix_now().saturating_add(ttl))
-                    .filter(|expires_at| *expires_at > 0);
+                    .filter(|expires_at| *expires_at > 0)
+                });
                 Ok(BrokerJoinCredential {
                     token: join_ticket_key.mint(&JoinTicketClaims::device_surface_join(
                         broker_room_id,
@@ -142,6 +145,16 @@ impl BrokerAuthConfig {
                 device_join_ttl_secs,
                 ..
             } => *device_join_ttl_secs,
+            Self::PublicControlPlane { .. } => None,
+        }
+    }
+
+    pub(crate) fn predicted_device_join_expires_at(&self, now: u64) -> Option<u64> {
+        match self {
+            Self::SelfHostedSharedSecret {
+                device_join_ttl_secs,
+                ..
+            } => device_join_ttl_secs.map(|ttl| now.saturating_add(ttl)),
             Self::PublicControlPlane { .. } => None,
         }
     }

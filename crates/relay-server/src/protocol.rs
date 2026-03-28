@@ -51,6 +51,15 @@ pub enum SecurityMode {
     Managed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceLifecycleState {
+    Pending,
+    Approved,
+    Rejected,
+    Revoked,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSnapshot {
     pub provider: &'static str,
@@ -76,6 +85,7 @@ pub struct SessionSnapshot {
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
+    pub device_records: Vec<DeviceRecordView>,
     pub paired_devices: Vec<PairedDeviceView>,
     pub pending_pairing_requests: Vec<PendingPairingRequestView>,
     pub pending_approvals: Vec<ApprovalRequestView>,
@@ -84,12 +94,28 @@ pub struct SessionSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DeviceRecordView {
+    pub device_id: String,
+    pub label: String,
+    pub lifecycle_state: DeviceLifecycleState,
+    pub created_at: u64,
+    pub state_changed_at: u64,
+    pub last_seen_at: Option<u64>,
+    pub last_peer_id: Option<String>,
+    pub broker_join_ticket_expires_at: Option<u64>,
+    pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PairedDeviceView {
     pub device_id: String,
     pub label: String,
+    pub lifecycle_state: DeviceLifecycleState,
     pub created_at: u64,
     pub last_seen_at: Option<u64>,
     pub last_peer_id: Option<String>,
+    pub broker_join_ticket_expires_at: Option<u64>,
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,8 +123,10 @@ pub struct PendingPairingRequestView {
     pub pairing_id: String,
     pub device_id: String,
     pub label: String,
+    pub lifecycle_state: DeviceLifecycleState,
     pub requested_at: u64,
     pub broker_peer_id: String,
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,6 +248,13 @@ pub struct PairingDecisionReceipt {
 pub struct RevokeDeviceReceipt {
     pub device_id: String,
     pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkRevokeDevicesReceipt {
+    pub kept_device_id: String,
+    pub revoked_device_ids: Vec<String>,
+    pub revoked_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

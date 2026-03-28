@@ -119,6 +119,12 @@ transcript.addEventListener("click", (event) => {
 });
 
 pairedDevicesList.addEventListener("click", (event) => {
+  const revokeOthersButton = event.target.closest("[data-revoke-others-except-device-id]");
+  if (revokeOthersButton) {
+    void revokeOtherDevices(revokeOthersButton.dataset.revokeOthersExceptDeviceId);
+    return;
+  }
+
   const revokeButton = event.target.closest("[data-revoke-device-id]");
   if (!revokeButton) {
     return;
@@ -399,6 +405,10 @@ async function revokePairedDevice(deviceId) {
     return;
   }
 
+  if (!window.confirm(`Revoke paired device ${deviceId}?`)) {
+    return;
+  }
+
   logLine(`Revoking paired device ${shortId(deviceId)}.`);
 
   try {
@@ -415,6 +425,41 @@ async function revokePairedDevice(deviceId) {
     logLine(`Revoked paired device ${shortId(deviceId)}.`);
   } catch (error) {
     logLine(`Revoke failed: ${error.message}`);
+  }
+}
+
+async function revokeOtherDevices(keepDeviceId) {
+  if (!keepDeviceId) {
+    return;
+  }
+
+  if (!window.confirm(`Keep ${keepDeviceId} and revoke every other paired device?`)) {
+    return;
+  }
+
+  logLine(`Keeping ${shortId(keepDeviceId)} and revoking every other paired device.`);
+
+  try {
+    const response = await apiFetch(
+      `/api/devices/${encodeURIComponent(keepDeviceId)}/revoke-others`,
+      {
+        method: "POST",
+      }
+    );
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to revoke other paired devices");
+    }
+
+    await loadSession("post-bulk-device-revoke refresh");
+    logLine(
+      payload.data.revoked_count > 0
+        ? `Revoked ${payload.data.revoked_count} other device(s); kept ${shortId(keepDeviceId)}.`
+        : `No other paired devices were active; kept ${shortId(keepDeviceId)}.`
+    );
+  } catch (error) {
+    logLine(`Bulk revoke failed: ${error.message}`);
   }
 }
 
@@ -546,7 +591,7 @@ function renderSession(session) {
 
   renderSessionMeta(session);
   renderPairingPanel();
-  renderPairedDevices(session.paired_devices || []);
+  renderDeviceRecords(session.device_records || []);
   renderPendingPairingRequests(session.pending_pairing_requests || []);
   renderControlBanner(session);
   renderTranscript(session, approval);
@@ -580,31 +625,76 @@ function renderPairingPanel() {
   pairingExpiry.textContent = `Expires ${formatTimestamp(pairing.expires_at)}`;
 }
 
-function renderPairedDevices(devices) {
-  if (!devices.length) {
-    pairedDevicesList.innerHTML = `<p class="sidebar-empty">No remote devices paired yet.</p>`;
+function renderDeviceRecords(records) {
+  if (!records.length) {
+    pairedDevicesList.innerHTML = `<p class="sidebar-empty">No remote devices have touched this relay yet.</p>`;
     return;
   }
 
-  pairedDevicesList.innerHTML = devices
-    .map((device) => {
-      const lastSeen = device.last_seen_at
-        ? `Seen ${formatTimestamp(device.last_seen_at)}`
-        : "Never seen";
+  pairedDevicesList.innerHTML = records
+    .map((record) => {
+      const lastSeen = record.last_seen_at ? formatTimestamp(record.last_seen_at) : "Never";
+      const lastPeer = record.last_peer_id ? shortId(record.last_peer_id) : "None";
+      const fingerprint = record.fingerprint || "Unavailable";
+      const canManage = record.lifecycle_state === "approved";
+      const ticketExpiry = formatBrokerJoinTicketExpiry(
+        record.lifecycle_state,
+        record.broker_join_ticket_expires_at
+      );
 
       return `
         <article class="paired-device-card">
           <div class="paired-device-copy">
-            <strong>${escapeHtml(device.label)}</strong>
-            <p class="paired-device-meta">${escapeHtml(shortId(device.device_id))} · ${escapeHtml(lastSeen)}</p>
+            <div class="paired-device-heading">
+              <strong>${escapeHtml(record.label)}</strong>
+              <span class="device-state-badge ${deviceLifecycleBadgeClass(record.lifecycle_state)}">${escapeHtml(deviceLifecycleLabel(record.lifecycle_state))}</span>
+            </div>
+            <p class="paired-device-meta paired-device-id">${escapeHtml(record.device_id)}</p>
+            <dl class="paired-device-fields">
+              <div class="paired-device-field">
+                <dt>Last Seen</dt>
+                <dd>${escapeHtml(lastSeen)}</dd>
+              </div>
+              <div class="paired-device-field">
+                <dt>Last Peer</dt>
+                <dd>${escapeHtml(lastPeer)}</dd>
+              </div>
+              <div class="paired-device-field">
+                <dt>Broker Ticket</dt>
+                <dd>${escapeHtml(ticketExpiry)}</dd>
+              </div>
+              <div class="paired-device-field">
+                <dt>Fingerprint</dt>
+                <dd class="paired-device-fingerprint">${escapeHtml(fingerprint)}</dd>
+              </div>
+              <div class="paired-device-field">
+                <dt>State Updated</dt>
+                <dd>${escapeHtml(formatTimestamp(record.state_changed_at))}</dd>
+              </div>
+            </dl>
           </div>
-          <button
-            class="sidebar-link-button"
-            type="button"
-            data-revoke-device-id="${escapeHtml(device.device_id)}"
-          >
-            Revoke
-          </button>
+          ${
+            canManage
+              ? `
+                <div class="paired-device-actions">
+                  <button
+                    class="approval-button"
+                    type="button"
+                    data-revoke-others-except-device-id="${escapeHtml(record.device_id)}"
+                  >
+                    Keep Only This
+                  </button>
+                  <button
+                    class="approval-button approval-button-danger"
+                    type="button"
+                    data-revoke-device-id="${escapeHtml(record.device_id)}"
+                  >
+                    Revoke
+                  </button>
+                </div>
+              `
+              : ""
+          }
         </article>
       `;
     })
@@ -623,9 +713,13 @@ function renderPendingPairingRequests(requests) {
       return `
         <article class="paired-device-card">
           <div class="paired-device-copy">
-            <strong>${escapeHtml(request.label)}</strong>
+            <div class="paired-device-heading">
+              <strong>${escapeHtml(request.label)}</strong>
+              <span class="device-state-badge ${deviceLifecycleBadgeClass(request.lifecycle_state)}">${escapeHtml(deviceLifecycleLabel(request.lifecycle_state))}</span>
+            </div>
             <p class="paired-device-meta">${escapeHtml(shortId(request.device_id))} · requested ${escapeHtml(formatTimestamp(request.requested_at))}</p>
             <p class="paired-device-meta">Broker peer ${escapeHtml(shortId(request.broker_peer_id))}</p>
+            <p class="paired-device-meta">Fingerprint ${escapeHtml(request.fingerprint || "Unavailable")}</p>
           </div>
           <div class="paired-device-actions">
             <button
@@ -1260,6 +1354,48 @@ function pairedDeviceCountLabel(session) {
     ? session.paired_devices.length
     : 0;
   return count === 0 ? "None" : `${count} paired`;
+}
+
+function deviceLifecycleLabel(state) {
+  switch (state) {
+    case "pending":
+      return "Pending";
+    case "approved":
+      return "Approved";
+    case "rejected":
+      return "Rejected";
+    case "revoked":
+      return "Revoked";
+    default:
+      return "Unknown";
+  }
+}
+
+function deviceLifecycleBadgeClass(state) {
+  switch (state) {
+    case "pending":
+      return "device-state-pending";
+    case "approved":
+      return "device-state-approved";
+    case "rejected":
+      return "device-state-rejected";
+    case "revoked":
+      return "device-state-revoked";
+    default:
+      return "device-state-neutral";
+  }
+}
+
+function formatBrokerJoinTicketExpiry(state, expiresAt) {
+  if (state !== "approved") {
+    return "Not active";
+  }
+
+  if (!expiresAt) {
+    return "Until revoked";
+  }
+
+  return formatTimestamp(expiresAt);
 }
 
 function formatTimestamp(seconds) {

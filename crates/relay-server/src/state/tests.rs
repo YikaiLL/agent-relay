@@ -5,7 +5,7 @@ use tokio::sync::watch;
 
 use crate::{
     codex::ThreadSyncData,
-    protocol::{LogEntryView, ThreadSummaryView, TranscriptEntryView},
+    protocol::{DeviceLifecycleState, LogEntryView, ThreadSummaryView, TranscriptEntryView},
 };
 
 use super::{
@@ -14,6 +14,21 @@ use super::{
 };
 
 fn test_persisted_state() -> PersistedRelayState {
+    let mut device_records = std::collections::HashMap::new();
+    device_records.insert(
+        "phone-1".to_string(),
+        DeviceRecord {
+            device_id: "phone-1".to_string(),
+            label: "Primary Phone".to_string(),
+            lifecycle_state: crate::protocol::DeviceLifecycleState::Approved,
+            created_at: 7,
+            state_changed_at: 7,
+            last_seen_at: Some(9),
+            last_peer_id: Some("surface-1".to_string()),
+            device_verify_key: None,
+            broker_join_ticket_expires_at: None,
+        },
+    );
     let mut paired_devices = std::collections::HashMap::new();
     paired_devices.insert(
         "phone-1".to_string(),
@@ -26,6 +41,7 @@ fn test_persisted_state() -> PersistedRelayState {
             created_at: 7,
             last_seen_at: Some(9),
             last_peer_id: Some("surface-1".to_string()),
+            broker_join_ticket_expires_at: None,
         },
     );
     PersistedRelayState {
@@ -40,6 +56,7 @@ fn test_persisted_state() -> PersistedRelayState {
         approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
         sandbox: DEFAULT_SANDBOX.to_string(),
         reasoning_effort: DEFAULT_EFFORT.to_string(),
+        device_records,
         paired_devices,
         transcript: vec![TranscriptRecord {
             item_id: "history-0".to_string(),
@@ -467,6 +484,7 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
             Some("My Phone".to_string()),
             Some("Primary Phone".to_string()),
             None,
+            None,
             "surface-a",
             100,
         )
@@ -541,6 +559,7 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
             Some("phone-2".to_string()),
             None,
             None,
+            None,
             "surface-a",
             100,
         )
@@ -559,6 +578,7 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
             &replacement.pairing_id,
             &replacement.pairing_secret,
             Some("phone-2".to_string()),
+            None,
             None,
             None,
             "surface-a",
@@ -589,14 +609,24 @@ fn revoking_paired_device_removes_it() {
             Some("tablet".to_string()),
             Some("Tablet".to_string()),
             None,
+            None,
             "surface-tablet",
             100,
         )
         .expect("pairing should succeed");
 
-    assert!(relay.revoke_paired_device(&device.device_id));
-    assert!(!relay.revoke_paired_device(&device.device_id));
+    assert!(relay.revoke_paired_device(&device.device_id, 101));
+    assert!(!relay.revoke_paired_device(&device.device_id, 102));
     assert!(relay.paired_devices.is_empty());
+
+    let snapshot = relay.snapshot();
+    let record = snapshot
+        .device_records
+        .iter()
+        .find(|record| record.device_id == device.device_id)
+        .expect("revoked device record should remain visible");
+    assert_eq!(record.lifecycle_state, DeviceLifecycleState::Revoked);
+    assert_eq!(record.last_peer_id.as_deref(), Some("surface-tablet"));
 }
 
 #[tokio::test]
@@ -653,7 +683,7 @@ fn pairing_request_waits_for_local_approval_before_device_is_created() {
     assert_eq!(relay.pending_pairing_requests.len(), 1);
 
     let result = relay
-        .decide_pairing_request(&ticket.pairing_id, true, 101)
+        .decide_pairing_request(&ticket.pairing_id, true, None, 101)
         .expect("approval should complete pairing");
 
     assert_eq!(relay.pending_pairing_requests.len(), 0);
@@ -693,7 +723,7 @@ fn rejecting_pairing_request_returns_error_without_creating_device() {
         .expect("pairing request should register");
 
     let result = relay
-        .decide_pairing_request(&ticket.pairing_id, false, 101)
+        .decide_pairing_request(&ticket.pairing_id, false, None, 101)
         .expect("rejection should succeed");
 
     assert_eq!(relay.pending_pairing_requests.len(), 0);
@@ -705,6 +735,195 @@ fn rejecting_pairing_request_returns_error_without_creating_device() {
         result.error.as_deref(),
         Some("pairing request was rejected on the local relay")
     );
+}
+
+#[test]
+fn snapshot_exposes_pending_device_record_metadata() {
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-pending".to_string()),
+            Some("Pending Phone".to_string()),
+            "surface-pending",
+            "verify-key-pending".to_string(),
+            100,
+        )
+        .expect("pairing request should register");
+
+    let snapshot = relay.snapshot();
+    let record = snapshot
+        .device_records
+        .iter()
+        .find(|record| record.device_id == "phone-pending")
+        .expect("pending device record should be present");
+
+    assert_eq!(record.lifecycle_state, DeviceLifecycleState::Pending);
+    assert_eq!(record.label, "Pending Phone");
+    assert_eq!(record.last_seen_at, None);
+    assert_eq!(record.last_peer_id.as_deref(), Some("surface-pending"));
+    assert_eq!(record.broker_join_ticket_expires_at, None);
+    assert!(record.fingerprint.is_some());
+}
+
+#[test]
+fn approving_pairing_request_updates_device_record_metadata() {
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-approved".to_string()),
+            Some("Approved Phone".to_string()),
+            "surface-approved",
+            "verify-key-approved".to_string(),
+            100,
+        )
+        .expect("pairing request should register");
+
+    relay
+        .decide_pairing_request(&ticket.pairing_id, true, Some(3600), 101)
+        .expect("approval should succeed");
+
+    let snapshot = relay.snapshot();
+    let record = snapshot
+        .device_records
+        .iter()
+        .find(|record| record.device_id == "phone-approved")
+        .expect("approved device record should be present");
+
+    assert_eq!(record.lifecycle_state, DeviceLifecycleState::Approved);
+    assert_eq!(record.label, "Approved Phone");
+    assert_eq!(record.last_seen_at, Some(101));
+    assert_eq!(record.last_peer_id.as_deref(), Some("surface-approved"));
+    assert_eq!(record.broker_join_ticket_expires_at, Some(3600));
+    assert!(record.fingerprint.is_some());
+}
+
+#[test]
+fn rejecting_pairing_request_records_rejected_device_state() {
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-rejected".to_string()),
+            Some("Rejected Phone".to_string()),
+            "surface-rejected",
+            "verify-key-rejected".to_string(),
+            100,
+        )
+        .expect("pairing request should register");
+
+    relay
+        .decide_pairing_request(&ticket.pairing_id, false, None, 101)
+        .expect("rejection should succeed");
+
+    let snapshot = relay.snapshot();
+    let record = snapshot
+        .device_records
+        .iter()
+        .find(|record| record.device_id == "phone-rejected")
+        .expect("rejected device record should be present");
+
+    assert_eq!(record.lifecycle_state, DeviceLifecycleState::Rejected);
+    assert_eq!(record.label, "Rejected Phone");
+    assert_eq!(record.last_seen_at, None);
+    assert_eq!(record.last_peer_id.as_deref(), Some("surface-rejected"));
+    assert_eq!(record.broker_join_ticket_expires_at, None);
+    assert!(record.fingerprint.is_some());
+}
+
+#[test]
+fn revoke_all_other_devices_keeps_selected_device_and_marks_others_revoked() {
+    let mut relay = test_state();
+    let keep_ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+    let drop_ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    let (keep_device, _) = relay
+        .consume_pairing_ticket(
+            &keep_ticket.pairing_id,
+            &keep_ticket.pairing_secret,
+            Some("phone-keep".to_string()),
+            Some("Keep Phone".to_string()),
+            Some("verify-key-keep".to_string()),
+            Some(300),
+            "surface-keep",
+            100,
+        )
+        .expect("keep device should pair");
+    let (drop_device, _) = relay
+        .consume_pairing_ticket(
+            &drop_ticket.pairing_id,
+            &drop_ticket.pairing_secret,
+            Some("phone-drop".to_string()),
+            Some("Drop Phone".to_string()),
+            Some("verify-key-drop".to_string()),
+            Some(400),
+            "surface-drop",
+            101,
+        )
+        .expect("drop device should pair");
+
+    let revoked = relay
+        .revoke_all_other_paired_devices(&keep_device.device_id, 102)
+        .expect("bulk revoke should succeed");
+
+    assert_eq!(revoked, vec![drop_device.device_id.clone()]);
+    assert_eq!(relay.paired_devices.len(), 1);
+    assert!(relay.paired_devices.contains_key(&keep_device.device_id));
+
+    let snapshot = relay.snapshot();
+    let kept_record = snapshot
+        .device_records
+        .iter()
+        .find(|record| record.device_id == keep_device.device_id)
+        .expect("kept device record should be present");
+    let revoked_record = snapshot
+        .device_records
+        .iter()
+        .find(|record| record.device_id == drop_device.device_id)
+        .expect("revoked device record should be present");
+
+    assert_eq!(kept_record.lifecycle_state, DeviceLifecycleState::Approved);
+    assert_eq!(kept_record.broker_join_ticket_expires_at, Some(300));
+    assert_eq!(revoked_record.lifecycle_state, DeviceLifecycleState::Revoked);
+    assert_eq!(revoked_record.broker_join_ticket_expires_at, Some(400));
+    assert_eq!(revoked_record.last_peer_id.as_deref(), Some("surface-drop"));
 }
 
 #[test]
@@ -743,7 +962,7 @@ fn repeated_pairing_request_rebinds_to_latest_broker_peer() {
     assert_eq!(rebound.broker_peer_id, "surface-new");
 
     let result = relay
-        .decide_pairing_request(&ticket.pairing_id, true, 102)
+        .decide_pairing_request(&ticket.pairing_id, true, None, 102)
         .expect("approval should use the rebound broker peer");
     assert_eq!(result.target_peer_id, "surface-new");
 }
@@ -770,7 +989,7 @@ fn completed_pairing_can_replay_result_to_reconnected_peer() {
         )
         .expect("pairing request should register");
     relay
-        .decide_pairing_request(&ticket.pairing_id, true, 101)
+        .decide_pairing_request(&ticket.pairing_id, true, None, 101)
         .expect("approval should complete pairing");
 
     let replay = relay
