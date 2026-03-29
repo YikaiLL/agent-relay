@@ -21,8 +21,9 @@ use axum::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode},
+    middleware,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -50,6 +51,9 @@ const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' http: https: ws: wss:; manifest-src 'self'; worker-src 'self' blob:";
+const REFERRER_POLICY: &str = "no-referrer";
+const X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
 
 const PUBLIC_API_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE";
 const JOIN_RATE_LIMIT_ENV: &str = "RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE";
@@ -389,6 +393,7 @@ fn app_with_web_root_and_verifier_and_hardening(
                 connection_tracker: ActiveConnectionTracker::default(),
             },
         })
+        .layer(middleware::map_response(with_security_headers))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -978,6 +983,26 @@ fn parse_usize_env(name: &str, default: usize) -> Result<usize, String> {
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid utf-8")),
     }
+}
+
+async fn with_security_headers<B>(mut response: Response<B>) -> Response<B> {
+    apply_security_headers(response.headers_mut());
+    response
+}
+
+fn apply_security_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static(REFERRER_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static(X_CONTENT_TYPE_OPTIONS),
+    );
 }
 
 #[cfg(test)]

@@ -28,18 +28,6 @@ fn bearer_header_authorizes_request() {
 }
 
 #[test]
-fn access_token_query_authorizes_request() {
-    let auth = AuthConfig {
-        token: Some("secret".to_string()),
-    };
-    let headers = HeaderMap::new();
-
-    assert!(auth
-        .authorize(&headers, &uri("/api/stream?access_token=secret"))
-        .is_ok());
-}
-
-#[test]
 fn invalid_token_is_rejected() {
     let auth = AuthConfig {
         token: Some("secret".to_string()),
@@ -48,6 +36,20 @@ fn invalid_token_is_rejected() {
     let error = auth
         .authorize(&headers, &uri("/api/session"))
         .expect_err("missing token should be rejected");
+
+    assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.1 .0.error.code, "unauthorized");
+}
+
+#[test]
+fn access_token_query_is_rejected() {
+    let auth = AuthConfig {
+        token: Some("secret".to_string()),
+    };
+    let headers = HeaderMap::new();
+    let error = auth
+        .authorize(&headers, &uri("/api/stream?access_token=secret"))
+        .expect_err("query tokens should no longer authorize the stream");
 
     assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     assert_eq!(error.1 .0.error.code, "unauthorized");

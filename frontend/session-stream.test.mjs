@@ -1,0 +1,59 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { openSessionStream, sessionStreamUrl } from "./session-stream.js";
+
+function nextTick() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+test("session stream uses authorization header instead of query access_token", async () => {
+  const fetchCalls = [];
+  let controllerRef = null;
+  let sessionPayload = null;
+  let opened = false;
+
+  const stream = openSessionStream({
+    apiToken: "secret-token",
+    url: sessionStreamUrl("https://relay.example.test"),
+    fetchImpl: async (url, options) => {
+      fetchCalls.push({
+        url: String(url),
+        headers: options.headers,
+      });
+      controllerRef = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new TextEncoder().encode(
+              'event: session\ndata: {"current_status":"ready"}\n\n'
+            )
+          );
+          controller.close();
+        },
+      });
+      return {
+        ok: true,
+        body: controllerRef,
+      };
+    },
+    onOpen() {
+      opened = true;
+    },
+    onSession(data) {
+      sessionPayload = JSON.parse(data);
+    },
+  });
+
+  await nextTick();
+  await nextTick();
+
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].url, "https://relay.example.test/api/stream");
+  assert.ok(!fetchCalls[0].url.includes("access_token="));
+  assert.equal(fetchCalls[0].headers.get("Authorization"), "Bearer secret-token");
+  assert.equal(fetchCalls[0].headers.get("Accept"), "text/event-stream");
+  assert.equal(opened, true);
+  assert.deepEqual(sessionPayload, { current_status: "ready" });
+
+  await stream.ready;
+});

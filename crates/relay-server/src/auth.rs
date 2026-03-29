@@ -2,7 +2,6 @@ use axum::{
     http::{header, HeaderMap, StatusCode, Uri},
     Json,
 };
-use url::form_urlencoded;
 
 use crate::protocol::ApiError;
 
@@ -25,16 +24,14 @@ impl AuthConfig {
     pub fn authorize(
         &self,
         headers: &HeaderMap,
-        uri: &Uri,
+        _uri: &Uri,
     ) -> Result<(), (StatusCode, Json<ApiError>)> {
         let Some(expected) = self.token.as_deref() else {
             return Ok(());
         };
 
         let header_token = bearer_token(headers);
-        let query_token = query_access_token(uri);
-
-        if header_token == Some(expected) || query_token.as_deref() == Some(expected) {
+        if header_token == Some(expected) {
             Ok(())
         } else {
             Err(unauthorized())
@@ -56,13 +53,6 @@ fn normalized(value: Option<String>) -> Option<String> {
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let header_value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     header_value.strip_prefix("Bearer ")
-}
-
-fn query_access_token(uri: &Uri) -> Option<String> {
-    let query = uri.query()?;
-    form_urlencoded::parse(query.as_bytes())
-        .find(|(key, _)| key == "access_token")
-        .map(|(_, value)| value.into_owned())
 }
 
 fn unauthorized() -> (StatusCode, Json<ApiError>) {

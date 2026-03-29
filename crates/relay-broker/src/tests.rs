@@ -573,6 +573,19 @@ async fn public_auth_plane_health_reports_ready() {
 }
 
 #[tokio::test]
+async fn security_headers_are_present_on_static_and_api_routes() {
+    let address = spawn_app().await;
+    let root_response = http_get(address, "/").await.to_ascii_lowercase();
+    let health_response = http_get(address, "/api/health").await.to_ascii_lowercase();
+
+    for response in [root_response, health_response] {
+        assert!(response.contains("content-security-policy:"));
+        assert!(response.contains("referrer-policy: no-referrer"));
+        assert!(response.contains("x-content-type-options: nosniff"));
+    }
+}
+
+#[tokio::test]
 async fn public_relay_ws_token_can_join_broker() {
     let address = spawn_public_mode_app().await;
     let relay_token: RelayWsTokenResponse = public_post(

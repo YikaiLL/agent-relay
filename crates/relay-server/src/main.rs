@@ -14,10 +14,11 @@ use auth::AuthConfig;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    http::{HeaderMap, Uri},
+    http::{header::HeaderName, HeaderMap, HeaderValue, Uri},
+    middleware,
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
@@ -36,6 +37,10 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing::{info, warn};
+
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' http: https: ws: wss:; manifest-src 'self'; worker-src 'self' blob:";
+const REFERRER_POLICY: &str = "no-referrer";
+const X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
 
 #[derive(Clone)]
 struct AppContext {
@@ -92,6 +97,7 @@ async fn main() {
         .route_service("/", ServeFile::new(web_root.join("index.html")))
         .nest_service("/static", ServeDir::new(web_root))
         .with_state(context)
+        .layer(middleware::map_response(with_security_headers))
         .layer(TraceLayer::new_for_http());
 
     let port = std::env::var("PORT")
@@ -386,5 +392,55 @@ fn snapshot_event(snapshot: SessionSnapshot) -> Event {
         Err(error) => Event::default().event("session").data(format!(
             "{{\"ok\":false,\"error\":\"failed_to_encode_snapshot:{error}\"}}"
         )),
+    }
+}
+
+async fn with_security_headers<B>(mut response: Response<B>) -> Response<B> {
+    apply_security_headers(response.headers_mut());
+    response
+}
+
+fn apply_security_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static(REFERRER_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static(X_CONTENT_TYPE_OPTIONS),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_headers_are_applied() {
+        let mut headers = HeaderMap::new();
+        apply_security_headers(&mut headers);
+
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some(CONTENT_SECURITY_POLICY)
+        );
+        assert_eq!(
+            headers
+                .get("referrer-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some(REFERRER_POLICY)
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .and_then(|value| value.to_str().ok()),
+            Some(X_CONTENT_TYPE_OPTIONS)
+        );
     }
 }

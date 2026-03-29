@@ -1,3 +1,5 @@
+import { openSessionStream, sessionStreamUrl } from "./session-stream.js";
+
 const DEVICE_STORAGE_KEY = "agent-relay.device-id";
 const API_TOKEN_STORAGE_KEY = "agent-relay.api-token";
 const CONTROL_HEARTBEAT_MS = 5000;
@@ -1314,8 +1316,8 @@ function cancelControllerLeaseRefresh() {
 }
 
 function connectSessionStream() {
-  if (!("EventSource" in window)) {
-    logLine("EventSource is unavailable. Falling back to polling.");
+  if (typeof fetch !== "function" || typeof AbortController === "undefined") {
+    logLine("Fetch streaming is unavailable. Falling back to polling.");
     state.streamConnected = false;
     scheduleSessionPoll();
     return;
@@ -1325,42 +1327,41 @@ function connectSessionStream() {
     state.sessionStream.close();
   }
 
-  const stream = new EventSource(sessionStreamUrl());
-  state.sessionStream = stream;
-
-  stream.addEventListener("session", (event) => {
-    try {
-      const snapshot = JSON.parse(event.data);
+  const stream = openSessionStream({
+    url: sessionStreamUrl(window.location.origin),
+    apiToken: state.apiToken,
+    onSession(data) {
+      try {
+        const snapshot = JSON.parse(data);
+        state.streamConnected = true;
+        cancelSessionPoll();
+        seedDefaults(snapshot);
+        renderSession(snapshot);
+      } catch (error) {
+        logLine(`Stream payload failed: ${error.message}`);
+      }
+    },
+    onOpen() {
+      if (!state.streamConnected) {
+        logLine("Session stream connected.");
+      }
       state.streamConnected = true;
       cancelSessionPoll();
-      seedDefaults(snapshot);
-      renderSession(snapshot);
-    } catch (error) {
-      logLine(`Stream payload failed: ${error.message}`);
-    }
+      cancelStreamReconnect();
+    },
+    onError() {
+      if (state.sessionStream !== stream) {
+        return;
+      }
+
+      logLine("Session stream disconnected. Falling back to polling.");
+      state.streamConnected = false;
+      state.sessionStream = null;
+      scheduleSessionPoll();
+      scheduleStreamReconnect();
+    },
   });
-
-  stream.onopen = () => {
-    if (!state.streamConnected) {
-      logLine("Session stream connected.");
-    }
-    state.streamConnected = true;
-    cancelSessionPoll();
-    cancelStreamReconnect();
-  };
-
-  stream.onerror = () => {
-    if (state.sessionStream !== stream) {
-      return;
-    }
-
-    logLine("Session stream disconnected. Falling back to polling.");
-    state.streamConnected = false;
-    state.sessionStream.close();
-    state.sessionStream = null;
-    scheduleSessionPoll();
-    scheduleStreamReconnect();
-  };
+  state.sessionStream = stream;
 }
 
 function cancelSessionPoll() {
@@ -1382,14 +1383,6 @@ function apiFetch(input, init = {}) {
     ...init,
     headers,
   });
-}
-
-function sessionStreamUrl() {
-  const url = new URL("/api/stream", window.location.origin);
-  if (state.apiToken) {
-    url.searchParams.set("access_token", state.apiToken);
-  }
-  return url.toString();
 }
 
 function applyApiToken(rawValue) {
