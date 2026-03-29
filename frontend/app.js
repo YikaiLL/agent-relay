@@ -7,6 +7,9 @@ const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
 
 const state = {
   apiToken: loadApiToken(),
+  authRequired: false,
+  authenticated: false,
+  cookieSession: false,
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
@@ -28,7 +31,9 @@ const state = {
 const transcript = document.querySelector("#transcript");
 const clientLog = document.querySelector("#client-log");
 const connectionForm = document.querySelector("#connection-form");
+const apiTokenLabel = connectionForm.querySelector("label[for='api-token-input']");
 const apiTokenInput = document.querySelector("#api-token-input");
+const applyTokenButton = document.querySelector("#apply-token-button");
 const startPairingButton = document.querySelector("#start-pairing-button");
 const openSecurityModalBtn = document.querySelector("#open-security-modal");
 const closeSecurityModalBtn = document.querySelector("#close-security-modal");
@@ -76,7 +81,7 @@ const takeOverButton = document.querySelector("#take-over-button");
 
 connectionForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  applyApiToken(apiTokenInput.value);
+  void submitAuthSession();
 });
 
 startPairingButton.addEventListener("click", () => {
@@ -175,7 +180,22 @@ void boot();
 
 async function boot() {
   apiTokenInput.value = state.apiToken;
+  updateConnectionForm();
   setNewSessionPanelOpen(false);
+
+  await refreshAuthSession("initial boot");
+  if (state.apiToken && state.authRequired && !state.authenticated) {
+    await signInWithApiToken(state.apiToken, "stored token migration");
+  }
+  if (state.authRequired && !state.authenticated) {
+    clearStoredApiToken();
+    state.apiToken = "";
+    apiTokenInput.value = "";
+    updateConnectionForm();
+    renderAuthRequiredState("Enter RELAY_API_TOKEN to access the local relay.");
+    return;
+  }
+
   await loadSession("initial boot");
   if (state.selectedCwd) {
     await loadThreads("initial boot");
@@ -184,6 +204,196 @@ async function boot() {
   }
   connectSessionStream();
   scheduleThreadsPoll();
+}
+
+async function refreshAuthSession(reason) {
+  try {
+    const response = await fetch("/api/auth/session", {
+      method: "GET",
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to check local auth session");
+    }
+
+    applyAuthSessionState(payload.data);
+    return payload.data;
+  } catch (error) {
+    logLine(`Auth session check failed (${reason}): ${error.message}`);
+    return null;
+  }
+}
+
+async function submitAuthSession() {
+  if (!state.authRequired) {
+    logLine("This relay does not require an API token on the current bind host.");
+    return;
+  }
+
+  const token = apiTokenInput.value.trim();
+  if (token) {
+    await signInWithApiToken(token, "manual sign-in");
+    return;
+  }
+
+  if (!state.authenticated) {
+    logLine("Enter RELAY_API_TOKEN to sign in.");
+    apiTokenInput.focus();
+    return;
+  }
+
+  await signOutAuthSession("manual sign-out");
+}
+
+async function signInWithApiToken(token, reason) {
+  setConnectionFormBusy(true);
+
+  try {
+    const response = await fetch("/api/auth/session", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ token }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to create local auth session");
+    }
+
+    clearStoredApiToken();
+    state.apiToken = "";
+    apiTokenInput.value = "";
+    applyAuthSessionState(payload.data);
+    logLine(`Local relay sign-in succeeded (${reason}).`);
+    await resumeAfterAuthChange("sign-in");
+  } catch (error) {
+    clearStoredApiToken();
+    state.apiToken = "";
+    logLine(`Local relay sign-in failed: ${error.message}`);
+  } finally {
+    setConnectionFormBusy(false);
+  }
+}
+
+async function signOutAuthSession(reason) {
+  setConnectionFormBusy(true);
+
+  try {
+    const response = await fetch("/api/auth/session", {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to clear local auth session");
+    }
+
+    clearStoredApiToken();
+    state.apiToken = "";
+    apiTokenInput.value = "";
+    applyAuthSessionState(payload.data);
+    logLine(`Local relay sign-out succeeded (${reason}).`);
+    await resumeAfterAuthChange("sign-out");
+  } catch (error) {
+    logLine(`Local relay sign-out failed: ${error.message}`);
+  } finally {
+    setConnectionFormBusy(false);
+  }
+}
+
+function applyAuthSessionState(view) {
+  state.authRequired = Boolean(view?.auth_required);
+  state.authenticated = Boolean(view?.authenticated);
+  state.cookieSession = Boolean(view?.cookie_session);
+  if (state.authenticated || !state.authRequired) {
+    clearStoredApiToken();
+    state.apiToken = "";
+  }
+  updateConnectionForm();
+}
+
+function updateConnectionForm() {
+  if (!apiTokenLabel || !applyTokenButton) {
+    return;
+  }
+
+  if (!state.authRequired) {
+    apiTokenLabel.textContent = "Local Access";
+    apiTokenInput.value = "";
+    apiTokenInput.disabled = true;
+    apiTokenInput.placeholder = "No API token required on this relay";
+    applyTokenButton.textContent = "Ready";
+    applyTokenButton.disabled = true;
+    return;
+  }
+
+  apiTokenLabel.textContent = state.cookieSession ? "Local Session" : "API Token";
+  apiTokenInput.disabled = false;
+  applyTokenButton.disabled = false;
+
+  if (state.authenticated) {
+    apiTokenInput.placeholder = "Signed in. Submit an empty field to sign out.";
+    applyTokenButton.textContent = "Sign Out";
+  } else {
+    apiTokenInput.placeholder = "Enter RELAY_API_TOKEN to sign in";
+    applyTokenButton.textContent = "Sign In";
+  }
+}
+
+function setConnectionFormBusy(busy) {
+  apiTokenInput.disabled = busy || !state.authRequired;
+  applyTokenButton.disabled = busy || !state.authRequired;
+}
+
+async function resumeAfterAuthChange(reason) {
+  state.streamConnected = false;
+  cancelStreamReconnect();
+  cancelSessionPoll();
+  cancelThreadsPoll();
+  if (state.sessionStream) {
+    state.sessionStream.close();
+    state.sessionStream = null;
+  }
+
+  if (state.authRequired && !state.authenticated) {
+    renderAuthRequiredState("Enter RELAY_API_TOKEN to access the local relay.");
+    return;
+  }
+
+  await loadSession(reason);
+  if (state.selectedCwd) {
+    await loadThreads(reason);
+  }
+  connectSessionStream();
+}
+
+function handleUnauthorized(message) {
+  const alreadySignedOut = state.authRequired && !state.authenticated;
+  clearStoredApiToken();
+  state.apiToken = "";
+  apiTokenInput.value = "";
+  state.authenticated = false;
+  state.cookieSession = false;
+  state.streamConnected = false;
+  cancelStreamReconnect();
+  cancelSessionPoll();
+  cancelThreadsPoll();
+  if (state.sessionStream) {
+    state.sessionStream.close();
+    state.sessionStream = null;
+  }
+  updateConnectionForm();
+  renderAuthRequiredState(message);
+  if (!alreadySignedOut) {
+    logLine(message);
+  }
 }
 
 async function loadSession(reason) {
@@ -200,6 +410,12 @@ async function loadSession(reason) {
     seedDefaults(payload.data);
     renderSession(payload.data);
   } catch (error) {
+    if (state.authRequired && !state.authenticated) {
+      renderAuthRequiredState("Enter RELAY_API_TOKEN to access the local relay.");
+      logLine(`Session fetch blocked by local auth: ${error.message}`);
+      return;
+    }
+
     state.session = null;
     cancelControllerHeartbeat();
     cancelControllerLeaseRefresh();
@@ -258,6 +474,13 @@ async function loadThreads(reason) {
       state.session?.pending_approvals?.[0] || null
     );
   } catch (error) {
+    if (state.authRequired && !state.authenticated) {
+      threadsCount.textContent = "Sign in";
+      threadsList.innerHTML = `<p class="sidebar-empty">Enter RELAY_API_TOKEN to load threads.</p>`;
+      logLine(`Thread fetch blocked by local auth: ${error.message}`);
+      return;
+    }
+
     threadsCount.textContent = "Error";
     threadsList.innerHTML = `<p class="sidebar-empty">${escapeHtml(error.message)}</p>`;
     logLine(`Thread fetch failed: ${error.message}`);
@@ -1249,7 +1472,7 @@ function setNewSessionPanelOpen(open) {
 }
 
 function scheduleSessionPoll() {
-  if (state.streamConnected) {
+  if (state.streamConnected || (state.authRequired && !state.authenticated)) {
     return;
   }
 
@@ -1263,6 +1486,11 @@ function scheduleSessionPoll() {
 }
 
 function scheduleThreadsPoll() {
+  if (state.authRequired && !state.authenticated) {
+    cancelThreadsPoll();
+    return;
+  }
+
   if (state.threadsPollTimer) {
     window.clearTimeout(state.threadsPollTimer);
   }
@@ -1270,6 +1498,15 @@ function scheduleThreadsPoll() {
   state.threadsPollTimer = window.setTimeout(() => {
     void loadThreads("poll");
   }, 12000);
+}
+
+function cancelThreadsPoll() {
+  if (!state.threadsPollTimer) {
+    return;
+  }
+
+  window.clearTimeout(state.threadsPollTimer);
+  state.threadsPollTimer = null;
 }
 
 function scheduleControllerHeartbeat(session) {
@@ -1354,6 +1591,10 @@ function cancelControllerLeaseRefresh() {
 }
 
 function connectSessionStream() {
+  if (state.authRequired && !state.authenticated) {
+    return;
+  }
+
   if (typeof fetch !== "function" || typeof AbortController === "undefined") {
     logLine("Fetch streaming is unavailable. Falling back to polling.");
     state.streamConnected = false;
@@ -1387,8 +1628,14 @@ function connectSessionStream() {
       cancelSessionPoll();
       cancelStreamReconnect();
     },
-    onError() {
+    onError(error) {
       if (state.sessionStream !== stream) {
+        return;
+      }
+
+      if (error?.code === "unauthorized") {
+        state.sessionStream = null;
+        handleUnauthorized("Local auth session expired. Sign in again.");
         return;
       }
 
@@ -1411,42 +1658,23 @@ function cancelSessionPoll() {
   state.sessionPollTimer = null;
 }
 
-function apiFetch(input, init = {}) {
+async function apiFetch(input, init = {}) {
   const headers = new Headers(init.headers || {});
   if (state.apiToken) {
     headers.set("Authorization", `Bearer ${state.apiToken}`);
   }
 
-  return fetch(input, {
+  const response = await fetch(input, {
     ...init,
+    credentials: "same-origin",
     headers,
   });
-}
 
-function applyApiToken(rawValue) {
-  const nextToken = rawValue.trim();
-  state.apiToken = nextToken;
-  apiTokenInput.value = nextToken;
-
-  if (nextToken) {
-    window.localStorage.setItem(API_TOKEN_STORAGE_KEY, nextToken);
-    logLine("Stored API token for this device.");
-  } else {
-    window.localStorage.removeItem(API_TOKEN_STORAGE_KEY);
-    logLine("Cleared API token for this device.");
+  if (response.status === 401) {
+    handleUnauthorized("Local authentication is required. Sign in with RELAY_API_TOKEN.");
   }
 
-  state.streamConnected = false;
-  cancelStreamReconnect();
-  if (state.sessionStream) {
-    state.sessionStream.close();
-    state.sessionStream = null;
-  }
-  connectSessionStream();
-  void loadSession("auth change");
-  if (state.selectedCwd) {
-    void loadThreads("auth change");
-  }
+  return response;
 }
 
 function scheduleStreamReconnect() {
@@ -1688,6 +1916,29 @@ function loadOrCreateDeviceId() {
 
 function loadApiToken() {
   return window.localStorage.getItem(API_TOKEN_STORAGE_KEY)?.trim() || "";
+}
+
+function clearStoredApiToken() {
+  window.localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+}
+
+function renderAuthRequiredState(message) {
+  state.session = null;
+  state.threads = [];
+  cancelControllerHeartbeat();
+  cancelControllerLeaseRefresh();
+  renderOverview(null, null, null, message);
+  threadsCount.textContent = "Sign in";
+  threadsList.innerHTML = `<p class="sidebar-empty">Enter RELAY_API_TOKEN to load threads.</p>`;
+  statusBadge.textContent = "Sign in";
+  statusBadge.className = "status-badge status-badge-offline";
+  sessionMeta.innerHTML = `<span class="meta-empty">${escapeHtml(message)}</span>`;
+  transcript.innerHTML = `
+    <div class="thread-empty">
+      <h2>Authentication required</h2>
+      <p>${escapeHtml(message)}</p>
+    </div>
+  `;
 }
 
 function logLine(message) {

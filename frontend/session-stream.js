@@ -35,12 +35,17 @@ export function openSessionStream({
     try {
       const response = await fetchImpl(url, {
         method: "GET",
+        credentials: "same-origin",
         headers: sessionStreamHeaders(apiToken),
         cache: "no-store",
         signal: controller.signal,
       });
       if (!response.ok) {
-        throw new Error(`session stream request failed (${response.status})`);
+        const error = new Error(`session stream request failed (${response.status})`);
+        if (response.status === 401) {
+          error.code = "unauthorized";
+        }
+        throw error;
       }
       if (!response.body || typeof response.body.getReader !== "function") {
         throw new Error("streaming response body is unavailable");

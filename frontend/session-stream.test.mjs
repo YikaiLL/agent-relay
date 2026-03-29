@@ -20,6 +20,7 @@ test("session stream uses authorization header instead of query access_token", a
       fetchCalls.push({
         url: String(url),
         headers: options.headers,
+        credentials: options.credentials,
       });
       controllerRef = new ReadableStream({
         start(controller) {
@@ -52,8 +53,29 @@ test("session stream uses authorization header instead of query access_token", a
   assert.ok(!fetchCalls[0].url.includes("access_token="));
   assert.equal(fetchCalls[0].headers.get("Authorization"), "Bearer secret-token");
   assert.equal(fetchCalls[0].headers.get("Accept"), "text/event-stream");
+  assert.equal(fetchCalls[0].credentials, "same-origin");
   assert.equal(opened, true);
   assert.deepEqual(sessionPayload, { current_status: "ready" });
 
   await stream.ready;
+});
+
+test("session stream surfaces unauthorized errors for expired local auth", async () => {
+  let observedError = null;
+
+  const stream = openSessionStream({
+    url: sessionStreamUrl("https://relay.example.test"),
+    fetchImpl: async () => ({
+      ok: false,
+      status: 401,
+    }),
+    onError(error) {
+      observedError = error;
+    },
+  });
+
+  await stream.ready;
+
+  assert.equal(observedError?.code, "unauthorized");
+  assert.match(observedError?.message || "", /401/);
 });

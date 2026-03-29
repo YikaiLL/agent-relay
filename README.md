@@ -131,6 +131,8 @@ Notes:
 - set `RELAY_API_TOKEN` to protect `/api` routes
 - when `BIND_HOST` is non-loopback, `RELAY_API_TOKEN` is now required by default
 - `RELAY_ALLOW_INSECURE_NO_AUTH=1` only exists as an explicit insecure development escape hatch for non-loopback binds
+- the local web UI now exchanges `RELAY_API_TOKEN` for an `HttpOnly` same-site session cookie, so normal browser use no longer needs to keep sending the raw token on every request
+- direct `Authorization: Bearer ...` API access still works for scripts and manual clients
 - relay HTTP responses now send CSP, `Permissions-Policy`, `Referrer-Policy: no-referrer`, and `X-Content-Type-Options: nosniff`
 - relay CSP keeps `connect-src` wide by default for local/LAN development; set `RELAY_CSP_CONNECT_SRC` only when you want to tighten production origins
 - set `RELAY_ENABLE_HSTS=1` only when the relay is actually behind HTTPS and forwards `X-Forwarded-Proto: https`

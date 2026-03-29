@@ -25,11 +25,11 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use protocol::{
-    ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, BulkRevokeDevicesReceipt,
-    HealthResponse, HeartbeatInput, PairingDecisionInput, PairingDecisionReceipt,
-    PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
-    SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsQuery,
-    ThreadsResponse,
+    ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, AuthSessionInput,
+    AuthSessionView, BulkRevokeDevicesReceipt, HealthResponse, HeartbeatInput,
+    PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
+    ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput,
+    TakeOverInput, ThreadsQuery, ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -164,6 +164,12 @@ async fn main() {
 fn build_router(context: AppContext, web_root: PathBuf) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route(
+            "/api/auth/session",
+            get(auth_session_status)
+                .post(auth_session_login)
+                .delete(auth_session_logout),
+        )
         .route("/api/session", get(session_snapshot))
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
@@ -199,6 +205,60 @@ async fn health() -> Json<ApiEnvelope<HealthResponse>> {
         service: "relay-server",
         provider: "codex",
     }))
+}
+
+async fn auth_session_status(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+) -> Json<ApiEnvelope<AuthSessionView>> {
+    Json(ApiEnvelope::ok(context.auth.session_view(&headers)))
+}
+
+async fn auth_session_login(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<AuthSessionInput>,
+) -> Result<(HeaderMap, Json<ApiEnvelope<AuthSessionView>>), (StatusCode, Json<ApiError>)> {
+    let mut response_headers = HeaderMap::new();
+    if let Some(cookie) = context
+        .auth
+        .issue_session_cookie(&input.token, request_uses_https(&headers, &uri))?
+    {
+        response_headers.insert(HeaderName::from_static("set-cookie"), cookie);
+    }
+
+    Ok((
+        response_headers,
+        Json(ApiEnvelope::ok(AuthSessionView {
+            auth_required: context.auth.enabled(),
+            authenticated: true,
+            cookie_session: context.auth.enabled(),
+        })),
+    ))
+}
+
+async fn auth_session_logout(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> (HeaderMap, Json<ApiEnvelope<AuthSessionView>>) {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        HeaderName::from_static("set-cookie"),
+        context
+            .auth
+            .clear_session_cookie(request_uses_https(&headers, &uri)),
+    );
+
+    (
+        response_headers,
+        Json(ApiEnvelope::ok(AuthSessionView {
+            auth_required: context.auth.enabled(),
+            authenticated: !context.auth.enabled(),
+            cookie_session: false,
+        })),
+    )
 }
 
 async fn session_snapshot(

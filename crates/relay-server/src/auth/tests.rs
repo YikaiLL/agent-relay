@@ -48,6 +48,125 @@ fn invalid_token_is_rejected() {
 }
 
 #[test]
+fn session_cookie_authorizes_request() {
+    let auth = AuthConfig {
+        token: Some("secret".to_string()),
+        insecure_no_auth_override: false,
+    };
+    let set_cookie = auth
+        .issue_session_cookie("secret", false)
+        .expect("cookie issuance should succeed")
+        .expect("auth-enabled config should issue a cookie");
+    let cookie_value = set_cookie.to_str().expect("cookie header should be utf-8");
+    let session_cookie = cookie_value
+        .split(';')
+        .next()
+        .expect("set-cookie should include name=value");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(session_cookie).unwrap(),
+    );
+
+    assert!(auth.authorize(&headers, &uri("/api/session")).is_ok());
+
+    let view = auth.session_view(&headers);
+    assert!(view.auth_required);
+    assert!(view.authenticated);
+    assert!(view.cookie_session);
+}
+
+#[test]
+fn session_cookie_uses_secure_attribute_for_https() {
+    let auth = AuthConfig {
+        token: Some("secret".to_string()),
+        insecure_no_auth_override: false,
+    };
+    let set_cookie = auth
+        .issue_session_cookie("secret", true)
+        .expect("cookie issuance should succeed")
+        .expect("auth-enabled config should issue a cookie");
+    let header = set_cookie.to_str().expect("cookie header should be utf-8");
+
+    assert!(header.contains("Secure"));
+    assert!(header.contains("HttpOnly"));
+    assert!(header.contains("SameSite=Lax"));
+}
+
+#[test]
+fn invalid_session_cookie_is_rejected() {
+    let auth = AuthConfig {
+        token: Some("secret".to_string()),
+        insecure_no_auth_override: false,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_static("agent_relay_session=not-a-real-cookie"),
+    );
+
+    let error = auth
+        .authorize(&headers, &uri("/api/session"))
+        .expect_err("invalid cookie should be rejected");
+
+    assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn bearer_header_marks_session_as_authenticated_without_cookie_session() {
+    let auth = AuthConfig {
+        token: Some("secret".to_string()),
+        insecure_no_auth_override: false,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer secret"),
+    );
+
+    let view = auth.session_view(&headers);
+
+    assert!(view.auth_required);
+    assert!(view.authenticated);
+    assert!(!view.cookie_session);
+}
+
+#[test]
+fn expired_session_cookie_is_rejected() {
+    let auth = AuthConfig {
+        token: Some("secret".to_string()),
+        insecure_no_auth_override: false,
+    };
+    let expired_cookie =
+        mint_session_cookie_value("secret", now_seconds().saturating_sub(1)).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(&format!("agent_relay_session={expired_cookie}")).unwrap(),
+    );
+
+    let error = auth
+        .authorize(&headers, &uri("/api/session"))
+        .expect_err("expired cookie should be rejected");
+
+    assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn clear_session_cookie_expires_immediately() {
+    let auth = AuthConfig {
+        token: Some("secret".to_string()),
+        insecure_no_auth_override: false,
+    };
+    let clear_cookie = auth.clear_session_cookie(false);
+    let header = clear_cookie.to_str().expect("clear cookie should be utf-8");
+
+    assert!(header.contains("Max-Age=0"));
+    assert!(header.contains("HttpOnly"));
+}
+
+#[test]
 fn access_token_query_is_rejected() {
     let auth = AuthConfig {
         token: Some("secret".to_string()),
@@ -60,6 +179,19 @@ fn access_token_query_is_rejected() {
 
     assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     assert_eq!(error.1 .0.error.code, "unauthorized");
+}
+
+#[test]
+fn disabled_auth_reports_authenticated_without_cookie_session() {
+    let auth = AuthConfig {
+        token: None,
+        insecure_no_auth_override: false,
+    };
+    let view = auth.session_view(&HeaderMap::new());
+
+    assert!(!view.auth_required);
+    assert!(view.authenticated);
+    assert!(!view.cookie_session);
 }
 
 #[test]
