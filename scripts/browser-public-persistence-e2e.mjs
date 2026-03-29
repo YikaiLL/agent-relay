@@ -88,16 +88,20 @@ async function main() {
     await waitForPairedRemote(remotePage);
 
     const authBeforeRestart = await readStoredRemoteAuth(remotePage);
-    assert.ok(
-      authBeforeRestart?.deviceRefreshToken,
-      "paired remote should persist a device refresh token"
+    assert.ok(authBeforeRestart?.deviceToken, "paired remote should persist a device token");
+    assert.equal(authBeforeRestart?.deviceRefreshMode, "cookie");
+    assert.equal(authBeforeRestart?.deviceRefreshToken, undefined);
+    assert.equal(authBeforeRestart?.deviceJoinTicket, undefined);
+    assert.equal(authBeforeRestart?.sessionClaim, undefined);
+    const deviceSessionCookie = await readDeviceSessionCookie(
+      remoteContext,
+      `http://${lanIp}:${brokerPort}`
     );
-    assert.ok(
-      authBeforeRestart?.deviceJoinTicket,
-      "paired remote should persist a device ws token"
-    );
+    assert.ok(deviceSessionCookie, "paired remote should establish a device session cookie");
 
     await waitForPersistedDeviceGrant(brokerStatePath, authBeforeRestart.deviceId);
+    await remotePage.reload({ waitUntil: "domcontentloaded" });
+    await waitForPairedRemote(remotePage);
 
     await stopManagedProcess(broker);
     broker = startPublicBroker({
@@ -107,16 +111,11 @@ async function main() {
     await waitForHealth(`http://127.0.0.1:${brokerPort}/api/health`);
     await waitForBrokerConnection(`http://127.0.0.1:${relayPort}/api/session`);
 
-    const refreshed = await issueDeviceWsToken(
+    const refreshed = await issueDeviceWsTokenWithCookie(
       brokerPort,
-      authBeforeRestart.deviceRefreshToken
+      `${deviceSessionCookie.name}=${deviceSessionCookie.value}`
     );
     assert.ok(refreshed.device_ws_token, "broker restart should still allow device ws token minting");
-    assert.notEqual(
-      refreshed.device_ws_token,
-      authBeforeRestart.deviceJoinTicket,
-      "restart persistence should mint a fresh device ws token"
-    );
     assert.equal(
       typeof refreshed.device_ws_token_expires_at,
       "number",
@@ -131,7 +130,6 @@ async function main() {
           pairingOrigin: new URL(pairingUrl).origin,
           deviceId: authBeforeRestart.deviceId,
           persistedStatePath: brokerStatePath,
-          refreshedTokenChanged: refreshed.device_ws_token !== authBeforeRestart.deviceJoinTicket,
           refreshedTokenExpiresAt: refreshed.device_ws_token_expires_at,
         },
         null,
@@ -196,6 +194,11 @@ async function startPairingFromLocalPage(localPage, previousUrl = "") {
 }
 
 async function openSecurityModal(page) {
+  const isOpen = await page.evaluate(() => Boolean(document.querySelector("#security-modal")?.open));
+  if (isOpen) {
+    return;
+  }
+
   await page.click("#open-security-modal");
   await page.waitForFunction(() => {
     const dialog = document.querySelector("#security-modal");
@@ -236,11 +239,11 @@ async function waitForPersistedDeviceGrant(statePath, deviceId, timeoutMs = TIME
   throw new Error(`timed out waiting for persisted device grant for ${deviceId}`);
 }
 
-async function issueDeviceWsToken(brokerPort, refreshToken) {
+async function issueDeviceWsTokenWithCookie(brokerPort, cookieHeader) {
   const response = await fetch(`http://127.0.0.1:${brokerPort}/api/public/device/ws-token`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${refreshToken}`,
+      Cookie: cookieHeader,
     },
   });
   const payload = await response.json();
@@ -254,6 +257,13 @@ async function readStoredRemoteAuth(page) {
   return page.evaluate(
     () => JSON.parse(window.localStorage.getItem("agent-relay.remote-auth") || "null")
   );
+}
+
+async function readDeviceSessionCookie(context, origin) {
+  const cookies = await context.cookies(
+    new URL("/api/public/device/ws-token", origin).toString()
+  );
+  return cookies.find((cookie) => cookie.name === "agent_relay_device_session") || null;
 }
 
 function spawnManagedProcess(name, command, args, extraEnv) {

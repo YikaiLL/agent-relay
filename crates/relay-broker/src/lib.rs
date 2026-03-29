@@ -21,7 +21,7 @@ use axum::{
         ws::{Message, WebSocket},
         Path, Query, Request, State, WebSocketUpgrade,
     },
-    http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode},
+    http::{header, header::HeaderName, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -33,8 +33,8 @@ use protocol::{ClientMessage, ConnectQuery, HealthResponse, ServerMessage};
 use public_control::{
     DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
     DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
-    RelayWsTokenRequest, RelayWsTokenResponse,
+    DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
+    PublicControlPlane, RelayWsTokenRequest, RelayWsTokenResponse,
 };
 use rand::{distributions::Alphanumeric, Rng};
 use tokio::{sync::Mutex, time::Instant};
@@ -51,6 +51,8 @@ const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+const DEVICE_SESSION_COOKIE_NAME: &str = "agent_relay_device_session";
+const DEVICE_SESSION_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 400;
 const PERMISSIONS_POLICY: &str = "accelerometer=(), ambient-light-sensor=(), autoplay=(), bluetooth=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(), usb=(), web-share=(), xr-spatial-tracking=()";
 const REFERRER_POLICY: &str = "no-referrer";
 const X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
@@ -425,6 +427,10 @@ fn app_with_web_root_and_verifier_and_hardening(
         )
         .route("/api/public/devices", post(public_issue_device_grant))
         .route(
+            "/api/public/device/session",
+            post(public_issue_device_session).delete(public_clear_device_session),
+        )
+        .route(
             "/api/public/device/ws-token",
             post(public_issue_device_ws_token),
         )
@@ -470,6 +476,11 @@ async fn health(State(state): State<BrokerAppState>) -> impl IntoResponse {
 struct ApiErrorBody {
     error: &'static str,
     message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DeviceSessionClearResponse {
+    cleared: bool,
 }
 
 async fn public_issue_relay_ws_token(
@@ -520,18 +531,63 @@ async fn public_issue_device_grant(
         .map_err(public_api_error)
 }
 
+async fn public_issue_device_session(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<DeviceSessionResponse>), (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "device_session").await?;
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::SET_COOKIE,
+        build_device_session_cookie(bearer, request_uses_https(&headers))?,
+    );
+    control_plane
+        .issue_device_session(bearer)
+        .await
+        .map(|response| (response_headers, Json(response)))
+        .map_err(public_api_error)
+}
+
+async fn public_clear_device_session(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<DeviceSessionClearResponse>), (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "clear_device_session").await?;
+    let _ = require_public_control_plane(&state)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::SET_COOKIE,
+        clear_device_session_cookie(request_uses_https(&headers)),
+    );
+    Ok((
+        response_headers,
+        Json(DeviceSessionClearResponse { cleared: true }),
+    ))
+}
+
 async fn public_issue_device_ws_token(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<BrokerAppState>,
     headers: HeaderMap,
-) -> Result<Json<DeviceWsTokenResponse>, (StatusCode, Json<ApiErrorBody>)> {
+) -> Result<(HeaderMap, Json<DeviceWsTokenResponse>), (StatusCode, Json<ApiErrorBody>)> {
     enforce_public_api_rate_limit(&state, remote_addr, "device_ws_token").await?;
     let control_plane = require_public_control_plane(&state)?;
-    let bearer = bearer_token(&headers)?;
+    let bearer = device_refresh_token(&headers)?;
+    let mut response_headers = HeaderMap::new();
+    if let Some(cookie) = device_session_cookie(&headers) {
+        response_headers.insert(
+            header::SET_COOKIE,
+            build_device_session_cookie(cookie, request_uses_https(&headers))?,
+        );
+    }
     control_plane
         .issue_device_ws_token(bearer)
         .await
-        .map(Json)
+        .map(|response| (response_headers, Json(response)))
         .map_err(public_api_error)
 }
 
@@ -933,9 +989,17 @@ fn require_public_control_plane(
     })
 }
 
+fn device_refresh_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<ApiErrorBody>)> {
+    if let Some(cookie) = device_session_cookie(headers) {
+        return Ok(cookie);
+    }
+
+    bearer_token(headers)
+}
+
 fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<ApiErrorBody>)> {
     let value = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
@@ -950,6 +1014,51 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<ApiErrorB
             )
         })?;
     Ok(value)
+}
+
+fn device_session_cookie(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        let Some((name, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if name.trim() == DEVICE_SESSION_COOKIE_NAME {
+            let cookie = value.trim();
+            if !cookie.is_empty() {
+                return Some(cookie);
+            }
+        }
+    }
+    None
+}
+
+fn build_device_session_cookie(
+    refresh_token: &str,
+    secure: bool,
+) -> Result<HeaderValue, (StatusCode, Json<ApiErrorBody>)> {
+    HeaderValue::from_str(&format!(
+        "{DEVICE_SESSION_COOKIE_NAME}={}; HttpOnly; Path=/api/public/device; SameSite=Strict; Max-Age={DEVICE_SESSION_COOKIE_MAX_AGE_SECS}{}",
+        refresh_token.trim(),
+        if secure { "; Secure" } else { "" }
+    ))
+    .map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorBody {
+                error: "bad_request",
+                message: "device session cookie could not be created".to_string(),
+            }),
+        )
+    })
+}
+
+fn clear_device_session_cookie(secure: bool) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{DEVICE_SESSION_COOKIE_NAME}=; HttpOnly; Path=/api/public/device; SameSite=Strict; Max-Age=0{}",
+        if secure { "; Secure" } else { "" }
+    ))
+    .expect("device session clear-cookie header should be valid")
 }
 
 fn public_api_error(message: String) -> (StatusCode, Json<ApiErrorBody>) {

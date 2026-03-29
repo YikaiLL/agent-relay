@@ -86,6 +86,13 @@ pub struct DeviceWsTokenResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceSessionResponse {
+    pub broker_room_id: String,
+    pub device_id: String,
+    pub cookie_session: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceGrantRevokeRequest {
     pub relay_id: String,
     pub broker_room_id: String,
@@ -325,17 +332,23 @@ impl PublicControlPlane {
         })
     }
 
+    pub async fn issue_device_session(
+        &self,
+        bearer_token: &str,
+    ) -> Result<DeviceSessionResponse, String> {
+        let grant = self.device_grant_from_refresh_token(bearer_token).await?;
+        Ok(DeviceSessionResponse {
+            broker_room_id: grant.broker_room_id,
+            device_id: grant.device_id,
+            cookie_session: true,
+        })
+    }
+
     pub async fn issue_device_ws_token(
         &self,
         bearer_token: &str,
     ) -> Result<DeviceWsTokenResponse, String> {
-        let token_hash = sha256_hex(bearer_token.trim());
-        let store = self.inner.device_grants.lock().await;
-        let grant = store
-            .grants_by_hash
-            .get(&token_hash)
-            .cloned()
-            .ok_or_else(|| "device refresh token is invalid".to_string())?;
+        let grant = self.device_grant_from_refresh_token(bearer_token).await?;
         let registration = RelayRegistration {
             relay_id: grant.relay_id,
             broker_room_id: grant.broker_room_id,
@@ -434,6 +447,19 @@ impl PublicControlPlane {
                 ))?,
             device_ws_token_expires_at: expires_at,
         })
+    }
+
+    async fn device_grant_from_refresh_token(
+        &self,
+        bearer_token: &str,
+    ) -> Result<PersistedDeviceGrant, String> {
+        let token_hash = sha256_hex(bearer_token.trim());
+        let store = self.inner.device_grants.lock().await;
+        store
+            .grants_by_hash
+            .get(&token_hash)
+            .cloned()
+            .ok_or_else(|| "device refresh token is invalid".to_string())
     }
 }
 

@@ -4,6 +4,11 @@ import nacl from "tweetnacl";
 import { base64ToBytes, base64UrlToBytes, bytesToBase64 } from "./encoding.js";
 
 const REMOTE_DEVICE_KEYPAIR_STORAGE_KEY = "agent-relay.remote-device-keypair";
+const REMOTE_DEVICE_KEY_DB_NAME = "agent-relay-crypto";
+const REMOTE_DEVICE_KEY_STORE_NAME = "device-keys";
+const REMOTE_DEVICE_KEY_RECORD_ID = "remote-device-keypair-v1";
+
+let deviceKeypairPromise = null;
 
 export function parsePairingPayload(rawInput) {
   let raw = rawInput.trim();
@@ -81,38 +86,237 @@ export async function decryptJson(secret, envelope) {
   return JSON.parse(new TextDecoder().decode(plaintext));
 }
 
-export function loadOrCreateDeviceKeypair() {
-  const raw = window.localStorage.getItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed?.verifyKey && parsed?.signSecretKey) {
-        return parsed;
-      }
-    } catch {
-      window.localStorage.removeItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
-    }
+export async function ensureDeviceKeypair() {
+  if (!deviceKeypairPromise) {
+    deviceKeypairPromise = loadOrCreateDeviceKeypair().catch((error) => {
+      deviceKeypairPromise = null;
+      throw error;
+    });
   }
-
-  const keypair = nacl.sign.keyPair();
-  const stored = {
-    verifyKey: bytesToBase64(keypair.publicKey),
-    signSecretKey: bytesToBase64(keypair.secretKey),
-  };
-  window.localStorage.setItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY, JSON.stringify(stored));
-  return stored;
+  return deviceKeypairPromise;
 }
 
 export function pairingProofMessage(pairingId, deviceId) {
   return `agent-relay:pairing:${pairingId}:${deviceId || ""}`;
 }
 
-export function signPairingProof(pairingId, deviceId, keypair = loadOrCreateDeviceKeypair()) {
-  const message = new TextEncoder().encode(pairingProofMessage(pairingId, deviceId));
-  const signature = nacl.sign.detached(message, base64ToBytes(keypair.signSecretKey));
+export async function signPairingProof(pairingId, deviceId, keypair = null) {
+  return signDeviceProof(
+    pairingProofMessage(pairingId, deviceId),
+    keypair || (await ensureDeviceKeypair())
+  );
+}
+
+export function claimProofMessage(actionId, deviceId, peerId) {
+  return `agent-relay:claim:${actionId}:${deviceId || ""}:${peerId || ""}`;
+}
+
+export async function signClaimProof(
+  actionId,
+  deviceId,
+  peerId,
+  keypair = null
+) {
+  return signDeviceProof(
+    claimProofMessage(actionId, deviceId, peerId),
+    keypair || (await ensureDeviceKeypair())
+  );
+}
+
+async function signDeviceProof(message, keypair) {
+  const encodedMessage = new TextEncoder().encode(message);
+  const signature = await keypair.sign(encodedMessage);
   return bytesToBase64(signature);
 }
 
 function deriveSecretKey(secret) {
   return sha256(new TextEncoder().encode(secret));
+}
+
+async function loadOrCreateDeviceKeypair() {
+  if (supportsProtectedDeviceKeypairStorage()) {
+    try {
+      const protectedKeypair = await loadProtectedDeviceKeypair();
+      if (protectedKeypair) {
+        clearLegacyDeviceKeypairStorage();
+        return protectedKeypair;
+      }
+    } catch {
+      // Fall back to legacy storage if the browser cannot restore the protected key.
+    }
+  }
+
+  const legacyKeypair = loadLegacyDeviceKeypair();
+  if (legacyKeypair) {
+    return legacyKeypair;
+  }
+
+  if (supportsProtectedDeviceKeypairStorage()) {
+    try {
+      const protectedKeypair = await createProtectedDeviceKeypair();
+      clearLegacyDeviceKeypairStorage();
+      return protectedKeypair;
+    } catch {
+      // Fall back to legacy storage below.
+    }
+  }
+
+  return createLegacyDeviceKeypair();
+}
+
+function loadLegacyDeviceKeypair() {
+  const raw = window.localStorage.getItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed?.verifyKey && parsed?.signSecretKey) {
+      return {
+        verifyKey: parsed.verifyKey,
+        storageMode: "legacy",
+        async sign(messageBytes) {
+          return nacl.sign.detached(messageBytes, base64ToBytes(parsed.signSecretKey));
+        },
+      };
+    }
+  } catch {
+    clearLegacyDeviceKeypairStorage();
+  }
+
+  clearLegacyDeviceKeypairStorage();
+  return null;
+}
+
+function createLegacyDeviceKeypair() {
+  const keypair = nacl.sign.keyPair();
+  const stored = {
+    verifyKey: bytesToBase64(keypair.publicKey),
+    signSecretKey: bytesToBase64(keypair.secretKey),
+  };
+  window.localStorage.setItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY, JSON.stringify(stored));
+  return {
+    verifyKey: stored.verifyKey,
+    storageMode: "legacy",
+    async sign(messageBytes) {
+      return nacl.sign.detached(messageBytes, keypair.secretKey);
+    },
+  };
+}
+
+function clearLegacyDeviceKeypairStorage() {
+  window.localStorage.removeItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
+}
+
+function supportsProtectedDeviceKeypairStorage() {
+  return Boolean(getWebCrypto()?.subtle && getIndexedDb());
+}
+
+function getWebCrypto() {
+  return globalThis.crypto || window.crypto || null;
+}
+
+function getIndexedDb() {
+  return globalThis.indexedDB || window.indexedDB || null;
+}
+
+async function loadProtectedDeviceKeypair() {
+  const record = await readProtectedDeviceKeypairRecord();
+  if (!record?.verifyKey || !record.privateKey || !record.publicKey) {
+    return null;
+  }
+  return buildProtectedDeviceKeypair(record);
+}
+
+async function createProtectedDeviceKeypair() {
+  const webcrypto = getWebCrypto();
+  const generated = await webcrypto.subtle.generateKey({ name: "Ed25519" }, false, [
+    "sign",
+    "verify",
+  ]);
+  const verifyKey = bytesToBase64(
+    new Uint8Array(await webcrypto.subtle.exportKey("raw", generated.publicKey))
+  );
+  const record = {
+    id: REMOTE_DEVICE_KEY_RECORD_ID,
+    verifyKey,
+    privateKey: generated.privateKey,
+    publicKey: generated.publicKey,
+  };
+  await writeProtectedDeviceKeypairRecord(record);
+  return buildProtectedDeviceKeypair(record);
+}
+
+function buildProtectedDeviceKeypair(record) {
+  const webcrypto = getWebCrypto();
+  return {
+    verifyKey: record.verifyKey,
+    storageMode: "webcrypto",
+    async sign(messageBytes) {
+      const signature = await webcrypto.subtle.sign("Ed25519", record.privateKey, messageBytes);
+      return new Uint8Array(signature);
+    },
+  };
+}
+
+async function readProtectedDeviceKeypairRecord() {
+  return withProtectedKeyStore("readonly", (store) => {
+    const request = store.get(REMOTE_DEVICE_KEY_RECORD_ID);
+    return wrapRequest(request);
+  });
+}
+
+async function writeProtectedDeviceKeypairRecord(record) {
+  return withProtectedKeyStore("readwrite", (store) => {
+    const request = store.put(record);
+    return wrapRequest(request);
+  });
+}
+
+async function withProtectedKeyStore(mode, run) {
+  const database = await openProtectedKeyDatabase();
+  try {
+    const transaction = database.transaction(REMOTE_DEVICE_KEY_STORE_NAME, mode);
+    const store = transaction.objectStore(REMOTE_DEVICE_KEY_STORE_NAME);
+    const completion = waitForTransaction(transaction);
+    const result = await run(store);
+    await completion;
+    return result;
+  } finally {
+    database.close();
+  }
+}
+
+function openProtectedKeyDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = getIndexedDb().open(REMOTE_DEVICE_KEY_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(REMOTE_DEVICE_KEY_STORE_NAME)) {
+        database.createObjectStore(REMOTE_DEVICE_KEY_STORE_NAME, { keyPath: "id" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error || new Error("failed to open device key database"));
+  });
+}
+
+function waitForTransaction(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () =>
+      reject(transaction.error || new Error("device key transaction aborted"));
+    transaction.onerror = () =>
+      reject(transaction.error || new Error("device key transaction failed"));
+  });
+}
+
+function wrapRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error || new Error("device key storage request failed"));
+  });
 }

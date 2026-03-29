@@ -33,7 +33,7 @@ import {
   syncRemoteSnapshot,
   takeOverControl,
 } from "./session-ops.js";
-import { loadDeviceLabel, state } from "./state.js";
+import { ensureDeviceIdentity, loadDeviceLabel, state } from "./state.js";
 
 configureRenderHandlers({
   onResumeThread(threadId) {
@@ -138,6 +138,11 @@ void boot();
 async function boot() {
   if (!window.crypto?.getRandomValues) {
     renderLog("Secure random bytes are unavailable in this browser. Remote pairing cannot start here.");
+  }
+  try {
+    await ensureDeviceIdentity();
+  } catch (error) {
+    renderLog(`Device identity could not be initialized: ${error.message}`);
   }
   void registerRemotePwa();
 

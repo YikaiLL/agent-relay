@@ -1,10 +1,8 @@
-import { loadOrCreateDeviceKeypair } from "./crypto.js";
+import { ensureDeviceKeypair } from "./crypto.js";
 
 const REMOTE_AUTH_STORAGE_KEY = "agent-relay.remote-auth";
 const REMOTE_DEVICE_LABEL_STORAGE_KEY = "agent-relay.remote-device-label";
 const REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY = "agent-relay.remote-device-id";
-
-const deviceKeypair = loadOrCreateDeviceKeypair();
 
 export const CONTROL_HEARTBEAT_MS = 5000;
 export const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
@@ -17,13 +15,15 @@ export const state = {
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
-  deviceKeypair,
+  deviceIdentityPromise: null,
+  deviceKeypair: null,
+  deviceKeyStorageMode: null,
   pairingError: null,
   pairingPhase: null,
   pairingTicket: null,
   pendingActions: new Map(),
   remoteAuth: loadRemoteAuth(),
-  requestedDeviceId: loadOrCreateRequestedDeviceId(),
+  requestedDeviceId: null,
   session: null,
   socket: null,
   socketPeerId: null,
@@ -53,7 +53,9 @@ export function connectionTarget() {
 }
 
 export function canRefreshDeviceJoinTicket() {
-  return Boolean(state.remoteAuth?.deviceRefreshToken);
+  return Boolean(
+    state.remoteAuth?.deviceRefreshMode === "cookie" || state.remoteAuth?.deviceRefreshToken
+  );
 }
 
 export function hasUsableDeviceJoinTicket(skewMs = 0) {
@@ -83,7 +85,6 @@ export function clearSessionClaim() {
 
   state.remoteAuth.sessionClaim = null;
   state.remoteAuth.sessionClaimExpiresAt = null;
-  saveRemoteAuth(state.remoteAuth);
 }
 
 export function setSessionClaim(claim, expiresAt) {
@@ -93,7 +94,6 @@ export function setSessionClaim(claim, expiresAt) {
 
   state.remoteAuth.sessionClaim = claim;
   state.remoteAuth.sessionClaimExpiresAt = expiresAt || null;
-  saveRemoteAuth(state.remoteAuth);
 }
 
 export function setSocketPeerId(value) {
@@ -146,13 +146,36 @@ function defaultDeviceLabel() {
   return `${platform} Remote`;
 }
 
-function loadOrCreateRequestedDeviceId() {
+export async function ensureDeviceIdentity() {
+  if (state.deviceKeypair && state.requestedDeviceId) {
+    return state.deviceKeypair;
+  }
+  if (state.deviceIdentityPromise) {
+    return state.deviceIdentityPromise;
+  }
+
+  state.deviceIdentityPromise = (async () => {
+    const deviceKeypair = await ensureDeviceKeypair();
+    state.deviceKeypair = deviceKeypair;
+    state.deviceKeyStorageMode = deviceKeypair.storageMode || null;
+    state.requestedDeviceId = loadOrCreateRequestedDeviceId(deviceKeypair.verifyKey);
+    return deviceKeypair;
+  })();
+
+  try {
+    return await state.deviceIdentityPromise;
+  } finally {
+    state.deviceIdentityPromise = null;
+  }
+}
+
+function loadOrCreateRequestedDeviceId(verifyKey) {
   const existing = window.localStorage.getItem(REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY);
   if (existing) {
     return existing;
   }
 
-  const fingerprint = deviceKeypair.verifyKey
+  const fingerprint = verifyKey
     .replaceAll("/", "")
     .replaceAll("+", "")
     .replaceAll("=", "")
@@ -170,17 +193,29 @@ function loadRemoteAuth() {
 
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed?.deviceJoinTicket && !parsed?.deviceRefreshToken) {
+    if (
+      !parsed?.brokerUrl ||
+      !parsed?.brokerChannelId ||
+      !parsed?.deviceId ||
+      !parsed?.deviceToken
+    ) {
       window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
       return null;
     }
     return {
-      ...parsed,
-      deviceJoinTicket: parsed.deviceJoinTicket || null,
-      deviceJoinTicketExpiresAt: parsed.deviceJoinTicketExpiresAt || null,
+      brokerUrl: parsed.brokerUrl,
+      brokerChannelId: parsed.brokerChannelId,
+      relayPeerId: parsed.relayPeerId || null,
+      securityMode: parsed.securityMode || "private",
+      deviceId: parsed.deviceId,
+      deviceLabel: parsed.deviceLabel || defaultDeviceLabel(),
+      deviceToken: parsed.deviceToken,
+      deviceRefreshMode: parsed.deviceRefreshMode === "cookie" ? "cookie" : null,
       deviceRefreshToken: parsed.deviceRefreshToken || null,
-      sessionClaim: parsed.sessionClaim || null,
-      sessionClaimExpiresAt: parsed.sessionClaimExpiresAt || null,
+      deviceJoinTicket: null,
+      deviceJoinTicketExpiresAt: null,
+      sessionClaim: null,
+      sessionClaimExpiresAt: null,
     };
   } catch {
     window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
@@ -194,7 +229,19 @@ export function saveRemoteAuth(value) {
     return;
   }
 
-  window.localStorage.setItem(REMOTE_AUTH_STORAGE_KEY, JSON.stringify(value));
+  window.localStorage.setItem(
+    REMOTE_AUTH_STORAGE_KEY,
+    JSON.stringify({
+      brokerUrl: value.brokerUrl,
+      brokerChannelId: value.brokerChannelId,
+      relayPeerId: value.relayPeerId || null,
+      securityMode: value.securityMode || "private",
+      deviceId: value.deviceId,
+      deviceLabel: value.deviceLabel || null,
+      deviceToken: value.deviceToken,
+      deviceRefreshMode: value.deviceRefreshMode === "cookie" ? "cookie" : null,
+    })
+  );
 }
 
 export function brokerControlUrl(brokerUrl) {

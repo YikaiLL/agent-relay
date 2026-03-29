@@ -17,8 +17,8 @@ use crate::join_ticket::{JoinTicketClaims, JoinTicketKey};
 use crate::public_control::{
     DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
     DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
-    RelayWsTokenRequest, RelayWsTokenResponse,
+    DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
+    PublicControlPlane, RelayWsTokenRequest, RelayWsTokenResponse,
 };
 
 async fn spawn_app() -> SocketAddr {
@@ -159,6 +159,58 @@ where
         .json::<TResp>()
         .await
         .expect("response should decode")
+}
+
+async fn public_post_response<TReq>(
+    address: SocketAddr,
+    path: &str,
+    bearer_token: &str,
+    request: &TReq,
+) -> reqwest::Response
+where
+    TReq: serde::Serialize + ?Sized,
+{
+    reqwest::Client::new()
+        .post(format!("http://{address}{path}"))
+        .bearer_auth(bearer_token)
+        .json(request)
+        .send()
+        .await
+        .expect("request should succeed")
+}
+
+async fn public_post_with_cookie<TReq, TResp>(
+    address: SocketAddr,
+    path: &str,
+    cookie: &str,
+    request: &TReq,
+) -> TResp
+where
+    TReq: serde::Serialize + ?Sized,
+    TResp: serde::de::DeserializeOwned,
+{
+    reqwest::Client::new()
+        .post(format!("http://{address}{path}"))
+        .header(reqwest::header::COOKIE, cookie)
+        .json(request)
+        .send()
+        .await
+        .expect("request should succeed")
+        .error_for_status()
+        .expect("response should be successful")
+        .json::<TResp>()
+        .await
+        .expect("response should decode")
+}
+
+fn set_cookie_name_value(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::to_string)
+        .expect("set-cookie header should include a name=value pair")
 }
 
 async fn public_post_expect_status<TReq>(
@@ -953,6 +1005,47 @@ async fn public_device_ws_tokens_can_refresh_after_expiry() {
 }
 
 #[tokio::test]
+async fn public_device_session_cookie_can_refresh_ws_tokens() {
+    let address = spawn_public_mode_app().await;
+    let device_grant: DeviceGrantResponse = public_post(
+        address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-cookie".to_string(),
+        },
+    )
+    .await;
+
+    let session_response = public_post_response(
+        address,
+        "/api/public/device/session",
+        &device_grant.device_refresh_token,
+        &serde_json::json!({}),
+    )
+    .await
+    .error_for_status()
+    .expect("device session request should succeed");
+    let cookie = set_cookie_name_value(&session_response);
+    let session: DeviceSessionResponse = session_response
+        .json()
+        .await
+        .expect("device session response should decode");
+    assert_eq!(session.device_id, "device-cookie");
+
+    let refreshed: DeviceWsTokenResponse = public_post_with_cookie(
+        address,
+        "/api/public/device/ws-token",
+        &cookie,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(refreshed.device_id, "device-cookie");
+}
+
+#[tokio::test]
 async fn public_device_refresh_tokens_survive_control_plane_restart() {
     let state_path = temp_state_path("agent-relay-public-control");
     let first_address = spawn_public_mode_app_with(
@@ -1039,6 +1132,53 @@ async fn public_device_refresh_tokens_fail_after_revoke() {
     )
     .await;
     assert!(error_body.contains("request failed"));
+}
+
+#[tokio::test]
+async fn public_device_session_cookie_fails_after_revoke() {
+    let address = spawn_public_mode_app().await;
+    let device_grant: DeviceGrantResponse = public_post(
+        address,
+        "/api/public/devices",
+        "relay-refresh-1",
+        &DeviceGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-cookie-revoked".to_string(),
+        },
+    )
+    .await;
+
+    let session_response = public_post_response(
+        address,
+        "/api/public/device/session",
+        &device_grant.device_refresh_token,
+        &serde_json::json!({}),
+    )
+    .await
+    .error_for_status()
+    .expect("device session request should succeed");
+    let cookie = set_cookie_name_value(&session_response);
+
+    let _: DeviceGrantRevokeResponse = public_post(
+        address,
+        "/api/public/devices/device-cookie-revoked/revoke",
+        "relay-refresh-1",
+        &DeviceGrantRevokeRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+        },
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/api/public/device/ws-token"))
+        .header(reqwest::header::COOKIE, cookie)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("cookie refresh request should complete");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

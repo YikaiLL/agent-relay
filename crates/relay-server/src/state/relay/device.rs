@@ -35,7 +35,7 @@ pub(crate) struct PairedDevice {
     pub(crate) shared_secret: String,
     pub(crate) token_hash: String,
     #[serde(default)]
-    pub(crate) device_verify_key: Option<String>,
+    pub(crate) device_verify_key: String,
     pub(crate) created_at: u64,
     pub(crate) last_seen_at: Option<u64>,
     pub(crate) last_peer_id: Option<String>,
@@ -53,7 +53,7 @@ pub(crate) struct DeviceRecord {
     pub(crate) last_seen_at: Option<u64>,
     pub(crate) last_peer_id: Option<String>,
     #[serde(default)]
-    pub(crate) device_verify_key: Option<String>,
+    pub(crate) device_verify_key: String,
     #[serde(default)]
     pub(crate) broker_join_ticket_expires_at: Option<u64>,
 }
@@ -68,7 +68,7 @@ impl PairedDevice {
             last_seen_at: self.last_seen_at,
             last_peer_id: self.last_peer_id.clone(),
             broker_join_ticket_expires_at: self.broker_join_ticket_expires_at,
-            fingerprint: device_fingerprint(self.device_verify_key.as_deref()),
+            fingerprint: device_fingerprint(Some(&self.device_verify_key)),
         }
     }
 }
@@ -98,7 +98,7 @@ impl DeviceRecord {
             last_seen_at: self.last_seen_at,
             last_peer_id: self.last_peer_id.clone(),
             broker_join_ticket_expires_at: self.broker_join_ticket_expires_at,
-            fingerprint: device_fingerprint(self.device_verify_key.as_deref()),
+            fingerprint: device_fingerprint(Some(&self.device_verify_key)),
         }
     }
 }
@@ -240,7 +240,7 @@ impl RelayState {
         pairing_secret: &str,
         requested_device_id: Option<String>,
         device_label: Option<String>,
-        device_verify_key: Option<String>,
+        device_verify_key: String,
         broker_join_ticket_expires_at: Option<u64>,
         peer_id: &str,
         now: u64,
@@ -375,7 +375,7 @@ impl RelayState {
                 &pending.pairing_secret,
                 Some(request.device_id),
                 Some(request.label),
-                Some(device_verify_key.clone()),
+                device_verify_key.clone(),
                 device_join_ticket_expires_at,
                 &request.broker_peer_id,
                 now,
@@ -551,6 +551,18 @@ impl RelayState {
             .ok_or_else(|| "device is not paired".to_string())
     }
 
+    pub fn paired_device_verify_key(&self, device_id: &str) -> Result<String, String> {
+        let verify_key = self
+            .paired_devices
+            .get(device_id)
+            .map(|device| device.device_verify_key.clone())
+            .ok_or_else(|| "device is not paired".to_string())?;
+        if verify_key.trim().is_empty() {
+            return Err("device verify key is missing; re-pair this device".to_string());
+        }
+        Ok(verify_key)
+    }
+
     pub fn mark_paired_device_seen(
         &mut self,
         device_id: &str,
@@ -646,14 +658,14 @@ impl RelayState {
                 state_changed_at: now,
                 last_seen_at: None,
                 last_peer_id: Some(last_peer_id.to_string()),
-                device_verify_key: Some(device_verify_key.to_string()),
+                device_verify_key: device_verify_key.to_string(),
                 broker_join_ticket_expires_at: None,
             });
         record.label = label.to_string();
         record.lifecycle_state = DeviceLifecycleState::Rejected;
         record.state_changed_at = now;
         record.last_peer_id = Some(last_peer_id.to_string());
-        record.device_verify_key = Some(device_verify_key.to_string());
+        record.device_verify_key = device_verify_key.to_string();
         record.broker_join_ticket_expires_at = None;
     }
 

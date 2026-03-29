@@ -16,6 +16,8 @@ use super::{
     *,
 };
 
+const TEST_VERIFY_KEY_B64: &str = "dGVzdC12ZXJpZnkta2V5";
+
 fn test_persisted_state() -> PersistedRelayState {
     let mut device_records = std::collections::HashMap::new();
     device_records.insert(
@@ -28,7 +30,7 @@ fn test_persisted_state() -> PersistedRelayState {
             state_changed_at: 7,
             last_seen_at: Some(9),
             last_peer_id: Some("surface-1".to_string()),
-            device_verify_key: None,
+            device_verify_key: TEST_VERIFY_KEY_B64.to_string(),
             broker_join_ticket_expires_at: None,
         },
     );
@@ -40,7 +42,7 @@ fn test_persisted_state() -> PersistedRelayState {
             label: "Primary Phone".to_string(),
             shared_secret: "shared-secret".to_string(),
             token_hash: "token-hash".to_string(),
-            device_verify_key: None,
+            device_verify_key: TEST_VERIFY_KEY_B64.to_string(),
             created_at: 7,
             last_seen_at: Some(9),
             last_peer_id: Some("surface-1".to_string()),
@@ -549,7 +551,7 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
             &ticket.pairing_secret,
             Some("My Phone".to_string()),
             Some("Primary Phone".to_string()),
-            None,
+            TEST_VERIFY_KEY_B64.to_string(),
             None,
             "surface-a",
             100,
@@ -572,6 +574,30 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
             .and_then(|device| device.last_peer_id.as_deref()),
         Some("surface-b")
     );
+}
+
+#[test]
+fn paired_device_requires_a_verify_key() {
+    let mut relay = test_state();
+    relay.paired_devices.insert(
+        "phone-1".to_string(),
+        PairedDevice {
+            device_id: "phone-1".to_string(),
+            label: "Primary Phone".to_string(),
+            shared_secret: "shared-secret".to_string(),
+            token_hash: "token-hash".to_string(),
+            device_verify_key: String::new(),
+            created_at: 7,
+            last_seen_at: Some(9),
+            last_peer_id: Some("surface-1".to_string()),
+            broker_join_ticket_expires_at: None,
+        },
+    );
+
+    let error = relay
+        .paired_device_verify_key("phone-1")
+        .expect_err("empty verify key should be rejected");
+    assert!(error.contains("re-pair"));
 }
 
 #[test]
@@ -624,7 +650,7 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
             "wrong-secret",
             Some("phone-2".to_string()),
             None,
-            None,
+            TEST_VERIFY_KEY_B64.to_string(),
             None,
             "surface-a",
             100,
@@ -645,7 +671,7 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
             &replacement.pairing_secret,
             Some("phone-2".to_string()),
             None,
-            None,
+            TEST_VERIFY_KEY_B64.to_string(),
             None,
             "surface-a",
             100,
@@ -674,7 +700,7 @@ fn revoking_paired_device_removes_it() {
             &ticket.pairing_secret,
             Some("tablet".to_string()),
             Some("Tablet".to_string()),
-            None,
+            TEST_VERIFY_KEY_B64.to_string(),
             None,
             "surface-tablet",
             100,
@@ -1043,7 +1069,7 @@ fn revoke_all_other_devices_keeps_selected_device_and_marks_others_revoked() {
             &keep_ticket.pairing_secret,
             Some("phone-keep".to_string()),
             Some("Keep Phone".to_string()),
-            Some("verify-key-keep".to_string()),
+            "verify-key-keep".to_string(),
             Some(300),
             "surface-keep",
             100,
@@ -1055,7 +1081,7 @@ fn revoke_all_other_devices_keeps_selected_device_and_marks_others_revoked() {
             &drop_ticket.pairing_secret,
             Some("phone-drop".to_string()),
             Some("Drop Phone".to_string()),
-            Some("verify-key-drop".to_string()),
+            "verify-key-drop".to_string(),
             Some(400),
             "surface-drop",
             101,

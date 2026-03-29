@@ -821,12 +821,44 @@ fn verify_pairing_request_proof(
         .map_err(|_| "pairing proof is invalid".to_string())
 }
 
+pub(super) fn verify_device_claim_proof(
+    action_id: &str,
+    device_id: &str,
+    peer_id: &str,
+    verify_key_b64: &str,
+    signature_b64: &str,
+) -> Result<(), String> {
+    let verify_key_bytes: [u8; 32] = STANDARD
+        .decode(verify_key_b64)
+        .map_err(|_| "device verify key is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "device verify key is invalid".to_string())?;
+    let signature_bytes: [u8; 64] = STANDARD
+        .decode(signature_b64)
+        .map_err(|_| "device claim proof is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "device claim proof is invalid".to_string())?;
+    let verify_key = VerifyingKey::from_bytes(&verify_key_bytes)
+        .map_err(|_| "device verify key is invalid".to_string())?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verify_key
+        .verify(
+            device_claim_proof_message(action_id, device_id, peer_id).as_bytes(),
+            &signature,
+        )
+        .map_err(|_| "device claim proof is invalid".to_string())
+}
+
 fn pairing_proof_message(pairing_id: &str, device_id: Option<&str>) -> String {
     format!(
         "agent-relay:pairing:{}:{}",
         pairing_id,
         device_id.unwrap_or_default()
     )
+}
+
+fn device_claim_proof_message(action_id: &str, device_id: &str, peer_id: &str) -> String {
+    format!("agent-relay:claim:{action_id}:{device_id}:{peer_id}")
 }
 
 #[cfg(test)]

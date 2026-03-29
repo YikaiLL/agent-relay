@@ -152,7 +152,7 @@ impl RelayState {
                     state_changed_at: request.requested_at,
                     last_seen_at: None,
                     last_peer_id: Some(request.broker_peer_id.clone()),
-                    device_verify_key: Some(request.device_verify_key.clone()),
+                    device_verify_key: request.device_verify_key.clone(),
                     broker_join_ticket_expires_at: None,
                 },
             );

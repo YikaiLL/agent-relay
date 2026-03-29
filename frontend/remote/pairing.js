@@ -6,7 +6,13 @@ import {
   parsePairingPayload,
   signPairingProof,
 } from "./crypto.js";
-import { closeBrokerSocket, connectBroker, sendBrokerFrame } from "./broker-client.js";
+import {
+  clearDeviceRefreshSession,
+  closeBrokerSocket,
+  connectBroker,
+  establishDeviceRefreshSession,
+  sendBrokerFrame,
+} from "./broker-client.js";
 import {
   clearClaimLifecycle,
   ensureRemoteClaim,
@@ -20,6 +26,7 @@ import {
 } from "./render.js";
 import {
   normalizedDeviceLabel,
+  ensureDeviceIdentity,
   saveDeviceLabel,
   saveRemoteAuth,
   state,
@@ -90,6 +97,7 @@ export async function sendPairingRequest() {
   if (!ticket) {
     return;
   }
+  const deviceKeypair = await ensureDeviceIdentity();
 
   state.pairingPhase = "requesting";
   state.pairingError = null;
@@ -101,11 +109,11 @@ export async function sendPairingRequest() {
     envelope: await encryptJson(ticket.pairing_secret, {
       device_id: state.requestedDeviceId,
       device_label: normalizedDeviceLabel(dom.deviceLabelInput.value),
-      device_verify_key: state.deviceKeypair.verifyKey,
-      pairing_proof: signPairingProof(
+      device_verify_key: deviceKeypair.verifyKey,
+      pairing_proof: await signPairingProof(
         ticket.pairing_id,
         state.requestedDeviceId,
-        state.deviceKeypair
+        deviceKeypair
       ),
     }),
   };
@@ -151,12 +159,27 @@ export async function handleEncryptedPairingResult(payload) {
     deviceId: device.device_id,
     deviceLabel: device.label,
     deviceToken: result.device_token,
+    deviceRefreshMode: null,
     deviceRefreshToken: result.device_refresh_token || null,
     deviceJoinTicket: result.device_join_ticket,
     deviceJoinTicketExpiresAt: result.device_join_ticket_expires_at || null,
     sessionClaim: null,
     sessionClaimExpiresAt: null,
   };
+  if (state.remoteAuth.deviceRefreshToken) {
+    try {
+      await establishDeviceRefreshSession(
+        state.remoteAuth.deviceRefreshToken,
+        state.remoteAuth.brokerUrl
+      );
+      state.remoteAuth.deviceRefreshMode = "cookie";
+      state.remoteAuth.deviceRefreshToken = null;
+    } catch (error) {
+      renderLog(
+        `Broker device session cookie could not be established yet: ${error.message}`
+      );
+    }
+  }
   saveRemoteAuth(state.remoteAuth);
   state.pairingTicket = null;
   state.pairingPhase = null;
@@ -174,6 +197,7 @@ export async function handleEncryptedPairingResult(payload) {
 }
 
 export function forgetCurrentDevice() {
+  const brokerUrl = state.remoteAuth?.brokerUrl || null;
   state.pairingError = null;
   state.pairingPhase = null;
   state.pairingTicket = null;
@@ -187,6 +211,7 @@ export function forgetCurrentDevice() {
   saveRemoteAuth(null);
   clearPairingQueryFromUrl();
   closeBrokerSocket();
+  void clearDeviceRefreshSession(brokerUrl);
   dom.pairingInput.value = "";
   resetRemoteSurface();
   renderLog("Forgot the stored remote device for this browser.");

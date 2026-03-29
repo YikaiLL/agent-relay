@@ -126,6 +126,7 @@ function installBrowserStubs() {
   globalThis.WebSocket = FakeWebSocket;
 
   return {
+    localStorage,
     runTimers() {
       while (pendingTimers.length) {
         const callback = pendingTimers.shift();
@@ -194,15 +195,26 @@ test("expired device broker access refreshes automatically during reconnect", as
 
   FakeWebSocket.instances[0].emit("close", { code: 1006, reason: "restart" });
   browser.runTimers();
-  await waitFor(() => fetchCalls.length === 1);
+  await waitFor(() => fetchCalls.length === 2);
   await waitFor(() => FakeWebSocket.instances.length === 2);
 
-  assert.equal(fetchCalls.length, 1);
-  assert.match(fetchCalls[0].url, /\/api\/public\/device\/ws-token$/);
+  assert.equal(fetchCalls.length, 2);
+  assert.match(fetchCalls[0].url, /\/api\/public\/device\/session$/);
   assert.equal(fetchCalls[0].options.headers.Authorization, "Bearer device-refresh-1");
+  assert.equal(fetchCalls[0].options.credentials, "same-origin");
+  assert.match(fetchCalls[1].url, /\/api\/public\/device\/ws-token$/);
+  assert.equal(fetchCalls[1].options.credentials, "same-origin");
+  assert.equal(fetchCalls[1].options.headers, undefined);
   assert.equal(FakeWebSocket.instances.length, 2);
   assert.match(FakeWebSocket.instances[1].url, /join_ticket=fresh-device-ws-token/);
+  assert.equal(state.remoteAuth.deviceRefreshMode, "cookie");
+  assert.equal(state.remoteAuth.deviceRefreshToken, null);
   assert.equal(state.remoteAuth.deviceJoinTicket, "fresh-device-ws-token");
+  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
+  assert.equal(storedAuth.deviceRefreshToken, undefined);
+  assert.equal(storedAuth.deviceJoinTicket, undefined);
+  assert.equal(storedAuth.sessionClaim, undefined);
+  assert.equal(storedAuth.deviceRefreshMode, "cookie");
   FakeWebSocket.instances[1].emit("open");
   assert.equal(state.socketConnected, true);
 });

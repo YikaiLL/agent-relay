@@ -13,8 +13,8 @@ use crate::{
 
 use super::{
     crypto::{decrypt_json, encrypt_json, EncryptedEnvelope},
-    issue_session_claim, publish_payload, verify_session_claim, BrokerSocket,
-    OutboundBrokerPayload,
+    issue_session_claim, publish_payload, verify_device_claim_proof, verify_session_claim,
+    BrokerSocket, OutboundBrokerPayload,
 };
 
 const SESSION_CONTROL_REQUIRED_ERROR: &str =
@@ -29,7 +29,9 @@ pub(super) struct RemoteDeviceAuth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum RemoteActionRequest {
-    ClaimDevice,
+    ClaimDevice {
+        proof: String,
+    },
     StartSession {
         input: StartSessionInput,
     },
@@ -57,7 +59,7 @@ pub(super) enum RemoteActionRequest {
 impl RemoteActionRequest {
     pub(super) fn kind(&self) -> RemoteActionKind {
         match self {
-            Self::ClaimDevice => RemoteActionKind::ClaimDevice,
+            Self::ClaimDevice { .. } => RemoteActionKind::ClaimDevice,
             Self::StartSession { .. } => RemoteActionKind::StartSession,
             Self::ResumeSession { .. } => RemoteActionKind::ResumeSession,
             Self::SendMessage { .. } => RemoteActionKind::SendMessage,
@@ -70,7 +72,7 @@ impl RemoteActionRequest {
 
     fn bind_device(self, device_id: String) -> Self {
         match self {
-            Self::ClaimDevice => Self::ClaimDevice,
+            Self::ClaimDevice { proof } => Self::ClaimDevice { proof },
             Self::StartSession { mut input } => {
                 input.device_id = Some(device_id);
                 Self::StartSession { input }
@@ -99,6 +101,13 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::DecideApproval { request_id, input }
             }
+        }
+    }
+
+    fn claim_proof(&self) -> Option<&str> {
+        match self {
+            Self::ClaimDevice { proof } => Some(proof.as_str()),
+            _ => None,
         }
     }
 }
@@ -179,6 +188,7 @@ pub(super) async fn handle_remote_action(
     let resolved_device_id = match resolve_plain_remote_device(
         state,
         &from_peer_id,
+        &action_id,
         session_claim.as_deref(),
         auth.as_ref(),
         &request,
@@ -268,7 +278,7 @@ pub(super) async fn handle_remote_action(
         }
     }
 
-    let result = if matches!(request, RemoteActionRequest::ClaimDevice) {
+    let result = if matches!(request, RemoteActionRequest::ClaimDevice { .. }) {
         issue_claim_outcome(state, &resolved_device_id, &from_peer_id).await
     } else {
         execute_remote_action(state, request.bind_device(resolved_device_id.clone())).await
@@ -311,6 +321,7 @@ pub(super) async fn handle_encrypted_remote_action(
     let (device_id, action_kind) = match resolve_encrypted_action_context(
         state,
         &from_peer_id,
+        &action_id,
         session_claim.as_deref(),
         device_id.as_deref(),
         &envelope,
@@ -439,7 +450,7 @@ pub(super) async fn handle_encrypted_remote_action(
             state
                 .mark_remote_device_seen(&device_id, &from_peer_id)
                 .await?;
-            if matches!(request, RemoteActionRequest::ClaimDevice) {
+            if matches!(request, RemoteActionRequest::ClaimDevice { .. }) {
                 issue_claim_outcome(state, &device_id, &from_peer_id).await
             } else {
                 execute_remote_action(state, request.bind_device(device_id.clone())).await
@@ -516,7 +527,7 @@ async fn execute_remote_action(
     request: RemoteActionRequest,
 ) -> Result<RemoteActionOutcome, String> {
     match request {
-        RemoteActionRequest::ClaimDevice => {
+        RemoteActionRequest::ClaimDevice { .. } => {
             Err("claim_device must be handled before generic action execution".to_string())
         }
         RemoteActionRequest::StartSession { input } => state
@@ -582,6 +593,7 @@ async fn decrypt_remote_action(
 async fn resolve_plain_remote_device(
     state: &AppState,
     from_peer_id: &str,
+    action_id: &str,
     session_claim: Option<&str>,
     auth: Option<&RemoteDeviceAuth>,
     request: &RemoteActionRequest,
@@ -591,9 +603,13 @@ async fn resolve_plain_remote_device(
     }
 
     let auth = auth.ok_or_else(|| match request {
-        RemoteActionRequest::ClaimDevice => "claim_device requires device auth".to_string(),
+        RemoteActionRequest::ClaimDevice { .. } => "claim_device requires device auth".to_string(),
         _ => SESSION_CONTROL_REQUIRED_ERROR.to_string(),
     })?;
+
+    if let Some(proof) = request.claim_proof() {
+        verify_remote_device_claim(state, &auth.device_id, action_id, from_peer_id, proof).await?;
+    }
 
     state
         .authenticate_remote_device(&auth.device_id, &auth.device_token, from_peer_id)
@@ -603,6 +619,7 @@ async fn resolve_plain_remote_device(
 async fn resolve_encrypted_action_context(
     state: &AppState,
     from_peer_id: &str,
+    action_id: &str,
     session_claim: Option<&str>,
     device_id: Option<&str>,
     envelope: &EncryptedEnvelope,
@@ -620,7 +637,23 @@ async fn resolve_encrypted_action_context(
     if !matches!(action_kind, RemoteActionKind::ClaimDevice) {
         return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
     }
+    let request = decrypt_remote_action(state, &device_id, envelope).await?;
+    let proof = request
+        .claim_proof()
+        .ok_or_else(|| "claim_device requires a device proof".to_string())?;
+    verify_remote_device_claim(state, &device_id, action_id, from_peer_id, proof).await?;
     Ok((device_id, action_kind))
+}
+
+async fn verify_remote_device_claim(
+    state: &AppState,
+    device_id: &str,
+    action_id: &str,
+    peer_id: &str,
+    proof: &str,
+) -> Result<(), String> {
+    let verify_key = state.paired_device_verify_key(device_id).await?;
+    verify_device_claim_proof(action_id, device_id, peer_id, &verify_key, proof)
 }
 
 async fn issue_claim_outcome(

@@ -140,6 +140,39 @@ export function sendBrokerFrame(payload) {
   );
 }
 
+export async function establishDeviceRefreshSession(refreshToken, brokerUrl) {
+  const url = new URL("/api/public/device/session", brokerControlUrl(brokerUrl));
+  const response = await fetch(url, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      Authorization: `Bearer ${refreshToken}`,
+    },
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.message || payload?.error || "device session setup failed");
+  }
+  return payload;
+}
+
+export async function clearDeviceRefreshSession(brokerUrl) {
+  if (!brokerUrl) {
+    return;
+  }
+
+  const url = new URL("/api/public/device/session", brokerControlUrl(brokerUrl));
+  await fetch(url, {
+    method: "DELETE",
+    credentials: "same-origin",
+  }).catch(() => {});
+}
+
 async function handleSocketMessage(rawData, connectReason) {
   let frame;
   try {
@@ -199,18 +232,54 @@ function cancelSocketReconnect() {
 }
 
 async function refreshDeviceJoinTicket(reason) {
-  if (!state.remoteAuth?.deviceRefreshToken) {
+  if (!state.remoteAuth) {
+    throw new Error("no paired device is stored");
+  }
+
+  const brokerUrl = state.remoteAuth.brokerUrl;
+  if (!brokerUrl) {
+    throw new Error("no broker url is stored");
+  }
+
+  if (!canRefreshDeviceJoinTicket()) {
     throw new Error("no device refresh token is stored");
   }
 
-  const url = new URL("/api/public/device/ws-token", brokerControlUrl(state.remoteAuth.brokerUrl));
+  const url = new URL("/api/public/device/ws-token", brokerControlUrl(brokerUrl));
   renderLog(`Refreshing broker access token (${reason}).`);
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${state.remoteAuth.deviceRefreshToken}`,
-    },
-  });
+  let response;
+  if (state.remoteAuth.deviceRefreshMode === "cookie") {
+    response = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+  } else {
+    const refreshToken = state.remoteAuth.deviceRefreshToken;
+    if (!refreshToken) {
+      throw new Error("no device refresh token is stored");
+    }
+
+    let cookieSessionReady = false;
+    try {
+      await establishDeviceRefreshSession(refreshToken, brokerUrl);
+      state.remoteAuth.deviceRefreshMode = "cookie";
+      state.remoteAuth.deviceRefreshToken = null;
+      saveRemoteAuth(state.remoteAuth);
+      cookieSessionReady = true;
+    } catch {
+      cookieSessionReady = false;
+    }
+
+    response = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: cookieSessionReady
+        ? undefined
+        : {
+            Authorization: `Bearer ${refreshToken}`,
+          },
+    });
+  }
   let payload = null;
   try {
     payload = await response.json();
@@ -223,6 +292,5 @@ async function refreshDeviceJoinTicket(reason) {
 
   state.remoteAuth.deviceJoinTicket = payload.device_ws_token;
   state.remoteAuth.deviceJoinTicketExpiresAt = payload.device_ws_token_expires_at || null;
-  saveRemoteAuth(state.remoteAuth);
   renderLog("Refreshed broker access token for this device.");
 }

@@ -748,6 +748,11 @@ impl AppState {
         relay.paired_device_shared_secret(device_id)
     }
 
+    pub(crate) async fn paired_device_verify_key(&self, device_id: &str) -> Result<String, String> {
+        let relay = self.relay.read().await;
+        relay.paired_device_verify_key(device_id)
+    }
+
     pub(crate) async fn mark_remote_device_seen(
         &self,
         device_id: &str,

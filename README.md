@@ -29,7 +29,6 @@ The repository currently includes:
 - `crates/relay-server`: Rust API server, Codex bridge, session state, and static web hosting
 - `crates/relay-broker`: early Rust broker service for future remote transport
 - `frontend/`: Vite-based web client source
-- `web/`: generated static build output for Rust to serve locally
 
 The current implementation supports:
 
@@ -82,9 +81,6 @@ Longer-term, the plan is to grow from local-first control into:
 - stronger audit and policy controls
 - native mobile only where the web hits real limits
 - cloud execution targets and team workflows later
-
-The business should look more like paid control infrastructure than another chat
-subscription.
 
 ## Run
 
@@ -245,8 +241,16 @@ Notes:
 - in `public` mode, approved devices now receive:
   - a short-lived broker websocket token
   - a long-lived `device_refresh_token`
-  - the remote web surface uses that refresh token to rotate broker access
+  - the remote web surface immediately exchanges that refresh token for an
+    `HttpOnly` broker cookie and then uses the cookie to rotate broker access
     instead of forcing re-pairing on every ws token expiry
+  - when the browser supports `WebCrypto` + `IndexedDB`, the remote surface now
+    keeps its device signing key in browser-managed crypto storage instead of a
+    `localStorage` string; legacy/non-secure contexts still fall back to the
+    older storage path
+  - browser `localStorage` keeps only durable device metadata plus the current
+    `device_token`; it no longer persists the refresh token, broker ws token,
+    or `session_claim`
 - public-mode device refresh grants are persisted via
   `RELAY_BROKER_PUBLIC_STATE_PATH`; when the broker binds to a non-loopback
   host, startup now requires that path so refresh survives restart and revoke

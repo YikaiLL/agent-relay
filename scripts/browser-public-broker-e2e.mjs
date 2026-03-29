@@ -78,6 +78,7 @@ async function main() {
   let localPage;
   let remotePage;
   let createdThreadId = null;
+  const refreshRequests = [];
 
   try {
     browser = await chromium.launch({ headless: true });
@@ -98,6 +99,11 @@ async function main() {
     );
 
     remotePage = await context.newPage();
+    remotePage.on("request", (request) => {
+      if (request.url().endsWith("/api/public/device/ws-token")) {
+        refreshRequests.push(request.url());
+      }
+    });
     await remotePage.goto(pairingUrl, { waitUntil: "domcontentloaded" });
     await localPage.waitForFunction(() => {
       return Boolean(document.querySelector("[data-pairing-id][data-pairing-decision='approve']"));
@@ -120,19 +126,25 @@ async function main() {
     });
     await remotePage.evaluate(() => window.__replayCapturedStartSessionFrame());
 
-    await remotePage.waitForFunction(() => {
-      const transcript = document.querySelector("#remote-transcript")?.textContent || "";
-      return transcript.includes("Session ready");
-    }, null, { timeout: TIMEOUT_MS });
-
     await waitForSingleStartedThread(relayPort, workspaceDir);
+    await remotePage.waitForFunction(() => {
+      const input = document.querySelector("#remote-message-input");
+      return Boolean(input && !input.disabled);
+    }, null, { timeout: TIMEOUT_MS });
 
     await sendPromptAndWaitForReply(remotePage, BEFORE_RESTART_PROMPT);
     const authBeforeRestart = await readStoredRemoteAuth(remotePage);
-    assert.ok(authBeforeRestart?.deviceRefreshToken, "paired remote should persist a device refresh token");
-    assert.ok(authBeforeRestart?.deviceJoinTicket, "paired remote should persist a device ws token");
-    assert.ok(authBeforeRestart?.sessionClaim, "paired remote should persist an active session claim");
-    await waitForStoredDeviceJoinTicketToExpire(remotePage);
+    assert.ok(authBeforeRestart?.deviceToken, "paired remote should persist a device token");
+    assert.equal(authBeforeRestart?.deviceRefreshMode, "cookie");
+    assert.equal(authBeforeRestart?.deviceRefreshToken, undefined);
+    assert.equal(authBeforeRestart?.deviceJoinTicket, undefined);
+    assert.equal(authBeforeRestart?.sessionClaim, undefined);
+    const deviceSessionCookie = await readDeviceSessionCookie(
+      context,
+      `http://${lanIp}:${brokerPort}`
+    );
+    assert.ok(deviceSessionCookie, "paired remote should establish a device session cookie");
+    await delay(3000);
 
     await stopManagedProcess(broker);
     broker = await startPublicBroker({
@@ -142,14 +154,7 @@ async function main() {
     await waitForHealth(`http://127.0.0.1:${brokerPort}/api/health`);
     await waitForBrokerConnection(`http://127.0.0.1:${relayPort}/api/session`);
 
-    await waitForStoredRemoteAuth(remotePage, (auth) => {
-      return Boolean(
-        auth?.deviceJoinTicket &&
-          auth.deviceJoinTicket !== authBeforeRestart.deviceJoinTicket &&
-          auth?.sessionClaim &&
-          auth.sessionClaim !== authBeforeRestart.sessionClaim
-      );
-    }, "refreshed device ws token and renewed session claim");
+    await waitFor(() => refreshRequests.length >= 1);
     await remotePage.waitForFunction(() => {
       const badge = document.querySelector("#remote-status-badge")?.textContent || "";
       return badge.trim().length > 0 && !badge.toLowerCase().includes("offline");
@@ -165,8 +170,9 @@ async function main() {
     await localPage.click("[data-revoke-device-id]");
     await waitForRevokedDevice(relayPort);
     const authAfterRevoke = await readStoredRemoteAuth(remotePage);
-    assert.ok(authAfterRevoke?.deviceRefreshToken, "revoked remote should still hold the stale refresh token locally");
-    await waitForStoredDeviceJoinTicketToExpire(remotePage);
+    assert.equal(authAfterRevoke?.deviceRefreshMode, "cookie");
+    assert.equal(authAfterRevoke?.deviceRefreshToken, undefined);
+    await delay(3000);
 
     await stopManagedProcess(broker);
     broker = await startPublicBroker({
@@ -181,7 +187,7 @@ async function main() {
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${authAfterRevoke.deviceRefreshToken}`,
+          Cookie: `${deviceSessionCookie.name}=${deviceSessionCookie.value}`,
         },
       }
     );
@@ -202,6 +208,7 @@ async function main() {
           pairingOrigin: new URL(pairingUrl).origin,
           workspaceDir,
           activeThreadId: relaySession.active_thread_id,
+          refreshRequestCount: refreshRequests.length,
           deviceStates: relaySession.device_records?.map((device) => ({
             deviceId: device.device_id,
             state: device.lifecycle_state,
@@ -238,6 +245,11 @@ async function main() {
 }
 
 async function openSecurityModal(page) {
+  const isOpen = await page.evaluate(() => Boolean(document.querySelector("#security-modal")?.open));
+  if (isOpen) {
+    return;
+  }
+
   await page.click("#open-security-modal");
   await page.waitForFunction(() => {
     const dialog = document.querySelector("#security-modal");
@@ -371,33 +383,23 @@ async function readStoredRemoteAuth(page) {
   );
 }
 
-async function waitForStoredRemoteAuth(page, predicate, description, timeoutMs = TIMEOUT_MS) {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    const auth = await readStoredRemoteAuth(page);
-    if (predicate(auth)) {
-      return auth;
-    }
-    await delay(300);
-  }
-
-  throw new Error(`timed out waiting for ${description}`);
+async function readDeviceSessionCookie(context, origin) {
+  const cookies = await context.cookies(
+    new URL("/api/public/device/ws-token", origin).toString()
+  );
+  return cookies.find((cookie) => cookie.name === "agent_relay_device_session") || null;
 }
 
-async function waitForStoredDeviceJoinTicketToExpire(page, timeoutMs = TIMEOUT_MS) {
-  await page.waitForFunction(
-    () => {
-      const raw = window.localStorage.getItem("agent-relay.remote-auth");
-      if (!raw) {
-        return false;
-      }
-      const auth = JSON.parse(raw);
-      const expiresAt = auth?.deviceJoinTicketExpiresAt;
-      return Boolean(expiresAt && expiresAt * 1000 <= Date.now());
-    },
-    { timeout: timeoutMs }
-  );
+async function waitFor(predicate, timeoutMs = TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await delay(100);
+  }
+
+  throw new Error("timed out waiting for condition");
 }
 
 function spawnManagedProcess(name, command, args, extraEnv) {

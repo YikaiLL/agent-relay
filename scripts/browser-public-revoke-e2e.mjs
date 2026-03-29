@@ -95,7 +95,7 @@ async function main() {
 
     const revokedOneRefresh = await tryIssueDeviceWsToken(
       brokerPort,
-      deviceA.auth.deviceRefreshToken
+      deviceA.cookie
     );
     assert.equal(
       revokedOneRefresh.ok,
@@ -105,7 +105,7 @@ async function main() {
 
     const keptBeforeBulkRefresh = await issueDeviceWsToken(
       brokerPort,
-      deviceB.auth.deviceRefreshToken
+      deviceB.cookie
     );
     assert.ok(
       keptBeforeBulkRefresh.device_ws_token,
@@ -126,7 +126,7 @@ async function main() {
 
     const revokedOtherRefresh = await tryIssueDeviceWsToken(
       brokerPort,
-      deviceC.auth.deviceRefreshToken
+      deviceC.cookie
     );
     assert.equal(
       revokedOtherRefresh.ok,
@@ -136,7 +136,7 @@ async function main() {
 
     const keptAfterBulkRefresh = await issueDeviceWsToken(
       brokerPort,
-      deviceB.auth.deviceRefreshToken
+      deviceB.cookie
     );
     assert.ok(
       keptAfterBulkRefresh.device_ws_token,
@@ -217,9 +217,15 @@ async function pairDevice(browser, localPage, lanIp, brokerPort) {
   await waitForPairedRemote(page);
   const auth = await readStoredRemoteAuth(page);
   assert.ok(auth?.deviceId, "paired remote should persist a device id");
-  assert.ok(auth?.deviceRefreshToken, "paired remote should persist a device refresh token");
+  assert.equal(auth?.deviceRefreshMode, "cookie");
+  assert.equal(auth?.deviceRefreshToken, undefined);
+  assert.equal(auth?.deviceJoinTicket, undefined);
+  assert.equal(auth?.sessionClaim, undefined);
+  const cookie = await readDeviceSessionCookie(context, `http://${lanIp}:${brokerPort}`);
+  assert.ok(cookie, "paired remote should establish a device session cookie");
   return {
     auth,
+    cookie: `${cookie.name}=${cookie.value}`,
     context,
     page,
     pairingUrl,
@@ -245,6 +251,11 @@ async function startPairingFromLocalPage(localPage, previousUrl = "") {
 }
 
 async function openSecurityModal(page) {
+  const isOpen = await page.evaluate(() => Boolean(document.querySelector("#security-modal")?.open));
+  if (isOpen) {
+    return;
+  }
+
   await page.click("#open-security-modal");
   await page.waitForFunction(() => {
     const dialog = document.querySelector("#security-modal");
@@ -282,11 +293,11 @@ async function postRelayJson(relayPort, pathName, body) {
   return payload.data;
 }
 
-async function tryIssueDeviceWsToken(brokerPort, refreshToken) {
+async function tryIssueDeviceWsToken(brokerPort, cookieHeader) {
   const response = await fetch(`http://127.0.0.1:${brokerPort}/api/public/device/ws-token`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${refreshToken}`,
+      Cookie: cookieHeader,
     },
   });
   const payload = await response.json().catch(() => null);
@@ -297,8 +308,8 @@ async function tryIssueDeviceWsToken(brokerPort, refreshToken) {
   };
 }
 
-async function issueDeviceWsToken(brokerPort, refreshToken) {
-  const result = await tryIssueDeviceWsToken(brokerPort, refreshToken);
+async function issueDeviceWsToken(brokerPort, cookieHeader) {
+  const result = await tryIssueDeviceWsToken(brokerPort, cookieHeader);
   if (!result.ok) {
     throw new Error(result.payload?.message || result.payload?.error || "device ws token refresh failed");
   }
@@ -347,6 +358,13 @@ async function readStoredRemoteAuth(page) {
   return page.evaluate(
     () => JSON.parse(window.localStorage.getItem("agent-relay.remote-auth") || "null")
   );
+}
+
+async function readDeviceSessionCookie(context, origin) {
+  const cookies = await context.cookies(
+    new URL("/api/public/device/ws-token", origin).toString()
+  );
+  return cookies.find((cookie) => cookie.name === "agent_relay_device_session") || null;
 }
 
 function spawnManagedProcess(name, command, args, extraEnv) {

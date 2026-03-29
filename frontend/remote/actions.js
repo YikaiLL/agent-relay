@@ -1,9 +1,10 @@
-import { decryptJson, encryptJson } from "./crypto.js";
+import { decryptJson, encryptJson, signClaimProof } from "./crypto.js";
 import { renderDeviceMeta, renderLog, renderThreads } from "./render.js";
 import {
   CLAIM_REFRESH_FLOOR_MS,
   CLAIM_REFRESH_SKEW_MS,
   clearSessionClaim,
+  ensureDeviceIdentity,
   hasUsableSessionClaim,
   setSessionClaim,
   state,
@@ -256,6 +257,18 @@ async function dispatchRemoteAction(actionType, request) {
 }
 
 async function buildClaimDevicePayload(actionId, request) {
+  if (!state.socketPeerId) {
+    throw new Error("broker peer id is not ready yet");
+  }
+  const deviceKeypair = await ensureDeviceIdentity();
+
+  const claimProof = await signClaimProof(
+    actionId,
+    state.remoteAuth.deviceId,
+    state.socketPeerId,
+    deviceKeypair
+  );
+
   if (state.remoteAuth.securityMode === "managed") {
     return {
       kind: "remote_action",
@@ -266,6 +279,7 @@ async function buildClaimDevicePayload(actionId, request) {
       },
       request: {
         type: "claim_device",
+        proof: claimProof,
         ...request,
       },
     };
@@ -277,6 +291,7 @@ async function buildClaimDevicePayload(actionId, request) {
     device_id: state.remoteAuth.deviceId,
     envelope: await encryptJson(state.remoteAuth.deviceToken, {
       type: "claim_device",
+      proof: claimProof,
       ...request,
     }),
   };
