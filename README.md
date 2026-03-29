@@ -109,6 +109,12 @@ Browser pairing e2e:
 npm run test:browser:pairing
 ```
 
+Browser local auth e2e:
+
+```bash
+npm run test:browser:local-auth
+```
+
 Remote broker smoke test:
 
 ```bash
@@ -272,6 +278,9 @@ cargo run -p relay-server
 The current server exposes:
 
 - `GET /api/health`
+- `GET /api/auth/session`
+- `POST /api/auth/session`
+- `DELETE /api/auth/session`
 - `GET /api/session`
 - `GET /api/stream`
 - `GET /api/threads`
@@ -294,6 +303,7 @@ CI currently runs:
 Useful browser E2E commands:
 
 - `npm run test:browser:pairing`
+- `npm run test:browser:local-auth`
 - `npm run test:browser:local-session`
 - `npm run test:browser:public`
 - `npm run test:browser:public-refresh`
