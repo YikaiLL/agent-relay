@@ -17,47 +17,9 @@
           </div>
         </form>
 
-        <section class="remote-access-shell">
-          <div class="sidebar-row">
-            <div>
-              <p class="sidebar-caption">Remote Pairing</p>
-              <p class="sidebar-hint">Create a QR link for the broker-hosted mobile surface.</p>
-            </div>
-            <button id="start-pairing-button" class="sidebar-link-button" type="button">
-              New QR
-            </button>
-          </div>
-
-          <section id="pairing-panel" class="pairing-panel" hidden>
-            <div id="pairing-qr" class="pairing-qr" aria-live="polite"></div>
-            <p id="pairing-expiry" class="pairing-copy">Pairing ticket not created yet.</p>
-            <label class="sidebar-label" for="pairing-link-input">Pairing Link</label>
-            <div class="workspace-picker">
-              <input id="pairing-link-input" type="text" readonly>
-              <button id="copy-pairing-link-button" class="load-button" type="button">Copy</button>
-            </div>
-          </section>
-
-          <div class="sidebar-row">
-            <div>
-              <p class="sidebar-caption">Device Security</p>
-              <p class="sidebar-hint">Review known devices, fingerprints, and broker access.</p>
-            </div>
-          </div>
-          <div id="paired-devices-list" class="paired-devices-list">
-            <p class="sidebar-empty">No remote devices have touched this relay yet.</p>
-          </div>
-
-          <div class="sidebar-row">
-            <div>
-              <p class="sidebar-caption">Pending Pairing Requests</p>
-              <p class="sidebar-hint">Approve or reject devices that are asking to pair.</p>
-            </div>
-          </div>
-          <div id="pending-pairings-list" class="paired-devices-list">
-            <p class="sidebar-empty">No devices are waiting for local approval.</p>
-          </div>
-        </section>
+        <button id="open-security-modal" class="new-chat-button" type="button">
+          Security & Devices
+        </button>
 
         <button id="new-session-toggle" class="new-chat-button" type="button" aria-expanded="false">
           Launch Session
@@ -143,40 +105,40 @@
         </header>
 
         <details class="meta-drawer">
-          <summary>Session details</summary>
+          <summary>Dashboard & Details</summary>
           <section id="session-meta" class="session-meta">
             <span class="meta-empty">Session details will appear here.</span>
           </section>
+
+          <section id="overview-strip" class="overview-strip" aria-label="Relay overview">
+            <article class="overview-card overview-card-primary">
+              <p class="overview-label">Session Pulse</p>
+              <div class="overview-body">
+                <div>
+                  <h2 id="overview-session-title" class="overview-title">Pick a workspace to launch</h2>
+                  <p id="overview-session-copy" class="overview-copy">
+                    Load a workspace, review prior threads, and start a fresh relay session.
+                  </p>
+                </div>
+                <div id="overview-session-badges" class="overview-badges"></div>
+              </div>
+            </article>
+
+            <article class="overview-card overview-card-secondary">
+              <p class="overview-label">Relay Posture</p>
+              <div class="overview-body">
+                <div>
+                  <h2 id="overview-security-title" class="overview-title">Private by default</h2>
+                  <p id="overview-security-copy" class="overview-copy">
+                    Pair devices only when you need remote access. Broker visibility and trust
+                    state stay visible here.
+                  </p>
+                </div>
+                <div id="overview-security-badges" class="overview-badges"></div>
+              </div>
+            </article>
+          </section>
         </details>
-
-        <section id="overview-strip" class="overview-strip" aria-label="Relay overview">
-          <article class="overview-card overview-card-primary">
-            <p class="overview-label">Session Pulse</p>
-            <div class="overview-body">
-              <div>
-                <h2 id="overview-session-title" class="overview-title">Pick a workspace to launch</h2>
-                <p id="overview-session-copy" class="overview-copy">
-                  Load a workspace, review prior threads, and start a fresh relay session.
-                </p>
-              </div>
-              <div id="overview-session-badges" class="overview-badges"></div>
-            </div>
-          </article>
-
-          <article class="overview-card overview-card-secondary">
-            <p class="overview-label">Relay Posture</p>
-            <div class="overview-body">
-              <div>
-                <h2 id="overview-security-title" class="overview-title">Private by default</h2>
-                <p id="overview-security-copy" class="overview-copy">
-                  Pair devices only when you need remote access. Broker visibility and trust
-                  state stay visible here.
-                </p>
-              </div>
-              <div id="overview-security-badges" class="overview-badges"></div>
-            </div>
-          </article>
-        </section>
 
         <section id="control-banner" class="control-banner" hidden>
           <div>
@@ -224,6 +186,54 @@
         </details>
       </main>
     </div>
+
+    <dialog id="security-modal" class="security-modal">
+      <div class="modal-header">
+        <h2>Security & Devices</h2>
+        <button id="close-security-modal" class="header-button close-modal-btn" type="button">&times;</button>
+      </div>
+      <section class="remote-access-shell">
+        <div class="sidebar-row">
+          <div>
+            <p class="sidebar-caption">Remote Pairing</p>
+            <p class="sidebar-hint">Create a QR link for the broker-hosted mobile surface.</p>
+          </div>
+          <button id="start-pairing-button" class="sidebar-link-button" type="button">
+            New QR
+          </button>
+        </div>
+
+        <section id="pairing-panel" class="pairing-panel" hidden>
+          <div id="pairing-qr" class="pairing-qr" aria-live="polite"></div>
+          <p id="pairing-expiry" class="pairing-copy">Pairing ticket not created yet.</p>
+          <label class="sidebar-label" for="pairing-link-input">Pairing Link</label>
+          <div class="workspace-picker">
+            <input id="pairing-link-input" type="text" readonly>
+            <button id="copy-pairing-link-button" class="load-button" type="button">Copy</button>
+          </div>
+        </section>
+
+        <div class="sidebar-row">
+          <div>
+            <p class="sidebar-caption">Device Security</p>
+            <p class="sidebar-hint">Review known devices, fingerprints, and broker access.</p>
+          </div>
+        </div>
+        <div id="paired-devices-list" class="paired-devices-list">
+          <p class="sidebar-empty">No remote devices have touched this relay yet.</p>
+        </div>
+
+        <div class="sidebar-row">
+          <div>
+            <p class="sidebar-caption">Pending Pairing Requests</p>
+            <p class="sidebar-hint">Approve or reject devices that are asking to pair.</p>
+          </div>
+        </div>
+        <div id="pending-pairings-list" class="paired-devices-list">
+          <p class="sidebar-empty">No devices are waiting for local approval.</p>
+        </div>
+      </section>
+    </dialog>
 
     <script src="/app.js" type="module"></script>
   </body>

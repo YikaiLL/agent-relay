@@ -1,0 +1,125 @@
+import { spawn } from "node:child_process";
+import net from "node:net";
+import process from "node:process";
+
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const relayPort = process.env.RELAY_DEV_SERVER_PORT || "8787";
+const brokerPort = process.env.RELAY_DEV_BROKER_PORT || "8788";
+const vitePort = process.env.RELAY_DEV_VITE_PORT || "5173";
+
+const defaultBrokerUrl = `ws://127.0.0.1:${brokerPort}`;
+const brokerPublicUrl = process.env.RELAY_BROKER_PUBLIC_URL || defaultBrokerUrl;
+
+const sharedEnv = {
+  ...process.env,
+  RELAY_DEV_SERVER_PORT: relayPort,
+  RELAY_DEV_BROKER_PORT: brokerPort,
+  RELAY_DEV_VITE_PORT: vitePort,
+};
+
+const brokerEnv = {
+  ...sharedEnv,
+  PORT: process.env.RELAY_BROKER_PORT || brokerPort,
+  BIND_HOST: process.env.RELAY_BROKER_BIND_HOST || process.env.BIND_HOST || "127.0.0.1",
+  RELAY_BROKER_TICKET_SECRET:
+    process.env.RELAY_BROKER_TICKET_SECRET || "change-me-dev-broker-ticket-secret",
+};
+
+const relayEnv = {
+  ...sharedEnv,
+  PORT: process.env.RELAY_SERVER_PORT || relayPort,
+  BIND_HOST: process.env.RELAY_SERVER_BIND_HOST || process.env.BIND_HOST || "127.0.0.1",
+  RELAY_BROKER_URL: process.env.RELAY_BROKER_URL || defaultBrokerUrl,
+  RELAY_BROKER_PUBLIC_URL: brokerPublicUrl,
+  RELAY_BROKER_CHANNEL_ID: process.env.RELAY_BROKER_CHANNEL_ID || "dev-room",
+  RELAY_BROKER_PEER_ID: process.env.RELAY_BROKER_PEER_ID || "local-relay",
+  RELAY_BROKER_TICKET_SECRET:
+    process.env.RELAY_BROKER_TICKET_SECRET || "change-me-dev-broker-ticket-secret",
+};
+
+const children = [];
+let shuttingDown = false;
+
+function spawnManaged(name, command, args, env) {
+  const child = spawn(command, args, {
+    env,
+    stdio: "inherit",
+  });
+  child.on("exit", (code, signal) => {
+    if (shuttingDown) {
+      return;
+    }
+    const reason = signal ? `signal ${signal}` : `exit code ${code ?? 0}`;
+    console.error(`[dev:full] ${name} exited unexpectedly (${reason}). Stopping the other processes.`);
+    shutdown(code ?? 1);
+  });
+  children.push(child);
+  return child;
+}
+
+function shutdown(exitCode = 0) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  for (const child of children) {
+    if (!child.killed && child.exitCode === null) {
+      child.kill("SIGTERM");
+    }
+  }
+  setTimeout(() => {
+    for (const child of children) {
+      if (!child.killed && child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+    }
+    process.exit(exitCode);
+  }, 250).unref();
+}
+
+process.on("SIGINT", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(0));
+
+await ensurePortsAreAvailable([
+  { name: "Vite", port: vitePort },
+  { name: "relay-server", port: relayPort },
+  { name: "relay-broker", port: brokerPort },
+]);
+
+console.log("[dev:full] Starting Vite, relay-broker, and relay-server...");
+console.log(`[dev:full] Vite:   http://127.0.0.1:${vitePort}/static/`);
+console.log(`[dev:full] Relay:  http://127.0.0.1:${relayPort}`);
+console.log(`[dev:full] Broker: http://127.0.0.1:${brokerPort}`);
+if (brokerPublicUrl !== defaultBrokerUrl) {
+  console.log(`[dev:full] Pairing links will use broker public URL: ${brokerPublicUrl}`);
+}
+
+spawnManaged(
+  "vite",
+  npmCommand,
+  ["run", "dev", "--", "--port", vitePort, "--strictPort"],
+  sharedEnv
+);
+spawnManaged("relay-broker", "cargo", ["run", "-p", "relay-broker"], brokerEnv);
+spawnManaged("relay-server", "cargo", ["run", "-p", "relay-server"], relayEnv);
+
+async function ensurePortsAreAvailable(ports) {
+  for (const { name, port } of ports) {
+    const available = await canBindPort(Number(port));
+    if (!available) {
+      console.error(`[dev:full] ${name} port ${port} is already in use. Stop the existing process or override the port env vars first.`);
+      process.exit(1);
+    }
+  }
+}
+
+function canBindPort(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", () => resolve(false));
+    server.listen({ host: "127.0.0.1", port }, () => {
+      server.close(() => resolve(true));
+    });
+  });
+}

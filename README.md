@@ -138,6 +138,12 @@ Notes:
 - set `RELAY_SECURITY_MODE=private` or `RELAY_SECURITY_MODE=managed` to switch visibility mode
 - use `npm run dev` when iterating on the web UI, then `npm run build` to refresh the
   Rust-served assets under `web/`
+- use `npm run dev:full` to launch Vite on `5173`, relay-server on `8787`, and
+  relay-broker on `8788` together for local development
+- override `RELAY_DEV_VITE_PORT`, `RELAY_DEV_SERVER_PORT`, or
+  `RELAY_DEV_BROKER_PORT` if those defaults are already in use
+- if you want phone/LAN pairing while using `npm run dev:full`, override
+  `RELAY_BROKER_BIND_HOST=0.0.0.0` and `RELAY_BROKER_PUBLIC_URL=ws://<your-lan-ip>:8788`
 
 ## Remote broker deploy
 

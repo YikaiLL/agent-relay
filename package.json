@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
+    "dev:full": "node scripts/dev-full.mjs",
     "test": "node --test frontend/*.test.mjs frontend/remote/*.test.mjs && vite build",
     "build": "vite build",
     "preview": "vite preview --host",

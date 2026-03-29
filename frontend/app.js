@@ -30,6 +30,9 @@ const clientLog = document.querySelector("#client-log");
 const connectionForm = document.querySelector("#connection-form");
 const apiTokenInput = document.querySelector("#api-token-input");
 const startPairingButton = document.querySelector("#start-pairing-button");
+const openSecurityModalBtn = document.querySelector("#open-security-modal");
+const closeSecurityModalBtn = document.querySelector("#close-security-modal");
+const securityModal = document.querySelector("#security-modal");
 const pairingPanel = document.querySelector("#pairing-panel");
 const pairingQr = document.querySelector("#pairing-qr");
 const pairingExpiry = document.querySelector("#pairing-expiry");
@@ -78,6 +81,20 @@ connectionForm.addEventListener("submit", (event) => {
 
 startPairingButton.addEventListener("click", () => {
   void startPairing();
+});
+
+openSecurityModalBtn?.addEventListener("click", () => {
+  securityModal?.showModal();
+});
+
+closeSecurityModalBtn?.addEventListener("click", () => {
+  securityModal?.close();
+});
+
+securityModal?.addEventListener("click", (event) => {
+  if (event.target === securityModal) {
+    securityModal.close();
+  }
 });
 
 copyPairingLinkButton.addEventListener("click", () => {
@@ -673,74 +690,95 @@ function renderDeviceRecords(records) {
     return;
   }
 
-  pairedDevicesList.innerHTML = records
-    .map((record) => {
-      const lastSeen = record.last_seen_at ? formatTimestamp(record.last_seen_at) : "Never";
-      const lastPeer = record.last_peer_id ? shortId(record.last_peer_id) : "None";
-      const fingerprint = record.fingerprint || "Unavailable";
-      const canManage = record.lifecycle_state === "approved";
-      const ticketExpiry = formatBrokerJoinTicketExpiry(
-        record.lifecycle_state,
-        record.broker_join_ticket_expires_at
-      );
+  const activeRecords = records.filter((r) => r.lifecycle_state !== "revoked");
+  const revokedRecords = records.filter((r) => r.lifecycle_state === "revoked");
 
-      return `
-        <article class="paired-device-card">
-          <div class="paired-device-copy">
-            <div class="paired-device-heading">
-              <strong>${escapeHtml(record.label)}</strong>
-              <span class="device-state-badge ${deviceLifecycleBadgeClass(record.lifecycle_state)}">${escapeHtml(deviceLifecycleLabel(record.lifecycle_state))}</span>
-            </div>
-            <p class="paired-device-meta paired-device-id">${escapeHtml(record.device_id)}</p>
-            <dl class="paired-device-fields">
-              <div class="paired-device-field">
-                <dt>Last Seen</dt>
-                <dd>${escapeHtml(lastSeen)}</dd>
-              </div>
-              <div class="paired-device-field">
-                <dt>Last Peer</dt>
-                <dd>${escapeHtml(lastPeer)}</dd>
-              </div>
-              <div class="paired-device-field">
-                <dt>Broker Ticket</dt>
-                <dd>${escapeHtml(ticketExpiry)}</dd>
-              </div>
-              <div class="paired-device-field">
-                <dt>Fingerprint</dt>
-                <dd class="paired-device-fingerprint">${escapeHtml(fingerprint)}</dd>
-              </div>
-              <div class="paired-device-field">
-                <dt>State Updated</dt>
-                <dd>${escapeHtml(formatTimestamp(record.state_changed_at))}</dd>
-              </div>
-            </dl>
+  const renderCard = (record) => {
+    const lastSeen = record.last_seen_at ? formatTimestamp(record.last_seen_at) : "Never";
+    const lastPeer = record.last_peer_id ? shortId(record.last_peer_id) : "None";
+    const fingerprint = record.fingerprint || "Unavailable";
+    const canManage = record.lifecycle_state === "approved";
+    const ticketExpiry = formatBrokerJoinTicketExpiry(
+      record.lifecycle_state,
+      record.broker_join_ticket_expires_at
+    );
+
+    return `
+      <article class="paired-device-card">
+        <div class="paired-device-copy">
+          <div class="paired-device-heading">
+            <strong>${escapeHtml(record.label)}</strong>
+            <span class="device-state-badge ${deviceLifecycleBadgeClass(record.lifecycle_state)}">${escapeHtml(deviceLifecycleLabel(record.lifecycle_state))}</span>
           </div>
-          ${
-            canManage
-              ? `
-                <div class="paired-device-actions">
-                  <button
-                    class="approval-button"
-                    type="button"
-                    data-revoke-others-except-device-id="${escapeHtml(record.device_id)}"
-                  >
-                    Keep Only This
-                  </button>
-                  <button
-                    class="approval-button approval-button-danger"
-                    type="button"
-                    data-revoke-device-id="${escapeHtml(record.device_id)}"
-                  >
-                    Revoke
-                  </button>
-                </div>
-              `
-              : ""
-          }
-        </article>
-      `;
-    })
-    .join("");
+          <p class="paired-device-meta paired-device-id">${escapeHtml(record.device_id)}</p>
+          <dl class="paired-device-fields">
+            <div class="paired-device-field">
+              <dt>Last Seen</dt>
+              <dd>${escapeHtml(lastSeen)}</dd>
+            </div>
+            <div class="paired-device-field">
+              <dt>Last Peer</dt>
+              <dd>${escapeHtml(lastPeer)}</dd>
+            </div>
+            <div class="paired-device-field">
+              <dt>Broker Ticket</dt>
+              <dd>${escapeHtml(ticketExpiry)}</dd>
+            </div>
+            <div class="paired-device-field">
+              <dt>Fingerprint</dt>
+              <dd class="paired-device-fingerprint">${escapeHtml(fingerprint)}</dd>
+            </div>
+            <div class="paired-device-field">
+              <dt>State Updated</dt>
+              <dd>${escapeHtml(formatTimestamp(record.state_changed_at))}</dd>
+            </div>
+          </dl>
+        </div>
+        ${
+          canManage
+            ? `
+              <div class="paired-device-actions">
+                <button
+                  class="approval-button"
+                  type="button"
+                  data-revoke-others-except-device-id="${escapeHtml(record.device_id)}"
+                >
+                  Keep Only This
+                </button>
+                <button
+                  class="approval-button approval-button-danger"
+                  type="button"
+                  data-revoke-device-id="${escapeHtml(record.device_id)}"
+                >
+                  Revoke
+                </button>
+              </div>
+            `
+            : ""
+        }
+      </article>
+    `;
+  };
+
+  let html = "";
+  if (activeRecords.length) {
+    html += activeRecords.map(renderCard).join("");
+  } else if (!revokedRecords.length) {
+    html += `<p class="sidebar-empty">No active devices.</p>`;
+  }
+
+  if (revokedRecords.length) {
+    html += `
+      <details class="revoked-drawer">
+        <summary>${revokedRecords.length} Revoked Device${revokedRecords.length === 1 ? "" : "s"}</summary>
+        <div class="revoked-devices-nested">
+          ${revokedRecords.map(renderCard).join("")}
+        </div>
+      </details>
+    `;
+  }
+
+  pairedDevicesList.innerHTML = html;
 }
 
 function renderPendingPairingRequests(requests) {
