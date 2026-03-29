@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host",
     "dev:full": "node scripts/dev-full.mjs",
+    "dev:full:local": "RELAY_DEV_LOCALHOST_ONLY=1 node scripts/dev-full.mjs",
     "test": "node --test frontend/*.test.mjs frontend/remote/*.test.mjs && vite build",
     "build": "vite build",
     "preview": "vite preview --host",

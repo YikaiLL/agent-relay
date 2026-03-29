@@ -101,9 +101,8 @@ async function main() {
 
     await localPage.click("[data-pairing-id][data-pairing-decision='approve']");
     await remotePage.waitForFunction(() => {
-      const overview = document.querySelector("#remote-device-overview")?.textContent || "";
       const meta = document.querySelector("#device-meta")?.textContent || "";
-      return overview.includes("Paired") || meta.includes("Paired");
+      return meta.includes("Paired");
     }, null, { timeout: PAIRING_TIMEOUT_MS });
 
     await remotePage.click("#remote-session-toggle");
@@ -150,7 +149,7 @@ async function main() {
     );
 
     const remoteStatus = await remotePage.textContent("#remote-status-badge");
-    const remoteDeviceOverview = await remotePage.textContent("#remote-device-overview");
+    const remoteDeviceMeta = await remotePage.textContent("#device-meta");
     const relaySession = await fetchSession(relayPort);
     createdThreadId = relaySession.active_thread_id;
 
@@ -163,7 +162,7 @@ async function main() {
           cwdInput,
           pairingUrl,
           remoteStatus,
-          remoteDeviceOverview,
+          remoteDeviceMeta,
           activeThreadId: relaySession.active_thread_id,
           currentCwd: relaySession.current_cwd,
           pairedDevices: relaySession.paired_devices?.map((device) => ({

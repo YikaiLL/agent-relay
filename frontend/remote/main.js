@@ -82,6 +82,20 @@ dom.pairingForm.addEventListener("submit", (event) => {
   void beginPairing(dom.pairingInput.value);
 });
 
+dom.openPairingModalBtn?.addEventListener("click", () => {
+  dom.pairingModal?.showModal();
+});
+
+dom.closePairingModalBtn?.addEventListener("click", () => {
+  dom.pairingModal?.close();
+});
+
+dom.pairingModal?.addEventListener("click", (event) => {
+  if (event.target === dom.pairingModal) {
+    dom.pairingModal.close();
+  }
+});
+
 dom.forgetDeviceButton.addEventListener("click", () => {
   forgetCurrentDevice();
 });

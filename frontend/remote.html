@@ -15,36 +15,15 @@
   <body>
     <div class="app-shell">
       <aside class="sidebar">
-        <section class="remote-access-shell remote-surface-shell">
-          <div class="sidebar-row">
-            <div>
-              <p class="sidebar-caption">Remote Surface</p>
-              <p class="sidebar-hint">Scan a pairing QR or paste a pairing link from your local relay.</p>
-            </div>
+        <div class="sidebar-row">
+          <div>
+            <p class="sidebar-caption">Device Pairing</p>
+            <p class="sidebar-hint">Manage broker pairing and device identity.</p>
           </div>
-
-          <form id="pairing-form" class="workspace-form">
-            <label class="sidebar-label" for="pairing-input">Pairing Link Or Code</label>
-            <textarea
-              id="pairing-input"
-              rows="4"
-              placeholder="Paste the full pairing URL, or only the pairing payload."
-            ></textarea>
-            <label class="sidebar-label" for="device-label-input">Device Label</label>
-            <div class="workspace-picker">
-              <input id="device-label-input" type="text" placeholder="iPhone, Pixel, Safari on iPad">
-              <button id="connect-button" class="load-button" type="submit">Pair</button>
-            </div>
-          </form>
-
-          <div class="sidebar-row">
-            <p class="sidebar-caption">Current Device</p>
-            <button id="forget-device-button" class="sidebar-link-button" type="button">Forget</button>
-          </div>
-          <div id="device-meta" class="paired-devices-list">
-            <p class="sidebar-empty">No paired remote device stored in this browser.</p>
-          </div>
-        </section>
+          <button id="open-pairing-modal" class="sidebar-link-button" type="button">
+            Manage
+          </button>
+        </div>
 
         <button id="remote-session-toggle" class="new-chat-button" type="button" aria-expanded="false">
           Start Remote Session
@@ -133,32 +112,8 @@
           </div>
         </header>
 
-        <section class="overview-strip" aria-label="Remote state overview">
-          <article class="overview-card">
-            <p class="overview-label">Paired Device</p>
-            <div id="remote-device-overview" class="overview-body">
-              <p class="overview-title">Not paired</p>
-              <p class="overview-copy">Pair this browser from your local relay to receive an owner device claim.</p>
-              <div class="overview-badges">
-                <span class="status-badge status-badge-offline">Unpaired</span>
-              </div>
-            </div>
-          </article>
-
-          <article class="overview-card">
-            <p class="overview-label">Session State</p>
-            <div id="remote-session-overview" class="overview-body">
-              <p class="overview-title">No live session</p>
-              <p class="overview-copy">Once a remote session is started or resumed, the active thread and control owner will appear here.</p>
-              <div class="overview-badges">
-                <span class="status-badge status-badge-offline">Idle</span>
-              </div>
-            </div>
-          </article>
-        </section>
-
         <details class="meta-drawer">
-          <summary>Session details</summary>
+          <summary>Dashboard & Details</summary>
           <section id="remote-session-meta" class="session-meta">
             <span class="meta-empty">Pair a remote device to start streaming session details.</span>
           </section>
@@ -210,6 +165,36 @@
         </details>
       </main>
     </div>
+
+    <dialog id="pairing-modal" class="security-modal">
+      <div class="modal-header">
+        <h2>Remote Surface</h2>
+        <button id="close-pairing-modal" class="header-button close-modal-btn" type="button">&times;</button>
+      </div>
+      <section class="remote-access-shell remote-surface-shell">
+        <form id="pairing-form" class="workspace-form">
+          <label class="sidebar-label" for="pairing-input">Pairing Link Or Code</label>
+          <textarea
+            id="pairing-input"
+            rows="4"
+            placeholder="Paste the full pairing URL, or only the pairing payload."
+          ></textarea>
+          <label class="sidebar-label" for="device-label-input">Device Label</label>
+          <div class="workspace-picker">
+            <input id="device-label-input" type="text" placeholder="iPhone, Pixel, Safari on iPad">
+            <button id="connect-button" class="load-button" type="submit">Pair</button>
+          </div>
+        </form>
+
+        <div class="sidebar-row">
+          <p class="sidebar-caption">Current Device</p>
+          <button id="forget-device-button" class="sidebar-link-button" type="button">Forget</button>
+        </div>
+        <div id="device-meta" class="paired-devices-list">
+          <p class="sidebar-empty">No paired remote device stored in this browser.</p>
+        </div>
+      </section>
+    </dialog>
 
     <script src="/remote.js" type="module"></script>
   </body>

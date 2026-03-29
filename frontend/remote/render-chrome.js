@@ -197,67 +197,11 @@ function renderControlBanner(session) {
   dom.remoteTakeOverButton.hidden = false;
 }
 
-function renderOverviewCards() {
-  renderDeviceOverview();
-  renderSessionOverview();
-}
+function renderOverviewCards() {}
 
-function renderDeviceOverview() {
-  if (!state.remoteAuth && !state.pairingTicket) {
-    dom.remoteDeviceOverview.innerHTML = `
-      <p class="overview-title">Not paired</p>
-      <p class="overview-copy">Pair this browser from your local relay to receive an owner device claim.</p>
-      <div class="overview-badges">
-        ${statusBadgeMarkup("Unpaired", "offline")}
-      </div>
-    `;
-    return;
-  }
+function renderDeviceOverview() {}
 
-  if (state.pairingTicket) {
-    dom.remoteDeviceOverview.innerHTML = `
-      <p class="overview-title">${escapeHtml(pairingHeading())}</p>
-      <p class="overview-copy">${escapeHtml(pairingCopy())}</p>
-      <div class="overview-badges">
-        ${statusBadgeMarkup(pairingBadgeText(), pairingBadgeTone())}
-      </div>
-    `;
-    return;
-  }
-
-  dom.remoteDeviceOverview.innerHTML = `
-    <p class="overview-title">${escapeHtml(state.remoteAuth.deviceLabel)}</p>
-    <p class="overview-copy">${escapeHtml(shortId(state.remoteAuth.deviceId))} on broker ${escapeHtml(state.remoteAuth.brokerChannelId)}</p>
-    <div class="overview-badges">
-      ${statusBadgeMarkup("Paired", "ready")}
-      ${statusBadgeMarkup(securityModeLabel(state.session), state.remoteAuth.securityMode === "managed" ? "alert" : "ready")}
-      ${statusBadgeMarkup(sessionClaimStatusText(), sessionClaimBadgeTone())}
-    </div>
-  `;
-}
-
-function renderSessionOverview() {
-  if (!state.session?.active_thread_id) {
-    dom.remoteSessionOverview.innerHTML = `
-      <p class="overview-title">No live session</p>
-      <p class="overview-copy">Start or resume a remote thread to see the active workspace and control owner.</p>
-      <div class="overview-badges">
-        ${statusBadgeMarkup(state.socketConnected ? "Connected" : "Idle", state.socketConnected ? "ready" : "offline")}
-      </div>
-    `;
-    return;
-  }
-
-  dom.remoteSessionOverview.innerHTML = `
-    <p class="overview-title">${escapeHtml(shortId(state.session.active_thread_id))}</p>
-    <p class="overview-copy">${escapeHtml(state.session.current_cwd || "No workspace")}</p>
-    <div class="overview-badges">
-      ${statusBadgeMarkup(controlStatusText(state.session), controlStatusTone(state.session))}
-      ${statusBadgeMarkup(brokerStatusText(state.session), state.session.broker_connected ? "ready" : "offline")}
-      ${statusBadgeMarkup(state.session.pending_approvals?.length ? "Approval waiting" : "Live", state.session.pending_approvals?.length ? "alert" : "ready")}
-    </div>
-  `;
-}
+function renderSessionOverview() {}
 
 function metaChip(label, value) {
   return `

@@ -1,13 +1,20 @@
 import { spawn } from "node:child_process";
 import net from "node:net";
+import os from "node:os";
 import process from "node:process";
 
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const relayPort = process.env.RELAY_DEV_SERVER_PORT || "8787";
 const brokerPort = process.env.RELAY_DEV_BROKER_PORT || "8788";
 const vitePort = process.env.RELAY_DEV_VITE_PORT || "5173";
+const localhostOnly =
+  process.env.RELAY_DEV_LOCALHOST_ONLY === "1" ||
+  process.env.RELAY_DEV_LOCALHOST_ONLY === "true";
+const detectedLanIp = localhostOnly ? null : resolvePrivateIpv4();
+const defaultBrokerHost = localhostOnly || !detectedLanIp ? "127.0.0.1" : detectedLanIp;
+const defaultBrokerBindHost = localhostOnly || !detectedLanIp ? "127.0.0.1" : "0.0.0.0";
 
-const defaultBrokerUrl = `ws://127.0.0.1:${brokerPort}`;
+const defaultBrokerUrl = `ws://${defaultBrokerHost}:${brokerPort}`;
 const brokerPublicUrl = process.env.RELAY_BROKER_PUBLIC_URL || defaultBrokerUrl;
 
 const sharedEnv = {
@@ -20,7 +27,8 @@ const sharedEnv = {
 const brokerEnv = {
   ...sharedEnv,
   PORT: process.env.RELAY_BROKER_PORT || brokerPort,
-  BIND_HOST: process.env.RELAY_BROKER_BIND_HOST || process.env.BIND_HOST || "127.0.0.1",
+  BIND_HOST:
+    process.env.RELAY_BROKER_BIND_HOST || process.env.BIND_HOST || defaultBrokerBindHost,
   RELAY_BROKER_TICKET_SECRET:
     process.env.RELAY_BROKER_TICKET_SECRET || "change-me-dev-broker-ticket-secret",
 };
@@ -90,8 +98,13 @@ console.log("[dev:full] Starting Vite, relay-broker, and relay-server...");
 console.log(`[dev:full] Vite:   http://127.0.0.1:${vitePort}/static/`);
 console.log(`[dev:full] Relay:  http://127.0.0.1:${relayPort}`);
 console.log(`[dev:full] Broker: http://127.0.0.1:${brokerPort}`);
+if (detectedLanIp && !localhostOnly) {
+  console.log(`[dev:full] LAN broker: http://${detectedLanIp}:${brokerPort}`);
+}
 if (brokerPublicUrl !== defaultBrokerUrl) {
   console.log(`[dev:full] Pairing links will use broker public URL: ${brokerPublicUrl}`);
+} else {
+  console.log(`[dev:full] Pairing links default to ${brokerPublicUrl}`);
 }
 
 spawnManaged(
@@ -118,8 +131,27 @@ function canBindPort(port) {
     const server = net.createServer();
     server.unref();
     server.on("error", () => resolve(false));
-    server.listen({ host: "127.0.0.1", port }, () => {
+    server.listen({ host: "0.0.0.0", port }, () => {
       server.close(() => resolve(true));
     });
   });
+}
+
+function resolvePrivateIpv4() {
+  const interfaces = os.networkInterfaces();
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (!entry || entry.family !== "IPv4" || entry.internal) {
+        continue;
+      }
+      if (
+        entry.address.startsWith("10.") ||
+        entry.address.startsWith("192.168.") ||
+        /^172\.(1[6-9]|2\d|3[0-1])\./.test(entry.address)
+      ) {
+        return entry.address;
+      }
+    }
+  }
+  return null;
 }
