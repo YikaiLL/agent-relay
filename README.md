@@ -131,6 +131,10 @@ Notes:
 - set `RELAY_API_TOKEN` to protect `/api` routes
 - when `BIND_HOST` is non-loopback, `RELAY_API_TOKEN` is now required by default
 - `RELAY_ALLOW_INSECURE_NO_AUTH=1` only exists as an explicit insecure development escape hatch for non-loopback binds
+- relay HTTP responses now send CSP, `Permissions-Policy`, `Referrer-Policy: no-referrer`, and `X-Content-Type-Options: nosniff`
+- relay CSP keeps `connect-src` wide by default for local/LAN development; set `RELAY_CSP_CONNECT_SRC` only when you want to tighten production origins
+- set `RELAY_ENABLE_HSTS=1` only when the relay is actually behind HTTPS and forwards `X-Forwarded-Proto: https`
+- set `RELAY_HSTS_VALUE` if you need a narrower HSTS policy than the default `max-age=31536000; includeSubDomains`
 - set `RELAY_SECURITY_MODE=private` or `RELAY_SECURITY_MODE=managed` to switch visibility mode
 - use `npm run dev` when iterating on the web UI, then `npm run build` to refresh the
   Rust-served assets under `web/`
@@ -196,13 +200,16 @@ Notes:
     - optional `RELAY_BROKER_PUBLIC_STATE_PATH` for localhost-only development
     - optional `RELAY_BROKER_PUBLIC_RELAY_WS_TTL_SECS`
     - optional `RELAY_BROKER_PUBLIC_DEVICE_WS_TTL_SECS`
-    - optional hardening env:
+  - optional hardening env:
       - `RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE`
       - `RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE`
       - `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE`
       - `RELAY_BROKER_MAX_CONNECTIONS_PER_IP`
       - `RELAY_BROKER_MAX_TEXT_FRAME_BYTES`
       - `RELAY_BROKER_IDLE_TIMEOUT_SECS`
+      - `RELAY_BROKER_CSP_CONNECT_SRC` when you want production `connect-src` tighter than the default dev/LAN-friendly policy
+      - `RELAY_BROKER_ENABLE_HSTS=1` only behind HTTPS with `X-Forwarded-Proto: https`
+      - `RELAY_BROKER_HSTS_VALUE` if you need a custom HSTS policy instead of `max-age=31536000; includeSubDomains`
   - relay-server env:
     - `RELAY_BROKER_AUTH_MODE=public`
     - `RELAY_BROKER_RELAY_ID`

@@ -19,10 +19,10 @@ use axum::{
     extract::{
         connect_info::ConnectInfo,
         ws::{Message, WebSocket},
-        Path, Query, State, WebSocketUpgrade,
+        Path, Query, Request, State, WebSocketUpgrade,
     },
     http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode},
-    middleware,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -51,9 +51,11 @@ const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' http: https: ws: wss:; manifest-src 'self'; worker-src 'self' blob:";
+const PERMISSIONS_POLICY: &str = "accelerometer=(), ambient-light-sensor=(), autoplay=(), bluetooth=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(), usb=(), web-share=(), xr-spatial-tracking=()";
 const REFERRER_POLICY: &str = "no-referrer";
 const X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
+const DEFAULT_CONNECT_SRC: &str = "'self' http: https: ws: wss:";
+const DEFAULT_HSTS_VALUE: &str = "max-age=31536000; includeSubDomains";
 
 const PUBLIC_API_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE";
 const JOIN_RATE_LIMIT_ENV: &str = "RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE";
@@ -61,6 +63,9 @@ const PUBLISH_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE
 const MAX_CONNECTIONS_PER_IP_ENV: &str = "RELAY_BROKER_MAX_CONNECTIONS_PER_IP";
 const MAX_TEXT_FRAME_BYTES_ENV: &str = "RELAY_BROKER_MAX_TEXT_FRAME_BYTES";
 const IDLE_TIMEOUT_SECS_ENV: &str = "RELAY_BROKER_IDLE_TIMEOUT_SECS";
+const CSP_CONNECT_SRC_ENV: &str = "RELAY_BROKER_CSP_CONNECT_SRC";
+const ENABLE_HSTS_ENV: &str = "RELAY_BROKER_ENABLE_HSTS";
+const HSTS_VALUE_ENV: &str = "RELAY_BROKER_HSTS_VALUE";
 
 pub async fn app(state: BrokerState) -> Router {
     let join_verifier = BrokerJoinVerifier::from_env().await;
@@ -71,11 +76,19 @@ pub async fn app(state: BrokerState) -> Router {
             BrokerHardeningConfig::default()
         }
     };
+    let security_headers = match SecurityHeadersConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            warn!(%error, "invalid broker security header config; HSTS will stay disabled");
+            SecurityHeadersConfig::default()
+        }
+    };
     app_with_web_root_and_verifier_and_hardening(
         state,
         default_web_root(),
         join_verifier,
         hardening,
+        security_headers,
     )
 }
 
@@ -103,6 +116,20 @@ struct BrokerHardeningState {
     config: BrokerHardeningConfig,
     rate_limiter: SlidingWindowRateLimiter,
     connection_tracker: ActiveConnectionTracker,
+}
+
+#[derive(Clone, Debug)]
+struct SecurityHeadersConfig {
+    enable_hsts: bool,
+    content_security_policy: HeaderValue,
+    strict_transport_security: HeaderValue,
+}
+
+impl Default for SecurityHeadersConfig {
+    fn default() -> Self {
+        Self::from_parts(false, None, None)
+            .expect("default broker security headers config should be valid")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +197,39 @@ impl BrokerHardeningConfig {
                 IDLE_TIMEOUT_SECS_ENV,
                 DEFAULT_IDLE_TIMEOUT_SECS,
             )?),
+        })
+    }
+}
+
+impl SecurityHeadersConfig {
+    fn from_env() -> Result<Self, String> {
+        Self::from_parts(
+            parse_bool_env(ENABLE_HSTS_ENV, false)?,
+            parse_optional_string_env(CSP_CONNECT_SRC_ENV)?,
+            parse_optional_string_env(HSTS_VALUE_ENV)?,
+        )
+    }
+
+    fn from_parts(
+        enable_hsts: bool,
+        connect_src: Option<String>,
+        hsts_value: Option<String>,
+    ) -> Result<Self, String> {
+        let content_security_policy =
+            build_content_security_policy(connect_src.as_deref().unwrap_or(DEFAULT_CONNECT_SRC));
+        let content_security_policy =
+            HeaderValue::from_str(&content_security_policy).map_err(|error| {
+                format!("{CSP_CONNECT_SRC_ENV} produces an invalid CSP header: {error}")
+            })?;
+        let strict_transport_security = HeaderValue::from_str(
+            hsts_value.as_deref().unwrap_or(DEFAULT_HSTS_VALUE),
+        )
+        .map_err(|error| format!("{HSTS_VALUE_ENV} must be a valid HSTS header value: {error}"))?;
+
+        Ok(Self {
+            enable_hsts,
+            content_security_policy,
+            strict_transport_security,
         })
     }
 }
@@ -338,6 +398,7 @@ fn app_with_web_root_and_verifier_and_hardening(
     web_root: PathBuf,
     join_verifier: BrokerJoinVerifier,
     hardening_config: BrokerHardeningConfig,
+    security_headers: SecurityHeadersConfig,
 ) -> Router {
     if !web_root.join("remote.html").exists() {
         warn!(
@@ -393,7 +454,10 @@ fn app_with_web_root_and_verifier_and_hardening(
                 connection_tracker: ActiveConnectionTracker::default(),
             },
         })
-        .layer(middleware::map_response(with_security_headers))
+        .layer(middleware::from_fn_with_state(
+            security_headers,
+            with_security_headers,
+        ))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -985,15 +1049,83 @@ fn parse_usize_env(name: &str, default: usize) -> Result<usize, String> {
     }
 }
 
-async fn with_security_headers<B>(mut response: Response<B>) -> Response<B> {
-    apply_security_headers(response.headers_mut());
+fn parse_bool_env(name: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(default),
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!(
+                "{name} must be one of: 1, true, yes, on, 0, false, no, off"
+            )),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid utf-8")),
+    }
+}
+
+fn parse_optional_string_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid utf-8")),
+    }
+}
+
+async fn with_security_headers(
+    State(config): State<SecurityHeadersConfig>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_https = request_uses_https(request.headers());
+    let mut response = next.run(request).await;
+    apply_security_headers(response.headers_mut(), &config, is_https);
     response
 }
 
-fn apply_security_headers(headers: &mut HeaderMap) {
+fn request_uses_https(headers: &HeaderMap) -> bool {
+    if let Some(value) = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+    {
+        return value
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case("https"));
+    }
+
+    headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("proto=https"))
+        .unwrap_or(false)
+        || headers
+            .get("x-forwarded-ssl")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
+}
+
+fn build_content_security_policy(connect_src: &str) -> String {
+    format!(
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src {connect_src}; manifest-src 'self'; worker-src 'self' blob:"
+    )
+}
+
+fn apply_security_headers(headers: &mut HeaderMap, config: &SecurityHeadersConfig, is_https: bool) {
     headers.insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+        config.content_security_policy.clone(),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static(PERMISSIONS_POLICY),
     );
     headers.insert(
         HeaderName::from_static("referrer-policy"),
@@ -1003,6 +1135,12 @@ fn apply_security_headers(headers: &mut HeaderMap) {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static(X_CONTENT_TYPE_OPTIONS),
     );
+    if config.enable_hsts && is_https {
+        headers.insert(
+            HeaderName::from_static("strict-transport-security"),
+            config.strict_transport_security.clone(),
+        );
+    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ async fn spawn_app() -> SocketAddr {
     spawn_app_with(
         BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
         BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
     )
     .await
 }
@@ -32,6 +33,7 @@ async fn spawn_app() -> SocketAddr {
 async fn spawn_app_with(
     join_verifier: BrokerJoinVerifier,
     hardening: BrokerHardeningConfig,
+    security_headers: SecurityHeadersConfig,
 ) -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -42,6 +44,7 @@ async fn spawn_app_with(
         test_web_root(),
         join_verifier,
         hardening,
+        security_headers,
     );
     tokio::spawn(async move {
         axum::serve(
@@ -58,6 +61,7 @@ async fn spawn_public_mode_app() -> SocketAddr {
     spawn_public_mode_app_with(
         test_public_control_plane().await,
         BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
     )
     .await
 }
@@ -65,6 +69,7 @@ async fn spawn_public_mode_app() -> SocketAddr {
 async fn spawn_public_mode_app_with(
     public_control: PublicControlPlane,
     hardening: BrokerHardeningConfig,
+    security_headers: SecurityHeadersConfig,
 ) -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -75,6 +80,7 @@ async fn spawn_public_mode_app_with(
         test_web_root(),
         BrokerJoinVerifier::PublicControlPlane(public_control),
         hardening,
+        security_headers,
     );
     tokio::spawn(async move {
         axum::serve(
@@ -102,10 +108,22 @@ async fn next_server_message(
 }
 
 async fn http_get(address: SocketAddr, path: &str) -> String {
+    http_get_with_headers(address, path, &[]).await
+}
+
+async fn http_get_with_headers(
+    address: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> String {
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("tcp stream should connect");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -580,9 +598,89 @@ async fn security_headers_are_present_on_static_and_api_routes() {
 
     for response in [root_response, health_response] {
         assert!(response.contains("content-security-policy:"));
+        assert!(response.contains("permissions-policy:"));
         assert!(response.contains("referrer-policy: no-referrer"));
         assert!(response.contains("x-content-type-options: nosniff"));
+        assert!(!response.contains("strict-transport-security:"));
     }
+}
+
+#[tokio::test]
+async fn strict_transport_security_is_only_sent_for_secure_requests_when_enabled() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::from_parts(true, None, Some("max-age=86400".to_string()))
+            .expect("custom broker HSTS config should parse"),
+    )
+    .await;
+
+    let insecure = http_get(address, "/api/health").await.to_ascii_lowercase();
+    assert!(!insecure.contains("strict-transport-security:"));
+
+    let secure = http_get_with_headers(address, "/api/health", &[("X-Forwarded-Proto", "https")])
+        .await
+        .to_ascii_lowercase();
+    assert!(secure.contains("strict-transport-security: max-age=86400"));
+}
+
+#[tokio::test]
+async fn content_security_policy_can_override_connect_src() {
+    let connect_src = "'self' https://relay.example.com wss://broker.example.com";
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::from_parts(false, Some(connect_src.to_string()), None)
+            .expect("custom broker CSP config should parse"),
+    )
+    .await;
+
+    let response = http_get(address, "/api/health").await.to_ascii_lowercase();
+    assert!(response.contains(&format!(
+        "content-security-policy: {}",
+        build_content_security_policy(connect_src).to_ascii_lowercase()
+    )));
+}
+
+#[tokio::test]
+async fn forwarded_and_forwarded_ssl_headers_are_treated_as_secure() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::from_parts(true, None, Some("max-age=86400".to_string()))
+            .expect("custom broker HSTS config should parse"),
+    )
+    .await;
+
+    let forwarded = http_get_with_headers(
+        address,
+        "/api/health",
+        &[("Forwarded", "for=203.0.113.9;proto=https")],
+    )
+    .await
+    .to_ascii_lowercase();
+    assert!(forwarded.contains("strict-transport-security: max-age=86400"));
+
+    let forwarded_ssl = http_get_with_headers(address, "/api/health", &[("X-Forwarded-Ssl", "on")])
+        .await
+        .to_ascii_lowercase();
+    assert!(forwarded_ssl.contains("strict-transport-security: max-age=86400"));
+}
+
+#[test]
+fn invalid_security_header_overrides_are_rejected() {
+    let csp_error = SecurityHeadersConfig::from_parts(
+        false,
+        Some("https://broker.example.com\r\nx".to_string()),
+        None,
+    )
+    .expect_err("invalid broker CSP override should fail");
+    assert!(csp_error.contains(CSP_CONNECT_SRC_ENV));
+
+    let hsts_error =
+        SecurityHeadersConfig::from_parts(true, None, Some("max-age=86400\r\nx".to_string()))
+            .expect_err("invalid broker HSTS override should fail");
+    assert!(hsts_error.contains(HSTS_VALUE_ENV));
 }
 
 #[tokio::test]
@@ -799,6 +897,7 @@ async fn public_device_ws_tokens_can_refresh_after_expiry() {
     let address = spawn_public_mode_app_with(
         test_public_control_plane_with_parts(None, Some("300"), Some("1")).await,
         BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
     )
     .await;
 
@@ -860,6 +959,7 @@ async fn public_device_refresh_tokens_survive_control_plane_restart() {
         test_public_control_plane_with_parts(Some(state_path.clone()), Some("300"), Some("300"))
             .await,
         BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
     )
     .await;
 
@@ -878,6 +978,7 @@ async fn public_device_refresh_tokens_survive_control_plane_restart() {
     let restarted_address = spawn_public_mode_app_with(
         test_public_control_plane_with_parts(Some(state_path), Some("300"), Some("300")).await,
         BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
     )
     .await;
     let refreshed: DeviceWsTokenResponse = public_post(
@@ -948,6 +1049,7 @@ async fn public_api_rate_limit_is_enforced() {
             public_api_rate_limit_per_minute: 1,
             ..BrokerHardeningConfig::default()
         },
+        SecurityHeadersConfig::default(),
     )
     .await;
 
@@ -986,6 +1088,7 @@ async fn websocket_join_rate_limit_is_enforced() {
             join_rate_limit_per_minute: 1,
             ..BrokerHardeningConfig::default()
         },
+        SecurityHeadersConfig::default(),
     )
     .await;
     let first_url = websocket_url(
@@ -1029,6 +1132,7 @@ async fn websocket_connection_limit_is_enforced_per_ip() {
             max_connections_per_ip: 1,
             ..BrokerHardeningConfig::default()
         },
+        SecurityHeadersConfig::default(),
     )
     .await;
     let first_url = websocket_url(
@@ -1072,6 +1176,7 @@ async fn oversized_client_frames_are_rejected() {
             max_text_frame_bytes: 64,
             ..BrokerHardeningConfig::default()
         },
+        SecurityHeadersConfig::default(),
     )
     .await;
     let url = websocket_url(
@@ -1107,6 +1212,7 @@ async fn idle_connections_are_closed() {
             idle_timeout: std::time::Duration::from_millis(100),
             ..BrokerHardeningConfig::default()
         },
+        SecurityHeadersConfig::default(),
     )
     .await;
     let url = websocket_url(
