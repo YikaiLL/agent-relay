@@ -68,6 +68,7 @@ export async function beginPairing(rawValue, { auto = false } = {}) {
     rejectPendingActions("pairing restarted before broker actions completed");
     saveRemoteAuth(null);
     saveDeviceLabel(dom.deviceLabelInput.value);
+    closePairingModalIfOpen();
     renderDeviceMeta();
     renderThreads([]);
     renderLog(
@@ -161,6 +162,7 @@ export async function handleEncryptedPairingResult(payload) {
   state.pairingPhase = null;
   state.pairingError = null;
   dom.pairingInput.value = "";
+  closePairingModalIfOpen();
   clearPairingQueryFromUrl();
   renderDeviceMeta();
   renderLog(`Paired remote device ${device.label} (${shortId(device.device_id)}).`);
@@ -188,4 +190,10 @@ export function forgetCurrentDevice() {
   dom.pairingInput.value = "";
   resetRemoteSurface();
   renderLog("Forgot the stored remote device for this browser.");
+}
+
+function closePairingModalIfOpen() {
+  if (dom.pairingModal?.open) {
+    dom.pairingModal.close();
+  }
 }

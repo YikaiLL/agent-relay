@@ -89,6 +89,15 @@ async function main() {
 
     remotePage = await context.newPage();
     await remotePage.goto(pairingUrl, { waitUntil: "domcontentloaded" });
+    await remotePage.waitForFunction(() => {
+      const modal = document.querySelector("#pairing-modal");
+      if (!modal) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(modal);
+      return modal.open === false && style.display === "none";
+    }, null, { timeout: PAIRING_TIMEOUT_MS });
     await localPage.waitForFunction(() => {
       return Boolean(document.querySelector("[data-pairing-id][data-pairing-decision='approve']"));
     }, null, { timeout: PAIRING_TIMEOUT_MS });

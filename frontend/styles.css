@@ -729,6 +729,11 @@ input:focus, textarea:focus, select:focus {
   width: 90%;
   max-width: 500px;
 }
+
+.security-modal:not([open]) {
+  display: none;
+}
+
 .security-modal::backdrop {
   background: rgba(0, 0, 0, 0.7);
   backdrop-filter: blur(4px);
