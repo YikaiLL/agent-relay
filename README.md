@@ -129,6 +129,8 @@ Notes:
 - `web/` is generated and gitignored, so build the frontend before running the Rust web servers
 - set `BIND_HOST=0.0.0.0` only when you intentionally want network reachability
 - set `RELAY_API_TOKEN` to protect `/api` routes
+- when `BIND_HOST` is non-loopback, `RELAY_API_TOKEN` is now required by default
+- `RELAY_ALLOW_INSECURE_NO_AUTH=1` only exists as an explicit insecure development escape hatch for non-loopback binds
 - set `RELAY_SECURITY_MODE=private` or `RELAY_SECURITY_MODE=managed` to switch visibility mode
 - use `npm run dev` when iterating on the web UI, then `npm run build` to refresh the
   Rust-served assets under `web/`

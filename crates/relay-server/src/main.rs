@@ -57,13 +57,29 @@ async fn main() {
         )
         .init();
 
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8787);
+    let host = std::env::var("BIND_HOST")
+        .ok()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    let auth = AuthConfig::from_env_for_bind_host(host)
+        .unwrap_or_else(|error| panic!("relay-server auth config is invalid: {error}"));
+    if auth.enabled() {
+        info!("relay-server API token auth is enabled for protected /api routes");
+    } else if auth.insecure_no_auth_override_active() {
+        warn!(
+            "relay-server API auth is disabled on a non-loopback bind because RELAY_ALLOW_INSECURE_NO_AUTH is set"
+        );
+    } else {
+        info!("relay-server API auth is disabled because the server is bound to loopback only");
+    }
+
     let state = AppState::new()
         .await
         .expect("failed to initialize Codex app-server bridge");
-    let auth = AuthConfig::from_env();
-    if auth.enabled() {
-        info!("relay-server API token auth is enabled for protected /api routes");
-    }
     let web_root = workspace_root().join("web");
     if !web_root.join("index.html").exists() {
         warn!(
@@ -72,8 +88,22 @@ async fn main() {
         );
     }
     let context = AppContext { app: state, auth };
+    let app = build_router(context, web_root);
+    let address = SocketAddr::from((host, port));
 
-    let app = Router::new()
+    info!("relay-server listening on http://{}:{}", host, port);
+
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("failed to bind tcp listener");
+
+    axum::serve(listener, app)
+        .await
+        .expect("server exited unexpectedly");
+}
+
+fn build_router(context: AppContext, web_root: PathBuf) -> Router {
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/session", get(session_snapshot))
         .route("/api/stream", get(session_stream))
@@ -98,27 +128,7 @@ async fn main() {
         .nest_service("/static", ServeDir::new(web_root))
         .with_state(context)
         .layer(middleware::map_response(with_security_headers))
-        .layer(TraceLayer::new_for_http());
-
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(8787);
-    let host = std::env::var("BIND_HOST")
-        .ok()
-        .and_then(|value| value.parse::<IpAddr>().ok())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-    let address = SocketAddr::from((host, port));
-
-    info!("relay-server listening on http://{}:{}", host, port);
-
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .expect("failed to bind tcp listener");
-
-    axum::serve(listener, app)
-        .await
-        .expect("server exited unexpectedly");
+        .layer(TraceLayer::new_for_http())
 }
 
 async fn health() -> Json<ApiEnvelope<HealthResponse>> {
