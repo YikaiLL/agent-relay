@@ -664,8 +664,18 @@ input:focus, textarea:focus, select:focus {
   background: var(--bg-base);
   margin-top: 8px;
 }
+.paired-device-card-warning {
+  border-color: rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.06);
+}
 .paired-device-heading { font-weight: 600; margin-bottom: 8px; }
 .paired-device-meta { font-size: 13px; color: var(--text-tertiary); margin-bottom: 8px; }
+.paired-device-warning {
+  font-size: 13px;
+  color: var(--status-alert-text);
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
 .paired-device-fields dt { font-size: 10px; text-transform: uppercase; color: var(--text-tertiary); margin-bottom: 2px; }
 .paired-device-fields dd { font-family: ui-monospace, monospace; font-size: 12px; margin: 0 0 8px 0; color: var(--text-secondary); }
 
