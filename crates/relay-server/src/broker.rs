@@ -91,6 +91,10 @@ enum OutboundBrokerPayload {
         threads: Option<ThreadsResponse>,
         session_claim: Option<String>,
         session_claim_expires_at: Option<u64>,
+        claim_challenge_id: Option<String>,
+        claim_challenge: Option<String>,
+        claim_challenge_expires_at: Option<u64>,
+        device_token: Option<String>,
         error: Option<String>,
     },
     EncryptedSessionSnapshot {
@@ -821,8 +825,9 @@ fn verify_pairing_request_proof(
         .map_err(|_| "pairing proof is invalid".to_string())
 }
 
-pub(super) fn verify_device_claim_proof(
-    action_id: &str,
+pub(super) fn verify_device_claim_challenge_proof(
+    challenge_id: &str,
+    challenge: &str,
     device_id: &str,
     peer_id: &str,
     verify_key_b64: &str,
@@ -843,7 +848,7 @@ pub(super) fn verify_device_claim_proof(
     let signature = Signature::from_bytes(&signature_bytes);
     verify_key
         .verify(
-            device_claim_proof_message(action_id, device_id, peer_id).as_bytes(),
+            device_claim_proof_message(challenge_id, challenge, device_id, peer_id).as_bytes(),
             &signature,
         )
         .map_err(|_| "device claim proof is invalid".to_string())
@@ -857,8 +862,13 @@ fn pairing_proof_message(pairing_id: &str, device_id: Option<&str>) -> String {
     )
 }
 
-fn device_claim_proof_message(action_id: &str, device_id: &str, peer_id: &str) -> String {
-    format!("agent-relay:claim:{action_id}:{device_id}:{peer_id}")
+fn device_claim_proof_message(
+    challenge_id: &str,
+    challenge: &str,
+    device_id: &str,
+    peer_id: &str,
+) -> String {
+    format!("agent-relay:claim-challenge:{challenge_id}:{challenge}:{device_id}:{peer_id}")
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ use super::RelayState;
 
 const DEFAULT_PAIRING_TTL_SECS: u64 = 90;
 const MAX_PAIRING_TTL_SECS: u64 = 600;
+const CLAIM_CHALLENGE_TTL_SECS: u64 = 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PendingPairing {
@@ -111,6 +112,29 @@ pub(crate) struct PendingPairingRequest {
     pub(crate) requested_at: u64,
     pub(crate) broker_peer_id: String,
     pub(crate) device_verify_key: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClaimChallenge {
+    pub(crate) challenge_id: String,
+    pub(crate) device_id: String,
+    pub(crate) peer_id: String,
+    pub(crate) challenge: String,
+    pub(crate) token_hash: String,
+    pub(crate) expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IssuedClaimChallenge {
+    pub(crate) challenge_id: String,
+    pub(crate) challenge: String,
+    pub(crate) expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedRemoteClaim {
+    pub(crate) previous_device_token: String,
+    pub(crate) device_token: String,
 }
 
 impl PendingPairingRequest {
@@ -544,6 +568,108 @@ impl RelayState {
             .ok_or_else(|| "pairing request is missing or expired".to_string())
     }
 
+    pub fn issue_claim_challenge(
+        &mut self,
+        device_id: &str,
+        peer_id: &str,
+        now: u64,
+    ) -> Result<IssuedClaimChallenge, String> {
+        self.prune_expired_claim_challenges(now);
+        self.prune_claim_challenges_for_device(device_id, "");
+        let device = self
+            .paired_devices
+            .get(device_id)
+            .ok_or_else(|| "device is not paired".to_string())?;
+        let challenge_id = format!("claim-{}", random_token(10).to_ascii_lowercase());
+        let challenge = random_token(40);
+        let expires_at = now.saturating_add(CLAIM_CHALLENGE_TTL_SECS);
+        self.pending_claim_challenges.insert(
+            challenge_id.clone(),
+            ClaimChallenge {
+                challenge_id: challenge_id.clone(),
+                device_id: device_id.to_string(),
+                peer_id: peer_id.to_string(),
+                challenge: challenge.clone(),
+                token_hash: device.token_hash.clone(),
+                expires_at,
+            },
+        );
+        Ok(IssuedClaimChallenge {
+            challenge_id,
+            challenge,
+            expires_at,
+        })
+    }
+
+    pub fn claim_challenge(
+        &mut self,
+        device_id: &str,
+        challenge_id: &str,
+        peer_id: &str,
+        now: u64,
+    ) -> Result<ClaimChallenge, String> {
+        self.prune_expired_claim_challenges(now);
+        let challenge = self
+            .pending_claim_challenges
+            .get(challenge_id)
+            .cloned()
+            .ok_or_else(|| "claim challenge is missing or expired".to_string())?;
+        if challenge.device_id != device_id {
+            return Err("claim challenge does not belong to this device".to_string());
+        }
+        if challenge.peer_id != peer_id {
+            return Err("claim challenge does not belong to this broker peer".to_string());
+        }
+        let device = self
+            .paired_devices
+            .get(device_id)
+            .ok_or_else(|| "device is not paired".to_string())?;
+        if device.token_hash != challenge.token_hash {
+            return Err(
+                "claim challenge no longer matches the current device credential".to_string(),
+            );
+        }
+        Ok(challenge)
+    }
+
+    pub fn complete_remote_claim(
+        &mut self,
+        device_id: &str,
+        challenge_id: &str,
+        peer_id: &str,
+        now: u64,
+    ) -> Result<CompletedRemoteClaim, String> {
+        let challenge = self.claim_challenge(device_id, challenge_id, peer_id, now)?;
+        self.pending_claim_challenges.remove(challenge_id);
+
+        let new_device_token = random_token(40);
+        let new_token_hash = sha256_hex(&new_device_token);
+        let previous_device_token = {
+            let device = self
+                .paired_devices
+                .get_mut(device_id)
+                .ok_or_else(|| "device is not paired".to_string())?;
+            let previous = device.shared_secret.clone();
+            device.shared_secret = new_device_token.clone();
+            device.token_hash = new_token_hash;
+            device.last_seen_at = Some(now);
+            device.last_peer_id = Some(peer_id.to_string());
+            previous
+        };
+        let approved_device = self
+            .paired_devices
+            .get(device_id)
+            .cloned()
+            .ok_or_else(|| "device is not paired".to_string())?;
+        self.sync_device_record_from_approved_device(&approved_device, now);
+        self.prune_claim_challenges_for_device(device_id, &challenge.challenge_id);
+
+        Ok(CompletedRemoteClaim {
+            previous_device_token,
+            device_token: new_device_token,
+        })
+    }
+
     pub fn paired_device_shared_secret(&self, device_id: &str) -> Result<String, String> {
         self.paired_devices
             .get(device_id)
@@ -624,6 +750,11 @@ impl RelayState {
             .retain(|_, pairing| pairing.expires_at > now);
     }
 
+    pub fn prune_expired_claim_challenges(&mut self, now: u64) {
+        self.pending_claim_challenges
+            .retain(|_, challenge| challenge.expires_at > now);
+    }
+
     fn sync_device_record_from_approved_device(&mut self, device: &PairedDevice, now: u64) {
         let record = self
             .device_records
@@ -681,6 +812,13 @@ impl RelayState {
         record.last_peer_id = device.last_peer_id.clone();
         record.device_verify_key = device.device_verify_key.clone();
         record.broker_join_ticket_expires_at = device.broker_join_ticket_expires_at;
+    }
+
+    fn prune_claim_challenges_for_device(&mut self, device_id: &str, except_challenge_id: &str) {
+        self.pending_claim_challenges
+            .retain(|challenge_id, challenge| {
+                challenge.device_id != device_id || challenge_id == except_challenge_id
+            });
     }
 }
 

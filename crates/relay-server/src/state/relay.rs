@@ -20,8 +20,9 @@ use super::{
 
 pub use self::approval::{ApprovalKind, PendingApproval};
 pub(crate) use self::device::{
-    BrokerPendingMessage, CompletedPairing, DeviceRecord, PairedDevice, PendingPairing,
-    PendingPairingRequest, PendingPairingResult,
+    BrokerPendingMessage, ClaimChallenge, CompletedPairing, CompletedRemoteClaim, DeviceRecord,
+    IssuedClaimChallenge, PairedDevice, PendingPairing, PendingPairingRequest,
+    PendingPairingResult,
 };
 pub(crate) use self::transcript::TranscriptRecord;
 
@@ -37,6 +38,11 @@ pub(crate) struct CachedRemoteActionResult {
     pub(crate) threads: Option<ThreadsResponse>,
     pub(crate) session_claim: Option<String>,
     pub(crate) session_claim_expires_at: Option<u64>,
+    pub(crate) claim_challenge_id: Option<String>,
+    pub(crate) claim_challenge: Option<String>,
+    pub(crate) claim_challenge_expires_at: Option<u64>,
+    pub(crate) device_token: Option<String>,
+    pub(crate) response_secret: Option<String>,
     pub(crate) error: Option<String>,
 }
 
@@ -83,6 +89,7 @@ pub struct RelayState {
     pub pending_pairings: HashMap<String, PendingPairing>,
     pub pending_pairing_requests: HashMap<String, PendingPairingRequest>,
     pub completed_pairings: HashMap<String, CompletedPairing>,
+    pub pending_claim_challenges: HashMap<String, ClaimChallenge>,
     pub pending_broker_messages: Vec<BrokerPendingMessage>,
     pub threads: Vec<ThreadSummaryView>,
     locally_deleted_thread_ids: HashSet<String>,
@@ -122,6 +129,7 @@ impl RelayState {
             pending_pairings: HashMap::new(),
             pending_pairing_requests: HashMap::new(),
             completed_pairings: HashMap::new(),
+            pending_claim_challenges: HashMap::new(),
             pending_broker_messages: Vec::new(),
             threads: Vec::new(),
             locally_deleted_thread_ids: HashSet::new(),
@@ -305,6 +313,7 @@ impl RelayState {
         self.pending_pairings.clear();
         self.pending_pairing_requests.clear();
         self.completed_pairings.clear();
+        self.pending_claim_challenges.clear();
         self.pending_broker_messages.clear();
         self.pending_approvals.clear();
         self.recent_remote_actions.clear();

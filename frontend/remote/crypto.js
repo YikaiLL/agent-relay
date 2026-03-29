@@ -107,18 +107,19 @@ export async function signPairingProof(pairingId, deviceId, keypair = null) {
   );
 }
 
-export function claimProofMessage(actionId, deviceId, peerId) {
-  return `agent-relay:claim:${actionId}:${deviceId || ""}:${peerId || ""}`;
+export function claimProofMessage(challengeId, challenge, deviceId, peerId) {
+  return `agent-relay:claim-challenge:${challengeId}:${challenge}:${deviceId || ""}:${peerId || ""}`;
 }
 
-export async function signClaimProof(
-  actionId,
+export async function signClaimChallengeProof(
+  challengeId,
+  challenge,
   deviceId,
   peerId,
   keypair = null
 ) {
   return signDeviceProof(
-    claimProofMessage(actionId, deviceId, peerId),
+    claimProofMessage(challengeId, challenge, deviceId, peerId),
     keypair || (await ensureDeviceKeypair())
   );
 }

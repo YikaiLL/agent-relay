@@ -203,6 +203,11 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         }),
         session_claim: Some("claim-1".to_string()),
         session_claim_expires_at: Some(120),
+        claim_challenge_id: None,
+        claim_challenge: None,
+        claim_challenge_expires_at: None,
+        device_token: None,
+        response_secret: None,
         error: if ok {
             None
         } else {
@@ -574,6 +579,117 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
             .and_then(|device| device.last_peer_id.as_deref()),
         Some("surface-b")
     );
+}
+
+#[test]
+fn claim_challenge_rotates_device_token_and_invalidates_old_challenge() {
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    let (device, original_token) = relay
+        .consume_pairing_ticket(
+            &ticket.pairing_id,
+            &ticket.pairing_secret,
+            Some("My Phone".to_string()),
+            Some("Primary Phone".to_string()),
+            TEST_VERIFY_KEY_B64.to_string(),
+            None,
+            "surface-a",
+            100,
+        )
+        .expect("pairing should succeed");
+
+    let challenge = relay
+        .issue_claim_challenge(&device.device_id, "surface-a", 101)
+        .expect("challenge should issue");
+    let completed = relay
+        .complete_remote_claim(&device.device_id, &challenge.challenge_id, "surface-a", 102)
+        .expect("claim should rotate the device token");
+
+    assert_eq!(completed.previous_device_token, original_token);
+    assert_ne!(completed.device_token, completed.previous_device_token);
+    assert!(
+        relay
+            .authenticate_paired_device(
+                &device.device_id,
+                &completed.device_token,
+                "surface-a",
+                103
+            )
+            .is_ok(),
+        "rotated device token should authenticate"
+    );
+    let old_token_error = relay
+        .authenticate_paired_device(
+            &device.device_id,
+            &completed.previous_device_token,
+            "surface-a",
+            103,
+        )
+        .expect_err("old device token should be rejected after rotation");
+    assert!(old_token_error.contains("invalid"));
+    let reused = relay
+        .claim_challenge(&device.device_id, &challenge.challenge_id, "surface-a", 104)
+        .expect_err("claim challenges should be one-time use");
+    assert!(reused.contains("missing or expired"));
+}
+
+#[test]
+fn claim_challenge_enforces_peer_binding_and_replaces_older_challenges() {
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    let (device, _token) = relay
+        .consume_pairing_ticket(
+            &ticket.pairing_id,
+            &ticket.pairing_secret,
+            Some("My Phone".to_string()),
+            Some("Primary Phone".to_string()),
+            TEST_VERIFY_KEY_B64.to_string(),
+            None,
+            "surface-a",
+            100,
+        )
+        .expect("pairing should succeed");
+
+    let first = relay
+        .issue_claim_challenge(&device.device_id, "surface-a", 101)
+        .expect("first challenge should issue");
+    let second = relay
+        .issue_claim_challenge(&device.device_id, "surface-a", 102)
+        .expect("second challenge should issue");
+
+    let replaced = relay
+        .claim_challenge(&device.device_id, &first.challenge_id, "surface-a", 103)
+        .expect_err("issuing a new challenge should invalidate the older one");
+    assert!(replaced.contains("missing or expired"));
+
+    let wrong_peer = relay
+        .claim_challenge(&device.device_id, &second.challenge_id, "surface-b", 103)
+        .expect_err("challenge should stay bound to the broker peer");
+    assert!(wrong_peer.contains("broker peer"));
+
+    let expired = relay
+        .claim_challenge(
+            &device.device_id,
+            &second.challenge_id,
+            "surface-a",
+            102 + 61,
+        )
+        .expect_err("challenge should expire quickly");
+    assert!(expired.contains("missing or expired"));
 }
 
 #[test]

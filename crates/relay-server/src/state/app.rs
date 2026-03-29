@@ -112,8 +112,9 @@ impl AppState {
         } else {
             limit
         };
+        let listed_threads = self.codex.list_threads(scan_limit).await?;
         let mut relay = self.relay.write().await;
-        let threads = relay.filter_deleted_threads(self.codex.list_threads(scan_limit).await?);
+        let threads = relay.filter_deleted_threads(listed_threads);
         let response_threads = filter_threads(threads.clone(), cwd.as_deref(), limit);
         relay.threads = threads;
         relay.notify();
@@ -751,6 +752,37 @@ impl AppState {
     pub(crate) async fn paired_device_verify_key(&self, device_id: &str) -> Result<String, String> {
         let relay = self.relay.read().await;
         relay.paired_device_verify_key(device_id)
+    }
+
+    pub(crate) async fn issue_claim_challenge(
+        &self,
+        device_id: &str,
+        peer_id: &str,
+    ) -> Result<super::IssuedClaimChallenge, String> {
+        let mut relay = self.relay.write().await;
+        relay.issue_claim_challenge(device_id, peer_id, unix_now())
+    }
+
+    pub(crate) async fn claim_challenge(
+        &self,
+        device_id: &str,
+        challenge_id: &str,
+        peer_id: &str,
+    ) -> Result<super::ClaimChallenge, String> {
+        let mut relay = self.relay.write().await;
+        relay.claim_challenge(device_id, challenge_id, peer_id, unix_now())
+    }
+
+    pub(crate) async fn complete_remote_claim(
+        &self,
+        device_id: &str,
+        challenge_id: &str,
+        peer_id: &str,
+    ) -> Result<super::CompletedRemoteClaim, String> {
+        let mut relay = self.relay.write().await;
+        let claim = relay.complete_remote_claim(device_id, challenge_id, peer_id, unix_now())?;
+        relay.notify();
+        Ok(claim)
     }
 
     pub(crate) async fn mark_remote_device_seen(

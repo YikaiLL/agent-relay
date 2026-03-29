@@ -13,8 +13,8 @@ use crate::{
 
 use super::{
     crypto::{decrypt_json, encrypt_json, EncryptedEnvelope},
-    issue_session_claim, publish_payload, verify_device_claim_proof, verify_session_claim,
-    BrokerSocket, OutboundBrokerPayload,
+    issue_session_claim, publish_payload, verify_device_claim_challenge_proof,
+    verify_session_claim, BrokerSocket, OutboundBrokerPayload,
 };
 
 const SESSION_CONTROL_REQUIRED_ERROR: &str =
@@ -29,7 +29,9 @@ pub(super) struct RemoteDeviceAuth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum RemoteActionRequest {
+    ClaimChallenge,
     ClaimDevice {
+        challenge_id: String,
         proof: String,
     },
     StartSession {
@@ -59,6 +61,7 @@ pub(super) enum RemoteActionRequest {
 impl RemoteActionRequest {
     pub(super) fn kind(&self) -> RemoteActionKind {
         match self {
+            Self::ClaimChallenge => RemoteActionKind::ClaimChallenge,
             Self::ClaimDevice { .. } => RemoteActionKind::ClaimDevice,
             Self::StartSession { .. } => RemoteActionKind::StartSession,
             Self::ResumeSession { .. } => RemoteActionKind::ResumeSession,
@@ -72,7 +75,14 @@ impl RemoteActionRequest {
 
     fn bind_device(self, device_id: String) -> Self {
         match self {
-            Self::ClaimDevice { proof } => Self::ClaimDevice { proof },
+            Self::ClaimChallenge => Self::ClaimChallenge,
+            Self::ClaimDevice {
+                challenge_id,
+                proof,
+            } => Self::ClaimDevice {
+                challenge_id,
+                proof,
+            },
             Self::StartSession { mut input } => {
                 input.device_id = Some(device_id);
                 Self::StartSession { input }
@@ -103,18 +113,12 @@ impl RemoteActionRequest {
             }
         }
     }
-
-    fn claim_proof(&self) -> Option<&str> {
-        match self {
-            Self::ClaimDevice { proof } => Some(proof.as_str()),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum RemoteActionKind {
+    ClaimChallenge,
     ClaimDevice,
     StartSession,
     ResumeSession,
@@ -128,6 +132,7 @@ pub(super) enum RemoteActionKind {
 impl RemoteActionKind {
     pub(super) fn as_str(self) -> &'static str {
         match self {
+            Self::ClaimChallenge => "claim_challenge",
             Self::ClaimDevice => "claim_device",
             Self::StartSession => "start_session",
             Self::ResumeSession => "resume_session",
@@ -149,6 +154,10 @@ struct RemoteActionResultPlaintext {
     threads: Option<ThreadsResponse>,
     session_claim: Option<String>,
     session_claim_expires_at: Option<u64>,
+    claim_challenge_id: Option<String>,
+    claim_challenge: Option<String>,
+    claim_challenge_expires_at: Option<u64>,
+    device_token: Option<String>,
     error: Option<String>,
 }
 
@@ -158,6 +167,10 @@ pub(super) struct RemoteActionOutcome {
     pub(super) threads: Option<ThreadsResponse>,
     pub(super) session_claim: Option<String>,
     pub(super) session_claim_expires_at: Option<u64>,
+    pub(super) claim_challenge_id: Option<String>,
+    pub(super) claim_challenge: Option<String>,
+    pub(super) claim_challenge_expires_at: Option<u64>,
+    pub(super) device_token: Option<String>,
 }
 
 pub(super) async fn handle_remote_action(
@@ -188,7 +201,6 @@ pub(super) async fn handle_remote_action(
     let resolved_device_id = match resolve_plain_remote_device(
         state,
         &from_peer_id,
-        &action_id,
         session_claim.as_deref(),
         auth.as_ref(),
         &request,
@@ -263,6 +275,7 @@ pub(super) async fn handle_remote_action(
                 RemoteActionOutcome::default(),
                 Some(error),
                 false,
+                None,
             );
             state
                 .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
@@ -278,10 +291,26 @@ pub(super) async fn handle_remote_action(
         }
     }
 
-    let result = if matches!(request, RemoteActionRequest::ClaimDevice { .. }) {
-        issue_claim_outcome(state, &resolved_device_id, &from_peer_id).await
-    } else {
-        execute_remote_action(state, request.bind_device(resolved_device_id.clone())).await
+    let result = match request {
+        RemoteActionRequest::ClaimChallenge => {
+            issue_claim_challenge_outcome(state, &resolved_device_id, &from_peer_id).await
+        }
+        RemoteActionRequest::ClaimDevice {
+            challenge_id,
+            proof,
+        } => {
+            issue_claim_outcome(
+                state,
+                &resolved_device_id,
+                &from_peer_id,
+                &challenge_id,
+                &proof,
+            )
+            .await
+        }
+        request => {
+            execute_remote_action(state, request.bind_device(resolved_device_id.clone())).await
+        }
     };
     let snapshot = state.snapshot().await;
 
@@ -301,7 +330,7 @@ pub(super) async fn handle_remote_action(
             (false, RemoteActionOutcome::default(), Some(error))
         }
     };
-    let cached = cached_remote_action_result(action_kind, snapshot, outcome, error, ok);
+    let cached = cached_remote_action_result(action_kind, snapshot, outcome, error, ok, None);
     state
         .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
         .await;
@@ -321,7 +350,6 @@ pub(super) async fn handle_encrypted_remote_action(
     let (device_id, action_kind) = match resolve_encrypted_action_context(
         state,
         &from_peer_id,
-        &action_id,
         session_claim.as_deref(),
         device_id.as_deref(),
         &envelope,
@@ -355,12 +383,10 @@ pub(super) async fn handle_encrypted_remote_action(
                 action_id,
                 action_kind,
                 snapshot,
-                None,
-                None,
-                None,
-                None,
+                RemoteActionOutcome::default(),
                 Some(error),
                 false,
+                None,
             )
             .await
             {
@@ -428,6 +454,7 @@ pub(super) async fn handle_encrypted_remote_action(
                 RemoteActionOutcome::default(),
                 Some(error),
                 false,
+                None,
             );
             state
                 .store_remote_action_result(&device_id, &action_id, cached.clone())
@@ -445,29 +472,68 @@ pub(super) async fn handle_encrypted_remote_action(
         }
     }
 
-    let result = match decrypt_remote_action(state, &device_id, &envelope).await {
-        Ok(request) => {
+    let response_secret = state.paired_device_secret(&device_id).await?;
+    let request = match decrypt_remote_action_with_secret(&response_secret, &envelope) {
+        Ok(request) => request,
+        Err(error) => {
+            let snapshot = state.snapshot().await;
+            let cached = cached_remote_action_result(
+                action_kind,
+                snapshot,
+                RemoteActionOutcome::default(),
+                Some(error),
+                false,
+                Some(response_secret),
+            );
+            state
+                .store_remote_action_result(&device_id, &action_id, cached.clone())
+                .await;
+            return match replay_encrypted_remote_action_result(
+                state,
+                sender,
+                from_peer_id,
+                device_id,
+                action_id,
+                action_kind,
+                cached,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(publish_error) if publish_error.contains("device is not paired") => {
+                    state
+                        .push_runtime_log(
+                            "warn",
+                            "Skipped encrypted broker action result because the device is no longer paired."
+                                .to_string(),
+                        )
+                        .await;
+                    Ok(())
+                }
+                Err(publish_error) => Err(publish_error),
+            };
+        }
+    };
+
+    let result = match request {
+        RemoteActionRequest::ClaimChallenge => {
+            issue_claim_challenge_outcome(state, &device_id, &from_peer_id).await
+        }
+        RemoteActionRequest::ClaimDevice {
+            challenge_id,
+            proof,
+        } => issue_claim_outcome(state, &device_id, &from_peer_id, &challenge_id, &proof).await,
+        request => {
             state
                 .mark_remote_device_seen(&device_id, &from_peer_id)
                 .await?;
-            if matches!(request, RemoteActionRequest::ClaimDevice { .. }) {
-                issue_claim_outcome(state, &device_id, &from_peer_id).await
-            } else {
-                execute_remote_action(state, request.bind_device(device_id.clone())).await
-            }
+            execute_remote_action(state, request.bind_device(device_id.clone())).await
         }
-        Err(error) => Err(error),
     };
+
     let snapshot = state.snapshot().await;
-    let (ok, receipt, threads, issued_claim, issued_claim_expires_at, error) = match result {
-        Ok(outcome) => (
-            true,
-            outcome.receipt,
-            outcome.threads,
-            outcome.session_claim,
-            outcome.session_claim_expires_at,
-            None,
-        ),
+    let (ok, outcome, error) = match result {
+        Ok(outcome) => (true, outcome, None),
         Err(error) => {
             state
                 .push_runtime_log(
@@ -479,19 +545,17 @@ pub(super) async fn handle_encrypted_remote_action(
                     ),
                 )
                 .await;
-            (false, None, None, None, None, Some(error))
+            (false, RemoteActionOutcome::default(), Some(error))
         }
     };
-    let cached = CachedRemoteActionResult {
-        action_kind: action_kind.as_str().to_string(),
-        ok,
+    let cached = cached_remote_action_result(
+        action_kind,
         snapshot,
-        receipt,
-        threads,
-        session_claim: issued_claim,
-        session_claim_expires_at: issued_claim_expires_at,
+        outcome,
         error,
-    };
+        ok,
+        Some(response_secret),
+    );
     state
         .store_remote_action_result(&device_id, &action_id, cached.clone())
         .await;
@@ -527,8 +591,8 @@ async fn execute_remote_action(
     request: RemoteActionRequest,
 ) -> Result<RemoteActionOutcome, String> {
     match request {
-        RemoteActionRequest::ClaimDevice { .. } => {
-            Err("claim_device must be handled before generic action execution".to_string())
+        RemoteActionRequest::ClaimChallenge | RemoteActionRequest::ClaimDevice { .. } => {
+            Err("claim actions must be handled before generic action execution".to_string())
         }
         RemoteActionRequest::StartSession { input } => state
             .start_session(input)
@@ -558,6 +622,7 @@ async fn execute_remote_action(
                 threads: Some(threads),
                 session_claim: None,
                 session_claim_expires_at: None,
+                ..RemoteActionOutcome::default()
             }),
         RemoteActionRequest::DecideApproval { request_id, input } => state
             .decide_approval(&request_id, input)
@@ -567,6 +632,7 @@ async fn execute_remote_action(
                 threads: None,
                 session_claim: None,
                 session_claim_expires_at: None,
+                ..RemoteActionOutcome::default()
             })
             .map_err(approval_error_message),
     }
@@ -587,13 +653,19 @@ async fn decrypt_remote_action(
     envelope: &EncryptedEnvelope,
 ) -> Result<RemoteActionRequest, String> {
     let secret = state.paired_device_secret(device_id).await?;
-    decrypt_json(&secret, envelope)
+    decrypt_remote_action_with_secret(&secret, envelope)
+}
+
+fn decrypt_remote_action_with_secret(
+    secret: &str,
+    envelope: &EncryptedEnvelope,
+) -> Result<RemoteActionRequest, String> {
+    decrypt_json(secret, envelope)
 }
 
 async fn resolve_plain_remote_device(
     state: &AppState,
     from_peer_id: &str,
-    action_id: &str,
     session_claim: Option<&str>,
     auth: Option<&RemoteDeviceAuth>,
     request: &RemoteActionRequest,
@@ -603,12 +675,16 @@ async fn resolve_plain_remote_device(
     }
 
     let auth = auth.ok_or_else(|| match request {
+        RemoteActionRequest::ClaimChallenge => "claim_challenge requires device auth".to_string(),
         RemoteActionRequest::ClaimDevice { .. } => "claim_device requires device auth".to_string(),
         _ => SESSION_CONTROL_REQUIRED_ERROR.to_string(),
     })?;
 
-    if let Some(proof) = request.claim_proof() {
-        verify_remote_device_claim(state, &auth.device_id, action_id, from_peer_id, proof).await?;
+    if !matches!(
+        request,
+        RemoteActionRequest::ClaimChallenge | RemoteActionRequest::ClaimDevice { .. }
+    ) {
+        return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
     }
 
     state
@@ -619,7 +695,6 @@ async fn resolve_plain_remote_device(
 async fn resolve_encrypted_action_context(
     state: &AppState,
     from_peer_id: &str,
-    action_id: &str,
     session_claim: Option<&str>,
     device_id: Option<&str>,
     envelope: &EncryptedEnvelope,
@@ -634,40 +709,79 @@ async fn resolve_encrypted_action_context(
         .map(str::to_string)
         .ok_or_else(|| "encrypted remote action is missing device_id".to_string())?;
     let action_kind = decrypt_remote_action_kind(state, &device_id, envelope).await?;
-    if !matches!(action_kind, RemoteActionKind::ClaimDevice) {
+    if !matches!(
+        action_kind,
+        RemoteActionKind::ClaimChallenge | RemoteActionKind::ClaimDevice
+    ) {
         return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
     }
-    let request = decrypt_remote_action(state, &device_id, envelope).await?;
-    let proof = request
-        .claim_proof()
-        .ok_or_else(|| "claim_device requires a device proof".to_string())?;
-    verify_remote_device_claim(state, &device_id, action_id, from_peer_id, proof).await?;
     Ok((device_id, action_kind))
 }
 
 async fn verify_remote_device_claim(
     state: &AppState,
     device_id: &str,
-    action_id: &str,
+    challenge_id: &str,
+    challenge: &str,
     peer_id: &str,
     proof: &str,
 ) -> Result<(), String> {
     let verify_key = state.paired_device_verify_key(device_id).await?;
-    verify_device_claim_proof(action_id, device_id, peer_id, &verify_key, proof)
+    verify_device_claim_challenge_proof(
+        challenge_id,
+        challenge,
+        device_id,
+        peer_id,
+        &verify_key,
+        proof,
+    )
+}
+
+async fn issue_claim_challenge_outcome(
+    state: &AppState,
+    device_id: &str,
+    peer_id: &str,
+) -> Result<RemoteActionOutcome, String> {
+    state.mark_remote_device_seen(device_id, peer_id).await?;
+    let challenge = state.issue_claim_challenge(device_id, peer_id).await?;
+    Ok(RemoteActionOutcome {
+        claim_challenge_id: Some(challenge.challenge_id),
+        claim_challenge: Some(challenge.challenge),
+        claim_challenge_expires_at: Some(challenge.expires_at),
+        ..RemoteActionOutcome::default()
+    })
 }
 
 async fn issue_claim_outcome(
     state: &AppState,
     device_id: &str,
     peer_id: &str,
+    challenge_id: &str,
+    proof: &str,
 ) -> Result<RemoteActionOutcome, String> {
-    state.mark_remote_device_seen(device_id, peer_id).await?;
+    let challenge = state
+        .claim_challenge(device_id, challenge_id, peer_id)
+        .await?;
+    verify_remote_device_claim(
+        state,
+        device_id,
+        &challenge.challenge_id,
+        &challenge.challenge,
+        peer_id,
+        proof,
+    )
+    .await?;
+    let completed = state
+        .complete_remote_claim(device_id, &challenge.challenge_id, peer_id)
+        .await?;
     let claim = issue_session_claim(device_id, peer_id)?;
     Ok(RemoteActionOutcome {
         receipt: None,
         threads: None,
         session_claim: Some(claim.token),
         session_claim_expires_at: Some(claim.expires_at),
+        device_token: Some(completed.device_token),
+        ..RemoteActionOutcome::default()
     })
 }
 
@@ -703,6 +817,10 @@ async fn publish_plain_remote_action_result(
             threads: outcome.threads,
             session_claim: outcome.session_claim,
             session_claim_expires_at: outcome.session_claim_expires_at,
+            claim_challenge_id: outcome.claim_challenge_id,
+            claim_challenge: outcome.claim_challenge,
+            claim_challenge_expires_at: outcome.claim_challenge_expires_at,
+            device_token: outcome.device_token,
             error,
         },
     )
@@ -728,6 +846,10 @@ async fn replay_plain_remote_action_result(
             threads: cached.threads,
             session_claim: cached.session_claim,
             session_claim_expires_at: cached.session_claim_expires_at,
+            claim_challenge_id: cached.claim_challenge_id,
+            claim_challenge: cached.claim_challenge,
+            claim_challenge_expires_at: cached.claim_challenge_expires_at,
+            device_token: cached.device_token,
         },
         cached.error,
         cached.ok,
@@ -744,24 +866,29 @@ async fn publish_remote_action_result_private(
     action_id: String,
     action: RemoteActionKind,
     snapshot: SessionSnapshot,
-    receipt: Option<ApprovalReceipt>,
-    threads: Option<ThreadsResponse>,
-    session_claim: Option<String>,
-    session_claim_expires_at: Option<u64>,
+    outcome: RemoteActionOutcome,
     error: Option<String>,
     ok: bool,
+    response_secret: Option<&str>,
 ) -> Result<(), String> {
-    let secret = state.paired_device_secret(&device_id).await?;
+    let secret = match response_secret {
+        Some(secret) => secret.to_string(),
+        None => state.paired_device_secret(&device_id).await?,
+    };
     let envelope = encrypt_json(
         &secret,
         &RemoteActionResultPlaintext {
             action,
             ok,
             snapshot,
-            receipt,
-            threads,
-            session_claim,
-            session_claim_expires_at,
+            receipt: outcome.receipt,
+            threads: outcome.threads,
+            session_claim: outcome.session_claim,
+            session_claim_expires_at: outcome.session_claim_expires_at,
+            claim_challenge_id: outcome.claim_challenge_id,
+            claim_challenge: outcome.claim_challenge,
+            claim_challenge_expires_at: outcome.claim_challenge_expires_at,
+            device_token: outcome.device_token,
             error,
         },
     )?;
@@ -796,12 +923,19 @@ async fn replay_encrypted_remote_action_result(
         action_id,
         action,
         cached.snapshot,
-        cached.receipt,
-        cached.threads,
-        cached.session_claim,
-        cached.session_claim_expires_at,
+        RemoteActionOutcome {
+            receipt: cached.receipt,
+            threads: cached.threads,
+            session_claim: cached.session_claim,
+            session_claim_expires_at: cached.session_claim_expires_at,
+            claim_challenge_id: cached.claim_challenge_id,
+            claim_challenge: cached.claim_challenge,
+            claim_challenge_expires_at: cached.claim_challenge_expires_at,
+            device_token: cached.device_token,
+        },
         cached.error,
         cached.ok,
+        cached.response_secret.as_deref(),
     )
     .await
 }
@@ -812,6 +946,7 @@ fn cached_remote_action_result(
     outcome: RemoteActionOutcome,
     error: Option<String>,
     ok: bool,
+    response_secret: Option<String>,
 ) -> CachedRemoteActionResult {
     CachedRemoteActionResult {
         action_kind: action.as_str().to_string(),
@@ -821,6 +956,11 @@ fn cached_remote_action_result(
         threads: outcome.threads,
         session_claim: outcome.session_claim,
         session_claim_expires_at: outcome.session_claim_expires_at,
+        claim_challenge_id: outcome.claim_challenge_id,
+        claim_challenge: outcome.claim_challenge,
+        claim_challenge_expires_at: outcome.claim_challenge_expires_at,
+        device_token: outcome.device_token,
+        response_secret,
         error,
     }
 }

@@ -466,16 +466,50 @@ fn parse_inbound_payload_parses_encrypted_remote_actions() {
 }
 
 #[test]
+fn parse_inbound_payload_parses_claim_challenge_request() {
+    let payload = serde_json::json!({
+        "kind": "remote_action",
+        "action_id": "claim-start-1",
+        "auth": {
+            "device_id": "phone-1",
+            "device_token": "token-1"
+        },
+        "request": {
+            "type": "claim_challenge"
+        }
+    });
+
+    let action = parse_inbound_payload(payload)
+        .expect("payload should parse")
+        .expect("payload should be handled");
+    match action {
+        InboundBrokerPayload::RemoteAction {
+            action_id,
+            auth,
+            request: RemoteActionRequest::ClaimChallenge,
+            ..
+        } => {
+            assert_eq!(action_id, "claim-start-1");
+            let auth = auth.expect("auth should be present");
+            assert_eq!(auth.device_id, "phone-1");
+            assert_eq!(auth.device_token, "token-1");
+        }
+        other => panic!("unexpected request: {other:?}"),
+    }
+}
+
+#[test]
 fn parse_inbound_payload_parses_claim_device_proof() {
     let payload = serde_json::json!({
         "kind": "remote_action",
-        "action_id": "claim-1",
+        "action_id": "claim-finish-1",
         "auth": {
             "device_id": "phone-1",
             "device_token": "token-1"
         },
         "request": {
             "type": "claim_device",
+            "challenge_id": "challenge-1",
             "proof": "signed-proof"
         }
     });
@@ -487,10 +521,15 @@ fn parse_inbound_payload_parses_claim_device_proof() {
         InboundBrokerPayload::RemoteAction {
             action_id,
             auth,
-            request: RemoteActionRequest::ClaimDevice { proof },
+            request:
+                RemoteActionRequest::ClaimDevice {
+                    challenge_id,
+                    proof,
+                },
             ..
         } => {
-            assert_eq!(action_id, "claim-1");
+            assert_eq!(action_id, "claim-finish-1");
+            assert_eq!(challenge_id, "challenge-1");
             assert_eq!(proof, "signed-proof");
             let auth = auth.expect("auth should be present");
             assert_eq!(auth.device_id, "phone-1");
@@ -537,27 +576,51 @@ fn session_claim_rejects_different_peer() {
 fn device_claim_proof_round_trips_for_same_peer_and_action() {
     let signing_key = SigningKey::from_bytes(&[5_u8; 32]);
     let verify_key = STANDARD.encode(signing_key.verifying_key().to_bytes());
+    let challenge_id = "claim-1";
+    let challenge = "server-challenge";
     let signature = STANDARD.encode(
         signing_key
-            .sign(device_claim_proof_message("claim-1", "device-a", "peer-a").as_bytes())
+            .sign(
+                device_claim_proof_message(challenge_id, challenge, "device-a", "peer-a")
+                    .as_bytes(),
+            )
             .to_bytes(),
     );
 
-    verify_device_claim_proof("claim-1", "device-a", "peer-a", &verify_key, &signature)
-        .expect("claim proof should verify");
+    verify_device_claim_challenge_proof(
+        challenge_id,
+        challenge,
+        "device-a",
+        "peer-a",
+        &verify_key,
+        &signature,
+    )
+    .expect("claim proof should verify");
 }
 
 #[test]
 fn device_claim_proof_rejects_different_peer() {
     let signing_key = SigningKey::from_bytes(&[6_u8; 32]);
     let verify_key = STANDARD.encode(signing_key.verifying_key().to_bytes());
+    let challenge_id = "claim-1";
+    let challenge = "server-challenge";
     let signature = STANDARD.encode(
         signing_key
-            .sign(device_claim_proof_message("claim-1", "device-a", "peer-a").as_bytes())
+            .sign(
+                device_claim_proof_message(challenge_id, challenge, "device-a", "peer-a")
+                    .as_bytes(),
+            )
             .to_bytes(),
     );
 
-    let error = verify_device_claim_proof("claim-1", "device-a", "peer-b", &verify_key, &signature)
-        .expect_err("claim proof should reject a different peer");
+    let error = verify_device_claim_challenge_proof(
+        challenge_id,
+        challenge,
+        "device-a",
+        "peer-b",
+        &verify_key,
+        &signature,
+    )
+    .expect_err("claim proof should reject a different peer");
     assert!(error.contains("device claim proof is invalid"));
 }

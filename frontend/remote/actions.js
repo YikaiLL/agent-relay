@@ -1,4 +1,4 @@
-import { decryptJson, encryptJson, signClaimProof } from "./crypto.js";
+import { decryptJson, encryptJson, signClaimChallengeProof } from "./crypto.js";
 import { renderDeviceMeta, renderLog, renderThreads } from "./render.js";
 import {
   CLAIM_REFRESH_FLOOR_MS,
@@ -6,6 +6,7 @@ import {
   clearSessionClaim,
   ensureDeviceIdentity,
   hasUsableSessionClaim,
+  saveRemoteAuth,
   setSessionClaim,
   state,
 } from "./state.js";
@@ -64,7 +65,14 @@ export async function ensureRemoteClaim({
   const needsRefresh = Boolean(state.remoteAuth.sessionClaim);
   state.claimPromise = (async () => {
     renderLog(`${needsRefresh ? "Refreshing" : "Claiming"} remote device (${reason}).`);
-    const result = await dispatchRemoteAction("claim_device", {});
+    const challengeResult = await dispatchRemoteAction("claim_challenge", {});
+    if (!challengeResult.claim_challenge_id || !challengeResult.claim_challenge) {
+      throw new Error("claim challenge response is incomplete");
+    }
+    const result = await dispatchRemoteAction("claim_device", {
+      challenge_id: challengeResult.claim_challenge_id,
+      challenge: challengeResult.claim_challenge,
+    });
     if (syncAfterClaim) {
       await onSyncRemoteSnapshot(`claim sync (${reason})`, true);
     }
@@ -92,7 +100,7 @@ export async function dispatchOrRecover(actionType, request, options = {}) {
   const allowClaimRetry = options.allowClaimRetry !== false;
   const skipPreclaim = options.skipPreclaim === true;
 
-  if (actionType !== "claim_device" && !skipPreclaim) {
+  if (!["claim_challenge", "claim_device"].includes(actionType) && !skipPreclaim) {
     await ensureRemoteClaim({
       force: !hasUsableSessionClaim(CLAIM_REFRESH_SKEW_MS),
       reason: `${actionType} preflight`,
@@ -103,7 +111,11 @@ export async function dispatchOrRecover(actionType, request, options = {}) {
   try {
     return await dispatchRemoteAction(actionType, request);
   } catch (error) {
-    if (allowClaimRetry && actionType !== "claim_device" && isSessionClaimError(error.message)) {
+    if (
+      allowClaimRetry &&
+      !["claim_challenge", "claim_device"].includes(actionType) &&
+      isSessionClaimError(error.message)
+    ) {
       clearSessionClaim();
       renderDeviceMeta();
       renderLog(`Session claim expired during ${actionType}; re-claiming and retrying once.`);
@@ -188,6 +200,11 @@ async function handleEncryptedRemoteActionResult(payload) {
 }
 
 function handleRemoteActionResult(actionId, result) {
+  if (result.device_token && state.remoteAuth) {
+    state.remoteAuth.deviceToken = result.device_token;
+    saveRemoteAuth(state.remoteAuth);
+  }
+
   if (result.session_claim && state.remoteAuth) {
     setSessionClaim(result.session_claim, result.session_claim_expires_at || null);
     scheduleClaimRefresh();
@@ -206,6 +223,9 @@ function handleRemoteActionResult(actionId, result) {
   settlePendingAction(actionId, result);
 
   if (result.ok) {
+    if (result.action === "claim_challenge") {
+      return;
+    }
     if (result.action === "claim_device") {
       renderLog("Remote device claim is active.");
       return;
@@ -239,6 +259,11 @@ async function dispatchRemoteAction(actionType, request) {
   const resultPromise = registerPendingAction(actionId, actionType);
 
   try {
+    if (actionType === "claim_challenge") {
+      sendBrokerFrame(await buildClaimChallengePayload(actionId));
+      return await resultPromise;
+    }
+
     if (actionType === "claim_device") {
       sendBrokerFrame(await buildClaimDevicePayload(actionId, request));
       return await resultPromise;
@@ -256,14 +281,43 @@ async function dispatchRemoteAction(actionType, request) {
   }
 }
 
+async function buildClaimChallengePayload(actionId) {
+  if (state.remoteAuth.securityMode === "managed") {
+    return {
+      kind: "remote_action",
+      action_id: actionId,
+      auth: {
+        device_id: state.remoteAuth.deviceId,
+        device_token: state.remoteAuth.deviceToken,
+      },
+      request: {
+        type: "claim_challenge",
+      },
+    };
+  }
+
+  return {
+    kind: "encrypted_remote_action",
+    action_id: actionId,
+    device_id: state.remoteAuth.deviceId,
+    envelope: await encryptJson(state.remoteAuth.deviceToken, {
+      type: "claim_challenge",
+    }),
+  };
+}
+
 async function buildClaimDevicePayload(actionId, request) {
   if (!state.socketPeerId) {
     throw new Error("broker peer id is not ready yet");
   }
+  if (!request?.challenge_id || !request?.challenge) {
+    throw new Error("claim_device requires a claim challenge");
+  }
   const deviceKeypair = await ensureDeviceIdentity();
 
-  const claimProof = await signClaimProof(
-    actionId,
+  const claimProof = await signClaimChallengeProof(
+    request.challenge_id,
+    request.challenge,
     state.remoteAuth.deviceId,
     state.socketPeerId,
     deviceKeypair
@@ -279,8 +333,8 @@ async function buildClaimDevicePayload(actionId, request) {
       },
       request: {
         type: "claim_device",
+        challenge_id: request.challenge_id,
         proof: claimProof,
-        ...request,
       },
     };
   }
@@ -291,8 +345,8 @@ async function buildClaimDevicePayload(actionId, request) {
     device_id: state.remoteAuth.deviceId,
     envelope: await encryptJson(state.remoteAuth.deviceToken, {
       type: "claim_device",
+      challenge_id: request.challenge_id,
       proof: claimProof,
-      ...request,
     }),
   };
 }
