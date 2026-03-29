@@ -8,6 +8,7 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { chromium } from "playwright";
+import { deleteThreadAndWait, fetchSession } from "./e2e-thread-cleanup.mjs";
 
 const ROOT = process.cwd();
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 60000);
@@ -77,6 +78,7 @@ async function main() {
   let context;
   let localPage;
   let remotePage;
+  let createdThreadId = null;
 
   try {
     browser = await chromium.launch({ headless: true });
@@ -84,6 +86,7 @@ async function main() {
 
     localPage = await context.newPage();
     await localPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await openSecurityModal(localPage);
     await localPage.click("#start-pairing-button");
     await localPage.waitForFunction(() => {
       const input = document.querySelector("#pairing-link-input");
@@ -159,6 +162,7 @@ async function main() {
     await sendPromptAndWaitForReply(remotePage, AFTER_REFRESH_PROMPT);
 
     const relaySession = await fetchSession(relayPort);
+    createdThreadId = relaySession.active_thread_id;
     console.log(
       JSON.stringify(
         {
@@ -183,6 +187,15 @@ async function main() {
     dumpProcessLogs(relay);
     throw error;
   } finally {
+    if (createdThreadId) {
+      await deleteThreadAndWait(relayPort, createdThreadId, { cwd: workspaceDir }).catch(
+        (error) => {
+          console.error(
+            `[cleanup] failed to delete public refresh e2e thread ${createdThreadId}: ${error.message}`
+          );
+        }
+      );
+    }
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await stopManagedProcess(relay);
@@ -190,6 +203,14 @@ async function main() {
     await fs.rm(relayStateDir, { recursive: true, force: true }).catch(() => {});
     await fs.rm(workspaceDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+async function openSecurityModal(page) {
+  await page.click("#open-security-modal");
+  await page.waitForFunction(() => {
+    const dialog = document.querySelector("#security-modal");
+    return Boolean(dialog?.open);
+  });
 }
 
 function startPublicBroker({ brokerPort, brokerStatePath }) {
@@ -273,12 +294,6 @@ async function sendPromptAndWaitForReply(page, prompt) {
     expectedReply,
     { timeout: TIMEOUT_MS }
   );
-}
-
-async function fetchSession(relayPort) {
-  return fetch(`http://127.0.0.1:${relayPort}/api/session`)
-    .then((response) => response.json())
-    .then((response) => response.data);
 }
 
 async function waitForSingleStartedThread(relayPort, cwd, timeoutMs = TIMEOUT_MS) {

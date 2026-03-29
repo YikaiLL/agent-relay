@@ -227,6 +227,7 @@ async function pairDevice(browser, localPage, lanIp, brokerPort) {
 }
 
 async function startPairingFromLocalPage(localPage, previousUrl = "") {
+  await openSecurityModal(localPage);
   await localPage.click("#start-pairing-button");
   await localPage.waitForFunction(
     (previous) => {
@@ -241,6 +242,14 @@ async function startPairingFromLocalPage(localPage, previousUrl = "") {
     { timeout: TIMEOUT_MS }
   );
   return localPage.inputValue("#pairing-link-input");
+}
+
+async function openSecurityModal(page) {
+  await page.click("#open-security-modal");
+  await page.waitForFunction(() => {
+    const dialog = document.querySelector("#security-modal");
+    return Boolean(dialog?.open);
+  });
 }
 
 async function approvePendingPairing(localPage) {

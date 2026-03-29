@@ -745,6 +745,53 @@ fn active_running_thread_cannot_be_archived() {
     assert_eq!(relay.threads[0].id, "thread-1");
 }
 
+#[test]
+fn active_idle_thread_can_be_deleted() {
+    let mut relay = test_state();
+    relay.threads = vec![test_thread("thread-1", "/tmp/project")];
+    relay.active_thread_id = Some("thread-1".to_string());
+    relay.active_turn_id = None;
+
+    let is_active = relay
+        .can_delete_thread("thread-1")
+        .expect("idle active thread should be deletable");
+    let removed = relay.remove_thread("thread-1");
+
+    assert!(is_active);
+    assert!(removed);
+    assert!(relay.threads.is_empty());
+}
+
+#[test]
+fn active_running_thread_cannot_be_deleted() {
+    let mut relay = test_state();
+    relay.threads = vec![test_thread("thread-1", "/tmp/project")];
+    relay.active_thread_id = Some("thread-1".to_string());
+    relay.active_turn_id = Some("turn-1".to_string());
+
+    let error = relay
+        .can_delete_thread("thread-1")
+        .expect_err("running active thread should not be deletable");
+
+    assert!(error.contains("Codex is still running"));
+    assert_eq!(relay.threads.len(), 1);
+    assert_eq!(relay.threads[0].id, "thread-1");
+}
+
+#[test]
+fn filter_deleted_threads_hides_locally_purged_threads() {
+    let mut relay = test_state();
+    relay.mark_thread_deleted("thread-deleted");
+
+    let filtered = relay.filter_deleted_threads(vec![
+        test_thread("thread-keep", "/tmp/project"),
+        test_thread("thread-deleted", "/tmp/project"),
+    ]);
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].id, "thread-keep");
+}
+
 #[tokio::test]
 async fn persistence_store_round_trips_to_disk() {
     let unique = format!("agent-relay-test-{}-{}", std::process::id(), unix_now());

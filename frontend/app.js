@@ -66,6 +66,7 @@ const threadsList = document.querySelector("#threads-list");
 const threadsCount = document.querySelector("#threads-count");
 const threadContextMenu = document.querySelector("#thread-context-menu");
 const archiveThreadButton = document.querySelector("#archive-thread-button");
+const deleteThreadButton = document.querySelector("#delete-thread-button");
 const pairedDevicesList = document.querySelector("#paired-devices-list");
 const workspaceTitle = document.querySelector("#workspace-title");
 const workspaceSubtitle = document.querySelector("#workspace-subtitle");
@@ -119,6 +120,10 @@ threadsRefreshButton.addEventListener("click", () => {
 
 archiveThreadButton?.addEventListener("click", () => {
   void archiveThreadFromContextMenu();
+});
+
+deleteThreadButton?.addEventListener("click", () => {
+  void deleteThreadFromContextMenu();
 });
 
 document.addEventListener("click", (event) => {
@@ -1721,17 +1726,22 @@ async function apiFetch(input, init = {}) {
 }
 
 function openThreadContextMenu(threadId, clientX, clientY) {
-  if (!threadContextMenu || !archiveThreadButton || !threadId) {
+  if (!threadContextMenu || !archiveThreadButton || !deleteThreadButton || !threadId) {
     return;
   }
 
   state.threadContextMenuThreadId = threadId;
+  const isActive = state.session?.active_thread_id === threadId;
   const isRunningActiveSession =
-    state.session?.active_thread_id === threadId && Boolean(state.session?.active_turn_id);
+    isActive && Boolean(state.session?.active_turn_id);
   archiveThreadButton.disabled = isRunningActiveSession;
   archiveThreadButton.textContent = isRunningActiveSession
     ? "Running session cannot be archived"
     : "Archive session";
+  deleteThreadButton.disabled = isRunningActiveSession;
+  deleteThreadButton.textContent = isRunningActiveSession
+    ? "Running session cannot be deleted"
+    : "Delete permanently";
 
   threadContextMenu.hidden = false;
   const left = Math.max(12, Math.min(clientX, window.innerWidth - 220));
@@ -1752,6 +1762,10 @@ function closeThreadContextMenu() {
   if (archiveThreadButton) {
     archiveThreadButton.disabled = false;
     archiveThreadButton.textContent = "Archive session";
+  }
+  if (deleteThreadButton) {
+    deleteThreadButton.disabled = false;
+    deleteThreadButton.textContent = "Delete permanently";
   }
   threadsList
     .querySelectorAll(".conversation-item")
@@ -1788,6 +1802,42 @@ async function archiveThreadFromContextMenu() {
     logLine(payload.data?.message || `Archived local session ${shortId(threadId)}.`);
   } catch (error) {
     logLine(`Failed to archive local session: ${error.message}`);
+  }
+}
+
+async function deleteThreadFromContextMenu() {
+  const threadId = state.threadContextMenuThreadId;
+  closeThreadContextMenu();
+
+  if (!threadId) {
+    return;
+  }
+
+  const thread = resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
+  const title = thread?.name || thread?.preview || shortId(threadId);
+  const confirmed = window.confirm(
+    `Permanently delete "${title}" from local Codex storage?\n\nThis removes the local thread file and related local index/state entries. This cannot be undone.`
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const response = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/delete`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to permanently delete session");
+    }
+
+    state.threads = state.threads.filter((entry) => entry.id !== threadId);
+    renderThreads(state.threads);
+    await loadSession("post-delete refresh");
+    await loadThreads("post-delete refresh");
+    logLine(payload.data?.message || `Deleted local session ${shortId(threadId)} permanently.`);
+  } catch (error) {
+    logLine(`Failed to permanently delete local session: ${error.message}`);
   }
 }
 

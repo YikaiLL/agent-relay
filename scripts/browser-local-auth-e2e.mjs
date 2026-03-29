@@ -8,6 +8,7 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { chromium } from "playwright";
+import { deleteThreadAndWait, fetchSession } from "./e2e-thread-cleanup.mjs";
 
 const ROOT = process.cwd();
 const LOCAL_TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
@@ -51,6 +52,7 @@ async function main() {
   let browser;
   let context;
   let page;
+  let createdThreadId = null;
 
   try {
     browser = await chromium.launch({ headless: true });
@@ -171,13 +173,8 @@ async function main() {
       return transcript.includes("Authentication required");
     }, null, { timeout: LOCAL_TIMEOUT_MS });
 
-    const relaySession = await fetch(`${baseUrl}/api/session`, {
-      headers: {
-        Authorization: `Bearer ${API_TOKEN}`,
-      },
-    })
-      .then((response) => response.json())
-      .then((response) => response.data);
+    const relaySession = await fetchSession(relayPort, { bearerToken: API_TOKEN });
+    createdThreadId = relaySession.active_thread_id;
 
     console.log(
       JSON.stringify(
@@ -200,6 +197,16 @@ async function main() {
     dumpProcessLogs(relay);
     throw error;
   } finally {
+    if (createdThreadId) {
+      await deleteThreadAndWait(relayPort, createdThreadId, {
+        bearerToken: API_TOKEN,
+        cwd: ROOT,
+      }).catch((error) => {
+        console.error(
+          `[cleanup] failed to delete local auth e2e thread ${createdThreadId}: ${error.message}`
+        );
+      });
+    }
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await stopManagedProcess(relay);

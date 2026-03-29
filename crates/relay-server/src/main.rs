@@ -1,6 +1,7 @@
 mod auth;
 mod broker;
 mod codex;
+mod codex_local;
 mod protocol;
 mod state;
 
@@ -29,7 +30,7 @@ use protocol::{
     AuthSessionView, BulkRevokeDevicesReceipt, HealthResponse, HeartbeatInput,
     PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
     ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput,
-    TakeOverInput, ThreadArchiveReceipt, ThreadsQuery, ThreadsResponse,
+    TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadsQuery, ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -174,6 +175,10 @@ fn build_router(context: AppContext, web_root: PathBuf) -> Router {
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
+        .route(
+            "/api/threads/:thread_id/delete",
+            post(delete_thread_permanently),
+        )
         .route("/api/session/start", post(start_session))
         .route("/api/session/resume", post(resume_session))
         .route("/api/session/heartbeat", post(session_heartbeat))
@@ -339,6 +344,27 @@ async fn archive_thread(
         .map(|receipt| Json(ApiEnvelope::ok(receipt)))
         .map_err(|error| {
             if error.starts_with("cannot archive") {
+                bad_request(error)
+            } else {
+                bad_gateway(error)
+            }
+        })
+}
+
+async fn delete_thread_permanently(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+) -> Result<Json<ApiEnvelope<ThreadDeleteReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .delete_thread_permanently(&thread_id)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(|error| {
+            if error.starts_with("cannot permanently delete") {
                 bad_request(error)
             } else {
                 bad_gateway(error)

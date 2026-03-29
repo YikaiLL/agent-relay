@@ -11,7 +11,7 @@ use crate::{
         HeartbeatInput, PairingDecision, PairingDecisionInput, PairingDecisionReceipt,
         PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
         SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadArchiveReceipt,
-        ThreadsResponse,
+        ThreadDeleteReceipt, ThreadsResponse,
     },
 };
 
@@ -112,9 +112,9 @@ impl AppState {
         } else {
             limit
         };
-        let threads = self.codex.list_threads(scan_limit).await?;
-        let response_threads = filter_threads(threads.clone(), cwd.as_deref(), limit);
         let mut relay = self.relay.write().await;
+        let threads = relay.filter_deleted_threads(self.codex.list_threads(scan_limit).await?);
+        let response_threads = filter_threads(threads.clone(), cwd.as_deref(), limit);
         relay.threads = threads;
         relay.notify();
         Ok(ThreadsResponse {
@@ -153,10 +153,52 @@ impl AppState {
 
         Ok(ThreadArchiveReceipt {
             thread_id: thread_id.to_string(),
-            message: if archived_active_thread {
-                "Session archived and removed from local history.".to_string()
+            message: "Session archived and removed from local history.".to_string(),
+        })
+    }
+
+    pub async fn delete_thread_permanently(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadDeleteReceipt, String> {
+        let deleted_active_thread = {
+            let relay = self.relay.read().await;
+            relay.can_delete_thread(thread_id)?
+        };
+
+        let delete_summary = self.codex.delete_thread_permanently(thread_id).await?;
+
+        {
+            let mut relay = self.relay.write().await;
+            if deleted_active_thread {
+                relay.clear_active_session();
+            }
+            relay.mark_thread_deleted(thread_id);
+            relay.push_log(
+                "info",
+                format!(
+                    "{} local thread {thread_id} from Codex storage ({} rollout file{} removed, thread row removed: {}).",
+                    if deleted_active_thread {
+                        "Permanently deleted active"
+                    } else {
+                        "Permanently deleted"
+                    },
+                    delete_summary.deleted_paths.len(),
+                    if delete_summary.deleted_paths.len() == 1 { "" } else { "s" },
+                    delete_summary.deleted_thread_row
+                ),
+            );
+            relay.notify();
+        }
+
+        let _ = self.list_threads(20, None).await;
+
+        Ok(ThreadDeleteReceipt {
+            thread_id: thread_id.to_string(),
+            message: if deleted_active_thread {
+                "Active session permanently deleted from local Codex storage.".to_string()
             } else {
-                "Session archived and removed from local history.".to_string()
+                "Session permanently deleted from local Codex storage.".to_string()
             },
         })
     }

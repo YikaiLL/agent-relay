@@ -8,11 +8,12 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { chromium } from "playwright";
-import { deleteThreadAndWait, fetchSession } from "./e2e-thread-cleanup.mjs";
+import { fetchSession } from "./e2e-thread-cleanup.mjs";
 
 const ROOT = process.cwd();
 const LOCAL_TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
-const PROMPT = process.env.BROWSER_E2E_LOCAL_PROMPT || "Reply with exactly: local-browser-e2e";
+const PROMPT =
+  process.env.BROWSER_E2E_LOCAL_DELETE_PROMPT || "Reply with exactly: local-delete-browser-e2e";
 
 const managedProcesses = [];
 
@@ -26,26 +27,20 @@ process.on("exit", () => {
 
 async function main() {
   const relayPort = await getFreePort();
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-relay-local-e2e-"));
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-relay-local-delete-e2e-"));
   const statePath = path.join(stateDir, "session.json");
   const cwdInput = toTildePath(ROOT);
 
-  const relay = spawnManagedProcess(
-    "relay",
-    "cargo",
-    ["run", "-p", "relay-server"],
-    {
-      PORT: String(relayPort),
-      RELAY_STATE_PATH: statePath,
-    }
-  );
+  const relay = spawnManagedProcess("relay", "cargo", ["run", "-p", "relay-server"], {
+    PORT: String(relayPort),
+    RELAY_STATE_PATH: statePath,
+  });
 
   await waitForHealth(`http://127.0.0.1:${relayPort}/api/health`);
 
   let browser;
   let context;
   let page;
-  let createdThreadId = null;
 
   try {
     browser = await chromium.launch({ headless: true });
@@ -53,16 +48,6 @@ async function main() {
     page = await context.newPage();
 
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    assert.match(
-      (await page.textContent("#overview-session-title")) || "",
-      /^(Pick a workspace to launch|Launch from .+)$/,
-      "overview should show either the empty launch prompt or the preselected workspace"
-    );
-    assert.equal(
-      await page.textContent("#overview-security-title"),
-      "Private by default",
-      "overview should describe the default private posture"
-    );
     await page.click("#new-session-toggle");
     await page.waitForFunction(() => {
       const panel = document.querySelector("#new-session-panel");
@@ -81,40 +66,9 @@ async function main() {
       const transcript = document.querySelector("#transcript")?.textContent || "";
       return transcript.includes("Session ready");
     }, null, { timeout: LOCAL_TIMEOUT_MS });
-    await page.waitForFunction(
-      (expectedWorkspace) => {
-        const title = document.querySelector("#overview-session-title")?.textContent || "";
-        const badges = document.querySelector("#overview-session-badges")?.textContent || "";
-        const securityBadges = document.querySelector("#overview-security-badges")?.textContent || "";
-        return (
-          title.includes(`Ready in ${expectedWorkspace}`) &&
-          badges.includes("Status") &&
-          badges.includes("Model") &&
-          badges.includes("Approval") &&
-          badges.includes("Control") &&
-          securityBadges.includes("Security") &&
-          securityBadges.includes("Visibility")
-        );
-      },
-      path.basename(ROOT),
-      { timeout: LOCAL_TIMEOUT_MS }
-    );
-    assert.match(
-      (await page.textContent("#overview-session-copy")) || "",
-      /controls/i,
-      "overview should describe that this device owns the live session"
-    );
-    assert.match(
-      (await page.textContent("#overview-session-badges")) || "",
-      /never/i,
-      "overview badges should reflect the selected approval policy"
-    );
 
-    const messageInput = page.locator("#message-input");
-    await assertEnabled(messageInput);
-    await messageInput.fill(PROMPT);
+    await page.fill("#message-input", PROMPT);
     await page.click("#send-button");
-
     const expectedReply = PROMPT.replace("Reply with exactly: ", "");
     await page.waitForFunction(
       (expected) => {
@@ -126,18 +80,41 @@ async function main() {
     );
 
     const relaySession = await fetchSession(relayPort);
-    createdThreadId = relaySession.active_thread_id;
+    const threadId = relaySession.active_thread_id;
+    assert.ok(threadId, "local delete e2e should create an active thread");
+
+    const target = page.locator(`[data-thread-id="${threadId}"]`);
+    await target.waitFor({ state: "visible", timeout: LOCAL_TIMEOUT_MS });
+    page.once("dialog", (dialog) => dialog.accept());
+    await target.click({ button: "right" });
+    await page.waitForFunction(() => {
+      const menu = document.querySelector("#thread-context-menu");
+      const button = document.querySelector("#delete-thread-button");
+      return Boolean(menu && !menu.hidden && button && !button.disabled);
+    }, null, { timeout: LOCAL_TIMEOUT_MS });
+    await page.click("#delete-thread-button");
+
+    await waitForThreadMissing(relayPort, threadId);
+    await page.waitForFunction(
+      (deletedThreadId) => !document.querySelector(`[data-thread-id="${deletedThreadId}"]`),
+      threadId,
+      { timeout: LOCAL_TIMEOUT_MS }
+    );
+
+    const relayAfterDelete = await fetchSession(relayPort);
+    assert.equal(
+      relayAfterDelete.active_thread_id,
+      null,
+      "deleting the current idle session should clear the active session"
+    );
 
     console.log(
       JSON.stringify(
         {
           relayPort,
           cwdInput,
-          activeThreadId: relaySession.active_thread_id,
-          currentCwd: relaySession.current_cwd,
-          lastAssistant: [...relaySession.transcript]
-            .reverse()
-            .find((entry) => entry.role === "assistant")?.text,
+          deletedThreadId: threadId,
+          currentStatus: relayAfterDelete.current_status,
         },
         null,
         2
@@ -148,13 +125,6 @@ async function main() {
     dumpProcessLogs(relay);
     throw error;
   } finally {
-    if (createdThreadId) {
-      await deleteThreadAndWait(relayPort, createdThreadId, { cwd: ROOT }).catch((error) => {
-        console.error(
-          `[cleanup] failed to delete local session e2e thread ${createdThreadId}: ${error.message}`
-        );
-      });
-    }
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await stopManagedProcess(relay);
@@ -242,12 +212,6 @@ async function safeText(page, selector) {
   }
 }
 
-async function assertEnabled(locator) {
-  await locator.waitFor({ state: "visible", timeout: LOCAL_TIMEOUT_MS });
-  const disabled = await locator.evaluate((element) => element.disabled);
-  assert.equal(disabled, false, "expected locator to be enabled");
-}
-
 async function waitForHealth(url, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -262,22 +226,48 @@ async function waitForHealth(url, timeoutMs = 30000) {
   throw new Error(`timed out waiting for health endpoint: ${url}`);
 }
 
+async function waitForThreadMissing(relayPort, threadId, timeoutMs = LOCAL_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(
+      `http://127.0.0.1:${relayPort}/api/threads?cwd=${encodeURIComponent(ROOT)}`
+    );
+    const payload = await response.json();
+    if (response.ok && payload?.ok) {
+      const threads = payload.data?.threads || [];
+      if (!threads.some((thread) => thread.id === threadId)) {
+        return;
+      }
+    }
+    await delay(250);
+  }
+
+  throw new Error(`timed out waiting for deleted thread ${threadId} to disappear`);
+}
+
 async function getFreePort() {
   return await new Promise((resolve, reject) => {
     const server = net.createServer();
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
-      const port = address?.port;
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("failed to acquire an ephemeral port")));
+        return;
+      }
+      const { port } = address;
       server.close((error) => {
         if (error) {
           reject(error);
-          return;
+        } else {
+          resolve(port);
         }
-        resolve(port);
       });
     });
     server.on("error", reject);
   });
 }
 
-await main();
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -222,6 +222,12 @@ pub struct ThreadArchiveReceipt {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadDeleteReceipt {
+    pub thread_id: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PairingStartInput {
     pub expires_in_seconds: Option<u64>,

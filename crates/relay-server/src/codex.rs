@@ -15,6 +15,9 @@ use tokio::{
 };
 
 use crate::{
+    codex_local::{
+        delete_thread_permanently as delete_thread_permanently_local, LocalThreadDeleteSummary,
+    },
     protocol::{ApprovalDecisionInput, ThreadSummaryView, TranscriptEntryView},
     state::{ApprovalKind, PendingApproval, RelayState},
 };
@@ -173,6 +176,16 @@ impl CodexBridge {
         self.send_request("thread/archive", json!({ "threadId": thread_id }))
             .await
             .map(|_| ())
+    }
+
+    pub async fn delete_thread_permanently(
+        &self,
+        thread_id: &str,
+    ) -> Result<LocalThreadDeleteSummary, String> {
+        let thread_id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || delete_thread_permanently_local(&thread_id))
+            .await
+            .map_err(|error| format!("failed to join local Codex delete task: {error}"))?
     }
 
     pub async fn start_turn(

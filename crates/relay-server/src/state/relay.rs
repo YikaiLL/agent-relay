@@ -2,7 +2,7 @@ mod approval;
 mod device;
 mod transcript;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tokio::sync::watch;
 
@@ -85,6 +85,7 @@ pub struct RelayState {
     pub completed_pairings: HashMap<String, CompletedPairing>,
     pub pending_broker_messages: Vec<BrokerPendingMessage>,
     pub threads: Vec<ThreadSummaryView>,
+    locally_deleted_thread_ids: HashSet<String>,
     pub pending_approvals: HashMap<String, PendingApproval>,
     pub(super) transcript: Vec<TranscriptRecord>,
     pub(super) logs: Vec<LogEntryView>,
@@ -123,6 +124,7 @@ impl RelayState {
             completed_pairings: HashMap::new(),
             pending_broker_messages: Vec::new(),
             threads: Vec::new(),
+            locally_deleted_thread_ids: HashSet::new(),
             pending_approvals: HashMap::new(),
             transcript: Vec::new(),
             logs: Vec::new(),
@@ -306,6 +308,7 @@ impl RelayState {
         self.pending_broker_messages.clear();
         self.pending_approvals.clear();
         self.recent_remote_actions.clear();
+        self.locally_deleted_thread_ids.clear();
         self.transcript = data
             .transcript
             .into_iter()
@@ -322,6 +325,9 @@ impl RelayState {
     }
 
     pub fn upsert_thread(&mut self, thread: ThreadSummaryView) {
+        if self.locally_deleted_thread_ids.contains(&thread.id) {
+            return;
+        }
         if let Some(existing) = self.threads.iter_mut().find(|item| item.id == thread.id) {
             *existing = thread;
         } else {
@@ -340,10 +346,38 @@ impl RelayState {
         Ok(is_active)
     }
 
+    pub fn can_delete_thread(&self, thread_id: &str) -> Result<bool, String> {
+        let is_active = self.active_thread_id.as_deref() == Some(thread_id);
+        if is_active && self.active_turn_id.is_some() {
+            return Err(
+                "cannot permanently delete the active session while Codex is still running"
+                    .to_string(),
+            );
+        }
+
+        Ok(is_active)
+    }
+
     pub fn remove_thread(&mut self, thread_id: &str) -> bool {
         let before_len = self.threads.len();
         self.threads.retain(|thread| thread.id != thread_id);
         self.threads.len() != before_len
+    }
+
+    pub fn mark_thread_deleted(&mut self, thread_id: &str) {
+        self.locally_deleted_thread_ids
+            .insert(thread_id.to_string());
+        self.remove_thread(thread_id);
+    }
+
+    pub fn filter_deleted_threads(
+        &self,
+        threads: Vec<ThreadSummaryView>,
+    ) -> Vec<ThreadSummaryView> {
+        threads
+            .into_iter()
+            .filter(|thread| !self.locally_deleted_thread_ids.contains(&thread.id))
+            .collect()
     }
 
     pub fn set_connection(&mut self, connected: bool) {
@@ -488,6 +522,7 @@ impl RelayState {
         self.pending_broker_messages.clear();
         self.pending_approvals.clear();
         self.recent_remote_actions.clear();
+        self.locally_deleted_thread_ids.clear();
         self.transcript = persisted.transcript.clone();
         self.logs = persisted.logs.clone();
     }

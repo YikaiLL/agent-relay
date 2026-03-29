@@ -12,6 +12,7 @@
     "smoke:pairing": "node scripts/pairing-smoke.mjs",
     "test:browser:install": "playwright install chromium",
     "test:browser:pairing": "npm run build && node scripts/browser-pairing-e2e.mjs",
+    "test:browser:local-delete": "npm run build && node scripts/browser-local-delete-e2e.mjs",
     "test:browser:local-session": "npm run build && node scripts/browser-local-session-e2e.mjs",
     "test:browser:local-auth": "npm run build && node scripts/browser-local-auth-e2e.mjs",
     "test:browser:public-broker": "npm run build && node scripts/browser-public-broker-e2e.mjs",
