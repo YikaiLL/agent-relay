@@ -24,6 +24,7 @@ const state = {
   streamConnected: false,
   streamReconnectTimer: null,
   sessionPollTimer: null,
+  threadContextMenuThreadId: null,
   threads: [],
   threadsPollTimer: null,
 };
@@ -63,6 +64,8 @@ const sandboxInput = document.querySelector("#sandbox-input");
 const startEffortInput = document.querySelector("#start-effort");
 const threadsList = document.querySelector("#threads-list");
 const threadsCount = document.querySelector("#threads-count");
+const threadContextMenu = document.querySelector("#thread-context-menu");
+const archiveThreadButton = document.querySelector("#archive-thread-button");
 const pairedDevicesList = document.querySelector("#paired-devices-list");
 const workspaceTitle = document.querySelector("#workspace-title");
 const workspaceSubtitle = document.querySelector("#workspace-subtitle");
@@ -112,6 +115,36 @@ refreshButton.addEventListener("click", () => {
 
 threadsRefreshButton.addEventListener("click", () => {
   void loadThreads("manual refresh");
+});
+
+archiveThreadButton?.addEventListener("click", () => {
+  void archiveThreadFromContextMenu();
+});
+
+document.addEventListener("click", (event) => {
+  if (!threadContextMenu || threadContextMenu.hidden) {
+    return;
+  }
+
+  if (event.target.closest("#thread-context-menu")) {
+    return;
+  }
+
+  closeThreadContextMenu();
+});
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeThreadContextMenu();
+  }
+});
+
+window.addEventListener("blur", () => {
+  closeThreadContextMenu();
+});
+
+window.addEventListener("resize", () => {
+  closeThreadContextMenu();
 });
 
 directoryForm.addEventListener("submit", (event) => {
@@ -1372,6 +1405,7 @@ function renderApprovalCard(approval) {
 function renderThreads(threads) {
   const selectedCwd = state.selectedCwd;
   const activeThreadId = state.session?.active_thread_id || null;
+  closeThreadContextMenu();
 
   if (!selectedCwd) {
     threadsCount.textContent = "Choose a directory";
@@ -1394,7 +1428,12 @@ function renderThreads(threads) {
       const activeClass = activeThreadId === thread.id ? " is-active" : "";
 
       return `
-        <button class="conversation-item${activeClass}" type="button" data-thread-id="${escapeHtml(thread.id)}">
+        <button
+          class="conversation-item${activeClass}"
+          type="button"
+          data-thread-id="${escapeHtml(thread.id)}"
+          data-thread-title="${escapeHtml(title)}"
+        >
           <span class="conversation-title">${escapeHtml(title)}</span>
           <span class="conversation-preview">${escapeHtml(thread.preview || "No preview yet.")}</span>
           <span class="conversation-meta">${escapeHtml(formatTimestamp(thread.updated_at))}</span>
@@ -1406,6 +1445,10 @@ function renderThreads(threads) {
   threadsList.querySelectorAll("[data-thread-id]").forEach((button) => {
     button.addEventListener("click", () => {
       void resumeSession(button.dataset.threadId);
+    });
+    button.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      openThreadContextMenu(button.dataset.threadId, event.clientX, event.clientY);
     });
   });
 }
@@ -1675,6 +1718,77 @@ async function apiFetch(input, init = {}) {
   }
 
   return response;
+}
+
+function openThreadContextMenu(threadId, clientX, clientY) {
+  if (!threadContextMenu || !archiveThreadButton || !threadId) {
+    return;
+  }
+
+  state.threadContextMenuThreadId = threadId;
+  const isRunningActiveSession =
+    state.session?.active_thread_id === threadId && Boolean(state.session?.active_turn_id);
+  archiveThreadButton.disabled = isRunningActiveSession;
+  archiveThreadButton.textContent = isRunningActiveSession
+    ? "Running session cannot be archived"
+    : "Archive session";
+
+  threadContextMenu.hidden = false;
+  const left = Math.max(12, Math.min(clientX, window.innerWidth - 220));
+  const top = Math.max(12, Math.min(clientY, window.innerHeight - 64));
+  threadContextMenu.style.left = `${left}px`;
+  threadContextMenu.style.top = `${top}px`;
+
+  threadsList
+    .querySelectorAll(".conversation-item")
+    .forEach((item) => item.classList.toggle("is-context-target", item.dataset.threadId === threadId));
+}
+
+function closeThreadContextMenu() {
+  state.threadContextMenuThreadId = null;
+  if (threadContextMenu) {
+    threadContextMenu.hidden = true;
+  }
+  if (archiveThreadButton) {
+    archiveThreadButton.disabled = false;
+    archiveThreadButton.textContent = "Archive session";
+  }
+  threadsList
+    .querySelectorAll(".conversation-item")
+    .forEach((item) => item.classList.remove("is-context-target"));
+}
+
+async function archiveThreadFromContextMenu() {
+  const threadId = state.threadContextMenuThreadId;
+  closeThreadContextMenu();
+
+  if (!threadId) {
+    return;
+  }
+
+  const thread = resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
+  const title = thread?.name || thread?.preview || shortId(threadId);
+  if (!window.confirm(`Archive "${title}" from local history?`)) {
+    return;
+  }
+
+  try {
+    const response = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/archive`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to archive session");
+    }
+
+    state.threads = state.threads.filter((entry) => entry.id !== threadId);
+    renderThreads(state.threads);
+    await loadSession("post-archive refresh");
+    await loadThreads("post-archive refresh");
+    logLine(payload.data?.message || `Archived local session ${shortId(threadId)}.`);
+  } catch (error) {
+    logLine(`Failed to archive local session: ${error.message}`);
+  }
 }
 
 function scheduleStreamReconnect() {

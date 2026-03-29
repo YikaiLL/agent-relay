@@ -272,6 +272,10 @@ input:focus, textarea:focus, select:focus {
   background: var(--bg-elevated);
   border-color: var(--border-subtle);
 }
+.conversation-item.is-context-target {
+  background: var(--bg-elevated);
+  border-color: var(--accent-soft);
+}
 
 .conversation-title {
   color: var(--text-primary);
@@ -287,6 +291,37 @@ input:focus, textarea:focus, select:focus {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 180px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-elevated) 92%, white 8%);
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.18);
+}
+
+.context-menu-button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  font: inherit;
+  padding: 10px 12px;
+  border-radius: calc(var(--radius-sm) - 4px);
+}
+
+.context-menu-button:hover:not(:disabled) {
+  background: var(--bg-elevated);
+}
+
+.context-menu-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* MAIN SHELL */

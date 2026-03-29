@@ -10,7 +10,8 @@ use crate::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, BulkRevokeDevicesReceipt,
         HeartbeatInput, PairingDecision, PairingDecisionInput, PairingDecisionReceipt,
         PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
-        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadsResponse,
+        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadArchiveReceipt,
+        ThreadsResponse,
     },
 };
 
@@ -118,6 +119,45 @@ impl AppState {
         relay.notify();
         Ok(ThreadsResponse {
             threads: response_threads,
+        })
+    }
+
+    pub async fn archive_thread(&self, thread_id: &str) -> Result<ThreadArchiveReceipt, String> {
+        let archived_active_thread = {
+            let relay = self.relay.read().await;
+            relay.can_archive_thread(thread_id)?
+        };
+
+        self.codex.archive_thread(thread_id).await?;
+
+        {
+            let mut relay = self.relay.write().await;
+            let removed = relay.remove_thread(thread_id);
+            if archived_active_thread {
+                relay.clear_active_session();
+            }
+            relay.push_log(
+                "info",
+                if archived_active_thread {
+                    format!("Archived active thread {thread_id} from local history and cleared the current session.")
+                } else {
+                    format!("Archived thread {thread_id} from local history.")
+                },
+            );
+            if removed {
+                relay.notify();
+            }
+        }
+
+        let _ = self.list_threads(20, None).await;
+
+        Ok(ThreadArchiveReceipt {
+            thread_id: thread_id.to_string(),
+            message: if archived_active_thread {
+                "Session archived and removed from local history.".to_string()
+            } else {
+                "Session archived and removed from local history.".to_string()
+            },
         })
     }
 

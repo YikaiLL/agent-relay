@@ -695,6 +695,56 @@ fn revoking_paired_device_removes_it() {
     assert_eq!(record.last_peer_id.as_deref(), Some("surface-tablet"));
 }
 
+#[test]
+fn remove_thread_removes_non_active_thread_from_local_history() {
+    let mut relay = test_state();
+    relay.threads = vec![
+        test_thread("thread-1", "/tmp/project"),
+        test_thread("thread-2", "/tmp/project"),
+    ];
+    relay.active_thread_id = Some("thread-1".to_string());
+
+    let removed = relay.remove_thread("thread-2");
+
+    assert!(removed);
+    assert_eq!(relay.threads.len(), 1);
+    assert_eq!(relay.threads[0].id, "thread-1");
+    assert_eq!(relay.active_thread_id.as_deref(), Some("thread-1"));
+}
+
+#[test]
+fn active_idle_thread_can_be_archived() {
+    let mut relay = test_state();
+    relay.threads = vec![test_thread("thread-1", "/tmp/project")];
+    relay.active_thread_id = Some("thread-1".to_string());
+    relay.active_turn_id = None;
+
+    let is_active = relay
+        .can_archive_thread("thread-1")
+        .expect("idle active thread should be archivable");
+    let removed = relay.remove_thread("thread-1");
+
+    assert!(is_active);
+    assert!(removed);
+    assert!(relay.threads.is_empty());
+}
+
+#[test]
+fn active_running_thread_cannot_be_archived() {
+    let mut relay = test_state();
+    relay.threads = vec![test_thread("thread-1", "/tmp/project")];
+    relay.active_thread_id = Some("thread-1".to_string());
+    relay.active_turn_id = Some("turn-1".to_string());
+
+    let error = relay
+        .can_archive_thread("thread-1")
+        .expect_err("running active thread should not be archivable");
+
+    assert!(error.contains("Codex is still running"));
+    assert_eq!(relay.threads.len(), 1);
+    assert_eq!(relay.threads[0].id, "thread-1");
+}
+
 #[tokio::test]
 async fn persistence_store_round_trips_to_disk() {
     let unique = format!("agent-relay-test-{}-{}", std::process::id(), unix_now());

@@ -329,6 +329,23 @@ impl RelayState {
         }
     }
 
+    pub fn can_archive_thread(&self, thread_id: &str) -> Result<bool, String> {
+        let is_active = self.active_thread_id.as_deref() == Some(thread_id);
+        if is_active && self.active_turn_id.is_some() {
+            return Err(
+                "cannot archive the active session while Codex is still running".to_string(),
+            );
+        }
+
+        Ok(is_active)
+    }
+
+    pub fn remove_thread(&mut self, thread_id: &str) -> bool {
+        let before_len = self.threads.len();
+        self.threads.retain(|thread| thread.id != thread_id);
+        self.threads.len() != before_len
+    }
+
     pub fn set_connection(&mut self, connected: bool) {
         self.codex_connected = connected;
     }

@@ -29,7 +29,7 @@ use protocol::{
     AuthSessionView, BulkRevokeDevicesReceipt, HealthResponse, HeartbeatInput,
     PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
     ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput,
-    TakeOverInput, ThreadsQuery, ThreadsResponse,
+    TakeOverInput, ThreadArchiveReceipt, ThreadsQuery, ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -173,6 +173,7 @@ fn build_router(context: AppContext, web_root: PathBuf) -> Router {
         .route("/api/session", get(session_snapshot))
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
+        .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route("/api/session/start", post(start_session))
         .route("/api/session/resume", post(resume_session))
         .route("/api/session/heartbeat", post(session_heartbeat))
@@ -322,6 +323,27 @@ async fn list_threads(
         .await
         .map(|threads| Json(ApiEnvelope::ok(threads)))
         .map_err(bad_gateway)
+}
+
+async fn archive_thread(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+) -> Result<Json<ApiEnvelope<ThreadArchiveReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .archive_thread(&thread_id)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(|error| {
+            if error.starts_with("cannot archive") {
+                bad_request(error)
+            } else {
+                bad_gateway(error)
+            }
+        })
 }
 
 async fn start_session(

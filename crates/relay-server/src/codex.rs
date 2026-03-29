@@ -91,7 +91,7 @@ impl CodexBridge {
 
     pub async fn list_threads(&self, limit: usize) -> Result<Vec<ThreadSummaryView>, String> {
         let result = self
-            .send_request("thread/list", json!({ "limit": limit }))
+            .send_request("thread/list", json!({ "limit": limit, "archived": false }))
             .await?;
         let threads = value_at(&result, &["data"])
             .and_then(Value::as_array)
@@ -167,6 +167,12 @@ impl CodexBridge {
             active_flags,
             transcript: parse_transcript(thread),
         })
+    }
+
+    pub async fn archive_thread(&self, thread_id: &str) -> Result<(), String> {
+        self.send_request("thread/archive", json!({ "threadId": thread_id }))
+            .await
+            .map(|_| ())
     }
 
     pub async fn start_turn(
