@@ -324,11 +324,19 @@ input:focus, textarea:focus, select:focus {
   cursor: not-allowed;
 }
 
+.context-menu-button-danger {
+  color: #9f1239;
+}
+
+.context-menu-button-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, #ffe4e6 78%, white 22%);
+}
+
 /* MAIN SHELL */
 .chat-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
   background: var(--bg-base);
 }
 
@@ -480,6 +488,10 @@ input:focus, textarea:focus, select:focus {
 .control-hint { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); }
 
 /* THREAD SHELL */
+.thread-shell {
+  height: 100%;
+  overflow: hidden;
+}
 .chat-thread {
   height: 100%;
   overflow-y: auto;
