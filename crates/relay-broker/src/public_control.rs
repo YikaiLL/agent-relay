@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +22,7 @@ pub const PUBLIC_DEVICE_WS_TTL_SECS_ENV: &str = "RELAY_BROKER_PUBLIC_DEVICE_WS_T
 
 const DEFAULT_PUBLIC_RELAY_WS_TTL_SECS: u64 = 300;
 const DEFAULT_PUBLIC_DEVICE_WS_TTL_SECS: u64 = 300;
+const DEFAULT_RELAY_ENROLLMENT_CHALLENGE_TTL_SECS: u64 = 300;
 const PUBLIC_CONTROL_STATE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +45,40 @@ pub struct RelayWsTokenResponse {
     pub broker_room_id: String,
     pub relay_ws_token: String,
     pub relay_ws_token_expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEnrollmentChallengeRequest {
+    pub relay_verify_key: String,
+    #[serde(default)]
+    pub relay_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEnrollmentChallengeResponse {
+    pub relay_verify_key: String,
+    pub challenge_id: String,
+    pub challenge: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEnrollmentCompleteRequest {
+    pub relay_verify_key: String,
+    pub challenge_id: String,
+    pub challenge_signature: String,
+    #[serde(default)]
+    pub relay_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayEnrollmentResponse {
+    pub relay_id: String,
+    pub broker_room_id: String,
+    pub relay_refresh_token: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub relay_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,22 +167,38 @@ pub struct PublicControlPlane {
 
 struct PublicControlPlaneInner {
     issuer_key: JoinTicketKey,
-    relay_registrations: HashMap<String, RelayRegistration>,
     relay_ws_ttl_secs: u64,
     device_ws_ttl_secs: u64,
     state_path: Option<PathBuf>,
-    device_grants: Mutex<DeviceGrantStore>,
+    state: Mutex<PublicControlStateStore>,
+    relay_enrollment_challenges: Mutex<HashMap<String, PendingRelayEnrollmentChallenge>>,
 }
 
 #[derive(Debug, Clone)]
-struct RelayRegistration {
+struct PendingRelayEnrollmentChallenge {
+    relay_verify_key: String,
+    challenge: String,
+    relay_label: Option<String>,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRelayRegistration {
     relay_id: String,
     broker_room_id: String,
+    refresh_token_hash: String,
+    created_at: u64,
+    #[serde(default)]
+    relay_label: Option<String>,
+    #[serde(default)]
+    relay_verify_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedPublicControlState {
     schema_version: u32,
+    #[serde(default)]
+    relay_registrations: Vec<PersistedRelayRegistration>,
     #[serde(default)]
     device_grants: Vec<PersistedDeviceGrant>,
 }
@@ -160,7 +213,8 @@ struct PersistedDeviceGrant {
 }
 
 #[derive(Debug, Default)]
-struct DeviceGrantStore {
+struct PublicControlStateStore {
+    relay_registrations_by_hash: HashMap<String, PersistedRelayRegistration>,
     grants_by_hash: HashMap<String, PersistedDeviceGrant>,
 }
 
@@ -187,24 +241,6 @@ impl PublicControlPlane {
             format!("{PUBLIC_ISSUER_SECRET_ENV} is required in public broker auth mode")
         })?;
         let issuer_key = JoinTicketKey::from_secret(issuer_secret.as_bytes())?;
-        let relay_registrations = parse_relay_registrations(relay_registrations_json)?
-            .into_iter()
-            .map(|registration| {
-                (
-                    sha256_hex(&registration.refresh_token),
-                    RelayRegistration {
-                        relay_id: registration.relay_id,
-                        broker_room_id: registration.broker_room_id,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        if relay_registrations.is_empty() {
-            return Err(format!(
-                "{PUBLIC_RELAY_REGISTRATIONS_ENV} must contain at least one relay registration in public broker auth mode"
-            ));
-        }
-
         let state_path = trimmed(state_path).map(PathBuf::from);
         if state_path.is_none() && public_mode_requires_persistent_state() {
             return Err(format!(
@@ -212,12 +248,12 @@ impl PublicControlPlane {
                 crate::auth::BROKER_AUTH_MODE_ENV
             ));
         }
-        let device_grants = DeviceGrantStore::load(state_path.as_deref()).await?;
+        let mut state = PublicControlStateStore::load(state_path.as_deref()).await?;
+        state.seed_relay_registrations(parse_relay_registrations(relay_registrations_json)?);
 
         Ok(Self {
             inner: Arc::new(PublicControlPlaneInner {
                 issuer_key,
-                relay_registrations,
                 relay_ws_ttl_secs: parse_optional_u64(
                     PUBLIC_RELAY_WS_TTL_SECS_ENV,
                     relay_ws_ttl_secs,
@@ -229,7 +265,8 @@ impl PublicControlPlane {
                 )?
                 .unwrap_or(DEFAULT_PUBLIC_DEVICE_WS_TTL_SECS),
                 state_path,
-                device_grants: Mutex::new(device_grants),
+                state: Mutex::new(state),
+                relay_enrollment_challenges: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -252,13 +289,88 @@ impl PublicControlPlane {
         ))
     }
 
+    pub async fn create_relay_enrollment_challenge(
+        &self,
+        request: RelayEnrollmentChallengeRequest,
+    ) -> Result<RelayEnrollmentChallengeResponse, String> {
+        self.prune_expired_relay_enrollment_challenges().await;
+
+        let relay_verify_key = trimmed(Some(request.relay_verify_key))
+            .ok_or_else(|| "relay verify key is required".to_string())?;
+        validate_relay_verify_key(&relay_verify_key)?;
+        let relay_label = request
+            .relay_label
+            .and_then(|label| trimmed(Some(label)))
+            .filter(|label| !label.is_empty());
+        let challenge_id = format!("rch-{}", random_token(24).to_ascii_lowercase());
+        let challenge = format!("rc-{}", random_token(40).to_ascii_lowercase());
+        let expires_at = unix_now().saturating_add(DEFAULT_RELAY_ENROLLMENT_CHALLENGE_TTL_SECS);
+        self.inner.relay_enrollment_challenges.lock().await.insert(
+            challenge_id.clone(),
+            PendingRelayEnrollmentChallenge {
+                relay_verify_key: relay_verify_key.clone(),
+                challenge: challenge.clone(),
+                relay_label,
+                expires_at,
+            },
+        );
+        Ok(RelayEnrollmentChallengeResponse {
+            relay_verify_key,
+            challenge_id,
+            challenge,
+            expires_at,
+        })
+    }
+
+    pub async fn complete_relay_enrollment(
+        &self,
+        request: RelayEnrollmentCompleteRequest,
+    ) -> Result<RelayEnrollmentResponse, String> {
+        self.prune_expired_relay_enrollment_challenges().await;
+
+        let relay_verify_key = trimmed(Some(request.relay_verify_key))
+            .ok_or_else(|| "relay verify key is required".to_string())?;
+        validate_relay_verify_key(&relay_verify_key)?;
+        let challenge_id = trimmed(Some(request.challenge_id))
+            .ok_or_else(|| "relay enrollment challenge id is required".to_string())?;
+        let challenge_signature = trimmed(Some(request.challenge_signature))
+            .ok_or_else(|| "relay enrollment challenge signature is required".to_string())?;
+
+        let pending = {
+            let mut challenges = self.inner.relay_enrollment_challenges.lock().await;
+            challenges
+                .remove(&challenge_id)
+                .ok_or_else(|| "relay enrollment challenge is invalid".to_string())?
+        };
+        if pending.expires_at <= unix_now() {
+            return Err("relay enrollment challenge has expired".to_string());
+        }
+        if pending.relay_verify_key != relay_verify_key {
+            return Err("relay enrollment verify key does not match challenge".to_string());
+        }
+        verify_relay_enrollment_challenge_signature(
+            &relay_verify_key,
+            &challenge_id,
+            &pending.challenge,
+            &challenge_signature,
+        )?;
+        let relay_label = request
+            .relay_label
+            .and_then(|label| trimmed(Some(label)))
+            .filter(|label| !label.is_empty())
+            .or(pending.relay_label);
+        self.issue_relay_registration_for_verify_key(&relay_verify_key, relay_label)
+            .await
+    }
+
     pub async fn issue_relay_ws_token(
         &self,
         bearer_token: &str,
         request: RelayWsTokenRequest,
     ) -> Result<RelayWsTokenResponse, String> {
-        let registration =
-            self.authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)?;
+        let registration = self
+            .authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)
+            .await?;
         let expires_at = unix_now().saturating_add(self.inner.relay_ws_ttl_secs);
         Ok(RelayWsTokenResponse {
             relay_id: registration.relay_id.clone(),
@@ -279,8 +391,9 @@ impl PublicControlPlane {
         bearer_token: &str,
         request: PairingWsTokenRequest,
     ) -> Result<PairingWsTokenResponse, String> {
-        let registration =
-            self.authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)?;
+        let registration = self
+            .authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)
+            .await?;
         Ok(PairingWsTokenResponse {
             relay_id: registration.relay_id.clone(),
             broker_room_id: registration.broker_room_id.clone(),
@@ -300,13 +413,14 @@ impl PublicControlPlane {
         bearer_token: &str,
         request: DeviceGrantRequest,
     ) -> Result<DeviceGrantResponse, String> {
-        let registration =
-            self.authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)?;
+        let registration = self
+            .authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)
+            .await?;
         let refresh_token = format!("dref-{}", random_token(40).to_ascii_lowercase());
         let refresh_token_hash = sha256_hex(&refresh_token);
         let created_at = unix_now();
 
-        let mut store = self.inner.device_grants.lock().await;
+        let mut store = self.inner.state.lock().await;
         store.remove_device_grants(&registration.relay_id, None, Some(&request.device_id));
         store.grants_by_hash.insert(
             refresh_token_hash.clone(),
@@ -349,9 +463,13 @@ impl PublicControlPlane {
         bearer_token: &str,
     ) -> Result<DeviceWsTokenResponse, String> {
         let grant = self.device_grant_from_refresh_token(bearer_token).await?;
-        let registration = RelayRegistration {
+        let registration = PersistedRelayRegistration {
             relay_id: grant.relay_id,
             broker_room_id: grant.broker_room_id,
+            refresh_token_hash: String::new(),
+            created_at: grant.created_at,
+            relay_label: None,
+            relay_verify_key: None,
         };
         self.issue_device_ws_token_for_registration(&registration, &grant.device_id)
     }
@@ -362,9 +480,10 @@ impl PublicControlPlane {
         device_id: &str,
         request: DeviceGrantRevokeRequest,
     ) -> Result<DeviceGrantRevokeResponse, String> {
-        let registration =
-            self.authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)?;
-        let mut store = self.inner.device_grants.lock().await;
+        let registration = self
+            .authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)
+            .await?;
+        let mut store = self.inner.state.lock().await;
         let revoked_grant_count = store.remove_device_grants(
             &registration.relay_id,
             Some(&registration.broker_room_id),
@@ -387,9 +506,10 @@ impl PublicControlPlane {
         bearer_token: &str,
         request: DeviceGrantBulkRevokeRequest,
     ) -> Result<DeviceGrantBulkRevokeResponse, String> {
-        let registration =
-            self.authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)?;
-        let mut store = self.inner.device_grants.lock().await;
+        let registration = self
+            .authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)
+            .await?;
+        let mut store = self.inner.state.lock().await;
         let revoked_device_ids = store.remove_all_other_device_grants(
             &registration.relay_id,
             &registration.broker_room_id,
@@ -407,16 +527,16 @@ impl PublicControlPlane {
         })
     }
 
-    fn authenticate_relay(
+    async fn authenticate_relay(
         &self,
         bearer_token: &str,
         relay_id: &str,
         broker_room_id: &str,
-    ) -> Result<RelayRegistration, String> {
+    ) -> Result<PersistedRelayRegistration, String> {
         let token_hash = sha256_hex(bearer_token.trim());
-        let registration = self
-            .inner
-            .relay_registrations
+        let store = self.inner.state.lock().await;
+        let registration = store
+            .relay_registrations_by_hash
             .get(&token_hash)
             .ok_or_else(|| "relay refresh token is invalid".to_string())?;
         if registration.relay_id != relay_id {
@@ -430,7 +550,7 @@ impl PublicControlPlane {
 
     fn issue_device_ws_token_for_registration(
         &self,
-        registration: &RelayRegistration,
+        registration: &PersistedRelayRegistration,
         device_id: &str,
     ) -> Result<DeviceWsTokenResponse, String> {
         let expires_at = unix_now().saturating_add(self.inner.device_ws_ttl_secs);
@@ -454,16 +574,65 @@ impl PublicControlPlane {
         bearer_token: &str,
     ) -> Result<PersistedDeviceGrant, String> {
         let token_hash = sha256_hex(bearer_token.trim());
-        let store = self.inner.device_grants.lock().await;
+        let store = self.inner.state.lock().await;
         store
             .grants_by_hash
             .get(&token_hash)
             .cloned()
             .ok_or_else(|| "device refresh token is invalid".to_string())
     }
+
+    async fn issue_relay_registration_for_verify_key(
+        &self,
+        relay_verify_key: &str,
+        relay_label: Option<String>,
+    ) -> Result<RelayEnrollmentResponse, String> {
+        let created_at = unix_now();
+        let mut store = self.inner.state.lock().await;
+        let (relay_id, broker_room_id) =
+            if let Some(existing) = store.registration_for_verify_key(relay_verify_key) {
+                let relay_id = existing.relay_id.clone();
+                let broker_room_id = existing.broker_room_id.clone();
+                store.remove_relay_registration_by_verify_key(relay_verify_key);
+                (relay_id, broker_room_id)
+            } else {
+                let (relay_id, broker_room_id) = store.issue_new_relay_ids();
+                (relay_id, broker_room_id)
+            };
+        let relay_refresh_token = format!("rref-{}", random_token(40).to_ascii_lowercase());
+        let refresh_token_hash = sha256_hex(&relay_refresh_token);
+        let registration = PersistedRelayRegistration {
+            relay_id: relay_id.clone(),
+            broker_room_id: broker_room_id.clone(),
+            refresh_token_hash: refresh_token_hash.clone(),
+            created_at,
+            relay_label: relay_label.clone(),
+            relay_verify_key: Some(relay_verify_key.to_string()),
+        };
+        store
+            .relay_registrations_by_hash
+            .insert(refresh_token_hash, registration);
+        store.save(self.inner.state_path.as_deref()).await?;
+        Ok(RelayEnrollmentResponse {
+            relay_id,
+            broker_room_id,
+            relay_refresh_token,
+            created_at,
+            relay_label,
+        })
+    }
+
+    async fn prune_expired_relay_enrollment_challenges(&self) {
+        let now = unix_now();
+        self.inner
+            .relay_enrollment_challenges
+            .lock()
+            .await
+            .retain(|_, challenge| challenge.expires_at > now);
+    }
 }
 
-impl DeviceGrantStore {
+impl PublicControlStateStore {
     async fn load(path: Option<&Path>) -> Result<Self, String> {
         let Some(path) = path else {
             return Ok(Self::default());
@@ -495,6 +664,11 @@ impl DeviceGrantStore {
             ));
         }
         Ok(Self {
+            relay_registrations_by_hash: persisted
+                .relay_registrations
+                .into_iter()
+                .map(|registration| (registration.refresh_token_hash.clone(), registration))
+                .collect(),
             grants_by_hash: persisted
                 .device_grants
                 .into_iter()
@@ -514,6 +688,7 @@ impl DeviceGrantStore {
         }
         let payload = serde_json::to_vec_pretty(&PersistedPublicControlState {
             schema_version: PUBLIC_CONTROL_STATE_VERSION,
+            relay_registrations: self.relay_registrations_by_hash.values().cloned().collect(),
             device_grants: self.grants_by_hash.values().cloned().collect(),
         })
         .map_err(|error| format!("failed to encode public control-plane state: {error}"))?;
@@ -569,14 +744,78 @@ impl DeviceGrantStore {
         revoked_device_ids.sort();
         revoked_device_ids
     }
+
+    fn seed_relay_registrations(&mut self, registrations: Vec<RelayRegistrationConfig>) {
+        for registration in registrations {
+            let refresh_token_hash = sha256_hex(&registration.refresh_token);
+            self.relay_registrations_by_hash
+                .entry(refresh_token_hash.clone())
+                .or_insert_with(|| PersistedRelayRegistration {
+                    relay_id: registration.relay_id,
+                    broker_room_id: registration.broker_room_id,
+                    refresh_token_hash,
+                    created_at: 0,
+                    relay_label: None,
+                    relay_verify_key: None,
+                });
+        }
+    }
+
+    fn issue_new_relay_ids(&self) -> (String, String) {
+        loop {
+            let relay_id = format!("relay-{}", random_token(12).to_ascii_lowercase());
+            let broker_room_id = format!("room-{}", random_token(12).to_ascii_lowercase());
+            if self
+                .relay_registrations_by_hash
+                .values()
+                .any(|registration| {
+                    registration.relay_id == relay_id
+                        || registration.broker_room_id == broker_room_id
+                })
+            {
+                continue;
+            }
+            return (relay_id, broker_room_id);
+        }
+    }
+
+    fn registration_for_verify_key(
+        &self,
+        relay_verify_key: &str,
+    ) -> Option<PersistedRelayRegistration> {
+        self.relay_registrations_by_hash
+            .values()
+            .find(|registration| {
+                registration
+                    .relay_verify_key
+                    .as_deref()
+                    .is_some_and(|value| value == relay_verify_key)
+            })
+            .cloned()
+    }
+
+    fn remove_relay_registration_by_verify_key(&mut self, relay_verify_key: &str) -> usize {
+        let mut removed = 0;
+        self.relay_registrations_by_hash.retain(|_, registration| {
+            let matches = registration
+                .relay_verify_key
+                .as_deref()
+                .is_some_and(|value| value == relay_verify_key);
+            if matches {
+                removed += 1;
+            }
+            !matches
+        });
+        removed
+    }
 }
 
 fn parse_relay_registrations(
     value: Option<String>,
 ) -> Result<Vec<RelayRegistrationConfig>, String> {
-    let raw = trimmed(value).ok_or_else(|| {
-        format!("{PUBLIC_RELAY_REGISTRATIONS_ENV} is required in public broker auth mode")
-    })?;
+    let Some(raw) = trimmed(value) else {
+        return Ok(Vec::new());
+    };
     let parsed: Vec<RelayRegistrationConfig> = serde_json::from_str(&raw)
         .map_err(|error| format!("{PUBLIC_RELAY_REGISTRATIONS_ENV} must be valid JSON: {error}"))?;
     for registration in &parsed {
@@ -644,4 +883,46 @@ fn public_mode_requires_persistent_state() -> bool {
         .and_then(|value| value.parse::<IpAddr>().ok())
         .map(|addr| !addr.is_loopback())
         .unwrap_or(false)
+}
+
+fn validate_relay_verify_key(verify_key_b64: &str) -> Result<(), String> {
+    let verify_key_bytes: [u8; 32] = STANDARD
+        .decode(verify_key_b64)
+        .map_err(|_| "relay verify key is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "relay verify key is invalid".to_string())?;
+    VerifyingKey::from_bytes(&verify_key_bytes)
+        .map(|_| ())
+        .map_err(|_| "relay verify key is invalid".to_string())
+}
+
+fn verify_relay_enrollment_challenge_signature(
+    verify_key_b64: &str,
+    challenge_id: &str,
+    challenge: &str,
+    signature_b64: &str,
+) -> Result<(), String> {
+    let verify_key_bytes: [u8; 32] = STANDARD
+        .decode(verify_key_b64)
+        .map_err(|_| "relay verify key is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "relay verify key is invalid".to_string())?;
+    let signature_bytes: [u8; 64] = STANDARD
+        .decode(signature_b64)
+        .map_err(|_| "relay enrollment signature is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "relay enrollment signature is invalid".to_string())?;
+    let verify_key = VerifyingKey::from_bytes(&verify_key_bytes)
+        .map_err(|_| "relay verify key is invalid".to_string())?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verify_key
+        .verify(
+            relay_enrollment_challenge_message(challenge_id, challenge).as_bytes(),
+            &signature,
+        )
+        .map_err(|_| "relay enrollment signature is invalid".to_string())
+}
+
+fn relay_enrollment_challenge_message(challenge_id: &str, challenge: &str) -> String {
+    format!("agent-relay:relay-enroll:{challenge_id}:{challenge}")
 }

@@ -87,7 +87,7 @@ fn test_state() -> RelayState {
     )
 }
 
-fn test_broker_config(
+async fn test_broker_config(
     broker_url: &str,
     channel_id: &str,
     peer_id: &str,
@@ -103,7 +103,10 @@ fn test_broker_config(
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect("broker config should parse")
     .expect("broker config should be enabled")
 }
@@ -115,7 +118,11 @@ fn issue_test_pairing_ticket(
     peer_id: &str,
     expires_in_seconds: Option<u64>,
 ) -> crate::protocol::PairingTicketView {
-    let broker = test_broker_config(broker_url, channel_id, peer_id);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let broker = runtime.block_on(test_broker_config(broker_url, channel_id, peer_id));
     let prepared = relay
         .prepare_pairing_ticket(expires_in_seconds)
         .expect("pairing ticket should prepare");

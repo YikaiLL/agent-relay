@@ -34,7 +34,9 @@ use public_control::{
     DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
     DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
     DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
-    PublicControlPlane, RelayWsTokenRequest, RelayWsTokenResponse,
+    PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+    RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
+    RelayWsTokenResponse,
 };
 use rand::{distributions::Alphanumeric, Rng};
 use tokio::{sync::Mutex, time::Instant};
@@ -418,6 +420,14 @@ fn app_with_web_root_and_verifier_and_hardening(
     Router::new()
         .route("/api/health", get(health))
         .route(
+            "/api/public/relay-enrollment/challenge",
+            post(public_create_relay_enrollment_challenge),
+        )
+        .route(
+            "/api/public/relay-enrollment/complete",
+            post(public_complete_relay_enrollment),
+        )
+        .route(
             "/api/public/relay/ws-token",
             post(public_issue_relay_ws_token),
         )
@@ -481,6 +491,34 @@ struct ApiErrorBody {
 #[derive(Debug, Clone, serde::Serialize)]
 struct DeviceSessionClearResponse {
     cleared: bool,
+}
+
+async fn public_create_relay_enrollment_challenge(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    Json(input): Json<RelayEnrollmentChallengeRequest>,
+) -> Result<Json<RelayEnrollmentChallengeResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "relay_enrollment_challenge").await?;
+    let control_plane = require_public_control_plane(&state)?;
+    control_plane
+        .create_relay_enrollment_challenge(input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_complete_relay_enrollment(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    Json(input): Json<RelayEnrollmentCompleteRequest>,
+) -> Result<Json<RelayEnrollmentResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "relay_enrollment_complete").await?;
+    let control_plane = require_public_control_plane(&state)?;
+    control_plane
+        .complete_relay_enrollment(input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
 }
 
 async fn public_issue_relay_ws_token(
@@ -1017,13 +1055,17 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<ApiErrorB
 }
 
 fn device_session_cookie(headers: &HeaderMap) -> Option<&str> {
+    named_cookie(headers, DEVICE_SESSION_COOKIE_NAME)
+}
+
+fn named_cookie<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
         let trimmed = part.trim();
         let Some((name, value)) = trimmed.split_once('=') else {
             continue;
         };
-        if name.trim() == DEVICE_SESSION_COOKIE_NAME {
+        if name.trim() == cookie_name {
             let cookie = value.trim();
             if !cookie.is_empty() {
                 return Some(cookie);

@@ -3,12 +3,15 @@ mod crypto;
 mod remote_actions;
 mod session_claim;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use rand::RngCore;
 use relay_broker::auth::{BrokerAuthMode, BROKER_AUTH_MODE_ENV};
+use relay_broker::join_ticket::unix_now;
 use relay_broker::protocol::{ClientMessage, PeerRole, PresenceKind, ServerMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,8 +26,10 @@ use crate::{
 };
 
 use self::auth::{
-    BrokerAuthConfig, BrokerJoinCredential, DeviceBrokerCredential, RELAY_BROKER_CONTROL_URL_ENV,
-    RELAY_BROKER_RELAY_ID_ENV, RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV,
+    complete_public_relay_enrollment, request_public_relay_enrollment_challenge, BrokerAuthConfig,
+    BrokerJoinCredential, DeviceBrokerCredential, PublicRelayRegistration,
+    RELAY_BROKER_CONTROL_URL_ENV, RELAY_BROKER_REGISTRATION_PATH_ENV, RELAY_BROKER_RELAY_ID_ENV,
+    RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV,
 };
 use self::crypto::{decrypt_json, encrypt_json, EncryptedEnvelope};
 use self::remote_actions::{
@@ -34,6 +39,12 @@ use self::remote_actions::{
 use self::session_claim::{issue_session_claim, verify_session_claim};
 
 const RECONNECT_DELAY_SECS: u64 = 2;
+const PUBLIC_RELAY_AUTH_REQUEST_RETRY_SECS: u64 = 5;
+const PUBLIC_RELAY_REGISTRATION_SCHEMA_VERSION: u32 = 1;
+const PUBLIC_RELAY_IDENTITY_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_PUBLIC_RELAY_REGISTRATION_FILE: &str = ".agent-relay/public-broker-registration.json";
+const DEFAULT_PUBLIC_RELAY_IDENTITY_FILE: &str = ".agent-relay/public-broker-identity.json";
+pub(crate) const RELAY_BROKER_IDENTITY_PATH_ENV: &str = "RELAY_BROKER_IDENTITY_PATH";
 type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone, Debug)]
@@ -43,6 +54,40 @@ pub struct BrokerConfig {
     broker_room_id: String,
     relay_peer_id: String,
     auth: BrokerAuthConfig,
+}
+
+enum BrokerConfigResolution {
+    Disabled,
+    Ready(BrokerConfig),
+    PendingPublicEnrollment(PendingPublicEnrollment),
+}
+
+#[derive(Clone, Debug)]
+struct PendingPublicEnrollment {
+    control_url: Url,
+    registration_path: PathBuf,
+    identity_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPublicRelayRegistration {
+    schema_version: u32,
+    control_url: String,
+    relay_id: String,
+    broker_room_id: String,
+    relay_refresh_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPublicRelayIdentity {
+    schema_version: u32,
+    control_url: String,
+    relay_signing_seed: String,
+}
+
+#[derive(Debug, Clone)]
+struct PublicRelayIdentity {
+    signing_key: SigningKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,8 +172,19 @@ struct PairingResultPlaintext {
 }
 
 impl BrokerConfig {
-    pub fn from_env() -> Result<Option<Self>, String> {
-        Self::from_parts(
+    pub async fn from_env() -> Result<Option<Self>, String> {
+        match Self::from_env_resolution().await? {
+            BrokerConfigResolution::Disabled => Ok(None),
+            BrokerConfigResolution::Ready(config) => Ok(Some(config)),
+            BrokerConfigResolution::PendingPublicEnrollment(_) => Err(
+                "public broker relay is not enrolled yet; wait for automatic enrollment to finish or inspect the local relay logs"
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn from_env_resolution() -> Result<BrokerConfigResolution, String> {
+        Self::from_parts_resolution(
             std::env::var("RELAY_BROKER_URL").ok(),
             std::env::var("RELAY_BROKER_PUBLIC_URL").ok(),
             std::env::var(RELAY_BROKER_CONTROL_URL_ENV).ok(),
@@ -138,11 +194,14 @@ impl BrokerConfig {
             std::env::var(relay_broker::join_ticket::JOIN_TICKET_SECRET_ENV).ok(),
             std::env::var(RELAY_BROKER_RELAY_ID_ENV).ok(),
             std::env::var(RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV).ok(),
+            std::env::var(RELAY_BROKER_IDENTITY_PATH_ENV).ok(),
+            std::env::var(RELAY_BROKER_REGISTRATION_PATH_ENV).ok(),
             std::env::var(self::auth::RELAY_BROKER_DEVICE_JOIN_TTL_SECS_ENV).ok(),
         )
+        .await
     }
 
-    pub(crate) fn from_parts(
+    pub(crate) async fn from_parts(
         url: Option<String>,
         public_url: Option<String>,
         control_url: Option<String>,
@@ -152,47 +211,165 @@ impl BrokerConfig {
         join_ticket_secret: Option<String>,
         relay_id: Option<String>,
         relay_refresh_token: Option<String>,
+        relay_identity_path: Option<String>,
+        registration_path: Option<String>,
         device_join_ttl_secs: Option<String>,
     ) -> Result<Option<Self>, String> {
+        match Self::from_parts_resolution(
+            url,
+            public_url,
+            control_url,
+            broker_room_id,
+            relay_peer_id,
+            auth_mode,
+            join_ticket_secret,
+            relay_id,
+            relay_refresh_token,
+            relay_identity_path,
+            registration_path,
+            device_join_ttl_secs,
+        )
+        .await?
+        {
+            BrokerConfigResolution::Disabled => Ok(None),
+            BrokerConfigResolution::Ready(config) => Ok(Some(config)),
+            BrokerConfigResolution::PendingPublicEnrollment(_) => Err(
+                "public broker relay is not enrolled yet; wait for automatic enrollment to finish or inspect the local relay logs"
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn from_parts_resolution(
+        url: Option<String>,
+        public_url: Option<String>,
+        control_url: Option<String>,
+        broker_room_id: Option<String>,
+        relay_peer_id: Option<String>,
+        auth_mode: Option<String>,
+        join_ticket_secret: Option<String>,
+        relay_id: Option<String>,
+        relay_refresh_token: Option<String>,
+        relay_identity_path: Option<String>,
+        registration_path: Option<String>,
+        device_join_ttl_secs: Option<String>,
+    ) -> Result<BrokerConfigResolution, String> {
         let Some(url) = url.and_then(trimmed_string) else {
-            return Ok(None);
+            return Ok(BrokerConfigResolution::Disabled);
         };
-        let broker_room_id = trimmed(broker_room_id).ok_or_else(|| {
-            "RELAY_BROKER_CHANNEL_ID is required when RELAY_BROKER_URL is set".to_string()
-        })?;
         let relay_peer_id = trimmed(relay_peer_id).unwrap_or_else(|| "local-relay".to_string());
         let public_url = public_url
             .and_then(trimmed_string)
             .unwrap_or_else(|| url.clone());
-        let auth = BrokerAuthConfig::from_parts(
-            auth_mode,
-            join_ticket_secret,
-            control_url.or_else(|| Some(http_control_url(&url))),
-            relay_id,
-            relay_refresh_token,
-            device_join_ttl_secs,
-        )?;
+        let auth_mode = BrokerAuthMode::parse(auth_mode)?;
 
-        let mut url = Url::parse(&url)
+        let mut broker_url = Url::parse(&url)
             .map_err(|error| format!("invalid RELAY_BROKER_URL `{url}`: {error}"))?;
-        let scheme = url.scheme().to_ascii_lowercase();
+        let scheme = broker_url.scheme().to_ascii_lowercase();
         if scheme != "ws" && scheme != "wss" {
             return Err("RELAY_BROKER_URL must use ws:// or wss://".to_string());
         }
 
-        let mut public_url = Url::parse(&public_url)
+        let mut parsed_public_url = Url::parse(&public_url)
             .map_err(|error| format!("invalid RELAY_BROKER_PUBLIC_URL `{public_url}`: {error}"))?;
-        let public_scheme = public_url.scheme().to_ascii_lowercase();
+        let public_scheme = parsed_public_url.scheme().to_ascii_lowercase();
         if public_scheme != "ws" && public_scheme != "wss" {
             return Err("RELAY_BROKER_PUBLIC_URL must use ws:// or wss://".to_string());
         }
 
-        public_url.set_path("");
-        public_url.set_query(None);
-        let public_base_url = public_url.as_str().trim_end_matches('/').to_string();
+        parsed_public_url.set_path("");
+        parsed_public_url.set_query(None);
+        let public_base_url = parsed_public_url.as_str().trim_end_matches('/').to_string();
+
+        let control_url = control_url
+            .or_else(|| Some(http_control_url(&url)))
+            .and_then(trimmed_string);
+        let current_dir = std::env::current_dir()
+            .map_err(|error| format!("failed to resolve current directory: {error}"))?;
+        let registration_path =
+            resolve_public_relay_registration_path(&current_dir, registration_path);
+        let identity_path = resolve_public_relay_identity_path(&current_dir, relay_identity_path);
+
+        let (broker_room_id, relay_id, relay_refresh_token, pending_public_enrollment) =
+            match auth_mode {
+                BrokerAuthMode::SelfHostedSharedSecret => (
+                    trimmed(broker_room_id).ok_or_else(|| {
+                        "RELAY_BROKER_CHANNEL_ID is required when RELAY_BROKER_URL is set"
+                            .to_string()
+                    })?,
+                    trimmed(relay_id),
+                    trimmed(relay_refresh_token),
+                    None,
+                ),
+                BrokerAuthMode::PublicControlPlane => {
+                    let control_url_string = trimmed(control_url.clone()).ok_or_else(|| {
+                        format!(
+                            "{RELAY_BROKER_CONTROL_URL_ENV} is required in public broker auth mode"
+                        )
+                    })?;
+                    let control_url = Url::parse(&control_url_string).map_err(|error| {
+                        format!(
+                        "invalid {RELAY_BROKER_CONTROL_URL_ENV} `{control_url_string}`: {error}"
+                    )
+                    })?;
+                    let scheme = control_url.scheme().to_ascii_lowercase();
+                    if scheme != "http" && scheme != "https" {
+                        return Err(format!(
+                            "{RELAY_BROKER_CONTROL_URL_ENV} must use http:// or https://"
+                        ));
+                    }
+
+                    if let (Some(broker_room_id), Some(relay_id), Some(relay_refresh_token)) = (
+                        trimmed(broker_room_id.clone()),
+                        trimmed(relay_id.clone()),
+                        trimmed(relay_refresh_token.clone()),
+                    ) {
+                        (
+                            broker_room_id,
+                            Some(relay_id),
+                            Some(relay_refresh_token),
+                            None,
+                        )
+                    } else if let Some(cached) =
+                        load_public_relay_registration(&registration_path, control_url.as_str())
+                            .await?
+                    {
+                        (
+                            cached.broker_room_id,
+                            Some(cached.relay_id),
+                            Some(cached.relay_refresh_token),
+                            None,
+                        )
+                    } else {
+                        (
+                            String::new(),
+                            None,
+                            None,
+                            Some(PendingPublicEnrollment {
+                                control_url,
+                                registration_path: registration_path.clone(),
+                                identity_path: identity_path.clone(),
+                            }),
+                        )
+                    }
+                }
+            };
+
+        if let Some(pending) = pending_public_enrollment {
+            return Ok(BrokerConfigResolution::PendingPublicEnrollment(pending));
+        }
+
+        let auth = BrokerAuthConfig::from_parts(
+            Some(auth_mode.as_str().to_string()),
+            join_ticket_secret,
+            control_url.clone(),
+            relay_id.clone(),
+            relay_refresh_token.clone(),
+            device_join_ttl_secs,
+        )?;
 
         {
-            let mut segments = url.path_segments_mut().map_err(|_| {
+            let mut segments = broker_url.path_segments_mut().map_err(|_| {
                 "RELAY_BROKER_URL cannot be a base URL without path support".to_string()
             })?;
             segments.clear();
@@ -200,9 +377,9 @@ impl BrokerConfig {
             segments.push(&broker_room_id);
         }
 
-        Ok(Some(Self {
+        Ok(BrokerConfigResolution::Ready(Self {
             public_base_url,
-            url,
+            url: broker_url,
             broker_room_id,
             relay_peer_id,
             auth,
@@ -285,10 +462,28 @@ impl BrokerConfig {
     }
 }
 
-pub fn spawn_broker_task(state: AppState) -> Result<(), String> {
-    let Some(config) = BrokerConfig::from_env()? else {
-        return Ok(());
+pub async fn spawn_broker_task(state: AppState) -> Result<(), String> {
+    let resolution = BrokerConfig::from_env_resolution().await?;
+    let (config, pending_public_enrollment) = match resolution {
+        BrokerConfigResolution::Disabled => return Ok(()),
+        BrokerConfigResolution::Ready(config) => (Some(config), None),
+        BrokerConfigResolution::PendingPublicEnrollment(pending) => (None, Some(pending)),
     };
+
+    if let Some(pending) = pending_public_enrollment {
+        info!(
+            broker_auth_mode = BrokerAuthMode::PublicControlPlane.as_str(),
+            control_url = %pending.control_url,
+            "relay-server is waiting for public broker enrollment"
+        );
+        let broker_state = state.clone();
+        tokio::spawn(async move {
+            run_public_broker_enrollment_loop(broker_state, pending).await;
+        });
+        return Ok(());
+    }
+
+    let config = config.expect("ready broker config should be present");
 
     info!(
         broker_room_id = config.broker_room_id(),
@@ -368,6 +563,104 @@ async fn run_broker_loop(
         state.set_broker_connection(false).await;
         tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
     }
+}
+
+async fn run_public_broker_enrollment_loop(state: AppState, pending: PendingPublicEnrollment) {
+    let client = reqwest::Client::new();
+    loop {
+        match perform_public_relay_enrollment(&client, &pending).await {
+            Ok(registration) => match BrokerConfig::from_env().await {
+                Ok(Some(config)) => {
+                    let change_rx = state.subscribe();
+                    state
+                        .set_broker_channel(
+                            Some(config.broker_room_id().to_string()),
+                            Some(config.relay_peer_id().to_string()),
+                        )
+                        .await;
+                    state
+                        .push_runtime_log(
+                            "info",
+                            format!(
+                                "Public broker enrollment completed for room {}.",
+                                config.broker_room_id()
+                            ),
+                        )
+                        .await;
+                    run_broker_loop(state.clone(), change_rx, config).await;
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    state
+                            .push_runtime_log(
+                                "warn",
+                                format!(
+                                    "Public broker enrollment completed for relay {}, but broker config reload failed: {error}",
+                                    registration.relay_id
+                                ),
+                            )
+                            .await;
+                }
+            },
+            Err(error) => {
+                state
+                    .push_runtime_log(
+                        "warn",
+                        format!("Automatic public broker enrollment failed: {error}"),
+                    )
+                    .await;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(PUBLIC_RELAY_AUTH_REQUEST_RETRY_SECS)).await;
+    }
+}
+
+async fn perform_public_relay_enrollment(
+    client: &reqwest::Client,
+    pending: &PendingPublicEnrollment,
+) -> Result<PublicRelayRegistration, String> {
+    let identity =
+        load_or_create_public_relay_identity(&pending.identity_path, pending.control_url.as_str())
+            .await?;
+    let verify_key_b64 = STANDARD.encode(identity.signing_key.verifying_key().to_bytes());
+    let challenge = request_public_relay_enrollment_challenge(
+        client,
+        &pending.control_url,
+        verify_key_b64.clone(),
+        None,
+    )
+    .await?;
+    if challenge.expires_at <= unix_now() {
+        return Err(
+            "public relay enrollment challenge expired before it could be completed".to_string(),
+        );
+    }
+    let challenge_signature = STANDARD.encode(
+        identity
+            .signing_key
+            .sign(
+                relay_enrollment_challenge_message(&challenge.challenge_id, &challenge.challenge)
+                    .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let registration = complete_public_relay_enrollment(
+        client,
+        &pending.control_url,
+        verify_key_b64,
+        challenge.challenge_id,
+        challenge_signature,
+        None,
+    )
+    .await?;
+    save_public_relay_registration(
+        &pending.registration_path,
+        pending.control_url.as_str(),
+        &registration,
+    )
+    .await?;
+    Ok(registration)
 }
 
 async fn run_broker_session(
@@ -771,6 +1064,183 @@ async fn publish_payload(
         .await
 }
 
+fn resolve_public_relay_registration_path(cwd: &Path, configured: Option<String>) -> PathBuf {
+    configured
+        .and_then(trimmed_string)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.join(DEFAULT_PUBLIC_RELAY_REGISTRATION_FILE))
+}
+
+fn resolve_public_relay_identity_path(cwd: &Path, configured: Option<String>) -> PathBuf {
+    configured
+        .and_then(trimmed_string)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.join(DEFAULT_PUBLIC_RELAY_IDENTITY_FILE))
+}
+
+async fn load_public_relay_registration(
+    path: &Path,
+    expected_control_url: &str,
+) -> Result<Option<PublicRelayRegistration>, String> {
+    let contents = match tokio::fs::read(path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read broker registration cache {}: {error}",
+                path.display()
+            ))
+        }
+    };
+
+    let persisted: PersistedPublicRelayRegistration =
+        serde_json::from_slice(&contents).map_err(|error| {
+            format!(
+                "failed to decode broker registration cache {}: {error}",
+                path.display()
+            )
+        })?;
+    if persisted.schema_version != PUBLIC_RELAY_REGISTRATION_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported broker registration cache schema {} in {}",
+            persisted.schema_version,
+            path.display()
+        ));
+    }
+    if persisted.control_url != expected_control_url {
+        return Ok(None);
+    }
+
+    Ok(Some(PublicRelayRegistration {
+        relay_id: persisted.relay_id,
+        broker_room_id: persisted.broker_room_id,
+        relay_refresh_token: persisted.relay_refresh_token,
+    }))
+}
+
+async fn save_public_relay_registration(
+    path: &Path,
+    control_url: &str,
+    registration: &PublicRelayRegistration,
+) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("broker registration cache path must have a parent directory".to_string());
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let payload = serde_json::to_vec_pretty(&PersistedPublicRelayRegistration {
+        schema_version: PUBLIC_RELAY_REGISTRATION_SCHEMA_VERSION,
+        control_url: control_url.to_string(),
+        relay_id: registration.relay_id.clone(),
+        broker_room_id: registration.broker_room_id.clone(),
+        relay_refresh_token: registration.relay_refresh_token.clone(),
+    })
+    .map_err(|error| format!("failed to encode broker registration cache: {error}"))?;
+    let temporary_path = path.with_extension("tmp");
+    tokio::fs::write(&temporary_path, payload)
+        .await
+        .map_err(|error| format!("failed to write {}: {error}", temporary_path.display()))?;
+    tokio::fs::rename(&temporary_path, path)
+        .await
+        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
+async fn load_or_create_public_relay_identity(
+    path: &Path,
+    control_url: &str,
+) -> Result<PublicRelayIdentity, String> {
+    let contents = match tokio::fs::read(path).await {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "failed to read broker relay identity {}: {error}",
+                path.display()
+            ))
+        }
+    };
+
+    if let Some(contents) = contents {
+        let persisted: PersistedPublicRelayIdentity =
+            serde_json::from_slice(&contents).map_err(|error| {
+                format!(
+                    "failed to decode broker relay identity {}: {error}",
+                    path.display()
+                )
+            })?;
+        if persisted.schema_version != PUBLIC_RELAY_IDENTITY_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported broker relay identity schema {} in {}",
+                persisted.schema_version,
+                path.display()
+            ));
+        }
+        if persisted.control_url != control_url {
+            return Err(format!(
+                "broker relay identity {} was created for {}, expected {}",
+                path.display(),
+                persisted.control_url,
+                control_url
+            ));
+        }
+        let signing_seed: [u8; 32] = STANDARD
+            .decode(&persisted.relay_signing_seed)
+            .map_err(|_| {
+                format!(
+                    "broker relay identity {} contains an invalid signing seed",
+                    path.display()
+                )
+            })?
+            .try_into()
+            .map_err(|_| {
+                format!(
+                    "broker relay identity {} contains an invalid signing seed",
+                    path.display()
+                )
+            })?;
+        return Ok(PublicRelayIdentity {
+            signing_key: SigningKey::from_bytes(&signing_seed),
+        });
+    }
+
+    let mut signing_seed = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut signing_seed);
+    let identity = PublicRelayIdentity {
+        signing_key: SigningKey::from_bytes(&signing_seed),
+    };
+    save_public_relay_identity(path, control_url, &identity).await?;
+    Ok(identity)
+}
+
+async fn save_public_relay_identity(
+    path: &Path,
+    control_url: &str,
+    identity: &PublicRelayIdentity,
+) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("broker relay identity path must have a parent directory".to_string());
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let payload = serde_json::to_vec_pretty(&PersistedPublicRelayIdentity {
+        schema_version: PUBLIC_RELAY_IDENTITY_SCHEMA_VERSION,
+        control_url: control_url.to_string(),
+        relay_signing_seed: STANDARD.encode(identity.signing_key.to_bytes()),
+    })
+    .map_err(|error| format!("failed to encode broker relay identity: {error}"))?;
+    let temporary_path = path.with_extension("tmp");
+    tokio::fs::write(&temporary_path, payload)
+        .await
+        .map_err(|error| format!("failed to write {}: {error}", temporary_path.display()))?;
+    tokio::fs::rename(&temporary_path, path)
+        .await
+        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
 fn trimmed(value: Option<String>) -> Option<String> {
     value.and_then(|value| trimmed_string(value))
 }
@@ -869,6 +1339,10 @@ fn device_claim_proof_message(
     peer_id: &str,
 ) -> String {
     format!("agent-relay:claim-challenge:{challenge_id}:{challenge}:{device_id}:{peer_id}")
+}
+
+fn relay_enrollment_challenge_message(challenge_id: &str, challenge: &str) -> String {
+    format!("agent-relay:relay-enroll:{challenge_id}:{challenge}")
 }
 
 #[cfg(test)]

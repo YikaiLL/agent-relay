@@ -208,7 +208,6 @@ Notes:
   - broker env:
     - `RELAY_BROKER_AUTH_MODE=public`
     - `RELAY_BROKER_PUBLIC_ISSUER_SECRET`
-    - `RELAY_BROKER_PUBLIC_RELAYS_JSON`
     - `RELAY_BROKER_PUBLIC_STATE_PATH` in production or any non-loopback bind
     - optional `RELAY_BROKER_PUBLIC_STATE_PATH` for localhost-only development
     - optional `RELAY_BROKER_PUBLIC_RELAY_WS_TTL_SECS`
@@ -225,18 +224,13 @@ Notes:
       - `RELAY_BROKER_HSTS_VALUE` if you need a custom HSTS policy instead of `max-age=31536000; includeSubDomains`
   - relay-server env:
     - `RELAY_BROKER_AUTH_MODE=public`
-    - `RELAY_BROKER_RELAY_ID`
-    - `RELAY_BROKER_RELAY_REFRESH_TOKEN`
     - optional `RELAY_BROKER_CONTROL_URL`
-  - the broker still uses `RELAY_BROKER_CHANNEL_ID` on the relay side as the
-    room id, but the hosted control-plane validates that it matches the relay's
-    registered room
-- `RELAY_BROKER_PUBLIC_RELAYS_JSON` is a minimal bootstrap registry, not a full
-  hosted account system yet. A single entry looks like:
-
-```json
-[{"relay_id":"relay-1","broker_room_id":"demo-room","refresh_token":"change-me"}]
-```
+    - optional `RELAY_BROKER_REGISTRATION_PATH`
+    - optional `RELAY_BROKER_IDENTITY_PATH`
+- a relay without a cached registration now generates a local Ed25519
+  identity, requests a short-lived enrollment challenge from the broker, signs
+  it locally, and caches the resulting `relay_id`, `broker_room_id`, and
+  `relay_refresh_token` in `RELAY_BROKER_REGISTRATION_PATH` automatically
 
 - in `public` mode, approved devices now receive:
   - a short-lived broker websocket token
@@ -265,20 +259,25 @@ Public mode example:
 ```bash
 RELAY_BROKER_AUTH_MODE=public \
 RELAY_BROKER_PUBLIC_ISSUER_SECRET=change-me \
-RELAY_BROKER_PUBLIC_RELAYS_JSON='[{"relay_id":"relay-1","broker_room_id":"demo-room","refresh_token":"relay-refresh-1"}]' \
+RELAY_BROKER_PUBLIC_STATE_PATH=/var/lib/agent-relay/public-control.json \
 docker compose up --build relay-broker
 ```
 
 ```bash
 RELAY_BROKER_URL=wss://broker.example.com \
 RELAY_BROKER_PUBLIC_URL=wss://broker.example.com \
+RELAY_BROKER_CONTROL_URL=https://broker.example.com \
 RELAY_BROKER_AUTH_MODE=public \
-RELAY_BROKER_CHANNEL_ID=demo-room \
 RELAY_BROKER_PEER_ID=local-relay \
-RELAY_BROKER_RELAY_ID=relay-1 \
-RELAY_BROKER_RELAY_REFRESH_TOKEN=relay-refresh-1 \
+RELAY_BROKER_REGISTRATION_PATH=.agent-relay/public-broker-registration.json \
+RELAY_BROKER_IDENTITY_PATH=.agent-relay/public-broker-identity.json \
 cargo run -p relay-server
 ```
+
+On first startup without a cached registration, the relay now creates a local
+broker identity, requests an enrollment challenge from the broker, signs it,
+and caches the returned registration automatically. No shared broker admin token
+is required for the default public-mode bootstrap path.
 
 ## Current API surface
 
@@ -313,6 +312,7 @@ Useful browser E2E commands:
 - `npm run test:browser:local-auth`
 - `npm run test:browser:local-session`
 - `npm run test:browser:public`
+- `npm run test:browser:public-enrollment`
 - `npm run test:browser:public-refresh`
 - `npm run test:browser:public-persistence`
 - `npm run test:browser:public-revoke`

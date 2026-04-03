@@ -82,7 +82,7 @@ impl AppState {
             change_tx,
         };
 
-        crate::broker::spawn_broker_task(state.clone())?;
+        crate::broker::spawn_broker_task(state.clone()).await?;
 
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
@@ -401,7 +401,7 @@ impl AppState {
         &self,
         input: PairingStartInput,
     ) -> Result<PairingTicketView, String> {
-        let broker = BrokerConfig::from_env()?.ok_or_else(|| {
+        let broker = BrokerConfig::from_env().await?.ok_or_else(|| {
             "broker pairing is unavailable because RELAY_BROKER_URL is not configured".to_string()
         })?;
         let prepared = {
@@ -439,7 +439,7 @@ impl AppState {
     }
 
     pub async fn revoke_device(&self, device_id: &str) -> Result<RevokeDeviceReceipt, String> {
-        let broker = BrokerConfig::from_env()?;
+        let broker = BrokerConfig::from_env().await?;
         let mut relay = self.relay.write().await;
         let revoked = relay.revoke_paired_device(device_id, unix_now());
         if revoked {
@@ -470,7 +470,7 @@ impl AppState {
         &self,
         keep_device_id: &str,
     ) -> Result<BulkRevokeDevicesReceipt, String> {
-        let broker = BrokerConfig::from_env()?;
+        let broker = BrokerConfig::from_env().await?;
         let mut relay = self.relay.write().await;
         let revoked_device_ids =
             relay.revoke_all_other_paired_devices(keep_device_id, unix_now())?;
@@ -511,7 +511,7 @@ impl AppState {
         pairing_id: &str,
         input: PairingDecisionInput,
     ) -> Result<PairingDecisionReceipt, String> {
-        let broker = BrokerConfig::from_env()?.ok_or_else(|| {
+        let broker = BrokerConfig::from_env().await?.ok_or_else(|| {
             "broker pairing is unavailable because RELAY_BROKER_URL is not configured".to_string()
         })?;
         let now = unix_now();

@@ -1,17 +1,73 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::*;
 use crate::protocol::SendMessageInput;
 use axum::{extract::Path, routing::post, Json, Router};
-use ed25519_dalek::{Signer, SigningKey};
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::{Signer, SigningKey, Verifier};
 use relay_broker::public_control::{
     DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
     DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    PairingWsTokenRequest, PairingWsTokenResponse, RelayWsTokenRequest, RelayWsTokenResponse,
+    PairingWsTokenRequest, PairingWsTokenResponse, RelayEnrollmentChallengeRequest,
+    RelayEnrollmentChallengeResponse, RelayEnrollmentCompleteRequest, RelayEnrollmentResponse,
+    RelayWsTokenRequest, RelayWsTokenResponse,
 };
 use tokio::net::TcpListener;
 
 use super::session_claim::{decode_and_verify_session_claim, unix_now};
 
+fn temp_registration_path(prefix: &str) -> String {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic enough for tests")
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("{prefix}-{unique}.json"))
+        .display()
+        .to_string()
+}
+
 async fn spawn_public_control_mock() -> String {
+    async fn relay_enrollment_challenge(
+        Json(request): Json<RelayEnrollmentChallengeRequest>,
+    ) -> Json<RelayEnrollmentChallengeResponse> {
+        Json(RelayEnrollmentChallengeResponse {
+            relay_verify_key: request.relay_verify_key,
+            challenge_id: "rch-1".to_string(),
+            challenge: "rc-1".to_string(),
+            expires_at: unix_now() + 300,
+        })
+    }
+
+    async fn relay_enrollment_complete(
+        Json(request): Json<RelayEnrollmentCompleteRequest>,
+    ) -> Json<RelayEnrollmentResponse> {
+        assert_eq!(request.challenge_id, "rch-1");
+        let verify_key_bytes: [u8; 32] = STANDARD
+            .decode(&request.relay_verify_key)
+            .expect("verify key should decode")
+            .try_into()
+            .expect("verify key length should match");
+        let verify_key =
+            ed25519_dalek::VerifyingKey::from_bytes(&verify_key_bytes).expect("verify key valid");
+        let signature_bytes: [u8; 64] = STANDARD
+            .decode(&request.challenge_signature)
+            .expect("signature should decode")
+            .try_into()
+            .expect("signature length should match");
+        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+        verify_key
+            .verify("agent-relay:relay-enroll:rch-1:rc-1".as_bytes(), &signature)
+            .expect("signature should verify");
+        Json(RelayEnrollmentResponse {
+            relay_id: "relay-enrolled".to_string(),
+            broker_room_id: "room-enrolled".to_string(),
+            relay_refresh_token: "relay-refresh-enrolled".to_string(),
+            created_at: unix_now(),
+            relay_label: request.relay_label,
+        })
+    }
+
     async fn relay_ws_token(
         Json(request): Json<RelayWsTokenRequest>,
     ) -> Json<RelayWsTokenResponse> {
@@ -71,6 +127,14 @@ async fn spawn_public_control_mock() -> String {
     }
 
     let app = Router::new()
+        .route(
+            "/api/public/relay-enrollment/challenge",
+            post(relay_enrollment_challenge),
+        )
+        .route(
+            "/api/public/relay-enrollment/complete",
+            post(relay_enrollment_complete),
+        )
         .route("/api/public/relay/ws-token", post(relay_ws_token))
         .route("/api/public/pairing/ws-token", post(pairing_ws_token))
         .route("/api/public/devices", post(device_grant))
@@ -101,7 +165,10 @@ async fn broker_config_builds_websocket_url() {
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect("config should parse")
     .expect("config should be enabled");
 
@@ -120,8 +187,8 @@ async fn broker_config_builds_websocket_url() {
     assert_eq!(config.auth_mode(), BrokerAuthMode::SelfHostedSharedSecret);
 }
 
-#[test]
-fn broker_config_supports_distinct_public_url_for_pairing() {
+#[tokio::test]
+async fn broker_config_supports_distinct_public_url_for_pairing() {
     let config = BrokerConfig::from_parts(
         Some("ws://127.0.0.1:8788".to_string()),
         Some("ws://192.168.1.105:8788".to_string()),
@@ -133,15 +200,18 @@ fn broker_config_supports_distinct_public_url_for_pairing() {
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect("config should parse")
     .expect("config should be enabled");
 
     assert_eq!(config.public_base_url(), "ws://192.168.1.105:8788");
 }
 
-#[test]
-fn broker_config_requires_channel() {
+#[tokio::test]
+async fn broker_config_requires_channel() {
     let error = BrokerConfig::from_parts(
         Some("ws://127.0.0.1:8788".to_string()),
         None,
@@ -153,13 +223,16 @@ fn broker_config_requires_channel() {
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect_err("missing channel should fail");
     assert!(error.contains("RELAY_BROKER_CHANNEL_ID"));
 }
 
-#[test]
-fn broker_config_disables_when_url_is_missing() {
+#[tokio::test]
+async fn broker_config_disables_when_url_is_missing() {
     let config = BrokerConfig::from_parts(
         None,
         None,
@@ -171,13 +244,16 @@ fn broker_config_disables_when_url_is_missing() {
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect("missing url should be accepted");
     assert!(config.is_none());
 }
 
-#[test]
-fn broker_config_rejects_invalid_public_url_scheme() {
+#[tokio::test]
+async fn broker_config_rejects_invalid_public_url_scheme() {
     let error = BrokerConfig::from_parts(
         Some("ws://127.0.0.1:8788".to_string()),
         Some("http://192.168.1.105:8788".to_string()),
@@ -189,13 +265,16 @@ fn broker_config_rejects_invalid_public_url_scheme() {
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect_err("invalid public url scheme should fail");
     assert!(error.contains("RELAY_BROKER_PUBLIC_URL"));
 }
 
-#[test]
-fn broker_config_requires_join_ticket_secret_in_self_hosted_mode() {
+#[tokio::test]
+async fn broker_config_requires_join_ticket_secret_in_self_hosted_mode() {
     let error = BrokerConfig::from_parts(
         Some("ws://127.0.0.1:8788".to_string()),
         None,
@@ -207,7 +286,10 @@ fn broker_config_requires_join_ticket_secret_in_self_hosted_mode() {
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect_err("missing ticket secret should fail");
     assert!(error.contains(relay_broker::join_ticket::JOIN_TICKET_SECRET_ENV));
 }
@@ -226,7 +308,10 @@ async fn broker_config_public_mode_uses_control_plane_tokens() {
         Some("relay-owner-1".to_string()),
         Some("relay-refresh-1".to_string()),
         None,
+        None,
+        None,
     )
+    .await
     .expect("config should parse")
     .expect("config should be enabled");
 
@@ -249,8 +334,117 @@ async fn broker_config_public_mode_uses_control_plane_tokens() {
     assert_eq!(device.refresh_token.as_deref(), Some("refresh-device-1"));
 }
 
-#[test]
-fn broker_config_public_mode_requires_relay_refresh_token() {
+#[tokio::test]
+async fn broker_config_public_mode_returns_pending_enrollment_until_cached_registration_exists() {
+    let control_url = spawn_public_control_mock().await;
+    let registration_path = temp_registration_path("agent-relay-public-registration");
+    let identity_path = temp_registration_path("agent-relay-public-identity");
+
+    let pending = BrokerConfig::from_parts_resolution(
+        Some("wss://broker.example.com".to_string()),
+        Some("wss://public-broker.example.com".to_string()),
+        Some(control_url.clone()),
+        None,
+        Some("relay-auto".to_string()),
+        Some("public".to_string()),
+        None,
+        None,
+        None,
+        Some(identity_path.clone()),
+        Some(registration_path.clone()),
+        None,
+    )
+    .await
+    .expect("config resolution should parse");
+    assert!(matches!(
+        pending,
+        BrokerConfigResolution::PendingPublicEnrollment(_)
+    ));
+
+    let BrokerConfigResolution::PendingPublicEnrollment(pending) = pending else {
+        panic!("expected pending public enrollment");
+    };
+    let client = reqwest::Client::new();
+    let registration = perform_public_relay_enrollment(&client, &pending)
+        .await
+        .expect("challenge enrollment should succeed");
+    assert_eq!(registration.relay_id, "relay-enrolled");
+    assert_eq!(registration.broker_room_id, "room-enrolled");
+
+    let cached = BrokerConfig::from_parts(
+        Some("wss://broker.example.com".to_string()),
+        Some("wss://public-broker.example.com".to_string()),
+        Some(control_url),
+        None,
+        Some("relay-auto".to_string()),
+        Some("public".to_string()),
+        None,
+        None,
+        None,
+        Some(identity_path),
+        Some(registration_path),
+        None,
+    )
+    .await
+    .expect("cached config should parse")
+    .expect("cached config should be enabled");
+
+    assert_eq!(cached.broker_room_id(), "room-enrolled");
+    let cached_pairing = cached
+        .pairing_join_credential("pair-cached", 123)
+        .await
+        .expect("cached relay should reuse the saved registration");
+    assert_eq!(cached_pairing.token, "pairing-token-pair-cached");
+}
+
+#[tokio::test]
+async fn perform_public_relay_enrollment_uses_relay_keypair_challenge_flow() {
+    let control_url = spawn_public_control_mock().await;
+    let registration_path = temp_registration_path("agent-relay-public-registration");
+    let identity_path = temp_registration_path("agent-relay-public-identity");
+    let pending = PendingPublicEnrollment {
+        control_url: Url::parse(&control_url).expect("control url should parse"),
+        registration_path: std::path::PathBuf::from(&registration_path),
+        identity_path: std::path::PathBuf::from(&identity_path),
+    };
+
+    let registration = perform_public_relay_enrollment(&reqwest::Client::new(), &pending)
+        .await
+        .expect("automatic relay enrollment should succeed");
+
+    assert_eq!(registration.relay_id, "relay-enrolled");
+    assert_eq!(registration.broker_room_id, "room-enrolled");
+    assert_eq!(registration.relay_refresh_token, "relay-refresh-enrolled");
+
+    let cached = load_public_relay_registration(
+        std::path::Path::new(&registration_path),
+        pending.control_url.as_str(),
+    )
+    .await
+    .expect("cached registration should load")
+    .expect("cached registration should exist");
+    assert_eq!(cached, registration);
+
+    let identity = load_or_create_public_relay_identity(
+        std::path::Path::new(&identity_path),
+        pending.control_url.as_str(),
+    )
+    .await
+    .expect("relay identity should persist");
+    let reloaded_identity = load_or_create_public_relay_identity(
+        std::path::Path::new(&identity_path),
+        pending.control_url.as_str(),
+    )
+    .await
+    .expect("relay identity should reload");
+    assert_eq!(
+        STANDARD.encode(identity.signing_key.verifying_key().to_bytes()),
+        STANDARD.encode(reloaded_identity.signing_key.verifying_key().to_bytes())
+    );
+}
+
+#[tokio::test]
+async fn broker_config_public_mode_requires_relay_refresh_token() {
     let error = BrokerConfig::from_parts(
         Some("wss://broker.example.com".to_string()),
         None,
@@ -262,11 +456,15 @@ fn broker_config_public_mode_requires_relay_refresh_token() {
         None,
         None,
         None,
+        None,
+        None,
     )
+    .await
     .expect_err("public mode should require a relay refresh token");
     assert!(
         error.contains(RELAY_BROKER_RELAY_ID_ENV)
             || error.contains(RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV)
+            || error.contains("not enrolled yet")
     );
 }
 
@@ -282,8 +480,11 @@ async fn broker_config_self_hosted_can_issue_expiring_device_join_credentials() 
         Some("test-broker-ticket-secret".to_string()),
         None,
         None,
+        None,
+        None,
         Some("3600".to_string()),
     )
+    .await
     .expect("config should parse")
     .expect("config should be enabled");
 

@@ -4,7 +4,9 @@ use relay_broker::{
     public_control::{
         DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
         DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-        PairingWsTokenRequest, PairingWsTokenResponse, RelayWsTokenRequest, RelayWsTokenResponse,
+        PairingWsTokenRequest, PairingWsTokenResponse, RelayEnrollmentChallengeRequest,
+        RelayEnrollmentChallengeResponse, RelayEnrollmentCompleteRequest, RelayEnrollmentResponse,
+        RelayWsTokenRequest, RelayWsTokenResponse,
     },
 };
 use reqwest::Client;
@@ -14,7 +16,15 @@ use url::Url;
 pub(crate) const RELAY_BROKER_CONTROL_URL_ENV: &str = "RELAY_BROKER_CONTROL_URL";
 pub(crate) const RELAY_BROKER_RELAY_ID_ENV: &str = "RELAY_BROKER_RELAY_ID";
 pub(crate) const RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV: &str = "RELAY_BROKER_RELAY_REFRESH_TOKEN";
+pub(crate) const RELAY_BROKER_REGISTRATION_PATH_ENV: &str = "RELAY_BROKER_REGISTRATION_PATH";
 pub(crate) const RELAY_BROKER_DEVICE_JOIN_TTL_SECS_ENV: &str = "RELAY_BROKER_DEVICE_JOIN_TTL_SECS";
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct PublicRelayRegistration {
+    pub(crate) relay_id: String,
+    pub(crate) broker_room_id: String,
+    pub(crate) relay_refresh_token: String,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct BrokerJoinCredential {
@@ -337,10 +347,67 @@ impl BrokerAuthConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PublicRelayEnrollmentChallenge {
+    pub(crate) challenge_id: String,
+    pub(crate) challenge: String,
+    pub(crate) expires_at: u64,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ControlPlaneErrorResponse {
     message: Option<String>,
     error: Option<String>,
+}
+
+pub(crate) async fn request_public_relay_enrollment_challenge(
+    client: &Client,
+    control_url: &Url,
+    relay_verify_key: String,
+    relay_label: Option<String>,
+) -> Result<PublicRelayEnrollmentChallenge, String> {
+    let response: RelayEnrollmentChallengeResponse = post_control_plane_without_auth(
+        client,
+        control_url,
+        "/api/public/relay-enrollment/challenge",
+        &RelayEnrollmentChallengeRequest {
+            relay_verify_key,
+            relay_label,
+        },
+    )
+    .await?;
+    Ok(PublicRelayEnrollmentChallenge {
+        challenge_id: response.challenge_id,
+        challenge: response.challenge,
+        expires_at: response.expires_at,
+    })
+}
+
+pub(crate) async fn complete_public_relay_enrollment(
+    client: &Client,
+    control_url: &Url,
+    relay_verify_key: String,
+    challenge_id: String,
+    challenge_signature: String,
+    relay_label: Option<String>,
+) -> Result<PublicRelayRegistration, String> {
+    let response: RelayEnrollmentResponse = post_control_plane_without_auth(
+        client,
+        control_url,
+        "/api/public/relay-enrollment/complete",
+        &RelayEnrollmentCompleteRequest {
+            relay_verify_key,
+            challenge_id,
+            challenge_signature,
+            relay_label,
+        },
+    )
+    .await?;
+    Ok(PublicRelayRegistration {
+        relay_id: response.relay_id,
+        broker_room_id: response.broker_room_id,
+        relay_refresh_token: response.relay_refresh_token,
+    })
 }
 
 async fn post_control_plane<TReq, TResp>(
@@ -365,7 +432,40 @@ where
         .send()
         .await
         .map_err(|error| format!("failed to reach broker control-plane {url}: {error}"))?;
+    decode_control_plane_response(url, response).await
+}
 
+async fn post_control_plane_without_auth<TReq, TResp>(
+    client: &Client,
+    base_url: &Url,
+    path: &str,
+    request: &TReq,
+) -> Result<TResp, String>
+where
+    TReq: serde::Serialize + ?Sized,
+    TResp: DeserializeOwned,
+{
+    let mut url = base_url.clone();
+    url.set_path(path);
+    url.set_query(None);
+
+    let response = client
+        .post(url.clone())
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| format!("failed to reach broker control-plane {url}: {error}"))?;
+
+    decode_control_plane_response(url, response).await
+}
+
+async fn decode_control_plane_response<TResp>(
+    url: Url,
+    response: reqwest::Response,
+) -> Result<TResp, String>
+where
+    TResp: DeserializeOwned,
+{
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();

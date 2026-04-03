@@ -5,6 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,7 +20,9 @@ use crate::public_control::{
     DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
     DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
     DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
-    PublicControlPlane, RelayWsTokenRequest, RelayWsTokenResponse,
+    PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+    RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
+    RelayWsTokenResponse,
 };
 
 async fn spawn_app() -> SocketAddr {
@@ -733,6 +737,100 @@ fn invalid_security_header_overrides_are_rejected() {
         SecurityHeadersConfig::from_parts(true, None, Some("max-age=86400\r\nx".to_string()))
             .expect_err("invalid broker HSTS override should fail");
     assert!(hsts_error.contains(HSTS_VALUE_ENV));
+}
+
+#[tokio::test]
+async fn public_relay_challenge_enrollment_can_issue_registration_and_relay_tokens() {
+    let control_plane = PublicControlPlane::from_parts(
+        Some("public-broker-issuer-secret".to_string()),
+        None,
+        None,
+        Some("300".to_string()),
+        Some("300".to_string()),
+    )
+    .await
+    .expect("public control plane should allow challenge bootstrap");
+    let address = spawn_public_mode_app_with(
+        control_plane,
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    let relay_verify_key = STANDARD.encode(signing_key.verifying_key().to_bytes());
+    let challenge: RelayEnrollmentChallengeResponse = reqwest::Client::new()
+        .post(format!(
+            "http://{address}/api/public/relay-enrollment/challenge"
+        ))
+        .json(&RelayEnrollmentChallengeRequest {
+            relay_verify_key: relay_verify_key.clone(),
+            relay_label: Some("Laptop".to_string()),
+        })
+        .send()
+        .await
+        .expect("challenge request should complete")
+        .error_for_status()
+        .expect("challenge request should succeed")
+        .json()
+        .await
+        .expect("challenge response should decode");
+
+    let challenge_signature = STANDARD.encode(
+        signing_key
+            .sign(
+                format!(
+                    "agent-relay:relay-enroll:{}:{}",
+                    challenge.challenge_id, challenge.challenge
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+
+    let enrollment: RelayEnrollmentResponse = reqwest::Client::new()
+        .post(format!(
+            "http://{address}/api/public/relay-enrollment/complete"
+        ))
+        .json(&RelayEnrollmentCompleteRequest {
+            relay_verify_key,
+            challenge_id: challenge.challenge_id,
+            challenge_signature,
+            relay_label: Some("Laptop".to_string()),
+        })
+        .send()
+        .await
+        .expect("complete request should complete")
+        .error_for_status()
+        .expect("complete should succeed")
+        .json()
+        .await
+        .expect("complete response should decode");
+
+    let relay_token: RelayWsTokenResponse = public_post(
+        address,
+        "/api/public/relay/ws-token",
+        &enrollment.relay_refresh_token,
+        &RelayWsTokenRequest {
+            relay_id: enrollment.relay_id.clone(),
+            broker_room_id: enrollment.broker_room_id.clone(),
+            relay_peer_id: "relay-challenge".to_string(),
+        },
+    )
+    .await;
+
+    let url = format!(
+        "ws://{address}/ws/{}?role=relay&peer_id=relay-challenge&join_ticket={}",
+        relay_token.broker_room_id, relay_token.relay_ws_token
+    );
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("challenge-enrolled relay should connect");
+    let welcome = next_server_message(&mut socket).await;
+    match welcome {
+        ServerMessage::Welcome { peer_id, .. } => assert_eq!(peer_id, "relay-challenge"),
+        other => panic!("unexpected response: {other:?}"),
+    }
 }
 
 #[tokio::test]
