@@ -13,7 +13,7 @@ import {
   renderLogs,
   renderTranscriptPanel,
 } from "./render-transcript.js";
-import { state } from "./state.js";
+import { hasUsableSessionClaim, state } from "./state.js";
 import { escapeHtml, formatTimestamp, shortId } from "./utils.js";
 
 let onResumeThread = () => {};
@@ -26,7 +26,12 @@ export function renderSession(session) {
   state.session = session;
   const approval = session.pending_approvals?.[0] || null;
   const hasActiveSession = Boolean(session.active_thread_id);
-  const canWrite = canCurrentDeviceWrite(session);
+  const hasControllerLease = canCurrentDeviceWrite(session);
+  const needsClaimRecovery =
+    hasActiveSession &&
+    isRemoteController(session) &&
+    !hasUsableSessionClaim();
+  const canWrite = hasControllerLease && !needsClaimRecovery;
   state.currentApprovalId = approval?.request_id || null;
 
   if (session.current_cwd && !dom.remoteThreadsCwdInput.value.trim()) {
@@ -42,6 +47,8 @@ export function renderSession(session) {
   dom.remoteMessageInput.disabled = !hasActiveSession || !canWrite;
   dom.remoteMessageInput.placeholder = !hasActiveSession
     ? "Start a remote session first."
+    : needsClaimRecovery
+      ? "Reclaiming remote control..."
     : canWrite
       ? "Message Codex remotely..."
       : "Another device has control. Take over to reply.";

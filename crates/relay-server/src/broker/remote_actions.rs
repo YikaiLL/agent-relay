@@ -347,7 +347,12 @@ pub(super) async fn handle_encrypted_remote_action(
     envelope: EncryptedEnvelope,
 ) -> Result<(), String> {
     let hinted_device_id = device_id.clone();
-    let (device_id, action_kind) = match resolve_encrypted_action_context(
+    let ResolvedEncryptedAction {
+        device_id,
+        action_kind,
+        request,
+        response_secret,
+    } = match resolve_encrypted_action_context(
         state,
         &from_peer_id,
         session_claim.as_deref(),
@@ -472,49 +477,6 @@ pub(super) async fn handle_encrypted_remote_action(
         }
     }
 
-    let response_secret = state.paired_device_secret(&device_id).await?;
-    let request = match decrypt_remote_action_with_secret(&response_secret, &envelope) {
-        Ok(request) => request,
-        Err(error) => {
-            let snapshot = state.snapshot().await;
-            let cached = cached_remote_action_result(
-                action_kind,
-                snapshot,
-                RemoteActionOutcome::default(),
-                Some(error),
-                false,
-                Some(response_secret),
-            );
-            state
-                .store_remote_action_result(&device_id, &action_id, cached.clone())
-                .await;
-            return match replay_encrypted_remote_action_result(
-                state,
-                sender,
-                from_peer_id,
-                device_id,
-                action_id,
-                action_kind,
-                cached,
-            )
-            .await
-            {
-                Ok(()) => Ok(()),
-                Err(publish_error) if publish_error.contains("device is not paired") => {
-                    state
-                        .push_runtime_log(
-                            "warn",
-                            "Skipped encrypted broker action result because the device is no longer paired."
-                                .to_string(),
-                        )
-                        .await;
-                    Ok(())
-                }
-                Err(publish_error) => Err(publish_error),
-            };
-        }
-    };
-
     let result = match request {
         RemoteActionRequest::ClaimChallenge => {
             issue_claim_challenge_outcome(state, &device_id, &from_peer_id).await
@@ -554,7 +516,7 @@ pub(super) async fn handle_encrypted_remote_action(
         outcome,
         error,
         ok,
-        Some(response_secret),
+        Some(response_secret.clone()),
     );
     state
         .store_remote_action_result(&device_id, &action_id, cached.clone())
@@ -584,6 +546,13 @@ pub(super) async fn handle_encrypted_remote_action(
         }
         Err(publish_error) => Err(publish_error),
     }
+}
+
+struct ResolvedEncryptedAction {
+    device_id: String,
+    action_kind: RemoteActionKind,
+    request: RemoteActionRequest,
+    response_secret: String,
 }
 
 async fn execute_remote_action(
@@ -652,8 +621,16 @@ async fn decrypt_remote_action(
     device_id: &str,
     envelope: &EncryptedEnvelope,
 ) -> Result<RemoteActionRequest, String> {
-    let secret = state.paired_device_secret(device_id).await?;
-    decrypt_remote_action_with_secret(&secret, envelope)
+    let secrets = state.paired_device_candidate_secrets(device_id).await?;
+    let mut last_error = None;
+    for secret in secrets {
+        match decrypt_remote_action_with_secret(&secret, envelope) {
+            Ok(request) => return Ok(request),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "device is not paired".to_string()))
 }
 
 fn decrypt_remote_action_with_secret(
@@ -698,24 +675,55 @@ async fn resolve_encrypted_action_context(
     session_claim: Option<&str>,
     device_id: Option<&str>,
     envelope: &EncryptedEnvelope,
-) -> Result<(String, RemoteActionKind), String> {
+) -> Result<ResolvedEncryptedAction, String> {
     if let Some(claim) = session_claim {
         let device_id = verify_session_claim(state, claim, from_peer_id).await?;
-        let action_kind = decrypt_remote_action_kind(state, &device_id, envelope).await?;
-        return Ok((device_id, action_kind));
+        let candidate_secrets = state.paired_device_candidate_secrets(&device_id).await?;
+        let mut last_error = None;
+        for response_secret in candidate_secrets {
+            match decrypt_remote_action_with_secret(&response_secret, envelope) {
+                Ok(request) => {
+                    let action_kind = request.kind();
+                    return Ok(ResolvedEncryptedAction {
+                        device_id,
+                        action_kind,
+                        request,
+                        response_secret,
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        return Err(last_error.unwrap_or_else(|| "device is not paired".to_string()));
     }
 
     let device_id = device_id
         .map(str::to_string)
         .ok_or_else(|| "encrypted remote action is missing device_id".to_string())?;
-    let action_kind = decrypt_remote_action_kind(state, &device_id, envelope).await?;
-    if !matches!(
-        action_kind,
-        RemoteActionKind::ClaimChallenge | RemoteActionKind::ClaimDevice
-    ) {
-        return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
+    let candidate_secrets = state.paired_device_candidate_secrets(&device_id).await?;
+    let mut last_error = None;
+    for response_secret in candidate_secrets {
+        match decrypt_remote_action_with_secret(&response_secret, envelope) {
+            Ok(request) => {
+                let action_kind = request.kind();
+                if !matches!(
+                    action_kind,
+                    RemoteActionKind::ClaimChallenge | RemoteActionKind::ClaimDevice
+                ) {
+                    return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
+                }
+                return Ok(ResolvedEncryptedAction {
+                    device_id,
+                    action_kind,
+                    request,
+                    response_secret,
+                });
+            }
+            Err(error) => last_error = Some(error),
+        }
     }
-    Ok((device_id, action_kind))
+
+    Err(last_error.unwrap_or_else(|| "device is not paired".to_string()))
 }
 
 async fn verify_remote_device_claim(

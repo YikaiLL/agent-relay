@@ -178,3 +178,55 @@ test("ensureRemoteClaim performs challenge-response and persists a rotated devic
   assert.equal(storedAuth.deviceRefreshToken, undefined);
   assert.equal(storedAuth.deviceJoinTicket, undefined);
 });
+
+test("encrypted remote action results can decrypt with the previous device token during rotation", async () => {
+  const browser = installBrowserStubs();
+
+  const { encryptJson } = await import("./crypto.js");
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  state.remoteAuth = {
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    deviceToken: "current-device-token",
+    previousDeviceToken: "previous-device-token",
+    previousDeviceTokenExpiresAt: Math.floor(Date.now() / 1000) + 30,
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  };
+  saveRemoteAuth(state.remoteAuth);
+  state.socketPeerId = "surface-peer-1";
+
+  const envelope = await encryptJson("previous-device-token", {
+    action: "claim_device",
+    ok: true,
+    snapshot: {},
+    session_claim: "session-claim-3",
+    session_claim_expires_at: Math.floor(Date.now() / 1000) + 300,
+    device_token: "newest-device-token",
+  });
+
+  await handleRemoteBrokerPayload({
+    kind: "encrypted_remote_action_result",
+    action_id: "action-1",
+    target_peer_id: "surface-peer-1",
+    device_id: "device-1",
+    envelope,
+  });
+
+  assert.equal(state.remoteAuth.deviceToken, "newest-device-token");
+  assert.equal(state.remoteAuth.previousDeviceToken, "current-device-token");
+  assert.equal(state.remoteAuth.sessionClaim, "session-claim-3");
+
+  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
+  assert.equal(storedAuth.deviceToken, "newest-device-token");
+});

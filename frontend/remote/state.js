@@ -8,6 +8,7 @@ export const CONTROL_HEARTBEAT_MS = 5000;
 export const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
 export const CLAIM_REFRESH_SKEW_MS = 60_000;
 export const CLAIM_REFRESH_FLOOR_MS = 5000;
+export const PREVIOUS_DEVICE_TOKEN_GRACE_MS = 30_000;
 
 export const state = {
   claimPromise: null,
@@ -22,6 +23,8 @@ export const state = {
   pairingPhase: null,
   pairingTicket: null,
   pendingActions: new Map(),
+  recoverPromise: null,
+  recoveredSocketPeerId: null,
   remoteAuth: loadRemoteAuth(),
   requestedDeviceId: null,
   session: null,
@@ -85,6 +88,14 @@ export function clearSessionClaim() {
 
   state.remoteAuth.sessionClaim = null;
   state.remoteAuth.sessionClaimExpiresAt = null;
+}
+
+export function clearRecoveredSocketPeerId() {
+  state.recoveredSocketPeerId = null;
+}
+
+export function setRecoveredSocketPeerId(value) {
+  state.recoveredSocketPeerId = value || null;
 }
 
 export function setSessionClaim(claim, expiresAt) {
@@ -169,6 +180,46 @@ export async function ensureDeviceIdentity() {
   }
 }
 
+export function candidateDeviceTokens() {
+  if (!state.remoteAuth?.deviceToken) {
+    return [];
+  }
+
+  prunePreviousDeviceToken();
+  const tokens = [state.remoteAuth.deviceToken];
+  if (state.remoteAuth.previousDeviceToken) {
+    tokens.push(state.remoteAuth.previousDeviceToken);
+  }
+  return tokens;
+}
+
+export function rotateDeviceToken(nextToken) {
+  if (!state.remoteAuth || !nextToken || state.remoteAuth.deviceToken === nextToken) {
+    return;
+  }
+
+  state.remoteAuth.previousDeviceToken = state.remoteAuth.deviceToken;
+  state.remoteAuth.previousDeviceTokenExpiresAt =
+    Math.floor((Date.now() + PREVIOUS_DEVICE_TOKEN_GRACE_MS) / 1000);
+  state.remoteAuth.deviceToken = nextToken;
+}
+
+function prunePreviousDeviceToken() {
+  if (
+    !state.remoteAuth?.previousDeviceToken ||
+    !state.remoteAuth.previousDeviceTokenExpiresAt
+  ) {
+    return;
+  }
+
+  if (state.remoteAuth.previousDeviceTokenExpiresAt * 1000 > Date.now()) {
+    return;
+  }
+
+  state.remoteAuth.previousDeviceToken = null;
+  state.remoteAuth.previousDeviceTokenExpiresAt = null;
+}
+
 function loadOrCreateRequestedDeviceId(verifyKey) {
   const existing = window.localStorage.getItem(REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY);
   if (existing) {
@@ -210,6 +261,8 @@ function loadRemoteAuth() {
       deviceId: parsed.deviceId,
       deviceLabel: parsed.deviceLabel || defaultDeviceLabel(),
       deviceToken: parsed.deviceToken,
+      previousDeviceToken: null,
+      previousDeviceTokenExpiresAt: null,
       deviceRefreshMode: parsed.deviceRefreshMode === "cookie" ? "cookie" : null,
       deviceRefreshToken: parsed.deviceRefreshToken || null,
       deviceJoinTicket: null,

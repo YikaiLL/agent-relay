@@ -1,12 +1,16 @@
 import { decryptJson, encryptJson, signClaimChallengeProof } from "./crypto.js";
 import { renderDeviceMeta, renderLog, renderThreads } from "./render.js";
 import {
+  candidateDeviceTokens,
   CLAIM_REFRESH_FLOOR_MS,
   CLAIM_REFRESH_SKEW_MS,
   clearSessionClaim,
+  clearRecoveredSocketPeerId,
   ensureDeviceIdentity,
   hasUsableSessionClaim,
+  rotateDeviceToken,
   saveRemoteAuth,
+  setRecoveredSocketPeerId,
   setSessionClaim,
   state,
 } from "./state.js";
@@ -63,7 +67,7 @@ export async function ensureRemoteClaim({
   }
 
   const needsRefresh = Boolean(state.remoteAuth.sessionClaim);
-  state.claimPromise = (async () => {
+  const claimPromise = (async () => {
     renderLog(`${needsRefresh ? "Refreshing" : "Claiming"} remote device (${reason}).`);
     const challengeResult = await dispatchRemoteAction("claim_challenge", {});
     if (!challengeResult.claim_challenge_id || !challengeResult.claim_challenge) {
@@ -73,27 +77,67 @@ export async function ensureRemoteClaim({
       challenge_id: challengeResult.claim_challenge_id,
       challenge: challengeResult.claim_challenge,
     });
-    if (syncAfterClaim) {
-      await onSyncRemoteSnapshot(`claim sync (${reason})`, true);
-    }
     return result.session_claim;
   })().finally(() => {
     state.claimPromise = null;
   });
+  state.claimPromise = claimPromise;
 
-  return state.claimPromise;
+  const sessionClaim = await claimPromise;
+  if (syncAfterClaim) {
+    await onSyncRemoteSnapshot(`claim sync (${reason})`, true);
+  }
+  return sessionClaim;
 }
 
 export async function recoverRemoteSession(reason) {
-  try {
-    await ensureRemoteClaim({
-      force: true,
-      reason,
-      syncAfterClaim: true,
-    });
-  } catch (error) {
-    renderLog(`Remote recovery failed: ${error.message}`);
+  if (!state.remoteAuth) {
+    return;
   }
+  if (
+    state.socketConnected &&
+    state.socketPeerId &&
+    state.recoveredSocketPeerId === state.socketPeerId &&
+    hasUsableSessionClaim()
+  ) {
+    await onSyncRemoteSnapshot(`already recovered (${reason})`, true);
+    return;
+  }
+  if (state.recoverPromise) {
+    return state.recoverPromise;
+  }
+
+  state.recoverPromise = (async () => {
+    try {
+      if (
+        state.session?.active_controller_device_id &&
+        state.session.active_controller_device_id === state.remoteAuth?.deviceId
+      ) {
+        onApplySessionSnapshot({
+          ...state.session,
+          active_controller_device_id: null,
+          active_controller_last_seen_at: null,
+          controller_lease_expires_at: null,
+        });
+      }
+      if (state.remoteAuth?.sessionClaim) {
+        clearSessionClaim();
+        renderDeviceMeta();
+      }
+      await ensureRemoteClaim({
+        force: true,
+        reason,
+        syncAfterClaim: true,
+      });
+      setRecoveredSocketPeerId(state.socketPeerId);
+    } catch (error) {
+      renderLog(`Remote recovery failed: ${error.message}`);
+    } finally {
+      state.recoverPromise = null;
+    }
+  })();
+
+  return state.recoverPromise;
 }
 
 export async function dispatchOrRecover(actionType, request, options = {}) {
@@ -161,6 +205,8 @@ export function scheduleClaimRefresh() {
 export function clearClaimLifecycle() {
   cancelClaimRefresh();
   state.claimPromise = null;
+  state.recoverPromise = null;
+  clearRecoveredSocketPeerId();
 }
 
 export function rejectPendingActions(message) {
@@ -183,7 +229,7 @@ async function handleEncryptedSessionSnapshot(payload) {
     return;
   }
 
-  const snapshot = await decryptJson(state.remoteAuth.deviceToken, payload.envelope);
+  const snapshot = await decryptPayloadWithDeviceTokens(payload.envelope);
   onApplySessionSnapshot(snapshot);
 }
 
@@ -195,13 +241,13 @@ async function handleEncryptedRemoteActionResult(payload) {
     return;
   }
 
-  const result = await decryptJson(state.remoteAuth.deviceToken, payload.envelope);
+  const result = await decryptPayloadWithDeviceTokens(payload.envelope);
   handleRemoteActionResult(payload.action_id, result);
 }
 
 function handleRemoteActionResult(actionId, result) {
   if (result.device_token && state.remoteAuth) {
-    state.remoteAuth.deviceToken = result.device_token;
+    rotateDeviceToken(result.device_token);
     saveRemoteAuth(state.remoteAuth);
   }
 
@@ -245,6 +291,23 @@ function handleRemoteActionResult(actionId, result) {
   }
 
   renderLog(`Remote ${result.action} failed: ${result.error || "unknown error"}`);
+}
+
+async function decryptPayloadWithDeviceTokens(envelope) {
+  if (!state.remoteAuth) {
+    throw new Error("this browser is not paired yet");
+  }
+
+  let lastError = null;
+  for (const token of candidateDeviceTokens()) {
+    try {
+      return await decryptJson(token, envelope);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("decryption failed");
 }
 
 async function dispatchRemoteAction(actionType, request) {

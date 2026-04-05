@@ -19,6 +19,7 @@ use super::RelayState;
 const DEFAULT_PAIRING_TTL_SECS: u64 = 90;
 const MAX_PAIRING_TTL_SECS: u64 = 600;
 const CLAIM_CHALLENGE_TTL_SECS: u64 = 60;
+const PREVIOUS_DEVICE_TOKEN_GRACE_SECS: u64 = 30;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PendingPairing {
@@ -35,6 +36,12 @@ pub(crate) struct PairedDevice {
     pub(crate) label: String,
     pub(crate) shared_secret: String,
     pub(crate) token_hash: String,
+    #[serde(default)]
+    pub(crate) previous_shared_secret: Option<String>,
+    #[serde(default)]
+    pub(crate) previous_token_hash: Option<String>,
+    #[serde(default)]
+    pub(crate) previous_token_expires_at: Option<u64>,
     #[serde(default)]
     pub(crate) device_verify_key: String,
     pub(crate) created_at: u64,
@@ -191,6 +198,17 @@ pub(crate) struct PreparedPairingTicket {
 }
 
 impl RelayState {
+    fn prune_expired_previous_device_token(device: &mut PairedDevice, now: u64) {
+        if device
+            .previous_token_expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            device.previous_shared_secret = None;
+            device.previous_token_hash = None;
+            device.previous_token_expires_at = None;
+        }
+    }
+
     pub fn prepare_pairing_ticket(
         &mut self,
         requested_ttl_secs: Option<u64>,
@@ -301,6 +319,9 @@ impl RelayState {
                     label: label.clone(),
                     shared_secret: device_token.clone(),
                     token_hash: token_hash.clone(),
+                    previous_shared_secret: None,
+                    previous_token_hash: None,
+                    previous_token_expires_at: None,
                     device_verify_key: device_verify_key.clone(),
                     created_at: now,
                     last_seen_at: Some(now),
@@ -311,6 +332,9 @@ impl RelayState {
             device.label = label;
             device.shared_secret = device_token.clone();
             device.token_hash = token_hash;
+            device.previous_shared_secret = None;
+            device.previous_token_hash = None;
+            device.previous_token_expires_at = None;
             device.device_verify_key = device_verify_key;
             device.last_seen_at = Some(now);
             device.last_peer_id = Some(peer_id.to_string());
@@ -510,7 +534,14 @@ impl RelayState {
                 .paired_devices
                 .get_mut(device_id)
                 .ok_or_else(|| "device is not paired".to_string())?;
-            if device.token_hash != sha256_hex(device_token) {
+            Self::prune_expired_previous_device_token(device, now);
+            let device_token_hash = sha256_hex(device_token);
+            let current_matches = device.token_hash == device_token_hash;
+            let previous_matches = device
+                .previous_token_hash
+                .as_deref()
+                .is_some_and(|hash| hash == device_token_hash);
+            if !current_matches && !previous_matches {
                 return Err("device token is invalid".to_string());
             }
 
@@ -576,13 +607,17 @@ impl RelayState {
     ) -> Result<IssuedClaimChallenge, String> {
         self.prune_expired_claim_challenges(now);
         self.prune_claim_challenges_for_device(device_id, "");
-        let device = self
-            .paired_devices
-            .get(device_id)
-            .ok_or_else(|| "device is not paired".to_string())?;
         let challenge_id = format!("claim-{}", random_token(10).to_ascii_lowercase());
         let challenge = random_token(40);
         let expires_at = now.saturating_add(CLAIM_CHALLENGE_TTL_SECS);
+        let token_hash = {
+            let device = self
+                .paired_devices
+                .get_mut(device_id)
+                .ok_or_else(|| "device is not paired".to_string())?;
+            Self::prune_expired_previous_device_token(device, now);
+            device.token_hash.clone()
+        };
         self.pending_claim_challenges.insert(
             challenge_id.clone(),
             ClaimChallenge {
@@ -590,7 +625,7 @@ impl RelayState {
                 device_id: device_id.to_string(),
                 peer_id: peer_id.to_string(),
                 challenge: challenge.clone(),
-                token_hash: device.token_hash.clone(),
+                token_hash,
                 expires_at,
             },
         );
@@ -622,8 +657,9 @@ impl RelayState {
         }
         let device = self
             .paired_devices
-            .get(device_id)
+            .get_mut(device_id)
             .ok_or_else(|| "device is not paired".to_string())?;
+        Self::prune_expired_previous_device_token(device, now);
         if device.token_hash != challenge.token_hash {
             return Err(
                 "claim challenge no longer matches the current device credential".to_string(),
@@ -649,7 +685,13 @@ impl RelayState {
                 .paired_devices
                 .get_mut(device_id)
                 .ok_or_else(|| "device is not paired".to_string())?;
+            Self::prune_expired_previous_device_token(device, now);
             let previous = device.shared_secret.clone();
+            let previous_hash = device.token_hash.clone();
+            device.previous_shared_secret = Some(previous.clone());
+            device.previous_token_hash = Some(previous_hash);
+            device.previous_token_expires_at =
+                Some(now.saturating_add(PREVIOUS_DEVICE_TOKEN_GRACE_SECS));
             device.shared_secret = new_device_token.clone();
             device.token_hash = new_token_hash;
             device.last_seen_at = Some(now);
@@ -675,6 +717,24 @@ impl RelayState {
             .get(device_id)
             .map(|device| device.shared_secret.clone())
             .ok_or_else(|| "device is not paired".to_string())
+    }
+
+    pub fn paired_device_candidate_secrets(
+        &mut self,
+        device_id: &str,
+        now: u64,
+    ) -> Result<Vec<String>, String> {
+        let device = self
+            .paired_devices
+            .get_mut(device_id)
+            .ok_or_else(|| "device is not paired".to_string())?;
+        Self::prune_expired_previous_device_token(device, now);
+
+        let mut secrets = vec![device.shared_secret.clone()];
+        if let Some(previous_secret) = device.previous_shared_secret.clone() {
+            secrets.push(previous_secret);
+        }
+        Ok(secrets)
     }
 
     pub fn paired_device_verify_key(&self, device_id: &str) -> Result<String, String> {

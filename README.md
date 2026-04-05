@@ -316,6 +316,7 @@ Useful browser E2E commands:
 - `npm run test:browser:public-refresh`
 - `npm run test:browser:public-persistence`
 - `npm run test:browser:public-revoke`
+- `npm run test:browser:public-reclaim`
 
 ## License
 

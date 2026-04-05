@@ -42,6 +42,9 @@ fn test_persisted_state() -> PersistedRelayState {
             label: "Primary Phone".to_string(),
             shared_secret: "shared-secret".to_string(),
             token_hash: "token-hash".to_string(),
+            previous_shared_secret: None,
+            previous_token_hash: None,
+            previous_token_expires_at: None,
             device_verify_key: TEST_VERIFY_KEY_B64.to_string(),
             created_at: 7,
             last_seen_at: Some(9),
@@ -632,14 +635,25 @@ fn claim_challenge_rotates_device_token_and_invalidates_old_challenge() {
             .is_ok(),
         "rotated device token should authenticate"
     );
+    assert!(
+        relay
+            .authenticate_paired_device(
+                &device.device_id,
+                &completed.previous_device_token,
+                "surface-a",
+                103,
+            )
+            .is_ok(),
+        "old device token should remain valid briefly to absorb reconnect overlap"
+    );
     let old_token_error = relay
         .authenticate_paired_device(
             &device.device_id,
             &completed.previous_device_token,
             "surface-a",
-            103,
+            102 + 31,
         )
-        .expect_err("old device token should be rejected after rotation");
+        .expect_err("old device token should expire after the overlap grace window");
     assert!(old_token_error.contains("invalid"));
     let reused = relay
         .claim_challenge(&device.device_id, &challenge.challenge_id, "surface-a", 104)
@@ -709,6 +723,9 @@ fn paired_device_requires_a_verify_key() {
             label: "Primary Phone".to_string(),
             shared_secret: "shared-secret".to_string(),
             token_hash: "token-hash".to_string(),
+            previous_shared_secret: None,
+            previous_token_hash: None,
+            previous_token_expires_at: None,
             device_verify_key: String::new(),
             created_at: 7,
             last_seen_at: Some(9),

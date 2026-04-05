@@ -82,11 +82,11 @@ impl AppState {
             change_tx,
         };
 
-        crate::broker::spawn_broker_task(state.clone()).await?;
-
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
         }
+
+        crate::broker::spawn_broker_task(state.clone()).await?;
 
         Ok(state)
     }
@@ -747,6 +747,14 @@ impl AppState {
     pub(crate) async fn paired_device_secret(&self, device_id: &str) -> Result<String, String> {
         let relay = self.relay.read().await;
         relay.paired_device_shared_secret(device_id)
+    }
+
+    pub(crate) async fn paired_device_candidate_secrets(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let mut relay = self.relay.write().await;
+        relay.paired_device_candidate_secrets(device_id, unix_now())
     }
 
     pub(crate) async fn paired_device_verify_key(&self, device_id: &str) -> Result<String, String> {
