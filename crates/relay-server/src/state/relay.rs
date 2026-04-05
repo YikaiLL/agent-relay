@@ -41,7 +41,6 @@ pub(crate) struct CachedRemoteActionResult {
     pub(crate) claim_challenge_id: Option<String>,
     pub(crate) claim_challenge: Option<String>,
     pub(crate) claim_challenge_expires_at: Option<u64>,
-    pub(crate) device_token: Option<String>,
     pub(crate) response_secret: Option<String>,
     pub(crate) error: Option<String>,
 }

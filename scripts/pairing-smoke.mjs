@@ -44,6 +44,14 @@ function pairingProofMessage(pairingId, deviceId) {
   return `agent-relay:pairing:${pairingId}:${deviceId || ""}`;
 }
 
+function claimInitProofMessage(actionId, deviceId, peerId) {
+  return `agent-relay:claim-init:${actionId}:${deviceId || ""}:${peerId || ""}`;
+}
+
+function claimProofMessage(challengeId, challenge, deviceId, peerId) {
+  return `agent-relay:claim-challenge:${challengeId}:${challenge}:${deviceId || ""}:${peerId || ""}`;
+}
+
 async function waitForPendingPairing(pairingId) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -175,7 +183,39 @@ async function main() {
   }
 
   const deviceId = pairingResult.device.device_id;
-  const deviceToken = pairingResult.device_token;
+  const payloadSecret = pairingResult.payload_secret;
+
+  ws.send(
+    JSON.stringify({
+      type: "publish",
+      payload: {
+        kind: "encrypted_remote_action",
+        action_id: "claim-challenge-smoke",
+        device_id: deviceId,
+        envelope: encryptJson(payloadSecret, {
+          type: "claim_challenge",
+          proof: bytesToBase64(
+            nacl.sign.detached(
+              encoder.encode(claimInitProofMessage("claim-challenge-smoke", deviceId, peerId)),
+              signingKeyPair.secretKey
+            )
+          ),
+        }),
+      },
+    })
+  );
+
+  const challengeFrame = await nextFrame(
+    (frame) =>
+      frame.type === "message" &&
+      frame.payload?.kind === "encrypted_remote_action_result" &&
+      frame.payload?.action_id === "claim-challenge-smoke",
+    timeoutMs
+  );
+  const challengeResult = decryptJson(payloadSecret, challengeFrame.payload.envelope);
+  if (!challengeResult.ok) {
+    throw new Error(`claim challenge failed: ${challengeResult.error}`);
+  }
 
   ws.send(
     JSON.stringify({
@@ -184,7 +224,23 @@ async function main() {
         kind: "encrypted_remote_action",
         action_id: "claim-smoke",
         device_id: deviceId,
-        envelope: encryptJson(deviceToken, { type: "claim_device" }),
+        envelope: encryptJson(payloadSecret, {
+          type: "claim_device",
+          challenge_id: challengeResult.claim_challenge_id,
+          proof: bytesToBase64(
+            nacl.sign.detached(
+              encoder.encode(
+                claimProofMessage(
+                  challengeResult.claim_challenge_id,
+                  challengeResult.claim_challenge,
+                  deviceId,
+                  peerId
+                )
+              ),
+              signingKeyPair.secretKey
+            )
+          ),
+        }),
       },
     })
   );
@@ -196,7 +252,7 @@ async function main() {
       frame.payload?.action_id === "claim-smoke",
     timeoutMs
   );
-  const claimResult = decryptJson(deviceToken, claimFrame.payload.envelope);
+  const claimResult = decryptJson(payloadSecret, claimFrame.payload.envelope);
   if (!claimResult.ok) {
     throw new Error(`claim failed: ${claimResult.error}`);
   }
@@ -209,7 +265,7 @@ async function main() {
         action_id: "start-smoke",
         device_id: deviceId,
         session_claim: claimResult.session_claim,
-        envelope: encryptJson(deviceToken, {
+        envelope: encryptJson(payloadSecret, {
           type: "start_session",
           input: {
             cwd,
@@ -231,7 +287,7 @@ async function main() {
       frame.payload?.action_id === "start-smoke",
     timeoutMs
   );
-  const startResult = decryptJson(deviceToken, startFrame.payload.envelope);
+  const startResult = decryptJson(payloadSecret, startFrame.payload.envelope);
   if (!startResult.ok) {
     throw new Error(`start_session failed: ${startResult.error}`);
   }

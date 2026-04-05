@@ -34,7 +34,6 @@ use self::auth::{
 use self::crypto::{decrypt_json, encrypt_json, EncryptedEnvelope};
 use self::remote_actions::{
     handle_encrypted_remote_action, handle_remote_action, RemoteActionKind, RemoteActionRequest,
-    RemoteDeviceAuth,
 };
 use self::session_claim::{issue_session_claim, verify_session_claim};
 
@@ -109,7 +108,6 @@ enum InboundBrokerPayload {
         action_id: String,
         session_claim: Option<String>,
         device_id: Option<String>,
-        auth: Option<RemoteDeviceAuth>,
         request: RemoteActionRequest,
     },
     EncryptedRemoteAction {
@@ -139,7 +137,6 @@ enum OutboundBrokerPayload {
         claim_challenge_id: Option<String>,
         claim_challenge: Option<String>,
         claim_challenge_expires_at: Option<u64>,
-        device_token: Option<String>,
         error: Option<String>,
     },
     EncryptedSessionSnapshot {
@@ -164,7 +161,7 @@ enum OutboundBrokerPayload {
 struct PairingResultPlaintext {
     ok: bool,
     device: Option<PairedDeviceView>,
-    device_token: Option<String>,
+    payload_secret: Option<String>,
     device_refresh_token: Option<String>,
     device_join_ticket: Option<String>,
     device_join_ticket_expires_at: Option<u64>,
@@ -796,7 +793,6 @@ async fn handle_server_message(
                     action_id,
                     session_claim,
                     device_id,
-                    auth,
                     request,
                 }) => {
                     handle_remote_action(
@@ -806,7 +802,6 @@ async fn handle_server_message(
                         action_id,
                         session_claim,
                         device_id,
-                        auth,
                         request,
                     )
                     .await
@@ -992,7 +987,7 @@ async fn publish_snapshot(
 
     let targets = state.broker_targets().await;
     for target in targets {
-        let envelope = encrypt_json(&target.shared_secret, &snapshot)?;
+        let envelope = encrypt_json(&target.payload_secret, &snapshot)?;
         publish_payload(
             sender,
             OutboundBrokerPayload::EncryptedSessionSnapshot {
@@ -1031,7 +1026,7 @@ async fn publish_pairing_result(
         &PairingResultPlaintext {
             ok: result.error.is_none(),
             device: result.device,
-            device_token: result.device_token,
+            payload_secret: result.payload_secret,
             device_refresh_token: result.device_refresh_token,
             device_join_ticket: result.device_join_ticket,
             device_join_ticket_expires_at: result.device_join_ticket_expires_at,
@@ -1324,6 +1319,34 @@ pub(super) fn verify_device_claim_challenge_proof(
         .map_err(|_| "device claim proof is invalid".to_string())
 }
 
+pub(super) fn verify_device_claim_init_proof(
+    action_id: &str,
+    device_id: &str,
+    peer_id: &str,
+    verify_key_b64: &str,
+    signature_b64: &str,
+) -> Result<(), String> {
+    let verify_key_bytes: [u8; 32] = STANDARD
+        .decode(verify_key_b64)
+        .map_err(|_| "device verify key is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "device verify key is invalid".to_string())?;
+    let signature_bytes: [u8; 64] = STANDARD
+        .decode(signature_b64)
+        .map_err(|_| "device claim proof is invalid".to_string())?
+        .try_into()
+        .map_err(|_| "device claim proof is invalid".to_string())?;
+    let verify_key = VerifyingKey::from_bytes(&verify_key_bytes)
+        .map_err(|_| "device verify key is invalid".to_string())?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verify_key
+        .verify(
+            device_claim_init_proof_message(action_id, device_id, peer_id).as_bytes(),
+            &signature,
+        )
+        .map_err(|_| "device claim proof is invalid".to_string())
+}
+
 fn pairing_proof_message(pairing_id: &str, device_id: Option<&str>) -> String {
     format!(
         "agent-relay:pairing:{}:{}",
@@ -1339,6 +1362,10 @@ fn device_claim_proof_message(
     peer_id: &str,
 ) -> String {
     format!("agent-relay:claim-challenge:{challenge_id}:{challenge}:{device_id}:{peer_id}")
+}
+
+fn device_claim_init_proof_message(action_id: &str, device_id: &str, peer_id: &str) -> String {
+    format!("agent-relay:claim-init:{action_id}:{device_id}:{peer_id}")
 }
 
 fn relay_enrollment_challenge_message(challenge_id: &str, challenge: &str) -> String {

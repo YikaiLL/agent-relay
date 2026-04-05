@@ -139,7 +139,7 @@ async function main() {
     await sendPromptAndWaitForReply(remotePage, BEFORE_REFRESH_PROMPT);
 
     const authBeforeExpiry = await readStoredRemoteAuth(remotePage);
-    assert.ok(authBeforeExpiry?.deviceToken, "paired remote should persist a device token");
+    assert.ok(authBeforeExpiry?.payloadSecret, "paired remote should persist a payload secret");
     assert.equal(authBeforeExpiry?.deviceRefreshMode, "cookie");
     assert.equal(authBeforeExpiry?.deviceRefreshToken, undefined);
     assert.equal(authBeforeExpiry?.deviceJoinTicket, undefined);
@@ -165,6 +165,7 @@ async function main() {
 
     await sendPromptAndWaitForReply(remotePage, AFTER_REFRESH_PROMPT);
     const authAfterRefresh = await readStoredRemoteAuth(remotePage);
+    assert.equal(authAfterRefresh?.payloadSecret, authBeforeExpiry?.payloadSecret);
     assert.equal(authAfterRefresh?.deviceRefreshMode, "cookie");
     assert.equal(authAfterRefresh?.deviceRefreshToken, undefined);
     assert.equal(authAfterRefresh?.deviceJoinTicket, undefined);

@@ -56,7 +56,9 @@ pub(super) async fn verify_session_claim(
     peer_id: &str,
 ) -> Result<String, String> {
     let payload = decode_and_verify_session_claim(token, peer_id)?;
-    state.paired_device_secret(&payload.device_id).await?;
+    state
+        .paired_device_payload_secret(&payload.device_id)
+        .await?;
     Ok(payload.device_id)
 }
 

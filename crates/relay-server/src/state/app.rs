@@ -716,19 +716,6 @@ impl AppState {
         relay.drain_pending_broker_messages()
     }
 
-    pub(crate) async fn authenticate_remote_device(
-        &self,
-        device_id: &str,
-        device_token: &str,
-        peer_id: &str,
-    ) -> Result<String, String> {
-        let mut relay = self.relay.write().await;
-        let device_id =
-            relay.authenticate_paired_device(device_id, device_token, peer_id, unix_now())?;
-        relay.notify();
-        Ok(device_id)
-    }
-
     pub(crate) async fn pending_pairing_secret(&self, pairing_id: &str) -> Result<String, String> {
         let mut relay = self.relay.write().await;
         relay.pending_pairing_secret(pairing_id, unix_now())
@@ -744,17 +731,12 @@ impl AppState {
         relay.completed_pairing_result(pairing_id, device_verify_key, peer_id, unix_now())
     }
 
-    pub(crate) async fn paired_device_secret(&self, device_id: &str) -> Result<String, String> {
-        let relay = self.relay.read().await;
-        relay.paired_device_shared_secret(device_id)
-    }
-
-    pub(crate) async fn paired_device_candidate_secrets(
+    pub(crate) async fn paired_device_payload_secret(
         &self,
         device_id: &str,
-    ) -> Result<Vec<String>, String> {
-        let mut relay = self.relay.write().await;
-        relay.paired_device_candidate_secrets(device_id, unix_now())
+    ) -> Result<String, String> {
+        let relay = self.relay.read().await;
+        relay.paired_device_payload_secret(device_id)
     }
 
     pub(crate) async fn paired_device_verify_key(&self, device_id: &str) -> Result<String, String> {
@@ -818,7 +800,7 @@ impl AppState {
                 device.last_peer_id.as_ref().map(|peer_id| BrokerTarget {
                     device_id: device.device_id.clone(),
                     peer_id: peer_id.clone(),
-                    shared_secret: device.shared_secret.clone(),
+                    payload_secret: device.payload_secret.clone(),
                 })
             })
             .collect()
@@ -864,5 +846,5 @@ struct SessionDefaults {
 pub(crate) struct BrokerTarget {
     pub(crate) device_id: String,
     pub(crate) peer_id: String,
-    pub(crate) shared_secret: String,
+    pub(crate) payload_secret: String,
 }

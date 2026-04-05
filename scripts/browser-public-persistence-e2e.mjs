@@ -88,7 +88,7 @@ async function main() {
     await waitForPairedRemote(remotePage);
 
     const authBeforeRestart = await readStoredRemoteAuth(remotePage);
-    assert.ok(authBeforeRestart?.deviceToken, "paired remote should persist a device token");
+    assert.ok(authBeforeRestart?.payloadSecret, "paired remote should persist a payload secret");
     assert.equal(authBeforeRestart?.deviceRefreshMode, "cookie");
     assert.equal(authBeforeRestart?.deviceRefreshToken, undefined);
     assert.equal(authBeforeRestart?.deviceJoinTicket, undefined);

@@ -1,15 +1,17 @@
-import { decryptJson, encryptJson, signClaimChallengeProof } from "./crypto.js";
+import {
+  decryptJson,
+  encryptJson,
+  signClaimChallengeProof,
+  signClaimInitProof,
+} from "./crypto.js";
 import { renderDeviceMeta, renderLog, renderThreads } from "./render.js";
 import {
-  candidateDeviceTokens,
   CLAIM_REFRESH_FLOOR_MS,
   CLAIM_REFRESH_SKEW_MS,
   clearSessionClaim,
   clearRecoveredSocketPeerId,
   ensureDeviceIdentity,
   hasUsableSessionClaim,
-  rotateDeviceToken,
-  saveRemoteAuth,
   setRecoveredSocketPeerId,
   setSessionClaim,
   state,
@@ -246,11 +248,6 @@ async function handleEncryptedRemoteActionResult(payload) {
 }
 
 function handleRemoteActionResult(actionId, result) {
-  if (result.device_token && state.remoteAuth) {
-    rotateDeviceToken(result.device_token);
-    saveRemoteAuth(state.remoteAuth);
-  }
-
   if (result.session_claim && state.remoteAuth) {
     setSessionClaim(result.session_claim, result.session_claim_expires_at || null);
     scheduleClaimRefresh();
@@ -298,16 +295,7 @@ async function decryptPayloadWithDeviceTokens(envelope) {
     throw new Error("this browser is not paired yet");
   }
 
-  let lastError = null;
-  for (const token of candidateDeviceTokens()) {
-    try {
-      return await decryptJson(token, envelope);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error("decryption failed");
+  return decryptJson(state.remoteAuth.payloadSecret, envelope);
 }
 
 async function dispatchRemoteAction(actionType, request) {
@@ -345,16 +333,25 @@ async function dispatchRemoteAction(actionType, request) {
 }
 
 async function buildClaimChallengePayload(actionId) {
+  if (!state.socketPeerId) {
+    throw new Error("broker peer id is not ready yet");
+  }
+  const deviceKeypair = await ensureDeviceIdentity();
+  const proof = await signClaimInitProof(
+    actionId,
+    state.remoteAuth.deviceId,
+    state.socketPeerId,
+    deviceKeypair
+  );
+
   if (state.remoteAuth.securityMode === "managed") {
     return {
       kind: "remote_action",
       action_id: actionId,
-      auth: {
-        device_id: state.remoteAuth.deviceId,
-        device_token: state.remoteAuth.deviceToken,
-      },
+      device_id: state.remoteAuth.deviceId,
       request: {
         type: "claim_challenge",
+        proof,
       },
     };
   }
@@ -363,8 +360,9 @@ async function buildClaimChallengePayload(actionId) {
     kind: "encrypted_remote_action",
     action_id: actionId,
     device_id: state.remoteAuth.deviceId,
-    envelope: await encryptJson(state.remoteAuth.deviceToken, {
+    envelope: await encryptJson(state.remoteAuth.payloadSecret, {
       type: "claim_challenge",
+      proof,
     }),
   };
 }
@@ -390,10 +388,7 @@ async function buildClaimDevicePayload(actionId, request) {
     return {
       kind: "remote_action",
       action_id: actionId,
-      auth: {
-        device_id: state.remoteAuth.deviceId,
-        device_token: state.remoteAuth.deviceToken,
-      },
+      device_id: state.remoteAuth.deviceId,
       request: {
         type: "claim_device",
         challenge_id: request.challenge_id,
@@ -406,7 +401,7 @@ async function buildClaimDevicePayload(actionId, request) {
     kind: "encrypted_remote_action",
     action_id: actionId,
     device_id: state.remoteAuth.deviceId,
-    envelope: await encryptJson(state.remoteAuth.deviceToken, {
+    envelope: await encryptJson(state.remoteAuth.payloadSecret, {
       type: "claim_device",
       challenge_id: request.challenge_id,
       proof: claimProof,
@@ -433,7 +428,7 @@ async function buildClaimedActionPayload(actionId, actionType, request) {
     action_id: actionId,
     session_claim: state.remoteAuth.sessionClaim,
     device_id: state.remoteAuth.deviceId,
-    envelope: await encryptJson(state.remoteAuth.deviceToken, {
+    envelope: await encryptJson(state.remoteAuth.payloadSecret, {
       type: actionType,
       ...request,
     }),

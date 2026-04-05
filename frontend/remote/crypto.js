@@ -111,6 +111,17 @@ export function claimProofMessage(challengeId, challenge, deviceId, peerId) {
   return `agent-relay:claim-challenge:${challengeId}:${challenge}:${deviceId || ""}:${peerId || ""}`;
 }
 
+export function claimInitProofMessage(actionId, deviceId, peerId) {
+  return `agent-relay:claim-init:${actionId}:${deviceId || ""}:${peerId || ""}`;
+}
+
+export async function signClaimInitProof(actionId, deviceId, peerId, keypair = null) {
+  return signDeviceProof(
+    claimInitProofMessage(actionId, deviceId, peerId),
+    keypair || (await ensureDeviceKeypair())
+  );
+}
+
 export async function signClaimChallengeProof(
   challengeId,
   challenge,

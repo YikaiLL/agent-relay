@@ -8,7 +8,6 @@ export const CONTROL_HEARTBEAT_MS = 5000;
 export const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
 export const CLAIM_REFRESH_SKEW_MS = 60_000;
 export const CLAIM_REFRESH_FLOOR_MS = 5000;
-export const PREVIOUS_DEVICE_TOKEN_GRACE_MS = 30_000;
 
 export const state = {
   claimPromise: null,
@@ -181,43 +180,7 @@ export async function ensureDeviceIdentity() {
 }
 
 export function candidateDeviceTokens() {
-  if (!state.remoteAuth?.deviceToken) {
-    return [];
-  }
-
-  prunePreviousDeviceToken();
-  const tokens = [state.remoteAuth.deviceToken];
-  if (state.remoteAuth.previousDeviceToken) {
-    tokens.push(state.remoteAuth.previousDeviceToken);
-  }
-  return tokens;
-}
-
-export function rotateDeviceToken(nextToken) {
-  if (!state.remoteAuth || !nextToken || state.remoteAuth.deviceToken === nextToken) {
-    return;
-  }
-
-  state.remoteAuth.previousDeviceToken = state.remoteAuth.deviceToken;
-  state.remoteAuth.previousDeviceTokenExpiresAt =
-    Math.floor((Date.now() + PREVIOUS_DEVICE_TOKEN_GRACE_MS) / 1000);
-  state.remoteAuth.deviceToken = nextToken;
-}
-
-function prunePreviousDeviceToken() {
-  if (
-    !state.remoteAuth?.previousDeviceToken ||
-    !state.remoteAuth.previousDeviceTokenExpiresAt
-  ) {
-    return;
-  }
-
-  if (state.remoteAuth.previousDeviceTokenExpiresAt * 1000 > Date.now()) {
-    return;
-  }
-
-  state.remoteAuth.previousDeviceToken = null;
-  state.remoteAuth.previousDeviceTokenExpiresAt = null;
+  return state.remoteAuth?.payloadSecret ? [state.remoteAuth.payloadSecret] : [];
 }
 
 function loadOrCreateRequestedDeviceId(verifyKey) {
@@ -248,7 +211,7 @@ function loadRemoteAuth() {
       !parsed?.brokerUrl ||
       !parsed?.brokerChannelId ||
       !parsed?.deviceId ||
-      !parsed?.deviceToken
+      !(parsed?.payloadSecret || parsed?.deviceToken)
     ) {
       window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
       return null;
@@ -260,9 +223,7 @@ function loadRemoteAuth() {
       securityMode: parsed.securityMode || "private",
       deviceId: parsed.deviceId,
       deviceLabel: parsed.deviceLabel || defaultDeviceLabel(),
-      deviceToken: parsed.deviceToken,
-      previousDeviceToken: null,
-      previousDeviceTokenExpiresAt: null,
+      payloadSecret: parsed.payloadSecret || parsed.deviceToken,
       deviceRefreshMode: parsed.deviceRefreshMode === "cookie" ? "cookie" : null,
       deviceRefreshToken: parsed.deviceRefreshToken || null,
       deviceJoinTicket: null,
@@ -291,7 +252,7 @@ export function saveRemoteAuth(value) {
       securityMode: value.securityMode || "private",
       deviceId: value.deviceId,
       deviceLabel: value.deviceLabel || null,
-      deviceToken: value.deviceToken,
+      payloadSecret: value.payloadSecret,
       deviceRefreshMode: value.deviceRefreshMode === "cookie" ? "cookie" : null,
     })
   );

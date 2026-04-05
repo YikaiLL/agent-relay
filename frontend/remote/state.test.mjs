@@ -47,7 +47,7 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
       securityMode: "private",
       deviceId: "device-1",
       deviceLabel: "Primary Phone",
-      deviceToken: "device-token-1",
+      payloadSecret: "payload-secret-1",
       deviceRefreshToken: "legacy-refresh-token",
       deviceJoinTicket: "legacy-join-ticket",
       deviceJoinTicketExpiresAt: 123,
@@ -59,7 +59,7 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
   const { ensureDeviceIdentity, saveRemoteAuth, state } = await import("./state.js");
 
   assert.equal(state.remoteAuth.deviceId, "device-1");
-  assert.equal(state.remoteAuth.deviceToken, "device-token-1");
+  assert.equal(state.remoteAuth.payloadSecret, "payload-secret-1");
   assert.equal(state.remoteAuth.deviceRefreshToken, "legacy-refresh-token");
   assert.equal(state.remoteAuth.deviceJoinTicket, null);
   assert.equal(state.remoteAuth.sessionClaim, null);
@@ -69,7 +69,7 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
 
   const stored = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
   assert.equal(stored.deviceId, "device-1");
-  assert.equal(stored.deviceToken, "device-token-1");
+  assert.equal(stored.payloadSecret, "payload-secret-1");
   assert.equal(stored.deviceRefreshMode, "cookie");
   assert.equal("deviceRefreshToken" in stored, false);
   assert.equal("deviceJoinTicket" in stored, false);

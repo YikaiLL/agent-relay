@@ -40,11 +40,7 @@ fn test_persisted_state() -> PersistedRelayState {
         PairedDevice {
             device_id: "phone-1".to_string(),
             label: "Primary Phone".to_string(),
-            shared_secret: "shared-secret".to_string(),
-            token_hash: "token-hash".to_string(),
-            previous_shared_secret: None,
-            previous_token_hash: None,
-            previous_token_expires_at: None,
+            payload_secret: "payload-secret".to_string(),
             device_verify_key: TEST_VERIFY_KEY_B64.to_string(),
             created_at: 7,
             last_seen_at: Some(9),
@@ -216,7 +212,6 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         claim_challenge_id: None,
         claim_challenge: None,
         claim_challenge_expires_at: None,
-        device_token: None,
         response_secret: None,
         error: if ok {
             None
@@ -550,7 +545,7 @@ fn restore_thread_data_keeps_persisted_controller_and_settings() {
 }
 
 #[test]
-fn pairing_ticket_registers_and_authenticates_remote_device() {
+fn pairing_ticket_registers_remote_device_and_persists_payload_secret() {
     let mut relay = test_state();
     let ticket = issue_test_pairing_ticket(
         &mut relay,
@@ -578,10 +573,15 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
     assert_eq!(relay.pending_pairings.len(), 0);
     assert_eq!(relay.paired_devices.len(), 1);
 
-    let authenticated = relay
-        .authenticate_paired_device(&device.device_id, &token, "surface-b", 101)
-        .expect("device token should authenticate");
-    assert_eq!(authenticated, "my-phone");
+    assert_eq!(
+        relay
+            .paired_device_payload_secret(&device.device_id)
+            .expect("payload secret should persist"),
+        token
+    );
+    relay
+        .mark_paired_device_seen(&device.device_id, "surface-b", 101)
+        .expect("device should remain paired");
     assert_eq!(
         relay
             .paired_devices
@@ -592,7 +592,7 @@ fn pairing_ticket_registers_and_authenticates_remote_device() {
 }
 
 #[test]
-fn claim_challenge_rotates_device_token_and_invalidates_old_challenge() {
+fn claim_challenge_keeps_payload_secret_stable_and_invalidates_old_challenge() {
     let mut relay = test_state();
     let ticket = issue_test_pairing_ticket(
         &mut relay,
@@ -602,7 +602,7 @@ fn claim_challenge_rotates_device_token_and_invalidates_old_challenge() {
         Some(60),
     );
 
-    let (device, original_token) = relay
+    let (device, payload_secret) = relay
         .consume_pairing_ticket(
             &ticket.pairing_id,
             &ticket.pairing_secret,
@@ -618,43 +618,15 @@ fn claim_challenge_rotates_device_token_and_invalidates_old_challenge() {
     let challenge = relay
         .issue_claim_challenge(&device.device_id, "surface-a", 101)
         .expect("challenge should issue");
-    let completed = relay
+    relay
         .complete_remote_claim(&device.device_id, &challenge.challenge_id, "surface-a", 102)
-        .expect("claim should rotate the device token");
-
-    assert_eq!(completed.previous_device_token, original_token);
-    assert_ne!(completed.device_token, completed.previous_device_token);
-    assert!(
+        .expect("claim should complete");
+    assert_eq!(
         relay
-            .authenticate_paired_device(
-                &device.device_id,
-                &completed.device_token,
-                "surface-a",
-                103
-            )
-            .is_ok(),
-        "rotated device token should authenticate"
+            .paired_device_payload_secret(&device.device_id)
+            .expect("payload secret should remain available"),
+        payload_secret
     );
-    assert!(
-        relay
-            .authenticate_paired_device(
-                &device.device_id,
-                &completed.previous_device_token,
-                "surface-a",
-                103,
-            )
-            .is_ok(),
-        "old device token should remain valid briefly to absorb reconnect overlap"
-    );
-    let old_token_error = relay
-        .authenticate_paired_device(
-            &device.device_id,
-            &completed.previous_device_token,
-            "surface-a",
-            102 + 31,
-        )
-        .expect_err("old device token should expire after the overlap grace window");
-    assert!(old_token_error.contains("invalid"));
     let reused = relay
         .claim_challenge(&device.device_id, &challenge.challenge_id, "surface-a", 104)
         .expect_err("claim challenges should be one-time use");
@@ -721,11 +693,7 @@ fn paired_device_requires_a_verify_key() {
         PairedDevice {
             device_id: "phone-1".to_string(),
             label: "Primary Phone".to_string(),
-            shared_secret: "shared-secret".to_string(),
-            token_hash: "token-hash".to_string(),
-            previous_shared_secret: None,
-            previous_token_hash: None,
-            previous_token_expires_at: None,
+            payload_secret: "payload-secret".to_string(),
             device_verify_key: String::new(),
             created_at: 7,
             last_seen_at: Some(9),
@@ -774,7 +742,7 @@ fn pairing_ticket_includes_scannable_broker_link() {
 }
 
 #[test]
-fn pairing_rejects_invalid_secret_and_bad_device_token() {
+fn pairing_rejects_invalid_secret_and_mints_a_fresh_payload_secret() {
     let mut relay = test_state();
     let ticket = issue_test_pairing_ticket(
         &mut relay,
@@ -817,10 +785,12 @@ fn pairing_rejects_invalid_secret_and_bad_device_token() {
             100,
         )
         .expect("replacement ticket should pair");
-    let auth_error = relay
-        .authenticate_paired_device(&device.device_id, "bad-token", "surface-a", 101)
-        .expect_err("bad device token should fail");
-    assert!(auth_error.contains("invalid"));
+    assert_eq!(
+        relay
+            .paired_device_payload_secret(&device.device_id)
+            .expect("payload secret should exist"),
+        token
+    );
     assert_ne!(token, "bad-token");
 }
 
@@ -1019,7 +989,7 @@ fn pairing_request_waits_for_local_approval_before_device_is_created() {
     assert_eq!(relay.pending_pairings.len(), 0);
     assert_eq!(relay.paired_devices.len(), 1);
     assert_eq!(result.target_peer_id, "surface-a");
-    assert!(result.device_token.is_some());
+    assert!(result.payload_secret.is_some());
     assert_eq!(
         result
             .device
@@ -1059,7 +1029,7 @@ fn rejecting_pairing_request_returns_error_without_creating_device() {
     assert_eq!(relay.pending_pairings.len(), 0);
     assert!(relay.paired_devices.is_empty());
     assert!(result.device.is_none());
-    assert!(result.device_token.is_none());
+    assert!(result.payload_secret.is_none());
     assert_eq!(
         result.error.as_deref(),
         Some("pairing request was rejected on the local relay")
@@ -1337,7 +1307,7 @@ fn completed_pairing_can_replay_result_to_reconnected_peer() {
             .map(|device| device.device_id.as_str()),
         Some("phone-replay")
     );
-    assert!(replay.device_token.is_some());
+    assert!(replay.payload_secret.is_some());
 }
 
 #[test]

@@ -114,12 +114,12 @@ async function main() {
     createdThreadId = relaySessionBeforeRestart.active_thread_id;
     assert.ok(createdThreadId, "remote start should create an active thread before relay restart");
     authBeforeRestart = await readStoredRemoteAuth(remotePage);
-    assert.ok(authBeforeRestart?.deviceToken, "paired remote should persist a device token");
+    assert.ok(authBeforeRestart?.payloadSecret, "paired remote should persist a payload secret");
     await waitForPersistedRelayState(relayStatePath, createdThreadId);
-    await waitForPersistedDeviceTokenHash(
+    await waitForPersistedPayloadSecret(
       relayStatePath,
       authBeforeRestart.deviceId,
-      authBeforeRestart.deviceToken
+      authBeforeRestart.payloadSecret
     );
 
     await stopManagedProcess(relay);
@@ -164,13 +164,18 @@ async function main() {
     );
     authAfterRestart = await readStoredRemoteAuth(remotePage);
     assert.ok(
-      authAfterRestart?.deviceToken,
-      "remote auth should still contain a device token after reclaim"
+      authAfterRestart?.payloadSecret,
+      "remote auth should still contain a payload secret after reclaim"
     );
-    await waitForPersistedDeviceTokenHash(
+    assert.equal(
+      authAfterRestart.payloadSecret,
+      authBeforeRestart.payloadSecret,
+      "reclaim should not rotate the payload secret"
+    );
+    await waitForPersistedPayloadSecret(
       relayStatePath,
       authAfterRestart.deviceId,
-      authAfterRestart.deviceToken
+      authAfterRestart.payloadSecret
     );
 
     await sendPromptAndWaitForReply(remotePage, AFTER_RESTART_PROMPT);
@@ -202,15 +207,15 @@ async function main() {
       )
     );
   } catch (error) {
-    if (authBeforeRestart?.deviceToken || authAfterRestart?.deviceToken) {
+    if (authBeforeRestart?.payloadSecret || authAfterRestart?.payloadSecret) {
       console.error(
         JSON.stringify(
           {
-            authBeforeRestartHash: authBeforeRestart?.deviceToken
-              ? sha256Hex(authBeforeRestart.deviceToken)
+            authBeforeRestartHash: authBeforeRestart?.payloadSecret
+              ? sha256Hex(authBeforeRestart.payloadSecret)
               : null,
-            authAfterRestartHash: authAfterRestart?.deviceToken
-              ? sha256Hex(authAfterRestart.deviceToken)
+            authAfterRestartHash: authAfterRestart?.payloadSecret
+              ? sha256Hex(authAfterRestart.payloadSecret)
               : null,
             authBeforeRestartDeviceId: authBeforeRestart?.deviceId || null,
             authAfterRestartDeviceId: authAfterRestart?.deviceId || null,
@@ -510,29 +515,28 @@ async function waitForPersistedRelayState(statePath, expectedThreadId, timeoutMs
   throw new Error(`timed out waiting for relay state persistence for ${expectedThreadId}`);
 }
 
-async function waitForPersistedDeviceTokenHash(
+async function waitForPersistedPayloadSecret(
   statePath,
   deviceId,
-  deviceToken,
+  payloadSecret,
   timeoutMs = TIMEOUT_MS
 ) {
-  const expectedHash = sha256Hex(deviceToken);
   const deadline = Date.now() + timeoutMs;
-  let lastPersistedHash = null;
+  let lastPersistedSecret = null;
   while (Date.now() < deadline) {
     try {
       const raw = await fs.readFile(statePath, "utf8");
       const parsed = JSON.parse(raw);
-      const persistedHash = parsed?.paired_devices?.[deviceId]?.token_hash || null;
-      lastPersistedHash = persistedHash;
-      if (persistedHash === expectedHash) {
+      const persistedSecret = parsed?.paired_devices?.[deviceId]?.payload_secret || null;
+      lastPersistedSecret = persistedSecret;
+      if (persistedSecret === payloadSecret) {
         return parsed;
       }
     } catch {}
     await delay(250);
   }
   throw new Error(
-    `timed out waiting for persisted device token hash for ${deviceId} (expected ${expectedHash}, last seen ${lastPersistedHash})`
+    `timed out waiting for persisted payload secret for ${deviceId} (last seen ${lastPersistedSecret})`
   );
 }
 

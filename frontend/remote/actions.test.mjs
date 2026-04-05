@@ -92,7 +92,7 @@ function nextTick() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-test("ensureRemoteClaim performs challenge-response and persists a rotated device token", async () => {
+test("ensureRemoteClaim performs challenge-response without rotating payload secrets", async () => {
   const browser = installBrowserStubs();
   const sentPayloads = [];
 
@@ -106,7 +106,7 @@ test("ensureRemoteClaim performs challenge-response and persists a rotated devic
     securityMode: "managed",
     deviceId: "device-1",
     deviceLabel: "Primary Phone",
-    deviceToken: "device-token-1",
+    payloadSecret: "payload-secret-1",
     deviceRefreshMode: "cookie",
     deviceRefreshToken: null,
     deviceJoinTicket: "device-ws-token",
@@ -146,7 +146,6 @@ test("ensureRemoteClaim performs challenge-response and persists a rotated devic
             snapshot: {},
             session_claim: "session-claim-2",
             session_claim_expires_at: Math.floor(Date.now() / 1000) + 300,
-            device_token: "rotated-device-token",
           });
         }
       });
@@ -164,22 +163,24 @@ test("ensureRemoteClaim performs challenge-response and persists a rotated devic
   assert.equal(sessionClaim, "session-claim-2");
   assert.equal(sentPayloads.length, 2);
   assert.equal(sentPayloads[0].request.type, "claim_challenge");
-  assert.equal(sentPayloads[0].auth.device_token, "device-token-1");
+  assert.equal(sentPayloads[0].device_id, "device-1");
+  assert.ok(typeof sentPayloads[0].request.proof === "string");
+  assert.ok(sentPayloads[0].request.proof.length > 20);
   assert.equal(sentPayloads[1].request.type, "claim_device");
   assert.equal(sentPayloads[1].request.challenge_id, "challenge-1");
   assert.ok(typeof sentPayloads[1].request.proof === "string");
   assert.ok(sentPayloads[1].request.proof.length > 20);
-  assert.equal(sentPayloads[1].auth.device_token, "device-token-1");
-  assert.equal(state.remoteAuth.deviceToken, "rotated-device-token");
+  assert.equal(sentPayloads[1].device_id, "device-1");
+  assert.equal(state.remoteAuth.payloadSecret, "payload-secret-1");
   assert.equal(state.remoteAuth.sessionClaim, "session-claim-2");
 
   const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
-  assert.equal(storedAuth.deviceToken, "rotated-device-token");
+  assert.equal(storedAuth.payloadSecret, "payload-secret-1");
   assert.equal(storedAuth.deviceRefreshToken, undefined);
   assert.equal(storedAuth.deviceJoinTicket, undefined);
 });
 
-test("encrypted remote action results can decrypt with the previous device token during rotation", async () => {
+test("encrypted remote action results decrypt with the persisted payload secret", async () => {
   const browser = installBrowserStubs();
 
   const { encryptJson } = await import("./crypto.js");
@@ -193,9 +194,7 @@ test("encrypted remote action results can decrypt with the previous device token
     securityMode: "private",
     deviceId: "device-1",
     deviceLabel: "Primary Phone",
-    deviceToken: "current-device-token",
-    previousDeviceToken: "previous-device-token",
-    previousDeviceTokenExpiresAt: Math.floor(Date.now() / 1000) + 30,
+    payloadSecret: "payload-secret-1",
     deviceRefreshMode: "cookie",
     deviceRefreshToken: null,
     deviceJoinTicket: "device-ws-token",
@@ -206,13 +205,12 @@ test("encrypted remote action results can decrypt with the previous device token
   saveRemoteAuth(state.remoteAuth);
   state.socketPeerId = "surface-peer-1";
 
-  const envelope = await encryptJson("previous-device-token", {
+  const envelope = await encryptJson("payload-secret-1", {
     action: "claim_device",
     ok: true,
     snapshot: {},
     session_claim: "session-claim-3",
     session_claim_expires_at: Math.floor(Date.now() / 1000) + 300,
-    device_token: "newest-device-token",
   });
 
   await handleRemoteBrokerPayload({
@@ -223,10 +221,9 @@ test("encrypted remote action results can decrypt with the previous device token
     envelope,
   });
 
-  assert.equal(state.remoteAuth.deviceToken, "newest-device-token");
-  assert.equal(state.remoteAuth.previousDeviceToken, "current-device-token");
+  assert.equal(state.remoteAuth.payloadSecret, "payload-secret-1");
   assert.equal(state.remoteAuth.sessionClaim, "session-claim-3");
 
   const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
-  assert.equal(storedAuth.deviceToken, "newest-device-token");
+  assert.equal(storedAuth.payloadSecret, "payload-secret-1");
 });

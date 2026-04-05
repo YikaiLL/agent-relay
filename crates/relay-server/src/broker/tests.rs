@@ -501,10 +501,7 @@ fn parse_inbound_payload_parses_remote_action_requests() {
     let payload = serde_json::json!({
         "kind": "remote_action",
         "action_id": "act-1",
-        "auth": {
-            "device_id": "phone-1",
-            "device_token": "token-1"
-        },
+        "device_id": "phone-1",
         "request": {
             "type": "send_message",
             "input": {
@@ -520,15 +517,11 @@ fn parse_inbound_payload_parses_remote_action_requests() {
         InboundBrokerPayload::RemoteAction {
             action_id,
             device_id,
-            auth,
             request: RemoteActionRequest::SendMessage { input },
             session_claim,
         } => {
             assert_eq!(action_id, "act-1");
-            assert!(device_id.is_none());
-            let auth = auth.expect("auth should be present");
-            assert_eq!(auth.device_id, "phone-1");
-            assert_eq!(auth.device_token, "token-1");
+            assert_eq!(device_id.as_deref(), Some("phone-1"));
             assert!(session_claim.is_none());
             assert_eq!(input.text, "hello");
         }
@@ -541,10 +534,7 @@ fn parse_inbound_payload_parses_list_threads_requests() {
     let payload = serde_json::json!({
         "kind": "remote_action",
         "action_id": "act-threads",
-        "auth": {
-            "device_id": "phone-1",
-            "device_token": "token-1"
-        },
+        "device_id": "phone-1",
         "request": {
             "type": "list_threads",
             "query": {
@@ -671,12 +661,10 @@ fn parse_inbound_payload_parses_claim_challenge_request() {
     let payload = serde_json::json!({
         "kind": "remote_action",
         "action_id": "claim-start-1",
-        "auth": {
-            "device_id": "phone-1",
-            "device_token": "token-1"
-        },
+        "device_id": "phone-1",
         "request": {
-            "type": "claim_challenge"
+            "type": "claim_challenge",
+            "proof": "claim-init-proof"
         }
     });
 
@@ -686,14 +674,13 @@ fn parse_inbound_payload_parses_claim_challenge_request() {
     match action {
         InboundBrokerPayload::RemoteAction {
             action_id,
-            auth,
-            request: RemoteActionRequest::ClaimChallenge,
+            device_id,
+            request: RemoteActionRequest::ClaimChallenge { proof },
             ..
         } => {
             assert_eq!(action_id, "claim-start-1");
-            let auth = auth.expect("auth should be present");
-            assert_eq!(auth.device_id, "phone-1");
-            assert_eq!(auth.device_token, "token-1");
+            assert_eq!(device_id.as_deref(), Some("phone-1"));
+            assert_eq!(proof, "claim-init-proof");
         }
         other => panic!("unexpected request: {other:?}"),
     }
@@ -704,10 +691,7 @@ fn parse_inbound_payload_parses_claim_device_proof() {
     let payload = serde_json::json!({
         "kind": "remote_action",
         "action_id": "claim-finish-1",
-        "auth": {
-            "device_id": "phone-1",
-            "device_token": "token-1"
-        },
+        "device_id": "phone-1",
         "request": {
             "type": "claim_device",
             "challenge_id": "challenge-1",
@@ -721,7 +705,7 @@ fn parse_inbound_payload_parses_claim_device_proof() {
     match action {
         InboundBrokerPayload::RemoteAction {
             action_id,
-            auth,
+            device_id,
             request:
                 RemoteActionRequest::ClaimDevice {
                     challenge_id,
@@ -730,11 +714,9 @@ fn parse_inbound_payload_parses_claim_device_proof() {
             ..
         } => {
             assert_eq!(action_id, "claim-finish-1");
+            assert_eq!(device_id.as_deref(), Some("phone-1"));
             assert_eq!(challenge_id, "challenge-1");
             assert_eq!(proof, "signed-proof");
-            let auth = auth.expect("auth should be present");
-            assert_eq!(auth.device_id, "phone-1");
-            assert_eq!(auth.device_token, "token-1");
         }
         other => panic!("unexpected request: {other:?}"),
     }

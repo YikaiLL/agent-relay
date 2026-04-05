@@ -87,7 +87,7 @@ test("legacy device key storage renders a visible warning", async () => {
     securityMode: "private",
     deviceId: "device-1",
     deviceLabel: "Primary Phone",
-    deviceToken: "device-token-1",
+    payloadSecret: "payload-secret-1",
     deviceRefreshMode: "cookie",
     deviceRefreshToken: null,
     deviceJoinTicket: "device-ws-token",

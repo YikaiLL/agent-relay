@@ -168,7 +168,7 @@ test("expired device broker access refreshes automatically during reconnect", as
     relayPeerId: "relay-1",
     deviceId: "device-1",
     deviceLabel: "Primary Phone",
-    deviceToken: "device-token-1",
+    payloadSecret: "payload-secret-1",
     deviceJoinTicket: "seed-device-ws-token",
     deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
     deviceRefreshToken: "device-refresh-1",

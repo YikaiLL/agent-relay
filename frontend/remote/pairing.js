@@ -144,7 +144,7 @@ export async function handleEncryptedPairingResult(payload) {
   }
 
   const device = result.device;
-  if (!device || !result.device_token || !result.device_join_ticket) {
+  if (!device || !result.payload_secret || !result.device_join_ticket) {
     state.pairingPhase = "error";
     state.pairingError = "pairing result is incomplete";
     renderDeviceMeta();
@@ -158,7 +158,7 @@ export async function handleEncryptedPairingResult(payload) {
     securityMode: state.pairingTicket.security_mode,
     deviceId: device.device_id,
     deviceLabel: device.label,
-    deviceToken: result.device_token,
+    payloadSecret: result.payload_secret,
     deviceRefreshMode: null,
     deviceRefreshToken: result.device_refresh_token || null,
     deviceJoinTicket: result.device_join_ticket,
