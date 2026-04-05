@@ -69,12 +69,12 @@ export function renderDeviceMeta() {
           <div class="paired-device-badges">
             ${statusBadgeMarkup("Paired", "ready")}
             ${statusBadgeMarkup(securityModeLabel(state.session), state.remoteAuth.securityMode === "managed" ? "alert" : "ready")}
-            ${statusBadgeMarkup(sessionClaimStatusText(), sessionClaimBadgeTone())}
+            ${statusBadgeMarkup(remoteAccessStatusText(), remoteAccessBadgeTone())}
             ${deviceKeyStorageBadgeMarkup()}
           </div>
           <p class="paired-device-meta">Device ${escapeHtml(shortId(state.remoteAuth.deviceId))}</p>
           <p class="paired-device-meta">Broker ${escapeHtml(state.remoteAuth.brokerChannelId)} via ${escapeHtml(shortId(state.remoteAuth.relayPeerId))}</p>
-          <p class="paired-device-meta">${escapeHtml(sessionClaimLabel())}</p>
+          <p class="paired-device-meta">${escapeHtml(remoteAccessLabel())}</p>
           ${deviceKeyStorageWarningCopyMarkup()}
         </div>
       </article>
@@ -164,7 +164,6 @@ function renderSessionMeta(session) {
     metaChip("Visibility", contentVisibilityLabel(session)),
     metaChip("Broker", brokerStatusLabel(session)),
     metaChip("Device", state.remoteAuth?.deviceLabel || "Unpaired"),
-    metaChip("Claim", sessionClaimLabel()),
     metaChip(
       "Control",
       session.active_controller_device_id
@@ -187,7 +186,7 @@ function renderControlBanner(session) {
 
   if (!session.active_controller_device_id) {
     dom.remoteControlSummary.textContent = "No device currently has control";
-    dom.remoteControlHint.textContent = "The next paired device to send a message will claim control.";
+    dom.remoteControlHint.textContent = "The first device to send a message from here will take control automatically.";
     dom.remoteTakeOverButton.hidden = true;
     return;
   }
@@ -243,37 +242,68 @@ function brokerStatusLabel(session) {
     : `${brokerState} · ${channel}`;
 }
 
-function sessionClaimLabel() {
+function remoteAccessLabel() {
   if (!state.remoteAuth) {
     return "Unpaired";
   }
 
-  if (!state.remoteAuth.sessionClaim) {
-    return "Pending";
+  if (!state.session?.active_thread_id) {
+    return "Standby until you start or resume a session";
   }
 
-  if (!state.remoteAuth.sessionClaimExpiresAt) {
-    return "Active";
+  if (!state.session.active_controller_device_id) {
+    return "Standby until you send the first message";
   }
 
-  return `Active until ${formatTimestamp(state.remoteAuth.sessionClaimExpiresAt)}`;
+  if (state.session.active_controller_device_id === state.remoteAuth.deviceId) {
+    if (!state.remoteAuth.sessionClaim) {
+      return "Ready here; control refresh happens automatically when you type";
+    }
+
+    if (!state.remoteAuth.sessionClaimExpiresAt) {
+      return "Ready to type from this browser";
+    }
+
+    return `Ready here until ${formatTimestamp(state.remoteAuth.sessionClaimExpiresAt)}`;
+  }
+
+  return `Viewing while ${controllerLabel(state.session.active_controller_device_id)} has control`;
 }
 
-function sessionClaimStatusText() {
+function remoteAccessStatusText() {
   if (!state.remoteAuth) {
     return "Unpaired";
   }
-  if (!state.remoteAuth.sessionClaim) {
-    return "Claim pending";
+
+  if (!state.session?.active_thread_id) {
+    return "Standby";
   }
-  return "Claim active";
+
+  if (!state.session.active_controller_device_id) {
+    return "Auto-control";
+  }
+
+  if (state.session.active_controller_device_id === state.remoteAuth.deviceId) {
+    return "Ready";
+  }
+
+  return "View only";
 }
 
-function sessionClaimBadgeTone() {
+function remoteAccessBadgeTone() {
   if (!state.remoteAuth) {
     return "offline";
   }
-  return state.remoteAuth.sessionClaim ? "ready" : "alert";
+
+  if (
+    state.session?.active_thread_id &&
+    state.session.active_controller_device_id &&
+    state.session.active_controller_device_id !== state.remoteAuth.deviceId
+  ) {
+    return "alert";
+  }
+
+  return "ready";
 }
 
 function controlStatusText(session) {

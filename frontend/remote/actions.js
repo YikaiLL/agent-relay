@@ -111,26 +111,18 @@ export async function recoverRemoteSession(reason) {
 
   state.recoverPromise = (async () => {
     try {
-      if (
-        state.session?.active_controller_device_id &&
-        state.session.active_controller_device_id === state.remoteAuth?.deviceId
-      ) {
-        onApplySessionSnapshot({
-          ...state.session,
-          active_controller_device_id: null,
-          active_controller_last_seen_at: null,
-          controller_lease_expires_at: null,
-        });
-      }
       if (state.remoteAuth?.sessionClaim) {
         clearSessionClaim();
         renderDeviceMeta();
       }
-      await ensureRemoteClaim({
-        force: true,
-        reason,
-        syncAfterClaim: true,
-      });
+      await onSyncRemoteSnapshot(`recovery sync (${reason})`, true);
+      if (shouldAutoReclaimSession()) {
+        await ensureRemoteClaim({
+          force: true,
+          reason,
+          syncAfterClaim: true,
+        });
+      }
       setRecoveredSocketPeerId(state.socketPeerId);
     } catch (error) {
       renderLog(`Remote recovery failed: ${error.message}`);
@@ -146,7 +138,7 @@ export async function dispatchOrRecover(actionType, request, options = {}) {
   const allowClaimRetry = options.allowClaimRetry !== false;
   const skipPreclaim = options.skipPreclaim === true;
 
-  if (!["claim_challenge", "claim_device"].includes(actionType) && !skipPreclaim) {
+  if (requiresSessionClaim(actionType) && !skipPreclaim) {
     await ensureRemoteClaim({
       force: !hasUsableSessionClaim(CLAIM_REFRESH_SKEW_MS),
       reason: `${actionType} preflight`,
@@ -159,7 +151,7 @@ export async function dispatchOrRecover(actionType, request, options = {}) {
   } catch (error) {
     if (
       allowClaimRetry &&
-      !["claim_challenge", "claim_device"].includes(actionType) &&
+      requiresSessionClaim(actionType) &&
       isSessionClaimError(error.message)
     ) {
       clearSessionClaim();
@@ -320,11 +312,15 @@ async function dispatchRemoteAction(actionType, request) {
       return await resultPromise;
     }
 
-    if (!state.remoteAuth.sessionClaim) {
+    if (requiresSessionClaim(actionType) && !state.remoteAuth.sessionClaim) {
       throw new Error("device is not claimed yet");
     }
 
-    sendBrokerFrame(await buildClaimedActionPayload(actionId, actionType, request));
+    sendBrokerFrame(
+      requiresSessionClaim(actionType)
+        ? await buildClaimedActionPayload(actionId, actionType, request)
+        : await buildDeviceActionPayload(actionId, actionType, request)
+    );
     return await resultPromise;
   } catch (error) {
     state.pendingActions.delete(actionId);
@@ -435,6 +431,30 @@ async function buildClaimedActionPayload(actionId, actionType, request) {
   };
 }
 
+async function buildDeviceActionPayload(actionId, actionType, request) {
+  if (state.remoteAuth.securityMode === "managed") {
+    return {
+      kind: "remote_action",
+      action_id: actionId,
+      device_id: state.remoteAuth.deviceId,
+      request: {
+        type: actionType,
+        ...request,
+      },
+    };
+  }
+
+  return {
+    kind: "encrypted_remote_action",
+    action_id: actionId,
+    device_id: state.remoteAuth.deviceId,
+    envelope: await encryptJson(state.remoteAuth.payloadSecret, {
+      type: actionType,
+      ...request,
+    }),
+  };
+}
+
 function registerPendingAction(actionId, actionType) {
   return new Promise((resolve, reject) => {
     state.pendingActions.set(actionId, {
@@ -475,6 +495,18 @@ function cancelClaimRefresh() {
 
 function isSessionClaimError(message) {
   return typeof message === "string" && message.toLowerCase().includes("session claim");
+}
+
+function requiresSessionClaim(actionType) {
+  return actionType === "send_message";
+}
+
+function shouldAutoReclaimSession() {
+  return Boolean(
+    state.remoteAuth?.deviceId &&
+      state.session?.active_thread_id &&
+      state.session.active_controller_device_id === state.remoteAuth.deviceId
+  );
 }
 
 function makeActionId(prefix) {

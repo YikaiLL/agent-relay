@@ -1,7 +1,6 @@
 import * as dom from "./dom.js";
 import {
   canCurrentDeviceWrite as canRemoteDeviceWrite,
-  isCurrentDeviceActiveController as isRemoteController,
   renderDeviceMeta as renderDeviceChrome,
   renderSessionChrome,
   resetRemoteSurfaceChrome,
@@ -13,7 +12,7 @@ import {
   renderLogs,
   renderTranscriptPanel,
 } from "./render-transcript.js";
-import { hasUsableSessionClaim, state } from "./state.js";
+import { state } from "./state.js";
 import { escapeHtml, formatTimestamp, shortId } from "./utils.js";
 
 let onResumeThread = () => {};
@@ -27,11 +26,7 @@ export function renderSession(session) {
   const approval = session.pending_approvals?.[0] || null;
   const hasActiveSession = Boolean(session.active_thread_id);
   const hasControllerLease = canCurrentDeviceWrite(session);
-  const needsClaimRecovery =
-    hasActiveSession &&
-    isRemoteController(session) &&
-    !hasUsableSessionClaim();
-  const canWrite = hasControllerLease && !needsClaimRecovery;
+  const canWrite = hasControllerLease;
   state.currentApprovalId = approval?.request_id || null;
 
   if (session.current_cwd && !dom.remoteThreadsCwdInput.value.trim()) {
@@ -43,13 +38,11 @@ export function renderSession(session) {
   renderLogs(session.logs || []);
   renderThreads(state.threads);
 
-  dom.remoteSendButton.disabled = !hasActiveSession || !canWrite;
-  dom.remoteMessageInput.disabled = !hasActiveSession || !canWrite;
+  dom.remoteSendButton.disabled = !hasActiveSession || !hasControllerLease;
+  dom.remoteMessageInput.disabled = !hasActiveSession || !hasControllerLease;
   dom.remoteMessageInput.placeholder = !hasActiveSession
     ? "Start a remote session first."
-    : needsClaimRecovery
-      ? "Reclaiming remote control..."
-    : canWrite
+    : hasControllerLease
       ? "Message Codex remotely..."
       : "Another device has control. Take over to reply.";
 }

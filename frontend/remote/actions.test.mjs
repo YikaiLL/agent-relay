@@ -117,6 +117,8 @@ test("ensureRemoteClaim performs challenge-response without rotating payload sec
   saveRemoteAuth(state.remoteAuth);
   state.socketConnected = true;
   state.socketPeerId = "surface-peer-1";
+  state.pendingActions.clear();
+  state.claimPromise = null;
   state.socket = {
     readyState: 1,
     send(frameText) {
@@ -226,4 +228,120 @@ test("encrypted remote action results decrypt with the persisted payload secret"
 
   const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
   assert.equal(storedAuth.payloadSecret, "payload-secret-1");
+});
+
+test("list_threads uses device access without pre-claiming control", async () => {
+  installBrowserStubs();
+  const sentPayloads = [];
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { dispatchOrRecover, handleRemoteBrokerPayload } = await import("./actions.js");
+
+  state.remoteAuth = {
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  };
+  saveRemoteAuth(state.remoteAuth);
+  state.socketConnected = true;
+  state.socketPeerId = "surface-peer-1";
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      sentPayloads.push(frame.payload);
+      setImmediate(async () => {
+        await handleRemoteBrokerPayload({
+          kind: "remote_action_result",
+          action_id: frame.payload.action_id,
+          action: "list_threads",
+          ok: true,
+          snapshot: {},
+          threads: {
+            threads: [
+              {
+                id: "thread-1",
+                updated_at: Math.floor(Date.now() / 1000),
+                preview: "hello",
+              },
+            ],
+          },
+        });
+      });
+    },
+  };
+
+  const result = await dispatchOrRecover("list_threads", {
+    query: {
+      limit: 20,
+      cwd: "/tmp/demo",
+    },
+  });
+
+  assert.equal(result.threads.threads.length, 1);
+  const listThreadsPayload = sentPayloads.find(
+    (payload) => payload.request?.type === "list_threads"
+  );
+  assert.ok(listThreadsPayload);
+  assert.equal(listThreadsPayload.session_claim, undefined);
+  assert.equal(listThreadsPayload.device_id, "device-1");
+});
+
+test("recoverRemoteSession only auto-claims when this device still controls the thread", async () => {
+  installBrowserStubs();
+
+  const { state } = await import("./state.js");
+  const {
+    configureRemoteActions,
+    recoverRemoteSession,
+  } = await import("./actions.js");
+
+  state.remoteAuth = {
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: "old-claim",
+    sessionClaimExpiresAt: Math.floor(Date.now() / 1000) + 300,
+  };
+  state.socketConnected = true;
+  state.socketPeerId = "surface-peer-1";
+  state.session = {
+    active_thread_id: "thread-1",
+    active_controller_device_id: "device-2",
+  };
+
+  let syncReason = null;
+  configureRemoteActions({
+    onSyncRemoteSnapshot: async (reason) => {
+      syncReason = reason;
+      state.session = {
+        active_thread_id: "thread-1",
+        active_controller_device_id: "device-2",
+      };
+    },
+  });
+
+  await recoverRemoteSession("unit test");
+
+  assert.equal(syncReason, "recovery sync (unit test)");
+  assert.equal(state.remoteAuth.sessionClaim, null);
+  assert.equal(state.recoverPromise, null);
 });

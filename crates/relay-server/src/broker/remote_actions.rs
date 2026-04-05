@@ -298,9 +298,12 @@ pub(super) async fn handle_remote_action(
             )
             .await
         }
-        request => {
-            execute_remote_action(state, request.bind_device(resolved_device_id.clone())).await
-        }
+        request => attach_session_claim_if_needed(
+            action_kind,
+            &resolved_device_id,
+            &from_peer_id,
+            execute_remote_action(state, request.bind_device(resolved_device_id.clone())).await?,
+        ),
     };
     let snapshot = state.snapshot().await;
 
@@ -479,7 +482,12 @@ pub(super) async fn handle_encrypted_remote_action(
             state
                 .mark_remote_device_seen(&device_id, &from_peer_id)
                 .await?;
-            execute_remote_action(state, request.bind_device(device_id.clone())).await
+            attach_session_claim_if_needed(
+                action_kind,
+                &device_id,
+                &from_peer_id,
+                execute_remote_action(state, request.bind_device(device_id.clone())).await?,
+            )
         }
     };
 
@@ -597,6 +605,19 @@ async fn execute_remote_action(
     }
 }
 
+fn requires_session_claim(action: RemoteActionKind) -> bool {
+    matches!(action, RemoteActionKind::SendMessage)
+}
+
+fn issues_session_claim(action: RemoteActionKind) -> bool {
+    matches!(
+        action,
+        RemoteActionKind::StartSession
+            | RemoteActionKind::ResumeSession
+            | RemoteActionKind::TakeOver
+    )
+}
+
 async fn decrypt_remote_action_kind(
     state: &AppState,
     device_id: &str,
@@ -634,18 +655,16 @@ async fn resolve_plain_remote_device(
         return verify_session_claim(state, claim, from_peer_id).await;
     }
 
-    let device_id = device_id.map(str::to_string).ok_or_else(|| match request {
-        RemoteActionRequest::ClaimChallenge { .. } => {
-            "claim_challenge requires device_id".to_string()
+    let action_kind = request.kind();
+    let device_id = device_id.map(str::to_string).ok_or_else(|| {
+        if requires_session_claim(action_kind) {
+            SESSION_CONTROL_REQUIRED_ERROR.to_string()
+        } else {
+            format!("{} requires device_id", action_kind.as_str())
         }
-        RemoteActionRequest::ClaimDevice { .. } => "claim_device requires device auth".to_string(),
-        _ => SESSION_CONTROL_REQUIRED_ERROR.to_string(),
     })?;
 
-    if !matches!(
-        request,
-        RemoteActionRequest::ClaimChallenge { .. } | RemoteActionRequest::ClaimDevice { .. }
-    ) {
+    if requires_session_claim(action_kind) {
         return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
     }
 
@@ -682,10 +701,7 @@ async fn resolve_encrypted_action_context(
     let response_secret = state.paired_device_payload_secret(&device_id).await?;
     let request = decrypt_remote_action_with_secret(&response_secret, envelope)?;
     let action_kind = request.kind();
-    if !matches!(
-        action_kind,
-        RemoteActionKind::ClaimChallenge | RemoteActionKind::ClaimDevice
-    ) {
+    if requires_session_claim(action_kind) {
         return Err(SESSION_CONTROL_REQUIRED_ERROR.to_string());
     }
     Ok(ResolvedEncryptedAction {
@@ -772,6 +788,22 @@ async fn issue_claim_outcome(
         session_claim_expires_at: Some(claim.expires_at),
         ..RemoteActionOutcome::default()
     })
+}
+
+fn attach_session_claim_if_needed(
+    action: RemoteActionKind,
+    device_id: &str,
+    peer_id: &str,
+    mut outcome: RemoteActionOutcome,
+) -> Result<RemoteActionOutcome, String> {
+    if !issues_session_claim(action) {
+        return Ok(outcome);
+    }
+
+    let claim = issue_session_claim(device_id, peer_id)?;
+    outcome.session_claim = Some(claim.token);
+    outcome.session_claim_expires_at = Some(claim.expires_at);
+    Ok(outcome)
 }
 
 fn approval_error_message(error: ApprovalError) -> String {
