@@ -151,6 +151,7 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
           deviceId: "device-1",
           deviceLabel: "Primary Phone",
           payloadSecret: "payload-secret-1",
+          deviceRefreshMode: "cookie",
           deviceRefreshToken: "refresh-token-1",
           deviceJoinTicket: "join-ticket-1",
           deviceJoinTicketExpiresAt: 123,
@@ -185,6 +186,39 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
   assert.ok(state.deviceKeypair);
   assert.match(state.requestedDeviceId, /^mobile-/);
   assert.equal(browser.localStorage.getItem("agent-relay.remote-device-keypair"), null);
+});
+
+test("self-hosted remote auth keeps the saved device join ticket across reloads", async () => {
+  const browser = installBrowserStubs();
+  browser.localStorage.setItem(
+    "agent-relay.remote-state-v2",
+    JSON.stringify({
+      activeRelayId: "relay-1",
+      remoteProfiles: {
+        "relay-1": {
+          relayId: "relay-1",
+          brokerUrl: "ws://broker.example.test",
+          brokerChannelId: "room-a",
+          relayPeerId: "relay-1",
+          securityMode: "private",
+          deviceId: "device-1",
+          deviceLabel: "Primary Phone",
+          payloadSecret: "payload-secret-1",
+          deviceJoinTicket: "self-hosted-join-ticket",
+          deviceJoinTicketExpiresAt: 123456,
+        },
+      },
+    })
+  );
+
+  const { state } = await import("./state.js?self-hosted-join-ticket");
+
+  assert.equal(state.remoteAuth?.deviceJoinTicket, "self-hosted-join-ticket");
+  assert.equal(state.remoteAuth?.deviceJoinTicketExpiresAt, 123456);
+
+  const stored = JSON.parse(browser.localStorage.getItem("agent-relay.remote-state-v2"));
+  assert.equal(stored.remoteProfiles["relay-1"].deviceJoinTicket, "self-hosted-join-ticket");
+  assert.equal(stored.remoteProfiles["relay-1"].deviceJoinTicketExpiresAt, 123456);
 });
 
 test("explicit relay home selection persists without auto-opening a stored relay", async () => {

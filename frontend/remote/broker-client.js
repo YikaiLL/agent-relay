@@ -46,6 +46,12 @@ export async function connectBroker(reason) {
       );
       return;
     }
+    if (state.remoteAuth && !state.remoteAuth.deviceJoinTicket && !canRefreshDeviceJoinTicket()) {
+      renderLog(
+        "This browser has an older saved relay profile that cannot reconnect automatically. Pair this relay again once to upgrade its local credentials."
+      );
+      return;
+    }
     renderLog("Broker connect skipped because no pairing or saved device is present.");
     return;
   }

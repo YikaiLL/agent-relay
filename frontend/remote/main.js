@@ -172,9 +172,6 @@ async function boot() {
   dom.deviceLabelInput.value = loadDeviceLabel();
   setRemoteSessionPanelOpen(false);
   const pairingQuery = applyPairingQuery();
-  if (!pairingQuery && state.remoteAuth) {
-    clearActiveRelaySelection();
-  }
   renderDeviceMeta();
   renderRelayDirectory();
   renderEmptyState();

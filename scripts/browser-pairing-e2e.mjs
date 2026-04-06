@@ -157,6 +157,13 @@ async function main() {
       { timeout: PAIRING_TIMEOUT_MS }
     );
 
+    await remotePage.reload({ waitUntil: "domcontentloaded" });
+    await remotePage.waitForFunction(() => {
+      const input = document.querySelector("#remote-message-input");
+      const badge = document.querySelector("#remote-status-badge")?.textContent || "";
+      return Boolean(input && !input.disabled && badge.trim() && !badge.toLowerCase().includes("offline"));
+    }, null, { timeout: PAIRING_TIMEOUT_MS });
+
     const remoteStatus = await remotePage.textContent("#remote-status-badge");
     const remoteDeviceMeta = await remotePage.textContent("#device-meta");
     const relaySession = await fetchSession(relayPort);

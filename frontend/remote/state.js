@@ -352,6 +352,8 @@ function normalizeRemoteProfile(profile, options = {}) {
     return null;
   }
 
+  const usesBrokerCookieRefresh = profile.deviceRefreshMode === "cookie";
+
   return {
     relayId: profile.relayId,
     relayLabel: profile.relayLabel || null,
@@ -362,10 +364,12 @@ function normalizeRemoteProfile(profile, options = {}) {
     deviceId: profile.deviceId,
     deviceLabel: profile.deviceLabel || defaultDeviceLabel(),
     payloadSecret: profile.payloadSecret,
-    deviceRefreshMode: profile.deviceRefreshMode === "cookie" ? "cookie" : null,
+    deviceRefreshMode: usesBrokerCookieRefresh ? "cookie" : null,
     deviceRefreshToken: fromStorage ? profile.deviceRefreshToken || null : profile.deviceRefreshToken ?? null,
-    deviceJoinTicket: fromStorage ? null : profile.deviceJoinTicket ?? null,
-    deviceJoinTicketExpiresAt: fromStorage ? null : profile.deviceJoinTicketExpiresAt ?? null,
+    deviceJoinTicket:
+      fromStorage && usesBrokerCookieRefresh ? null : profile.deviceJoinTicket ?? null,
+    deviceJoinTicketExpiresAt:
+      fromStorage && usesBrokerCookieRefresh ? null : profile.deviceJoinTicketExpiresAt ?? null,
     sessionClaim: fromStorage ? null : profile.sessionClaim ?? null,
     sessionClaimExpiresAt: fromStorage ? null : profile.sessionClaimExpiresAt ?? null,
   };
@@ -418,6 +422,14 @@ function persistRemoteStore() {
             profile.deviceRefreshMode === "cookie"
               ? null
               : profile.deviceRefreshToken || null,
+          deviceJoinTicket:
+            profile.deviceRefreshMode === "cookie"
+              ? null
+              : profile.deviceJoinTicket || null,
+          deviceJoinTicketExpiresAt:
+            profile.deviceRefreshMode === "cookie"
+              ? null
+              : profile.deviceJoinTicketExpiresAt || null,
         }),
       ])
     ),

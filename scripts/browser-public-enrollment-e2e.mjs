@@ -117,6 +117,12 @@ async function main() {
     }, null, { timeout: TIMEOUT_MS });
 
     await sendPromptAndWaitForReply(remotePage, ENROLLMENT_PROMPT);
+    await remotePage.reload({ waitUntil: "domcontentloaded" });
+    await remotePage.waitForFunction(() => {
+      const input = document.querySelector("#remote-message-input");
+      const badge = document.querySelector("#remote-status-badge")?.textContent || "";
+      return Boolean(input && !input.disabled && badge.trim() && !badge.toLowerCase().includes("offline"));
+    }, null, { timeout: TIMEOUT_MS });
 
     const relaySession = await fetchSession(relayPort);
     createdThreadId = relaySession.active_thread_id;
