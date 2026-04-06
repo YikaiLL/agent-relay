@@ -272,9 +272,8 @@ async function approvePendingPairing(localPage) {
 
 async function waitForPairedRemote(remotePage) {
   await remotePage.waitForFunction(() => {
-    const overview = document.querySelector("#remote-device-overview")?.textContent || "";
-    const meta = document.querySelector("#device-meta")?.textContent || "";
-    return overview.includes("Paired") || meta.includes("Paired");
+    const stored = JSON.parse(window.localStorage.getItem("agent-relay.remote-state-v2") || "null");
+    return Boolean(stored?.clientAuth?.clientId && Object.keys(stored?.remoteProfiles || {}).length);
   }, null, { timeout: TIMEOUT_MS });
 }
 

@@ -40,6 +40,7 @@ import {
   takeOverControl,
 } from "./session-ops.js";
 import {
+  clearActiveRelaySelection,
   ensureDeviceIdentity,
   loadDeviceLabel,
   selectRelayProfile,
@@ -130,6 +131,10 @@ dom.remoteRelaysRefreshButton.addEventListener("click", () => {
   void refreshRelayDirectoryFromUi();
 });
 
+dom.remoteHomeButton?.addEventListener("click", () => {
+  returnToRelayHome();
+});
+
 dom.remoteTakeOverButton.addEventListener("click", () => {
   void takeOverControl();
 });
@@ -167,6 +172,9 @@ async function boot() {
   dom.deviceLabelInput.value = loadDeviceLabel();
   setRemoteSessionPanelOpen(false);
   const pairingQuery = applyPairingQuery();
+  if (!pairingQuery && state.remoteAuth) {
+    clearActiveRelaySelection();
+  }
   renderDeviceMeta();
   renderRelayDirectory();
   renderEmptyState();
@@ -221,6 +229,26 @@ async function switchRelay(relayId) {
   renderThreads([]);
   renderLog(`Switching to relay ${relayId}.`);
   void connectBroker("switch relay");
+}
+
+function returnToRelayHome() {
+  if (!state.remoteAuth) {
+    return;
+  }
+
+  clearClaimLifecycle();
+  clearSessionRuntime();
+  rejectPendingActions("returned to relay directory before broker actions completed");
+  state.session = null;
+  state.threads = [];
+  state.currentApprovalId = null;
+  clearActiveRelaySelection();
+  closeBrokerSocket();
+  setRemoteSessionPanelOpen(false);
+  renderDeviceMeta();
+  renderEmptyState();
+  renderThreads([]);
+  renderLog("Returned to relay directory.");
 }
 
 async function refreshRelayDirectoryFromUi() {

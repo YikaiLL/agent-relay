@@ -57,7 +57,11 @@ export function renderThreads(threads) {
 
   if (!state.remoteAuth) {
     dom.remoteThreadsCount.textContent = "Remote session history";
-    dom.remoteThreadsList.innerHTML = `<p class="sidebar-empty">Pair a device, then refresh remote history.</p>`;
+    dom.remoteThreadsList.innerHTML = `<p class="sidebar-empty">${
+      state.relayDirectory?.length
+        ? "Open a relay to view its session history."
+        : "Pair a relay, then refresh remote history."
+    }</p>`;
     return;
   }
 
@@ -132,10 +136,23 @@ export function renderDeviceMeta() {
 }
 
 export function renderEmptyState() {
+  syncIdleSurfaceControls();
+
+  if (!state.remoteAuth && !state.pairingTicket) {
+    renderRelayHome();
+    return;
+  }
+
   renderTranscriptEmptyState();
 }
 
 export function setRemoteSessionPanelOpen(open) {
+  if (!state.remoteAuth) {
+    dom.remoteSessionPanel.hidden = true;
+    dom.remoteSessionToggle.setAttribute("aria-expanded", "false");
+    dom.remoteSessionToggle.textContent = "Select a relay first";
+    return;
+  }
   dom.remoteSessionPanel.hidden = !open;
   dom.remoteSessionToggle.setAttribute("aria-expanded", String(open));
   dom.remoteSessionToggle.textContent = open ? "Close Remote Session Setup" : "Start Remote Session";
@@ -180,4 +197,87 @@ function syncRemoteModelSuggestions(models, selectedModel) {
     .map((model) => `<option value="${escapeHtml(model.model)}">${escapeHtml(model.display_name)}</option>`)
     .join("");
   dom.remoteModelInput.value = currentValue;
+}
+
+function renderRelayHome() {
+  if (state.relayDirectory?.length) {
+    dom.remoteTranscript.innerHTML = `
+      <div class="relay-home">
+        <section class="thread-empty relay-home-empty">
+          <span class="thread-empty-badge">My relays</span>
+          <h2>Choose a relay</h2>
+          <p>This browser already has access to one or more relays. Open one below, or pair another from your local machine.</p>
+        </section>
+        <section class="relay-home-list">
+          ${state.relayDirectory.map(renderRelayHomeCard).join("")}
+        </section>
+      </div>
+    `;
+
+    dom.remoteTranscript.querySelectorAll("[data-relay-home-id]").forEach((button) => {
+      button.addEventListener("click", () => {
+        onSelectRelay(button.dataset.relayHomeId);
+      });
+    });
+    return;
+  }
+
+  dom.remoteTranscript.innerHTML = `
+    <div class="thread-empty relay-home-empty">
+      <span class="thread-empty-badge">Pairing</span>
+      <h2>${state.clientAuth ? "No relays yet" : "Pair your first relay"}</h2>
+      <p>${
+        state.clientAuth
+          ? "This browser has a client identity but no relay grants yet. Open a new QR code from a local relay to add one here."
+          : "Open a pairing QR code from your local relay to add your first remote surface to this browser."
+      }</p>
+    </div>
+  `;
+}
+
+function renderRelayHomeCard(relay) {
+  const title = relay.relayLabel || relay.relayId;
+  const subtitle = relay.hasLocalProfile
+    ? relay.deviceLabel || relay.deviceId
+    : "This browser can see the grant, but it does not have local encrypted access for this relay yet.";
+  const meta = relay.grantedAt
+    ? `Granted ${formatTimestamp(relay.grantedAt)}`
+    : relay.brokerRoomId || relay.relayId;
+  const cta = relay.hasLocalProfile ? "Open relay" : "Pair again in this browser";
+
+  return `
+    <button class="relay-home-card" type="button" data-relay-home-id="${escapeHtml(relay.relayId)}" ${relay.hasLocalProfile ? "" : "disabled"}>
+      <div class="relay-home-card-copy">
+        <span class="relay-home-card-label">${escapeHtml(title)}</span>
+        <strong class="relay-home-card-title">${escapeHtml(title)}</strong>
+        <p class="relay-home-card-body">${escapeHtml(subtitle)}</p>
+      </div>
+      <div class="relay-home-card-meta">
+        <span>${escapeHtml(meta)}</span>
+        <span>${escapeHtml(cta)}</span>
+      </div>
+    </button>
+  `;
+}
+
+function syncIdleSurfaceControls() {
+  const hasRelay = Boolean(state.remoteAuth);
+  dom.remoteSessionToggle.disabled = !hasRelay;
+  dom.remoteThreadsRefreshButton.disabled = !hasRelay;
+  dom.remoteThreadsCwdInput.disabled = !hasRelay;
+  dom.remoteStartSessionButton.disabled = !hasRelay;
+
+  if (!hasRelay) {
+    setRemoteSessionPanelOpen(false);
+  }
+
+  dom.remoteSendButton.disabled = true;
+  dom.remoteMessageInput.disabled = true;
+  dom.remoteMessageInput.placeholder = !hasRelay
+    ? state.relayDirectory?.length
+      ? "Open a relay before sending messages."
+      : "Pair this browser before sending messages."
+    : "Start or resume a remote session first.";
+  dom.remoteHomeButton.hidden = !hasRelay;
+  dom.remoteHomeButton.disabled = !hasRelay;
 }

@@ -124,9 +124,8 @@ async function main() {
     await localPage.click("[data-pairing-id][data-pairing-decision='approve']");
 
     await remotePage.waitForFunction(() => {
-      const overview = document.querySelector("#remote-device-overview")?.textContent || "";
-      const meta = document.querySelector("#device-meta")?.textContent || "";
-      return overview.includes("Paired") || meta.includes("Paired");
+      const stored = JSON.parse(window.localStorage.getItem("agent-relay.remote-state-v2") || "null");
+      return Boolean(stored?.clientAuth?.clientId && Object.keys(stored?.remoteProfiles || {}).length);
     }, null, { timeout: TIMEOUT_MS });
     await remotePage.waitForFunction(() => Boolean(window.__agentRelayLastSocket), null, {
       timeout: TIMEOUT_MS,
@@ -326,6 +325,7 @@ async function installSocketLifecycleHook(page) {
 }
 
 async function openRemoteSessionPanel(page) {
+  await selectFirstRelayIfNeeded(page);
   await page.click("#remote-session-toggle");
   await page.waitForFunction(() => {
     const panel = document.querySelector("#remote-session-panel");
@@ -336,6 +336,22 @@ async function openRemoteSessionPanel(page) {
     const details = document.querySelector("#remote-session-panel details");
     return Boolean(details && details.open);
   });
+}
+
+async function selectFirstRelayIfNeeded(page) {
+  const needsSelection = await page.evaluate(() => {
+    const toggle = document.querySelector("#remote-session-toggle");
+    return Boolean(toggle?.disabled);
+  });
+  if (!needsSelection) {
+    return;
+  }
+
+  await page.click("#remote-relays-list [data-relay-id]:not([disabled])");
+  await page.waitForFunction(() => {
+    const toggle = document.querySelector("#remote-session-toggle");
+    return Boolean(toggle && !toggle.disabled);
+  }, null, { timeout: TIMEOUT_MS });
 }
 
 async function sendPromptAndWaitForReply(page, prompt) {

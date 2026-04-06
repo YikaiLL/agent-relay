@@ -21,6 +21,7 @@ import {
 } from "./actions.js";
 import {
   renderDeviceMeta,
+  renderEmptyState,
   renderLog,
   renderThreads,
   resetRemoteSurface,
@@ -214,6 +215,7 @@ export async function handleEncryptedPairingResult(payload) {
   closePairingModalIfOpen();
   clearPairingQueryFromUrl();
   renderDeviceMeta();
+  renderEmptyState();
   renderLog(`Paired remote device ${device.label} (${shortId(device.device_id)}).`);
   await ensureRemoteClaim({
     force: true,

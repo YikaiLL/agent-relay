@@ -35,12 +35,13 @@ export function renderDeviceMeta() {
     dom.deviceMeta.innerHTML = `
       <p class="sidebar-empty">${
         state.relayDirectory?.length
-          ? "Select a relay from the sidebar to open its remote surface."
-          : "No paired remote device stored in this browser."
+          ? "Open one of your relays from home or the sidebar to enter its remote surface."
+          : "No paired remote device is stored in this browser yet."
       }</p>
     `;
     syncWorkspaceHeading();
     updatePairingControls();
+    updateHomeButton();
     renderOverviewCards();
     return;
   }
@@ -83,6 +84,7 @@ export function renderDeviceMeta() {
   dom.deviceMeta.innerHTML = rows.join("");
   syncWorkspaceHeading();
   updatePairingControls();
+  updateHomeButton();
   renderOverviewCards();
 }
 
@@ -123,7 +125,7 @@ export function updateStatusBadge() {
   }
 
   if (!state.remoteAuth && state.relayDirectory?.length) {
-    dom.remoteStatusBadge.textContent = "Select relay";
+    dom.remoteStatusBadge.textContent = "Home";
     dom.remoteStatusBadge.className = "status-badge status-badge-ready";
     renderOverviewCards();
     return;
@@ -142,6 +144,7 @@ export function resetRemoteSurfaceChrome() {
   dom.remoteWorkspaceTitle.textContent = workspaceTitle();
   dom.remoteWorkspaceSubtitle.textContent = workspaceSubtitle();
   renderEmptyState();
+  updateHomeButton();
   updateStatusBadge();
 }
 
@@ -356,6 +359,10 @@ function updatePairingControls() {
   dom.pairingInput.readOnly = pairingBusy;
 }
 
+function updateHomeButton() {
+  dom.remoteHomeButton.hidden = !state.remoteAuth || !(state.relayDirectory?.length);
+}
+
 function syncWorkspaceHeading() {
   if (state.session?.active_thread_id) {
     return;
@@ -373,9 +380,9 @@ function workspaceTitle() {
     return state.pairingPhase === "error" ? "Pairing failed" : "Pairing this browser";
   }
   if (state.relayDirectory?.length) {
-    return "Choose a relay";
+    return "My relays";
   }
-  return "Pair this browser";
+  return state.clientAuth ? "No relays yet" : "Pair this browser";
 }
 
 function workspaceSubtitle() {
@@ -386,9 +393,11 @@ function workspaceSubtitle() {
     return pairingCopy();
   }
   if (state.relayDirectory?.length) {
-    return "This browser already has access to one or more relays. Pick one from the sidebar.";
+    return "This browser already has access to one or more relays. Open one from the home view or sidebar, or pair another from your local relay.";
   }
-  return "Open a pairing QR from your local relay to control Codex remotely.";
+  return state.clientAuth
+    ? "This browser has a client identity but no relay grants yet. Pair a relay from your local machine to add one here."
+    : "Open a pairing QR from your local relay to control Codex remotely.";
 }
 
 function pairingHeading() {

@@ -186,3 +186,42 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
   assert.match(state.requestedDeviceId, /^mobile-/);
   assert.equal(browser.localStorage.getItem("agent-relay.remote-device-keypair"), null);
 });
+
+test("explicit relay home selection persists without auto-opening a stored relay", async () => {
+  const browser = installBrowserStubs();
+  browser.localStorage.setItem(
+    "agent-relay.remote-state-v2",
+    JSON.stringify({
+      activeRelayId: null,
+      remoteProfiles: {
+        "relay-1": {
+          relayId: "relay-1",
+          brokerUrl: "ws://broker.example.test",
+          brokerChannelId: "room-a",
+          relayPeerId: "relay-1",
+          securityMode: "private",
+          deviceId: "device-1",
+          deviceLabel: "Primary Phone",
+          payloadSecret: "payload-secret-1",
+        },
+      },
+    })
+  );
+
+  const { clearActiveRelaySelection, selectRelayProfile, state } = await import("./state.js?home-selection");
+
+  assert.equal(state.activeRelayId, null);
+  assert.equal(state.remoteAuth, null);
+
+  assert.equal(selectRelayProfile("relay-1"), true);
+  assert.equal(state.activeRelayId, "relay-1");
+  assert.equal(state.remoteAuth?.relayId, "relay-1");
+
+  clearActiveRelaySelection();
+  assert.equal(state.activeRelayId, null);
+  assert.equal(state.remoteAuth, null);
+
+  const stored = JSON.parse(browser.localStorage.getItem("agent-relay.remote-state-v2"));
+  assert.equal(stored.activeRelayId, null);
+  assert.equal(stored.remoteProfiles["relay-1"].relayId, "relay-1");
+});

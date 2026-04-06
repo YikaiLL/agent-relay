@@ -225,6 +225,12 @@ export function selectRelayProfile(relayId) {
   return true;
 }
 
+export function clearActiveRelaySelection() {
+  state.activeRelayId = null;
+  state.remoteAuth = null;
+  persistRemoteStore();
+}
+
 export function listRelayProfiles() {
   return Object.values(state.remoteProfiles).sort((left, right) => {
     return (left.relayLabel || left.relayId).localeCompare(right.relayLabel || right.relayId);
@@ -238,12 +244,8 @@ export function forgetCurrentRemoteProfile() {
   }
 
   delete state.remoteProfiles[state.activeRelayId];
-  const nextRelayId = nextRelaySelection(state.remoteProfiles, state.activeRelayId);
-  state.activeRelayId = nextRelayId;
-  state.remoteAuth = nextRelayId ? state.remoteProfiles[nextRelayId] : null;
-  if (!state.remoteAuth) {
-    state.clientAuth = null;
-  }
+  state.activeRelayId = null;
+  state.remoteAuth = null;
   state.relayDirectory = deriveRelayDirectory(state.remoteProfiles, []);
   persistRemoteStore();
 }
@@ -315,10 +317,13 @@ function loadRemoteStore() {
         ])
         .filter(([, profile]) => Boolean(profile))
     );
+    const hasPersistedSelection = Object.prototype.hasOwnProperty.call(parsed || {}, "activeRelayId");
     const activeRelayId =
       typeof parsed?.activeRelayId === "string" && remoteProfiles[parsed.activeRelayId]
         ? parsed.activeRelayId
-        : nextRelaySelection(remoteProfiles, null);
+        : hasPersistedSelection
+          ? null
+          : nextRelaySelection(remoteProfiles, null);
     const clientAuth = normalizeClientAuth(parsed?.clientAuth);
     return {
       clientAuth,
@@ -379,7 +384,7 @@ function normalizeClientAuth(value) {
 }
 
 function syncCurrentRemoteAuth() {
-  if (!state.activeRelayId || !state.remoteProfiles[state.activeRelayId]) {
+  if (state.activeRelayId && !state.remoteProfiles[state.activeRelayId]) {
     state.activeRelayId = nextRelaySelection(state.remoteProfiles, null);
   }
   state.remoteAuth = state.activeRelayId ? state.remoteProfiles[state.activeRelayId] : null;

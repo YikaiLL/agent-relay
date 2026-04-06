@@ -27,6 +27,7 @@ export const remoteDeviceOverview = document.querySelector("#remote-device-overv
 export const remoteSessionOverview = document.querySelector("#remote-session-overview");
 export const remoteWorkspaceTitle = document.querySelector("#remote-workspace-title");
 export const remoteWorkspaceSubtitle = document.querySelector("#remote-workspace-subtitle");
+export const remoteHomeButton = document.querySelector("#remote-home-button");
 export const remoteStatusBadge = document.querySelector("#remote-status-badge");
 export const remoteSessionMeta = document.querySelector("#remote-session-meta");
 export const remoteControlBanner = document.querySelector("#remote-control-banner");
