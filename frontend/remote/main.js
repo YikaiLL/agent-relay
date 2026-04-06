@@ -141,11 +141,6 @@ async function boot() {
   }
   try {
     await ensureDeviceIdentity();
-    if (state.deviceKeyStorageMode === "legacy") {
-      renderLog(
-        "This browser is using legacy localStorage for its device signing key. Re-pair from a secure modern browser context to upgrade storage."
-      );
-    }
   } catch (error) {
     renderLog(`Device identity could not be initialized: ${error.message}`);
   }

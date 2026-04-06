@@ -66,19 +66,18 @@ function installBrowserStubs() {
   return { elements };
 }
 
-test("legacy device key storage renders a visible warning", async () => {
+test("device meta renders without old key-storage warnings", async () => {
   const browser = installBrowserStubs();
   const { renderDeviceMeta } = await import("./render-chrome.js");
   const { state } = await import("./state.js");
 
-  state.deviceKeyStorageMode = "legacy";
   state.remoteAuth = null;
   state.pairingTicket = null;
   renderDeviceMeta();
 
   const unpairedMarkup = browser.elements.get("#device-meta").innerHTML;
-  assert.match(unpairedMarkup, /Legacy key storage/);
-  assert.match(unpairedMarkup, /device signing key in legacy localStorage/);
+  assert.doesNotMatch(unpairedMarkup, /Legacy key storage/);
+  assert.doesNotMatch(unpairedMarkup, /legacy localStorage/);
 
   state.remoteAuth = {
     brokerUrl: "ws://broker.example.test",
@@ -98,6 +97,7 @@ test("legacy device key storage renders a visible warning", async () => {
   renderDeviceMeta();
 
   const pairedMarkup = browser.elements.get("#device-meta").innerHTML;
-  assert.match(pairedMarkup, /Legacy key storage/);
-  assert.match(pairedMarkup, /protected browser crypto storage/);
+  assert.doesNotMatch(pairedMarkup, /Legacy key storage/);
+  assert.doesNotMatch(pairedMarkup, /legacy localStorage/);
+  assert.match(pairedMarkup, /Primary Phone/);
 });

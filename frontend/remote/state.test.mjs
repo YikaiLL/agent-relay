@@ -1,5 +1,94 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
+
+function createRequest() {
+  return {
+    result: undefined,
+    error: null,
+    onsuccess: null,
+    onerror: null,
+  };
+}
+
+function createIndexedDbStub() {
+  const databases = new Map();
+
+  function createDatabase() {
+    const stores = new Map();
+
+    return {
+      objectStoreNames: {
+        contains(name) {
+          return stores.has(name);
+        },
+      },
+      createObjectStore(name, options = {}) {
+        if (!stores.has(name)) {
+          stores.set(name, {
+            keyPath: options.keyPath || "id",
+            records: new Map(),
+          });
+        }
+        return {};
+      },
+      transaction(name) {
+        const storeState = stores.get(name);
+        const transaction = {
+          error: null,
+          oncomplete: null,
+          onabort: null,
+          onerror: null,
+          objectStore() {
+            return {
+              get(key) {
+                const request = createRequest();
+                queueMicrotask(() => {
+                  request.result = storeState.records.get(key);
+                  request.onsuccess?.();
+                  queueMicrotask(() => transaction.oncomplete?.());
+                });
+                return request;
+              },
+              put(value) {
+                const request = createRequest();
+                queueMicrotask(() => {
+                  storeState.records.set(value[storeState.keyPath], value);
+                  request.result = value[storeState.keyPath];
+                  request.onsuccess?.();
+                  queueMicrotask(() => transaction.oncomplete?.());
+                });
+                return request;
+              },
+            };
+          },
+        };
+        return transaction;
+      },
+      close() {},
+    };
+  }
+
+  return {
+    open(name) {
+      const request = createRequest();
+      queueMicrotask(() => {
+        let database = databases.get(name);
+        const isNew = !database;
+        if (!database) {
+          database = createDatabase();
+          databases.set(name, database);
+        }
+        request.result = database;
+        if (isNew) {
+          request.onupgradeneeded?.();
+        }
+        queueMicrotask(() => request.onsuccess?.());
+      });
+      return request;
+    },
+  };
+}
 
 function installBrowserStubs() {
   const storage = new Map();
@@ -27,10 +116,20 @@ function installBrowserStubs() {
     btoa(value) {
       return Buffer.from(value, "binary").toString("base64");
     },
+    crypto: webcrypto,
+    indexedDB: createIndexedDbStub(),
   };
   Object.defineProperty(globalThis, "navigator", {
     configurable: true,
     value: { platform: "Test Browser" },
+  });
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: webcrypto,
+  });
+  Object.defineProperty(globalThis, "indexedDB", {
+    configurable: true,
+    value: window.indexedDB,
   });
 
   return { localStorage };
@@ -48,10 +147,10 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
       deviceId: "device-1",
       deviceLabel: "Primary Phone",
       payloadSecret: "payload-secret-1",
-      deviceRefreshToken: "legacy-refresh-token",
-      deviceJoinTicket: "legacy-join-ticket",
+      deviceRefreshToken: "refresh-token-1",
+      deviceJoinTicket: "join-ticket-1",
       deviceJoinTicketExpiresAt: 123,
-      sessionClaim: "legacy-session-claim",
+      sessionClaim: "session-claim-1",
       sessionClaimExpiresAt: 456,
     })
   );
@@ -60,7 +159,7 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
 
   assert.equal(state.remoteAuth.deviceId, "device-1");
   assert.equal(state.remoteAuth.payloadSecret, "payload-secret-1");
-  assert.equal(state.remoteAuth.deviceRefreshToken, "legacy-refresh-token");
+  assert.equal(state.remoteAuth.deviceRefreshToken, "refresh-token-1");
   assert.equal(state.remoteAuth.deviceJoinTicket, null);
   assert.equal(state.remoteAuth.sessionClaim, null);
 
@@ -78,9 +177,5 @@ test("remote auth storage keeps durable metadata but drops refresh and session s
   await ensureDeviceIdentity();
   assert.ok(state.deviceKeypair);
   assert.match(state.requestedDeviceId, /^mobile-/);
-  const legacyKeypair = JSON.parse(
-    browser.localStorage.getItem("agent-relay.remote-device-keypair")
-  );
-  assert.ok(legacyKeypair.verifyKey);
-  assert.ok(legacyKeypair.signSecretKey);
+  assert.equal(browser.localStorage.getItem("agent-relay.remote-device-keypair"), null);
 });

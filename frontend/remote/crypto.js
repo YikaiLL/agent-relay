@@ -3,7 +3,6 @@ import nacl from "tweetnacl";
 
 import { base64ToBytes, base64UrlToBytes, bytesToBase64 } from "./encoding.js";
 
-const REMOTE_DEVICE_KEYPAIR_STORAGE_KEY = "agent-relay.remote-device-keypair";
 const REMOTE_DEVICE_KEY_DB_NAME = "agent-relay-crypto";
 const REMOTE_DEVICE_KEY_STORE_NAME = "device-keys";
 const REMOTE_DEVICE_KEY_RECORD_ID = "remote-device-keypair-v1";
@@ -146,79 +145,18 @@ function deriveSecretKey(secret) {
 }
 
 async function loadOrCreateDeviceKeypair() {
-  if (supportsProtectedDeviceKeypairStorage()) {
-    try {
-      const protectedKeypair = await loadProtectedDeviceKeypair();
-      if (protectedKeypair) {
-        clearLegacyDeviceKeypairStorage();
-        return protectedKeypair;
-      }
-    } catch {
-      // Fall back to legacy storage if the browser cannot restore the protected key.
-    }
+  if (!supportsProtectedDeviceKeypairStorage()) {
+    throw new Error(
+      "protected device key storage is unavailable in this browser context"
+    );
   }
 
-  const legacyKeypair = loadLegacyDeviceKeypair();
-  if (legacyKeypair) {
-    return legacyKeypair;
+  const protectedKeypair = await loadProtectedDeviceKeypair();
+  if (protectedKeypair) {
+    return protectedKeypair;
   }
 
-  if (supportsProtectedDeviceKeypairStorage()) {
-    try {
-      const protectedKeypair = await createProtectedDeviceKeypair();
-      clearLegacyDeviceKeypairStorage();
-      return protectedKeypair;
-    } catch {
-      // Fall back to legacy storage below.
-    }
-  }
-
-  return createLegacyDeviceKeypair();
-}
-
-function loadLegacyDeviceKeypair() {
-  const raw = window.localStorage.getItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
-  if (!raw) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed?.verifyKey && parsed?.signSecretKey) {
-      return {
-        verifyKey: parsed.verifyKey,
-        storageMode: "legacy",
-        async sign(messageBytes) {
-          return nacl.sign.detached(messageBytes, base64ToBytes(parsed.signSecretKey));
-        },
-      };
-    }
-  } catch {
-    clearLegacyDeviceKeypairStorage();
-  }
-
-  clearLegacyDeviceKeypairStorage();
-  return null;
-}
-
-function createLegacyDeviceKeypair() {
-  const keypair = nacl.sign.keyPair();
-  const stored = {
-    verifyKey: bytesToBase64(keypair.publicKey),
-    signSecretKey: bytesToBase64(keypair.secretKey),
-  };
-  window.localStorage.setItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY, JSON.stringify(stored));
-  return {
-    verifyKey: stored.verifyKey,
-    storageMode: "legacy",
-    async sign(messageBytes) {
-      return nacl.sign.detached(messageBytes, keypair.secretKey);
-    },
-  };
-}
-
-function clearLegacyDeviceKeypairStorage() {
-  window.localStorage.removeItem(REMOTE_DEVICE_KEYPAIR_STORAGE_KEY);
+  return createProtectedDeviceKeypair();
 }
 
 function supportsProtectedDeviceKeypairStorage() {
@@ -264,7 +202,6 @@ function buildProtectedDeviceKeypair(record) {
   const webcrypto = getWebCrypto();
   return {
     verifyKey: record.verifyKey,
-    storageMode: "webcrypto",
     async sign(messageBytes) {
       const signature = await webcrypto.subtle.sign("Ed25519", record.privateKey, messageBytes);
       return new Uint8Array(signature);

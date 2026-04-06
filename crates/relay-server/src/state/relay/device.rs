@@ -32,7 +32,6 @@ pub(crate) struct PendingPairing {
 pub(crate) struct PairedDevice {
     pub(crate) device_id: String,
     pub(crate) label: String,
-    #[serde(alias = "shared_secret")]
     pub(crate) payload_secret: String,
     #[serde(default)]
     pub(crate) device_verify_key: String,

@@ -34,7 +34,6 @@ export function renderDeviceMeta() {
   if (!state.remoteAuth && !state.pairingTicket) {
     dom.deviceMeta.innerHTML = `
       <p class="sidebar-empty">No paired remote device stored in this browser.</p>
-      ${deviceKeyStorageWarningMarkup()}
     `;
     syncWorkspaceHeading();
     updatePairingControls();
@@ -51,11 +50,9 @@ export function renderDeviceMeta() {
           <strong>${escapeHtml(pairingHeading())}</strong>
           <div class="paired-device-badges">
             ${statusBadgeMarkup(pairingBadgeText(), pairingBadgeTone())}
-            ${deviceKeyStorageBadgeMarkup()}
           </div>
           <p class="paired-device-meta">${escapeHtml(shortId(state.pairingTicket.pairing_id))} · expires ${escapeHtml(formatTimestamp(state.pairingTicket.expires_at))}</p>
           <p class="paired-device-meta">${escapeHtml(pairingCopy())}</p>
-          ${deviceKeyStorageWarningCopyMarkup()}
         </div>
       </article>
     `);
@@ -70,12 +67,10 @@ export function renderDeviceMeta() {
             ${statusBadgeMarkup("Paired", "ready")}
             ${statusBadgeMarkup(securityModeLabel(state.session), state.remoteAuth.securityMode === "managed" ? "alert" : "ready")}
             ${statusBadgeMarkup(remoteAccessStatusText(), remoteAccessBadgeTone())}
-            ${deviceKeyStorageBadgeMarkup()}
           </div>
           <p class="paired-device-meta">Device ${escapeHtml(shortId(state.remoteAuth.deviceId))}</p>
           <p class="paired-device-meta">Broker ${escapeHtml(state.remoteAuth.brokerChannelId)} via ${escapeHtml(shortId(state.remoteAuth.relayPeerId))}</p>
           <p class="paired-device-meta">${escapeHtml(remoteAccessLabel())}</p>
-          ${deviceKeyStorageWarningCopyMarkup()}
         </div>
       </article>
     `);
@@ -341,48 +336,6 @@ function controllerLabel(deviceId) {
 
 function statusBadgeMarkup(label, tone = "ready") {
   return `<span class="status-badge status-badge-${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
-}
-
-function deviceKeyStorageBadgeMarkup() {
-  if (state.deviceKeyStorageMode !== "legacy") {
-    return "";
-  }
-
-  return statusBadgeMarkup("Legacy key storage", "alert");
-}
-
-function deviceKeyStorageWarningCopyMarkup() {
-  if (state.deviceKeyStorageMode !== "legacy") {
-    return "";
-  }
-
-  return `
-    <p class="paired-device-warning">
-      This browser is still storing its device signing key in legacy localStorage.
-      Re-pair from a secure modern browser context to move the key into protected browser crypto storage.
-    </p>
-  `;
-}
-
-function deviceKeyStorageWarningMarkup() {
-  if (state.deviceKeyStorageMode !== "legacy") {
-    return "";
-  }
-
-  return `
-    <article class="paired-device-card paired-device-card-warning">
-      <div class="paired-device-copy">
-        <strong>Device key storage warning</strong>
-        <div class="paired-device-badges">
-          ${statusBadgeMarkup("Legacy key storage", "alert")}
-        </div>
-        <p class="paired-device-warning">
-          This browser is still storing its device signing key in legacy localStorage.
-          Re-pair from a secure modern browser context to move the key into protected browser crypto storage.
-        </p>
-      </div>
-    </article>
-  `;
 }
 
 function updatePairingControls() {

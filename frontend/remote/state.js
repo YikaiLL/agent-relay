@@ -17,7 +17,6 @@ export const state = {
   currentApprovalId: null,
   deviceIdentityPromise: null,
   deviceKeypair: null,
-  deviceKeyStorageMode: null,
   pairingError: null,
   pairingPhase: null,
   pairingTicket: null,
@@ -167,7 +166,6 @@ export async function ensureDeviceIdentity() {
   state.deviceIdentityPromise = (async () => {
     const deviceKeypair = await ensureDeviceKeypair();
     state.deviceKeypair = deviceKeypair;
-    state.deviceKeyStorageMode = deviceKeypair.storageMode || null;
     state.requestedDeviceId = loadOrCreateRequestedDeviceId(deviceKeypair.verifyKey);
     return deviceKeypair;
   })();
@@ -211,7 +209,7 @@ function loadRemoteAuth() {
       !parsed?.brokerUrl ||
       !parsed?.brokerChannelId ||
       !parsed?.deviceId ||
-      !(parsed?.payloadSecret || parsed?.deviceToken)
+      !parsed?.payloadSecret
     ) {
       window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
       return null;
@@ -223,7 +221,7 @@ function loadRemoteAuth() {
       securityMode: parsed.securityMode || "private",
       deviceId: parsed.deviceId,
       deviceLabel: parsed.deviceLabel || defaultDeviceLabel(),
-      payloadSecret: parsed.payloadSecret || parsed.deviceToken,
+      payloadSecret: parsed.payloadSecret,
       deviceRefreshMode: parsed.deviceRefreshMode === "cookie" ? "cookie" : null,
       deviceRefreshToken: parsed.deviceRefreshToken || null,
       deviceJoinTicket: null,
