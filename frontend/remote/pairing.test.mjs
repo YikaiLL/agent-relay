@@ -1,0 +1,145 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+function createElementStub() {
+  return {
+    value: "",
+    textContent: "",
+    innerHTML: "",
+    className: "",
+    disabled: false,
+    hidden: false,
+    readOnly: false,
+    open: false,
+    dataset: {},
+    addEventListener() {},
+    setAttribute() {},
+    close() {
+      this.open = false;
+    },
+    showModal() {
+      this.open = true;
+    },
+    querySelectorAll() {
+      return [];
+    },
+    closest() {
+      return null;
+    },
+  };
+}
+
+function installBrowserStubs() {
+  const storage = new Map();
+  const elements = new Map();
+  const localStorage = {
+    getItem(key) {
+      return storage.has(key) ? storage.get(key) : null;
+    },
+    setItem(key, value) {
+      storage.set(key, String(value));
+    },
+    removeItem(key) {
+      storage.delete(key);
+    },
+  };
+
+  globalThis.document = {
+    querySelector(selector) {
+      if (!elements.has(selector)) {
+        elements.set(selector, createElementStub());
+      }
+      return elements.get(selector);
+    },
+  };
+  globalThis.window = {
+    localStorage,
+    location: { href: "https://remote.example.test/" },
+    history: {
+      replaceState() {},
+    },
+    atob(value) {
+      return Buffer.from(value, "base64").toString("binary");
+    },
+    btoa(value) {
+      return Buffer.from(value, "binary").toString("base64");
+    },
+    crypto: {
+      getRandomValues(buffer) {
+        return buffer.fill(7);
+      },
+    },
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { platform: "Test Browser" },
+  });
+}
+
+test("expired pairing link is rejected locally with a clear QR renewal message", async () => {
+  installBrowserStubs();
+  const { beginPairing } = await import("./pairing.js");
+  const { state } = await import("./state.js");
+
+  state.pairingTicket = null;
+  state.pairingPhase = null;
+  state.pairingError = null;
+
+  const payload = {
+    broker_channel_id: "dev-room",
+    broker_url: "ws://192.168.1.47:8788",
+    expires_at: Math.floor(Date.now() / 1000) - 5,
+    pairing_id: "pair-expired-local",
+    pairing_join_ticket: "expired-pairing-ticket",
+    pairing_secret: "expired-pairing-secret",
+    relay_peer_id: "local-relay",
+    security_mode: "private",
+    version: 1,
+  };
+  const raw = Buffer.from(JSON.stringify(payload)).toString("base64url");
+
+  await beginPairing(raw, { auto: true });
+
+  assert.equal(state.pairingPhase, "error");
+  assert.match(
+    state.pairingError,
+    /QR code or pairing link has expired.*Generate a new QR code/i
+  );
+});
+
+test("expired pairing result from relay is translated into a clear QR renewal message", async () => {
+  installBrowserStubs();
+  const { handleEncryptedPairingResult } = await import("./pairing.js");
+  const { encryptJson } = await import("./crypto.js");
+  const { state } = await import("./state.js");
+
+  state.socketPeerId = "surface-expired";
+  state.pairingPhase = "requesting";
+  state.pairingError = null;
+  state.pairingTicket = {
+    pairing_id: "pair-expired-approval",
+    pairing_secret: "expired-approval-secret",
+    broker_url: "ws://192.168.1.47:8788",
+    broker_channel_id: "dev-room",
+    relay_peer_id: "local-relay",
+    security_mode: "private",
+    expires_at: Math.floor(Date.now() / 1000) - 1,
+  };
+
+  const envelope = await encryptJson(state.pairingTicket.pairing_secret, {
+    ok: false,
+    error: "pairing request is missing or expired",
+  });
+
+  await handleEncryptedPairingResult({
+    pairing_id: state.pairingTicket.pairing_id,
+    target_peer_id: "surface-expired",
+    envelope,
+  });
+
+  assert.equal(state.pairingPhase, "error");
+  assert.match(
+    state.pairingError,
+    /QR code or pairing link has expired.*Generate a new QR code/i
+  );
+});

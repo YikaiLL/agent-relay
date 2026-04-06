@@ -240,3 +240,49 @@ test("old pairing links without pairing_join_ticket are rejected with a clear er
     /pairing link is outdated and missing pairing_join_ticket/
   );
 });
+
+test("expired pairing join ticket surfaces a clear QR renewal message", async () => {
+  installBrowserStubs();
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() {
+      return {};
+    },
+  });
+
+  const { state } = await import("./state.js");
+  const { configureBrokerClient, connectBroker } = await import("./broker-client.js");
+
+  state.remoteAuth = null;
+  state.socket = null;
+  state.socketConnected = false;
+  state.socketPeerId = null;
+  state.pairingTicket = {
+    broker_url: "ws://broker.example.test",
+    broker_channel_id: "dev-room",
+    pairing_id: "pair-expired-ticket",
+    pairing_join_ticket: "expired-join-ticket",
+    expires_at: Math.floor(Date.now() / 1000) - 10,
+  };
+  state.pairingPhase = "connecting";
+  state.pairingError = null;
+
+  configureBrokerClient({});
+  await connectBroker("expired pairing");
+
+  assert.equal(FakeWebSocket.instances.length > 0, true);
+  const socket = FakeWebSocket.instances.at(-1);
+  socket.emit("error", {});
+  socket.emit("message", {
+    data: JSON.stringify({
+      type: "error",
+      message: "join_ticket has expired",
+    }),
+  });
+
+  assert.equal(state.pairingPhase, "error");
+  assert.match(
+    state.pairingError,
+    /QR code or pairing link has expired.*Generate a new QR code/i
+  );
+});

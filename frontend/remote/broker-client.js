@@ -1,4 +1,5 @@
-import { renderLog, updateStatusBadge } from "./render.js";
+import { renderDeviceMeta, renderLog, updateStatusBadge } from "./render.js";
+import { isExpiredPairingError, normalizePairingError } from "./pairing-errors.js";
 import {
   brokerControlUrl,
   canRefreshDeviceJoinTicket,
@@ -240,6 +241,14 @@ async function handleSocketMessage(rawData, connectReason) {
   }
 
   if (frame.type === "error") {
+    if (state.pairingTicket && isExpiredPairingError(frame.message)) {
+      state.pairingPhase = "error";
+      state.pairingError = normalizePairingError(frame.message);
+      renderDeviceMeta();
+      updateStatusBadge();
+      renderLog(`Pairing failed: ${state.pairingError}`);
+      return;
+    }
     renderLog(`Broker error: ${frame.message}`);
     return;
   }

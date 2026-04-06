@@ -6,6 +6,7 @@ import {
   parsePairingPayload,
   signPairingProof,
 } from "./crypto.js";
+import { expiredPairingMessage, normalizePairingError } from "./pairing-errors.js";
 import {
   clearDeviceRefreshSession,
   closeBrokerSocket,
@@ -66,7 +67,15 @@ export async function beginPairing(rawValue, { auto = false } = {}) {
   }
 
   try {
-    state.pairingTicket = parsePairingPayload(raw);
+    const pairingTicket = parsePairingPayload(raw);
+    state.pairingTicket = pairingTicket;
+    if (pairingTicket.expires_at * 1000 <= Date.now()) {
+      state.pairingPhase = "error";
+      state.pairingError = expiredPairingMessage();
+      renderDeviceMeta();
+      renderLog(`Pairing failed: ${state.pairingError}`);
+      return;
+    }
     state.pairingPhase = "connecting";
     state.pairingError = null;
     state.session = null;
@@ -96,6 +105,13 @@ export async function beginPairing(rawValue, { auto = false } = {}) {
 export async function sendPairingRequest() {
   const ticket = state.pairingTicket;
   if (!ticket) {
+    return;
+  }
+  if (ticket.expires_at * 1000 <= Date.now()) {
+    state.pairingPhase = "error";
+    state.pairingError = expiredPairingMessage();
+    renderDeviceMeta();
+    renderLog(`Pairing failed: ${state.pairingError}`);
     return;
   }
   const deviceKeypair = await ensureDeviceIdentity();
@@ -138,9 +154,9 @@ export async function handleEncryptedPairingResult(payload) {
   const result = await decryptJson(state.pairingTicket.pairing_secret, payload.envelope);
   if (!result.ok) {
     state.pairingPhase = "error";
-    state.pairingError = result.error || "unknown pairing error";
+    state.pairingError = normalizePairingError(result.error);
     renderDeviceMeta();
-    renderLog(`Pairing failed: ${result.error || "unknown pairing error"}`);
+    renderLog(`Pairing failed: ${state.pairingError}`);
     return;
   }
 
