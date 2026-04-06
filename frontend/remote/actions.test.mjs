@@ -199,6 +199,7 @@ test("ensureRemoteClaim performs challenge-response without rotating payload sec
   const { ensureRemoteClaim, handleRemoteBrokerPayload } = await import("./actions.js");
 
   state.remoteAuth = {
+    relayId: "relay-1",
     brokerUrl: "wss://broker.example.test",
     brokerChannelId: "room-a",
     relayPeerId: "relay-1",
@@ -259,7 +260,6 @@ test("ensureRemoteClaim performs challenge-response without rotating payload sec
     syncAfterClaim: false,
   });
   await nextTick();
-  browser.runTimers();
 
   assert.equal(sessionClaim, "session-claim-2");
   assert.equal(sentPayloads.length, 2);
@@ -275,10 +275,11 @@ test("ensureRemoteClaim performs challenge-response without rotating payload sec
   assert.equal(state.remoteAuth.payloadSecret, "payload-secret-1");
   assert.equal(state.remoteAuth.sessionClaim, "session-claim-2");
 
-  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
-  assert.equal(storedAuth.payloadSecret, "payload-secret-1");
-  assert.equal(storedAuth.deviceRefreshToken, undefined);
-  assert.equal(storedAuth.deviceJoinTicket, undefined);
+  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-state-v2"));
+  const storedProfile = storedAuth.remoteProfiles["relay-1"];
+  assert.equal(storedProfile.payloadSecret, "payload-secret-1");
+  assert.equal(storedProfile.deviceRefreshToken, undefined);
+  assert.equal(storedProfile.deviceJoinTicket, undefined);
 });
 
 test("encrypted remote action results decrypt with the persisted payload secret", async () => {
@@ -289,6 +290,7 @@ test("encrypted remote action results decrypt with the persisted payload secret"
   const { handleRemoteBrokerPayload } = await import("./actions.js");
 
   state.remoteAuth = {
+    relayId: "relay-1",
     brokerUrl: "wss://broker.example.test",
     brokerChannelId: "room-a",
     relayPeerId: "relay-1",
@@ -325,8 +327,8 @@ test("encrypted remote action results decrypt with the persisted payload secret"
   assert.equal(state.remoteAuth.payloadSecret, "payload-secret-1");
   assert.equal(state.remoteAuth.sessionClaim, "session-claim-3");
 
-  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
-  assert.equal(storedAuth.payloadSecret, "payload-secret-1");
+  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-state-v2"));
+  assert.equal(storedAuth.remoteProfiles["relay-1"].payloadSecret, "payload-secret-1");
 });
 
 test("list_threads uses device access without pre-claiming control", async () => {
@@ -337,6 +339,7 @@ test("list_threads uses device access without pre-claiming control", async () =>
   const { dispatchOrRecover, handleRemoteBrokerPayload } = await import("./actions.js");
 
   state.remoteAuth = {
+    relayId: "relay-1",
     brokerUrl: "wss://broker.example.test",
     brokerChannelId: "room-a",
     relayPeerId: "relay-1",
@@ -406,6 +409,7 @@ test("recoverRemoteSession only auto-claims when this device still controls the 
   } = await import("./actions.js");
 
   state.remoteAuth = {
+    relayId: "relay-1",
     brokerUrl: "wss://broker.example.test",
     brokerChannelId: "room-a",
     relayPeerId: "relay-1",

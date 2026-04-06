@@ -6,8 +6,8 @@ use tokio::sync::watch;
 use crate::{
     codex::ThreadSyncData,
     protocol::{
-        ApprovalReceipt, DeviceLifecycleState, LogEntryView, SessionSnapshot, ThreadSummaryView,
-        ThreadsResponse, TranscriptEntryView,
+        ApprovalReceipt, DeviceLifecycleState, LogEntryView, ModelOptionView, SessionSnapshot,
+        ThreadSummaryView, ThreadsResponse, TranscriptEntryView,
     },
 };
 
@@ -188,6 +188,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             active_flags: Vec::new(),
             current_cwd: "/tmp/project".to_string(),
             model: DEFAULT_MODEL.to_string(),
+            available_models: Vec::new(),
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
             sandbox: DEFAULT_SANDBOX.to_string(),
             reasoning_effort: DEFAULT_EFFORT.to_string(),
@@ -219,6 +220,41 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             Some("replayed failure".to_string())
         },
     }
+}
+
+#[test]
+fn available_models_update_default_model_and_effort() {
+    let mut relay = test_state();
+    relay.model = DEFAULT_MODEL.to_string();
+    relay.reasoning_effort = DEFAULT_EFFORT.to_string();
+
+    relay.set_available_models(vec![
+        ModelOptionView {
+            model: "gpt-5.4".to_string(),
+            display_name: "gpt-5.4".to_string(),
+            supported_reasoning_efforts: vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+            default_reasoning_effort: "medium".to_string(),
+            hidden: false,
+            is_default: true,
+        },
+        ModelOptionView {
+            model: "gpt-5.1-codex-mini".to_string(),
+            display_name: "gpt-5.1-codex-mini".to_string(),
+            supported_reasoning_efforts: vec!["medium".to_string(), "high".to_string()],
+            default_reasoning_effort: "medium".to_string(),
+            hidden: false,
+            is_default: false,
+        },
+    ]);
+
+    assert_eq!(relay.model, "gpt-5.4");
+    assert_eq!(relay.reasoning_effort, "medium");
+    assert_eq!(relay.available_models.len(), 2);
 }
 
 #[test]
@@ -1308,6 +1344,54 @@ fn completed_pairing_can_replay_result_to_reconnected_peer() {
         Some("phone-replay")
     );
     assert!(replay.payload_secret.is_some());
+}
+
+#[test]
+fn completed_pairing_can_carry_client_directory_grant() {
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("phone-directory".to_string()),
+            Some("Directory Phone".to_string()),
+            "surface-a",
+            "verify-key-5".to_string(),
+            100,
+        )
+        .expect("pairing request should register");
+    relay
+        .decide_pairing_request(&ticket.pairing_id, true, None, 101)
+        .expect("approval should complete pairing");
+    relay
+        .attach_pairing_client_grant(
+            &ticket.pairing_id,
+            Some("relay-directory".to_string()),
+            Some("Demo Relay".to_string()),
+            Some("client-directory".to_string()),
+            Some("client-refresh-directory".to_string()),
+        )
+        .expect("client directory grant should attach");
+
+    let replay = relay
+        .completed_pairing_result(&ticket.pairing_id, "verify-key-5", "surface-b", 102)
+        .expect("completed pairing lookup should succeed")
+        .expect("completed pairing should be replayable");
+
+    assert_eq!(replay.relay_id.as_deref(), Some("relay-directory"));
+    assert_eq!(replay.relay_label.as_deref(), Some("Demo Relay"));
+    assert_eq!(replay.client_id.as_deref(), Some("client-directory"));
+    assert_eq!(
+        replay.client_refresh_token.as_deref(),
+        Some("client-refresh-directory")
+    );
 }
 
 #[test]

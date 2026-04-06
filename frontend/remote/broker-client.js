@@ -4,8 +4,11 @@ import {
   canRefreshDeviceJoinTicket,
   clearSocketPeerId,
   connectionTarget,
+  currentClientControlUrl,
   hasExpiredDeviceJoinTicket,
+  saveClientAuth,
   setSocketPeerId,
+  setRelayDirectory,
   saveRemoteAuth,
   state,
 } from "./state.js";
@@ -171,6 +174,43 @@ export async function clearDeviceRefreshSession(brokerUrl) {
     method: "DELETE",
     credentials: "same-origin",
   }).catch(() => {});
+}
+
+export async function refreshRelayDirectory(reason, { silent = false } = {}) {
+  if (!state.clientAuth?.clientRefreshToken) {
+    setRelayDirectory([]);
+    return [];
+  }
+
+  if (!silent) {
+    renderLog(`Refreshing relay directory (${reason}).`);
+  }
+
+  const url = new URL("/api/public/relays", currentClientControlUrl());
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${state.clientAuth.clientRefreshToken}`,
+    },
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.message || payload?.error || "relay directory refresh failed");
+  }
+
+  if (payload?.client_id && payload.client_id !== state.clientAuth.clientId) {
+    saveClientAuth({
+      ...state.clientAuth,
+      clientId: payload.client_id,
+    });
+  }
+
+  setRelayDirectory(payload?.relays || []);
+  return payload?.relays || [];
 }
 
 async function handleSocketMessage(rawData, connectReason) {

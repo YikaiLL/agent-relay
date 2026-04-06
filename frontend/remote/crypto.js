@@ -6,6 +6,8 @@ import { base64ToBytes, base64UrlToBytes, bytesToBase64 } from "./encoding.js";
 const REMOTE_DEVICE_KEY_DB_NAME = "agent-relay-crypto";
 const REMOTE_DEVICE_KEY_STORE_NAME = "device-keys";
 const REMOTE_DEVICE_KEY_RECORD_ID = "remote-device-keypair-v1";
+const REMOTE_DEVICE_KEY_KIND_PROTECTED = "protected";
+const REMOTE_DEVICE_KEY_KIND_SOFTWARE = "software";
 
 let deviceKeypairPromise = null;
 
@@ -145,22 +147,36 @@ function deriveSecretKey(secret) {
 }
 
 async function loadOrCreateDeviceKeypair() {
-  if (!supportsProtectedDeviceKeypairStorage()) {
-    throw new Error(
-      "protected device key storage is unavailable in this browser context"
-    );
+  const storedKeypair = await loadStoredDeviceKeypair();
+  if (storedKeypair) {
+    return storedKeypair;
   }
 
-  const protectedKeypair = await loadProtectedDeviceKeypair();
-  if (protectedKeypair) {
-    return protectedKeypair;
+  if (supportsProtectedDeviceKeypairStorage()) {
+    try {
+      return await createProtectedDeviceKeypair();
+    } catch (error) {
+      if (!supportsSoftwareDeviceKeypairStorage()) {
+        throw new Error(
+          `protected device key storage could not be initialized: ${error.message}`
+        );
+      }
+    }
   }
 
-  return createProtectedDeviceKeypair();
+  if (supportsSoftwareDeviceKeypairStorage()) {
+    return createSoftwareDeviceKeypair();
+  }
+
+  throw new Error("device signing key storage is unavailable in this browser context");
 }
 
 function supportsProtectedDeviceKeypairStorage() {
   return Boolean(getWebCrypto()?.subtle && getIndexedDb());
+}
+
+function supportsSoftwareDeviceKeypairStorage() {
+  return Boolean(getIndexedDb());
 }
 
 function getWebCrypto() {
@@ -171,12 +187,30 @@ function getIndexedDb() {
   return globalThis.indexedDB || window.indexedDB || null;
 }
 
-async function loadProtectedDeviceKeypair() {
+async function loadStoredDeviceKeypair() {
   const record = await readProtectedDeviceKeypairRecord();
-  if (!record?.verifyKey || !record.privateKey || !record.publicKey) {
+  if (!record) {
     return null;
   }
-  return buildProtectedDeviceKeypair(record);
+
+  if (
+    (record.kind === REMOTE_DEVICE_KEY_KIND_PROTECTED || !record.kind) &&
+    record.verifyKey &&
+    record.privateKey &&
+    record.publicKey
+  ) {
+    return buildProtectedDeviceKeypair(record);
+  }
+
+  if (
+    record.kind === REMOTE_DEVICE_KEY_KIND_SOFTWARE &&
+    record.verifyKey &&
+    record.signingSeed
+  ) {
+    return buildSoftwareDeviceKeypair(record);
+  }
+
+  return null;
 }
 
 async function createProtectedDeviceKeypair() {
@@ -190,6 +224,7 @@ async function createProtectedDeviceKeypair() {
   );
   const record = {
     id: REMOTE_DEVICE_KEY_RECORD_ID,
+    kind: REMOTE_DEVICE_KEY_KIND_PROTECTED,
     verifyKey,
     privateKey: generated.privateKey,
     publicKey: generated.publicKey,
@@ -207,6 +242,41 @@ function buildProtectedDeviceKeypair(record) {
       return new Uint8Array(signature);
     },
   };
+}
+
+async function createSoftwareDeviceKeypair() {
+  const signingSeed = randomSigningSeed();
+  const naclKeypair = nacl.sign.keyPair.fromSeed(signingSeed);
+  const record = {
+    id: REMOTE_DEVICE_KEY_RECORD_ID,
+    kind: REMOTE_DEVICE_KEY_KIND_SOFTWARE,
+    verifyKey: bytesToBase64(naclKeypair.publicKey),
+    signingSeed: bytesToBase64(signingSeed),
+  };
+  await writeProtectedDeviceKeypairRecord(record);
+  return buildSoftwareDeviceKeypair(record);
+}
+
+function buildSoftwareDeviceKeypair(record) {
+  const signingSeed = base64ToBytes(record.signingSeed);
+  const naclKeypair = nacl.sign.keyPair.fromSeed(signingSeed);
+  return {
+    verifyKey: record.verifyKey,
+    async sign(messageBytes) {
+      return nacl.sign.detached(messageBytes, naclKeypair.secretKey);
+    },
+  };
+}
+
+function randomSigningSeed() {
+  const webcrypto = getWebCrypto();
+  if (webcrypto?.getRandomValues) {
+    const seed = new Uint8Array(nacl.sign.seedLength);
+    webcrypto.getRandomValues(seed);
+    return seed;
+  }
+
+  return nacl.randomBytes(nacl.sign.seedLength);
 }
 
 async function readProtectedDeviceKeypairRecord() {

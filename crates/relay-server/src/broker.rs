@@ -27,7 +27,7 @@ use crate::{
 
 use self::auth::{
     complete_public_relay_enrollment, request_public_relay_enrollment_challenge, BrokerAuthConfig,
-    BrokerJoinCredential, DeviceBrokerCredential, PublicRelayRegistration,
+    BrokerJoinCredential, ClientBrokerGrant, DeviceBrokerCredential, PublicRelayRegistration,
     RELAY_BROKER_CONTROL_URL_ENV, RELAY_BROKER_REGISTRATION_PATH_ENV, RELAY_BROKER_RELAY_ID_ENV,
     RELAY_BROKER_RELAY_REFRESH_TOKEN_ENV,
 };
@@ -162,6 +162,10 @@ struct PairingResultPlaintext {
     ok: bool,
     device: Option<PairedDeviceView>,
     payload_secret: Option<String>,
+    relay_id: Option<String>,
+    relay_label: Option<String>,
+    client_id: Option<String>,
+    client_refresh_token: Option<String>,
     device_refresh_token: Option<String>,
     device_join_ticket: Option<String>,
     device_join_ticket_expires_at: Option<u64>,
@@ -438,6 +442,22 @@ impl BrokerConfig {
     ) -> Result<DeviceBrokerCredential, String> {
         self.auth
             .device_broker_credential(&self.broker_room_id, device_id, expires_at)
+            .await
+    }
+
+    pub(crate) async fn client_broker_grant(
+        &self,
+        device_id: &str,
+        client_verify_key: &str,
+        device_label: Option<String>,
+    ) -> Result<Option<ClientBrokerGrant>, String> {
+        self.auth
+            .client_broker_grant(
+                &self.broker_room_id,
+                device_id,
+                client_verify_key,
+                device_label,
+            )
             .await
     }
 
@@ -1027,6 +1047,10 @@ async fn publish_pairing_result(
             ok: result.error.is_none(),
             device: result.device,
             payload_secret: result.payload_secret,
+            relay_id: result.relay_id,
+            relay_label: result.relay_label,
+            client_id: result.client_id,
+            client_refresh_token: result.client_refresh_token,
             device_refresh_token: result.device_refresh_token,
             device_join_ticket: result.device_join_ticket,
             device_join_ticket_expires_at: result.device_join_ticket_expires_at,

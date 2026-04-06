@@ -31,10 +31,11 @@ use futures_util::{sink::SinkExt, StreamExt};
 use join_ticket::{JoinTicketClaims, JoinTicketKey, JoinTicketKind, JOIN_TICKET_SECRET_ENV};
 use protocol::{ClientMessage, ConnectQuery, HealthResponse, ServerMessage};
 use public_control::{
-    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
-    PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+    ClientGrantRequest, ClientGrantResponse, ClientRelaysResponse, DeviceGrantBulkRevokeRequest,
+    DeviceGrantBulkRevokeResponse, DeviceGrantRequest, DeviceGrantResponse,
+    DeviceGrantRevokeRequest, DeviceGrantRevokeResponse, DeviceSessionResponse,
+    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
+    RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
     RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
     RelayWsTokenResponse,
 };
@@ -437,6 +438,11 @@ fn app_with_web_root_and_verifier_and_hardening(
         )
         .route("/api/public/devices", post(public_issue_device_grant))
         .route(
+            "/api/public/clients/grants",
+            post(public_issue_client_grant),
+        )
+        .route("/api/public/relays", get(public_list_client_relays))
+        .route(
             "/api/public/device/session",
             post(public_issue_device_session).delete(public_clear_device_session),
         )
@@ -564,6 +570,37 @@ async fn public_issue_device_grant(
     let bearer = bearer_token(&headers)?;
     control_plane
         .issue_device_grant(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_issue_client_grant(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+    Json(input): Json<ClientGrantRequest>,
+) -> Result<Json<ClientGrantResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "client_grant").await?;
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .issue_client_grant(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+async fn public_list_client_relays(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    headers: HeaderMap,
+) -> Result<Json<ClientRelaysResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "client_relays").await?;
+    let control_plane = require_public_control_plane(&state)?;
+    let bearer = bearer_token(&headers)?;
+    control_plane
+        .list_client_relays(bearer)
         .await
         .map(Json)
         .map_err(public_api_error)

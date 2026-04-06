@@ -7,7 +7,9 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { sha256 } from "@noble/hashes/sha2.js";
 import { chromium } from "playwright";
+import nacl from "tweetnacl";
 import { deleteThreadAndWait, fetchSession } from "./e2e-thread-cleanup.mjs";
 
 const ROOT = process.cwd();
@@ -28,6 +30,7 @@ const BROKER_ROOM_ID =
 const DEVICE_WS_TTL_SECS = Number(process.env.BROWSER_E2E_PUBLIC_DEVICE_WS_TTL_SECS || 2);
 
 const managedProcesses = [];
+const remoteConsoleMessages = [];
 
 process.on("exit", () => {
   for (const child of managedProcesses) {
@@ -38,6 +41,7 @@ process.on("exit", () => {
 });
 
 async function main() {
+  remoteConsoleMessages.length = 0;
   const lanIp = resolvePrivateIpv4();
   const brokerPort = await getFreePort();
   const relayPort = await getFreePort();
@@ -100,6 +104,9 @@ async function main() {
     );
 
     remotePage = await context.newPage();
+    remotePage.on("console", (message) => {
+      remoteConsoleMessages.push(`[${message.type()}] ${message.text()}`);
+    });
     remotePage.on("request", (request) => {
       if (request.url().endsWith("/api/public/device/ws-token")) {
         refreshRequests.push(request.url());
@@ -271,11 +278,40 @@ async function installSocketLifecycleHook(page) {
 
     window.__agentRelaySocketLifecycleHookInstalled = true;
     const NativeWebSocket = window.WebSocket;
+    window.__agentRelaySentActionIds = [];
+    window.__agentRelayReceivedActionIds = [];
+    window.__agentRelayReceivedPayloads = {};
 
     class InstrumentedWebSocket extends NativeWebSocket {
       constructor(...args) {
         super(...args);
         window.__agentRelayLastSocket = this;
+        this.addEventListener("message", (event) => {
+          if (typeof event.data !== "string") {
+            return;
+          }
+          try {
+            const frame = JSON.parse(event.data);
+            const actionId = frame?.payload?.action_id;
+            if (actionId) {
+              window.__agentRelayReceivedActionIds.push(actionId);
+              window.__agentRelayReceivedPayloads[actionId] = frame.payload;
+            }
+          } catch {}
+        });
+      }
+
+      send(data) {
+        if (typeof data === "string") {
+          try {
+            const frame = JSON.parse(data);
+            const actionId = frame?.payload?.action_id;
+            if (actionId) {
+              window.__agentRelaySentActionIds.push(actionId);
+            }
+          } catch {}
+        }
+        return super.send(data);
       }
     }
 
@@ -345,9 +381,15 @@ async function waitForSingleStartedThread(relayPort, cwd, timeoutMs = TIMEOUT_MS
 }
 
 async function readStoredRemoteAuth(page) {
-  return page.evaluate(
-    () => JSON.parse(window.localStorage.getItem("agent-relay.remote-auth") || "null")
-  );
+  return page.evaluate(() => {
+    const parsed = JSON.parse(window.localStorage.getItem("agent-relay.remote-state-v2") || "null");
+    if (!parsed?.remoteProfiles) {
+      return null;
+    }
+    const activeRelayId =
+      parsed.activeRelayId || Object.keys(parsed.remoteProfiles)[0] || null;
+    return activeRelayId ? parsed.remoteProfiles[activeRelayId] || null : null;
+  });
 }
 
 async function readDeviceSessionCookie(context, origin) {
@@ -430,7 +472,69 @@ async function dumpBrowserState(localPage, remotePage) {
   if (remotePage) {
     console.error("\n[remote page]");
     console.error(await safeText(remotePage, "#remote-client-log"));
+    try {
+      const sentActionIds = await remotePage.evaluate(() => window.__agentRelaySentActionIds || []);
+      console.error("\n[remote sent actions]");
+      console.error(sentActionIds.join("\n"));
+    } catch {}
+    try {
+      const receivedActionIds = await remotePage.evaluate(
+        () => window.__agentRelayReceivedActionIds || []
+      );
+      console.error("\n[remote received actions]");
+      console.error(receivedActionIds.join("\n"));
+    } catch {}
+    if (remoteConsoleMessages.length) {
+      console.error("\n[remote console]");
+      console.error(remoteConsoleMessages.join("\n"));
+    }
+    try {
+      const debugInfo = await remotePage.evaluate(() => {
+        const parsed = JSON.parse(
+          window.localStorage.getItem("agent-relay.remote-state-v2") || "null"
+        );
+        const activeRelayId =
+          parsed?.activeRelayId || Object.keys(parsed?.remoteProfiles || {})[0] || null;
+        const activeProfile = activeRelayId ? parsed.remoteProfiles?.[activeRelayId] || null : null;
+        const receivedPayloads = window.__agentRelayReceivedPayloads || {};
+        const lastClaimChallengeActionId = (window.__agentRelayReceivedActionIds || [])
+          .filter((actionId) => actionId.startsWith("claim_challenge-"))
+          .at(-1);
+        return {
+          payloadSecret: activeProfile?.payloadSecret || null,
+          lastClaimChallengeActionId,
+          lastClaimChallengePayload: lastClaimChallengeActionId
+            ? receivedPayloads[lastClaimChallengeActionId] || null
+            : null,
+        };
+      });
+      if (debugInfo?.lastClaimChallengePayload?.envelope && debugInfo.payloadSecret) {
+        console.error("\n[remote last claim_challenge result]");
+        console.error(
+          JSON.stringify(
+            decryptEnvelope(debugInfo.payloadSecret, debugInfo.lastClaimChallengePayload.envelope),
+            null,
+            2
+          )
+        );
+      }
+    } catch {}
   }
+}
+
+function decryptEnvelope(secret, envelope) {
+  const key = sha256(new TextEncoder().encode(secret));
+  const nonce = Buffer.from(envelope.nonce, "base64");
+  const ciphertext = Buffer.from(envelope.ciphertext, "base64");
+  const plaintext = nacl.secretbox.open(
+    new Uint8Array(ciphertext),
+    new Uint8Array(nonce),
+    key
+  );
+  if (!plaintext) {
+    throw new Error("failed to decrypt debug envelope");
+  }
+  return JSON.parse(new TextDecoder().decode(plaintext));
 }
 
 async function safeText(page, selector) {

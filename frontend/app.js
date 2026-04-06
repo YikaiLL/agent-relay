@@ -59,7 +59,6 @@ const startSessionButton = document.querySelector("#start-session-button");
 const cwdInput = document.querySelector("#cwd-input");
 const startPromptInput = document.querySelector("#start-prompt");
 const modelInput = document.querySelector("#model-input");
-const modelOptions = document.querySelector("#model-options");
 const approvalPolicyInput = document.querySelector("#approval-policy-input");
 const sandboxInput = document.querySelector("#sandbox-input");
 const startEffortInput = document.querySelector("#start-effort");
@@ -1469,7 +1468,7 @@ function renderLogs(entries) {
 }
 
 function seedDefaults(session) {
-  syncModelSuggestions(modelInput, modelOptions, session.available_models || [], session.model);
+  syncModelSuggestions(modelInput, session.available_models || [], session.model);
 
   if (!state.defaultsSeeded) {
     if (!modelInput.value || modelInput.value === "gpt-5-codex") {
@@ -1487,18 +1486,24 @@ function seedDefaults(session) {
   }
 }
 
-function syncModelSuggestions(input, datalist, models, selectedModel) {
-  if (!datalist) {
+function syncModelSuggestions(select, models, selectedModel) {
+  if (!select) {
     return;
   }
 
-  datalist.innerHTML = (models || [])
+  const currentValue = selectedModel || select.value || "gpt-5.4";
+  const options = [...(models || [])];
+  if (currentValue && !options.some((model) => model.model === currentValue)) {
+    options.unshift({
+      model: currentValue,
+      display_name: currentValue,
+    });
+  }
+
+  select.innerHTML = options
     .map((model) => `<option value="${escapeHtml(model.model)}">${escapeHtml(model.display_name)}</option>`)
     .join("");
-
-  if (!input.value || input.value === "gpt-5-codex") {
-    input.value = selectedModel || models?.find((model) => model.is_default)?.model || "gpt-5.4";
-  }
+  select.value = currentValue;
 }
 
 function setSelectedCwd(cwd) {

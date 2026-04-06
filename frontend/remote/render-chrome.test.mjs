@@ -80,6 +80,7 @@ test("device meta renders without old key-storage warnings", async () => {
   assert.doesNotMatch(unpairedMarkup, /legacy localStorage/);
 
   state.remoteAuth = {
+    relayId: "relay-1",
     brokerUrl: "ws://broker.example.test",
     brokerChannelId: "room-a",
     relayPeerId: "relay-1",

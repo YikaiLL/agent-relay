@@ -163,6 +163,7 @@ test("expired device broker access refreshes automatically during reconnect", as
   const { connectBroker } = await import("./broker-client.js");
 
   state.remoteAuth = {
+    relayId: "relay-1",
     brokerUrl: "ws://broker.example.test",
     brokerChannelId: "room-a",
     relayPeerId: "relay-1",
@@ -210,11 +211,12 @@ test("expired device broker access refreshes automatically during reconnect", as
   assert.equal(state.remoteAuth.deviceRefreshMode, "cookie");
   assert.equal(state.remoteAuth.deviceRefreshToken, null);
   assert.equal(state.remoteAuth.deviceJoinTicket, "fresh-device-ws-token");
-  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-auth"));
-  assert.equal(storedAuth.deviceRefreshToken, undefined);
-  assert.equal(storedAuth.deviceJoinTicket, undefined);
-  assert.equal(storedAuth.sessionClaim, undefined);
-  assert.equal(storedAuth.deviceRefreshMode, "cookie");
+  const storedAuth = JSON.parse(browser.localStorage.getItem("agent-relay.remote-state-v2"));
+  const storedProfile = storedAuth.remoteProfiles["relay-1"];
+  assert.equal(storedProfile.deviceRefreshToken, undefined);
+  assert.equal(storedProfile.deviceJoinTicket, undefined);
+  assert.equal(storedProfile.sessionClaim, undefined);
+  assert.equal(storedProfile.deviceRefreshMode, "cookie");
   FakeWebSocket.instances[1].emit("open");
   assert.equal(state.socketConnected, true);
 });

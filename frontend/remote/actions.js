@@ -70,16 +70,27 @@ export async function ensureRemoteClaim({
 
   const needsRefresh = Boolean(state.remoteAuth.sessionClaim);
   const claimPromise = (async () => {
-    renderLog(`${needsRefresh ? "Refreshing" : "Claiming"} remote device (${reason}).`);
-    const challengeResult = await dispatchRemoteAction("claim_challenge", {});
-    if (!challengeResult.claim_challenge_id || !challengeResult.claim_challenge) {
-      throw new Error("claim challenge response is incomplete");
+    try {
+      renderLog(`${needsRefresh ? "Refreshing" : "Claiming"} remote device (${reason}).`);
+      const challengeResult = await dispatchRemoteAction("claim_challenge", {});
+      if (!challengeResult.claim_challenge_id || !challengeResult.claim_challenge) {
+        throw new Error(
+          `claim challenge response is incomplete: ${JSON.stringify(challengeResult)}`
+        );
+      }
+      renderLog("Remote claim challenge accepted; completing claim.");
+      const result = await dispatchRemoteAction("claim_device", {
+        challenge_id: challengeResult.claim_challenge_id,
+        challenge: challengeResult.claim_challenge,
+      });
+      if (!result.session_claim) {
+        throw new Error(`claim device response is incomplete: ${JSON.stringify(result)}`);
+      }
+      return result.session_claim;
+    } catch (error) {
+      console.error("[agent-relay] ensureRemoteClaim failed", error);
+      throw error;
     }
-    const result = await dispatchRemoteAction("claim_device", {
-      challenge_id: challengeResult.claim_challenge_id,
-      challenge: challengeResult.claim_challenge,
-    });
-    return result.session_claim;
   })().finally(() => {
     state.claimPromise = null;
   });
@@ -240,22 +251,26 @@ async function handleEncryptedRemoteActionResult(payload) {
 }
 
 function handleRemoteActionResult(actionId, result) {
-  if (result.session_claim && state.remoteAuth) {
-    setSessionClaim(result.session_claim, result.session_claim_expires_at || null);
-    scheduleClaimRefresh();
-    renderDeviceMeta();
-  }
-
-  if (result.snapshot) {
-    onApplySessionSnapshot(result.snapshot);
-  }
-
-  if (result.threads?.threads) {
-    state.threads = result.threads.threads;
-    renderThreads(state.threads);
-  }
-
   settlePendingAction(actionId, result);
+
+  try {
+    if (result.session_claim && state.remoteAuth) {
+      setSessionClaim(result.session_claim, result.session_claim_expires_at || null);
+      scheduleClaimRefresh();
+      renderDeviceMeta();
+    }
+
+    if (result.snapshot) {
+      onApplySessionSnapshot(result.snapshot);
+    }
+
+    if (result.threads?.threads) {
+      state.threads = result.threads.threads;
+      renderThreads(state.threads);
+    }
+  } catch (error) {
+    console.error("[agent-relay] remote action result side effects failed", error);
+  }
 
   if (result.ok) {
     if (result.action === "claim_challenge") {

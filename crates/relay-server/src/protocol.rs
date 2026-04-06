@@ -142,6 +142,82 @@ impl SessionSnapshot {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{LogEntryView, SessionSnapshot, TranscriptEntryView};
+
+    fn make_snapshot() -> SessionSnapshot {
+        SessionSnapshot {
+            provider: "codex",
+            service_ready: true,
+            codex_connected: true,
+            broker_connected: true,
+            broker_channel_id: Some("room".to_string()),
+            broker_peer_id: Some("relay".to_string()),
+            security_mode: super::SecurityMode::Private,
+            e2ee_enabled: true,
+            broker_can_read_content: false,
+            audit_enabled: false,
+            active_thread_id: Some("thread-1".to_string()),
+            active_controller_device_id: Some("device-1".to_string()),
+            active_controller_last_seen_at: Some(1),
+            controller_lease_expires_at: Some(2),
+            controller_lease_seconds: 15,
+            active_turn_id: Some("turn-1".to_string()),
+            current_status: "idle".to_string(),
+            active_flags: vec![],
+            current_cwd: "/tmp/project".to_string(),
+            model: "gpt-5.4".to_string(),
+            available_models: vec![],
+            approval_policy: "untrusted".to_string(),
+            sandbox: "workspace-write".to_string(),
+            reasoning_effort: "medium".to_string(),
+            device_records: vec![],
+            paired_devices: vec![],
+            pending_pairing_requests: vec![],
+            pending_approvals: vec![],
+            transcript: (0..30)
+                .map(|index| TranscriptEntryView {
+                    role: "assistant".to_string(),
+                    text: "x".repeat(4500 + index),
+                    status: "completed".to_string(),
+                    turn_id: Some(format!("turn-{index}")),
+                })
+                .collect(),
+            logs: (0..30)
+                .map(|index| LogEntryView {
+                    kind: "info".to_string(),
+                    message: format!("log-{index}"),
+                    created_at: index,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn compact_for_broker_limits_logs_and_transcript() {
+        let compacted = make_snapshot().compact_for_broker();
+
+        assert_eq!(compacted.logs.len(), 24);
+        assert_eq!(compacted.transcript.len(), 24);
+        assert_eq!(
+            compacted
+                .transcript
+                .first()
+                .and_then(|entry| entry.turn_id.as_deref()),
+            Some("turn-6")
+        );
+        assert!(compacted
+            .transcript
+            .iter()
+            .all(|entry| entry.text.len() <= 4003));
+        assert!(compacted
+            .transcript
+            .iter()
+            .all(|entry| entry.text.ends_with("...")));
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceRecordView {
     pub device_id: String,

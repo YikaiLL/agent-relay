@@ -1,6 +1,6 @@
 import { ensureDeviceKeypair } from "./crypto.js";
 
-const REMOTE_AUTH_STORAGE_KEY = "agent-relay.remote-auth";
+const REMOTE_STATE_STORAGE_KEY = "agent-relay.remote-state-v2";
 const REMOTE_DEVICE_LABEL_STORAGE_KEY = "agent-relay.remote-device-label";
 const REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY = "agent-relay.remote-device-id";
 
@@ -9,9 +9,13 @@ export const LEASE_EXPIRY_REFRESH_SKEW_MS = 250;
 export const CLAIM_REFRESH_SKEW_MS = 60_000;
 export const CLAIM_REFRESH_FLOOR_MS = 5000;
 
+const loadedStore = loadRemoteStore();
+
 export const state = {
+  activeRelayId: loadedStore.activeRelayId,
   claimPromise: null,
   claimRefreshTimer: null,
+  clientAuth: loadedStore.clientAuth,
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
   currentApprovalId: null,
@@ -23,7 +27,9 @@ export const state = {
   pendingActions: new Map(),
   recoverPromise: null,
   recoveredSocketPeerId: null,
-  remoteAuth: loadRemoteAuth(),
+  relayDirectory: deriveRelayDirectory(loadedStore.remoteProfiles, []),
+  remoteAuth: null,
+  remoteProfiles: loadedStore.remoteProfiles,
   requestedDeviceId: null,
   session: null,
   socket: null,
@@ -32,6 +38,8 @@ export const state = {
   socketReconnectTimer: null,
   threads: [],
 };
+
+syncCurrentRemoteAuth();
 
 export function connectionTarget() {
   if (state.pairingTicket) {
@@ -86,6 +94,7 @@ export function clearSessionClaim() {
 
   state.remoteAuth.sessionClaim = null;
   state.remoteAuth.sessionClaimExpiresAt = null;
+  persistRemoteStore();
 }
 
 export function clearRecoveredSocketPeerId() {
@@ -103,6 +112,7 @@ export function setSessionClaim(claim, expiresAt) {
 
   state.remoteAuth.sessionClaim = claim;
   state.remoteAuth.sessionClaimExpiresAt = expiresAt || null;
+  persistRemoteStore();
 }
 
 export function setSocketPeerId(value) {
@@ -181,6 +191,94 @@ export function candidateDeviceTokens() {
   return state.remoteAuth?.payloadSecret ? [state.remoteAuth.payloadSecret] : [];
 }
 
+export function saveRemoteAuth(value) {
+  if (!value) {
+    forgetCurrentRemoteProfile();
+    return;
+  }
+
+  const relayId = value.relayId || state.activeRelayId || value.brokerChannelId;
+  if (!relayId) {
+    throw new Error("remote relay id is required");
+  }
+
+  const normalized = normalizeRemoteProfile({
+    ...value,
+    relayId,
+  });
+  state.remoteProfiles[relayId] = normalized;
+  state.activeRelayId = relayId;
+  state.remoteAuth = normalized;
+  state.relayDirectory = deriveRelayDirectory(state.remoteProfiles, state.relayDirectory);
+  persistRemoteStore();
+}
+
+export function selectRelayProfile(relayId) {
+  const profile = state.remoteProfiles[relayId];
+  if (!profile) {
+    return false;
+  }
+
+  state.activeRelayId = relayId;
+  state.remoteAuth = profile;
+  persistRemoteStore();
+  return true;
+}
+
+export function listRelayProfiles() {
+  return Object.values(state.remoteProfiles).sort((left, right) => {
+    return (left.relayLabel || left.relayId).localeCompare(right.relayLabel || right.relayId);
+  });
+}
+
+export function forgetCurrentRemoteProfile() {
+  if (!state.activeRelayId) {
+    state.remoteAuth = null;
+    return;
+  }
+
+  delete state.remoteProfiles[state.activeRelayId];
+  const nextRelayId = nextRelaySelection(state.remoteProfiles, state.activeRelayId);
+  state.activeRelayId = nextRelayId;
+  state.remoteAuth = nextRelayId ? state.remoteProfiles[nextRelayId] : null;
+  if (!state.remoteAuth) {
+    state.clientAuth = null;
+  }
+  state.relayDirectory = deriveRelayDirectory(state.remoteProfiles, []);
+  persistRemoteStore();
+}
+
+export function saveClientAuth(value) {
+  state.clientAuth = value
+    ? {
+        clientId: value.clientId,
+        clientRefreshToken: value.clientRefreshToken,
+        brokerControlUrl: value.brokerControlUrl,
+      }
+    : null;
+  persistRemoteStore();
+}
+
+export function setRelayDirectory(entries) {
+  state.relayDirectory = deriveRelayDirectory(state.remoteProfiles, entries);
+}
+
+export function hasAnyStoredRelayProfiles() {
+  return Object.keys(state.remoteProfiles).length > 0;
+}
+
+export function brokerControlUrl(brokerUrl) {
+  const url = new URL(brokerUrl);
+  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+  url.pathname = "";
+  url.search = "";
+  return url.toString().replace(/\/$/, "");
+}
+
+export function currentClientControlUrl() {
+  return state.clientAuth?.brokerControlUrl || brokerControlUrl(state.remoteAuth?.brokerUrl || state.pairingTicket?.broker_url || window.location.origin);
+}
+
 function loadOrCreateRequestedDeviceId(verifyKey) {
   const existing = window.localStorage.getItem(REMOTE_REQUESTED_DEVICE_ID_STORAGE_KEY);
   if (existing) {
@@ -197,69 +295,189 @@ function loadOrCreateRequestedDeviceId(verifyKey) {
   return generated;
 }
 
-function loadRemoteAuth() {
-  const raw = window.localStorage.getItem(REMOTE_AUTH_STORAGE_KEY);
+function loadRemoteStore() {
+  const raw = window.localStorage.getItem(REMOTE_STATE_STORAGE_KEY);
   if (!raw) {
-    return null;
+    return {
+      clientAuth: null,
+      activeRelayId: null,
+      remoteProfiles: {},
+    };
   }
 
   try {
     const parsed = JSON.parse(raw);
-    if (
-      !parsed?.brokerUrl ||
-      !parsed?.brokerChannelId ||
-      !parsed?.deviceId ||
-      !parsed?.payloadSecret
-    ) {
-      window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
-      return null;
-    }
+    const remoteProfiles = Object.fromEntries(
+      Object.entries(parsed?.remoteProfiles || {})
+        .map(([relayId, profile]) => [
+          relayId,
+          normalizeRemoteProfile({ ...profile, relayId }, { fromStorage: true }),
+        ])
+        .filter(([, profile]) => Boolean(profile))
+    );
+    const activeRelayId =
+      typeof parsed?.activeRelayId === "string" && remoteProfiles[parsed.activeRelayId]
+        ? parsed.activeRelayId
+        : nextRelaySelection(remoteProfiles, null);
+    const clientAuth = normalizeClientAuth(parsed?.clientAuth);
     return {
-      brokerUrl: parsed.brokerUrl,
-      brokerChannelId: parsed.brokerChannelId,
-      relayPeerId: parsed.relayPeerId || null,
-      securityMode: parsed.securityMode || "private",
-      deviceId: parsed.deviceId,
-      deviceLabel: parsed.deviceLabel || defaultDeviceLabel(),
-      payloadSecret: parsed.payloadSecret,
-      deviceRefreshMode: parsed.deviceRefreshMode === "cookie" ? "cookie" : null,
-      deviceRefreshToken: parsed.deviceRefreshToken || null,
-      deviceJoinTicket: null,
-      deviceJoinTicketExpiresAt: null,
-      sessionClaim: null,
-      sessionClaimExpiresAt: null,
+      clientAuth,
+      activeRelayId,
+      remoteProfiles,
     };
   } catch {
-    window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
+    window.localStorage.removeItem(REMOTE_STATE_STORAGE_KEY);
+    return {
+      clientAuth: null,
+      activeRelayId: null,
+      remoteProfiles: {},
+    };
+  }
+}
+
+function normalizeRemoteProfile(profile, options = {}) {
+  const { fromStorage = false } = options;
+  if (
+    !profile?.relayId ||
+    !profile?.brokerUrl ||
+    !profile?.brokerChannelId ||
+    !profile?.deviceId ||
+    !profile?.payloadSecret
+  ) {
     return null;
   }
+
+  return {
+    relayId: profile.relayId,
+    relayLabel: profile.relayLabel || null,
+    brokerUrl: profile.brokerUrl,
+    brokerChannelId: profile.brokerChannelId,
+    relayPeerId: profile.relayPeerId || null,
+    securityMode: profile.securityMode || "private",
+    deviceId: profile.deviceId,
+    deviceLabel: profile.deviceLabel || defaultDeviceLabel(),
+    payloadSecret: profile.payloadSecret,
+    deviceRefreshMode: profile.deviceRefreshMode === "cookie" ? "cookie" : null,
+    deviceRefreshToken: fromStorage ? profile.deviceRefreshToken || null : profile.deviceRefreshToken ?? null,
+    deviceJoinTicket: fromStorage ? null : profile.deviceJoinTicket ?? null,
+    deviceJoinTicketExpiresAt: fromStorage ? null : profile.deviceJoinTicketExpiresAt ?? null,
+    sessionClaim: fromStorage ? null : profile.sessionClaim ?? null,
+    sessionClaimExpiresAt: fromStorage ? null : profile.sessionClaimExpiresAt ?? null,
+  };
 }
 
-export function saveRemoteAuth(value) {
-  if (!value) {
-    window.localStorage.removeItem(REMOTE_AUTH_STORAGE_KEY);
-    return;
+function normalizeClientAuth(value) {
+  if (!value?.clientId || !value?.clientRefreshToken || !value?.brokerControlUrl) {
+    return null;
   }
 
-  window.localStorage.setItem(
-    REMOTE_AUTH_STORAGE_KEY,
-    JSON.stringify({
-      brokerUrl: value.brokerUrl,
-      brokerChannelId: value.brokerChannelId,
-      relayPeerId: value.relayPeerId || null,
-      securityMode: value.securityMode || "private",
-      deviceId: value.deviceId,
-      deviceLabel: value.deviceLabel || null,
-      payloadSecret: value.payloadSecret,
-      deviceRefreshMode: value.deviceRefreshMode === "cookie" ? "cookie" : null,
-    })
-  );
+  return {
+    clientId: value.clientId,
+    clientRefreshToken: value.clientRefreshToken,
+    brokerControlUrl: value.brokerControlUrl,
+  };
 }
 
-export function brokerControlUrl(brokerUrl) {
-  const url = new URL(brokerUrl);
-  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  url.pathname = "";
-  url.search = "";
-  return url.toString().replace(/\/$/, "");
+function syncCurrentRemoteAuth() {
+  if (!state.activeRelayId || !state.remoteProfiles[state.activeRelayId]) {
+    state.activeRelayId = nextRelaySelection(state.remoteProfiles, null);
+  }
+  state.remoteAuth = state.activeRelayId ? state.remoteProfiles[state.activeRelayId] : null;
+}
+
+function persistRemoteStore() {
+  const payload = {
+    activeRelayId: state.activeRelayId,
+    clientAuth: state.clientAuth
+      ? {
+          clientId: state.clientAuth.clientId,
+          clientRefreshToken: state.clientAuth.clientRefreshToken,
+          brokerControlUrl: state.clientAuth.brokerControlUrl,
+        }
+      : null,
+    remoteProfiles: Object.fromEntries(
+      Object.entries(state.remoteProfiles).map(([relayId, profile]) => [
+        relayId,
+        omitNullish({
+          relayId: profile.relayId,
+          relayLabel: profile.relayLabel || null,
+          brokerUrl: profile.brokerUrl,
+          brokerChannelId: profile.brokerChannelId,
+          relayPeerId: profile.relayPeerId || null,
+          securityMode: profile.securityMode || "private",
+          deviceId: profile.deviceId,
+          deviceLabel: profile.deviceLabel || null,
+          payloadSecret: profile.payloadSecret,
+          deviceRefreshMode: profile.deviceRefreshMode === "cookie" ? "cookie" : null,
+          deviceRefreshToken:
+            profile.deviceRefreshMode === "cookie"
+              ? null
+              : profile.deviceRefreshToken || null,
+        }),
+      ])
+    ),
+  };
+
+  window.localStorage.setItem(REMOTE_STATE_STORAGE_KEY, JSON.stringify(payload));
+}
+
+function deriveRelayDirectory(remoteProfiles, serverEntries) {
+  const entriesByRelayId = new Map();
+
+  for (const profile of Object.values(remoteProfiles)) {
+    entriesByRelayId.set(profile.relayId, {
+      relayId: profile.relayId,
+      relayLabel: profile.relayLabel || null,
+      brokerRoomId: profile.brokerChannelId,
+      deviceId: profile.deviceId,
+      deviceLabel: profile.deviceLabel,
+      hasLocalProfile: true,
+      grantedAt: null,
+    });
+  }
+
+  for (const entry of serverEntries || []) {
+    const current = entriesByRelayId.get(entry.relay_id) || {
+      relayId: entry.relay_id,
+      relayLabel: null,
+      brokerRoomId: entry.broker_room_id,
+      deviceId: entry.device_id,
+      deviceLabel: null,
+      hasLocalProfile: false,
+      grantedAt: null,
+    };
+    entriesByRelayId.set(entry.relay_id, {
+      ...current,
+      relayLabel: entry.relay_label || current.relayLabel || null,
+      brokerRoomId: entry.broker_room_id,
+      deviceId: current.deviceId || entry.device_id,
+      deviceLabel: current.deviceLabel || entry.device_label || null,
+      grantedAt: entry.granted_at || current.grantedAt || null,
+    });
+  }
+
+  return Array.from(entriesByRelayId.values()).sort((left, right) => {
+    const leftKey = left.relayLabel || left.relayId || left.brokerRoomId || left.deviceId || "";
+    const rightKey =
+      right.relayLabel || right.relayId || right.brokerRoomId || right.deviceId || "";
+    return leftKey.localeCompare(rightKey);
+  });
+}
+
+function nextRelaySelection(remoteProfiles, previousRelayId) {
+  const relayIds = Object.keys(remoteProfiles);
+  if (!relayIds.length) {
+    return null;
+  }
+  if (previousRelayId && remoteProfiles[previousRelayId]) {
+    return previousRelayId;
+  }
+  relayIds.sort();
+  return relayIds[0];
+}
+
+function omitNullish(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== null && entry !== undefined)
+  );
 }

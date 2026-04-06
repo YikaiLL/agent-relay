@@ -16,9 +16,11 @@ import { state } from "./state.js";
 import { escapeHtml, formatTimestamp, shortId } from "./utils.js";
 
 let onResumeThread = () => {};
+let onSelectRelay = () => {};
 
 export function configureRenderHandlers(handlers) {
   onResumeThread = handlers.onResumeThread || onResumeThread;
+  onSelectRelay = handlers.onSelectRelay || onSelectRelay;
 }
 
 export function renderSession(session) {
@@ -90,8 +92,43 @@ export function renderThreads(threads) {
   });
 }
 
+export function renderRelayDirectory() {
+  const relays = state.relayDirectory || [];
+  dom.remoteRelaysCount.textContent = `${relays.length} ${relays.length === 1 ? "relay" : "relays"}`;
+
+  if (!relays.length) {
+    dom.remoteRelaysList.innerHTML = `<p class="sidebar-empty">Pair a relay from your local machine to add it here.</p>`;
+    return;
+  }
+
+  dom.remoteRelaysList.innerHTML = relays
+    .map((relay) => {
+      const title = relay.relayLabel || relay.relayId;
+      const subtitle = relay.hasLocalProfile
+        ? relay.deviceLabel || relay.deviceId
+        : "Grant exists, but this browser does not have local encrypted access yet.";
+      const activeClass = state.remoteAuth?.relayId === relay.relayId ? " is-active" : "";
+      const actionLabel = relay.hasLocalProfile ? "Open relay" : "Pair again";
+      return `
+        <button class="conversation-item${activeClass}" type="button" data-relay-id="${escapeHtml(relay.relayId)}" ${relay.hasLocalProfile ? "" : "disabled"}>
+          <span class="conversation-title">${escapeHtml(title)}</span>
+          <span class="conversation-preview">${escapeHtml(subtitle)}</span>
+          <span class="conversation-meta">${escapeHtml(relay.brokerRoomId || relay.relayId)} · ${escapeHtml(actionLabel)}</span>
+        </button>
+      `;
+    })
+    .join("");
+
+  dom.remoteRelaysList.querySelectorAll("[data-relay-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      onSelectRelay(button.dataset.relayId);
+    });
+  });
+}
+
 export function renderDeviceMeta() {
   renderDeviceChrome();
+  renderRelayDirectory();
 }
 
 export function renderEmptyState() {
@@ -126,14 +163,21 @@ export function canCurrentDeviceWrite(session) {
 }
 
 function syncRemoteModelSuggestions(models, selectedModel) {
-  if (dom.remoteModelOptions) {
-    dom.remoteModelOptions.innerHTML = models
-      .map((model) => `<option value="${escapeHtml(model.model)}">${escapeHtml(model.display_name)}</option>`)
-      .join("");
+  const currentValue =
+    selectedModel
+    || dom.remoteModelInput.value
+    || models.find((model) => model.is_default)?.model
+    || "gpt-5.4";
+  const options = [...models];
+  if (currentValue && !options.some((model) => model.model === currentValue)) {
+    options.unshift({
+      model: currentValue,
+      display_name: currentValue,
+    });
   }
 
-  if (!dom.remoteModelInput.value || dom.remoteModelInput.value === "gpt-5-codex") {
-    dom.remoteModelInput.value =
-      selectedModel || models.find((model) => model.is_default)?.model || "gpt-5.4";
-  }
+  dom.remoteModelInput.innerHTML = options
+    .map((model) => `<option value="${escapeHtml(model.model)}">${escapeHtml(model.display_name)}</option>`)
+    .join("");
+  dom.remoteModelInput.value = currentValue;
 }

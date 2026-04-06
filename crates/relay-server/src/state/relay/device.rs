@@ -153,6 +153,10 @@ pub(crate) struct CompletedPairing {
     pub(crate) device_verify_key: String,
     pub(crate) device: Option<PairedDeviceView>,
     pub(crate) payload_secret: Option<String>,
+    pub(crate) relay_id: Option<String>,
+    pub(crate) relay_label: Option<String>,
+    pub(crate) client_id: Option<String>,
+    pub(crate) client_refresh_token: Option<String>,
     pub(crate) device_refresh_token: Option<String>,
     pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
@@ -171,6 +175,10 @@ pub(crate) struct PendingPairingResult {
     pub(crate) pairing_secret: String,
     pub(crate) device: Option<PairedDeviceView>,
     pub(crate) payload_secret: Option<String>,
+    pub(crate) relay_id: Option<String>,
+    pub(crate) relay_label: Option<String>,
+    pub(crate) client_id: Option<String>,
+    pub(crate) client_refresh_token: Option<String>,
     pub(crate) device_refresh_token: Option<String>,
     pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
@@ -404,6 +412,10 @@ impl RelayState {
                     device_verify_key,
                     device: Some(device.clone()),
                     payload_secret: Some(token.clone()),
+                    relay_id: None,
+                    relay_label: None,
+                    client_id: None,
+                    client_refresh_token: None,
                     device_refresh_token: None,
                     device_join_ticket: None,
                     device_join_ticket_expires_at,
@@ -416,6 +428,10 @@ impl RelayState {
                 pairing_secret: pending.pairing_secret,
                 device: Some(device),
                 payload_secret: Some(token),
+                relay_id: None,
+                relay_label: None,
+                client_id: None,
+                client_refresh_token: None,
                 device_refresh_token: None,
                 device_join_ticket: None,
                 device_join_ticket_expires_at,
@@ -441,6 +457,10 @@ impl RelayState {
                 device_verify_key: request.device_verify_key,
                 device: None,
                 payload_secret: None,
+                relay_id: None,
+                relay_label: None,
+                client_id: None,
+                client_refresh_token: None,
                 device_refresh_token: None,
                 device_join_ticket: None,
                 device_join_ticket_expires_at: None,
@@ -453,6 +473,10 @@ impl RelayState {
             pairing_secret: pending.pairing_secret,
             device: None,
             payload_secret: None,
+            relay_id: None,
+            relay_label: None,
+            client_id: None,
+            client_refresh_token: None,
             device_refresh_token: None,
             device_join_ticket: None,
             device_join_ticket_expires_at: None,
@@ -482,6 +506,10 @@ impl RelayState {
             pairing_secret: completed.pairing_secret,
             device: completed.device,
             payload_secret: completed.payload_secret,
+            relay_id: completed.relay_id,
+            relay_label: completed.relay_label,
+            client_id: completed.client_id,
+            client_refresh_token: completed.client_refresh_token,
             device_refresh_token: completed.device_refresh_token,
             device_join_ticket: completed.device_join_ticket,
             device_join_ticket_expires_at: completed.device_join_ticket_expires_at,
@@ -685,6 +713,25 @@ impl RelayState {
             self.sync_device_record_from_approved_device(&approved_device, now);
         }
 
+        Ok(())
+    }
+
+    pub fn attach_pairing_client_grant(
+        &mut self,
+        pairing_id: &str,
+        relay_id: Option<String>,
+        relay_label: Option<String>,
+        client_id: Option<String>,
+        client_refresh_token: Option<String>,
+    ) -> Result<(), String> {
+        let completed = self
+            .completed_pairings
+            .get_mut(pairing_id)
+            .ok_or_else(|| "completed pairing result is missing".to_string())?;
+        completed.relay_id = relay_id;
+        completed.relay_label = relay_label;
+        completed.client_id = client_id;
+        completed.client_refresh_token = client_refresh_token;
         Ok(())
     }
 

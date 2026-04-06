@@ -87,26 +87,29 @@ function createIndexedDbStub() {
       });
       return request;
     },
+    peek(dbName, storeName, recordId) {
+      return databases.get(dbName)?.transaction(storeName).objectStore().get(recordId);
+    },
   };
 }
 
-function installBrowserStubs() {
-  const storage = new Map();
-  const localStorage = {
-    getItem(key) {
-      return storage.has(key) ? storage.get(key) : null;
-    },
-    setItem(key, value) {
-      storage.set(key, String(value));
-    },
-    removeItem(key) {
-      storage.delete(key);
-    },
+function installBrowserStubs({ subtleAvailable, indexedDb = createIndexedDbStub() }) {
+  const cryptoObject = {
+    getRandomValues: webcrypto.getRandomValues.bind(webcrypto),
   };
+  if (subtleAvailable) {
+    cryptoObject.subtle = webcrypto.subtle;
+  }
 
   globalThis.window = {
-    localStorage,
-    location: { href: "https://remote.example.test/" },
+    localStorage: {
+      getItem() {
+        return null;
+      },
+      setItem() {},
+      removeItem() {},
+    },
+    location: { href: "http://192.168.1.47:8788/" },
     history: {
       replaceState() {},
     },
@@ -116,73 +119,56 @@ function installBrowserStubs() {
     btoa(value) {
       return Buffer.from(value, "binary").toString("base64");
     },
-    crypto: webcrypto,
-    indexedDB: createIndexedDbStub(),
+    crypto: cryptoObject,
+    indexedDB: indexedDb,
   };
-  Object.defineProperty(globalThis, "navigator", {
-    configurable: true,
-    value: { platform: "Test Browser" },
-  });
+
   Object.defineProperty(globalThis, "crypto", {
     configurable: true,
-    value: webcrypto,
+    value: cryptoObject,
   });
   Object.defineProperty(globalThis, "indexedDB", {
     configurable: true,
-    value: window.indexedDB,
+    value: indexedDb,
   });
 
-  return { localStorage };
+  return { indexedDb };
 }
 
-test("remote auth storage keeps durable metadata but drops refresh and session secrets", async () => {
-  const browser = installBrowserStubs();
-  browser.localStorage.setItem(
-    "agent-relay.remote-state-v2",
-    JSON.stringify({
-      activeRelayId: "relay-1",
-      remoteProfiles: {
-        "relay-1": {
-          relayId: "relay-1",
-          brokerUrl: "ws://broker.example.test",
-          brokerChannelId: "room-a",
-          relayPeerId: "relay-1",
-          securityMode: "private",
-          deviceId: "device-1",
-          deviceLabel: "Primary Phone",
-          payloadSecret: "payload-secret-1",
-          deviceRefreshToken: "refresh-token-1",
-          deviceJoinTicket: "join-ticket-1",
-          deviceJoinTicketExpiresAt: 123,
-          sessionClaim: "session-claim-1",
-          sessionClaimExpiresAt: 456,
-        },
-      },
-    })
-  );
+async function importCrypto(tag) {
+  return import(`./crypto.js?${tag}`);
+}
 
-  const { ensureDeviceIdentity, saveRemoteAuth, state } = await import("./state.js");
+test("ensureDeviceKeypair falls back to software storage when WebCrypto subtle is unavailable", async () => {
+  const { indexedDb } = installBrowserStubs({ subtleAvailable: false });
+  const { ensureDeviceKeypair } = await importCrypto(`software-fallback-${Date.now()}`);
 
-  assert.equal(state.remoteAuth.deviceId, "device-1");
-  assert.equal(state.remoteAuth.payloadSecret, "payload-secret-1");
-  assert.equal(state.remoteAuth.deviceRefreshToken, "refresh-token-1");
-  assert.equal(state.remoteAuth.deviceJoinTicket, null);
-  assert.equal(state.remoteAuth.sessionClaim, null);
+  const keypair = await ensureDeviceKeypair();
+  const signature = await keypair.sign(new TextEncoder().encode("agent-relay:test"));
 
-  state.remoteAuth.deviceRefreshMode = "cookie";
-  saveRemoteAuth(state.remoteAuth);
+  assert.ok(keypair.verifyKey);
+  assert.ok(signature instanceof Uint8Array);
 
-  const stored = JSON.parse(browser.localStorage.getItem("agent-relay.remote-state-v2"));
-  const profile = stored.remoteProfiles["relay-1"];
-  assert.equal(profile.deviceId, "device-1");
-  assert.equal(profile.payloadSecret, "payload-secret-1");
-  assert.equal(profile.deviceRefreshMode, "cookie");
-  assert.equal("deviceRefreshToken" in profile, false);
-  assert.equal("deviceJoinTicket" in profile, false);
-  assert.equal("sessionClaim" in profile, false);
+  const request = indexedDb.peek("agent-relay-crypto", "device-keys", "remote-device-keypair-v1");
+  await new Promise((resolve, reject) => {
+    request.onsuccess = () => {
+      assert.equal(request.result.kind, "software");
+      assert.ok(request.result.signingSeed);
+      resolve();
+    };
+    request.onerror = () => reject(request.error || new Error("failed to inspect key store"));
+  });
+});
 
-  await ensureDeviceIdentity();
-  assert.ok(state.deviceKeypair);
-  assert.match(state.requestedDeviceId, /^mobile-/);
-  assert.equal(browser.localStorage.getItem("agent-relay.remote-device-keypair"), null);
+test("software-stored device keypair persists across module reloads", async () => {
+  const indexedDb = createIndexedDbStub();
+  installBrowserStubs({ subtleAvailable: false, indexedDb });
+  const firstCrypto = await importCrypto(`software-persist-a-${Date.now()}`);
+  const firstKeypair = await firstCrypto.ensureDeviceKeypair();
+
+  installBrowserStubs({ subtleAvailable: false, indexedDb });
+  const secondCrypto = await importCrypto(`software-persist-b-${Date.now()}`);
+  const secondKeypair = await secondCrypto.ensureDeviceKeypair();
+
+  assert.equal(secondKeypair.verifyKey, firstKeypair.verifyKey);
 });

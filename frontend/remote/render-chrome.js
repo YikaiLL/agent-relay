@@ -33,7 +33,11 @@ export function renderSessionChrome(session) {
 export function renderDeviceMeta() {
   if (!state.remoteAuth && !state.pairingTicket) {
     dom.deviceMeta.innerHTML = `
-      <p class="sidebar-empty">No paired remote device stored in this browser.</p>
+      <p class="sidebar-empty">${
+        state.relayDirectory?.length
+          ? "Select a relay from the sidebar to open its remote surface."
+          : "No paired remote device stored in this browser."
+      }</p>
     `;
     syncWorkspaceHeading();
     updatePairingControls();
@@ -114,6 +118,13 @@ export function updateStatusBadge() {
   if (state.pairingTicket) {
     dom.remoteStatusBadge.textContent = pairingBadgeText();
     dom.remoteStatusBadge.className = `status-badge status-badge-${pairingBadgeTone()}`;
+    renderOverviewCards();
+    return;
+  }
+
+  if (!state.remoteAuth && state.relayDirectory?.length) {
+    dom.remoteStatusBadge.textContent = "Select relay";
+    dom.remoteStatusBadge.className = "status-badge status-badge-ready";
     renderOverviewCards();
     return;
   }
@@ -356,10 +367,13 @@ function syncWorkspaceHeading() {
 
 function workspaceTitle() {
   if (state.remoteAuth) {
-    return "Remote surface ready";
+    return state.remoteAuth.relayLabel || "Remote surface ready";
   }
   if (state.pairingTicket) {
     return state.pairingPhase === "error" ? "Pairing failed" : "Pairing this browser";
+  }
+  if (state.relayDirectory?.length) {
+    return "Choose a relay";
   }
   return "Pair this browser";
 }
@@ -370,6 +384,9 @@ function workspaceSubtitle() {
   }
   if (state.pairingTicket) {
     return pairingCopy();
+  }
+  if (state.relayDirectory?.length) {
+    return "This browser already has access to one or more relays. Pick one from the sidebar.";
   }
   return "Open a pairing QR from your local relay to control Codex remotely.";
 }

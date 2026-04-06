@@ -2,11 +2,12 @@ use relay_broker::{
     auth::BrokerAuthMode,
     join_ticket::{unix_now, JoinTicketClaims, JoinTicketKey, JOIN_TICKET_SECRET_ENV},
     public_control::{
-        DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-        DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-        PairingWsTokenRequest, PairingWsTokenResponse, RelayEnrollmentChallengeRequest,
-        RelayEnrollmentChallengeResponse, RelayEnrollmentCompleteRequest, RelayEnrollmentResponse,
-        RelayWsTokenRequest, RelayWsTokenResponse,
+        ClientGrantRequest, ClientGrantResponse, DeviceGrantBulkRevokeRequest,
+        DeviceGrantBulkRevokeResponse, DeviceGrantRequest, DeviceGrantResponse,
+        DeviceGrantRevokeRequest, DeviceGrantRevokeResponse, PairingWsTokenRequest,
+        PairingWsTokenResponse, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+        RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
+        RelayWsTokenResponse,
     },
 };
 use reqwest::Client;
@@ -36,6 +37,14 @@ pub(crate) struct BrokerJoinCredential {
 pub(crate) struct DeviceBrokerCredential {
     pub(crate) join_credential: BrokerJoinCredential,
     pub(crate) refresh_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClientBrokerGrant {
+    pub(crate) client_id: String,
+    pub(crate) refresh_token: String,
+    pub(crate) relay_id: String,
+    pub(crate) relay_label: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +265,49 @@ impl BrokerAuthConfig {
                     },
                     refresh_token: Some(response.device_refresh_token),
                 })
+            }
+        }
+    }
+
+    pub(crate) async fn client_broker_grant(
+        &self,
+        broker_room_id: &str,
+        device_id: &str,
+        client_verify_key: &str,
+        device_label: Option<String>,
+    ) -> Result<Option<ClientBrokerGrant>, String> {
+        match self {
+            Self::SelfHostedSharedSecret { .. } => Ok(None),
+            Self::PublicControlPlane {
+                control_url,
+                relay_id,
+                relay_refresh_token,
+                client,
+            } => {
+                let response: ClientGrantResponse = post_control_plane(
+                    client,
+                    control_url,
+                    "/api/public/clients/grants",
+                    relay_refresh_token,
+                    &ClientGrantRequest {
+                        relay_id: relay_id.clone(),
+                        broker_room_id: broker_room_id.to_string(),
+                        device_id: device_id.to_string(),
+                        client_verify_key: client_verify_key.to_string(),
+                        client_label: device_label.clone(),
+                        device_label,
+                    },
+                )
+                .await?;
+                ensure_room_binding(broker_room_id, &response.broker_room_id)?;
+                ensure_relay_binding(relay_id, &response.relay_id)?;
+                ensure_device_binding(device_id, &response.device_id)?;
+                Ok(Some(ClientBrokerGrant {
+                    client_id: response.client_id,
+                    refresh_token: response.client_refresh_token,
+                    relay_id: response.relay_id,
+                    relay_label: response.relay_label,
+                }))
             }
         }
     }

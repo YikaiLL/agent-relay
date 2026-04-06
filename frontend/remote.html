@@ -29,6 +29,21 @@
           Start Remote Session
         </button>
 
+        <section class="remote-access-shell remote-relay-shell">
+          <div class="sidebar-row">
+            <div>
+              <p id="remote-relays-count" class="sidebar-caption">My relays</p>
+              <p class="sidebar-hint">Switch between relays paired to this browser.</p>
+            </div>
+            <button id="remote-relays-refresh-button" class="sidebar-link-button" type="button">
+              Refresh
+            </button>
+          </div>
+          <div id="remote-relays-list" class="conversation-list">
+            <p class="sidebar-empty">Pair a relay from your local machine to add it here.</p>
+          </div>
+        </section>
+
         <section id="remote-session-panel" class="new-session-panel" hidden>
           <label class="sidebar-label" for="remote-cwd-input">Workspace</label>
           <div class="workspace-picker">
@@ -44,8 +59,9 @@
             <div class="settings-grid">
               <label class="field">
                 <span>Model</span>
-                <input id="remote-model-input" type="text" list="remote-model-options" value="gpt-5.4">
-                <datalist id="remote-model-options"></datalist>
+                <select id="remote-model-input">
+                  <option value="gpt-5.4">gpt-5.4</option>
+                </select>
               </label>
               <label class="field">
                 <span>Approval</span>

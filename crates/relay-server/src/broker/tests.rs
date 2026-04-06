@@ -6,11 +6,12 @@ use axum::{extract::Path, routing::post, Json, Router};
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use relay_broker::public_control::{
-    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    PairingWsTokenRequest, PairingWsTokenResponse, RelayEnrollmentChallengeRequest,
-    RelayEnrollmentChallengeResponse, RelayEnrollmentCompleteRequest, RelayEnrollmentResponse,
-    RelayWsTokenRequest, RelayWsTokenResponse,
+    ClientGrantRequest, ClientGrantResponse, DeviceGrantBulkRevokeRequest,
+    DeviceGrantBulkRevokeResponse, DeviceGrantRequest, DeviceGrantResponse,
+    DeviceGrantRevokeRequest, DeviceGrantRevokeResponse, PairingWsTokenRequest,
+    PairingWsTokenResponse, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+    RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
+    RelayWsTokenResponse,
 };
 use tokio::net::TcpListener;
 
@@ -101,6 +102,17 @@ async fn spawn_public_control_mock() -> String {
         })
     }
 
+    async fn client_grant(Json(request): Json<ClientGrantRequest>) -> Json<ClientGrantResponse> {
+        Json(ClientGrantResponse {
+            client_id: format!("client-for-{}", request.device_id),
+            client_refresh_token: format!("client-refresh-{}", request.device_id),
+            relay_id: request.relay_id,
+            broker_room_id: request.broker_room_id,
+            device_id: request.device_id,
+            relay_label: Some("Demo Relay".to_string()),
+        })
+    }
+
     async fn revoke_device(
         Path(device_id): Path<String>,
         Json(request): Json<DeviceGrantRevokeRequest>,
@@ -138,6 +150,7 @@ async fn spawn_public_control_mock() -> String {
         .route("/api/public/relay/ws-token", post(relay_ws_token))
         .route("/api/public/pairing/ws-token", post(pairing_ws_token))
         .route("/api/public/devices", post(device_grant))
+        .route("/api/public/clients/grants", post(client_grant))
         .route("/api/public/devices/:device_id/revoke", post(revoke_device))
         .route("/api/public/devices/revoke-others", post(revoke_other));
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -332,6 +345,19 @@ async fn broker_config_public_mode_uses_control_plane_tokens() {
         .expect("public mode should fetch a device token bundle");
     assert_eq!(device.join_credential.token, "device-ws-device-1");
     assert_eq!(device.refresh_token.as_deref(), Some("refresh-device-1"));
+    let client_grant = config
+        .client_broker_grant(
+            "device-1",
+            &STANDARD.encode([5_u8; 32]),
+            Some("Phone".to_string()),
+        )
+        .await
+        .expect("public mode should fetch a client grant")
+        .expect("public mode should issue a client grant");
+    assert_eq!(client_grant.client_id, "client-for-device-1");
+    assert_eq!(client_grant.refresh_token, "client-refresh-device-1");
+    assert_eq!(client_grant.relay_id, "relay-owner-1");
+    assert_eq!(client_grant.relay_label.as_deref(), Some("Demo Relay"));
 }
 
 #[tokio::test]

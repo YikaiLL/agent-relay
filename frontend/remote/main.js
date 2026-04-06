@@ -1,5 +1,9 @@
 import * as dom from "./dom.js";
-import { configureBrokerClient, connectBroker } from "./broker-client.js";
+import {
+  configureBrokerClient,
+  connectBroker,
+  refreshRelayDirectory,
+} from "./broker-client.js";
 import {
   clearClaimLifecycle,
   configureRemoteActions,
@@ -20,11 +24,13 @@ import {
   renderDeviceMeta,
   renderEmptyState,
   renderLog,
+  renderRelayDirectory,
   renderThreads,
   setRemoteSessionPanelOpen,
 } from "./render.js";
 import {
   applySessionSnapshot,
+  clearSessionRuntime,
   refreshRemoteThreads,
   resumeRemoteSession,
   sendMessage,
@@ -33,11 +39,19 @@ import {
   syncRemoteSnapshot,
   takeOverControl,
 } from "./session-ops.js";
-import { ensureDeviceIdentity, loadDeviceLabel, state } from "./state.js";
+import {
+  ensureDeviceIdentity,
+  loadDeviceLabel,
+  selectRelayProfile,
+  state,
+} from "./state.js";
 
 configureRenderHandlers({
   onResumeThread(threadId) {
     void resumeRemoteSession(threadId);
+  },
+  onSelectRelay(relayId) {
+    void switchRelay(relayId);
   },
 });
 
@@ -112,6 +126,10 @@ dom.remoteThreadsRefreshButton.addEventListener("click", () => {
   void refreshRemoteThreads("manual refresh");
 });
 
+dom.remoteRelaysRefreshButton.addEventListener("click", () => {
+  void refreshRelayDirectoryFromUi();
+});
+
 dom.remoteTakeOverButton.addEventListener("click", () => {
   void takeOverControl();
 });
@@ -150,12 +168,22 @@ async function boot() {
   setRemoteSessionPanelOpen(false);
   const pairingQuery = applyPairingQuery();
   renderDeviceMeta();
+  renderRelayDirectory();
   renderEmptyState();
   renderThreads([]);
 
   if (pairingQuery) {
     await beginPairing(pairingQuery, { auto: true });
     return;
+  }
+
+  if (state.clientAuth) {
+    try {
+      await refreshRelayDirectory("initial boot", { silent: true });
+      renderRelayDirectory();
+    } catch (error) {
+      renderLog(`Relay directory refresh failed: ${error.message}`);
+    }
   }
 
   if (state.remoteAuth) {
@@ -170,4 +198,36 @@ async function handleBrokerPayload(payload) {
   }
 
   await handleRemoteBrokerPayload(payload);
+}
+
+async function switchRelay(relayId) {
+  if (!relayId || state.remoteAuth?.relayId === relayId) {
+    return;
+  }
+
+  if (!selectRelayProfile(relayId)) {
+    renderLog("This relay is not stored in the current browser profile yet.");
+    return;
+  }
+
+  clearClaimLifecycle();
+  clearSessionRuntime();
+  rejectPendingActions("switched to a different relay profile");
+  state.session = null;
+  state.threads = [];
+  state.currentApprovalId = null;
+  renderDeviceMeta();
+  renderEmptyState();
+  renderThreads([]);
+  renderLog(`Switching to relay ${relayId}.`);
+  void connectBroker("switch relay");
+}
+
+async function refreshRelayDirectoryFromUi() {
+  try {
+    await refreshRelayDirectory("manual refresh");
+    renderDeviceMeta();
+  } catch (error) {
+    renderLog(`Relay directory refresh failed: ${error.message}`);
+  }
 }

@@ -541,9 +541,15 @@ async function waitForPersistedPayloadSecret(
 }
 
 async function readStoredRemoteAuth(page) {
-  return page.evaluate(
-    () => JSON.parse(window.localStorage.getItem("agent-relay.remote-auth") || "null")
-  );
+  return page.evaluate(() => {
+    const parsed = JSON.parse(window.localStorage.getItem("agent-relay.remote-state-v2") || "null");
+    if (!parsed?.remoteProfiles) {
+      return null;
+    }
+    const activeRelayId =
+      parsed.activeRelayId || Object.keys(parsed.remoteProfiles)[0] || null;
+    return activeRelayId ? parsed.remoteProfiles[activeRelayId] || null : null;
+  });
 }
 
 function sha256Hex(value) {

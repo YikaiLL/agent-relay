@@ -518,19 +518,25 @@ impl AppState {
         })?;
         let now = unix_now();
         let approved = matches!(input.decision, PairingDecision::Approve);
-        let pending_device_id = if approved {
+        let pending_request = if approved {
             Some({
                 let relay = self.relay.read().await;
                 relay
                     .pending_pairing_requests
                     .get(pairing_id)
-                    .map(|request| request.device_id.clone())
+                    .map(|request| {
+                        (
+                            request.device_id.clone(),
+                            request.label.clone(),
+                            request.device_verify_key.clone(),
+                        )
+                    })
                     .ok_or_else(|| "pairing request is not waiting for approval".to_string())?
             })
         } else {
             None
         };
-        let broker_credential = if let Some(device_id) = pending_device_id.as_deref() {
+        let broker_credential = if let Some((device_id, _, _)) = pending_request.as_ref() {
             Some(
                 broker
                     .device_broker_credential(
@@ -542,6 +548,14 @@ impl AppState {
         } else {
             None
         };
+        let client_grant =
+            if let Some((device_id, device_label, device_verify_key)) = pending_request.as_ref() {
+                broker
+                    .client_broker_grant(device_id, device_verify_key, Some(device_label.clone()))
+                    .await?
+            } else {
+                None
+            };
         let mut relay = self.relay.write().await;
         let mut result = match relay.decide_pairing_request(
             pairing_id,
@@ -554,7 +568,7 @@ impl AppState {
             Ok(result) => result,
             Err(error) => {
                 drop(relay);
-                if let Some(device_id) = pending_device_id.as_deref() {
+                if let Some((device_id, _, _)) = pending_request.as_ref() {
                     let _ = broker.revoke_device_credential(device_id).await;
                 }
                 return Err(error);
@@ -571,6 +585,19 @@ impl AppState {
             result.device_refresh_token = credential.refresh_token;
             result.device_join_ticket = Some(credential.join_credential.token);
             result.device_join_ticket_expires_at = credential.join_credential.expires_at;
+        }
+        if let Some(grant) = client_grant {
+            relay.attach_pairing_client_grant(
+                pairing_id,
+                Some(grant.relay_id.clone()),
+                grant.relay_label.clone(),
+                Some(grant.client_id.clone()),
+                Some(grant.refresh_token.clone()),
+            )?;
+            result.relay_id = Some(grant.relay_id);
+            result.relay_label = grant.relay_label;
+            result.client_id = Some(grant.client_id);
+            result.client_refresh_token = Some(grant.refresh_token);
         }
         let message = match input.decision {
             PairingDecision::Approve => {

@@ -23,7 +23,7 @@ pub const PUBLIC_DEVICE_WS_TTL_SECS_ENV: &str = "RELAY_BROKER_PUBLIC_DEVICE_WS_T
 const DEFAULT_PUBLIC_RELAY_WS_TTL_SECS: u64 = 300;
 const DEFAULT_PUBLIC_DEVICE_WS_TTL_SECS: u64 = 300;
 const DEFAULT_RELAY_ENROLLMENT_CHALLENGE_TTL_SECS: u64 = 300;
-const PUBLIC_CONTROL_STATE_VERSION: u32 = 1;
+const PUBLIC_CONTROL_STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayRegistrationConfig {
@@ -102,6 +102,47 @@ pub struct DeviceGrantRequest {
     pub relay_id: String,
     pub broker_room_id: String,
     pub device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientGrantRequest {
+    pub relay_id: String,
+    pub broker_room_id: String,
+    pub device_id: String,
+    pub client_verify_key: String,
+    #[serde(default)]
+    pub client_label: Option<String>,
+    #[serde(default)]
+    pub device_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientGrantResponse {
+    pub client_id: String,
+    pub client_refresh_token: String,
+    pub relay_id: String,
+    pub broker_room_id: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub relay_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRelayEntry {
+    pub relay_id: String,
+    pub broker_room_id: String,
+    pub device_id: String,
+    pub granted_at: u64,
+    #[serde(default)]
+    pub relay_label: Option<String>,
+    #[serde(default)]
+    pub device_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRelaysResponse {
+    pub client_id: String,
+    pub relays: Vec<ClientRelayEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,7 +241,11 @@ struct PersistedPublicControlState {
     #[serde(default)]
     relay_registrations: Vec<PersistedRelayRegistration>,
     #[serde(default)]
+    client_registrations: Vec<PersistedClientIdentity>,
+    #[serde(default)]
     device_grants: Vec<PersistedDeviceGrant>,
+    #[serde(default)]
+    client_relay_grants: Vec<PersistedClientRelayGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,10 +257,35 @@ struct PersistedDeviceGrant {
     created_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedClientIdentity {
+    client_id: String,
+    client_verify_key: String,
+    refresh_token_hash: String,
+    created_at: u64,
+    #[serde(default)]
+    client_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedClientRelayGrant {
+    client_id: String,
+    relay_id: String,
+    broker_room_id: String,
+    device_id: String,
+    granted_at: u64,
+    #[serde(default)]
+    relay_label: Option<String>,
+    #[serde(default)]
+    device_label: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct PublicControlStateStore {
     relay_registrations_by_hash: HashMap<String, PersistedRelayRegistration>,
+    client_registrations_by_hash: HashMap<String, PersistedClientIdentity>,
     grants_by_hash: HashMap<String, PersistedDeviceGrant>,
+    client_relay_grants_by_key: HashMap<String, PersistedClientRelayGrant>,
 }
 
 impl PublicControlPlane {
@@ -446,6 +516,68 @@ impl PublicControlPlane {
         })
     }
 
+    pub async fn issue_client_grant(
+        &self,
+        bearer_token: &str,
+        request: ClientGrantRequest,
+    ) -> Result<ClientGrantResponse, String> {
+        let registration = self
+            .authenticate_relay(bearer_token, &request.relay_id, &request.broker_room_id)
+            .await?;
+        let client_verify_key = trimmed(Some(request.client_verify_key))
+            .ok_or_else(|| "client verify key is required".to_string())?;
+        validate_relay_verify_key(&client_verify_key)?;
+        let client_label = request
+            .client_label
+            .and_then(|label| trimmed(Some(label)))
+            .filter(|label| !label.is_empty());
+        let device_label = request
+            .device_label
+            .and_then(|label| trimmed(Some(label)))
+            .filter(|label| !label.is_empty());
+        let created_at = unix_now();
+        let mut store = self.inner.state.lock().await;
+        let (client_id, client_refresh_token) =
+            store.issue_or_rotate_client_identity(&client_verify_key, client_label, created_at);
+        store.upsert_client_relay_grant(PersistedClientRelayGrant {
+            client_id: client_id.clone(),
+            relay_id: registration.relay_id.clone(),
+            broker_room_id: registration.broker_room_id.clone(),
+            device_id: request.device_id.clone(),
+            granted_at: created_at,
+            relay_label: registration.relay_label.clone(),
+            device_label,
+        });
+        store.save(self.inner.state_path.as_deref()).await?;
+        Ok(ClientGrantResponse {
+            client_id,
+            client_refresh_token,
+            relay_id: registration.relay_id.clone(),
+            broker_room_id: registration.broker_room_id.clone(),
+            device_id: request.device_id,
+            relay_label: registration.relay_label.clone(),
+        })
+    }
+
+    pub async fn list_client_relays(
+        &self,
+        bearer_token: &str,
+    ) -> Result<ClientRelaysResponse, String> {
+        let client = self.authenticate_client(bearer_token).await?;
+        let store = self.inner.state.lock().await;
+        let mut relays = store.client_relays(&client.client_id);
+        relays.sort_by(|left, right| {
+            right
+                .granted_at
+                .cmp(&left.granted_at)
+                .then_with(|| left.relay_id.cmp(&right.relay_id))
+        });
+        Ok(ClientRelaysResponse {
+            client_id: client.client_id,
+            relays,
+        })
+    }
+
     pub async fn issue_device_session(
         &self,
         bearer_token: &str,
@@ -489,6 +621,11 @@ impl PublicControlPlane {
             Some(&registration.broker_room_id),
             Some(device_id),
         );
+        store.remove_client_relay_grants(
+            &registration.relay_id,
+            Some(&registration.broker_room_id),
+            Some(device_id),
+        );
         if revoked_grant_count > 0 {
             store.save(self.inner.state_path.as_deref()).await?;
         }
@@ -511,6 +648,11 @@ impl PublicControlPlane {
             .await?;
         let mut store = self.inner.state.lock().await;
         let revoked_device_ids = store.remove_all_other_device_grants(
+            &registration.relay_id,
+            &registration.broker_room_id,
+            &request.keep_device_id,
+        );
+        store.remove_all_other_client_relay_grants(
             &registration.relay_id,
             &registration.broker_room_id,
             &request.keep_device_id,
@@ -546,6 +688,19 @@ impl PublicControlPlane {
             return Err("relay refresh token does not match broker_room_id".to_string());
         }
         Ok(registration.clone())
+    }
+
+    async fn authenticate_client(
+        &self,
+        bearer_token: &str,
+    ) -> Result<PersistedClientIdentity, String> {
+        let token_hash = sha256_hex(bearer_token.trim());
+        let store = self.inner.state.lock().await;
+        store
+            .client_registrations_by_hash
+            .get(&token_hash)
+            .cloned()
+            .ok_or_else(|| "client refresh token is invalid".to_string())
     }
 
     fn issue_device_ws_token_for_registration(
@@ -669,10 +824,25 @@ impl PublicControlStateStore {
                 .into_iter()
                 .map(|registration| (registration.refresh_token_hash.clone(), registration))
                 .collect(),
+            client_registrations_by_hash: persisted
+                .client_registrations
+                .into_iter()
+                .map(|registration| (registration.refresh_token_hash.clone(), registration))
+                .collect(),
             grants_by_hash: persisted
                 .device_grants
                 .into_iter()
                 .map(|grant| (grant.refresh_token_hash.clone(), grant))
+                .collect(),
+            client_relay_grants_by_key: persisted
+                .client_relay_grants
+                .into_iter()
+                .map(|grant| {
+                    (
+                        client_relay_grant_key(&grant.client_id, &grant.relay_id),
+                        grant,
+                    )
+                })
                 .collect(),
         })
     }
@@ -689,7 +859,13 @@ impl PublicControlStateStore {
         let payload = serde_json::to_vec_pretty(&PersistedPublicControlState {
             schema_version: PUBLIC_CONTROL_STATE_VERSION,
             relay_registrations: self.relay_registrations_by_hash.values().cloned().collect(),
+            client_registrations: self
+                .client_registrations_by_hash
+                .values()
+                .cloned()
+                .collect(),
             device_grants: self.grants_by_hash.values().cloned().collect(),
+            client_relay_grants: self.client_relay_grants_by_key.values().cloned().collect(),
         })
         .map_err(|error| format!("failed to encode public control-plane state: {error}"))?;
         let temp_path = path.with_extension("tmp");
@@ -725,6 +901,29 @@ impl PublicControlStateStore {
         removed
     }
 
+    fn remove_client_relay_grants(
+        &mut self,
+        relay_id: &str,
+        broker_room_id: Option<&str>,
+        device_id: Option<&str>,
+    ) -> usize {
+        let mut removed = 0;
+        self.client_relay_grants_by_key.retain(|_, grant| {
+            let matches = grant.relay_id == relay_id
+                && broker_room_id
+                    .map(|value| value == grant.broker_room_id)
+                    .unwrap_or(true)
+                && device_id
+                    .map(|value| value == grant.device_id)
+                    .unwrap_or(true);
+            if matches {
+                removed += 1;
+            }
+            !matches
+        });
+        removed
+    }
+
     fn remove_all_other_device_grants(
         &mut self,
         relay_id: &str,
@@ -743,6 +942,77 @@ impl PublicControlStateStore {
         });
         revoked_device_ids.sort();
         revoked_device_ids
+    }
+
+    fn remove_all_other_client_relay_grants(
+        &mut self,
+        relay_id: &str,
+        broker_room_id: &str,
+        keep_device_id: &str,
+    ) -> Vec<String> {
+        let mut revoked_device_ids = Vec::new();
+        self.client_relay_grants_by_key.retain(|_, grant| {
+            let revoke = grant.relay_id == relay_id
+                && grant.broker_room_id == broker_room_id
+                && grant.device_id != keep_device_id;
+            if revoke && !revoked_device_ids.iter().any(|id| id == &grant.device_id) {
+                revoked_device_ids.push(grant.device_id.clone());
+            }
+            !revoke
+        });
+        revoked_device_ids.sort();
+        revoked_device_ids
+    }
+
+    fn issue_or_rotate_client_identity(
+        &mut self,
+        client_verify_key: &str,
+        client_label: Option<String>,
+        created_at: u64,
+    ) -> (String, String) {
+        let (client_id, carried_label) =
+            if let Some(existing) = self.client_identity_for_verify_key(client_verify_key) {
+                let client_id = existing.client_id.clone();
+                self.remove_client_identity_by_client_id(&client_id);
+                (client_id, existing.client_label.clone())
+            } else {
+                (issue_client_id(client_verify_key), None)
+            };
+        let client_refresh_token = format!("cref-{}", random_token(40).to_ascii_lowercase());
+        let refresh_token_hash = sha256_hex(&client_refresh_token);
+        self.client_registrations_by_hash.insert(
+            refresh_token_hash.clone(),
+            PersistedClientIdentity {
+                client_id: client_id.clone(),
+                client_verify_key: client_verify_key.to_string(),
+                refresh_token_hash,
+                created_at,
+                client_label: client_label.or(carried_label),
+            },
+        );
+        (client_id, client_refresh_token)
+    }
+
+    fn upsert_client_relay_grant(&mut self, grant: PersistedClientRelayGrant) {
+        self.client_relay_grants_by_key.insert(
+            client_relay_grant_key(&grant.client_id, &grant.relay_id),
+            grant,
+        );
+    }
+
+    fn client_relays(&self, client_id: &str) -> Vec<ClientRelayEntry> {
+        self.client_relay_grants_by_key
+            .values()
+            .filter(|grant| grant.client_id == client_id)
+            .map(|grant| ClientRelayEntry {
+                relay_id: grant.relay_id.clone(),
+                broker_room_id: grant.broker_room_id.clone(),
+                device_id: grant.device_id.clone(),
+                granted_at: grant.granted_at,
+                relay_label: grant.relay_label.clone(),
+                device_label: grant.device_label.clone(),
+            })
+            .collect()
     }
 
     fn seed_relay_registrations(&mut self, registrations: Vec<RelayRegistrationConfig>) {
@@ -794,6 +1064,16 @@ impl PublicControlStateStore {
             .cloned()
     }
 
+    fn client_identity_for_verify_key(
+        &self,
+        client_verify_key: &str,
+    ) -> Option<PersistedClientIdentity> {
+        self.client_registrations_by_hash
+            .values()
+            .find(|registration| registration.client_verify_key == client_verify_key)
+            .cloned()
+    }
+
     fn remove_relay_registration_by_verify_key(&mut self, relay_verify_key: &str) -> usize {
         let mut removed = 0;
         self.relay_registrations_by_hash.retain(|_, registration| {
@@ -801,6 +1081,18 @@ impl PublicControlStateStore {
                 .relay_verify_key
                 .as_deref()
                 .is_some_and(|value| value == relay_verify_key);
+            if matches {
+                removed += 1;
+            }
+            !matches
+        });
+        removed
+    }
+
+    fn remove_client_identity_by_client_id(&mut self, client_id: &str) -> usize {
+        let mut removed = 0;
+        self.client_registrations_by_hash.retain(|_, registration| {
+            let matches = registration.client_id == client_id;
             if matches {
                 removed += 1;
             }
@@ -864,6 +1156,15 @@ fn sha256_hex(value: &str) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+fn client_relay_grant_key(client_id: &str, relay_id: &str) -> String {
+    format!("{client_id}:{relay_id}")
+}
+
+fn issue_client_id(client_verify_key: &str) -> String {
+    let digest = sha256_hex(client_verify_key);
+    format!("client-{}", &digest[..16])
 }
 
 fn trimmed(value: Option<String>) -> Option<String> {

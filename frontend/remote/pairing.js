@@ -25,8 +25,11 @@ import {
   resetRemoteSurface,
 } from "./render.js";
 import {
+  brokerControlUrl,
   normalizedDeviceLabel,
   ensureDeviceIdentity,
+  forgetCurrentRemoteProfile,
+  saveClientAuth,
   saveDeviceLabel,
   saveRemoteAuth,
   state,
@@ -66,14 +69,12 @@ export async function beginPairing(rawValue, { auto = false } = {}) {
     state.pairingTicket = parsePairingPayload(raw);
     state.pairingPhase = "connecting";
     state.pairingError = null;
-    state.remoteAuth = null;
     state.session = null;
     state.threads = [];
     state.currentApprovalId = null;
     clearClaimLifecycle();
     clearSessionRuntime();
     rejectPendingActions("pairing restarted before broker actions completed");
-    saveRemoteAuth(null);
     saveDeviceLabel(dom.deviceLabelInput.value);
     closePairingModalIfOpen();
     renderDeviceMeta();
@@ -152,6 +153,8 @@ export async function handleEncryptedPairingResult(payload) {
     return;
   }
   state.remoteAuth = {
+    relayId: result.relay_id || state.pairingTicket.broker_channel_id,
+    relayLabel: result.relay_label || null,
     brokerUrl: state.pairingTicket.broker_url,
     brokerChannelId: state.pairingTicket.broker_channel_id,
     relayPeerId: state.pairingTicket.relay_peer_id,
@@ -180,6 +183,13 @@ export async function handleEncryptedPairingResult(payload) {
       );
     }
   }
+  if (result.client_refresh_token && result.client_id) {
+    saveClientAuth({
+      clientId: result.client_id,
+      clientRefreshToken: result.client_refresh_token,
+      brokerControlUrl: brokerControlUrl(state.pairingTicket.broker_url),
+    });
+  }
   saveRemoteAuth(state.remoteAuth);
   state.pairingTicket = null;
   state.pairingPhase = null;
@@ -201,14 +211,13 @@ export function forgetCurrentDevice() {
   state.pairingError = null;
   state.pairingPhase = null;
   state.pairingTicket = null;
-  state.remoteAuth = null;
+  forgetCurrentRemoteProfile();
   state.session = null;
   state.currentApprovalId = null;
   state.threads = [];
   clearClaimLifecycle();
   clearSessionRuntime();
   rejectPendingActions("device was forgotten before broker actions completed");
-  saveRemoteAuth(null);
   clearPairingQueryFromUrl();
   closeBrokerSocket();
   void clearDeviceRefreshSession(brokerUrl);

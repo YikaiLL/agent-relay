@@ -17,10 +17,11 @@ use super::*;
 use crate::auth::BrokerAuthMode;
 use crate::join_ticket::{JoinTicketClaims, JoinTicketKey};
 use crate::public_control::{
-    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
-    PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+    ClientGrantRequest, ClientGrantResponse, ClientRelaysResponse, DeviceGrantBulkRevokeRequest,
+    DeviceGrantBulkRevokeResponse, DeviceGrantRequest, DeviceGrantResponse,
+    DeviceGrantRevokeRequest, DeviceGrantRevokeResponse, DeviceSessionResponse,
+    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
+    RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
     RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
     RelayWsTokenResponse,
 };
@@ -197,6 +198,23 @@ where
         .post(format!("http://{address}{path}"))
         .header(reqwest::header::COOKIE, cookie)
         .json(request)
+        .send()
+        .await
+        .expect("request should succeed")
+        .error_for_status()
+        .expect("response should be successful")
+        .json::<TResp>()
+        .await
+        .expect("response should decode")
+}
+
+async fn public_get<TResp>(address: SocketAddr, path: &str, bearer_token: &str) -> TResp
+where
+    TResp: serde::de::DeserializeOwned,
+{
+    reqwest::Client::new()
+        .get(format!("http://{address}{path}"))
+        .bearer_auth(bearer_token)
         .send()
         .await
         .expect("request should succeed")
@@ -1040,6 +1058,52 @@ async fn public_bulk_revoke_keeps_selected_device() {
     )
     .await;
     assert!(error_body.contains("request failed"));
+}
+
+#[tokio::test]
+async fn public_client_grants_list_relays_and_track_revoke() {
+    let address = spawn_public_mode_app().await;
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+
+    let grant: ClientGrantResponse = public_post(
+        address,
+        "/api/public/clients/grants",
+        "relay-refresh-1",
+        &ClientGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-1".to_string(),
+            client_verify_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+            client_label: Some("Phone".to_string()),
+            device_label: Some("Phone".to_string()),
+        },
+    )
+    .await;
+    assert!(grant.client_id.starts_with("client-"));
+
+    let relays: ClientRelaysResponse =
+        public_get(address, "/api/public/relays", &grant.client_refresh_token).await;
+    assert_eq!(relays.client_id, grant.client_id);
+    assert_eq!(relays.relays.len(), 1);
+    assert_eq!(relays.relays[0].relay_id, "relay-1");
+    assert_eq!(relays.relays[0].broker_room_id, "room-a");
+    assert_eq!(relays.relays[0].device_id, "device-1");
+    assert_eq!(relays.relays[0].device_label.as_deref(), Some("Phone"));
+
+    let _: DeviceGrantRevokeResponse = public_post(
+        address,
+        "/api/public/devices/device-1/revoke",
+        "relay-refresh-1",
+        &DeviceGrantRevokeRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+        },
+    )
+    .await;
+
+    let relays_after_revoke: ClientRelaysResponse =
+        public_get(address, "/api/public/relays", &grant.client_refresh_token).await;
+    assert!(relays_after_revoke.relays.is_empty());
 }
 
 #[tokio::test]
