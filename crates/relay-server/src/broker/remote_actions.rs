@@ -826,6 +826,7 @@ async fn publish_plain_remote_action_result(
     ok: bool,
     _device_id: String,
 ) -> Result<(), String> {
+    let snapshot = snapshot.compact_for_broker();
     publish_payload(
         sender,
         OutboundBrokerPayload::RemoteActionResult {
@@ -890,6 +891,7 @@ async fn publish_remote_action_result_private(
     ok: bool,
     response_secret: Option<&str>,
 ) -> Result<(), String> {
+    let snapshot = snapshot.compact_for_broker();
     let secret = match response_secret {
         Some(secret) => secret.to_string(),
         None => state.paired_device_payload_secret(&device_id).await?,

@@ -12,6 +12,7 @@ export const remoteStartSessionButton = document.querySelector("#remote-start-se
 export const remoteCwdInput = document.querySelector("#remote-cwd-input");
 export const remoteStartPromptInput = document.querySelector("#remote-start-prompt");
 export const remoteModelInput = document.querySelector("#remote-model-input");
+export const remoteModelOptions = document.querySelector("#remote-model-options");
 export const remoteApprovalPolicyInput = document.querySelector("#remote-approval-policy-input");
 export const remoteSandboxInput = document.querySelector("#remote-sandbox-input");
 export const remoteStartEffortInput = document.querySelector("#remote-start-effort");

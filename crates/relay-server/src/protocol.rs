@@ -94,6 +94,7 @@ pub struct SessionSnapshot {
     pub active_flags: Vec<String>,
     pub current_cwd: String,
     pub model: String,
+    pub available_models: Vec<ModelOptionView>,
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
@@ -103,6 +104,42 @@ pub struct SessionSnapshot {
     pub pending_approvals: Vec<ApprovalRequestView>,
     pub transcript: Vec<TranscriptEntryView>,
     pub logs: Vec<LogEntryView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelOptionView {
+    pub model: String,
+    pub display_name: String,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: String,
+    pub hidden: bool,
+    pub is_default: bool,
+}
+
+impl SessionSnapshot {
+    pub fn compact_for_broker(mut self) -> Self {
+        const BROKER_LOG_LIMIT: usize = 24;
+        const BROKER_TRANSCRIPT_LIMIT: usize = 24;
+        const BROKER_TEXT_LIMIT: usize = 4000;
+
+        if self.logs.len() > BROKER_LOG_LIMIT {
+            self.logs.truncate(BROKER_LOG_LIMIT);
+        }
+
+        if self.transcript.len() > BROKER_TRANSCRIPT_LIMIT {
+            let keep_from = self.transcript.len() - BROKER_TRANSCRIPT_LIMIT;
+            self.transcript = self.transcript.split_off(keep_from);
+        }
+
+        for entry in &mut self.transcript {
+            if entry.text.len() > BROKER_TEXT_LIMIT {
+                entry.text.truncate(BROKER_TEXT_LIMIT);
+                entry.text.push_str("...");
+            }
+        }
+
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

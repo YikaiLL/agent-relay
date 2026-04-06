@@ -977,7 +977,7 @@ async fn publish_snapshot(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     state: &AppState,
 ) -> Result<(), String> {
-    let snapshot = state.snapshot().await;
+    let snapshot = state.snapshot().await.compact_for_broker();
     if state.broker_can_read_content().await {
         publish_payload(sender, OutboundBrokerPayload::SessionSnapshot { snapshot })
             .await

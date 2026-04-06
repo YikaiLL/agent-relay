@@ -18,7 +18,7 @@ use crate::{
     codex_local::{
         delete_thread_permanently as delete_thread_permanently_local, LocalThreadDeleteSummary,
     },
-    protocol::{ApprovalDecisionInput, ThreadSummaryView, TranscriptEntryView},
+    protocol::{ApprovalDecisionInput, ModelOptionView, ThreadSummaryView, TranscriptEntryView},
     state::{ApprovalKind, PendingApproval, RelayState},
 };
 
@@ -101,6 +101,42 @@ impl CodexBridge {
             .ok_or_else(|| "thread/list did not return a thread array".to_string())?;
 
         threads.iter().map(parse_thread_summary).collect()
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<ModelOptionView>, String> {
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let result = self
+                .send_request(
+                    "model/list",
+                    json!({
+                        "cursor": cursor,
+                        "includeHidden": false,
+                        "limit": 100
+                    }),
+                )
+                .await?;
+
+            let data = value_at(&result, &["data"])
+                .and_then(Value::as_array)
+                .ok_or_else(|| "model/list did not return a model array".to_string())?;
+
+            for model in data {
+                models.push(parse_model_option(model)?);
+            }
+
+            cursor = value_at(&result, &["nextCursor"])
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(models)
     }
 
     pub async fn start_thread(
@@ -630,6 +666,31 @@ fn parse_thread_summary(thread: &Value) -> Result<ThreadSummaryView, String> {
     })
 }
 
+fn parse_model_option(model: &Value) -> Result<ModelOptionView, String> {
+    let supported_reasoning_efforts = value_at(model, &["supportedReasoningEfforts"])
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| value_at(item, &["reasoningEffort"]).and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(ModelOptionView {
+        model: string_at(model, &["model"])
+            .ok_or_else(|| "model/list item missing model".to_string())?,
+        display_name: string_at(model, &["displayName"])
+            .ok_or_else(|| "model/list item missing displayName".to_string())?,
+        supported_reasoning_efforts,
+        default_reasoning_effort: string_at(model, &["defaultReasoningEffort"])
+            .ok_or_else(|| "model/list item missing defaultReasoningEffort".to_string())?,
+        hidden: bool_at(model, &["hidden"]).unwrap_or(false),
+        is_default: bool_at(model, &["isDefault"]).unwrap_or(false),
+    })
+}
+
 fn parse_transcript(thread: &Value) -> Vec<TranscriptEntryView> {
     let mut transcript = Vec::new();
     let turns = match value_at(thread, &["turns"]).and_then(Value::as_array) {
@@ -744,6 +805,10 @@ fn string_at(value: &Value, path: &[&str]) -> Option<String> {
     value_at(value, path)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn bool_at(value: &Value, path: &[&str]) -> Option<bool> {
+    value_at(value, path).and_then(Value::as_bool)
 }
 
 fn normalize_id(value: &Value) -> String {

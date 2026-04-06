@@ -9,7 +9,8 @@ use tokio::sync::watch;
 use crate::{
     codex::ThreadSyncData,
     protocol::{
-        ApprovalReceipt, LogEntryView, SessionSnapshot, ThreadSummaryView, ThreadsResponse,
+        ApprovalReceipt, LogEntryView, ModelOptionView, SessionSnapshot, ThreadSummaryView,
+        ThreadsResponse,
     },
 };
 
@@ -83,6 +84,7 @@ pub struct RelayState {
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
+    pub available_models: Vec<ModelOptionView>,
     pub device_records: HashMap<String, DeviceRecord>,
     pub paired_devices: HashMap<String, PairedDevice>,
     pub pending_pairings: HashMap<String, PendingPairing>,
@@ -123,6 +125,7 @@ impl RelayState {
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
             sandbox: DEFAULT_SANDBOX.to_string(),
             reasoning_effort: DEFAULT_EFFORT.to_string(),
+            available_models: Vec::new(),
             device_records: HashMap::new(),
             paired_devices: HashMap::new(),
             pending_pairings: HashMap::new(),
@@ -211,6 +214,7 @@ impl RelayState {
             active_flags: self.active_flags.clone(),
             current_cwd: self.current_cwd.clone(),
             model: self.model.clone(),
+            available_models: self.available_models.clone(),
             approval_policy: self.approval_policy.clone(),
             sandbox: self.sandbox.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
@@ -255,6 +259,42 @@ impl RelayState {
         self.pending_approvals.clear();
         self.transcript.clear();
         self.upsert_thread(thread);
+    }
+
+    pub fn set_available_models(&mut self, models: Vec<ModelOptionView>) {
+        let preferred = models
+            .iter()
+            .find(|model| model.is_default)
+            .or_else(|| models.first())
+            .cloned();
+        self.available_models = models;
+
+        let current_model_known = self
+            .available_models
+            .iter()
+            .any(|option| option.model == self.model);
+
+        if let Some(default_model) = preferred {
+            if self.model == DEFAULT_MODEL || !current_model_known {
+                self.model = default_model.model.clone();
+            }
+
+            let effort_supported = self
+                .available_models
+                .iter()
+                .find(|option| option.model == self.model)
+                .map(|option| {
+                    option
+                        .supported_reasoning_efforts
+                        .iter()
+                        .any(|effort| effort == &self.reasoning_effort)
+                })
+                .unwrap_or(false);
+
+            if self.reasoning_effort == DEFAULT_EFFORT || !effort_supported {
+                self.reasoning_effort = default_model.default_reasoning_effort;
+            }
+        }
     }
 
     pub fn load_thread_data(

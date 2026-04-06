@@ -33,6 +33,8 @@ export function renderSession(session) {
     dom.remoteThreadsCwdInput.value = session.current_cwd;
   }
 
+  syncRemoteModelSuggestions(session.available_models || [], session.model);
+
   renderSessionChrome(session);
   renderTranscriptPanel(session, approval, canWrite);
   renderLogs(session.logs || []);
@@ -121,4 +123,17 @@ export function isCurrentDeviceActiveController(session) {
 
 export function canCurrentDeviceWrite(session) {
   return canRemoteDeviceWrite(session);
+}
+
+function syncRemoteModelSuggestions(models, selectedModel) {
+  if (dom.remoteModelOptions) {
+    dom.remoteModelOptions.innerHTML = models
+      .map((model) => `<option value="${escapeHtml(model.model)}">${escapeHtml(model.display_name)}</option>`)
+      .join("");
+  }
+
+  if (!dom.remoteModelInput.value || dom.remoteModelInput.value === "gpt-5-codex") {
+    dom.remoteModelInput.value =
+      selectedModel || models.find((model) => model.is_default)?.model || "gpt-5.4";
+  }
 }

@@ -82,6 +82,8 @@ impl AppState {
             change_tx,
         };
 
+        state.refresh_model_catalog().await;
+
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
         }
@@ -613,6 +615,24 @@ impl AppState {
             approval_policy: relay.approval_policy.clone(),
             sandbox: relay.sandbox.clone(),
             reasoning_effort: relay.reasoning_effort.clone(),
+        }
+    }
+
+    async fn refresh_model_catalog(&self) {
+        match self.codex.list_models().await {
+            Ok(models) => {
+                let mut relay = self.relay.write().await;
+                relay.set_available_models(models);
+                relay.notify();
+            }
+            Err(error) => {
+                let mut relay = self.relay.write().await;
+                relay.push_log(
+                    "warn",
+                    format!("Failed to load Codex model catalog: {error}"),
+                );
+                relay.notify();
+            }
         }
     }
 
