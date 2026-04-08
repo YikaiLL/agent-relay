@@ -98,6 +98,7 @@ pub struct SessionSnapshot {
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
+    pub allowed_roots: Vec<String>,
     pub device_records: Vec<DeviceRecordView>,
     pub paired_devices: Vec<PairedDeviceView>,
     pub pending_pairing_requests: Vec<PendingPairingRequestView>,
@@ -172,6 +173,7 @@ mod tests {
             approval_policy: "untrusted".to_string(),
             sandbox: "workspace-write".to_string(),
             reasoning_effort: "medium".to_string(),
+            allowed_roots: vec![],
             device_records: vec![],
             paired_devices: vec![],
             pending_pairing_requests: vec![],
@@ -398,6 +400,17 @@ pub struct BulkRevokeDevicesReceipt {
 pub struct ThreadsQuery {
     pub cwd: Option<String>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowedRootsInput {
+    pub allowed_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowedRootsReceipt {
+    pub allowed_roots: Vec<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

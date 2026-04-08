@@ -60,6 +60,7 @@ fn test_persisted_state() -> PersistedRelayState {
         approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
         sandbox: DEFAULT_SANDBOX.to_string(),
         reasoning_effort: DEFAULT_EFFORT.to_string(),
+        allowed_roots: vec!["/tmp/project".to_string()],
         device_records,
         paired_devices,
         transcript: vec![TranscriptRecord {
@@ -192,6 +193,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
             sandbox: DEFAULT_SANDBOX.to_string(),
             reasoning_effort: DEFAULT_EFFORT.to_string(),
+            allowed_roots: vec!["/tmp/project".to_string()],
             device_records: Vec::new(),
             paired_devices: Vec::new(),
             pending_pairing_requests: Vec::new(),
@@ -456,6 +458,30 @@ fn filter_threads_matches_tilde_scoped_workspace() {
 }
 
 #[test]
+fn normalize_allowed_roots_expands_home_and_deduplicates() {
+    let home = env::var("HOME").expect("HOME should be set for tests");
+    let root = PathBuf::from(home).join("git/agent-relay");
+
+    let normalized = normalize_allowed_roots(vec![
+        "~/git/agent-relay".to_string(),
+        root.display().to_string(),
+        "  ".to_string(),
+    ])
+    .expect("allowed roots should normalize");
+
+    assert_eq!(normalized, vec![root.display().to_string()]);
+}
+
+#[test]
+fn ensure_path_within_allowed_roots_rejects_outside_workspace() {
+    let roots = vec!["/tmp/project".to_string()];
+
+    assert!(ensure_path_within_allowed_roots("/tmp/project", &roots).is_ok());
+    assert!(ensure_path_within_allowed_roots("/tmp/project/subdir", &roots).is_ok());
+    assert!(ensure_path_within_allowed_roots("/tmp/other", &roots).is_err());
+}
+
+#[test]
 fn passive_device_cannot_refresh_another_devices_lease() {
     let mut relay = test_state();
     relay.activate_thread(
@@ -507,6 +533,7 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
     );
     relay.active_controller_last_seen_at = Some(99);
     relay.active_turn_id = Some("turn-ephemeral".to_string());
+    relay.allowed_roots = vec!["/tmp/project".to_string()];
     relay.transcript.push(TranscriptRecord {
         item_id: "history-0".to_string(),
         role: "assistant".to_string(),
@@ -536,6 +563,7 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
     assert_eq!(restored.active_turn_id, None);
     assert_eq!(restored.pending_approvals.len(), 0);
     assert_eq!(restored.paired_devices.len(), 0);
+    assert_eq!(restored.allowed_roots, vec!["/tmp/project".to_string()]);
     assert_eq!(restored.transcript.len(), 1);
     assert_eq!(restored.logs.len(), persisted.logs.len());
     assert_eq!(restored.logs[0].message, persisted.logs[0].message);

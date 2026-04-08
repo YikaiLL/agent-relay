@@ -226,6 +226,30 @@
 
         <div class="sidebar-row">
           <div>
+            <p class="sidebar-caption">Workspace Roots</p>
+            <p class="sidebar-hint">Limit every device on this relay to specific root directories. Leave empty for unrestricted access.</p>
+          </div>
+        </div>
+        <form id="allowed-roots-form" class="workspace-form">
+          <label class="sidebar-label" for="allowed-roots-input">Allowed Roots</label>
+          <textarea
+            id="allowed-roots-input"
+            rows="4"
+            placeholder="~/projects&#10;~/Documents/projects"
+          ></textarea>
+          <div class="workspace-picker">
+            <button id="save-allowed-roots-button" class="load-button" type="submit">Save roots</button>
+          </div>
+          <p id="allowed-roots-summary" class="sidebar-hint">
+            This relay is currently unrestricted.
+          </p>
+        </form>
+        <div id="allowed-roots-list" class="paired-devices-list">
+          <p class="sidebar-empty">No workspace restrictions are configured.</p>
+        </div>
+
+        <div class="sidebar-row">
+          <div>
             <p class="sidebar-caption">Device Security</p>
             <p class="sidebar-hint">Review known devices, fingerprints, and broker access.</p>
           </div>

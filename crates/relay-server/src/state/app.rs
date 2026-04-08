@@ -7,17 +7,19 @@ use crate::{
     broker::BrokerConfig,
     codex::CodexBridge,
     protocol::{
-        ApprovalDecision, ApprovalDecisionInput, ApprovalReceipt, BulkRevokeDevicesReceipt,
-        HeartbeatInput, PairingDecision, PairingDecisionInput, PairingDecisionReceipt,
-        PairingStartInput, PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt,
-        SendMessageInput, SessionSnapshot, StartSessionInput, TakeOverInput, ThreadArchiveReceipt,
-        ThreadDeleteReceipt, ThreadsResponse,
+        AllowedRootsInput, AllowedRootsReceipt, ApprovalDecision, ApprovalDecisionInput,
+        ApprovalReceipt, BulkRevokeDevicesReceipt, HeartbeatInput, PairingDecision,
+        PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
+        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+        StartSessionInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
+        ThreadsResponse,
     },
 };
 
 use super::persistence::{spawn_persistence_task, PersistedRelayState, PersistenceStore};
 use super::{
-    expire_controller_if_needed, filter_threads, non_empty, normalize_cwd, require_device_id,
+    ensure_path_within_allowed_roots, expire_controller_if_needed, filter_threads, non_empty,
+    normalize_allowed_roots, normalize_cwd, path_within_allowed_roots, require_device_id,
     short_device_id, unix_now, CachedRemoteActionResult, RelayState, RemoteActionReplayDecision,
     SecurityProfile, THREAD_SCAN_LIMIT,
 };
@@ -116,12 +118,63 @@ impl AppState {
         };
         let listed_threads = self.codex.list_threads(scan_limit).await?;
         let mut relay = self.relay.write().await;
-        let threads = relay.filter_deleted_threads(listed_threads);
+        if let Some(selected_cwd) = cwd.as_deref() {
+            ensure_path_within_allowed_roots(selected_cwd, &relay.allowed_roots)?;
+        }
+        let allowed_roots = relay.allowed_roots.clone();
+        let threads = relay
+            .filter_deleted_threads(listed_threads)
+            .into_iter()
+            .filter(|thread| path_within_allowed_roots(&thread.cwd, &allowed_roots))
+            .collect::<Vec<_>>();
         let response_threads = filter_threads(threads.clone(), cwd.as_deref(), limit);
         relay.threads = threads;
         relay.notify();
         Ok(ThreadsResponse {
             threads: response_threads,
+        })
+    }
+
+    pub async fn update_allowed_roots(
+        &self,
+        input: AllowedRootsInput,
+    ) -> Result<AllowedRootsReceipt, String> {
+        let allowed_roots = normalize_allowed_roots(input.allowed_roots)?;
+        let mut relay = self.relay.write().await;
+        let changed = relay.set_allowed_roots(allowed_roots.clone());
+
+        if changed {
+            let current_cwd = relay.current_cwd.clone();
+            relay.push_log(
+                "info",
+                if allowed_roots.is_empty() {
+                    "Cleared relay workspace restrictions. Any workspace can be started or resumed."
+                        .to_string()
+                } else {
+                    format!("Updated relay allowed roots: {}.", allowed_roots.join(", "))
+                },
+            );
+            if relay.active_thread_id.is_some()
+                && !path_within_allowed_roots(&current_cwd, &allowed_roots)
+            {
+                relay.push_log(
+                    "warn",
+                    format!(
+                        "Current session workspace {} is outside the configured allowed roots. New sends, starts, and resumes will be blocked until you switch back to an allowed directory.",
+                        current_cwd
+                    ),
+                );
+            }
+            relay.notify();
+        }
+
+        Ok(AllowedRootsReceipt {
+            allowed_roots,
+            message: if changed {
+                "Relay workspace restrictions saved.".to_string()
+            } else {
+                "Relay workspace restrictions were already up to date.".to_string()
+            },
         })
     }
 
@@ -210,6 +263,10 @@ impl AppState {
         let device_id = require_device_id(input.device_id)?;
         let defaults = self.defaults().await;
         let cwd = normalize_cwd(&non_empty(input.cwd).unwrap_or(defaults.current_cwd));
+        {
+            let relay = self.relay.read().await;
+            ensure_path_within_allowed_roots(&cwd, &relay.allowed_roots)?;
+        }
         let model = non_empty(input.model).unwrap_or(defaults.model);
         let approval_policy = non_empty(input.approval_policy).unwrap_or(defaults.approval_policy);
         let sandbox = non_empty(input.sandbox).unwrap_or(defaults.sandbox);
@@ -265,6 +322,12 @@ impl AppState {
         let sandbox = non_empty(input.sandbox).unwrap_or(defaults.sandbox);
         let effort = non_empty(input.effort).unwrap_or(defaults.reasoning_effort);
 
+        let preview = self.codex.read_thread(&input.thread_id).await?;
+        {
+            let relay = self.relay.read().await;
+            ensure_path_within_allowed_roots(&preview.thread.cwd, &relay.allowed_roots)?;
+        }
+
         self.codex
             .resume_thread(&input.thread_id, &approval_policy, &sandbox)
             .await?;
@@ -298,6 +361,7 @@ impl AppState {
         let thread_id = {
             let relay = self.relay.read().await;
             relay.ensure_device_can_send_message(&device_id)?;
+            ensure_path_within_allowed_roots(&relay.current_cwd, &relay.allowed_roots)?;
             relay
                 .active_thread_id
                 .clone()

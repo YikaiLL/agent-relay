@@ -81,6 +81,63 @@ fn thread_matches_cwd_scope(thread_cwd: &str, cwd: Option<&str>) -> bool {
     thread_path == selected_path || thread_path.starts_with(selected_path)
 }
 
+pub(super) fn path_within_allowed_roots(path: &str, allowed_roots: &[String]) -> bool {
+    if allowed_roots.is_empty() {
+        return true;
+    }
+
+    let normalized_path = normalize_cwd(path);
+    let candidate_path = Path::new(&normalized_path);
+    allowed_roots.iter().any(|root| {
+        let root_path = Path::new(root);
+        candidate_path == root_path || candidate_path.starts_with(root_path)
+    })
+}
+
+pub(super) fn ensure_path_within_allowed_roots(
+    path: &str,
+    allowed_roots: &[String],
+) -> Result<(), String> {
+    if path_within_allowed_roots(path, allowed_roots) {
+        return Ok(());
+    }
+
+    let normalized_path = normalize_cwd(path);
+    let root_hint = match allowed_roots {
+        [] => "this relay is unrestricted".to_string(),
+        [root] => format!("choose a directory under {root}"),
+        _ => "choose a directory under one of this relay's allowed roots".to_string(),
+    };
+
+    Err(format!(
+        "workspace {normalized_path} is outside this relay's allowed roots; {root_hint}"
+    ))
+}
+
+pub(super) fn normalize_allowed_roots(roots: Vec<String>) -> Result<Vec<String>, String> {
+    let mut normalized = roots
+        .into_iter()
+        .filter_map(|root| non_empty(Some(root)))
+        .map(|root| {
+            let normalized_root = normalize_cwd(&root);
+            let root_path = PathBuf::from(&normalized_root);
+            let metadata = std::fs::metadata(&root_path).map_err(|error| {
+                format!("allowed root {normalized_root} is not accessible: {error}")
+            })?;
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "allowed root {normalized_root} must be a directory"
+                ));
+            }
+            Ok(normalized_root)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 pub(super) fn normalize_cwd(cwd: &str) -> String {
     let trimmed = cwd.trim();
     if trimmed.is_empty() {

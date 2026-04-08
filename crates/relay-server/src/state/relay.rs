@@ -84,6 +84,7 @@ pub struct RelayState {
     pub approval_policy: String,
     pub sandbox: String,
     pub reasoning_effort: String,
+    pub allowed_roots: Vec<String>,
     pub available_models: Vec<ModelOptionView>,
     pub device_records: HashMap<String, DeviceRecord>,
     pub paired_devices: HashMap<String, PairedDevice>,
@@ -125,6 +126,7 @@ impl RelayState {
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
             sandbox: DEFAULT_SANDBOX.to_string(),
             reasoning_effort: DEFAULT_EFFORT.to_string(),
+            allowed_roots: Vec::new(),
             available_models: Vec::new(),
             device_records: HashMap::new(),
             paired_devices: HashMap::new(),
@@ -218,6 +220,7 @@ impl RelayState {
             approval_policy: self.approval_policy.clone(),
             sandbox: self.sandbox.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            allowed_roots: self.allowed_roots.clone(),
             device_records,
             paired_devices,
             pending_pairing_requests,
@@ -346,6 +349,7 @@ impl RelayState {
         self.approval_policy = persisted.approval_policy.clone();
         self.sandbox = persisted.sandbox.clone();
         self.reasoning_effort = persisted.reasoning_effort.clone();
+        self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
         self.backfill_device_records_from_paired_devices();
@@ -561,6 +565,7 @@ impl RelayState {
         self.approval_policy = persisted.approval_policy.clone();
         self.sandbox = persisted.sandbox.clone();
         self.reasoning_effort = persisted.reasoning_effort.clone();
+        self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
         self.backfill_device_records_from_paired_devices();
@@ -599,6 +604,14 @@ impl RelayState {
                 .entry(device.device_id.clone())
                 .or_insert_with(|| DeviceRecord::approved_from(device));
         }
+    }
+
+    pub fn set_allowed_roots(&mut self, allowed_roots: Vec<String>) -> bool {
+        if self.allowed_roots == allowed_roots {
+            return false;
+        }
+        self.allowed_roots = allowed_roots;
+        true
     }
 
     pub fn reserve_remote_action(

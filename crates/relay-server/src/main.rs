@@ -26,11 +26,12 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use protocol::{
-    ApiEnvelope, ApiError, ApprovalDecisionInput, ApprovalReceipt, AuthSessionInput,
-    AuthSessionView, BulkRevokeDevicesReceipt, HealthResponse, HeartbeatInput,
-    PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
-    ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput,
-    TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadsQuery, ThreadsResponse,
+    AllowedRootsInput, AllowedRootsReceipt, ApiEnvelope, ApiError, ApprovalDecisionInput,
+    ApprovalReceipt, AuthSessionInput, AuthSessionView, BulkRevokeDevicesReceipt, HealthResponse,
+    HeartbeatInput, PairingDecisionInput, PairingDecisionReceipt, PairingStartInput,
+    PairingTicketView, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+    StartSessionInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadsQuery,
+    ThreadsResponse,
 };
 use state::{AppState, ApprovalError};
 use tower_http::{
@@ -174,6 +175,7 @@ fn build_router(context: AppContext, web_root: PathBuf) -> Router {
         .route("/api/session", get(session_snapshot))
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
+        .route("/api/allowed-roots", post(update_allowed_roots))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
             "/api/threads/:thread_id/delete",
@@ -327,7 +329,28 @@ async fn list_threads(
         .list_threads(limit, query.cwd)
         .await
         .map(|threads| Json(ApiEnvelope::ok(threads)))
-        .map_err(bad_gateway)
+        .map_err(|error| {
+            if is_path_policy_error(&error) {
+                bad_request(error)
+            } else {
+                bad_gateway(error)
+            }
+        })
+}
+
+async fn update_allowed_roots(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<AllowedRootsInput>,
+) -> Result<Json<ApiEnvelope<AllowedRootsReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .update_allowed_roots(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
 }
 
 async fn archive_thread(
@@ -384,7 +407,13 @@ async fn start_session(
         .start_session(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
-        .map_err(bad_gateway)
+        .map_err(|error| {
+            if is_path_policy_error(&error) {
+                bad_request(error)
+            } else {
+                bad_gateway(error)
+            }
+        })
 }
 
 async fn resume_session(
@@ -399,7 +428,13 @@ async fn resume_session(
         .resume_session(input)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
-        .map_err(bad_gateway)
+        .map_err(|error| {
+            if is_path_policy_error(&error) {
+                bad_request(error)
+            } else {
+                bad_gateway(error)
+            }
+        })
 }
 
 async fn send_message(
@@ -564,6 +599,10 @@ fn bad_gateway(message: String) -> (StatusCode, Json<ApiError>) {
         StatusCode::BAD_GATEWAY,
         Json(ApiError::new("codex_bridge_error", message)),
     )
+}
+
+fn is_path_policy_error(message: &str) -> bool {
+    message.contains("outside this relay's allowed roots")
 }
 
 fn snapshot_event(snapshot: SessionSnapshot) -> Event {

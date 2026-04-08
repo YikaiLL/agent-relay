@@ -9,6 +9,7 @@ const state = {
   apiToken: loadApiToken(),
   authRequired: false,
   authenticated: false,
+  allowedRootsDraftDirty: false,
   cookieSession: false,
   controllerHeartbeatTimer: null,
   controllerLeaseRefreshTimer: null,
@@ -44,6 +45,11 @@ const pairingQr = document.querySelector("#pairing-qr");
 const pairingExpiry = document.querySelector("#pairing-expiry");
 const pairingLinkInput = document.querySelector("#pairing-link-input");
 const copyPairingLinkButton = document.querySelector("#copy-pairing-link-button");
+const allowedRootsForm = document.querySelector("#allowed-roots-form");
+const allowedRootsInput = document.querySelector("#allowed-roots-input");
+const saveAllowedRootsButton = document.querySelector("#save-allowed-roots-button");
+const allowedRootsSummary = document.querySelector("#allowed-roots-summary");
+const allowedRootsList = document.querySelector("#allowed-roots-list");
 const pendingPairingsList = document.querySelector("#pending-pairings-list");
 const refreshButton = document.querySelector("#refresh-button");
 const threadsRefreshButton = document.querySelector("#threads-refresh-button");
@@ -93,6 +99,8 @@ startPairingButton.addEventListener("click", () => {
 });
 
 openSecurityModalBtn?.addEventListener("click", () => {
+  state.allowedRootsDraftDirty = false;
+  renderAllowedRoots(state.session?.allowed_roots || []);
   securityModal?.showModal();
 });
 
@@ -108,6 +116,15 @@ securityModal?.addEventListener("click", (event) => {
 
 copyPairingLinkButton.addEventListener("click", () => {
   void copyPairingLink();
+});
+
+allowedRootsInput?.addEventListener("input", () => {
+  state.allowedRootsDraftDirty = true;
+});
+
+allowedRootsForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void saveAllowedRoots();
 });
 
 refreshButton.addEventListener("click", () => {
@@ -894,6 +911,7 @@ function renderSession(session) {
 
   renderOverview(session, activeThread, approval);
   renderSessionMeta(session);
+  renderAllowedRoots(session.allowed_roots || []);
   renderPairingPanel();
   renderDeviceRecords(session.device_records || []);
   renderPendingPairingRequests(pendingPairings);
@@ -943,6 +961,43 @@ function renderPairingPanel() {
   pairingQr.innerHTML = pairing.pairing_qr_svg;
   pairingLinkInput.value = pairing.pairing_url;
   pairingExpiry.textContent = `Expires ${formatTimestamp(pairing.expires_at)}`;
+}
+
+function renderAllowedRoots(roots) {
+  const configuredRoots = Array.isArray(roots) ? roots : [];
+
+  if (!state.allowedRootsDraftDirty && allowedRootsInput) {
+    allowedRootsInput.value = configuredRoots.join("\n");
+  }
+
+  if (!configuredRoots.length) {
+    allowedRootsSummary.textContent =
+      "This relay is currently unrestricted. Any device can start or resume sessions in any workspace.";
+    allowedRootsList.innerHTML =
+      `<p class="sidebar-empty">No workspace restrictions are configured.</p>`;
+    return;
+  }
+
+  allowedRootsSummary.textContent =
+    configuredRoots.length === 1
+      ? "Every device on this relay is limited to one root directory."
+      : `Every device on this relay is limited to ${configuredRoots.length} root directories.`;
+  allowedRootsList.innerHTML = configuredRoots
+    .map((root) => {
+      const name = workspaceBasename(root) || root;
+      return `
+        <article class="paired-device-card">
+          <div class="paired-device-copy">
+            <div class="paired-device-heading">
+              <strong>${escapeHtml(name)}</strong>
+              <span class="device-state-badge device-state-approved">Allowed root</span>
+            </div>
+            <p class="paired-device-meta paired-device-id">${escapeHtml(root)}</p>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
 }
 
 function renderDeviceRecords(records) {
@@ -1092,6 +1147,12 @@ function renderSessionMeta(session) {
     metaChip("Visibility", contentVisibilityLabel(session)),
     metaChip("Broker", brokerStatusLabel(session)),
     metaChip("Devices", pairedDeviceCountLabel(session)),
+    metaChip(
+      "Roots",
+      session.allowed_roots?.length
+        ? `${session.allowed_roots.length} configured`
+        : "Unrestricted"
+    ),
   ];
 
   if (!session.active_thread_id) {
@@ -1616,6 +1677,60 @@ async function sendSessionHeartbeat() {
   } finally {
     if (state.session?.active_thread_id && isCurrentDeviceActiveController(state.session)) {
       scheduleControllerHeartbeat(state.session);
+    }
+  }
+}
+
+async function saveAllowedRoots() {
+  const allowed_roots = (allowedRootsInput?.value || "")
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (saveAllowedRootsButton) {
+    saveAllowedRootsButton.disabled = true;
+  }
+  if (allowedRootsInput) {
+    allowedRootsInput.disabled = true;
+  }
+
+  logLine(
+    allowed_roots.length
+      ? `Saving ${allowed_roots.length} allowed workspace root${allowed_roots.length === 1 ? "" : "s"}.`
+      : "Clearing relay workspace restrictions."
+  );
+
+  try {
+    const response = await apiFetch("/api/allowed-roots", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        allowed_roots,
+      }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload?.error?.message || "Failed to save allowed roots");
+    }
+
+    state.allowedRootsDraftDirty = false;
+    renderAllowedRoots(payload.data.allowed_roots || []);
+    await loadSession("post-allowed-roots refresh");
+    if (state.selectedCwd) {
+      await loadThreads("post-allowed-roots refresh");
+    }
+    logLine(payload.data?.message || "Relay workspace restrictions saved.");
+  } catch (error) {
+    logLine(`Allowed roots update failed: ${error.message}`);
+  } finally {
+    if (saveAllowedRootsButton) {
+      saveAllowedRootsButton.disabled = false;
+    }
+    if (allowedRootsInput) {
+      allowedRootsInput.disabled = false;
     }
   }
 }

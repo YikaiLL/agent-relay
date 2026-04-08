@@ -28,6 +28,8 @@ pub(super) struct PersistedRelayState {
     pub(super) sandbox: String,
     pub(super) reasoning_effort: String,
     #[serde(default)]
+    pub(super) allowed_roots: Vec<String>,
+    #[serde(default)]
     pub(super) device_records: std::collections::HashMap<String, DeviceRecord>,
     #[serde(default)]
     pub(super) paired_devices: std::collections::HashMap<String, PairedDevice>,
@@ -49,6 +51,7 @@ impl PersistedRelayState {
             approval_policy: relay.approval_policy.clone(),
             sandbox: relay.sandbox.clone(),
             reasoning_effort: relay.reasoning_effort.clone(),
+            allowed_roots: relay.allowed_roots.clone(),
             device_records: relay.device_records.clone(),
             paired_devices: relay.paired_devices.clone(),
             transcript: relay.transcript.clone(),
