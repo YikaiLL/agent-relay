@@ -7,7 +7,7 @@ mod tests;
 
 use std::{
     env,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -148,11 +148,7 @@ pub(super) fn normalize_cwd(cwd: &str) -> String {
         .or_else(|| make_absolute(trimmed))
         .unwrap_or_else(|| PathBuf::from(trimmed));
 
-    expanded
-        .canonicalize()
-        .unwrap_or(expanded)
-        .display()
-        .to_string()
+    normalize_path_lossy(expanded).display().to_string()
 }
 
 fn expand_home_dir(path: &str) -> Option<PathBuf> {
@@ -174,6 +170,68 @@ fn make_absolute(path: &str) -> Option<PathBuf> {
     }
 
     env::current_dir().ok().map(|cwd| cwd.join(candidate))
+}
+
+fn normalize_path_lossy(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+
+    let mut current = path.clone();
+    let mut unresolved = Vec::new();
+
+    while !current.exists() {
+        let Some(component) = current.file_name().map(|value| value.to_os_string()) else {
+            break;
+        };
+        unresolved.push(component);
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+
+    let mut normalized = if current.exists() {
+        current.canonicalize().unwrap_or(current)
+    } else {
+        current
+    };
+
+    for component in unresolved.into_iter().rev() {
+        normalized.push(component);
+    }
+
+    collapse_lexical_components(normalized)
+}
+
+fn collapse_lexical_components(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    let mut has_root = false;
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => {
+                normalized.push(component.as_os_str());
+                has_root = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let last_is_parent = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|part| matches!(part, Component::ParentDir));
+                if normalized.file_name().is_some() && !last_is_parent {
+                    normalized.pop();
+                } else if !has_root {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
 }
 
 fn unix_now() -> u64 {

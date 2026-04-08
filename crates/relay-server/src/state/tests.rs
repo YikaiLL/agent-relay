@@ -474,11 +474,61 @@ fn normalize_allowed_roots_expands_home_and_deduplicates() {
 
 #[test]
 fn ensure_path_within_allowed_roots_rejects_outside_workspace() {
-    let roots = vec!["/tmp/project".to_string()];
+    let unique = format!("agent-relay-roots-{}-{}", std::process::id(), unix_now());
+    let root = std::env::temp_dir().join(unique);
+    let nested = root.join("subdir");
+    std::fs::create_dir_all(&nested).expect("workspace root should be creatable");
+    let roots = normalize_allowed_roots(vec![root.display().to_string()])
+        .expect("allowed roots should normalize");
 
-    assert!(ensure_path_within_allowed_roots("/tmp/project", &roots).is_ok());
-    assert!(ensure_path_within_allowed_roots("/tmp/project/subdir", &roots).is_ok());
+    assert!(ensure_path_within_allowed_roots(&root.display().to_string(), &roots).is_ok());
+    assert!(ensure_path_within_allowed_roots(&nested.display().to_string(), &roots).is_ok());
     assert!(ensure_path_within_allowed_roots("/tmp/other", &roots).is_err());
+
+    std::fs::remove_dir_all(&root).expect("temp workspace root should be removable");
+}
+
+#[test]
+fn normalize_cwd_collapses_parent_segments_for_missing_paths() {
+    let unique = format!(
+        "agent-relay-normalize-{}-{}",
+        std::process::id(),
+        unix_now()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(root.join("allowed")).expect("allowed root should be creatable");
+
+    let escaped = root.join("allowed/../outside");
+    let normalized = normalize_cwd(&escaped.display().to_string());
+    let expected = root
+        .canonicalize()
+        .expect("temp root should canonicalize")
+        .join("outside");
+
+    assert_eq!(normalized, expected.display().to_string());
+
+    std::fs::remove_dir_all(&root).expect("temp normalize directory should be removable");
+}
+
+#[test]
+fn ensure_path_within_allowed_roots_rejects_parent_dir_escape_for_missing_paths() {
+    let unique = format!(
+        "agent-relay-allowed-roots-{}-{}",
+        std::process::id(),
+        unix_now()
+    );
+    let root = std::env::temp_dir().join(unique);
+    let allowed = root.join("allowed");
+    std::fs::create_dir_all(&allowed).expect("allowed root should be creatable");
+
+    let escaped = allowed.join("../outside");
+    let roots = vec![allowed.display().to_string()];
+
+    let error = ensure_path_within_allowed_roots(&escaped.display().to_string(), &roots)
+        .expect_err("parent-dir traversal should be rejected");
+    assert!(error.contains("outside this relay's allowed roots"));
+
+    std::fs::remove_dir_all(&root).expect("temp allowed-roots directory should be removable");
 }
 
 #[test]
