@@ -108,3 +108,71 @@ test("refresh() force-fetches even when the revision is unchanged", async () => 
   await flush();
   assert.equal(calls, 2, "refresh bypasses the revision no-op");
 });
+
+test("a malformed/null fetch payload is not latched as applied and retries", async () => {
+  let calls = 0;
+  const store = createProjectsStore({
+    fetchProjects: async () => {
+      calls += 1;
+      // First call is malformed (null); second is valid.
+      return calls === 1 ? null : payload(2, [{ id: "p", name: "P" }]);
+    },
+  });
+
+  store.syncToRevision(2);
+  await flush();
+  assert.equal(calls, 1);
+  assert.notEqual(store.getState().error, null, "malformed payload surfaces an error");
+  assert.deepEqual(store.getState().projects, [], "no empty projects latched");
+
+  // The revision was NOT marked applied → a repeat sync refetches and recovers.
+  store.syncToRevision(2);
+  await flush();
+  assert.equal(calls, 2);
+  assert.deepEqual(
+    store.getState().projects.map((project) => project.id),
+    ["p"]
+  );
+  assert.equal(store.getState().error, null);
+});
+
+test("reset() forces a refetch even at the same revision", async () => {
+  let calls = 0;
+  const store = createProjectsStore({
+    fetchProjects: async () => {
+      calls += 1;
+      return payload(2);
+    },
+  });
+
+  store.syncToRevision(2);
+  await flush();
+  assert.equal(calls, 1);
+  store.syncToRevision(2); // no-op
+  await flush();
+  assert.equal(calls, 1);
+
+  store.reset(); // relay/channel identity changed
+  store.syncToRevision(2); // same revision, but reset → refetch
+  await flush();
+  assert.equal(calls, 2);
+});
+
+test("the response's revision is latched, not the triggering one", async () => {
+  let calls = 0;
+  const store = createProjectsStore({
+    fetchProjects: async () => {
+      calls += 1;
+      // The triggering snapshot said 2, but the relay advanced: response carries 5.
+      return payload(5, [{ id: "p", name: "P" }]);
+    },
+  });
+
+  store.syncToRevision(2);
+  await flush();
+  assert.equal(calls, 1);
+  // A later snapshot advertising 5 is a no-op — we already applied the response's 5.
+  store.syncToRevision(5);
+  await flush();
+  assert.equal(calls, 1, "already have the response's revision");
+});

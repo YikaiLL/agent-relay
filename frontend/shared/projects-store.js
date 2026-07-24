@@ -41,13 +41,21 @@ export function createProjectsStore({ fetchProjects }) {
     try {
       const data = await fetchProjects();
       if (seq !== requestSeq) return; // superseded by a newer fetch
+      if (!data || !Array.isArray(data.projects)) {
+        // A null/malformed payload must NOT latch empty Projects as "applied": that
+        // would hide real projects and, because the revision would be marked applied,
+        // never retry. Treat it as a failure so `appliedRevision` is left unchanged.
+        throw new Error("malformed projects payload");
+      }
       setState({
-        projects: Array.isArray(data?.projects) ? data.projects : [],
-        threadProjectId: data?.thread_project_id || {},
+        projects: data.projects,
+        threadProjectId: data.thread_project_id || {},
         loading: false,
         error: null,
       });
-      appliedRevision = Number.isFinite(data?.projects_revision)
+      // Latch the RESPONSE's revision (authoritative), not the triggering one — the
+      // relay may have advanced between the snapshot and the fetch resolving.
+      appliedRevision = Number.isFinite(data.projects_revision)
         ? data.projects_revision
         : targetRevision;
     } catch (error) {
@@ -78,6 +86,13 @@ export function createProjectsStore({ fetchProjects }) {
     // arrives) so the caller's own change is reflected immediately.
     refresh() {
       void fetchNow(appliedRevision ?? 0);
+    },
+    // Forget what's been fetched so the next syncToRevision refetches unconditionally.
+    // Call this when the relay/channel identity changes: an equal revision advertised
+    // by a DIFFERENT relay must not be mistaken for already-applied state.
+    reset() {
+      appliedRevision = null;
+      inFlightRevision = null;
     },
   };
 }
