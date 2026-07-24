@@ -100,19 +100,85 @@ test("switching back to a retained thread restores its exact scroll offset", () 
       scrollHeight: 1200,
       scrollTop: 800,
     },
-    restoredScrollTop: 437,
+    restoredScrollPosition: {
+      followBottom: false,
+      scrollTop: 437,
+    },
     scrollElement: target,
   });
   assert.deepEqual(action, { kind: "restore-thread", scrollTop: 437 });
 });
 
+test("switching back to a retained bottom-following thread follows its grown tail", () => {
+  const cache = new Map();
+  rememberTranscriptScrollPosition(
+    cache,
+    "thread-1",
+    makeScrollElement({
+      scrollHeight: 3000,
+      clientHeight: 400,
+      scrollTop: 2600,
+    }).target
+  );
+  const restoredScrollPosition = readTranscriptScrollPosition(cache, "thread-1");
+  assert.deepEqual(restoredScrollPosition, {
+    followBottom: true,
+    scrollTop: 2600,
+  });
+
+  // The live thread grew by 4,000px while it was hidden. Restoring 2,600 would
+  // strand the reader in history; restoring bottom intent lands on the new tail.
+  const { target } = makeScrollElement({
+    scrollHeight: 7000,
+    clientHeight: 400,
+    scrollTop: 0,
+  });
+  const action = decideTranscriptScrollAction({
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    previousSnapshot: {
+      activeThreadId: "thread-2",
+      entries: [userEntry("u2")],
+    },
+    restoredScrollPosition,
+    scrollElement: target,
+  });
+  assert.deepEqual(action, { kind: "jump-bottom", scrollTop: 6600 });
+});
+
+test("a reader who escaped by one wheel step retains history-reading intent", () => {
+  const cache = new Map();
+  rememberTranscriptScrollPosition(
+    cache,
+    "thread-1",
+    makeScrollElement({
+      scrollHeight: 3000,
+      clientHeight: 400,
+      // 40px above the bottom: inside the button's broad near-bottom band, but
+      // well outside the follower's 4px re-stick boundary.
+      scrollTop: 2560,
+    }).target
+  );
+  assert.deepEqual(readTranscriptScrollPosition(cache, "thread-1"), {
+    followBottom: false,
+    scrollTop: 2560,
+  });
+});
+
 test("per-thread scroll positions use bounded LRU retention", () => {
   const cache = new Map();
   for (let index = 0; index <= MAX_RETAINED_TRANSCRIPT_SCROLL_THREADS; index += 1) {
-    rememberTranscriptScrollPosition(cache, `thread-${index}`, { scrollTop: index * 10 });
+    rememberTranscriptScrollPosition(cache, `thread-${index}`, {
+      clientHeight: 100,
+      scrollHeight: 1000,
+      scrollTop: index * 10,
+    });
   }
   assert.equal(cache.has("thread-0"), false);
-  assert.equal(readTranscriptScrollPosition(cache, "thread-1"), 10);
+  assert.deepEqual(readTranscriptScrollPosition(cache, "thread-1"), {
+    followBottom: false,
+    scrollTop: 10,
+  });
   assert.equal([...cache.keys()].at(-1), "thread-1", "reading refreshes LRU recency");
   assert.equal(readTranscriptScrollPosition(cache, "missing"), null);
 });

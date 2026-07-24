@@ -19,7 +19,7 @@ use tokio::{
 use crate::{
     codex_local::LocalThreadDeleteSummary,
     protocol::{
-        ApprovalDecision, ApprovalDecisionInput, ModelOptionView, ThreadSummaryView,
+        ApprovalDecision, ApprovalDecisionInput, ModelOptionView, ThreadSummaryView, ToolCallView,
         TranscriptEntryKind, TranscriptEntryView,
     },
     provider::{ProviderBridge, ProviderImage, StartThreadResult, ThreadSyncData},
@@ -46,6 +46,12 @@ struct FakeTurnScenario {
     reply: Option<String>,
     chunks: Option<Vec<String>>,
     chunk_delay_ms: Option<u64>,
+    /// Number of fake Bash tool calls to emit, one at a time, before the
+    /// assistant text begins. Each call is first inserted as `running`, then
+    /// patched to `completed` after `tool_call_delay_ms`.
+    #[serde(default)]
+    tool_calls: usize,
+    tool_call_delay_ms: Option<u64>,
     pause_after_chunks: Option<usize>,
     barrier: Option<String>,
     #[serde(default)]
@@ -473,6 +479,16 @@ impl ProviderBridge for FakeProviderBridge {
                 .and_then(|scenario| scenario.chunk_delay_ms)
                 .unwrap_or(20),
         );
+        let tool_call_count = scenario
+            .as_ref()
+            .map(|scenario| scenario.tool_calls)
+            .unwrap_or_default();
+        let tool_call_delay = Duration::from_millis(
+            scenario
+                .as_ref()
+                .and_then(|scenario| scenario.tool_call_delay_ms)
+                .unwrap_or(40),
+        );
         let pause_after_chunks = scenario
             .as_ref()
             .and_then(|scenario| scenario.pause_after_chunks);
@@ -509,6 +525,9 @@ impl ProviderBridge for FakeProviderBridge {
         let turn_id = self.next_token("fake-turn");
         let user_item_id = self.next_token("fake-user");
         let assistant_item_id = self.next_token("fake-assistant");
+        let tool_item_ids = (0..tool_call_count)
+            .map(|_| self.next_token("fake-tool"))
+            .collect::<Vec<_>>();
         let state = self.state.clone();
         let threads = self.threads.clone();
         let turn_id_for_task = turn_id.clone();
@@ -662,7 +681,107 @@ impl ProviderBridge for FakeProviderBridge {
                 relay.notify();
             }
 
-            // 3. Begin the agent reply.
+            // 3. Stream tool-call lifecycle entries before the agent reply.
+            // This mirrors the Claude worker's `tool_call_requested` /
+            // `tool_call_result` sequence closely enough for browser tests to
+            // exercise live grouping, virtualization, and scroll following.
+            let mut tool_entries = Vec::with_capacity(tool_item_ids.len());
+            for (index, tool_item_id) in tool_item_ids.into_iter().enumerate() {
+                if stopped_turns.lock().await.contains(&turn_id_for_task) {
+                    settle_fake_turn(&state, &thread_id, &turn_id_for_task, "idle").await;
+                    record_scenario_event(
+                        scenario_harness.as_ref(),
+                        "turn_stopped",
+                        &thread_id,
+                        &turn_id_for_task,
+                        None,
+                    )
+                    .await;
+                    turn_stop_behaviors.lock().await.remove(&turn_id_for_task);
+                    stopped_turns.lock().await.remove(&turn_id_for_task);
+                    return;
+                }
+
+                let tool_number = index + 1;
+                let running_tool = fake_tool_call_view(tool_number, false);
+                {
+                    let mut relay = state.write().await;
+                    relay.upsert_transcript_item_for_thread(
+                        &thread_id,
+                        tool_item_id.clone(),
+                        TranscriptEntryKind::ToolCall,
+                        None,
+                        "running".to_string(),
+                        Some(turn_id_for_task.clone()),
+                        Some(running_tool.clone()),
+                    );
+                    if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
+                        relay.touch_progress(Some("tool"), Some(&running_tool.name));
+                        relay.push_log(
+                            "tool",
+                            format!("Fake tool call started: {}", running_tool.title),
+                        );
+                    }
+                    relay.notify();
+                }
+                record_scenario_event(
+                    scenario_harness.as_ref(),
+                    "tool_call_started",
+                    &thread_id,
+                    &turn_id_for_task,
+                    Some(serde_json::json!({
+                        "index": index,
+                        "item_id": tool_item_id,
+                    })),
+                )
+                .await;
+
+                sleep(tool_call_delay).await;
+
+                let completed_tool = fake_tool_call_view(tool_number, true);
+                {
+                    let mut relay = state.write().await;
+                    relay.upsert_transcript_item_for_thread(
+                        &thread_id,
+                        tool_item_id.clone(),
+                        TranscriptEntryKind::ToolCall,
+                        None,
+                        "completed".to_string(),
+                        Some(turn_id_for_task.clone()),
+                        Some(completed_tool.clone()),
+                    );
+                    if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
+                        relay.touch_progress(None, None);
+                        relay.push_log(
+                            "tool",
+                            format!("Fake tool call completed: {}", completed_tool.title),
+                        );
+                    }
+                    relay.notify();
+                }
+                record_scenario_event(
+                    scenario_harness.as_ref(),
+                    "tool_call_completed",
+                    &thread_id,
+                    &turn_id_for_task,
+                    Some(serde_json::json!({
+                        "index": index,
+                        "item_id": tool_item_id,
+                    })),
+                )
+                .await;
+                tool_entries.push(TranscriptEntryView {
+                    item_id: Some(tool_item_id),
+                    kind: TranscriptEntryKind::ToolCall,
+                    text: None,
+                    status: "completed".to_string(),
+                    turn_id: Some(turn_id_for_task.clone()),
+                    tool: Some(completed_tool),
+                    content_state: crate::protocol::TranscriptContentState::Full,
+                });
+            }
+
+            // 4. Begin the agent reply.
             {
                 let mut relay = state.write().await;
                 if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
@@ -791,14 +910,8 @@ impl ProviderBridge for FakeProviderBridge {
                         );
                         relay.notify();
                     }
-                    store_fake_turn(
-                        &threads,
-                        &thread_id,
-                        user_entry,
-                        Some(assistant_entry),
-                        "idle",
-                    )
-                    .await;
+                    tool_entries.push(assistant_entry);
+                    store_fake_turn(&threads, &thread_id, user_entry, tool_entries, "idle").await;
                     record_scenario_event(
                         scenario_harness.as_ref(),
                         "terminal_completed",
@@ -843,7 +956,10 @@ impl ProviderBridge for FakeProviderBridge {
                         status: "failed".to_string(),
                         ..assistant_entry
                     });
-                    store_fake_turn(&threads, &thread_id, user_entry, partial_entry, "idle").await;
+                    if let Some(partial_entry) = partial_entry {
+                        tool_entries.push(partial_entry);
+                    }
+                    store_fake_turn(&threads, &thread_id, user_entry, tool_entries, "idle").await;
                     if let Some(thread) = threads.lock().await.get_mut(&thread_id) {
                         thread.transcript.push(error_entry);
                     }
@@ -868,7 +984,10 @@ impl ProviderBridge for FakeProviderBridge {
                         status: "failed".to_string(),
                         ..assistant_entry
                     });
-                    store_fake_turn(&threads, &thread_id, user_entry, partial_entry, "idle").await;
+                    if let Some(partial_entry) = partial_entry {
+                        tool_entries.push(partial_entry);
+                    }
+                    store_fake_turn(&threads, &thread_id, user_entry, tool_entries, "idle").await;
                     record_scenario_event(
                         scenario_harness.as_ref(),
                         "provider_disconnected",
@@ -884,8 +1003,10 @@ impl ProviderBridge for FakeProviderBridge {
                         status: "streaming".to_string(),
                         ..assistant_entry
                     });
-                    store_fake_turn(&threads, &thread_id, user_entry, partial_entry, "active")
-                        .await;
+                    if let Some(partial_entry) = partial_entry {
+                        tool_entries.push(partial_entry);
+                    }
+                    store_fake_turn(&threads, &thread_id, user_entry, tool_entries, "active").await;
                     record_scenario_event(
                         scenario_harness.as_ref(),
                         "terminal_omitted",
@@ -1062,7 +1183,7 @@ async fn store_fake_turn(
     threads: &Arc<Mutex<HashMap<String, FakeThread>>>,
     thread_id: &str,
     user_entry: TranscriptEntryView,
-    assistant_entry: Option<TranscriptEntryView>,
+    mut turn_entries: Vec<TranscriptEntryView>,
     status: &str,
 ) {
     if let Some(thread) = threads.lock().await.get_mut(thread_id) {
@@ -1070,9 +1191,7 @@ async fn store_fake_turn(
         thread.summary.status = status.to_string();
         thread.summary.updated_at = unix_now();
         thread.transcript.push(user_entry);
-        if let Some(assistant_entry) = assistant_entry {
-            thread.transcript.push(assistant_entry);
-        }
+        thread.transcript.append(&mut turn_entries);
     }
 }
 
@@ -1203,6 +1322,25 @@ fn fake_reply_for_prompt(prompt: &str) -> String {
         .strip_prefix("Reply with exactly: ")
         .unwrap_or(prompt)
         .to_string()
+}
+
+fn fake_tool_call_view(index: usize, completed: bool) -> ToolCallView {
+    ToolCallView {
+        item_type: "toolCall".to_string(),
+        name: "Bash".to_string(),
+        title: format!("Fake Bash call {index}"),
+        detail: Some(format!("Synthetic streaming tool call {index}")),
+        query: None,
+        path: None,
+        url: None,
+        command: Some(format!("printf 'fake tool call {index}\\n'")),
+        input_preview: Some(format!("{{\"index\":{index}}}")),
+        result_preview: completed.then(|| format!("fake tool result {index}")),
+        diff: None,
+        file_changes: Vec::new(),
+        apply_state: None,
+        file_changes_omitted: false,
+    }
 }
 
 fn reply_chunks(reply: &str) -> Vec<String> {
@@ -1564,6 +1702,91 @@ mod tests {
             state.read().await.pending_broker_messages.len(),
             3,
             "original, duplicate, and late broker events should be queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_streams_tool_call_lifecycle_before_the_reply() {
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = test_scenario_harness(
+            &temp,
+            HashMap::from([(
+                "tools".to_string(),
+                FakeTurnScenario {
+                    reply: Some("done".to_string()),
+                    chunks: Some(vec!["done".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    tool_calls: 2,
+                    tool_call_delay_ms: Some(200),
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        );
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(ACTIVE_THREAD, "tools", "fake-echo", "medium", &[])
+            .await
+            .expect("turn");
+        assert!(
+            wait_for_scenario_event(&harness, "tool_call_started").await,
+            "the first tool call should start"
+        );
+        let live_snapshot = state.read().await.snapshot();
+        assert!(live_snapshot.transcript.iter().any(|entry| {
+            entry.kind == TranscriptEntryKind::ToolCall && entry.status == "running"
+        }));
+        assert_eq!(live_snapshot.current_phase.as_deref(), Some("tool"));
+        assert_eq!(live_snapshot.current_tool.as_deref(), Some("Bash"));
+
+        assert!(
+            wait_for_scenario_event(&harness, "terminal_completed").await,
+            "the turn should settle after both tool calls"
+        );
+        let stored = bridge.read_thread(ACTIVE_THREAD).await.expect("thread");
+        let tools = stored
+            .transcript
+            .iter()
+            .filter(|entry| entry.kind == TranscriptEntryKind::ToolCall)
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|entry| entry.status == "completed"));
+        assert!(tools.iter().all(|entry| {
+            entry
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.result_preview.as_deref())
+                .is_some()
+        }));
+        assert_eq!(
+            stored
+                .transcript
+                .last()
+                .and_then(|entry| entry.text.as_deref()),
+            Some("done"),
+            "the assistant reply should follow the streamed tool calls"
+        );
+
+        let event_log = tokio::fs::read_to_string(temp.path().join("events.ndjson"))
+            .await
+            .expect("event log");
+        let events = event_log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "tool_call_started")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "tool_call_completed")
+                .count(),
+            2
         );
     }
 

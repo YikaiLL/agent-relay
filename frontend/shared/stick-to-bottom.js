@@ -1,7 +1,9 @@
 import React from "react";
 
-import { SCROLL_TO_BOTTOM_THRESHOLD_PX } from "./scroll-to-bottom-core.js";
-import { TRANSCRIPT_SCROLL_ACTION_EVENT } from "./transcript-scroll.js";
+import {
+  TRANSCRIPT_BOTTOM_FOLLOW_THRESHOLD_PX,
+  TRANSCRIPT_SCROLL_ACTION_EVENT,
+} from "./transcript-scroll.js";
 
 const h = React.createElement;
 
@@ -11,7 +13,21 @@ const h = React.createElement;
 // trap the reader against the stream (the classic "can't scroll up while it's
 // streaming" bug). The reader gets back by scrolling to the bottom or with the
 // explicit "scroll to latest" button.
-export const RESTICK_AT_BOTTOM_PX = 4;
+export const RESTICK_AT_BOTTOM_PX = TRANSCRIPT_BOTTOM_FOLLOW_THRESHOLD_PX;
+
+// Programmatic transcript actions carry semantic intent. In particular,
+// `restore-thread` means the cached state explicitly recorded a reader who was
+// NOT following the bottom, so the follower must not reinterpret a nearby
+// pixel offset using the floating button's broader 160px visibility threshold.
+export function classifyTranscriptScrollAction({ kind } = {}) {
+  if (kind === "jump-bottom" || kind === "rejoin-bottom") {
+    return "stick";
+  }
+  if (kind === "restore-thread") {
+    return "unstick";
+  }
+  return "none";
+}
 
 // Classify a non-programmatic scroll event into what the follower should do. Pure
 // so the gesture policy is unit-testable (the wiring around it — self-pin echo
@@ -67,7 +83,8 @@ export function classifyScrollIntent({ scrolledUp, distance, interacting, stuck,
 //   - a real reader scroll-up (wheel up, or an upward touch/scrollbar drag) ->
 //     un-stick (stop following); reaching the bottom again -> re-stick.
 //   - intent events broadcast by transcript-scroll.js: jump-bottom / rejoin-bottom
-//     -> stick now; restore-thread -> stick only if already near the bottom.
+//     -> stick now; restore-thread -> remain unstuck at the retained history
+//     offset.
 //   Keyboard scrolling is intentionally NOT a first-class escape (it would also
 //   fire for caret movement inside AskUser inputs); a keyboard scroll-up is
 //   treated as churn and re-glued, which is acceptable for this dev surface.
@@ -179,14 +196,12 @@ export function StickToBottomFollower() {
       else if (distance() <= RESTICK_AT_BOTTOM_PX) stick();
     };
     const onAction = (event) => {
-      const kind = event?.detail?.kind;
-      if (kind === "jump-bottom" || kind === "rejoin-bottom") {
-        stick();
-      } else if (kind === "restore-thread") {
-        // Match the button's "near bottom" band for the restore decision.
-        if (distance() <= SCROLL_TO_BOTTOM_THRESHOLD_PX) stick();
-        else unstick();
-      }
+      const action = classifyTranscriptScrollAction({
+        distance: distance(),
+        kind: event?.detail?.kind,
+      });
+      if (action === "stick") stick();
+      else if (action === "unstick") unstick();
     };
 
     scroller.addEventListener("wheel", onWheel, { passive: true });

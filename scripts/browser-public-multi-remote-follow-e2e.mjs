@@ -233,6 +233,45 @@ async function main() {
       `remote B transcript should grow after the local Codex reply (before=${remoteBStatsBefore.transcriptText.length}, after=${remoteBStatsAfter.transcriptText.length})`
     );
 
+    // Remote-specific thread-switch regression: an explicit history-reading
+    // offset inside the floating button's broad 160px band must not be
+    // reinterpreted as bottom-follow when this page switches away and back.
+    const remoteAHistoryBeforeSwitch = await placeRemoteReaderNearBottom(remotePageA, 40);
+    await startLocalSession(localPage, {
+      cwd: workspaceDir,
+      approvalPolicy: "never",
+      provider: USE_FAKE_PROVIDER ? "fake" : undefined,
+      model: USE_FAKE_PROVIDER ? "fake-echo" : undefined,
+      timeoutMs: TIMEOUT_MS,
+    });
+    const secondSession = await waitForDifferentActiveThread(
+      relayPort,
+      workspaceDir,
+      threadId
+    );
+    const secondThreadId = secondSession.active_thread_id;
+    assert.ok(secondThreadId, "local page should start a second live thread");
+    await switchRemoteThread(remotePageA, secondThreadId, "A");
+    await switchRemoteThread(remotePageA, threadId, "A");
+    await waitForRemoteReply(remotePageA, EXPECTED_REPLY, "A after switch-back");
+    const remoteAHistoryAfterSwitch = await readRemoteScrollMetrics(remotePageA);
+    assert.ok(
+      Math.abs(
+        remoteAHistoryAfterSwitch.scrollTop - remoteAHistoryBeforeSwitch.scrollTop
+      ) <= 2,
+      `remote A should restore the history offset (before=${remoteAHistoryBeforeSwitch.scrollTop}, after=${remoteAHistoryAfterSwitch.scrollTop})`
+    );
+    assert.ok(
+      remoteAHistoryAfterSwitch.distance >= 5
+        && remoteAHistoryAfterSwitch.distance <= 160,
+      `remote A should remain history-reading after switch-back (distance=${remoteAHistoryAfterSwitch.distance})`
+    );
+    logStep("remote A history offset survived switch-back", {
+      before: remoteAHistoryBeforeSwitch,
+      after: remoteAHistoryAfterSwitch,
+      secondThreadId,
+    });
+
     console.log(
       JSON.stringify(
         {
@@ -241,11 +280,14 @@ async function main() {
           pairingOrigin: new URL(pairingUrl).origin,
           workspaceDir,
           activeThreadId: threadId,
+          secondThreadId,
           remoteA: {
             takeOverCountBeforeSend: remoteAStatsBefore.takeOverCount,
             takeOverCountAfterSend: remoteAStatsAfter.takeOverCount,
             transcriptBeforeSendLength: remoteAStatsBefore.transcriptText.length,
             transcriptAfterSendLength: remoteAStatsAfter.transcriptText.length,
+            historyBeforeSwitch: remoteAHistoryBeforeSwitch,
+            historyAfterSwitch: remoteAHistoryAfterSwitch,
             clientLog: await safeText(remotePageA, "#remote-client-log"),
           },
           remoteB: {
@@ -354,6 +396,76 @@ async function readRemoteObserverStats(page) {
   }));
 }
 
+async function placeRemoteReaderNearBottom(page, targetDistance) {
+  await page.setViewportSize({ width: 1280, height: 520 });
+  const transcript = page.locator("#remote-transcript");
+  await transcript.hover();
+  await page.waitForFunction(
+    (minimumDistance) => {
+      const element = document.querySelector("#remote-transcript");
+      return Boolean(
+        element
+        && element.scrollHeight - element.clientHeight >= minimumDistance
+      );
+    },
+    targetDistance + 5,
+    { timeout: TIMEOUT_MS }
+  );
+  await page.mouse.wheel(0, -targetDistance);
+  await page.waitForFunction(
+    () => {
+      const element = document.querySelector("#remote-transcript");
+      if (!element) return false;
+      const distance =
+        element.scrollHeight - element.clientHeight - element.scrollTop;
+      return distance >= 5 && distance <= 160;
+    },
+    null,
+    { timeout: TIMEOUT_MS }
+  );
+  return readRemoteScrollMetrics(page);
+}
+
+async function readRemoteScrollMetrics(page) {
+  return page.evaluate(() => {
+    const element = document.querySelector("#remote-transcript");
+    return {
+      clientHeight: element?.clientHeight || 0,
+      distance: element
+        ? Math.max(0, element.scrollHeight - element.clientHeight - element.scrollTop)
+        : 0,
+      scrollHeight: element?.scrollHeight || 0,
+      scrollTop: element?.scrollTop || 0,
+    };
+  });
+}
+
+async function switchRemoteThread(page, threadId, label) {
+  await page.click("#remote-threads-refresh-button");
+  await page.waitForFunction(
+    (expectedThreadId) =>
+      Boolean(
+        document.querySelector(
+          `#remote-threads-list [data-thread-id="${expectedThreadId}"]`
+        )
+      ),
+    threadId,
+    { timeout: TIMEOUT_MS }
+  );
+  await page.click(`#remote-threads-list [data-thread-id="${threadId}"]`);
+  await page.waitForFunction(
+    (expectedThreadId) =>
+      Boolean(
+        document.querySelector(
+          `#remote-threads-list [data-thread-id="${expectedThreadId}"].is-active`
+        )
+      ),
+    threadId,
+    { timeout: TIMEOUT_MS }
+  );
+  logStep(`remote ${label} switched thread`, { threadId });
+}
+
 async function installRemoteObserverHooks(page) {
   await page.addInitScript(() => {
     window.__agentRelayTakeOverCount = 0;
@@ -382,6 +494,27 @@ async function waitForActiveThread(relayPort, cwd, timeoutMs = TIMEOUT_MS) {
     await delay(250);
   }
   throw new Error(`timed out waiting for active thread in ${cwd}`);
+}
+
+async function waitForDifferentActiveThread(
+  relayPort,
+  cwd,
+  previousThreadId,
+  timeoutMs = TIMEOUT_MS
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const session = await fetchSession(relayPort);
+    if (
+      session.active_thread_id
+      && session.active_thread_id !== previousThreadId
+      && session.current_cwd === cwd
+    ) {
+      return session;
+    }
+    await delay(250);
+  }
+  throw new Error(`timed out waiting for a second active thread in ${cwd}`);
 }
 
 async function selectFirstRelayIfNeeded(page) {

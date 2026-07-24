@@ -1336,7 +1336,7 @@ export function createSessionRenderer({
     if (!state.localTranscriptScrollPositions) {
       state.localTranscriptScrollPositions = new Map();
     }
-    let restoredScrollTop = null;
+    let restoredScrollPosition = null;
     if (
       previousSnapshot?.activeThreadId
       && previousSnapshot.activeThreadId !== localThreadId
@@ -1349,7 +1349,7 @@ export function createSessionRenderer({
       if (evictedThreadId) {
         state.localTranscriptScrollAnchors.delete(evictedThreadId);
       }
-      restoredScrollTop = readTranscriptScrollPosition(
+      restoredScrollPosition = readTranscriptScrollPosition(
         state.localTranscriptScrollPositions,
         localThreadId
       );
@@ -1413,7 +1413,7 @@ export function createSessionRenderer({
       nextEntries: entries,
       nextThreadId: localThreadId,
       previousSnapshot,
-      restoredScrollTop,
+      restoredScrollPosition,
       scrollElement: transcript,
     });
     // A new-user-message jump-bottom carries userEntryId: record it so we only

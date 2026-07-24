@@ -1,3 +1,5 @@
+import { isScrolledToBottom } from "./scroll-to-bottom-core.js";
+
 // Top-anchor transcript scroll.
 //
 // Instead of chasing the bottom of a streaming transcript (which traps users
@@ -21,6 +23,10 @@
 export const TOP_SCROLL_PRESERVE_THRESHOLD_PX = 80;
 export const LATEST_USER_MESSAGE_ATTR = "data-latest-user-message";
 export const MAX_RETAINED_TRANSCRIPT_SCROLL_THREADS = 10;
+// Match the live follower's re-stick boundary. The floating button uses a much
+// wider "near bottom" band, but a reader who deliberately escaped by even one
+// wheel tick must retain that history-reading intent across a thread switch.
+export const TRANSCRIPT_BOTTOM_FOLLOW_THRESHOLD_PX = 4;
 
 // Dispatched on the scroll element after a programmatic scroll action is
 // APPLIED, with `detail.kind` set to the action kind. This is how the
@@ -109,8 +115,20 @@ export function rememberTranscriptScrollPosition(cache, threadId, scrollElement)
   if (!(cache instanceof Map) || !threadId || !scrollElement) {
     return null;
   }
+  const scrollTop = Math.max(0, Number(scrollElement.scrollTop) || 0);
+  const scrollHeight = Math.max(0, Number(scrollElement.scrollHeight) || 0);
+  const clientHeight = Math.max(0, Number(scrollElement.clientHeight) || 0);
   cache.delete(threadId);
-  cache.set(threadId, Math.max(0, Number(scrollElement.scrollTop) || 0));
+  cache.set(threadId, {
+    // Preserve the reader's intent, not only a pixel coordinate. A live thread
+    // may grow by thousands of pixels while hidden; restoring its old
+    // `scrollTop` would strand a formerly-bottom-following reader in history.
+    followBottom: isScrolledToBottom(
+      { scrollTop, scrollHeight, clientHeight },
+      TRANSCRIPT_BOTTOM_FOLLOW_THRESHOLD_PX
+    ),
+    scrollTop,
+  });
   let evictedThreadId = null;
   while (cache.size > MAX_RETAINED_TRANSCRIPT_SCROLL_THREADS) {
     evictedThreadId = cache.keys().next().value;
@@ -123,10 +141,25 @@ export function readTranscriptScrollPosition(cache, threadId) {
   if (!(cache instanceof Map) || !threadId || !cache.has(threadId)) {
     return null;
   }
-  const scrollTop = cache.get(threadId);
+  const stored = cache.get(threadId);
   cache.delete(threadId);
-  cache.set(threadId, scrollTop);
-  return scrollTop;
+  cache.set(threadId, stored);
+  // Compatibility with in-memory numeric entries created before this shape was
+  // introduced (and with small pure-object tests). They represent an exact
+  // historical offset, never an implicit bottom-follow intent.
+  if (Number.isFinite(stored)) {
+    return {
+      followBottom: false,
+      scrollTop: Math.max(0, stored),
+    };
+  }
+  if (!stored || typeof stored !== "object") {
+    return null;
+  }
+  return {
+    followBottom: Boolean(stored.followBottom),
+    scrollTop: Math.max(0, Number(stored.scrollTop) || 0),
+  };
 }
 
 export function findLatestUserEntryId(entries) {
@@ -184,7 +217,7 @@ export function decideTranscriptScrollAction({
   nextEntries = [],
   nextThreadId = null,
   previousSnapshot = null,
-  restoredScrollTop = null,
+  restoredScrollPosition = null,
   scrollElement,
 }) {
   if (!scrollElement) {
@@ -198,12 +231,20 @@ export function decideTranscriptScrollAction({
   const nextLatestUserId = findLatestUserEntryId(nextEntries);
 
   // Thread switch (or first ever view): land the user at the latest message
-  // on first visit, but restore the exact retained offset on switch-back.
+  // on first visit. On switch-back, preserve the semantic bottom-follow state
+  // for readers who left at the tail; only restore an exact offset when they
+  // were intentionally reading history.
   if (!prevThreadId || prevThreadId !== nextThreadId) {
-    if (Number.isFinite(restoredScrollTop)) {
+    if (restoredScrollPosition?.followBottom) {
+      return {
+        kind: "jump-bottom",
+        scrollTop: Math.max(0, liveScrollHeight - clientHeight),
+      };
+    }
+    if (Number.isFinite(restoredScrollPosition?.scrollTop)) {
       return {
         kind: "restore-thread",
-        scrollTop: Math.max(0, restoredScrollTop),
+        scrollTop: Math.max(0, restoredScrollPosition.scrollTop),
       };
     }
     return {
@@ -300,7 +341,7 @@ export function restoreTranscriptScrollPosition({
   nextEntries = [],
   nextThreadId = null,
   previousSnapshot = null,
-  restoredScrollTop = null,
+  restoredScrollPosition = null,
   scrollElement,
 }) {
   if (!scrollElement) {
@@ -311,7 +352,7 @@ export function restoreTranscriptScrollPosition({
     nextEntries,
     nextThreadId,
     previousSnapshot,
-    restoredScrollTop,
+    restoredScrollPosition,
     scrollElement,
   });
   applyTranscriptScrollAction(action, scrollElement);

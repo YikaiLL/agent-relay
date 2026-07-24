@@ -2274,7 +2274,7 @@ function RemoteTranscriptPanel({
     entries: [],
   });
   const anchoredUserIdsRef = useRef(new Map()); // threadId -> Set<userId>
-  const scrollPositionsRef = useRef(new Map()); // relayId:threadId -> scrollTop
+  const scrollPositionsRef = useRef(new Map()); // relayId:threadId -> restoration intent
 
   const approval = sessionView?.approval || null;
   const entries = session?.transcript || [];
@@ -2327,17 +2327,23 @@ function RemoteTranscriptPanel({
       currentState.promotedThreadAlias = null;
     }
 
-    let restoredScrollTop = null;
+    let restoredScrollPosition = null;
     if (previous?.scrollKey && previous.scrollKey !== remoteScrollKey) {
-      const evictedScrollKey = rememberTranscriptScrollPosition(
-        scrollPositionsRef.current,
-        previous.scrollKey,
-        transcript
-      );
-      if (evictedScrollKey) {
-        anchoredUserIdsRef.current.delete(evictedScrollKey);
+      // The prior layout-effect cleanup and scroll listener retained the old
+      // thread against its own DOM. Do not overwrite it here using the newly
+      // rendered thread's geometry; that can turn a history-reading offset into
+      // a false bottom-follow marker (or vice versa).
+      if (!scrollPositionsRef.current.has(previous.scrollKey)) {
+        const evictedScrollKey = rememberTranscriptScrollPosition(
+          scrollPositionsRef.current,
+          previous.scrollKey,
+          previous
+        );
+        if (evictedScrollKey) {
+          anchoredUserIdsRef.current.delete(evictedScrollKey);
+        }
       }
-      restoredScrollTop = readTranscriptScrollPosition(
+      restoredScrollPosition = readTranscriptScrollPosition(
         scrollPositionsRef.current,
         remoteScrollKey
       );
@@ -2349,7 +2355,7 @@ function RemoteTranscriptPanel({
       nextEntries: entries,
       nextThreadId: remoteThreadId,
       previousSnapshot: previous,
-      restoredScrollTop,
+      restoredScrollPosition,
       scrollElement: transcript,
     });
     // A new-user-message jump-bottom carries userEntryId: record it so we only

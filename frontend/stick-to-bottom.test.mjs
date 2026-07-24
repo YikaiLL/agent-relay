@@ -5,7 +5,11 @@ import {
   TRANSCRIPT_SCROLL_ACTION_EVENT,
   applyTranscriptScrollAction,
 } from "./shared/transcript-scroll.js";
-import { RESTICK_AT_BOTTOM_PX, classifyScrollIntent } from "./shared/stick-to-bottom.js";
+import {
+  RESTICK_AT_BOTTOM_PX,
+  classifyScrollIntent,
+  classifyTranscriptScrollAction,
+} from "./shared/stick-to-bottom.js";
 
 // The live stick-to-bottom follower (frontend/shared/stick-to-bottom.js) is a
 // small hand-rolled ResizeObserver-driven engine (we dropped the
@@ -13,9 +17,29 @@ import { RESTICK_AT_BOTTOM_PX, classifyScrollIntent } from "./shared/stick-to-bo
 // is exercised end-to-end by scripts/browser-stick-to-bottom-e2e.mjs. Two
 // unit-testable cores remain: (1) the intent CONTRACT it consumes from
 // transcript-scroll.js (jump-bottom / rejoin-bottom -> stick, restore-thread ->
-// follow only if near the bottom); (2) its pure scroll-gesture policy
+// preserve explicit history-reading intent); (2) its pure scroll-gesture policy
 // `classifyScrollIntent`. This is plain bottom-follow: no top-anchor, no hold, so
 // anchor-user is retired. These tests pin those.
+
+test("programmatic actions preserve explicit bottom-follow intent", () => {
+  assert.equal(classifyTranscriptScrollAction({ kind: "jump-bottom" }), "stick");
+  assert.equal(classifyTranscriptScrollAction({ kind: "rejoin-bottom" }), "stick");
+  assert.equal(classifyTranscriptScrollAction({ kind: "restore-thread" }), "unstick");
+  assert.equal(classifyTranscriptScrollAction({ kind: "preserve" }), "none");
+});
+
+test("restore-thread never re-sticks within the button's old 5-160px band", () => {
+  // Distance is deliberately irrelevant: `restore-thread` is only emitted for
+  // a cached `followBottom: false` state. The semantic intent wins over the
+  // floating button's much broader visual threshold.
+  for (const distance of [5, 40, 80, 159, 160]) {
+    assert.equal(
+      classifyTranscriptScrollAction({ distance, kind: "restore-thread" }),
+      "unstick",
+      `${distance}px from bottom must remain history-reading`
+    );
+  }
+});
 
 // --- classifyScrollIntent: the pure scroll-gesture policy ------------------
 

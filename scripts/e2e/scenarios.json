@@ -23,6 +23,7 @@
       "local-view-only-models",
       "local-scroll-to-bottom",
       "local-stick-to-bottom",
+      "local-multi-live-follow",
       "local-auth",
       "local-allowed-roots",
       "local-file-diff",
@@ -343,7 +344,8 @@
       "provider": "fake-compatible",
       "transport": "public-broker",
       "coverage": [
-        "multi-remote-follow"
+        "multi-remote-follow",
+        "remote-thread-switch-scroll"
       ]
     },
     "self-hosted-pairing": {
@@ -377,6 +379,17 @@
         "virtualized-transcript",
         "desktop-layout",
         "mobile-layout"
+      ]
+    },
+    "local-multi-live-follow": {
+      "script": "browser-local-multi-live-follow-e2e.mjs",
+      "tier": "full",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "multi-session-live-follow",
+        "tool-call-streaming",
+        "thread-switch-scroll"
       ]
     }
   }
