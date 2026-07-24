@@ -26,6 +26,46 @@ function shortId(value) {
   return value ? String(value).slice(0, 8) : "unknown";
 }
 
+// Small stroked glyphs for the project-header rename/delete affordances.
+function renameGlyph() {
+  return h(
+    "svg",
+    {
+      "aria-hidden": "true",
+      width: "13",
+      height: "13",
+      viewBox: "0 0 16 16",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.4",
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+    },
+    h("path", { d: "M10.5 3.5 12.5 5.5" }),
+    h("path", { d: "M3 11 10 4 12 6 5 13 2.5 13.5 3 11Z" })
+  );
+}
+
+function deleteGlyph() {
+  return h(
+    "svg",
+    {
+      "aria-hidden": "true",
+      width: "13",
+      height: "13",
+      viewBox: "0 0 16 16",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.4",
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+    },
+    h("path", { d: "M3.25 4.5H12.75" }),
+    h("path", { d: "M6.5 4.5V3H9.5V4.5" }),
+    h("path", { d: "M5 4.5 5.5 12.5H10.5L11 4.5" })
+  );
+}
+
 export function ThreadGroupList({
   activeThreadId = null,
   collapsedGroupCwds = new Set(),
@@ -37,6 +77,8 @@ export function ThreadGroupList({
   groups = [],
   includePreview = false,
   onContextThread = null,
+  onDeleteProject = null,
+  onRenameProject = null,
   onResumeThread = null,
   onSelectWorkspace = null,
   onToggleExpandedGroup = null,
@@ -102,6 +144,8 @@ export function ThreadGroupList({
             includePreview,
             normalizedSelectedCwd,
             onContextThread,
+            onDeleteProject,
+            onRenameProject,
             onResumeThread,
             onSelectWorkspace,
             onToggleExpandedGroup,
@@ -125,6 +169,8 @@ function ThreadListRow({
   includePreview,
   normalizedSelectedCwd,
   onContextThread,
+  onDeleteProject,
+  onRenameProject,
   onResumeThread,
   onSelectWorkspace,
   onToggleExpandedGroup,
@@ -148,6 +194,8 @@ function ThreadListRow({
         group: row.group,
         isCollapsed: row.isCollapsed,
         normalizedCwd: row.normalizedCwd,
+        onDeleteProject,
+        onRenameProject,
         onSelectWorkspace,
         onToggleGroup,
       })
@@ -293,12 +341,65 @@ export function ThreadGroupHeader({
   group,
   isCollapsed,
   normalizedCwd,
+  onDeleteProject,
+  onRenameProject,
   onSelectWorkspace,
   onToggleGroup,
 }) {
   // The unknown-workspace key is internal; every branch shows the label
   // instead so it is never presented to the user as a path.
   const headerTitle = isUnknownWorkspace(group.cwd) ? group.label : group.cwd;
+
+  // Real Project groups (project mode) carry a truthy `projectId`; cwd groups omit
+  // the field and the Unassigned bucket is `projectId: null`, so neither gets the
+  // rename/delete affordances. Rendered as a <div> (not a button) so the action
+  // <button>s are valid children and there's no header-level click to fight.
+  const projectId = group.projectId || null;
+  if (projectId && (onRenameProject || onDeleteProject)) {
+    return h(
+      "div",
+      {
+        className: "thread-group-header thread-group-header-static thread-group-header-project",
+        title: headerTitle,
+      },
+      h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
+      h("span", { className: "thread-group-name" }, group.label),
+      h(
+        "span",
+        { className: "thread-group-actions" },
+        onRenameProject &&
+          h(
+            "button",
+            {
+              type: "button",
+              className: "thread-group-action",
+              title: "Rename project",
+              "aria-label": `Rename project ${group.label}`,
+              onClick: (event) => {
+                event.stopPropagation();
+                onRenameProject(projectId, group.label);
+              },
+            },
+            renameGlyph()
+          ),
+        onDeleteProject &&
+          h(
+            "button",
+            {
+              type: "button",
+              className: "thread-group-action thread-group-action-danger",
+              title: "Delete project",
+              "aria-label": `Delete project ${group.label}`,
+              onClick: (event) => {
+                event.stopPropagation();
+                onDeleteProject(projectId, group.label);
+              },
+            },
+            deleteGlyph()
+          )
+      )
+    );
+  }
 
   if (collapsible) {
     return h(

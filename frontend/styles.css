@@ -916,6 +916,45 @@ input:focus, textarea:focus, select:focus {
   cursor: default;
 }
 
+/* Rename/delete affordances on a Project group header — revealed on hover/focus. */
+.thread-group-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.thread-group-header-project:hover .thread-group-actions,
+.thread-group-header-project:focus-within .thread-group-actions {
+  opacity: 1;
+}
+
+.thread-group-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.thread-group-action:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+
+.thread-group-action-danger:hover:not(:disabled) {
+  background: var(--err-bg);
+  color: var(--err-fg);
+}
+
 .thread-group-icon {
   position: relative;
   width: 16px;

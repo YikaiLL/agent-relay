@@ -188,6 +188,8 @@ export function createSessionRenderer({
   resumeSession,
   openThreadContextMenu,
   closeThreadContextMenu,
+  onRenameProject,
+  onDeleteProject,
   scheduleControllerHeartbeat,
   scheduleControllerLeaseRefresh,
   cancelControllerHeartbeat,
@@ -1508,6 +1510,10 @@ export function createSessionRenderer({
         onContextThread(threadId, clientX, clientY) {
           openThreadContextMenu(threadId, clientX, clientY);
         },
+        // Real project-group headers get rename/delete affordances (project mode only —
+        // cwd groups carry no projectId, so ThreadGroupHeader shows nothing there).
+        onRenameProject,
+        onDeleteProject,
         onResumeThread(threadId) {
           // Opening a thread clears its attention dot immediately; the click also
           // doubles as the user gesture that unlocks notification permission.

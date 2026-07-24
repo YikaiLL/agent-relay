@@ -145,6 +145,8 @@ import { createProjectsStore } from "./shared/projects-store.js";
 import {
   fetchProjectsPayload,
   createProject,
+  renameProject,
+  deleteProject,
   assignThreadToProject,
   unassignThread,
 } from "./local/project-actions.js";
@@ -589,6 +591,8 @@ const renderer = createSessionRenderer({
   },
   openThreadContextMenu,
   closeThreadContextMenu,
+  onRenameProject: renameProjectFromHeader,
+  onDeleteProject: deleteProjectFromHeader,
   scheduleControllerHeartbeat(...args) {
     return controller.scheduleControllerHeartbeat(...args);
   },
@@ -1094,6 +1098,44 @@ async function createProjectFromToolbar() {
 projectsCreateButton?.addEventListener("click", () => {
   void createProjectFromToolbar();
 });
+
+// Rename a Project from its group header (Projects view). Prompt pre-filled with the
+// current name; refresh rides the projects_revision snapshot bump like every mutation.
+async function renameProjectFromHeader(projectId, currentName) {
+  if (!projectId) {
+    return;
+  }
+  const name = promptProjectName(currentName || "");
+  if (!name || name === currentName) {
+    return;
+  }
+  try {
+    await renameProject(apiFetch, projectId, name);
+    logLine(`Renamed project to "${name}".`);
+  } catch (error) {
+    logLine(`Failed to rename project: ${error.message}`);
+  }
+}
+
+// Delete a Project from its group header. Its sessions become Unassigned (the sessions
+// themselves are not deleted). Confirm first, mirroring the archive/delete flows.
+async function deleteProjectFromHeader(projectId, name) {
+  if (!projectId) {
+    return;
+  }
+  const confirmed = window.confirm(
+    `Delete project "${name}"?\n\nIts sessions become Unassigned — the sessions themselves are not deleted.`
+  );
+  if (!confirmed) {
+    return;
+  }
+  try {
+    await deleteProject(apiFetch, projectId);
+    logLine(`Deleted project "${name}".`);
+  } catch (error) {
+    logLine(`Failed to delete project: ${error.message}`);
+  }
+}
 
 // Run one context-menu Project action for a thread (assign / unassign / new+assign).
 // `builtSeq` is the projectsStateSeq captured when the clicked button was built.

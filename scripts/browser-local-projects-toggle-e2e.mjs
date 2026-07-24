@@ -293,11 +293,39 @@ async function main() {
     let currentMarked = false;
     let unassignConfirmed = "unset";
     let menuCreateAssign = null;
+    let renameConfirmed = false;
+    let deleteConfirmed = false;
+    // Click a rename/delete action on a Project group header (Projects view). Returns
+    // whether the button was found. The action's prompt/confirm is answered by the
+    // page's dialog handler.
+    const clickHeaderAction = (name, title) =>
+      crudPage.evaluate(
+        (arg) => {
+          const header = [...document.querySelectorAll(".thread-group-header-project")].find(
+            (hd) => hd.querySelector(".thread-group-name")?.textContent?.trim() === arg.name
+          );
+          const btn = header?.querySelector(`.thread-group-action[title="${arg.title}"]`);
+          btn?.click();
+          return !!btn;
+        },
+        { name, title }
+      );
     // Right-click a session row to open its context menu, then read the Project buttons.
     const openThreadMenu = async (tid) => {
+      // Wait for the list to SETTLE first (not mid-refetch "Loading projects…" blank),
+      // else the row detaches under the click when the fail-closed placeholder swaps in.
+      // Then let locator.click() auto-scroll/auto-retry (a manual scrollIntoViewIfNeeded
+      // on a pre-resolved handle throws "element is not attached" across a re-render).
+      await crudPage.waitForFunction(
+        (t) => {
+          const count = document.querySelector("#threads-count")?.textContent || "";
+          if (count.includes("Loading projects")) return false;
+          return !!document.querySelector(`#threads-list [data-thread-id="${t}"]`);
+        },
+        tid,
+        { timeout: TIMEOUT_MS }
+      );
       const target = crudPage.locator(`#threads-list [data-thread-id="${tid}"]`);
-      await target.waitFor({ state: "visible", timeout: TIMEOUT_MS });
-      await target.scrollIntoViewIfNeeded({ timeout: TIMEOUT_MS });
       await target.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
       await crudPage.waitForFunction(() => {
         const menu = document.querySelector("#thread-context-menu");
@@ -364,6 +392,37 @@ async function main() {
         }
         await delay(150);
       }
+
+      // Rename a Project via its group-header action, then delete it (Projects view).
+      const beforeRename = await api(relayPort, "GET", "/api/projects");
+      const renameTargetId = beforeRename.projects.find((p) => p.name === "UiCrudProj")?.id;
+      assert.ok(renameTargetId, "a UiCrudProj to rename exists");
+      nextPrompt = "UiRenamedProj";
+      assert.ok(await clickHeaderAction("UiCrudProj", "Rename project"), "rename action found on the project header");
+      for (let i = 0; i < 100; i += 1) {
+        const data = await api(relayPort, "GET", "/api/projects");
+        const renamed = data.projects.find((p) => p.id === renameTargetId);
+        if (renamed && renamed.name === "UiRenamedProj") {
+          renameConfirmed = true;
+          break;
+        }
+        await delay(150);
+      }
+      // Wait for the renamed header to repaint, then delete it.
+      await crudPage.waitForFunction(
+        (name) => [...document.querySelectorAll(".thread-group-name")].some((n) => n.textContent.trim() === name),
+        "UiRenamedProj",
+        { timeout: TIMEOUT_MS }
+      );
+      assert.ok(await clickHeaderAction("UiRenamedProj", "Delete project"), "delete action found on the project header");
+      for (let i = 0; i < 100; i += 1) {
+        const data = await api(relayPort, "GET", "/api/projects");
+        if (!data.projects.some((p) => p.id === renameTargetId)) {
+          deleteConfirmed = true;
+          break;
+        }
+        await delay(150);
+      }
     } catch (crudError) {
       const dbg = await crudPage
         .evaluate((tid) => ({
@@ -401,7 +460,6 @@ async function main() {
     // Stay in Sessions mode (default); the session row is grouped by folder.
     const menuFailTarget = menuFailPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
     await menuFailTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
-    await menuFailTarget.scrollIntoViewIfNeeded({ timeout: TIMEOUT_MS });
     await menuFailTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
     await menuFailPage.waitForFunction(() => {
       const menu = document.querySelector("#thread-context-menu");
@@ -438,7 +496,6 @@ async function main() {
     });
     const staleTarget = staleMenuPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
     await staleTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
-    await staleTarget.scrollIntoViewIfNeeded({ timeout: TIMEOUT_MS });
     await staleTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
     // Menu open with actionable buttons (valid data).
     await staleMenuPage.waitForFunction(
@@ -480,7 +537,7 @@ async function main() {
           failClosed,
           gatePending,
           gateResolved,
-          crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign },
+          crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign, renameConfirmed, deleteConfirmed },
           menuFailClosed,
           staleMenu,
         },
@@ -523,6 +580,8 @@ async function main() {
     assert.ok(currentMarked, "the assigned project is marked current (✓) in the UI on reopen");
     assert.equal(unassignConfirmed, null, "removing via the context menu cleared membership server-side");
     assert.ok(menuCreateAssign, "the context menu 'New project…' both creates the project and assigns the session");
+    assert.ok(renameConfirmed, "renaming via the project header action updates the project name server-side");
+    assert.ok(deleteConfirmed, "deleting via the project header action removes the project server-side");
 
     // Menu fail-closed: no actionable Project controls while the payload is unavailable.
     assert.equal(menuFailClosed.sessionsActive, true, "menu fail-closed probe stays in Sessions mode");
