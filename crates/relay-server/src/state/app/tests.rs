@@ -238,9 +238,9 @@ mod path_scope_tests {
     use crate::fake_provider::FakeProviderBridge;
     use crate::protocol::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalScope, AskUserOptionView,
-        AskUserQuestionView, ForkSessionInput, ReadThreadTranscriptInput, ResumeSessionInput,
-        SendMessageInput, StartSessionInput, SubmitAskUserAnswerInput, ThreadSummaryView,
-        UpdateSessionSettingsInput,
+        AskUserQuestionView, ForkSessionInput, ProjectAction, ProjectActionInput,
+        ReadThreadTranscriptInput, ResumeSessionInput, SendMessageInput, StartSessionInput,
+        SubmitAskUserAnswerInput, ThreadSummaryView, UpdateSessionSettingsInput,
     };
     use crate::state::security::SecurityProfile;
     use crate::state::{
@@ -347,6 +347,76 @@ mod path_scope_tests {
             "fail-closed must NOT leak the active workspace's cwd"
         );
         assert!(ghost.file_changes.is_empty());
+    }
+
+    // B3: the manual Projects write path end to end through AppState.
+    #[tokio::test]
+    async fn project_action_create_assign_rename_delete() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+
+        // Create.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "Sealwire".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        assert_eq!(receipt.projects.len(), 1);
+        let project_id = receipt.projects[0].id.clone();
+        assert_eq!(receipt.projects[0].name, "Sealwire");
+
+        // A blank name is rejected.
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "   ".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+
+        // Assign a session; the receipt reflects membership immediately.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "t1".to_string(),
+                    project_id: project_id.clone(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("assign");
+        assert_eq!(receipt.thread_project_id.get("t1"), Some(&project_id));
+
+        // Rename.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Rename {
+                    project_id: project_id.clone(),
+                    name: "Renamed".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("rename");
+        assert_eq!(receipt.projects[0].name, "Renamed");
+
+        // Delete → project gone, session falls back to Unassigned.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Delete {
+                    project_id: project_id.clone(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("delete");
+        assert!(receipt.projects.is_empty());
+        assert!(receipt.thread_project_id.get("t1").is_none());
     }
 
     async fn build_status_app(cwd: &str, read_status: &str) -> (AppState, TempDir, TempDir) {

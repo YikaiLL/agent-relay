@@ -9,12 +9,12 @@ use crate::{
     protocol::{
         ApplyFileChangeInput, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
         AskUserQuestionDetailResponse, ForkSessionInput, HeartbeatInput, ModelOptionView,
-        ReadThreadEntriesInput, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
-        RequestReviewInput, ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot,
-        StartSessionInput, StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput,
-        TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-        ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
-        WorkspaceDiffResponse,
+        ProjectActionInput, ReadThreadEntriesInput, ReadThreadEntryDetailInput,
+        ReadThreadTranscriptInput, RequestReviewInput, ResumeSessionInput, ReviewsResponse,
+        SendMessageInput, SessionSnapshot, StartSessionInput, StartWorkflowInput, StopTurnInput,
+        SubmitAskUserAnswerInput, TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse,
+        ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput,
+        WorkflowActionInput, WorkspaceDiffResponse,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
@@ -96,6 +96,11 @@ pub(super) enum RemoteActionRequest {
         item_id: String,
         input: ApplyFileChangeInput,
     },
+    /// Manual Projects write (create/rename/delete/assign/unassign). Not
+    /// session-scoped, so it does not require a session claim.
+    ProjectAction {
+        input: ProjectActionInput,
+    },
     FetchWorkspaceDiff {
         #[serde(default)]
         device_id: Option<String>,
@@ -171,6 +176,7 @@ impl RemoteActionRequest {
             Self::FetchThreadTranscript { .. } => RemoteActionKind::FetchThreadTranscript,
             Self::DecideApproval { .. } => RemoteActionKind::DecideApproval,
             Self::ApplyFileChange { .. } => RemoteActionKind::ApplyFileChange,
+            Self::ProjectAction { .. } => RemoteActionKind::ProjectAction,
             Self::FetchWorkspaceDiff { .. } => RemoteActionKind::FetchWorkspaceDiff,
             Self::FetchReviews { .. } => RemoteActionKind::FetchReviews,
             Self::FetchAskUserQuestionDetail { .. } => RemoteActionKind::FetchAskUserQuestionDetail,
@@ -256,6 +262,10 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::ApplyFileChange { item_id, input }
             }
+            Self::ProjectAction { mut input } => {
+                input.device_id = Some(device_id);
+                Self::ProjectAction { input }
+            }
             Self::FetchWorkspaceDiff { thread_id, .. } => Self::FetchWorkspaceDiff {
                 device_id: Some(device_id),
                 // Preserve the viewed session selector; only device_id is stamped here.
@@ -332,6 +342,7 @@ pub(super) enum RemoteActionKind {
     FetchThreadTranscript,
     DecideApproval,
     ApplyFileChange,
+    ProjectAction,
     FetchWorkspaceDiff,
     FetchReviews,
     FetchAskUserQuestionDetail,
@@ -366,6 +377,7 @@ impl RemoteActionKind {
             Self::FetchThreadTranscript => "fetch_thread_transcript",
             Self::DecideApproval => "decide_approval",
             Self::ApplyFileChange => "apply_file_change",
+            Self::ProjectAction => "project_action",
             Self::FetchWorkspaceDiff => "fetch_workspace_diff",
             Self::FetchReviews => "fetch_reviews",
             Self::FetchAskUserQuestionDetail => "fetch_ask_user_question_detail",
@@ -1156,6 +1168,10 @@ async fn execute_remote_action(
             .map_err(approval_error_message),
         RemoteActionRequest::ApplyFileChange { item_id, input } => state
             .apply_file_change(&item_id, input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::ProjectAction { input } => state
+            .project_action(input)
             .await
             .map(|_| RemoteActionOutcome::default()),
         RemoteActionRequest::FetchWorkspaceDiff {
@@ -2341,6 +2357,7 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         }
         RemoteActionKind::SendMessage
         | RemoteActionKind::ApplyFileChange
+        | RemoteActionKind::ProjectAction
         | RemoteActionKind::RequestReview
         | RemoteActionKind::StartWorkflow
         | RemoteActionKind::ResolveReview

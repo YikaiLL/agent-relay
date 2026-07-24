@@ -38,14 +38,15 @@ use protocol::{
     ApplyFileChangeReceipt, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
     AuthSessionInput, AuthSessionView, BulkRevokeDevicesReceipt, DeleteThreadInput,
     ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView, PairingDecisionInput,
-    PairingDecisionReceipt, PairingStartInput, PairingTicketView, ReadThreadEntryDetailInput,
-    ReadThreadTranscriptInput, RequestReviewInput, RequestReviewReceipt, ResumeSessionInput,
-    ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput,
-    SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput,
-    StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
-    ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-    ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
-    WorkflowActionReceipt, WorkspaceDiffResponse,
+    PairingDecisionReceipt, PairingStartInput, PairingTicketView, ProjectActionInput,
+    ProjectActionReceipt, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
+    RequestReviewInput, RequestReviewReceipt, ResumeSessionInput, ReviewActionInput,
+    ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+    SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput, StartWorkflowReceipt,
+    StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt,
+    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadTranscriptResponse, ThreadsQuery,
+    ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput, WorkflowActionReceipt,
+    WorkspaceDiffResponse,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -202,6 +203,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             get(thread_entry_detail),
         )
         .route("/api/allowed-roots", post(update_allowed_roots))
+        .route("/api/projects", post(project_action))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
             "/api/threads/:thread_id/delete",
@@ -590,6 +592,21 @@ async fn update_allowed_roots(
     context
         .app
         .update_allowed_roots(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+async fn project_action(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<ProjectActionInput>,
+) -> Result<Json<ApiEnvelope<ProjectActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .project_action(input)
         .await
         .map(|receipt| Json(ApiEnvelope::ok(receipt)))
         .map_err(bad_request)

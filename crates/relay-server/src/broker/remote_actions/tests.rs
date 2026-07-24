@@ -231,6 +231,34 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
 }
 
 #[test]
+fn project_action_round_trips_and_binds_device_without_claim() {
+    let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "project_action",
+        "input": { "action": "assign", "thread_id": "t1", "project_id": "proj_x" }
+    }))
+    .expect("project_action should parse");
+    assert_eq!(request.kind(), RemoteActionKind::ProjectAction);
+    assert_eq!(RemoteActionKind::ProjectAction.as_str(), "project_action");
+
+    match request.bind_device("device-9".to_string()) {
+        RemoteActionRequest::ProjectAction { input } => {
+            assert_eq!(input.device_id.as_deref(), Some("device-9"));
+            assert_eq!(
+                input.action,
+                crate::protocol::ProjectAction::Assign {
+                    thread_id: "t1".to_string(),
+                    project_id: "proj_x".to_string(),
+                }
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // Projects are global, not session-scoped → no session claim required.
+    assert!(!requires_session_claim(RemoteActionKind::ProjectAction));
+}
+
+#[test]
 fn push_subscription_actions_round_trip_and_are_not_claim_gated() {
     let reg: RemoteActionRequest = serde_json::from_value(serde_json::json!({
         "type": "register_push_subscription",

@@ -1786,6 +1786,54 @@ pub struct AllowedRootsReceipt {
     pub message: String,
 }
 
+/// A single manual Projects write. Internally tagged so a client sends e.g.
+/// `{ "action": "create", "name": "Sealwire" }` or
+/// `{ "action": "assign", "thread_id": "…", "project_id": "…" }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ProjectAction {
+    /// Create a new (empty) Project. The relay assigns the id.
+    Create {
+        name: String,
+    },
+    Rename {
+        project_id: String,
+        name: String,
+    },
+    /// Delete a Project; its member sessions fall back to "Unassigned".
+    Delete {
+        project_id: String,
+    },
+    /// Move a session into a Project (replaces any prior membership).
+    Assign {
+        thread_id: String,
+        project_id: String,
+    },
+    /// Move a session out of its Project → "Unassigned".
+    Unassign {
+        thread_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectActionInput {
+    #[serde(flatten)]
+    pub action: ProjectAction,
+    /// Stamped server-side on the remote path (`bind_device`); `None` for the local
+    /// operator. Actor for logging only — Projects are global, not device-scoped.
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectActionReceipt {
+    /// The full project list + membership after the action, so a client can refresh
+    /// immediately without waiting for the next snapshot.
+    pub projects: Vec<ProjectView>,
+    pub thread_project_id: std::collections::HashMap<String, String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionInput {
     pub cwd: Option<String>,

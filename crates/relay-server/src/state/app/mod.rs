@@ -21,12 +21,13 @@ use crate::{
         AskUserQuestionDetailResponse, BulkRevokeDevicesReceipt, FileChangeApplyDirection,
         FileChangeDiffView, ForkSessionInput, HeartbeatInput, ModelOptionView, PairingDecision,
         PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
-        ReadThreadEntriesInput, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
-        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-        StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
-        ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
-        ThreadEntryDetailResponse, ThreadStateView, ThreadTranscriptResponse, ThreadsResponse,
-        UpdateSessionSettingsInput, WorkspaceDiffResponse,
+        ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
+        ReadThreadEntryDetailInput, ReadThreadTranscriptInput, ResumeSessionInput,
+        RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput, StopTurnInput,
+        SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
+        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadStateView,
+        ThreadTranscriptResponse, ThreadsResponse, UpdateSessionSettingsInput,
+        WorkspaceDiffResponse,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -120,6 +121,7 @@ mod approvals;
 mod broker;
 mod fork;
 mod pairing;
+mod projects;
 mod providers;
 mod review;
 mod sessions;

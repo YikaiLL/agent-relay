@@ -683,6 +683,74 @@ impl RelayState {
             .map(|binding| binding.cwd.clone())
     }
 
+    /// All projects as a stable (name, then id) sorted list for clients.
+    pub(crate) fn projects_view(&self) -> Vec<crate::protocol::ProjectView> {
+        let mut projects: Vec<_> = self.projects.values().cloned().collect();
+        projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        projects
+    }
+
+    /// Create a new (empty) project with a caller-chosen id.
+    pub(super) fn create_project(
+        &mut self,
+        id: String,
+        name: String,
+    ) -> crate::protocol::ProjectView {
+        let project = crate::protocol::ProjectView {
+            id: id.clone(),
+            name,
+            workspace_bindings: Vec::new(),
+            instructions: None,
+        };
+        self.projects.insert(id, project.clone());
+        project
+    }
+
+    pub(super) fn rename_project(&mut self, project_id: &str, name: String) -> Result<(), String> {
+        let project = self
+            .projects
+            .get_mut(project_id)
+            .ok_or_else(|| format!("project `{project_id}` not found"))?;
+        project.name = name;
+        Ok(())
+    }
+
+    /// Delete a project; its member sessions fall back to "Unassigned".
+    pub(super) fn delete_project(&mut self, project_id: &str) -> Result<(), String> {
+        if self.projects.remove(project_id).is_none() {
+            return Err(format!("project `{project_id}` not found"));
+        }
+        self.thread_project_id.retain(|_, pid| pid != project_id);
+        Ok(())
+    }
+
+    /// Move a session into a project (replaces any prior membership). Rejects
+    /// reviewer-owned threads (they're hidden, review-scoped, not user sessions);
+    /// an ordinary session id that isn't loaded into the thread list is still
+    /// assignable on purpose — membership is metadata, not gated on load state.
+    pub(super) fn assign_thread_to_project(
+        &mut self,
+        thread_id: &str,
+        project_id: &str,
+    ) -> Result<(), String> {
+        if !self.projects.contains_key(project_id) {
+            return Err(format!("project `{project_id}` not found"));
+        }
+        if self.reviewer_thread_ids().contains(thread_id) {
+            return Err(format!(
+                "`{thread_id}` is a reviewer thread and cannot be assigned to a project"
+            ));
+        }
+        self.thread_project_id
+            .insert(thread_id.to_string(), project_id.to_string());
+        Ok(())
+    }
+
+    /// Move a session out of its project → "Unassigned". Returns whether it changed.
+    pub(super) fn unassign_thread_from_project(&mut self, thread_id: &str) -> bool {
+        self.thread_project_id.remove(thread_id).is_some()
+    }
+
     /// Whether the ACTIVE thread's agent is mid-turn per its provider-reported
     /// status. Semantic mirror of the frontend `canRequestReview` gate: callers
     /// that need a "is the agent busy right now" check must use this, NOT a literal
@@ -2540,6 +2608,11 @@ impl RelayState {
     pub fn mark_thread_deleted(&mut self, thread_id: &str) {
         self.locally_deleted_thread_ids
             .insert(thread_id.to_string());
+        // Clear project membership on PERMANENT deletion specifically (not in the
+        // shared `remove_thread`, which archive also uses): otherwise the persisted
+        // `thread_project_id` keeps a durable orphan entry, and a reused id could
+        // silently regain its old project.
+        self.thread_project_id.remove(thread_id);
         self.remove_thread(thread_id);
     }
 
@@ -3546,6 +3619,124 @@ mod tests {
             serde_json::from_value(value).expect("pre-Projects state files must still load");
         assert!(legacy.projects.is_empty());
         assert!(legacy.thread_project_id.is_empty());
+    }
+
+    #[test]
+    fn project_crud_mutators() {
+        let mut relay = test_relay();
+
+        // Create.
+        let project = relay.create_project("proj_x".to_string(), "Sealwire".to_string());
+        assert_eq!(project.name, "Sealwire");
+        assert_eq!(relay.projects_view().len(), 1);
+
+        // Assign a session; membership resolves via the accessor.
+        relay.assign_thread_to_project("t1", "proj_x").unwrap();
+        assert_eq!(relay.project_for_thread("t1").unwrap().id, "proj_x");
+
+        // Assigning to a missing project errors and leaves membership untouched.
+        assert!(relay.assign_thread_to_project("t2", "ghost").is_err());
+        assert!(relay.project_for_thread("t2").is_none());
+
+        // Rename.
+        relay
+            .rename_project("proj_x", "Renamed".to_string())
+            .unwrap();
+        assert_eq!(relay.projects.get("proj_x").unwrap().name, "Renamed");
+        assert!(relay.rename_project("ghost", "x".to_string()).is_err());
+
+        // Unassign → Unassigned; idempotent.
+        assert!(relay.unassign_thread_from_project("t1"));
+        assert!(relay.project_for_thread("t1").is_none());
+        assert!(!relay.unassign_thread_from_project("t1"));
+
+        // Delete drops the project AND unassigns its remaining members.
+        relay.assign_thread_to_project("t3", "proj_x").unwrap();
+        relay.delete_project("proj_x").unwrap();
+        assert!(relay.projects_view().is_empty());
+        assert!(
+            relay.project_for_thread("t3").is_none(),
+            "deleting a project falls its members back to Unassigned"
+        );
+        assert!(relay.delete_project("proj_x").is_err());
+    }
+
+    #[test]
+    fn permanent_thread_deletion_clears_project_membership() {
+        let mut relay = test_relay();
+        relay.create_project("proj_x".to_string(), "P".to_string());
+        relay.assign_thread_to_project("t1", "proj_x").unwrap();
+        assert!(relay.project_for_thread("t1").is_some());
+
+        // Permanent deletion clears the membership...
+        relay.mark_thread_deleted("t1");
+        assert!(
+            relay.thread_project_id.get("t1").is_none(),
+            "a permanently deleted session must not leave an orphan project membership"
+        );
+
+        // ...and the cleared state survives a persistence round-trip (no durable orphan).
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        assert!(restored.thread_project_id.get("t1").is_none());
+    }
+
+    #[test]
+    fn assign_rejects_reviewer_threads() {
+        let mut relay = test_relay();
+        relay.create_project("proj_x".to_string(), "P".to_string());
+        relay.register_reviewer_thread("reviewer-1".to_string(), "parent-1".to_string());
+        assert!(relay
+            .assign_thread_to_project("reviewer-1", "proj_x")
+            .is_err());
+        assert!(relay.project_for_thread("reviewer-1").is_none());
+    }
+
+    #[test]
+    fn unloaded_ordinary_session_is_assignable() {
+        // Intended leniency: membership is metadata, so an ordinary session id that
+        // isn't in the in-memory thread list can still be assigned.
+        let mut relay = test_relay();
+        relay.create_project("proj_x".to_string(), "P".to_string());
+        assert!(relay.threads.is_empty());
+        assert!(relay
+            .assign_thread_to_project("not-loaded", "proj_x")
+            .is_ok());
+        assert_eq!(relay.project_for_thread("not-loaded").unwrap().id, "proj_x");
+    }
+
+    #[test]
+    fn project_action_input_deserializes_local_http_body() {
+        use crate::protocol::{ProjectAction, ProjectActionInput};
+        // The POST /api/projects body is a bare ProjectActionInput (internally-tagged
+        // action, no wrapper). This locks the endpoint's wire contract.
+        let create: ProjectActionInput = serde_json::from_value(serde_json::json!({
+            "action": "create",
+            "name": "Sealwire"
+        }))
+        .expect("create body parses");
+        assert!(create.device_id.is_none());
+        assert_eq!(
+            create.action,
+            ProjectAction::Create {
+                name: "Sealwire".to_string()
+            }
+        );
+
+        let assign: ProjectActionInput = serde_json::from_value(serde_json::json!({
+            "action": "assign",
+            "thread_id": "t1",
+            "project_id": "proj_x"
+        }))
+        .expect("assign body parses");
+        assert_eq!(
+            assign.action,
+            ProjectAction::Assign {
+                thread_id: "t1".to_string(),
+                project_id: "proj_x".to_string()
+            }
+        );
     }
 
     #[test]
