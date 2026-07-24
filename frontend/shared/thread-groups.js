@@ -23,6 +23,17 @@ export function isUnknownWorkspace(cwd) {
   return cwd === UNKNOWN_WORKSPACE_CWD;
 }
 
+export const UNASSIGNED_PROJECT_KEY = "__unassigned__";
+export const UNASSIGNED_PROJECT_LABEL = "Unassigned";
+
+// Like UNKNOWN_WORKSPACE_CWD, the "Unassigned" bucket key is a DISPLAY grouping
+// sentinel, not a real project id: it must never be sent to an assign/unassign
+// action as a project_id. Null `project_id` membership collapses to this ONE
+// bucket (never split by cwd).
+export function isUnassignedProject(key) {
+  return key === UNASSIGNED_PROJECT_KEY;
+}
+
 // Navigation policy, shared by every surface that renders the thread list.
 //
 // A thread whose cwd could not be recovered must still be REACHABLE. cwd
@@ -37,11 +48,21 @@ export function isUnknownWorkspace(cwd) {
 // This exists as a function rather than an option each caller remembers to
 // pass: local surfaces did not pass it while remote did, so the same thread was
 // visible on the phone and gone on the desktop.
-export function buildNavigationThreadGroups(threads) {
-  return buildThreadGroups(threads, { includeUnknownWorkspace: true });
+export function buildNavigationThreadGroups(threads, options = {}) {
+  return buildThreadGroups(threads, { includeUnknownWorkspace: true, ...options });
 }
 
+// Every group carries a neutral `key` (canonical cwd in cwd mode, project id or the
+// "__unassigned__" sentinel in project mode) so downstream collapse/row state can be
+// keyed uniformly regardless of grouping mode.
 export function buildThreadGroups(threads, options = {}) {
+  if (options.groupBy === "project") {
+    return buildProjectGroups(threads, options);
+  }
+  return buildCwdGroups(threads, options);
+}
+
+function buildCwdGroups(threads, options) {
   const includeUnknownWorkspace = options.includeUnknownWorkspace === true;
   const groups = new Map();
 
@@ -54,6 +75,7 @@ export function buildThreadGroups(threads, options = {}) {
 
     if (!groups.has(cwd)) {
       groups.set(cwd, {
+        key: cwd,
         cwd,
         label: knownCwd ? workspaceBasename(cwd) : UNKNOWN_WORKSPACE_LABEL,
         latestUpdatedAt: 0,
@@ -66,7 +88,51 @@ export function buildThreadGroups(threads, options = {}) {
     group.latestUpdatedAt = Math.max(group.latestUpdatedAt, Number(thread.updated_at) || 0);
   }
 
-  return [...groups.values()]
+  return sortThreadGroups([...groups.values()]);
+}
+
+// Group by Project (thread_project_id membership). Every known project seeds a
+// group so an empty project stays visible/navigable; a thread with no project — or
+// an ORPHANED membership whose project was deleted — collapses into ONE
+// "__unassigned__" bucket (never split by cwd).
+function buildProjectGroups(threads, options) {
+  const threadProjectId = options.threadProjectId || {};
+  const projectsById = new Map((options.projects || []).map((project) => [project.id, project]));
+  const groups = new Map();
+
+  const ensureGroup = (key, label, projectId) => {
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        cwd: "",
+        projectId: projectId ?? null,
+        label,
+        latestUpdatedAt: 0,
+        threads: [],
+      });
+    }
+    return groups.get(key);
+  };
+
+  for (const project of options.projects || []) {
+    ensureGroup(project.id, project.name || project.id, project.id);
+  }
+
+  for (const thread of threads || []) {
+    const rawId = threadProjectId[thread.id] || null;
+    const project = rawId ? projectsById.get(rawId) : null;
+    const group = project
+      ? ensureGroup(project.id, project.name || project.id, project.id)
+      : ensureGroup(UNASSIGNED_PROJECT_KEY, UNASSIGNED_PROJECT_LABEL, null);
+    group.threads.push(thread);
+    group.latestUpdatedAt = Math.max(group.latestUpdatedAt, Number(thread.updated_at) || 0);
+  }
+
+  return sortThreadGroups([...groups.values()]);
+}
+
+function sortThreadGroups(groups) {
+  return groups
     .map((group) => ({
       ...group,
       threads: [...group.threads].sort((left, right) => (right.updated_at || 0) - (left.updated_at || 0)),
@@ -95,15 +161,23 @@ export function findLatestThread(threads, preferredCwd) {
   );
 }
 
-export function summarizeThreadGroups(groups) {
+export function summarizeThreadGroups(groups, options = {}) {
   const safeGroups = groups || [];
   const totalThreads = safeGroups.reduce((count, group) => count + (group.threads?.length || 0), 0);
 
-  if (totalThreads === 0) {
+  if (totalThreads === 0 && safeGroups.length === 0) {
     return "No saved sessions yet.";
   }
 
-  return `${safeGroups.length} ${safeGroups.length === 1 ? "folder" : "folders"} · ${totalThreads} ${
+  const groupNoun =
+    options.groupBy === "project"
+      ? safeGroups.length === 1
+        ? "project"
+        : "projects"
+      : safeGroups.length === 1
+        ? "folder"
+        : "folders";
+  return `${safeGroups.length} ${groupNoun} · ${totalThreads} ${
     totalThreads === 1 ? "session" : "sessions"
   }`;
 }
