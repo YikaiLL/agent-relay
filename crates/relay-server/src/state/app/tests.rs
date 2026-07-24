@@ -419,11 +419,14 @@ mod path_scope_tests {
         assert!(receipt.thread_project_id.get("t1").is_none());
     }
 
-    // B4a: a project mutation must become visible through the snapshot channel (how
-    // both surfaces, incl. remote after an ack, learn project state).
+    // B4a (revised): projects are NOT embedded in the snapshot (unbounded → would
+    // defeat the byte budget). A mutation bumps `projects_revision`; the client learns
+    // of the change from the snapshot and refetches the dedicated payload.
     #[tokio::test]
-    async fn snapshot_exposes_projects_and_membership() {
+    async fn project_mutation_bumps_snapshot_revision_and_fetch_returns_payload() {
         let (app, _project, _outside) = build_app("/tmp/project").await;
+        assert_eq!(app.snapshot().await.projects_revision, 0);
+
         let receipt = app
             .project_action(ProjectActionInput {
                 action: ProjectAction::Create {
@@ -444,10 +447,135 @@ mod path_scope_tests {
         .await
         .expect("assign");
 
-        let snapshot = app.snapshot().await;
-        assert_eq!(snapshot.projects.len(), 1);
-        assert_eq!(snapshot.projects[0].name, "Sealwire");
-        assert_eq!(snapshot.thread_project_id.get("t1"), Some(&project_id));
+        // Snapshot carries ONLY the bumped revision (one per action).
+        assert_eq!(app.snapshot().await.projects_revision, 2);
+
+        // The dedicated fetch returns the full list + membership + matching revision.
+        let payload = app.fetch_projects().await;
+        assert_eq!(payload.projects_revision, 2);
+        assert_eq!(payload.projects.len(), 1);
+        assert_eq!(payload.projects[0].name, "Sealwire");
+        assert_eq!(payload.thread_project_id.get("t1"), Some(&project_id));
+    }
+
+    #[tokio::test]
+    async fn snapshot_stays_bounded_regardless_of_project_count() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        for i in 0..200 {
+            app.project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: format!("Project-{i}-{}", "x".repeat(150)),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        }
+
+        // The byte-budgeted remote frame stays bounded — projects are NOT embedded
+        // (only the tiny revision rides), so 200 long-named projects can't push it
+        // toward the ~40 KB an O(N) embedding would cost. The revision survives
+        // compaction so the client knows to refetch.
+        let remote = app
+            .snapshot()
+            .await
+            .compact_for(crate::protocol::SessionSnapshotCompactProfile::RemoteSurface);
+        assert_eq!(remote.projects_revision, 200);
+        let serialized = serde_json::to_string(&remote).expect("serialize");
+        assert!(
+            serialized.len() < 12_000,
+            "remote snapshot must stay bounded despite 200 projects; was {} bytes",
+            serialized.len()
+        );
+
+        // The full payload is available off the snapshot, on demand.
+        assert_eq!(app.fetch_projects().await.projects.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn project_action_rejects_overlong_names() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "x".repeat(500),
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn project_action_rejects_overlong_thread_ids() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "P".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        let project_id = receipt.projects[0].id.clone();
+        // A giant thread id can't bloat the persisted membership map / payload.
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "x".repeat(1000),
+                    project_id,
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn project_action_enforces_membership_cap() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "P".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        let project_id = receipt.projects[0].id.clone();
+        // Fill the membership map to the cap directly (fast — plain map inserts).
+        {
+            let mut relay = app.relay.write().await;
+            for i in 0..10_000 {
+                relay
+                    .thread_project_id
+                    .insert(format!("t{i}"), project_id.clone());
+            }
+        }
+        // A NEW membership past the cap is rejected...
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "overflow".to_string(),
+                    project_id: project_id.clone(),
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+        // ...but reassigning an EXISTING member still works.
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "t0".to_string(),
+                    project_id,
+                },
+                device_id: None,
+            })
+            .await
+            .is_ok());
     }
 
     async fn build_status_app(cwd: &str, read_status: &str) -> (AppState, TempDir, TempDir) {

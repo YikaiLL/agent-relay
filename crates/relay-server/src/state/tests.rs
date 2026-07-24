@@ -87,6 +87,7 @@ fn test_persisted_state() -> PersistedRelayState {
         push_subscriptions: std::collections::HashMap::new(),
         projects: Default::default(),
         thread_project_id: Default::default(),
+        projects_revision: 0,
     }
 }
 
@@ -299,8 +300,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             active_workflow_runs: Vec::new(),
             workflows_revision: 0,
             push_vapid_public_key: None,
-            projects: Vec::new(),
-            thread_project_id: Default::default(),
+            projects_revision: 0,
         }),
         receipt: Some(ApprovalReceipt {
             request_id: "req-1".to_string(),

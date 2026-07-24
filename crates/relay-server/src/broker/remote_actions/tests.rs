@@ -66,8 +66,7 @@ fn make_snapshot() -> SessionSnapshot {
         active_workflow_runs: vec![],
         workflows_revision: 0,
         push_vapid_public_key: None,
-        projects: Vec::new(),
-        thread_project_id: Default::default(),
+        projects_revision: 0,
     }
 }
 

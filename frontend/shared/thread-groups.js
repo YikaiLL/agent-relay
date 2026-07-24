@@ -169,15 +169,13 @@ export function summarizeThreadGroups(groups, options = {}) {
     return "No saved sessions yet.";
   }
 
-  const groupNoun =
-    options.groupBy === "project"
-      ? safeGroups.length === 1
-        ? "project"
-        : "projects"
-      : safeGroups.length === 1
-        ? "folder"
-        : "folders";
-  return `${safeGroups.length} ${groupNoun} · ${totalThreads} ${
-    totalThreads === 1 ? "session" : "sessions"
-  }`;
+  const sessions = `${totalThreads} ${totalThreads === 1 ? "session" : "sessions"}`;
+
+  if (options.groupBy === "project") {
+    // The "__unassigned__" bucket is NOT a project — count only real projects.
+    const projectCount = safeGroups.filter((group) => group.projectId).length;
+    return `${projectCount} ${projectCount === 1 ? "project" : "projects"} · ${sessions}`;
+  }
+
+  return `${safeGroups.length} ${safeGroups.length === 1 ? "folder" : "folders"} · ${sessions}`;
 }

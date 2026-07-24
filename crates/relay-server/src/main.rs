@@ -39,7 +39,7 @@ use protocol::{
     AuthSessionInput, AuthSessionView, BulkRevokeDevicesReceipt, DeleteThreadInput,
     ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView, PairingDecisionInput,
     PairingDecisionReceipt, PairingStartInput, PairingTicketView, ProjectActionInput,
-    ProjectActionReceipt, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
+    ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
     RequestReviewInput, RequestReviewReceipt, ResumeSessionInput, ReviewActionInput,
     ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
     SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput, StartWorkflowReceipt,
@@ -203,7 +203,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             get(thread_entry_detail),
         )
         .route("/api/allowed-roots", post(update_allowed_roots))
-        .route("/api/projects", post(project_action))
+        .route("/api/projects", get(fetch_projects).post(project_action))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
             "/api/threads/:thread_id/delete",
@@ -610,6 +610,17 @@ async fn project_action(
         .await
         .map(|receipt| Json(ApiEnvelope::ok(receipt)))
         .map_err(bad_request)
+}
+
+// The dedicated, uncompacted Projects payload (list + membership + revision),
+// decoupled from the byte-budgeted session snapshot.
+async fn fetch_projects(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<ProjectsResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.fetch_projects().await)))
 }
 
 async fn archive_thread(

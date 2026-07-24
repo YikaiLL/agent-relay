@@ -108,13 +108,37 @@ test("buildThreadGroups project mode seeds empty projects and folds orphans into
   assert.ok(!byKey.has("proj_gone"), "an orphan membership never creates a raw-id group");
 });
 
-test("summarizeThreadGroups uses project nouns in project mode", () => {
-  const groups = buildThreadGroups([{ id: "t1", cwd: "/x", updated_at: 1 }], {
+test("summarizeThreadGroups counts real projects, not the Unassigned bucket", () => {
+  // One real project + one session in it.
+  const one = buildThreadGroups([{ id: "t1", cwd: "/x", updated_at: 1 }], {
     groupBy: "project",
     projects: [{ id: "p", name: "P" }],
     threadProjectId: { t1: "p" },
   });
-  assert.equal(summarizeThreadGroups(groups, { groupBy: "project" }), "1 project · 1 session");
+  assert.equal(summarizeThreadGroups(one, { groupBy: "project" }), "1 project · 1 session");
+
+  // Unassigned-only: no real projects → "0 projects" (the bucket is not a project).
+  const unassignedOnly = buildThreadGroups(
+    [
+      { id: "t1", cwd: "/x", updated_at: 1 },
+      { id: "t2", cwd: "/y", updated_at: 2 },
+    ],
+    { groupBy: "project", projects: [], threadProjectId: {} }
+  );
+  assert.equal(
+    summarizeThreadGroups(unassignedOnly, { groupBy: "project" }),
+    "0 projects · 2 sessions"
+  );
+
+  // One real project PLUS Unassigned → still "1 project" (bucket excluded).
+  const mixed = buildThreadGroups(
+    [
+      { id: "t1", cwd: "/x", updated_at: 1 },
+      { id: "t2", cwd: "/y", updated_at: 2 },
+    ],
+    { groupBy: "project", projects: [{ id: "p", name: "P" }], threadProjectId: { t1: "p" } }
+  );
+  assert.equal(summarizeThreadGroups(mixed, { groupBy: "project" }), "1 project · 2 sessions");
 });
 
 test("createThreadListRows keys on the neutral project group key", () => {

@@ -95,6 +95,12 @@ pub(super) struct PersistedRelayState {
     /// `#[serde(default)]` keeps old state files loadable (empty map).
     #[serde(default)]
     pub(super) thread_project_id: std::collections::HashMap<String, String>,
+    /// Persisted Projects cache key. Restored nonzero so a fresh client (which starts
+    /// at 0) sees a mismatch and fetches the persisted projects across a restart —
+    /// otherwise revision 0 would match and leave existing projects invisible until
+    /// the next mutation. `#[serde(default)]` → 0 for pre-Projects state files.
+    #[serde(default)]
+    pub(super) projects_revision: u64,
 }
 
 impl PersistedRelayState {
@@ -153,6 +159,7 @@ impl PersistedRelayState {
             push_subscriptions: relay.push_subscriptions.clone(),
             projects: relay.projects.clone(),
             thread_project_id: relay.thread_project_id.clone(),
+            projects_revision: relay.projects_revision,
         }
     }
 

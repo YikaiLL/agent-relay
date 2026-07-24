@@ -172,14 +172,19 @@ pub struct SessionSnapshot {
     /// dispatcher is wired. Not secret — safe to publish in the snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_vapid_public_key: Option<String>,
-    /// Persisted Projects (named session groupings). Snapshot-embedded because the
-    /// payload is tiny; `#[serde(default)]` keeps older clients/frames decoding, and
-    /// `skip_serializing_if` keeps the empty (no-Projects) wire shape byte-identical.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub projects: Vec<ProjectView>,
-    /// Session (thread) -> project id membership. Absent id = "Unassigned".
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub thread_project_id: std::collections::HashMap<String, String>,
+    /// Cache key for the dedicated Projects channel. The full Projects payload
+    /// (names + membership) is deliberately NOT embedded in the snapshot: it can grow
+    /// unbounded (a paired device can create many projects / arbitrary memberships),
+    /// which would defeat the byte-budgeted remote frame and amplify every persisted
+    /// snapshot. Instead the client fetches it on demand (GET /api/projects /
+    /// FetchProjects) and refreshes only when this revision changes. Skipped when 0
+    /// so the empty (no-Projects) wire shape stays byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub projects_revision: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Uncompacted reviewer-panel payload served on demand (decoupled from the byte-budgeted
@@ -1636,6 +1641,17 @@ pub struct ProjectView {
     pub workspace_bindings: Vec<WorkspaceBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+}
+
+/// Uncompacted Projects payload served on demand (decoupled from the byte-budgeted
+/// session snapshot): the full project list + session->project membership, plus the
+/// matching `projects_revision` so the client can confirm its cache key. See
+/// `SessionSnapshot::projects_revision`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectsResponse {
+    pub projects_revision: u64,
+    pub projects: Vec<ProjectView>,
+    pub thread_project_id: std::collections::HashMap<String, String>,
 }
 
 /// What a provider's bridge can actually do when forking. The client used to

@@ -271,6 +271,11 @@ pub struct RelayState {
     pub(super) projects: HashMap<String, crate::protocol::ProjectView>,
     /// Session (thread) -> project id membership. Absent = "Unassigned".
     pub(super) thread_project_id: HashMap<String, String>,
+    /// Monotonic cache key for the dedicated Projects channel; bumped on every project
+    /// mutation. Rides the snapshot (tiny); the full projects/membership payload is
+    /// fetched on demand. In-memory only — a restart resets it to 0, so clients simply
+    /// refetch once on the revision mismatch (harmless).
+    pub(super) projects_revision: u64,
     pub allowed_roots: Vec<String>,
     pub available_models: Vec<ModelOptionView>,
     pub device_records: HashMap<String, DeviceRecord>,
@@ -382,6 +387,7 @@ impl RelayState {
             thread_last_activity_at: HashMap::new(),
             projects: HashMap::new(),
             thread_project_id: HashMap::new(),
+            projects_revision: 0,
             allowed_roots: Vec::new(),
             available_models: Vec::new(),
             device_records: HashMap::new(),
@@ -751,6 +757,21 @@ impl RelayState {
         self.thread_project_id.remove(thread_id).is_some()
     }
 
+    /// Bump the Projects cache key. Call after any project mutation so clients know
+    /// to refetch the dedicated payload.
+    pub(super) fn bump_projects_revision(&mut self) {
+        self.projects_revision = self.projects_revision.wrapping_add(1);
+    }
+
+    /// The full, uncompacted Projects payload for the dedicated fetch channel.
+    pub(crate) fn projects_response(&self) -> crate::protocol::ProjectsResponse {
+        crate::protocol::ProjectsResponse {
+            projects_revision: self.projects_revision,
+            projects: self.projects_view(),
+            thread_project_id: self.thread_project_id.clone(),
+        }
+    }
+
     /// Whether the ACTIVE thread's agent is mid-turn per its provider-reported
     /// status. Semantic mirror of the frontend `canRequestReview` gate: callers
     /// that need a "is the agent busy right now" check must use this, NOT a literal
@@ -1088,6 +1109,17 @@ impl RelayState {
                 .entry(real_id.to_string())
                 .or_insert(pending_activity);
             *entry = (*entry).max(pending_activity);
+        }
+        // Move Project membership from the synthetic pending id to the real session id.
+        // Without this an assigned pending session silently becomes "Unassigned" after
+        // its first turn, leaving an orphan mapping under `claude-pending-*`. Preserve
+        // any assignment the real id already has (conflict → keep the real one), and
+        // bump the revision so clients refetch the changed membership.
+        if let Some(pending_project) = self.thread_project_id.remove(pending_id) {
+            self.thread_project_id
+                .entry(real_id.to_string())
+                .or_insert(pending_project);
+            self.bump_projects_revision();
         }
         // Drop the stale pending row; the real row is upserted by the caller.
         self.threads.retain(|thread| thread.id != pending_id);
@@ -2003,8 +2035,7 @@ impl RelayState {
             active_workflow_runs: self.active_workflow_runs_view(),
             workflows_revision: self.workflows_revision(),
             push_vapid_public_key: self.push_vapid_public_key.clone(),
-            projects: self.projects_view(),
-            thread_project_id: self.thread_project_id.clone(),
+            projects_revision: self.projects_revision,
         }
     }
 
@@ -2296,6 +2327,15 @@ impl RelayState {
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
+        self.projects_revision = persisted.projects_revision;
+        // Normalize: a state file written before `projects_revision` existed restores
+        // it as 0 while carrying projects; a fresh client (also 0) would then never
+        // fetch them. Advertise a nonzero revision whenever project data is present.
+        if self.projects_revision == 0
+            && (!self.projects.is_empty() || !self.thread_project_id.is_empty())
+        {
+            self.projects_revision = 1;
+        }
         self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
@@ -2613,8 +2653,12 @@ impl RelayState {
         // Clear project membership on PERMANENT deletion specifically (not in the
         // shared `remove_thread`, which archive also uses): otherwise the persisted
         // `thread_project_id` keeps a durable orphan entry, and a reused id could
-        // silently regain its old project.
-        self.thread_project_id.remove(thread_id);
+        // silently regain its old project. Bump the Projects revision when membership
+        // actually changed so passive clients drop the stale mapping (a reused id
+        // would otherwise still render under its former Project).
+        if self.thread_project_id.remove(thread_id).is_some() {
+            self.bump_projects_revision();
+        }
         self.remove_thread(thread_id);
     }
 
@@ -3008,6 +3052,15 @@ impl RelayState {
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
+        self.projects_revision = persisted.projects_revision;
+        // Normalize: a state file written before `projects_revision` existed restores
+        // it as 0 while carrying projects; a fresh client (also 0) would then never
+        // fetch them. Advertise a nonzero revision whenever project data is present.
+        if self.projects_revision == 0
+            && (!self.projects.is_empty() || !self.thread_project_id.is_empty())
+        {
+            self.projects_revision = 1;
+        }
         self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
@@ -3621,6 +3674,131 @@ mod tests {
             serde_json::from_value(value).expect("pre-Projects state files must still load");
         assert!(legacy.projects.is_empty());
         assert!(legacy.thread_project_id.is_empty());
+    }
+
+    #[test]
+    fn persisted_projects_restore_a_nonzero_revision_for_fresh_clients() {
+        use crate::protocol::ProjectView;
+        let mut relay = test_relay();
+        relay.projects.insert(
+            "proj_a".to_string(),
+            ProjectView {
+                id: "proj_a".to_string(),
+                name: "P".to_string(),
+                workspace_bindings: Vec::new(),
+                instructions: None,
+            },
+        );
+        relay.bump_projects_revision(); // as a real mutation does
+        assert!(relay.projects_revision > 0);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+
+        // Restored nonzero, and the snapshot advertises it — so a fresh client (which
+        // starts at revision 0) sees a mismatch and fetches the persisted projects,
+        // instead of matching 0 and leaving them invisible until the next mutation.
+        assert_eq!(restored.projects_revision, relay.projects_revision);
+        assert!(restored.projects_revision > 0);
+        assert_eq!(
+            restored.snapshot().projects_revision,
+            restored.projects_revision
+        );
+    }
+
+    #[test]
+    fn promotion_moves_project_membership_to_the_real_id() {
+        let mut relay = test_relay();
+        relay.create_project("proj_x".to_string(), "P".to_string());
+        relay
+            .assign_thread_to_project("claude-pending-1", "proj_x")
+            .unwrap();
+        let rev_before = relay.projects_revision;
+
+        relay.promote_background_thread("claude-pending-1", "real-1");
+
+        assert!(
+            relay.thread_project_id.get("claude-pending-1").is_none(),
+            "the synthetic pending membership must not orphan"
+        );
+        assert_eq!(relay.project_for_thread("real-1").unwrap().id, "proj_x");
+        assert!(
+            relay.projects_revision > rev_before,
+            "promotion that moves membership bumps the revision"
+        );
+
+        // Conflict: an assignment the real id ALREADY has is preserved.
+        let mut relay = test_relay();
+        relay.create_project("proj_x".to_string(), "X".to_string());
+        relay.create_project("proj_y".to_string(), "Y".to_string());
+        relay
+            .assign_thread_to_project("claude-pending-2", "proj_x")
+            .unwrap();
+        relay.assign_thread_to_project("real-2", "proj_y").unwrap();
+        relay.promote_background_thread("claude-pending-2", "real-2");
+        assert_eq!(
+            relay.project_for_thread("real-2").unwrap().id,
+            "proj_y",
+            "an existing real-id assignment wins over the pending one"
+        );
+        assert!(relay.thread_project_id.get("claude-pending-2").is_none());
+    }
+
+    #[test]
+    fn permanent_deletion_bumps_revision_only_when_membership_changed() {
+        let mut relay = test_relay();
+        relay.create_project("proj_x".to_string(), "P".to_string());
+        relay.assign_thread_to_project("t1", "proj_x").unwrap();
+
+        // Deleting an ASSIGNED thread bumps the revision (membership changed) so
+        // passive clients drop the stale mapping.
+        let rev = relay.projects_revision;
+        relay.mark_thread_deleted("t1");
+        assert!(relay.projects_revision > rev);
+
+        // Deleting an UNASSIGNED thread does not (no membership change).
+        let rev = relay.projects_revision;
+        relay.mark_thread_deleted("t-unassigned");
+        assert_eq!(relay.projects_revision, rev);
+    }
+
+    #[test]
+    fn restoring_pre_revision_projects_state_advertises_a_nonzero_revision() {
+        use crate::protocol::ProjectView;
+        let mut source = test_relay();
+        source.projects.insert(
+            "proj_a".to_string(),
+            ProjectView {
+                id: "proj_a".to_string(),
+                name: "P".to_string(),
+                workspace_bindings: Vec::new(),
+                instructions: None,
+            },
+        );
+        source
+            .thread_project_id
+            .insert("t1".to_string(), "proj_a".to_string());
+
+        // Simulate a state file written before `projects_revision` existed: it carries
+        // projects but the field is absent (loads as 0).
+        let persisted = PersistedRelayState::from_relay(&source);
+        let mut value = serde_json::to_value(&persisted).expect("serialize");
+        value.as_object_mut().unwrap().remove("projects_revision");
+        let pre_revision: PersistedRelayState =
+            serde_json::from_value(value).expect("pre-revision file loads");
+        assert_eq!(pre_revision.projects_revision, 0);
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&pre_revision);
+        assert!(
+            restored.projects_revision > 0,
+            "restored projects must advertise a nonzero revision so fresh clients fetch"
+        );
+        assert_eq!(
+            restored.snapshot().projects_revision,
+            restored.projects_revision
+        );
     }
 
     #[test]
