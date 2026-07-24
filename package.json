@@ -122,6 +122,7 @@
     "@tauri-apps/cli": "^2.11.4",
     "eslint": "^9.39.4",
     "globals": "^17.6.0",
+    "jsdom": "^29.1.1",
     "playwright": "^1.58.2",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",

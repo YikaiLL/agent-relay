@@ -3634,7 +3634,12 @@ body.is-resizing-panel {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 4px 8px;
+  /* On a narrow card the status label ("Reviewer still has concerns") is long and
+     would collide with / overflow past the effort chip on one line. Let the meta
+     cluster wrap to its own line when it doesn't fit; on a wide card it still sits
+     inline at the top-right. */
+  flex-wrap: wrap;
 }
 .reviewer-job-identity {
   display: flex;
@@ -3673,6 +3678,51 @@ body.is-resizing-panel {
   background: var(--surface-muted);
   white-space: nowrap;
   text-transform: capitalize;
+}
+/* Small circled "i" that collapses the noisy reviewer session id out of the resting
+   card; click to toggle the id line in/out (see .reviewer-job-thread). */
+.reviewer-job-info {
+  flex-shrink: 0;
+  align-self: center; /* the identity row is baseline-aligned; center the circle */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1;
+  cursor: pointer;
+}
+.reviewer-job-info:hover,
+.reviewer-job-info[aria-expanded="true"] {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+.reviewer-job-info[aria-expanded="true"] {
+  background: var(--surface-muted);
+}
+/* Touch devices: keep the dot visually small (per the "little circled i" intent) but
+   expand the actual tap target to ~40px — matching the other round mobile controls —
+   via an invisible centered overlay, so the resting header doesn't grow. */
+@media (pointer: coarse) {
+  .reviewer-job-info {
+    position: relative;
+  }
+  .reviewer-job-info::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 40px;
+    height: 40px;
+    transform: translate(-50%, -50%);
+  }
 }
 /* The reviewer thread name is long: keep it to one line, truncate with an
    ellipsis, and rely on the title/aria-label for the full value on hover. */

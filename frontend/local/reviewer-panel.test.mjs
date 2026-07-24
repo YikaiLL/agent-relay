@@ -383,7 +383,7 @@ test("ReviewerPanel treats an escalated review as terminal (Delete enabled)", ()
   assert.doesNotMatch(html, /Stop the reviewer before deleting/);
 });
 
-test("ReviewerPanel shows the reviewer model + the (long) thread name with a full-value tooltip", () => {
+test("ReviewerPanel shows the reviewer model and collapses the (long) session id behind the info toggle, full value in its tooltip", () => {
   const longName = "Review: refactor the workspace-diff host into shared chrome (round 1)";
   const html = renderToStaticMarkup(
     h(ReviewerPanel, {
@@ -402,11 +402,15 @@ test("ReviewerPanel shows the reviewer model + the (long) thread name with a ful
   );
   // Model is shown.
   assert.match(html, /reviewer-job-model[^>]*>gpt-5-codex</);
-  // The long name renders, truncation is CSS, and the FULL value is in title + aria-label
-  // so hovering reveals all of it.
-  assert.match(html, /reviewer-job-thread/);
-  assert.match(html, new RegExp(`title="${longName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}"`));
-  assert.match(html, /aria-label="Reviewer session: Review: refactor/);
+  // The noisy session id/name is NOT in the resting card — it's collapsed behind the
+  // header "i" (default hidden), so it doesn't crowd the header.
+  assert.doesNotMatch(html, /reviewer-job-thread/);
+  // The info toggle is present, starts collapsed (aria-expanded="false"), and carries the
+  // FULL value in its title + aria-label so hovering/tapping reveals all of it.
+  const escaped = longName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+  assert.match(html, new RegExp(`reviewer-job-info[^>]*title="${escaped}"`));
+  assert.match(html, /reviewer-job-info[^>]*aria-expanded="false"/);
+  assert.match(html, /aria-label="Show reviewer session id \(Review: refactor/);
 });
 
 test("ReviewerPanel shows the reviewer effort chip beside the model, with a reasoning-effort tooltip", () => {
@@ -469,8 +473,44 @@ test("ReviewerPanel falls back to the reviewer thread id when the thread has no 
   );
   // No model span when the job carries no model.
   assert.doesNotMatch(html, /reviewer-job-model/);
-  // Falls back to the raw thread id as the displayed/tooltipped name.
-  assert.match(html, /reviewer-job-thread[^>]*title="rev-thread-2"/);
+  // The id is collapsed by default (not in the resting card)...
+  assert.doesNotMatch(html, /reviewer-job-thread/);
+  // ...and the info toggle falls back to the raw thread id as its tooltip value.
+  assert.match(html, /reviewer-job-info[^>]*title="rev-thread-2"/);
+});
+
+test("ReviewerPanel collapses the session id behind an info toggle (hidden by default; toggle omitted when there's no session)", () => {
+  // With a reviewer thread: the id line is collapsed and the info toggle stands in for it.
+  const withThread = renderToStaticMarkup(
+    h(ReviewerPanel, {
+      reviewJobs: [
+        {
+          id: "r1",
+          reviewer_provider: "codex",
+          status: "waiting_for_reviewer",
+          reviewer_thread_id: "rev-thread-9",
+        },
+      ],
+      canRequest: false,
+    })
+  );
+  // The id is NOT rendered in the resting card (collapsed by default)...
+  assert.doesNotMatch(withThread, /reviewer-job-thread/);
+  // ...but the reveal control is present, collapsed, and wired to the id.
+  assert.match(withThread, /reviewer-job-info[^>]*title="rev-thread-9"/);
+  assert.match(withThread, /reviewer-job-info[^>]*aria-expanded="false"/);
+  assert.match(withThread, /aria-label="Show reviewer session id \(rev-thread-9\)"/);
+
+  // With NO reviewer thread id there's nothing to reveal, so the toggle is omitted
+  // entirely (no dangling "i" that opens an empty line).
+  const noThread = renderToStaticMarkup(
+    h(ReviewerPanel, {
+      reviewJobs: [{ id: "r2", reviewer_provider: "codex", status: "waiting_for_reviewer" }],
+      canRequest: false,
+    })
+  );
+  assert.doesNotMatch(noThread, /reviewer-job-info/);
+  assert.doesNotMatch(noThread, /reviewer-job-thread/);
 });
 
 test("a terminal card carries a per-card Re-review launcher (prefilled, own modal id)", () => {

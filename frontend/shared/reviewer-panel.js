@@ -229,6 +229,9 @@ function ReviewerJobCard({
   fetchReviewerTranscript,
 }) {
   const [review, setReview] = React.useState({ status: "idle", text: null, error: null });
+  // The reviewer session id is noise in the resting card, so it's collapsed behind a
+  // small "i" in the header; this toggles it in/out (default hidden).
+  const [showThread, setShowThread] = React.useState(false);
   const terminal = isTerminalReviewStatus(job.status);
   const blocked = job.status === "blocked";
   const reviewerThreadId = job.reviewer_thread_id || null;
@@ -312,6 +315,25 @@ function ReviewerJobCard({
               },
               job.reviewer_effort
             )
+          : null,
+        // The reviewer session id is long/noisy in the resting card, so keep it
+        // collapsed behind a small circled "i": click to reveal (works without hover,
+        // i.e. on mobile), full value also lives in the tooltip + aria-label.
+        threadName
+          ? h(
+              "button",
+              {
+                type: "button",
+                className: "reviewer-job-info",
+                title: threadName,
+                "aria-label": showThread
+                  ? `Hide reviewer session id (${threadName})`
+                  : `Show reviewer session id (${threadName})`,
+                "aria-expanded": showThread,
+                onClick: () => setShowThread((v) => !v),
+              },
+              "i"
+            )
           : null
       ),
       // Right cluster: status + iterative-loop progress (when a budget was set).
@@ -332,9 +354,9 @@ function ReviewerJobCard({
           : null
       )
     ),
-    // The reviewer thread's name is long, so truncate it (CSS) but keep the full
-    // value in the tooltip + aria-label so hovering reveals the whole thing.
-    threadName
+    // Revealed only when the header "i" is toggled on. Still truncated (CSS) with the
+    // full value in the tooltip + aria-label so hovering reveals the whole thing.
+    showThread && threadName
       ? h(
           "p",
           {
