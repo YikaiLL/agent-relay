@@ -27,6 +27,7 @@ import {
   forkThreadButton,
   goConsoleHomeButton,
   goConsoleHomeSidebarButton,
+  launchStartSessionDialog,
   launchSettingsModal,
   liveSurfacesList,
   liveSurfacesSummary,
@@ -1242,6 +1243,28 @@ function renderNewSessionImageAttachments() {
 
     startPromptAttachments.append(chip);
   }
+}
+
+function clearNewSessionImageAttachments() {
+  if (state.newSessionImageAttachments.length === 0) return;
+  state.newSessionImageAttachments = [];
+  renderNewSessionImageAttachments();
+}
+
+// Treat each opening as a fresh attachment draft. In particular, reopening
+// after dismissing the dialog or after a failed start cannot silently carry a
+// screenshot into an unrelated workspace/session. An in-flight start already
+// captured its own attachment slice before the dialog closed.
+if (launchStartSessionDialog && typeof MutationObserver === "function") {
+  const newSessionDialogObserver = new MutationObserver(() => {
+    if (launchStartSessionDialog.hasAttribute("open")) {
+      clearNewSessionImageAttachments();
+    }
+  });
+  newSessionDialogObserver.observe(launchStartSessionDialog, {
+    attributeFilter: ["open"],
+    attributes: true,
+  });
 }
 
 startPromptInput?.addEventListener("paste", (event) => {

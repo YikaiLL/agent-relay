@@ -829,6 +829,7 @@ mod path_scope_tests {
         approval_thread_ids: Arc<Mutex<Vec<String>>>,
         ask_request_ids: Arc<Mutex<Vec<String>>>,
         turn_thread_ids: Arc<Mutex<Vec<String>>>,
+        turn_texts: Arc<Mutex<Vec<String>>>,
         turn_efforts: Arc<Mutex<Vec<String>>>,
         turn_images: Arc<Mutex<Vec<Vec<ProviderImage>>>>,
         interrupt_thread_ids: Arc<Mutex<Vec<String>>>,
@@ -858,6 +859,7 @@ mod path_scope_tests {
                 approval_thread_ids: Arc::new(Mutex::new(Vec::new())),
                 ask_request_ids: Arc::new(Mutex::new(Vec::new())),
                 turn_thread_ids: Arc::new(Mutex::new(Vec::new())),
+                turn_texts: Arc::new(Mutex::new(Vec::new())),
                 turn_efforts: Arc::new(Mutex::new(Vec::new())),
                 turn_images: Arc::new(Mutex::new(Vec::new())),
                 interrupt_thread_ids: Arc::new(Mutex::new(Vec::new())),
@@ -1023,7 +1025,7 @@ mod path_scope_tests {
         async fn start_turn(
             &self,
             thread_id: &str,
-            _text: &str,
+            text: &str,
             _model: &str,
             effort: &str,
             images: &[ProviderImage],
@@ -1032,6 +1034,7 @@ mod path_scope_tests {
                 .lock()
                 .await
                 .push(thread_id.to_string());
+            self.turn_texts.lock().await.push(text.to_string());
             self.turn_efforts.lock().await.push(effort.to_string());
             self.turn_images.lock().await.push(images.to_vec());
             let turn_id = format!("turn:{thread_id}");
@@ -1321,6 +1324,41 @@ mod path_scope_tests {
             .active_thread_id
             .expect("the new thread should be active");
         assert_eq!(*codex.turn_thread_ids.lock().await, vec![thread_id]);
+        assert_eq!(*codex.turn_texts.lock().await, vec![""]);
+        assert_eq!(*codex.turn_images.lock().await, vec![vec![image]]);
+    }
+
+    #[tokio::test]
+    async fn text_and_image_start_session_sends_both_in_the_first_provider_turn() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, _claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+        let image = ProviderImage {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+
+        app.start_session_with_images(
+            StartSessionInput {
+                cwd: Some(cwd.to_string()),
+                initial_prompt: Some("Inspect this screenshot".to_string()),
+                model: Some("codex-model".to_string()),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            },
+            vec![image.clone()],
+        )
+        .await
+        .expect("local start should forward text and images in its first turn");
+
+        assert_eq!(
+            *codex.turn_texts.lock().await,
+            vec!["Inspect this screenshot"]
+        );
         assert_eq!(*codex.turn_images.lock().await, vec![vec![image]]);
     }
 
