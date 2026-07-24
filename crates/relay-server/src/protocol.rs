@@ -172,6 +172,19 @@ pub struct SessionSnapshot {
     /// dispatcher is wired. Not secret — safe to publish in the snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_vapid_public_key: Option<String>,
+    /// Cache key for the dedicated Projects channel. The full Projects payload
+    /// (names + membership) is deliberately NOT embedded in the snapshot: it can grow
+    /// unbounded (a paired device can create many projects / arbitrary memberships),
+    /// which would defeat the byte-budgeted remote frame and amplify every persisted
+    /// snapshot. Instead the client fetches it on demand (GET /api/projects /
+    /// FetchProjects) and refreshes only when this revision changes. Skipped when 0
+    /// so the empty (no-Projects) wire shape stays byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub projects_revision: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Uncompacted reviewer-panel payload served on demand (decoupled from the byte-budgeted
@@ -1362,7 +1375,28 @@ pub struct WorkspaceDiffResponse {
     pub diff: String,
     pub truncated: bool,
     pub not_a_git_repo: bool,
+    /// The requested session's workspace could not be resolved (deleted / not-yet-loaded /
+    /// pending thread). Fail-closed marker: the panel renders "workspace unavailable" rather
+    /// than falling back to another workspace's diff. Distinct from a clean tree.
+    #[serde(default)]
+    pub unavailable: bool,
     pub generated_at: u64,
+}
+
+impl WorkspaceDiffResponse {
+    /// Fail-closed response for a viewed session whose workspace can't be resolved.
+    /// Deliberately carries no cwd/diff so it can never leak another workspace's state.
+    pub fn unavailable() -> Self {
+        Self {
+            cwd: String::new(),
+            file_changes: Vec::new(),
+            diff: String::new(),
+            truncated: false,
+            not_a_git_repo: false,
+            unavailable: true,
+            generated_at: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1585,6 +1619,41 @@ pub struct ThreadSummaryView {
     pub forked_from: Option<String>,
 }
 
+/// A checkout of a project on a specific relay *host*. `host_id` is the host axis
+/// (which machine the relay runs on; `LOCAL` for a single-relay setup) — distinct
+/// from the controller `device_id` used for access-control. Grouping metadata only;
+/// it never widens/narrows path scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceBinding {
+    pub host_id: String,
+    pub cwd: String,
+}
+
+/// A persisted, named grouping of sessions — the user-facing "Project". Orthogonal
+/// to `path_scope`/`allowed_roots` (which stay access-control). A session's
+/// membership is stored separately (`thread_project_id`) so it can be null
+/// ("Unassigned") without touching every thread row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectView {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub workspace_bindings: Vec<WorkspaceBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Uncompacted Projects payload served on demand (decoupled from the byte-budgeted
+/// session snapshot): the full project list + session->project membership, plus the
+/// matching `projects_revision` so the client can confirm its cache key. See
+/// `SessionSnapshot::projects_revision`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectsResponse {
+    pub projects_revision: u64,
+    pub projects: Vec<ProjectView>,
+    pub thread_project_id: std::collections::HashMap<String, String>,
+}
+
 /// What a provider's bridge can actually do when forking. The client used to
 /// infer this from provider NAMES, which silently mislabels any bridge without
 /// a native fork (the default trait impl replays) and cannot know that Codex
@@ -1738,6 +1807,54 @@ pub struct AllowedRootsInput {
 #[derive(Debug, Clone, Serialize)]
 pub struct AllowedRootsReceipt {
     pub allowed_roots: Vec<String>,
+    pub message: String,
+}
+
+/// A single manual Projects write. Internally tagged so a client sends e.g.
+/// `{ "action": "create", "name": "Sealwire" }` or
+/// `{ "action": "assign", "thread_id": "…", "project_id": "…" }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ProjectAction {
+    /// Create a new (empty) Project. The relay assigns the id.
+    Create {
+        name: String,
+    },
+    Rename {
+        project_id: String,
+        name: String,
+    },
+    /// Delete a Project; its member sessions fall back to "Unassigned".
+    Delete {
+        project_id: String,
+    },
+    /// Move a session into a Project (replaces any prior membership).
+    Assign {
+        thread_id: String,
+        project_id: String,
+    },
+    /// Move a session out of its Project → "Unassigned".
+    Unassign {
+        thread_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectActionInput {
+    #[serde(flatten)]
+    pub action: ProjectAction,
+    /// Stamped server-side on the remote path (`bind_device`); `None` for the local
+    /// operator. Actor for logging only — Projects are global, not device-scoped.
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectActionReceipt {
+    /// The full project list + membership after the action, so a client can refresh
+    /// immediately without waiting for the next snapshot.
+    pub projects: Vec<ProjectView>,
+    pub thread_project_id: std::collections::HashMap<String, String>,
     pub message: String,
 }
 

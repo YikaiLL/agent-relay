@@ -21,12 +21,13 @@ use crate::{
         AskUserQuestionDetailResponse, BulkRevokeDevicesReceipt, FileChangeApplyDirection,
         FileChangeDiffView, ForkSessionInput, HeartbeatInput, ModelOptionView, PairingDecision,
         PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
-        ReadThreadEntriesInput, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
-        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-        StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
-        ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
-        ThreadEntryDetailResponse, ThreadStateView, ThreadTranscriptResponse, ThreadsResponse,
-        UpdateSessionSettingsInput, WorkspaceDiffResponse,
+        ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
+        ReadThreadEntryDetailInput, ReadThreadTranscriptInput, ResumeSessionInput,
+        RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput, StopTurnInput,
+        SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
+        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadStateView,
+        ThreadTranscriptResponse, ThreadsResponse, UpdateSessionSettingsInput,
+        WorkspaceDiffResponse,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -120,6 +121,7 @@ mod approvals;
 mod broker;
 mod fork;
 mod pairing;
+mod projects;
 mod providers;
 mod review;
 mod sessions;
@@ -736,6 +738,7 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
             diff: String::new(),
             truncated: false,
             not_a_git_repo: true,
+            unavailable: false,
             generated_at,
         });
     }
@@ -793,6 +796,7 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
         file_changes,
         truncated: tracked_truncated || untracked_truncated,
         not_a_git_repo: false,
+        unavailable: false,
         generated_at,
     })
 }

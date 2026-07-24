@@ -1554,8 +1554,24 @@ export async function applyFileChange(itemId, direction) {
   }
 }
 
+// The session this remote surface is currently viewing (a view-only pin, else the
+// active thread). Shared so the diff request and its refetch-trigger key agree.
+export function getRemoteViewedThreadId() {
+  return viewOnlyThreadId || state.session?.active_thread_id || null;
+}
+
+// Identity of the viewed workspace (thread id + cwd): used to drop stale diff data
+// on a view switch OR a same-thread cwd change during the load window.
+export function getRemoteViewedWorkspaceKey() {
+  return JSON.stringify([getRemoteViewedThreadId() || "", state.session?.current_cwd || ""]);
+}
+
 export async function fetchRemoteWorkspaceDiff() {
-  const result = await dispatchOrRecover("fetch_workspace_diff", {});
+  const threadId = getRemoteViewedThreadId();
+  const result = await dispatchOrRecover(
+    "fetch_workspace_diff",
+    threadId ? { thread_id: threadId } : {},
+  );
   return result.workspace_diff;
 }
 

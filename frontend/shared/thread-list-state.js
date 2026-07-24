@@ -109,7 +109,11 @@ export function createThreadListRows({
   const rows = [];
 
   for (const group of groups || []) {
-    const normalizedCwd = canonicalizeWorkspace(group.cwd);
+    // Neutral group key: the canonical cwd in cwd mode, or the project id /
+    // "__unassigned__" sentinel in project mode. Collapse/expand Sets + row keys
+    // are keyed on this uniformly (kept under the `normalizedCwd` field name so the
+    // existing toggle handlers keep working — canonicalize is a no-op on ids).
+    const normalizedCwd = canonicalizeWorkspace(group.key ?? group.cwd);
     const isCollapsed = collapsible && collapsedGroupCwds.has(normalizedCwd);
     const allThreads = group.threads || [];
     const showAll = expandedGroupCwds.has(normalizedCwd);

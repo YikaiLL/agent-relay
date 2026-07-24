@@ -18,6 +18,11 @@ export function createThreadListStore(initialThreadList = {}) {
       clientY: 0,
       threadId: null,
     },
+    // Sidebar grouping mode: "sessions" (by cwd/folder, the default) or "projects".
+    viewMode: initialThreadList.viewMode === "projects" ? "projects" : "sessions",
+    setViewMode(mode) {
+      set({ viewMode: mode === "projects" ? "projects" : "sessions" });
+    },
     threadList: createThreadListUiState(initialThreadList),
     clearError() {
       set((state) => ({
@@ -90,4 +95,8 @@ export function readThreadListContextMenu(store) {
     clientY: 0,
     threadId: null,
   };
+}
+
+export function readThreadListViewMode(store) {
+  return store?.getState?.().viewMode === "projects" ? "projects" : "sessions";
 }

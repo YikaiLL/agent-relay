@@ -6,6 +6,7 @@ import {
   canonicalizeWorkspace,
   findLatestThread,
   summarizeThreadGroups,
+  UNASSIGNED_PROJECT_KEY,
 } from "./shared/thread-groups.js";
 import {
   createThreadListUiState,
@@ -55,6 +56,101 @@ test("buildThreadGroups sorts groups by latest activity and threads by recency",
     ["thread-nested-new", "thread-nested-old"]
   );
   assert.equal(groups[0].label, "nested");
+});
+
+test("buildThreadGroups project mode groups by project_id with a single Unassigned bucket", () => {
+  const threads = [
+    { id: "t1", cwd: "/a/repo", updated_at: 30 },
+    { id: "t2", cwd: "/a/repo", updated_at: 20 },
+    { id: "t3", cwd: "/b/repo", updated_at: 25 }, // no project, cwd /b
+    { id: "t4", cwd: "/c/repo", updated_at: 10 }, // no project, cwd /c
+  ];
+  const groups = buildThreadGroups(threads, {
+    groupBy: "project",
+    projects: [{ id: "proj_a", name: "Sealwire" }],
+    threadProjectId: { t1: "proj_a", t2: "proj_a" },
+  });
+
+  const byKey = new Map(groups.map((group) => [group.key, group]));
+  assert.equal(byKey.get("proj_a").label, "Sealwire");
+  assert.deepEqual(
+    byKey.get("proj_a").threads.map((thread) => thread.id),
+    ["t1", "t2"]
+  );
+  // t3 + t4 have no project and DIFFERENT cwds → ONE Unassigned bucket (not split).
+  const unassigned = byKey.get(UNASSIGNED_PROJECT_KEY);
+  assert.equal(unassigned.label, "Unassigned");
+  assert.deepEqual(
+    unassigned.threads.map((thread) => thread.id).sort(),
+    ["t3", "t4"]
+  );
+  assert.equal(groups.length, 2);
+});
+
+test("buildThreadGroups project mode seeds empty projects and folds orphans into Unassigned", () => {
+  const groups = buildThreadGroups([{ id: "t1", cwd: "/x", updated_at: 5 }], {
+    groupBy: "project",
+    projects: [
+      { id: "proj_a", name: "Alpha" },
+      { id: "proj_empty", name: "Empty" },
+    ],
+    // t1 points at a project that no longer exists → treated as Unassigned.
+    threadProjectId: { t1: "proj_gone" },
+  });
+
+  const byKey = new Map(groups.map((group) => [group.key, group]));
+  assert.ok(byKey.has("proj_empty"), "an empty project still appears (navigable)");
+  assert.equal(byKey.get("proj_empty").threads.length, 0);
+  assert.deepEqual(
+    byKey.get(UNASSIGNED_PROJECT_KEY).threads.map((thread) => thread.id),
+    ["t1"]
+  );
+  assert.ok(!byKey.has("proj_gone"), "an orphan membership never creates a raw-id group");
+});
+
+test("summarizeThreadGroups counts real projects, not the Unassigned bucket", () => {
+  // One real project + one session in it.
+  const one = buildThreadGroups([{ id: "t1", cwd: "/x", updated_at: 1 }], {
+    groupBy: "project",
+    projects: [{ id: "p", name: "P" }],
+    threadProjectId: { t1: "p" },
+  });
+  assert.equal(summarizeThreadGroups(one, { groupBy: "project" }), "1 project · 1 session");
+
+  // Unassigned-only: no real projects → "0 projects" (the bucket is not a project).
+  const unassignedOnly = buildThreadGroups(
+    [
+      { id: "t1", cwd: "/x", updated_at: 1 },
+      { id: "t2", cwd: "/y", updated_at: 2 },
+    ],
+    { groupBy: "project", projects: [], threadProjectId: {} }
+  );
+  assert.equal(
+    summarizeThreadGroups(unassignedOnly, { groupBy: "project" }),
+    "0 projects · 2 sessions"
+  );
+
+  // One real project PLUS Unassigned → still "1 project" (bucket excluded).
+  const mixed = buildThreadGroups(
+    [
+      { id: "t1", cwd: "/x", updated_at: 1 },
+      { id: "t2", cwd: "/y", updated_at: 2 },
+    ],
+    { groupBy: "project", projects: [{ id: "p", name: "P" }], threadProjectId: { t1: "p" } }
+  );
+  assert.equal(summarizeThreadGroups(mixed, { groupBy: "project" }), "1 project · 2 sessions");
+});
+
+test("createThreadListRows keys on the neutral project group key", () => {
+  const groups = buildThreadGroups([{ id: "t1", cwd: "/x", updated_at: 1 }], {
+    groupBy: "project",
+    projects: [{ id: "proj_a", name: "A" }],
+    threadProjectId: { t1: "proj_a" },
+  });
+  const rows = createThreadListRows({ groups, collapsible: true });
+  const groupRow = rows.find((row) => row.type === "group");
+  assert.equal(groupRow.key, "group:proj_a");
+  assert.equal(groupRow.normalizedCwd, "proj_a");
 });
 
 test("findLatestThread respects preferred workspace when available", () => {

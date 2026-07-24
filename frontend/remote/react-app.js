@@ -178,8 +178,21 @@ const subscribeThreadAttention = (listener) => threadAttention.subscribe(listene
 const getThreadAttentionVersion = () => threadAttention.getVersion();
 import {
   createThreadListStore,
+  readThreadListViewMode,
 } from "../shared/thread-list-store.js";
+import {
+  useRemoteProjects,
+  notifyRemoteProjects,
+  refreshRemoteProjects,
+} from "./projects-host.js";
+import {
+  createRemoteProject,
+  renameRemoteProject,
+  deleteRemoteProject,
+} from "./project-actions.js";
+import { normalizeProjectName, projectsMenuReady } from "../local/project-menu.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
+import { renderLog } from "./session-surface.js";
 import { setRemoteTranscriptElement } from "./ui-refs.js";
 import { formatRelativeTime, formatTimestamp, shortId } from "./utils.js";
 
@@ -193,6 +206,18 @@ function useThreadListStoreState(store) {
     store.subscribe,
     () => store.getState().threadList,
     () => store.getState().threadList
+  );
+}
+
+// viewMode lives as a SIBLING field of `threadList`, so useThreadListStoreState (which
+// snapshots only `threadList`) never re-renders on setViewMode. Snapshot the viewMode
+// string directly so toggling Sessions/Projects updates the UI immediately. The string
+// is stable between changes, so this only re-renders when the mode actually flips.
+function useThreadListViewMode(store) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => readThreadListViewMode(store),
+    () => readThreadListViewMode(store)
   );
 }
 
@@ -272,6 +297,11 @@ function RemoteApp() {
   const remoteUi = useRemoteUiStoreState(remoteUiStore);
   const [threadListStore] = useState(() => createThreadListStore());
   const threadListUi = useThreadListStoreState(threadListStore);
+  // Dedicated Projects payload (list + membership), fetched off the snapshot's
+  // projects_revision via the `fetch_projects` broker action. Re-renders the sidebar
+  // as it loads/errors.
+  const remoteProjects = useRemoteProjects();
+  const threadViewMode = useThreadListViewMode(threadListStore);
   const [progressVerb, setProgressVerb] = useState(null);
   const verbCyclerRef = useRef(null);
   if (!verbCyclerRef.current) verbCyclerRef.current = createVerbCycler();
@@ -490,7 +520,60 @@ function RemoteApp() {
     remoteAuth: currentState.remoteAuth,
     session,
     threads: currentState.threads,
+    viewMode: threadViewMode,
+    projects: remoteProjects.projects,
+    threadProjectId: remoteProjects.threadProjectId,
+    projectsError: remoteProjects.error,
+    projectsLoaded: remoteProjects.loaded,
+    projectsLoading: remoteProjects.loading,
   });
+  // Whether the Projects payload is fresh enough to expose mutation controls
+  // (mirrors the local fail-closed rule for the toolbar + header actions).
+  const remoteProjectsReady = projectsMenuReady({
+    projectsLoaded: remoteProjects.loaded,
+    projectsError: remoteProjects.error,
+    projectsLoading: remoteProjects.loading,
+  });
+  const promptRemoteProjectName = (current = "") =>
+    normalizeProjectName(window.prompt("Project name", current));
+  const setThreadViewMode = (mode) => threadListStore.getState().setViewMode(mode);
+  // Refresh rides the projects_revision snapshot bump, but the broker drops the write
+  // receipt, so also refetch eagerly for snappier remote feedback.
+  const createRemoteProjectFromToolbar = async () => {
+    const name = promptRemoteProjectName();
+    if (!name) return;
+    try {
+      await createRemoteProject(name);
+      refreshRemoteProjects();
+      renderLog(`Created project "${name}".`);
+    } catch (error) {
+      renderLog(`Failed to create project: ${error.message}`);
+    }
+  };
+  const handleRenameRemoteProject = async (projectId, currentName) => {
+    const name = promptRemoteProjectName(currentName || "");
+    if (!name || name === currentName) return;
+    try {
+      await renameRemoteProject(projectId, name);
+      refreshRemoteProjects();
+      renderLog(`Renamed project to "${name}".`);
+    } catch (error) {
+      renderLog(`Failed to rename project: ${error.message}`);
+    }
+  };
+  const handleDeleteRemoteProject = async (projectId, name) => {
+    const confirmed = window.confirm(
+      `Delete project "${name}"?\n\nIts sessions become Unassigned — the sessions themselves are not deleted.`
+    );
+    if (!confirmed) return;
+    try {
+      await deleteRemoteProject(projectId);
+      refreshRemoteProjects();
+      renderLog(`Deleted project "${name}".`);
+    } catch (error) {
+      renderLog(`Failed to delete project: ${error.message}`);
+    }
+  };
   const hasRelay = Boolean(currentState.remoteAuth);
   const hasUsableRelay = Boolean(currentState.remoteAuth?.payloadSecret);
   const sessionChromeModel = session
@@ -768,6 +851,7 @@ function RemoteApp() {
 
   useEffect(() => {
     notifyRemoteSessionUpdated(session);
+    notifyRemoteProjects(session);
   }, [session]);
 
   // Reviewer-tab actions, bound to the broker-backed remote handlers. `handlers`
@@ -1412,6 +1496,12 @@ function RemoteApp() {
         },
         onResumeThread: handleResumeThread,
         onContextThread: handleOpenForkDialog,
+        threadViewMode,
+        projectsReady: remoteProjectsReady,
+        onSetThreadViewMode: setThreadViewMode,
+        onCreateProject: createRemoteProjectFromToolbar,
+        onRenameProject: handleRenameRemoteProject,
+        onDeleteProject: handleDeleteRemoteProject,
         onSelectRelay(relayId) {
           closeRemoteNavigation();
           void handlers.onSelectRelay(relayId);
@@ -1684,6 +1774,12 @@ function RemoteSidebar({
   remoteUiState,
   onResumeThread,
   onContextThread,
+  threadViewMode,
+  projectsReady,
+  onSetThreadViewMode,
+  onCreateProject,
+  onRenameProject,
+  onDeleteProject,
   onSelectRelay,
   onStartSession,
   onToggleExpandedGroup,
@@ -1865,11 +1961,52 @@ function RemoteSidebar({
       ),
       h(
         "div",
+        { className: "thread-view-toggle", role: "group", "aria-label": "Group sessions by" },
+        h(
+          "button",
+          {
+            type: "button",
+            className: `thread-view-toggle-button${threadViewMode !== "projects" ? " is-active" : ""}`,
+            id: "remote-threads-view-sessions",
+            onClick: () => onSetThreadViewMode("sessions"),
+          },
+          "Sessions"
+        ),
+        h(
+          "button",
+          {
+            type: "button",
+            className: `thread-view-toggle-button${threadViewMode === "projects" ? " is-active" : ""}`,
+            id: "remote-threads-view-projects",
+            onClick: () => onSetThreadViewMode("projects"),
+          },
+          "Projects"
+        )
+      ),
+      threadViewMode === "projects"
+        ? h(
+            "div",
+            { className: "projects-toolbar", id: "remote-projects-toolbar" },
+            h(
+              "button",
+              {
+                type: "button",
+                className: "secondary-button projects-create-button",
+                id: "remote-projects-create-button",
+                onClick: () => onCreateProject(),
+              },
+              "+ New project"
+            )
+          )
+        : null,
+      h(
+        "div",
         { className: "conversation-list", id: "remote-threads-list" },
         h(ThreadGroupList, {
           activeThreadId: threadsModel.activeThreadId,
           collapsedGroupCwds: threadListUi?.collapsedGroupCwds || new Set(),
-          collapsible: true,
+          // Sessions (cwd) groups collapse; Project groups render header actions instead.
+          collapsible: threadViewMode !== "projects",
           emptyMessage: threadsModel.emptyMessage,
           expandedGroupCwds: threadListUi?.expandedGroupCwds || new Set(),
           formatThreadMeta(thread) {
@@ -1878,6 +2015,11 @@ function RemoteSidebar({
           groups: threadsModel.groups || [],
           includePreview: true,
           onContextThread,
+          // Rename/delete on real project headers — only in Projects mode and only when
+          // the payload is fresh (fail closed; the render model already returns no
+          // groups otherwise, this is defence in depth).
+          onRenameProject: threadViewMode === "projects" && projectsReady ? onRenameProject : null,
+          onDeleteProject: threadViewMode === "projects" && projectsReady ? onDeleteProject : null,
           onResumeThread,
           onToggleExpandedGroup,
           onToggleGroup,

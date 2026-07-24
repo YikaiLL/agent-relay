@@ -174,6 +174,41 @@ function ThreadDrawer() {
         id: "go-console-home-sidebar",
         type: "button",
       }, "Back to console"),
+      // Group the sidebar by cwd folders (Sessions) or by Project. Behavior is wired
+      // imperatively in app.js by these ids (like the refresh button above).
+      h(
+        "div",
+        { className: "thread-view-toggle", role: "group", "aria-label": "Group sessions by" },
+        h(
+          "button",
+          {
+            className: "thread-view-toggle-button is-active",
+            id: "threads-view-sessions",
+            type: "button",
+          },
+          "Sessions"
+        ),
+        h(
+          "button",
+          {
+            className: "thread-view-toggle-button",
+            id: "threads-view-projects",
+            type: "button",
+          },
+          "Projects"
+        )
+      ),
+      // Projects-only toolbar (create a Project). Shown only in Projects mode; the
+      // visibility is toggled imperatively in app.js by id (like the toggle above).
+      h(
+        "div",
+        { className: "projects-toolbar", id: "projects-toolbar", hidden: true },
+        h(
+          "button",
+          { className: "secondary-button projects-create-button", id: "projects-create-button", type: "button" },
+          "+ New project"
+        )
+      ),
       h(
         "div",
         {
@@ -197,7 +232,13 @@ function ThreadContextMenu() {
       className: "context-menu-button context-menu-button-danger",
       id: "delete-thread-button",
       type: "button",
-    }, "Delete permanently")
+    }, "Delete permanently"),
+    // Per-session Project assignment. Populated imperatively in app.js when the menu
+    // opens (one button per Project + unassign + "New project…"), from state.projects
+    // and the thread's current membership.
+    h("div", { className: "context-menu-separator", role: "separator" }),
+    h("p", { className: "context-menu-heading" }, "Project"),
+    h("div", { className: "context-menu-projects", id: "thread-project-actions" })
   );
 }
 

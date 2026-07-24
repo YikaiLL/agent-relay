@@ -9,12 +9,12 @@ use crate::{
     protocol::{
         ApplyFileChangeInput, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
         AskUserQuestionDetailResponse, ForkSessionInput, HeartbeatInput, ModelOptionView,
-        ReadThreadEntriesInput, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
-        RequestReviewInput, ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot,
-        StartSessionInput, StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput,
-        TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-        ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
-        WorkspaceDiffResponse,
+        ProjectActionInput, ProjectsResponse, ReadThreadEntriesInput, ReadThreadEntryDetailInput,
+        ReadThreadTranscriptInput, RequestReviewInput, ResumeSessionInput, ReviewsResponse,
+        SendMessageInput, SessionSnapshot, StartSessionInput, StartWorkflowInput, StopTurnInput,
+        SubmitAskUserAnswerInput, TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse,
+        ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput,
+        WorkflowActionInput, WorkspaceDiffResponse,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
@@ -96,11 +96,26 @@ pub(super) enum RemoteActionRequest {
         item_id: String,
         input: ApplyFileChangeInput,
     },
+    /// Manual Projects write (create/rename/delete/assign/unassign). Not
+    /// session-scoped, so it does not require a session claim.
+    ProjectAction {
+        input: ProjectActionInput,
+    },
     FetchWorkspaceDiff {
         #[serde(default)]
         device_id: Option<String>,
+        /// The session the client is *viewing*; selects which workspace to diff.
+        /// `#[serde(default)]` keeps legacy clients (which send only `{}`) working.
+        #[serde(default)]
+        thread_id: Option<String>,
     },
     FetchReviews {
+        #[serde(default)]
+        device_id: Option<String>,
+    },
+    /// Manual Projects read (list + membership). Not session-scoped; mirrors
+    /// FetchReviews. `device_id` is stamped for path-scope/logging only.
+    FetchProjects {
         #[serde(default)]
         device_id: Option<String>,
     },
@@ -167,8 +182,10 @@ impl RemoteActionRequest {
             Self::FetchThreadTranscript { .. } => RemoteActionKind::FetchThreadTranscript,
             Self::DecideApproval { .. } => RemoteActionKind::DecideApproval,
             Self::ApplyFileChange { .. } => RemoteActionKind::ApplyFileChange,
+            Self::ProjectAction { .. } => RemoteActionKind::ProjectAction,
             Self::FetchWorkspaceDiff { .. } => RemoteActionKind::FetchWorkspaceDiff,
             Self::FetchReviews { .. } => RemoteActionKind::FetchReviews,
+            Self::FetchProjects { .. } => RemoteActionKind::FetchProjects,
             Self::FetchAskUserQuestionDetail { .. } => RemoteActionKind::FetchAskUserQuestionDetail,
             Self::SubmitAskUserAnswer { .. } => RemoteActionKind::SubmitAskUserAnswer,
             Self::RequestReview { .. } => RemoteActionKind::RequestReview,
@@ -252,10 +269,19 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::ApplyFileChange { item_id, input }
             }
-            Self::FetchWorkspaceDiff { .. } => Self::FetchWorkspaceDiff {
+            Self::ProjectAction { mut input } => {
+                input.device_id = Some(device_id);
+                Self::ProjectAction { input }
+            }
+            Self::FetchWorkspaceDiff { thread_id, .. } => Self::FetchWorkspaceDiff {
                 device_id: Some(device_id),
+                // Preserve the viewed session selector; only device_id is stamped here.
+                thread_id,
             },
             Self::FetchReviews { .. } => Self::FetchReviews {
+                device_id: Some(device_id),
+            },
+            Self::FetchProjects { .. } => Self::FetchProjects {
                 device_id: Some(device_id),
             },
             Self::FetchAskUserQuestionDetail { request_id, .. } => {
@@ -326,8 +352,10 @@ pub(super) enum RemoteActionKind {
     FetchThreadTranscript,
     DecideApproval,
     ApplyFileChange,
+    ProjectAction,
     FetchWorkspaceDiff,
     FetchReviews,
+    FetchProjects,
     FetchAskUserQuestionDetail,
     SubmitAskUserAnswer,
     RequestReview,
@@ -360,8 +388,10 @@ impl RemoteActionKind {
             Self::FetchThreadTranscript => "fetch_thread_transcript",
             Self::DecideApproval => "decide_approval",
             Self::ApplyFileChange => "apply_file_change",
+            Self::ProjectAction => "project_action",
             Self::FetchWorkspaceDiff => "fetch_workspace_diff",
             Self::FetchReviews => "fetch_reviews",
+            Self::FetchProjects => "fetch_projects",
             Self::FetchAskUserQuestionDetail => "fetch_ask_user_question_detail",
             Self::SubmitAskUserAnswer => "submit_ask_user_answer",
             Self::RequestReview => "request_review",
@@ -394,6 +424,8 @@ struct RemoteActionResultPlaintext {
     workspace_diff: Option<WorkspaceDiffResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<ReviewsResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projects: Option<ProjectsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ask_user_question_detail: Option<AskUserQuestionDetailResponse>,
     session_claim: Option<String>,
@@ -434,6 +466,7 @@ struct RemoteActionResultSizeBreakdown {
     thread_transcript_bytes: usize,
     workspace_diff_bytes: usize,
     reviews_bytes: usize,
+    projects_bytes: usize,
     ask_user_question_detail_bytes: usize,
     session_claim_bytes: usize,
     claim_challenge_bytes: usize,
@@ -453,6 +486,7 @@ pub(super) struct RemoteActionOutcome {
     pub(super) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(super) workspace_diff: Option<WorkspaceDiffResponse>,
     pub(super) reviews: Option<ReviewsResponse>,
+    pub(super) projects: Option<ProjectsResponse>,
     pub(super) ask_user_question_detail: Option<AskUserQuestionDetailResponse>,
     pub(super) session_claim: Option<String>,
     pub(super) session_claim_expires_at: Option<u64>,
@@ -1152,8 +1186,15 @@ async fn execute_remote_action(
             .apply_file_change(&item_id, input)
             .await
             .map(|_| RemoteActionOutcome::default()),
-        RemoteActionRequest::FetchWorkspaceDiff { device_id } => state
-            .workspace_diff(device_id)
+        RemoteActionRequest::ProjectAction { input } => state
+            .project_action(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::FetchWorkspaceDiff {
+            device_id,
+            thread_id,
+        } => state
+            .workspace_diff(device_id, thread_id)
             .await
             .map(|workspace_diff| RemoteActionOutcome {
                 workspace_diff: Some(workspace_diff),
@@ -1164,6 +1205,12 @@ async fn execute_remote_action(
             // revision). Read-only; not gated on a session claim, but SCOPED to the
             // requesting device's workspace (like fetch_workspace_diff / transcripts).
             reviews: Some(state.reviews(device_id).await),
+            ..RemoteActionOutcome::default()
+        }),
+        RemoteActionRequest::FetchProjects { device_id: _ } => Ok(RemoteActionOutcome {
+            // The dedicated Projects payload (list + membership + revision). Read-only;
+            // Projects are global (not device-scoped) and not gated on a session claim.
+            projects: Some(state.fetch_projects().await),
             ..RemoteActionOutcome::default()
         }),
         RemoteActionRequest::FetchAskUserQuestionDetail {
@@ -1224,6 +1271,7 @@ fn remote_action_emits_info_log(action: RemoteActionKind) -> bool {
             | RemoteActionKind::FetchThreadTranscript
             | RemoteActionKind::FetchWorkspaceDiff
             | RemoteActionKind::FetchReviews
+            | RemoteActionKind::FetchProjects
             | RemoteActionKind::FetchAskUserQuestionDetail
     )
 }
@@ -1519,6 +1567,7 @@ async fn publish_plain_remote_action_result(
         thread_transcript,
         workspace_diff,
         reviews,
+        projects,
         ask_user_question_detail,
         session_claim,
         session_claim_expires_at,
@@ -1540,6 +1589,7 @@ async fn publish_plain_remote_action_result(
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
         reviews.as_ref(),
+        projects.as_ref(),
         ask_user_question_detail.as_ref(),
         session_claim.as_ref(),
         session_claim_expires_at,
@@ -1563,6 +1613,7 @@ async fn publish_plain_remote_action_result(
         thread_transcript,
         workspace_diff,
         reviews,
+        projects,
         ask_user_question_detail,
         session_claim,
         session_claim_expires_at,
@@ -1699,6 +1750,7 @@ fn build_plain_remote_action_result_payload(
                 thread_transcript: result.thread_transcript.clone(),
                 workspace_diff: result.workspace_diff.clone(),
                 reviews: result.reviews.clone(),
+                projects: result.projects.clone(),
                 ask_user_question_detail: result.ask_user_question_detail.clone(),
                 error: result.error.clone(),
             }
@@ -1730,6 +1782,7 @@ async fn replay_plain_remote_action_result(
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
             reviews: cached.reviews,
+            projects: cached.projects,
             ask_user_question_detail: cached.ask_user_question_detail,
             session_claim: cached.session_claim,
             session_claim_expires_at: cached.session_claim_expires_at,
@@ -1795,6 +1848,7 @@ async fn publish_remote_action_result_private(
         thread_transcript,
         workspace_diff,
         reviews,
+        projects,
         ask_user_question_detail,
         session_claim,
         session_claim_expires_at,
@@ -1820,6 +1874,7 @@ async fn publish_remote_action_result_private(
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
         reviews.as_ref(),
+        projects.as_ref(),
         ask_user_question_detail.as_ref(),
         session_claim.as_ref(),
         session_claim_expires_at,
@@ -1843,6 +1898,7 @@ async fn publish_remote_action_result_private(
         thread_transcript,
         workspace_diff,
         reviews,
+        projects,
         ask_user_question_detail,
         session_claim,
         session_claim_expires_at,
@@ -1923,6 +1979,7 @@ async fn replay_encrypted_remote_action_result(
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
             reviews: cached.reviews,
+            projects: cached.projects,
             ask_user_question_detail: cached.ask_user_question_detail,
             session_claim: cached.session_claim,
             session_claim_expires_at: cached.session_claim_expires_at,
@@ -2115,6 +2172,7 @@ fn cached_remote_action_result(
         thread_transcript: outcome.thread_transcript,
         workspace_diff: outcome.workspace_diff,
         reviews: outcome.reviews,
+        projects: outcome.projects,
         ask_user_question_detail: outcome.ask_user_question_detail,
         session_claim: outcome.session_claim,
         session_claim_expires_at: outcome.session_claim_expires_at,
@@ -2139,6 +2197,7 @@ fn measure_remote_action_result_sizes(
     thread_transcript: Option<&ThreadTranscriptResponse>,
     workspace_diff: Option<&WorkspaceDiffResponse>,
     reviews: Option<&ReviewsResponse>,
+    projects: Option<&ProjectsResponse>,
     ask_user_question_detail: Option<&AskUserQuestionDetailResponse>,
     session_claim: Option<&String>,
     session_claim_expires_at: Option<u64>,
@@ -2161,6 +2220,7 @@ fn measure_remote_action_result_sizes(
         thread_transcript,
         workspace_diff,
         reviews,
+        projects,
         ask_user_question_detail,
         session_claim,
         session_claim_expires_at,
@@ -2178,6 +2238,7 @@ fn measure_remote_action_result_sizes(
         thread_transcript_bytes: maybe_serialized_json_bytes(thread_transcript),
         workspace_diff_bytes: maybe_serialized_json_bytes(workspace_diff),
         reviews_bytes: maybe_serialized_json_bytes(reviews),
+        projects_bytes: maybe_serialized_json_bytes(projects),
         ask_user_question_detail_bytes: maybe_serialized_json_bytes(ask_user_question_detail),
         session_claim_bytes: session_claim
             .map(|claim| serialized_json_bytes(&(claim, session_claim_expires_at)))
@@ -2217,6 +2278,7 @@ fn log_remote_action_result_sizes(
         thread_transcript_bytes = breakdown.thread_transcript_bytes,
         workspace_diff_bytes = breakdown.workspace_diff_bytes,
         reviews_bytes = breakdown.reviews_bytes,
+        projects_bytes = breakdown.projects_bytes,
         ask_user_question_detail_bytes = breakdown.ask_user_question_detail_bytes,
         session_claim_bytes = breakdown.session_claim_bytes,
         claim_challenge_bytes = breakdown.claim_challenge_bytes,
@@ -2289,6 +2351,8 @@ struct RemoteActionResultPlaintextRef<'a> {
     workspace_diff: Option<&'a WorkspaceDiffResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<&'a ReviewsResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projects: Option<&'a ProjectsResponse>,
     ask_user_question_detail: Option<&'a AskUserQuestionDetailResponse>,
     session_claim: Option<&'a String>,
     session_claim_expires_at: Option<u64>,
@@ -2324,6 +2388,7 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         | RemoteActionKind::FetchThreadTranscript
         | RemoteActionKind::FetchWorkspaceDiff
         | RemoteActionKind::FetchReviews
+        | RemoteActionKind::FetchProjects
         | RemoteActionKind::FetchAskUserQuestionDetail => {
             RemoteActionResultKind::RemoteTranscriptResult
         }
@@ -2332,6 +2397,7 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         }
         RemoteActionKind::SendMessage
         | RemoteActionKind::ApplyFileChange
+        | RemoteActionKind::ProjectAction
         | RemoteActionKind::RequestReview
         | RemoteActionKind::StartWorkflow
         | RemoteActionKind::ResolveReview

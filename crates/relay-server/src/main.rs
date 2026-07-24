@@ -38,14 +38,15 @@ use protocol::{
     ApplyFileChangeReceipt, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
     AuthSessionInput, AuthSessionView, BulkRevokeDevicesReceipt, DeleteThreadInput,
     ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView, PairingDecisionInput,
-    PairingDecisionReceipt, PairingStartInput, PairingTicketView, ReadThreadEntryDetailInput,
-    ReadThreadTranscriptInput, RequestReviewInput, RequestReviewReceipt, ResumeSessionInput,
-    ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput,
-    SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput,
-    StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
-    ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-    ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
-    WorkflowActionReceipt, WorkspaceDiffResponse,
+    PairingDecisionReceipt, PairingStartInput, PairingTicketView, ProjectActionInput,
+    ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
+    RequestReviewInput, RequestReviewReceipt, ResumeSessionInput, ReviewActionInput,
+    ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+    SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput, StartWorkflowReceipt,
+    StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt,
+    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadTranscriptResponse, ThreadsQuery,
+    ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput, WorkflowActionReceipt,
+    WorkspaceDiffResponse,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -104,6 +105,13 @@ struct ThreadTranscriptQuery {
 struct ThreadEntryDetailQuery {
     field: Option<String>,
     cursor: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceDiffQuery {
+    /// The session the client is *viewing*. Absent → the global/active workspace
+    /// (legacy behavior). Present → diff that session's own workspace.
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +203,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             get(thread_entry_detail),
         )
         .route("/api/allowed-roots", post(update_allowed_roots))
+        .route("/api/projects", get(fetch_projects).post(project_action))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
             "/api/threads/:thread_id/delete",
@@ -461,11 +470,12 @@ async fn workspace_diff(
     State(context): State<AppContext>,
     headers: HeaderMap,
     uri: Uri,
+    Query(query): Query<WorkspaceDiffQuery>,
 ) -> Result<Json<ApiEnvelope<WorkspaceDiffResponse>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
     context
         .app
-        .workspace_diff(None)
+        .workspace_diff(None, query.thread_id)
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(|error| classify_session_error(error))
@@ -585,6 +595,32 @@ async fn update_allowed_roots(
         .await
         .map(|receipt| Json(ApiEnvelope::ok(receipt)))
         .map_err(bad_request)
+}
+
+async fn project_action(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<ProjectActionInput>,
+) -> Result<Json<ApiEnvelope<ProjectActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .project_action(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+// The dedicated, uncompacted Projects payload (list + membership + revision),
+// decoupled from the byte-budgeted session snapshot.
+async fn fetch_projects(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<ProjectsResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.fetch_projects().await)))
 }
 
 async fn archive_thread(

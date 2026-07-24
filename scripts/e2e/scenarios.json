@@ -14,6 +14,7 @@
       "local-transcript-load",
       "local-thread-settings",
       "local-thread-groups",
+      "local-projects-toggle",
       "local-rail-toggle-align",
       "local-permission-modes"
     ],
@@ -32,6 +33,7 @@
       "local-transcript-load",
       "local-thread-settings",
       "local-thread-groups",
+      "local-projects-toggle",
       "local-rail-toggle-align",
       "local-delete",
       "local-permission-modes"
@@ -223,6 +225,16 @@
       "transport": "local",
       "coverage": [
         "thread-groups"
+      ]
+    },
+    "local-projects-toggle": {
+      "script": "browser-local-projects-toggle-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "projects-toggle",
+        "projects-fail-closed"
       ]
     },
     "local-rail-toggle-align": {

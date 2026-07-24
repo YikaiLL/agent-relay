@@ -85,6 +85,9 @@ fn test_persisted_state() -> PersistedRelayState {
         thread_forked_from: Default::default(),
         thread_promoted_from: Default::default(),
         push_subscriptions: std::collections::HashMap::new(),
+        projects: Default::default(),
+        thread_project_id: Default::default(),
+        projects_revision: 0,
     }
 }
 
@@ -297,6 +300,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             active_workflow_runs: Vec::new(),
             workflows_revision: 0,
             push_vapid_public_key: None,
+            projects_revision: 0,
         }),
         receipt: Some(ApprovalReceipt {
             request_id: "req-1".to_string(),
@@ -315,6 +319,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        projects: None,
         ask_user_question_detail: None,
         session_claim: Some("claim-1".to_string()),
         session_claim_expires_at: Some(120),

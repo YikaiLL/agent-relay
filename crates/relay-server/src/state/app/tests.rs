@@ -238,9 +238,9 @@ mod path_scope_tests {
     use crate::fake_provider::FakeProviderBridge;
     use crate::protocol::{
         ApprovalDecision, ApprovalDecisionInput, ApprovalScope, AskUserOptionView,
-        AskUserQuestionView, ForkSessionInput, ReadThreadTranscriptInput, ResumeSessionInput,
-        SendMessageInput, StartSessionInput, SubmitAskUserAnswerInput, ThreadSummaryView,
-        UpdateSessionSettingsInput,
+        AskUserQuestionView, ForkSessionInput, ProjectAction, ProjectActionInput,
+        ReadThreadTranscriptInput, ResumeSessionInput, SendMessageInput, StartSessionInput,
+        SubmitAskUserAnswerInput, ThreadSummaryView, UpdateSessionSettingsInput,
     };
     use crate::state::security::SecurityProfile;
     use crate::state::{
@@ -274,6 +274,308 @@ mod path_scope_tests {
             project,
             outside,
         )
+    }
+
+    // Part A: the interactive diff must follow the *viewed* session's workspace,
+    // not the process-global/active one. Two runtimes at different cwds; thread-a is
+    // active, but viewing thread-b must diff B's checkout.
+    #[tokio::test]
+    async fn workspace_diff_follows_viewed_thread_not_active() {
+        let cwd_a_dir = TempDir::new().expect("cwd a");
+        let cwd_b_dir = TempDir::new().expect("cwd b");
+        let cwd_a = cwd_a_dir.path().to_string_lossy().to_string();
+        let cwd_b = cwd_b_dir.path().to_string_lossy().to_string();
+
+        let (app, _project, _outside) = build_app(&cwd_a).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = cwd_a.clone();
+            relay.ensure_runtime_for_thread("thread-b").current_cwd = cwd_b.clone();
+        }
+
+        // Absent selector → the global/active workspace (legacy back-compat).
+        let expected_global = { app.relay.read().await.current_cwd.clone() };
+        let global = app.workspace_diff(None, None).await.expect("global diff");
+        assert_eq!(global.cwd, expected_global);
+        assert_ne!(global.cwd, cwd_b);
+        assert!(!global.unavailable);
+
+        // Viewing thread-b returns B's workspace even though A is active — the fix.
+        let viewed_b = app
+            .workspace_diff(None, Some("thread-b".to_string()))
+            .await
+            .expect("viewed-b diff");
+        assert_eq!(
+            viewed_b.cwd, cwd_b,
+            "viewing session B must diff B's own workspace, not the active thread's"
+        );
+        assert!(!viewed_b.unavailable);
+
+        // Viewing thread-a returns A's workspace.
+        let viewed_a = app
+            .workspace_diff(None, Some("thread-a".to_string()))
+            .await
+            .expect("viewed-a diff");
+        assert_eq!(viewed_a.cwd, cwd_a);
+    }
+
+    // Part A fail-closed: a present-but-unresolvable selector must NOT fall back to
+    // the active/global cwd (that would re-open the bug and leak another workspace).
+    #[tokio::test]
+    async fn workspace_diff_fails_closed_on_unresolvable_thread() {
+        let cwd_a_dir = TempDir::new().expect("cwd a");
+        let cwd_a = cwd_a_dir.path().to_string_lossy().to_string();
+
+        let (app, _project, _outside) = build_app(&cwd_a).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = cwd_a.clone();
+        }
+
+        let ghost = app
+            .workspace_diff(None, Some("does-not-exist".to_string()))
+            .await
+            .expect("unresolvable selector returns unavailable, not an error");
+        assert!(
+            ghost.unavailable,
+            "an unresolvable viewed thread must fail closed (unavailable)"
+        );
+        assert_ne!(
+            ghost.cwd, cwd_a,
+            "fail-closed must NOT leak the active workspace's cwd"
+        );
+        assert!(ghost.file_changes.is_empty());
+    }
+
+    // B3: the manual Projects write path end to end through AppState.
+    #[tokio::test]
+    async fn project_action_create_assign_rename_delete() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+
+        // Create.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "Sealwire".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        assert_eq!(receipt.projects.len(), 1);
+        let project_id = receipt.projects[0].id.clone();
+        assert_eq!(receipt.projects[0].name, "Sealwire");
+
+        // A blank name is rejected.
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "   ".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+
+        // Assign a session; the receipt reflects membership immediately.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "t1".to_string(),
+                    project_id: project_id.clone(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("assign");
+        assert_eq!(receipt.thread_project_id.get("t1"), Some(&project_id));
+
+        // Rename.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Rename {
+                    project_id: project_id.clone(),
+                    name: "Renamed".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("rename");
+        assert_eq!(receipt.projects[0].name, "Renamed");
+
+        // Delete → project gone, session falls back to Unassigned.
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Delete {
+                    project_id: project_id.clone(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("delete");
+        assert!(receipt.projects.is_empty());
+        assert!(receipt.thread_project_id.get("t1").is_none());
+    }
+
+    // B4a (revised): projects are NOT embedded in the snapshot (unbounded → would
+    // defeat the byte budget). A mutation bumps `projects_revision`; the client learns
+    // of the change from the snapshot and refetches the dedicated payload.
+    #[tokio::test]
+    async fn project_mutation_bumps_snapshot_revision_and_fetch_returns_payload() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        assert_eq!(app.snapshot().await.projects_revision, 0);
+
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "Sealwire".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        let project_id = receipt.projects[0].id.clone();
+        app.project_action(ProjectActionInput {
+            action: ProjectAction::Assign {
+                thread_id: "t1".to_string(),
+                project_id: project_id.clone(),
+            },
+            device_id: None,
+        })
+        .await
+        .expect("assign");
+
+        // Snapshot carries ONLY the bumped revision (one per action).
+        assert_eq!(app.snapshot().await.projects_revision, 2);
+
+        // The dedicated fetch returns the full list + membership + matching revision.
+        let payload = app.fetch_projects().await;
+        assert_eq!(payload.projects_revision, 2);
+        assert_eq!(payload.projects.len(), 1);
+        assert_eq!(payload.projects[0].name, "Sealwire");
+        assert_eq!(payload.thread_project_id.get("t1"), Some(&project_id));
+    }
+
+    #[tokio::test]
+    async fn snapshot_stays_bounded_regardless_of_project_count() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        for i in 0..200 {
+            app.project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: format!("Project-{i}-{}", "x".repeat(150)),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        }
+
+        // The byte-budgeted remote frame stays bounded — projects are NOT embedded
+        // (only the tiny revision rides), so 200 long-named projects can't push it
+        // toward the ~40 KB an O(N) embedding would cost. The revision survives
+        // compaction so the client knows to refetch.
+        let remote = app
+            .snapshot()
+            .await
+            .compact_for(crate::protocol::SessionSnapshotCompactProfile::RemoteSurface);
+        assert_eq!(remote.projects_revision, 200);
+        let serialized = serde_json::to_string(&remote).expect("serialize");
+        assert!(
+            serialized.len() < 12_000,
+            "remote snapshot must stay bounded despite 200 projects; was {} bytes",
+            serialized.len()
+        );
+
+        // The full payload is available off the snapshot, on demand.
+        assert_eq!(app.fetch_projects().await.projects.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn project_action_rejects_overlong_names() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "x".repeat(500),
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn project_action_rejects_overlong_thread_ids() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "P".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        let project_id = receipt.projects[0].id.clone();
+        // A giant thread id can't bloat the persisted membership map / payload.
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "x".repeat(1000),
+                    project_id,
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn project_action_enforces_membership_cap() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "P".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        let project_id = receipt.projects[0].id.clone();
+        // Fill the membership map to the cap directly (fast — plain map inserts).
+        {
+            let mut relay = app.relay.write().await;
+            for i in 0..10_000 {
+                relay
+                    .thread_project_id
+                    .insert(format!("t{i}"), project_id.clone());
+            }
+        }
+        // A NEW membership past the cap is rejected...
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "overflow".to_string(),
+                    project_id: project_id.clone(),
+                },
+                device_id: None,
+            })
+            .await
+            .is_err());
+        // ...but reassigning an EXISTING member still works.
+        assert!(app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Assign {
+                    thread_id: "t0".to_string(),
+                    project_id,
+                },
+                device_id: None,
+            })
+            .await
+            .is_ok());
     }
 
     async fn build_status_app(cwd: &str, read_status: &str) -> (AppState, TempDir, TempDir) {

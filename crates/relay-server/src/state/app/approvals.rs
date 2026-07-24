@@ -182,19 +182,29 @@ impl AppState {
     pub async fn workspace_diff(
         &self,
         device_id: Option<String>,
+        thread_id: Option<String>,
     ) -> Result<WorkspaceDiffResponse, String> {
         let cwd = {
             let relay = self.relay.read().await;
+            // Resolve which workspace to diff:
+            // - absent selector       → the global/active cwd (legacy back-compat)
+            // - present & resolvable   → the *viewed* session's own workspace
+            // - present & unresolvable → fail closed; NEVER fall back to the active
+            //   cwd, which would show (and, for a broad-scope remote device, leak)
+            //   another workspace's diff.
+            let resolved = match thread_id.as_deref() {
+                None => relay.current_cwd.clone(),
+                Some(thread_id) => match relay.thread_cwd(thread_id) {
+                    Some(cwd) => cwd,
+                    None => return Ok(WorkspaceDiffResponse::unavailable()),
+                },
+            };
             let device_scope = device_id
                 .as_deref()
                 .map(|id| relay.device_path_scope(id))
                 .unwrap_or_default();
-            ensure_path_within_device_scope(
-                &relay.current_cwd,
-                &device_scope,
-                &relay.allowed_roots,
-            )?;
-            relay.current_cwd.clone()
+            ensure_path_within_device_scope(&resolved, &device_scope, &relay.allowed_roots)?;
+            resolved
         };
         collect_workspace_diff(&cwd).await
     }

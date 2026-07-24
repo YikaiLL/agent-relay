@@ -68,6 +68,9 @@ import {
   agentWorkingIndicatorLabel,
   stopButton,
   threadContextMenu,
+  threadProjectActions,
+  projectsToolbar,
+  projectsCreateButton,
   threadsCount,
   threadsList,
   threadsRefreshButton,
@@ -136,7 +139,24 @@ import {
   createThreadListStore,
   readThreadListContextMenu,
   readThreadListUi,
+  readThreadListViewMode,
 } from "./shared/thread-list-store.js";
+import { createProjectsStore } from "./shared/projects-store.js";
+import {
+  fetchProjectsPayload,
+  createProject,
+  renameProject,
+  deleteProject,
+  assignThreadToProject,
+  unassignThread,
+} from "./local/project-actions.js";
+import {
+  buildProjectMenuItems,
+  pickNewProjectId,
+  normalizeProjectName,
+  projectsMenuReady,
+  projectMenuActionAllowed,
+} from "./local/project-menu.js";
 import { installThreadListWheelProxy } from "./shared/thread-list-scroll.js";
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
@@ -259,6 +279,11 @@ const state = {
     fields: null,
   },
   threadGroups: [],
+  projects: [],
+  threadProjectId: {},
+  projectsLoading: false,
+  projectsError: null,
+  projectsLoaded: false,
   threadHistoryScrollTop: 0,
   threadListStore: createThreadListStore(),
   localUiStore: createLocalUiStore(),
@@ -277,7 +302,48 @@ const apiFetch = createApiFetch({
   },
 });
 
-const workspaceDiffStore = createWorkspaceDiffStore({ apiFetch, surface: "local" });
+const viewedThreadId = () => state.viewThreadId || state.session?.active_thread_id || null;
+const workspaceDiffStore = createWorkspaceDiffStore({
+  apiFetch,
+  surface: "local",
+  // Diff follows the session the user is viewing, not whichever thread is active.
+  getThreadId: viewedThreadId,
+  // Reset identity = viewed thread + its cwd, so a same-thread cwd change also
+  // clears the stale diff during loading (not just a thread switch).
+  getWorkspaceKey: () => JSON.stringify([viewedThreadId() || "", state.session?.current_cwd || ""]),
+});
+// Projects ride a dedicated channel off the byte-budgeted snapshot; this store fetches
+// the payload when `projects_revision` changes (see createProjectsStore) and feeds it
+// into state so the sidebar can group by Project.
+const projectsStore = createProjectsStore({
+  fetchProjects: () => fetchProjectsPayload(apiFetch),
+});
+// Monotonic token bumped on every Projects-store transition. A context-menu button
+// captures the token at build time; runThreadProjectAction() refuses to act if it has
+// since advanced, so a button built from now-stale Project state can't mutate.
+let projectsStateSeq = 0;
+projectsStore.subscribe((projectsState) => {
+  state.projects = projectsState.projects;
+  state.threadProjectId = projectsState.threadProjectId;
+  state.projectsLoading = projectsState.loading;
+  state.projectsError = projectsState.error;
+  state.projectsLoaded = projectsState.loaded;
+  projectsStateSeq += 1;
+  // Re-render on ANY change (loading/loaded/error transitions) while the Projects
+  // view is showing, so its loading/error placeholder resolves to the grouping.
+  // `renderThreads` is a module const defined below; this callback only ever fires
+  // asynchronously (after a fetch settles), by which point it is initialized.
+  if (readThreadListViewMode(state.threadListStore) === "projects") {
+    renderThreads();
+  }
+  // Keep an OPEN context menu's Project section in sync regardless of view mode —
+  // a settled refresh/failure must repopulate (fresh membership) or fall closed
+  // (loading/error note) rather than leave stale assign/unassign controls exposed.
+  const openContextThreadId = readThreadListContextMenu(state.threadListStore).threadId;
+  if (openContextThreadId && threadContextMenu && !threadContextMenu.hidden) {
+    populateThreadProjectActions(openContextThreadId);
+  }
+});
 let clientLogRootHandle = null;
 let clientLogRootElement = null;
 let forkSessionRoot = null;
@@ -387,20 +453,31 @@ document.addEventListener("keydown", (event) => {
 
 let lastTurnDiffItemId = null;
 let lastWorkspaceCwd = null;
+let lastViewThreadId = null;
 window.addEventListener("agent-relay:session-updated", () => {
   refreshWorkspaceDiffIfChanged();
+  // Fetch the dedicated Projects payload when the snapshot's revision changes (a
+  // no-op otherwise; unconditional on the first observation).
+  projectsStore.syncToRevision(state.session?.projects_revision || 0);
 });
 function refreshWorkspaceDiffIfChanged() {
   const session = state.session;
   if (!session) return;
   const cwd = session.current_cwd || "";
-  if (lastWorkspaceCwd !== null && cwd !== lastWorkspaceCwd) {
+  // The viewed session id is also part of the key: switching between two threads
+  // that share a cwd must still refetch (each has its own workspace state).
+  const viewThreadId = state.viewThreadId || session.active_thread_id || null;
+  const cwdChanged = lastWorkspaceCwd !== null && cwd !== lastWorkspaceCwd;
+  const viewChanged = lastViewThreadId !== null && viewThreadId !== lastViewThreadId;
+  if (cwdChanged || viewChanged) {
     lastWorkspaceCwd = cwd;
+    lastViewThreadId = viewThreadId;
     lastTurnDiffItemId = null;
     void workspaceDiffStore.refresh();
     return;
   }
   lastWorkspaceCwd = cwd;
+  lastViewThreadId = viewThreadId;
   const entries = session.transcript || [];
   let latest = null;
   for (let i = entries.length - 1; i >= 0; i -= 1) {
@@ -514,6 +591,8 @@ const renderer = createSessionRenderer({
   },
   openThreadContextMenu,
   closeThreadContextMenu,
+  onRenameProject: renameProjectFromHeader,
+  onDeleteProject: deleteProjectFromHeader,
   scheduleControllerHeartbeat(...args) {
     return controller.scheduleControllerHeartbeat(...args);
   },
@@ -973,6 +1052,195 @@ function openSecurityModal() {
 openSecurityModalBtn?.addEventListener("click", openSecurityModal);
 openSecurityConsoleButton?.addEventListener("click", openSecurityModal);
 openSecurityHeaderButton?.addEventListener("click", openSecurityModal);
+
+// Sessions/Projects sidebar grouping toggle (static-shell buttons wired by id).
+const threadsViewSessionsButton = document.getElementById("threads-view-sessions");
+const threadsViewProjectsButton = document.getElementById("threads-view-projects");
+function setThreadViewMode(mode) {
+  const isProjects = mode === "projects";
+  state.threadListStore.getState().setViewMode(isProjects ? "projects" : "sessions");
+  threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
+  threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
+  // The create-a-Project toolbar belongs to the Projects view only.
+  if (projectsToolbar) {
+    projectsToolbar.hidden = !isProjects;
+  }
+  // Ensure the Projects payload is loaded when switching in (no-op if already current).
+  if (isProjects) {
+    projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  }
+  renderThreads();
+}
+threadsViewSessionsButton?.addEventListener("click", () => setThreadViewMode("sessions"));
+threadsViewProjectsButton?.addEventListener("click", () => setThreadViewMode("projects"));
+
+// Prompt for a Project name (trimmed; null aborts). Native prompt mirrors the
+// window.confirm flow the archive/delete affordances already use.
+function promptProjectName(current = "") {
+  return normalizeProjectName(window.prompt("Project name", current));
+}
+
+// Create a Project from the Projects toolbar. Membership/list refresh rides the
+// snapshot's projects_revision bump (project_action calls notify()), same as an
+// API-driven mutation — no manual store.refresh() needed.
+async function createProjectFromToolbar() {
+  const name = promptProjectName();
+  if (!name) {
+    return;
+  }
+  try {
+    await createProject(apiFetch, name);
+    logLine(`Created project "${name}".`);
+  } catch (error) {
+    logLine(`Failed to create project: ${error.message}`);
+  }
+}
+projectsCreateButton?.addEventListener("click", () => {
+  void createProjectFromToolbar();
+});
+
+// Rename a Project from its group header (Projects view). Prompt pre-filled with the
+// current name; refresh rides the projects_revision snapshot bump like every mutation.
+async function renameProjectFromHeader(projectId, currentName) {
+  if (!projectId) {
+    return;
+  }
+  const name = promptProjectName(currentName || "");
+  if (!name || name === currentName) {
+    return;
+  }
+  try {
+    await renameProject(apiFetch, projectId, name);
+    logLine(`Renamed project to "${name}".`);
+  } catch (error) {
+    logLine(`Failed to rename project: ${error.message}`);
+  }
+}
+
+// Delete a Project from its group header. Its sessions become Unassigned (the sessions
+// themselves are not deleted). Confirm first, mirroring the archive/delete flows.
+async function deleteProjectFromHeader(projectId, name) {
+  if (!projectId) {
+    return;
+  }
+  const confirmed = window.confirm(
+    `Delete project "${name}"?\n\nIts sessions become Unassigned — the sessions themselves are not deleted.`
+  );
+  if (!confirmed) {
+    return;
+  }
+  try {
+    await deleteProject(apiFetch, projectId);
+    logLine(`Deleted project "${name}".`);
+  } catch (error) {
+    logLine(`Failed to delete project: ${error.message}`);
+  }
+}
+
+// Run one context-menu Project action for a thread (assign / unassign / new+assign).
+// `builtSeq` is the projectsStateSeq captured when the clicked button was built.
+async function runThreadProjectAction(threadId, item, builtSeq) {
+  closeThreadContextMenu();
+  if (!threadId || !item) {
+    return;
+  }
+  // Execution-time freshness guard: refuse to act on a button built from Project state
+  // that has since changed or is no longer trustworthy (a newer revision arrived, or a
+  // refresh is pending/failed). Otherwise a stale button could overwrite newer
+  // membership. The user reopens the menu to act on current state.
+  if (
+    !projectMenuActionAllowed({
+      builtSeq,
+      currentSeq: projectsStateSeq,
+      projectsLoaded: state.projectsLoaded,
+      projectsError: state.projectsError,
+      projectsLoading: state.projectsLoading,
+    })
+  ) {
+    logLine("Projects changed — reopen the menu to change membership.");
+    return;
+  }
+  try {
+    if (item.kind === "unassign") {
+      await unassignThread(apiFetch, threadId);
+      logLine(`Removed session ${shortId(threadId)} from its project.`);
+      return;
+    }
+    if (item.kind === "assign") {
+      if (item.isCurrent) {
+        return; // already there — no-op
+      }
+      await assignThreadToProject(apiFetch, threadId, item.projectId);
+      logLine(`Moved session ${shortId(threadId)} to "${item.label}".`);
+      return;
+    }
+    if (item.kind === "create") {
+      const name = promptProjectName();
+      if (!name) {
+        return;
+      }
+      const before = state.projects || [];
+      const receipt = await createProject(apiFetch, name);
+      const projectId = pickNewProjectId(before, receipt?.projects);
+      if (!projectId) {
+        // Created, but the new id was ambiguous — leave the session unassigned rather
+        // than guess. The snapshot refresh still surfaces the new (empty) project.
+        logLine(`Created project "${name}" (assign the session from its menu).`);
+        return;
+      }
+      await assignThreadToProject(apiFetch, threadId, projectId);
+      logLine(`Created project "${name}" and moved session ${shortId(threadId)} into it.`);
+    }
+  } catch (error) {
+    logLine(`Failed to update project membership: ${error.message}`);
+  }
+}
+
+// Rebuild the context menu's per-session Project section for `threadId` from the
+// current Projects payload. Called each time the menu opens (openThreadContextMenu).
+function populateThreadProjectActions(threadId) {
+  if (!threadProjectActions) {
+    return;
+  }
+  threadProjectActions.textContent = ""; // drop prior buttons (and their listeners)
+  // Fail closed: mirror the sidebar renderer — never present Project membership or
+  // mutation controls as authoritative unless we hold a current payload. During a
+  // pending/failed/first-load fetch, show a non-interactive note instead of buttons
+  // (which would falsely imply "no projects / not a member" or expose stale controls).
+  if (
+    !projectsMenuReady({
+      projectsLoaded: state.projectsLoaded,
+      projectsError: state.projectsError,
+      projectsLoading: state.projectsLoading,
+    })
+  ) {
+    const note = document.createElement("p");
+    note.className = "context-menu-note";
+    note.textContent = state.projectsError ? "Projects unavailable" : "Loading projects…";
+    threadProjectActions.appendChild(note);
+    return;
+  }
+  const builtSeq = projectsStateSeq; // freshness token for this build
+  const currentProjectId = state.threadProjectId?.[threadId] || null;
+  const items = buildProjectMenuItems({ projects: state.projects || [], currentProjectId });
+  for (const item of items) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "context-menu-button context-menu-project-button";
+    if (item.isCurrent) {
+      button.classList.add("is-current");
+      button.setAttribute("aria-current", "true");
+    }
+    if (item.kind === "create") {
+      button.classList.add("context-menu-project-create");
+    }
+    button.textContent = item.isCurrent ? `✓ ${item.label}` : item.label;
+    button.addEventListener("click", () => {
+      void runThreadProjectAction(threadId, item, builtSeq);
+    });
+    threadProjectActions.appendChild(button);
+  }
+}
 
 closeSecurityModalBtn?.addEventListener("click", () => {
   securityModal?.close();
@@ -2167,6 +2435,9 @@ function openThreadContextMenu(threadId, clientX, clientY) {
   deleteThreadButton.textContent = isRunningActiveSession
     ? "Running session cannot be deleted"
     : "Delete permanently";
+  // Per-session Project assignment — rebuilt from the current Projects payload each
+  // open so the marked "current" project and the list stay fresh.
+  populateThreadProjectActions(threadId);
 
   threadContextMenu.hidden = false;
   const left = Math.max(12, Math.min(clientX, window.innerWidth - 220));

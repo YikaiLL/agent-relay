@@ -39,6 +39,7 @@ import React from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
+  buildNavigationThreadGroups,
   canonicalizeWorkspace,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
@@ -48,6 +49,7 @@ import { canForkInSession } from "../shared/fork-fields.js";
 import {
   readThreadListContextMenu,
   readThreadListUi,
+  readThreadListViewMode,
 } from "../shared/thread-list-store.js";
 import {
   readLocalUiState,
@@ -186,6 +188,8 @@ export function createSessionRenderer({
   resumeSession,
   openThreadContextMenu,
   closeThreadContextMenu,
+  onRenameProject,
+  onDeleteProject,
   scheduleControllerHeartbeat,
   scheduleControllerLeaseRefresh,
   cancelControllerHeartbeat,
@@ -1451,12 +1455,45 @@ export function createSessionRenderer({
       openCtxThreadId = readThreadListContextMenu(state.threadListStore).threadId;
     }
 
-    const groups = state.threadGroups || [];
+    // Group by Project when the sidebar is in Projects mode; otherwise by cwd/folder.
+    // `state.threadGroups` stays the cwd grouping (the source of `state.threads`);
+    // project groups are derived on the fly from the flat list + the fetched Projects.
+    const viewMode = readThreadListViewMode(state.threadListStore);
+    const groupBy = viewMode === "projects" ? "project" : "cwd";
+
+    // Fail closed: only render Project grouping when we hold a payload we can vouch
+    // for as CURRENT. Bail to a placeholder not just on error or before the first
+    // successful load (!projectsLoaded), but ALSO while a newer revision's fetch is
+    // in flight (projectsLoading) — otherwise a pending refresh would present the
+    // prior membership as if it were current, and a failing retry would oscillate
+    // stale grouping back in. A successful fetch is the only state that renders groups.
+    if (
+      viewMode === "projects" &&
+      (state.projectsError || !state.projectsLoaded || state.projectsLoading)
+    ) {
+      renderWorkspaceSuggestions(state.session);
+      renderThreadListMessage(
+        state.projectsError ? "Projects unavailable" : "Loading projects…",
+        state.projectsError
+          ? `Failed to load projects: ${state.projectsError}`
+          : "Loading projects…"
+      );
+      return;
+    }
+
+    const groups =
+      viewMode === "projects"
+        ? buildNavigationThreadGroups(state.threads, {
+            groupBy: "project",
+            projects: state.projects || [],
+            threadProjectId: state.threadProjectId || {},
+          })
+        : state.threadGroups || [];
     const totalThreads = state.threads.length;
 
     renderWorkspaceSuggestions(state.session);
-    threadsCount.textContent = summarizeThreadGroups(groups);
-    threadsCount.title = groups.map((group) => group.cwd).join("\n");
+    threadsCount.textContent = summarizeThreadGroups(groups, { groupBy });
+    threadsCount.title = groups.map((group) => group.cwd || group.label).join("\n");
     resumeLatestButton.disabled = totalThreads === 0;
 
     renderReactContent(
@@ -1473,6 +1510,10 @@ export function createSessionRenderer({
         onContextThread(threadId, clientX, clientY) {
           openThreadContextMenu(threadId, clientX, clientY);
         },
+        // Real project-group headers get rename/delete affordances (project mode only —
+        // cwd groups carry no projectId, so ThreadGroupHeader shows nothing there).
+        onRenameProject,
+        onDeleteProject,
         onResumeThread(threadId) {
           // Opening a thread clears its attention dot immediately; the click also
           // doubles as the user gesture that unlocks notification permission.
@@ -1486,8 +1527,9 @@ export function createSessionRenderer({
         onSelectWorkspace(cwd) {
           // Defence in depth: the Unknown-workspace header is not rendered as a
           // button, but this value ends up in the workspace input verbatim, so
-          // refuse the display sentinel here too.
-          if (isUnknownWorkspace(cwd)) return;
+          // refuse the display sentinel here too. Project group headers carry an
+          // empty cwd — they're not workspaces, so ignore them as well.
+          if (!cwd || isUnknownWorkspace(cwd)) return;
           setSelectedCwd(cwd || "");
           renderThreads();
           renderOverviewState(state.session);

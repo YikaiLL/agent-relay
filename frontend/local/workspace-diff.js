@@ -23,7 +23,15 @@ export function WorkspaceDiffModalTitle({ store }) {
   return h("h2", null, onReviewer ? "Reviewer" : "Workspace diff");
 }
 
-export function createWorkspaceDiffStore({ apiFetch, fetchDiff = null, surface = "local" }) {
+export function createWorkspaceDiffStore({
+  apiFetch,
+  fetchDiff = null,
+  surface = "local",
+  getThreadId = null,
+  // Identity of the viewed workspace (thread id + cwd) used to decide when to drop
+  // stale data during loading. Falls back to getThreadId when not provided.
+  getWorkspaceKey = null,
+}) {
   const tabStorageKey = `agent-relay:right-panel-tab:${surface}`;
   let state = {
     status: "idle",
@@ -58,14 +66,41 @@ export function createWorkspaceDiffStore({ apiFetch, fetchDiff = null, surface =
     emit();
   }
 
+  // Monotonic guard: only the most recent refresh may write results. An earlier
+  // in-flight request (e.g. issued before a view switch A → B) that resolves late
+  // must not overwrite newer data, or the panel would show A's diff while B is viewed.
+  let requestSeq = 0;
+  // Identity of the viewed workspace (thread id + cwd) at the last refresh. When it
+  // changes we drop the previous workspace's data immediately so the load window
+  // can't flash it. Keying on thread id alone would miss a same-thread cwd change.
+  let lastKey = null;
   async function refresh() {
-    setState({ status: "loading", error: null });
+    const seq = (requestSeq += 1);
+    const keyFn =
+      typeof getWorkspaceKey === "function"
+        ? getWorkspaceKey
+        : typeof getThreadId === "function"
+          ? getThreadId
+          : null;
+    const key = keyFn ? keyFn() : null;
+    const viewChanged = key !== lastKey;
+    lastKey = key;
+    // Different workspace → clear stale data so we never render another session's
+    // changes during the load window. Same workspace (turnDiff / manual refresh) →
+    // keep prior data so the panel doesn't flicker on every refresh.
+    setState(
+      viewChanged
+        ? { status: "loading", error: null, data: null }
+        : { status: "loading", error: null }
+    );
     try {
       const data = fetchDiff
         ? await fetchDiff()
-        : await fetchViaApi(apiFetch);
+        : await fetchViaApi(apiFetch, getThreadId);
+      if (seq !== requestSeq) return; // superseded by a newer refresh
       setState({ status: "loaded", data, error: null });
     } catch (error) {
+      if (seq !== requestSeq) return; // superseded by a newer refresh
       setState({
         status: "error",
         error: error?.message || String(error),
@@ -118,8 +153,13 @@ function writeStoredTab(key, value) {
   }
 }
 
-async function fetchViaApi(apiFetch) {
-  const response = await apiFetch("/api/workspace/diff", { method: "GET" });
+async function fetchViaApi(apiFetch, getThreadId = null) {
+  // Diff the session the user is *viewing*, not the process-global/active one.
+  const threadId = typeof getThreadId === "function" ? getThreadId() : null;
+  const path = threadId
+    ? `/api/workspace/diff?thread_id=${encodeURIComponent(threadId)}`
+    : "/api/workspace/diff";
+  const response = await apiFetch(path, { method: "GET" });
   const payload = await response.json().catch(() => null);
   if (!response.ok || !payload?.ok) {
     throw new Error(payload?.error?.message || `HTTP ${response.status}`);
@@ -359,6 +399,9 @@ function renderStatsBadge(state, stats) {
   if (state.status === "loading" && !state.data) {
     return h("span", { className: "workspace-changes-row-pending" }, "…");
   }
+  if (state.data?.unavailable) {
+    return h("span", { className: "workspace-changes-row-empty" }, "—");
+  }
   if (state.data?.not_a_git_repo) {
     return h("span", { className: "workspace-changes-row-empty" }, "no git");
   }
@@ -391,6 +434,13 @@ function renderDiffContent(state) {
   const data = state.data;
   if (!data) {
     return h("p", { className: "diff-file-empty" }, "No data yet.");
+  }
+  if (data.unavailable) {
+    return h(
+      "p",
+      { className: "diff-file-empty" },
+      "Workspace unavailable — this session isn’t loaded yet or has no workspace."
+    );
   }
   if (data.not_a_git_repo) {
     return h(
@@ -426,7 +476,8 @@ export function WorkspaceDiffChip({ store, onTap }) {
   const stats = computeChangeStats(state.data);
   const isClean = state.status === "loaded" && stats.fileCount === 0;
   const notRepo = state.data?.not_a_git_repo;
-  if (notRepo) return null;
+  const unavailable = state.data?.unavailable;
+  if (notRepo || unavailable) return null;
   if (state.status === "idle" && !state.data) return null;
   if (isClean) return null;
   return h(
