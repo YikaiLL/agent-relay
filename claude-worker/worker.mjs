@@ -62,6 +62,7 @@ import {
 } from "./sdk-mapping.mjs";
 import { buildSessionOptionsBase } from "./session-options.mjs";
 import { createProgressTracker } from "./progress-tracker.mjs";
+import { checkInstalledClaudeBinary } from "./native-binary-check.mjs";
 import {
   findLocalSessionFile,
   readSessionCwdFromFile,
@@ -283,6 +284,32 @@ function fallbackThread(sessionId, cmd) {
   };
 }
 
+// Preflight (memoized): before the SDK `spawn()`s the native `claude` binary,
+// make sure that binary is actually present and complete. A truncated/partial
+// install otherwise surfaces as the undiagnosable `spawn Unknown system error
+// -88` (macOS EBADMACHO). We check once, on the first spawn attempt, and cache
+// success so healthy runs pay the cost (a small header read) exactly once. On
+// failure we keep the flag unset so the actionable error is re-thrown on retry.
+let claudeBinaryHealthy = false;
+function ensureClaudeBinaryHealthy() {
+  if (claudeBinaryHealthy) return;
+  // Test/diagnostic seam: force the preflight to inspect this exact path. Used to
+  // exercise the broken-install error path through the real command loop.
+  const checkPathOverride = process.env.CLAUDE_WORKER_CHECK_BINARY_PATH;
+  if (!checkPathOverride && process.env.CLAUDE_WORKER_SDK_MODULE) {
+    // A custom SDK module (integration tests / embedders) ships no native
+    // `claude` binary, so there is nothing to vet — skip rather than inspect the
+    // real install.
+    claudeBinaryHealthy = true;
+    return;
+  }
+  // Throws an actionable Error if the native binary is missing/truncated.
+  checkInstalledClaudeBinary(
+    checkPathOverride ? { resolve: () => checkPathOverride } : {},
+  );
+  claudeBinaryHealthy = true;
+}
+
 // claude-agent-sdk 0.3.x removed `unstable_v2_createSession`/`resumeSession`,
 // which returned a persistent session exposing `{ send, stream, close }`. The
 // streaming `query()` API replaces them: the returned Query is itself the
@@ -310,6 +337,7 @@ function createWorkerSession(sdk, options, resume) {
     }
   }
 
+  ensureClaudeBinaryHealthy();
   const query = sdk.query({
     prompt: inputStream(),
     options: resume ? { ...options, resume } : options,
@@ -428,6 +456,7 @@ async function readSupportedModels(sdk, cmd) {
     });
   }
 
+  ensureClaudeBinaryHealthy();
   const query = sdk.query({
     prompt: idlePrompt(),
     options: { cwd: cmd.cwd || process.cwd() },

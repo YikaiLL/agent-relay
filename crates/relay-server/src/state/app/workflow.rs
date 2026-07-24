@@ -981,8 +981,8 @@ the drain window; it may still be running."
             let note = if read_only_enforced {
                 "read-only sandbox enforced"
             } else {
-                "no hard read-only mode for this provider; edits require approval, which the \
-workflow denies"
+                "no hard read-only mode for this provider; file-mutation tools are withheld, but \
+Bash can still write without approval (best-effort read-only)"
             };
             relay.push_log(
                 "info",

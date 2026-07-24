@@ -928,3 +928,59 @@ test("replayed history on resume does not arm a turn", async () => {
     await worker.close();
   }
 });
+
+// ── native-binary preflight surfaces through the command loop ────────────────
+// A broken/missing native `claude` binary must come back as an actionable error
+// response (not the cryptic `spawn Unknown system error -88`, and not a worker
+// crash). We force the preflight to inspect a non-existent path via the
+// CLAUDE_WORKER_CHECK_BINARY_PATH seam.
+
+const BROKEN_BINARY_ENV = {
+  // A path guaranteed not to exist: unique per run, and under a directory we
+  // never create (so statSync ENOENTs deterministically — no flakiness if some
+  // fixed name happened to exist).
+  CLAUDE_WORKER_CHECK_BINARY_PATH: path.join(
+    os.tmpdir(),
+    `sealwire-nx-${process.pid}-${Date.now()}`,
+    "claude",
+  ),
+};
+
+function isErrorResponseFor(id) {
+  return (event) =>
+    event.type === "response" && event.id === id && event.ok === false;
+}
+
+test("model/list emits an actionable error when the native binary is broken", async () => {
+  const worker = spawnWorker(BROKEN_BINARY_ENV);
+  try {
+    worker.send({ type: "model/list", id: "models-1", cwd: "/tmp" });
+    const res = await worker.waitFor(isErrorResponseFor("models-1"), {
+      label: "model/list error response",
+    });
+    assert.match(res.error.message, /@anthropic-ai\/claude-agent-sdk/);
+    assert.match(res.error.message, /npm/);
+    // Never leak the cryptic raw failure without guidance.
+    assert.doesNotMatch(res.error.message, /^Error: spawn Unknown system error/);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("start emits an actionable error (no crash) when the native binary is broken", async () => {
+  const worker = spawnWorker(BROKEN_BINARY_ENV);
+  try {
+    worker.send(START_DEFAULT);
+    const res = await worker.waitFor(isErrorResponseFor("start-1"), {
+      label: "start error response",
+    });
+    assert.match(res.error.message, /@anthropic-ai\/claude-agent-sdk/);
+    // The worker must still be alive and responsive afterwards.
+    worker.send({ type: "model/list", id: "models-2", cwd: "/tmp" });
+    await worker.waitFor(isErrorResponseFor("models-2"), {
+      label: "second error response (worker still alive)",
+    });
+  } finally {
+    await worker.close();
+  }
+});
