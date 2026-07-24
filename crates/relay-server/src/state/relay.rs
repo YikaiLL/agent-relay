@@ -266,6 +266,11 @@ pub struct RelayState {
     ///     may report a bumpable mtime → freeze-first (`seed_*`) to avoid creep.
     /// Persisted so the ordering survives a relay restart.
     pub(super) thread_last_activity_at: HashMap<String, u64>,
+    /// Persisted Projects (named session groupings), keyed by project id. Orthogonal
+    /// to `allowed_roots`/`path_scope` (access-control) — grouping metadata only.
+    pub(super) projects: HashMap<String, crate::protocol::ProjectView>,
+    /// Session (thread) -> project id membership. Absent = "Unassigned".
+    pub(super) thread_project_id: HashMap<String, String>,
     pub allowed_roots: Vec<String>,
     pub available_models: Vec<ModelOptionView>,
     pub device_records: HashMap<String, DeviceRecord>,
@@ -375,6 +380,8 @@ impl RelayState {
             provider_fork_capabilities: Vec::new(),
             provider_status_base: Vec::new(),
             thread_last_activity_at: HashMap::new(),
+            projects: HashMap::new(),
+            thread_project_id: HashMap::new(),
             allowed_roots: Vec::new(),
             available_models: Vec::new(),
             device_records: HashMap::new(),
@@ -654,6 +661,26 @@ impl RelayState {
                     .map(|thread| thread.cwd.clone())
                     .filter(|cwd| !cwd.is_empty())
             })
+    }
+
+    /// The project a thread belongs to, if any (`None` = "Unassigned").
+    pub(crate) fn project_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Option<&crate::protocol::ProjectView> {
+        let project_id = self.thread_project_id.get(thread_id)?;
+        self.projects.get(project_id)
+    }
+
+    /// The bound checkout cwd for a project on a given host, if recorded. Used as a
+    /// gap-filler when a session has no usable cwd of its own (see workspace_diff).
+    pub(crate) fn project_binding_cwd(&self, project_id: &str, host_id: &str) -> Option<String> {
+        self.projects
+            .get(project_id)?
+            .workspace_bindings
+            .iter()
+            .find(|binding| binding.host_id == host_id)
+            .map(|binding| binding.cwd.clone())
     }
 
     /// Whether the ACTIVE thread's agent is mid-turn per its provider-reported
@@ -2197,6 +2224,8 @@ impl RelayState {
             .or_insert(materialized);
         self.thread_forked_from = persisted.thread_forked_from.clone();
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
+        self.projects = persisted.projects.clone();
+        self.thread_project_id = persisted.thread_project_id.clone();
         self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
@@ -2902,6 +2931,8 @@ impl RelayState {
         }
         self.thread_forked_from = persisted.thread_forked_from.clone();
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
+        self.projects = persisted.projects.clone();
+        self.thread_project_id = persisted.thread_project_id.clone();
         self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
@@ -3465,6 +3496,56 @@ mod tests {
         );
         assert!(restored.workflow_run("r1").unwrap().error.is_some());
         assert_eq!(restored.workflow_run("r2").unwrap().status, RunStatus::Done);
+    }
+
+    #[test]
+    fn projects_persist_round_trip_and_pre_projects_files_still_load() {
+        use crate::protocol::{ProjectView, WorkspaceBinding};
+
+        let mut relay = test_relay();
+        relay.projects.insert(
+            "proj_a".to_string(),
+            ProjectView {
+                id: "proj_a".to_string(),
+                name: "Sealwire".to_string(),
+                workspace_bindings: vec![WorkspaceBinding {
+                    host_id: "LOCAL".to_string(),
+                    cwd: "/srv/sealwire".to_string(),
+                }],
+                instructions: None,
+            },
+        );
+        relay
+            .thread_project_id
+            .insert("thread-1".to_string(), "proj_a".to_string());
+
+        // Writer carries the new fields.
+        let persisted = PersistedRelayState::from_relay(&relay);
+        assert_eq!(persisted.projects.len(), 1);
+
+        // Restore preserves projects + membership, and the accessors work.
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        let project = restored
+            .project_for_thread("thread-1")
+            .expect("thread-1 maps to its project");
+        assert_eq!(project.name, "Sealwire");
+        assert_eq!(
+            restored.project_binding_cwd("proj_a", "LOCAL").as_deref(),
+            Some("/srv/sealwire"),
+        );
+        assert!(restored.project_for_thread("unknown-thread").is_none());
+
+        // Back-compat: a state file written before Projects (no keys) still loads,
+        // with empty maps.
+        let mut value = serde_json::to_value(&persisted).expect("serialize");
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("projects");
+        obj.remove("thread_project_id");
+        let legacy: PersistedRelayState =
+            serde_json::from_value(value).expect("pre-Projects state files must still load");
+        assert!(legacy.projects.is_empty());
+        assert!(legacy.thread_project_id.is_empty());
     }
 
     #[test]

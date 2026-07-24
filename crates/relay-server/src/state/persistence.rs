@@ -87,6 +87,14 @@ pub(super) struct PersistedRelayState {
     /// `#[serde(default)]` keeps old state files loadable (empty map).
     #[serde(default)]
     pub(super) push_subscriptions: std::collections::HashMap<String, Vec<super::PushSubscription>>,
+    /// Persisted Projects (named session groupings), keyed by project id.
+    /// `#[serde(default)]` keeps pre-Projects state files loadable (empty map).
+    #[serde(default)]
+    pub(super) projects: std::collections::HashMap<String, crate::protocol::ProjectView>,
+    /// Session (thread) -> project id membership. Absent id = "Unassigned".
+    /// `#[serde(default)]` keeps old state files loadable (empty map).
+    #[serde(default)]
+    pub(super) thread_project_id: std::collections::HashMap<String, String>,
 }
 
 impl PersistedRelayState {
@@ -143,6 +151,8 @@ impl PersistedRelayState {
             // `Interrupted` and offer a re-run, rather than vanishing on restart.
             workflow_jobs: relay.workflow_jobs.clone(),
             push_subscriptions: relay.push_subscriptions.clone(),
+            projects: relay.projects.clone(),
+            thread_project_id: relay.thread_project_id.clone(),
         }
     }
 

@@ -1606,6 +1606,30 @@ pub struct ThreadSummaryView {
     pub forked_from: Option<String>,
 }
 
+/// A checkout of a project on a specific relay *host*. `host_id` is the host axis
+/// (which machine the relay runs on; `LOCAL` for a single-relay setup) — distinct
+/// from the controller `device_id` used for access-control. Grouping metadata only;
+/// it never widens/narrows path scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceBinding {
+    pub host_id: String,
+    pub cwd: String,
+}
+
+/// A persisted, named grouping of sessions — the user-facing "Project". Orthogonal
+/// to `path_scope`/`allowed_roots` (which stay access-control). A session's
+/// membership is stored separately (`thread_project_id`) so it can be null
+/// ("Unassigned") without touching every thread row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectView {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub workspace_bindings: Vec<WorkspaceBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
 /// What a provider's bridge can actually do when forking. The client used to
 /// infer this from provider NAMES, which silently mislabels any bridge without
 /// a native fork (the default trait impl replays) and cannot know that Codex

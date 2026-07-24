@@ -85,6 +85,8 @@ fn test_persisted_state() -> PersistedRelayState {
         thread_forked_from: Default::default(),
         thread_promoted_from: Default::default(),
         push_subscriptions: std::collections::HashMap::new(),
+        projects: Default::default(),
+        thread_project_id: Default::default(),
     }
 }
 
