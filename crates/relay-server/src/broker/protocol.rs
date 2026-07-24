@@ -127,6 +127,10 @@ pub(super) enum OutboundBrokerPayload {
         /// `RemoteActionResultPlaintext` wholesale and always carried it — so a phone's
         /// reuse picker in "Request review" showed no existing reviewers while local did.
         reviews: Option<crate::protocol::ReviewsResponse>,
+        /// The `fetch_projects` payload (project list + membership + revision). Same
+        /// plaintext-vs-sealed asymmetry as `reviews` above — must be copied in the
+        /// plaintext path or the remote Projects view silently sees nothing.
+        projects: Option<crate::protocol::ProjectsResponse>,
         ask_user_question_detail: Option<AskUserQuestionDetailResponse>,
         error: Option<String>,
     },

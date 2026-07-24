@@ -325,6 +325,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        projects: None,
         ask_user_question_detail: None,
         session_claim: None,
         session_claim_expires_at: None,
@@ -358,6 +359,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        projects: None,
         ask_user_question_detail: None,
         session_claim: Some("claim-1".to_string()),
         session_claim_expires_at: Some(123),
@@ -456,6 +458,8 @@ fn remote_action_result_size_breakdown_reports_large_thread_transcript_payloads(
         None,
         // reviews
         None,
+        // projects
+        None,
         None,
         None,
         None,
@@ -505,6 +509,7 @@ fn make_large_thread_transcript_plaintext() -> RemoteActionResultPlaintext {
         }),
         workspace_diff: None,
         reviews: None,
+        projects: None,
         ask_user_question_detail: None,
         session_claim: None,
         session_claim_expires_at: None,
@@ -531,6 +536,7 @@ fn make_large_ask_user_detail_plaintext() -> RemoteActionResultPlaintext {
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        projects: None,
         ask_user_question_detail: Some(AskUserQuestionDetailResponse {
             request: AskUserQuestionRequestView::with_inline_questions(
                 "ask:large".to_string(),
@@ -666,6 +672,32 @@ fn fetch_reviews_action_round_trips_and_is_not_claim_gated() {
     match request.bind_device("device-7".to_string()) {
         RemoteActionRequest::FetchReviews { device_id } => {
             assert_eq!(device_id.as_deref(), Some("device-7"));
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+}
+
+#[test]
+fn fetch_projects_action_round_trips_and_is_not_claim_gated() {
+    // The dedicated Projects read channel for remote (mirrors fetch_reviews): read-only,
+    // parses from `{}`, binds the device, is NOT claim-gated, and routes to the data
+    // (transcript-result) kind so its `projects` payload rides the plaintext path.
+    let request: RemoteActionRequest =
+        serde_json::from_value(serde_json::json!({ "type": "fetch_projects" }))
+            .expect("fetch_projects should parse");
+    assert_eq!(request.kind(), RemoteActionKind::FetchProjects);
+    assert_eq!(RemoteActionKind::FetchProjects.as_str(), "fetch_projects");
+    assert!(
+        !requires_session_claim(RemoteActionKind::FetchProjects),
+        "listing projects is read-only and must not require session control"
+    );
+    assert!(matches!(
+        remote_action_result_kind(RemoteActionKind::FetchProjects),
+        RemoteActionResultKind::RemoteTranscriptResult
+    ));
+    match request.bind_device("device-11".to_string()) {
+        RemoteActionRequest::FetchProjects { device_id } => {
+            assert_eq!(device_id.as_deref(), Some("device-11"));
         }
         other => panic!("unexpected bound request: {other:?}"),
     }
@@ -843,6 +875,7 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         reviews: Some(reviews),
+        projects: None,
         ask_user_question_detail: None,
         session_claim: None,
         session_claim_expires_at: None,
