@@ -174,6 +174,30 @@ function ThreadDrawer() {
         id: "go-console-home-sidebar",
         type: "button",
       }, "Back to console"),
+      // Group the sidebar by cwd folders (Sessions) or by Project. Behavior is wired
+      // imperatively in app.js by these ids (like the refresh button above).
+      h(
+        "div",
+        { className: "thread-view-toggle", role: "group", "aria-label": "Group sessions by" },
+        h(
+          "button",
+          {
+            className: "thread-view-toggle-button is-active",
+            id: "threads-view-sessions",
+            type: "button",
+          },
+          "Sessions"
+        ),
+        h(
+          "button",
+          {
+            className: "thread-view-toggle-button",
+            id: "threads-view-projects",
+            type: "button",
+          },
+          "Projects"
+        )
+      ),
       h(
         "div",
         {

@@ -136,7 +136,10 @@ import {
   createThreadListStore,
   readThreadListContextMenu,
   readThreadListUi,
+  readThreadListViewMode,
 } from "./shared/thread-list-store.js";
+import { createProjectsStore } from "./shared/projects-store.js";
+import { fetchProjectsPayload } from "./local/project-actions.js";
 import { installThreadListWheelProxy } from "./shared/thread-list-scroll.js";
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
@@ -259,6 +262,8 @@ const state = {
     fields: null,
   },
   threadGroups: [],
+  projects: [],
+  threadProjectId: {},
   threadHistoryScrollTop: 0,
   threadListStore: createThreadListStore(),
   localUiStore: createLocalUiStore(),
@@ -286,6 +291,22 @@ const workspaceDiffStore = createWorkspaceDiffStore({
   // Reset identity = viewed thread + its cwd, so a same-thread cwd change also
   // clears the stale diff during loading (not just a thread switch).
   getWorkspaceKey: () => JSON.stringify([viewedThreadId() || "", state.session?.current_cwd || ""]),
+});
+// Projects ride a dedicated channel off the byte-budgeted snapshot; this store fetches
+// the payload when `projects_revision` changes (see createProjectsStore) and feeds it
+// into state so the sidebar can group by Project.
+const projectsStore = createProjectsStore({
+  fetchProjects: () => fetchProjectsPayload(apiFetch),
+});
+projectsStore.subscribe((projectsState) => {
+  state.projects = projectsState.projects;
+  state.threadProjectId = projectsState.threadProjectId;
+  // Re-render only when the Projects view is showing. `renderThreads` is a module
+  // const defined below; this callback only ever fires asynchronously (after a fetch
+  // resolves), by which point it is initialized.
+  if (readThreadListViewMode(state.threadListStore) === "projects") {
+    renderThreads();
+  }
 });
 let clientLogRootHandle = null;
 let clientLogRootElement = null;
@@ -399,6 +420,9 @@ let lastWorkspaceCwd = null;
 let lastViewThreadId = null;
 window.addEventListener("agent-relay:session-updated", () => {
   refreshWorkspaceDiffIfChanged();
+  // Fetch the dedicated Projects payload when the snapshot's revision changes (a
+  // no-op otherwise; unconditional on the first observation).
+  projectsStore.syncToRevision(state.session?.projects_revision || 0);
 });
 function refreshWorkspaceDiffIfChanged() {
   const session = state.session;
@@ -990,6 +1014,23 @@ function openSecurityModal() {
 openSecurityModalBtn?.addEventListener("click", openSecurityModal);
 openSecurityConsoleButton?.addEventListener("click", openSecurityModal);
 openSecurityHeaderButton?.addEventListener("click", openSecurityModal);
+
+// Sessions/Projects sidebar grouping toggle (static-shell buttons wired by id).
+const threadsViewSessionsButton = document.getElementById("threads-view-sessions");
+const threadsViewProjectsButton = document.getElementById("threads-view-projects");
+function setThreadViewMode(mode) {
+  const isProjects = mode === "projects";
+  state.threadListStore.getState().setViewMode(isProjects ? "projects" : "sessions");
+  threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
+  threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
+  // Ensure the Projects payload is loaded when switching in (no-op if already current).
+  if (isProjects) {
+    projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  }
+  renderThreads();
+}
+threadsViewSessionsButton?.addEventListener("click", () => setThreadViewMode("sessions"));
+threadsViewProjectsButton?.addEventListener("click", () => setThreadViewMode("projects"));
 
 closeSecurityModalBtn?.addEventListener("click", () => {
   securityModal?.close();

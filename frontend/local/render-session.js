@@ -39,6 +39,7 @@ import React from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
+  buildNavigationThreadGroups,
   canonicalizeWorkspace,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
@@ -48,6 +49,7 @@ import { canForkInSession } from "../shared/fork-fields.js";
 import {
   readThreadListContextMenu,
   readThreadListUi,
+  readThreadListViewMode,
 } from "../shared/thread-list-store.js";
 import {
   readLocalUiState,
@@ -1451,12 +1453,24 @@ export function createSessionRenderer({
       openCtxThreadId = readThreadListContextMenu(state.threadListStore).threadId;
     }
 
-    const groups = state.threadGroups || [];
+    // Group by Project when the sidebar is in Projects mode; otherwise by cwd/folder.
+    // `state.threadGroups` stays the cwd grouping (the source of `state.threads`);
+    // project groups are derived on the fly from the flat list + the fetched Projects.
+    const viewMode = readThreadListViewMode(state.threadListStore);
+    const groupBy = viewMode === "projects" ? "project" : "cwd";
+    const groups =
+      viewMode === "projects"
+        ? buildNavigationThreadGroups(state.threads, {
+            groupBy: "project",
+            projects: state.projects || [],
+            threadProjectId: state.threadProjectId || {},
+          })
+        : state.threadGroups || [];
     const totalThreads = state.threads.length;
 
     renderWorkspaceSuggestions(state.session);
-    threadsCount.textContent = summarizeThreadGroups(groups);
-    threadsCount.title = groups.map((group) => group.cwd).join("\n");
+    threadsCount.textContent = summarizeThreadGroups(groups, { groupBy });
+    threadsCount.title = groups.map((group) => group.cwd || group.label).join("\n");
     resumeLatestButton.disabled = totalThreads === 0;
 
     renderReactContent(
@@ -1486,8 +1500,9 @@ export function createSessionRenderer({
         onSelectWorkspace(cwd) {
           // Defence in depth: the Unknown-workspace header is not rendered as a
           // button, but this value ends up in the workspace input verbatim, so
-          // refuse the display sentinel here too.
-          if (isUnknownWorkspace(cwd)) return;
+          // refuse the display sentinel here too. Project group headers carry an
+          // empty cwd — they're not workspaces, so ignore them as well.
+          if (!cwd || isUnknownWorkspace(cwd)) return;
           setSelectedCwd(cwd || "");
           renderThreads();
           renderOverviewState(state.session);
