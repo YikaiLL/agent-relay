@@ -3810,9 +3810,9 @@ body.is-resizing-panel {
   border-radius: 999px;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-style: italic;
-  line-height: 1;
+  line-height: var(--leading-none);
   cursor: pointer;
 }
 .reviewer-job-info:hover,
