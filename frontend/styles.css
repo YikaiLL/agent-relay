@@ -1199,6 +1199,15 @@ input:focus, textarea:focus, select:focus {
   font-style: italic;
 }
 
+/* Fail-closed note shown in place of Project buttons while the payload is
+   pending/failed/not-yet-loaded — non-interactive, muted. */
+.context-menu-note {
+  margin: 2px 0;
+  padding: 6px 10px;
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}
+
 /* Projects toolbar (create a Project) — shown only in the Projects view. */
 .projects-toolbar {
   display: flex;

@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildProjectMenuItems, pickNewProjectId, normalizeProjectName } from "./project-menu.js";
+import {
+  buildProjectMenuItems,
+  pickNewProjectId,
+  normalizeProjectName,
+  projectsMenuReady,
+  projectMenuActionAllowed,
+} from "./project-menu.js";
 
 test("buildProjectMenuItems: unassigned thread → assign options + create, no unassign", () => {
   const items = buildProjectMenuItems({
@@ -72,4 +78,52 @@ test("normalizeProjectName: trims, rejects blank/null", () => {
   assert.equal(normalizeProjectName(""), null);
   assert.equal(normalizeProjectName(null), null);
   assert.equal(normalizeProjectName(undefined), null);
+});
+
+test("projectsMenuReady: only fresh Projects state enables mutation controls (fail closed)", () => {
+  assert.equal(
+    projectsMenuReady({ projectsLoaded: true, projectsError: null, projectsLoading: false }),
+    true,
+    "loaded, no error, settled → controls enabled"
+  );
+  assert.equal(
+    projectsMenuReady({ projectsLoaded: false, projectsError: null, projectsLoading: false }),
+    false,
+    "before the first successful load"
+  );
+  assert.equal(
+    projectsMenuReady({ projectsLoaded: true, projectsError: "boom", projectsLoading: false }),
+    false,
+    "after an error (even if previously loaded)"
+  );
+  assert.equal(
+    projectsMenuReady({ projectsLoaded: true, projectsError: null, projectsLoading: true }),
+    false,
+    "while a newer-revision refresh is pending"
+  );
+  assert.equal(projectsMenuReady(), false, "missing state → fail closed");
+});
+
+test("projectMenuActionAllowed: a button built from stale Project state cannot execute", () => {
+  const fresh = { projectsLoaded: true, projectsError: null, projectsLoading: false };
+  assert.equal(
+    projectMenuActionAllowed({ builtSeq: 5, currentSeq: 5, ...fresh }),
+    true,
+    "same seq + fresh → allowed"
+  );
+  assert.equal(
+    projectMenuActionAllowed({ builtSeq: 5, currentSeq: 6, ...fresh }),
+    false,
+    "the state changed since the button was built (newer revision) → refused"
+  );
+  assert.equal(
+    projectMenuActionAllowed({ builtSeq: 5, currentSeq: 5, projectsLoaded: true, projectsError: "boom", projectsLoading: false }),
+    false,
+    "same seq but state no longer trustworthy → refused"
+  );
+  assert.equal(
+    projectMenuActionAllowed({ builtSeq: 5, currentSeq: 5, projectsLoaded: true, projectsError: null, projectsLoading: true }),
+    false,
+    "same seq but a refresh is pending → refused"
+  );
 });

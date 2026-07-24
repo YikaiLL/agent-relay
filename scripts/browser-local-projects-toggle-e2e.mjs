@@ -292,6 +292,7 @@ async function main() {
     let assignConfirmed = null;
     let currentMarked = false;
     let unassignConfirmed = "unset";
+    let menuCreateAssign = null;
     // Right-click a session row to open its context menu, then read the Project buttons.
     const openThreadMenu = async (tid) => {
       const target = crudPage.locator(`#threads-list [data-thread-id="${tid}"]`);
@@ -349,6 +350,20 @@ async function main() {
       await openThreadMenu(threadId);
       await clickProjectButton({ includes: "Remove from project" });
       unassignConfirmed = await waitForMembership(relayPort, threadId, null);
+
+      // Combined "New project…" (create + assign in one click) from the context menu.
+      await openThreadMenu(threadId);
+      nextPrompt = "UiMenuProj";
+      await clickProjectButton({ includes: "New project" });
+      for (let i = 0; i < 100; i += 1) {
+        const data = await api(relayPort, "GET", "/api/projects");
+        const proj = data.projects.find((p) => p.name === "UiMenuProj");
+        if (proj && data.thread_project_id[threadId] === proj.id) {
+          menuCreateAssign = proj.id;
+          break;
+        }
+        await delay(150);
+      }
     } catch (crudError) {
       const dbg = await crudPage
         .evaluate((tid) => ({
@@ -367,6 +382,92 @@ async function main() {
       await crudPage.close();
     }
 
+    // Probe (menu fail-closed): with GET /api/projects forced to fail, the context
+    // menu — even in Sessions mode — must expose NO actionable Project buttons, only a
+    // non-interactive "Projects unavailable" note. Otherwise it would falsely imply the
+    // session belongs to no project / that no projects exist.
+    const menuFailPage = await context.newPage();
+    await menuFailPage.route("**/api/projects*", (route) => {
+      if (route.request().method() === "GET") {
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ ok: false, error: { message: "boom" } }) });
+      }
+      return route.continue();
+    });
+    await menuFailPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await menuFailPage.evaluate(() => {
+      const drawer = document.querySelector(".sidebar-drawer");
+      if (drawer && !drawer.open) drawer.open = true;
+    });
+    // Stay in Sessions mode (default); the session row is grouped by folder.
+    const menuFailTarget = menuFailPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
+    await menuFailTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
+    await menuFailTarget.scrollIntoViewIfNeeded({ timeout: TIMEOUT_MS });
+    await menuFailTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+    await menuFailPage.waitForFunction(() => {
+      const menu = document.querySelector("#thread-context-menu");
+      const note = document.querySelector("#thread-project-actions .context-menu-note");
+      return menu && !menu.hidden && !!note;
+    }, null, { timeout: TIMEOUT_MS });
+    const menuFailClosed = await menuFailPage.evaluate(() => ({
+      buttonCount: document.querySelectorAll("#thread-project-actions button").length,
+      note: document.querySelector("#thread-project-actions .context-menu-note")?.textContent?.trim() || null,
+      sessionsActive: document.querySelector("#threads-view-sessions")?.classList.contains("is-active") || false,
+    }));
+    await menuFailPage.close();
+
+    // Probe (open menu goes stale): with the menu OPEN over valid data, a newer
+    // revision whose fetch is still in flight must withdraw the actionable buttons
+    // (repopulate to a fail-closed note) rather than leave stale assign/unassign
+    // controls exposed.
+    const staleMenuPage = await context.newPage();
+    let holdMenuRefresh = false;
+    let releaseMenuRefresh;
+    const menuRefreshGate = new Promise((resolve) => {
+      releaseMenuRefresh = resolve;
+    });
+    await staleMenuPage.route("**/api/projects*", async (route) => {
+      if (route.request().method() === "GET" && holdMenuRefresh) {
+        await menuRefreshGate;
+      }
+      return route.continue();
+    });
+    await staleMenuPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await staleMenuPage.evaluate(() => {
+      const drawer = document.querySelector(".sidebar-drawer");
+      if (drawer && !drawer.open) drawer.open = true;
+    });
+    const staleTarget = staleMenuPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
+    await staleTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
+    await staleTarget.scrollIntoViewIfNeeded({ timeout: TIMEOUT_MS });
+    await staleTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+    // Menu open with actionable buttons (valid data).
+    await staleMenuPage.waitForFunction(
+      () => {
+        const menu = document.querySelector("#thread-context-menu");
+        return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0;
+      },
+      null,
+      { timeout: TIMEOUT_MS }
+    );
+    // Arm the gate, bump the revision → the in-flight refresh is held pending.
+    holdMenuRefresh = true;
+    await api(relayPort, "POST", "/api/projects", { action: "create", name: "StaleBump" });
+    await staleMenuPage.waitForFunction(
+      () =>
+        document.querySelectorAll("#thread-project-actions button").length === 0 &&
+        !!document.querySelector("#thread-project-actions .context-menu-note"),
+      null,
+      { timeout: TIMEOUT_MS }
+    );
+    const staleMenu = await staleMenuPage.evaluate(() => ({
+      buttonCount: document.querySelectorAll("#thread-project-actions button").length,
+      note: document.querySelector("#thread-project-actions .context-menu-note")?.textContent?.trim() || null,
+      menuOpen: !document.querySelector("#thread-context-menu")?.hidden,
+    }));
+    releaseMenuRefresh();
+    holdMenuRefresh = false;
+    await staleMenuPage.close();
+
     console.log(
       JSON.stringify(
         {
@@ -379,7 +480,9 @@ async function main() {
           failClosed,
           gatePending,
           gateResolved,
-          crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed },
+          crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign },
+          menuFailClosed,
+          staleMenu,
         },
         null,
         2
@@ -419,6 +522,17 @@ async function main() {
     assert.ok(assignConfirmed, "assigning via the context menu recorded membership server-side");
     assert.ok(currentMarked, "the assigned project is marked current (✓) in the UI on reopen");
     assert.equal(unassignConfirmed, null, "removing via the context menu cleared membership server-side");
+    assert.ok(menuCreateAssign, "the context menu 'New project…' both creates the project and assigns the session");
+
+    // Menu fail-closed: no actionable Project controls while the payload is unavailable.
+    assert.equal(menuFailClosed.sessionsActive, true, "menu fail-closed probe stays in Sessions mode");
+    assert.equal(menuFailClosed.buttonCount, 0, `no Project mutation buttons while the fetch is failing: ${menuFailClosed.buttonCount}`);
+    assert.match(menuFailClosed.note || "", /Projects unavailable|Loading projects/, `a fail-closed note replaces the controls: ${menuFailClosed.note}`);
+
+    // Open menu goes stale: a held newer-revision refresh withdraws the buttons.
+    assert.equal(staleMenu.buttonCount, 0, `an open menu withdraws its buttons on a pending newer-revision refresh: ${staleMenu.buttonCount}`);
+    assert.match(staleMenu.note || "", /Loading projects/, `the open menu falls closed to a loading note: ${staleMenu.note}`);
+    assert.ok(staleMenu.menuOpen, "the menu stays open while its controls are withdrawn (not silently closed)");
 
     console.log("PROJECTS_TOGGLE_E2E: PASS");
   } catch (error) {

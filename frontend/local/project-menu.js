@@ -53,3 +53,30 @@ export function normalizeProjectName(raw) {
   const name = String(raw).trim();
   return name || null;
 }
+
+/**
+ * Whether the Projects payload is fresh enough to present membership + mutation
+ * controls. The context menu mirrors the sidebar's fail-closed rule: false while a
+ * fetch is pending, after an error, or before the first successful load — so we never
+ * expose stale/unknown assign/unassign controls or a wrong "current" marker.
+ */
+export function projectsMenuReady({ projectsLoaded, projectsError, projectsLoading } = {}) {
+  return Boolean(projectsLoaded) && !projectsError && !projectsLoading;
+}
+
+/**
+ * Whether a context-menu Project action may execute. The clicked button captured the
+ * Projects-state sequence token when it was built; the action runs only if that token
+ * still matches the current one (no transition since) AND the state is fresh. This is
+ * the execution-time guard that stops a button built from now-stale Project state from
+ * overwriting newer membership, even in the tiny window between click and handler.
+ */
+export function projectMenuActionAllowed({
+  builtSeq,
+  currentSeq,
+  projectsLoaded,
+  projectsError,
+  projectsLoading,
+} = {}) {
+  return builtSeq === currentSeq && projectsMenuReady({ projectsLoaded, projectsError, projectsLoading });
+}

@@ -148,7 +148,13 @@ import {
   assignThreadToProject,
   unassignThread,
 } from "./local/project-actions.js";
-import { buildProjectMenuItems, pickNewProjectId, normalizeProjectName } from "./local/project-menu.js";
+import {
+  buildProjectMenuItems,
+  pickNewProjectId,
+  normalizeProjectName,
+  projectsMenuReady,
+  projectMenuActionAllowed,
+} from "./local/project-menu.js";
 import { installThreadListWheelProxy } from "./shared/thread-list-scroll.js";
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
@@ -310,18 +316,30 @@ const workspaceDiffStore = createWorkspaceDiffStore({
 const projectsStore = createProjectsStore({
   fetchProjects: () => fetchProjectsPayload(apiFetch),
 });
+// Monotonic token bumped on every Projects-store transition. A context-menu button
+// captures the token at build time; runThreadProjectAction() refuses to act if it has
+// since advanced, so a button built from now-stale Project state can't mutate.
+let projectsStateSeq = 0;
 projectsStore.subscribe((projectsState) => {
   state.projects = projectsState.projects;
   state.threadProjectId = projectsState.threadProjectId;
   state.projectsLoading = projectsState.loading;
   state.projectsError = projectsState.error;
   state.projectsLoaded = projectsState.loaded;
+  projectsStateSeq += 1;
   // Re-render on ANY change (loading/loaded/error transitions) while the Projects
   // view is showing, so its loading/error placeholder resolves to the grouping.
   // `renderThreads` is a module const defined below; this callback only ever fires
   // asynchronously (after a fetch settles), by which point it is initialized.
   if (readThreadListViewMode(state.threadListStore) === "projects") {
     renderThreads();
+  }
+  // Keep an OPEN context menu's Project section in sync regardless of view mode —
+  // a settled refresh/failure must repopulate (fresh membership) or fall closed
+  // (loading/error note) rather than leave stale assign/unassign controls exposed.
+  const openContextThreadId = readThreadListContextMenu(state.threadListStore).threadId;
+  if (openContextThreadId && threadContextMenu && !threadContextMenu.hidden) {
+    populateThreadProjectActions(openContextThreadId);
   }
 });
 let clientLogRootHandle = null;
@@ -1078,9 +1096,26 @@ projectsCreateButton?.addEventListener("click", () => {
 });
 
 // Run one context-menu Project action for a thread (assign / unassign / new+assign).
-async function runThreadProjectAction(threadId, item) {
+// `builtSeq` is the projectsStateSeq captured when the clicked button was built.
+async function runThreadProjectAction(threadId, item, builtSeq) {
   closeThreadContextMenu();
   if (!threadId || !item) {
+    return;
+  }
+  // Execution-time freshness guard: refuse to act on a button built from Project state
+  // that has since changed or is no longer trustworthy (a newer revision arrived, or a
+  // refresh is pending/failed). Otherwise a stale button could overwrite newer
+  // membership. The user reopens the menu to act on current state.
+  if (
+    !projectMenuActionAllowed({
+      builtSeq,
+      currentSeq: projectsStateSeq,
+      projectsLoaded: state.projectsLoaded,
+      projectsError: state.projectsError,
+      projectsLoading: state.projectsLoading,
+    })
+  ) {
+    logLine("Projects changed — reopen the menu to change membership.");
     return;
   }
   try {
@@ -1126,6 +1161,24 @@ function populateThreadProjectActions(threadId) {
     return;
   }
   threadProjectActions.textContent = ""; // drop prior buttons (and their listeners)
+  // Fail closed: mirror the sidebar renderer — never present Project membership or
+  // mutation controls as authoritative unless we hold a current payload. During a
+  // pending/failed/first-load fetch, show a non-interactive note instead of buttons
+  // (which would falsely imply "no projects / not a member" or expose stale controls).
+  if (
+    !projectsMenuReady({
+      projectsLoaded: state.projectsLoaded,
+      projectsError: state.projectsError,
+      projectsLoading: state.projectsLoading,
+    })
+  ) {
+    const note = document.createElement("p");
+    note.className = "context-menu-note";
+    note.textContent = state.projectsError ? "Projects unavailable" : "Loading projects…";
+    threadProjectActions.appendChild(note);
+    return;
+  }
+  const builtSeq = projectsStateSeq; // freshness token for this build
   const currentProjectId = state.threadProjectId?.[threadId] || null;
   const items = buildProjectMenuItems({ projects: state.projects || [], currentProjectId });
   for (const item of items) {
@@ -1141,7 +1194,7 @@ function populateThreadProjectActions(threadId) {
     }
     button.textContent = item.isCurrent ? `✓ ${item.label}` : item.label;
     button.addEventListener("click", () => {
-      void runThreadProjectAction(threadId, item);
+      void runThreadProjectAction(threadId, item, builtSeq);
     });
     threadProjectActions.appendChild(button);
   }
