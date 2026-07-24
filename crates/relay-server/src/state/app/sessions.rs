@@ -2,6 +2,14 @@ use super::*;
 
 impl AppState {
     pub async fn start_session(&self, input: StartSessionInput) -> Result<SessionSnapshot, String> {
+        self.start_session_with_images(input, Vec::new()).await
+    }
+
+    pub async fn start_session_with_images(
+        &self,
+        input: StartSessionInput,
+        images: Vec<ProviderImage>,
+    ) -> Result<SessionSnapshot, String> {
         let device_id = require_device_id(input.device_id)?;
         // Hold the session guard for the whole start (incl. the optional initial
         // turn below), so a review can't interleave.
@@ -34,13 +42,22 @@ impl AppState {
             .unwrap_or(defaults.reasoning_effort);
         let initial_prompt = non_empty(input.initial_prompt);
 
+        // Providers that consume an initial prompt as part of thread creation
+        // cannot consume image attachments through `start_thread`. When images
+        // are present, create an empty thread and send the complete first turn
+        // through the image-aware `start_turn` path below.
+        let provider_initial_prompt = if images.is_empty() {
+            initial_prompt.as_deref()
+        } else {
+            None
+        };
         let start_result = bridge
             .start_thread(
                 &cwd,
                 &model,
                 &approval_policy,
                 &sandbox,
-                initial_prompt.as_deref(),
+                provider_initial_prompt,
             )
             .await?;
         let consumed_initial_prompt = start_result.consumed_initial_prompt;
@@ -102,16 +119,19 @@ impl AppState {
             relay.notify();
         }
 
-        if let Some(initial_prompt) = initial_prompt.filter(|_| !consumed_initial_prompt) {
+        if !consumed_initial_prompt && (initial_prompt.is_some() || !images.is_empty()) {
             // Slot-free: `start_session` already holds the session guard.
             return self
-                .send_message_inner(SendMessageInput {
-                    text: initial_prompt,
-                    model: Some(model),
-                    effort: Some(effort),
-                    device_id: Some(device_id),
-                    thread_id: started_thread_id,
-                })
+                .send_message_inner_with_images(
+                    SendMessageInput {
+                        text: initial_prompt.unwrap_or_default(),
+                        model: Some(model),
+                        effort: Some(effort),
+                        device_id: Some(device_id),
+                        thread_id: started_thread_id,
+                    },
+                    &images,
+                )
                 .await;
         }
 

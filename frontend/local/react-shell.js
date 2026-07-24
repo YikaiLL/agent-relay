@@ -141,6 +141,10 @@ function LaunchStartSessionDialog({ launchModel, onLaunchFieldChange }) {
     workspaceInputId: "cwd-input",
     suggestionsListId: "workspace-suggestions",
     startButtonId: "start-session-button",
+    initialPromptAttachmentsId: "start-prompt-attachments",
+    labels: {
+      initialPromptPlaceholder: "Optional first task. Paste an image to attach it.",
+    },
     settingsPrefix: "",
     directoryFormId: "directory-form",
     loadButtonId: "load-directory-button",

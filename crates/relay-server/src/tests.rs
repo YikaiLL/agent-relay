@@ -415,6 +415,26 @@ fn local_message_images_are_validated_and_canonicalized() {
 }
 
 #[test]
+fn local_start_session_accepts_images_without_changing_the_shared_start_input() {
+    let input: LocalStartSessionInput = serde_json::from_value(serde_json::json!({
+        "cwd": "/tmp/project",
+        "initial_prompt": null,
+        "model": "gpt-test",
+        "approval_policy": "untrusted",
+        "sandbox": "workspace-write",
+        "effort": "medium",
+        "device_id": "device-1",
+        "provider": "codex",
+        "images": [{ "data_url": "data:image/png;base64,iVBORw0KGgo=" }]
+    }))
+    .expect("the local start request should accept image attachments");
+
+    assert_eq!(input.session.cwd.as_deref(), Some("/tmp/project"));
+    assert!(input.session.initial_prompt.is_none());
+    assert_eq!(input.images.len(), 1);
+}
+
+#[test]
 fn local_message_images_reject_spoofed_content_and_unsupported_types() {
     let spoofed = BASE64_STANDARD.encode(b"not a png");
     let error = parse_local_message_images(vec![LocalImageInput {

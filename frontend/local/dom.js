@@ -46,6 +46,7 @@ export const launchSettingsModal = document.querySelector("#launch-settings-moda
 export const closeLaunchSettingsModalButton = document.querySelector("#close-launch-settings-modal");
 export const cwdInput = document.querySelector("#cwd-input");
 export const startPromptInput = document.querySelector("#start-prompt");
+export const startPromptAttachments = document.querySelector("#start-prompt-attachments");
 export const providerInput = document.querySelector("#provider-input");
 export const modelInput = document.querySelector("#model-input");
 export const modelInputLabel = document.querySelector("#model-input-label");

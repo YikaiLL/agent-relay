@@ -115,6 +115,14 @@ struct LocalSendMessageInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct LocalStartSessionInput {
+    #[serde(flatten)]
+    session: StartSessionInput,
+    #[serde(default)]
+    images: Vec<LocalImageInput>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LocalImageInput {
     data_url: String,
 }
@@ -201,7 +209,10 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             post(delete_thread_permanently),
         )
         .route("/api/file-changes/:item_id/apply", post(apply_file_change))
-        .route("/api/session/start", post(start_session))
+        .route(
+            "/api/session/start",
+            post(start_session).layer(DefaultBodyLimit::max(MAX_LOCAL_MESSAGE_BODY_BYTES)),
+        )
         .route("/api/session/fork", post(fork_session))
         .route("/api/session/resume", post(resume_session))
         .route("/api/session/settings", post(update_session_settings))
@@ -643,12 +654,13 @@ async fn start_session(
     State(context): State<AppContext>,
     headers: HeaderMap,
     uri: Uri,
-    Json(input): Json<StartSessionInput>,
+    Json(input): Json<LocalStartSessionInput>,
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
+    let images = parse_local_message_images(input.images).map_err(bad_request)?;
     context
         .app
-        .start_session(input)
+        .start_session_with_images(input.session, images)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(compact_local_snapshot(snapshot))))
         .map_err(|error| classify_session_error(error))

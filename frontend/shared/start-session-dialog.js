@@ -6,6 +6,7 @@ const h = React.createElement;
 export function StartSessionDialog({
   id,
   cwd,
+  labels = {},
   onCwdChange,
   fields,
   onFieldChange,
@@ -21,6 +22,7 @@ export function StartSessionDialog({
   suggestionsListId,
   startButtonId,
   settingsPrefix,
+  initialPromptAttachmentsId,
   hideWorkspace,
   directoryFormId,
   loadButtonId,
@@ -106,7 +108,7 @@ export function StartSessionDialog({
       h(SessionSettingsFields, {
         fields: fields || {},
         idPrefix: settingsPrefix ?? id,
-        labels: {},
+        labels,
         model: {
           approvalOptions: approvalOptions || [],
           effortOptions: effortOptions || [],
@@ -114,6 +116,14 @@ export function StartSessionDialog({
           providerOptions: providerOptions || [],
         },
         onFieldChange,
+        initialPromptAccessory: initialPromptAttachmentsId
+          ? h("div", {
+              "aria-live": "polite",
+              className: "composer-attachments start-session-attachments",
+              hidden: true,
+              id: initialPromptAttachmentsId,
+            })
+          : null,
       }),
       modelsStatus === "loading" || modelsStatus === "error"
         ? h(

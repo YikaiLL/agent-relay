@@ -7,6 +7,7 @@ const h = React.createElement;
 export function SessionSettingsFields({
   fields = {},
   idPrefix = "remote",
+  initialPromptAccessory = null,
   labels = {},
   model = {},
   onFieldChange = null,
@@ -71,7 +72,8 @@ export function SessionSettingsFields({
         // Local launch flow relies on this (it reads .value at submit time via the
         // document-level event listener pipeline).
         value: fields.initialPrompt ?? undefined,
-      })
+      }),
+      initialPromptAccessory
     )
   );
 }

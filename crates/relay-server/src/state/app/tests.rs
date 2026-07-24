@@ -1290,6 +1290,41 @@ mod path_scope_tests {
     }
 
     #[tokio::test]
+    async fn image_only_start_session_sends_the_image_in_the_first_provider_turn() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, _claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+        let image = ProviderImage {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+
+        let snapshot = app
+            .start_session_with_images(
+                StartSessionInput {
+                    cwd: Some(cwd.to_string()),
+                    initial_prompt: None,
+                    model: Some("codex-model".to_string()),
+                    approval_policy: None,
+                    sandbox: None,
+                    effort: None,
+                    device_id: Some("device-1".to_string()),
+                    provider: Some("codex".to_string()),
+                },
+                vec![image.clone()],
+            )
+            .await
+            .expect("local start should forward images in its first turn");
+
+        let thread_id = snapshot
+            .active_thread_id
+            .expect("the new thread should be active");
+        assert_eq!(*codex.turn_thread_ids.lock().await, vec![thread_id]);
+        assert_eq!(*codex.turn_images.lock().await, vec![vec![image]]);
+    }
+
+    #[tokio::test]
     async fn image_only_message_is_accepted_and_forwarded_to_the_provider() {
         let project = TempDir::new().expect("project tempdir");
         let cwd = project.path().to_str().unwrap();
