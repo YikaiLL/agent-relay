@@ -901,3 +901,65 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         "the device needs the reviewer threads to populate the reuse picker"
     );
 }
+
+#[test]
+fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
+    // Same plaintext-vs-sealed asymmetry as reviews (above): fetch_projects computes the
+    // full ProjectsResponse server-side, but the PLAINTEXT transcript-kind envelope only
+    // carries it if build_plain_remote_action_result_payload copies the new field. Guard
+    // the silent-drop trap so the remote Projects view isn't empty on small workspaces.
+    let mut thread_project_id = std::collections::HashMap::new();
+    thread_project_id.insert("thread-1".to_string(), "proj-1".to_string());
+    let projects = crate::protocol::ProjectsResponse {
+        projects_revision: 42,
+        projects: vec![crate::protocol::ProjectView {
+            id: "proj-1".to_string(),
+            name: "Sealwire".to_string(),
+            workspace_bindings: Vec::new(),
+            instructions: None,
+        }],
+        thread_project_id,
+    };
+    let result = RemoteActionResultPlaintext {
+        kind: remote_action_result_kind(RemoteActionKind::FetchProjects),
+        action: RemoteActionKind::FetchProjects,
+        ok: true,
+        snapshot: None,
+        receipt: None,
+        ask_user_answer_receipt: None,
+        providers: None,
+        models: None,
+        threads: None,
+        thread_entries: None,
+        thread_entry_detail: None,
+        thread_transcript: None,
+        workspace_diff: None,
+        reviews: None,
+        projects: Some(projects),
+        ask_user_question_detail: None,
+        session_claim: None,
+        session_claim_expires_at: None,
+        claim_challenge_id: None,
+        claim_challenge: None,
+        claim_challenge_expires_at: None,
+        error: None,
+    };
+
+    let payload = build_plain_remote_action_result_payload("action-projects", "surface-1", &result)
+        .expect("projects payload");
+    let json = serde_json::to_value(&payload).expect("serialize projects payload");
+    let carried = json
+        .get("projects")
+        .unwrap_or(&serde_json::Value::Null)
+        .clone();
+    assert!(
+        !carried.is_null(),
+        "the plaintext fetch_projects envelope must carry `projects` to the device; got: {json}"
+    );
+    assert_eq!(carried["projects_revision"], 42);
+    assert_eq!(carried["projects"][0]["id"], "proj-1");
+    assert_eq!(
+        carried["thread_project_id"]["thread-1"], "proj-1",
+        "the device needs membership to group sessions by project"
+    );
+}

@@ -136,6 +136,76 @@ test("a malformed/null fetch payload is not latched as applied and retries", asy
   assert.equal(store.getState().error, null);
 });
 
+test("reset() tears down the payload, emits, and refetches an equal revision (relay switch)", async () => {
+  const gates = [deferred(), deferred()];
+  let i = 0;
+  const store = createProjectsStore({ fetchProjects: () => gates[i++].promise });
+
+  // Relay A loads its projects at revision 7.
+  store.syncToRevision(7);
+  gates[0].resolve(payload(7, [{ id: "a", name: "Relay-A Project" }], { t1: "a" }));
+  await flush();
+  assert.equal(store.getState().loaded, true);
+  assert.deepEqual(store.getState().projects.map((p) => p.id), ["a"]);
+
+  // Switching relays: reset must CLEAR the payload, mark it unloaded, and EMIT — so
+  // relay A's names/controls can't linger while relay B connects (fail closed).
+  let emitted = false;
+  const unsub = store.subscribe(() => {
+    emitted = true;
+  });
+  store.reset();
+  unsub();
+  assert.equal(emitted, true, "reset emits so subscribers re-render");
+  assert.equal(store.getState().loaded, false, "reset marks the payload unloaded");
+  assert.deepEqual(store.getState().projects, [], "reset clears the previous relay's projects");
+  assert.deepEqual(store.getState().threadProjectId, {}, "reset clears membership");
+  assert.equal(store.getState().error, null);
+
+  // Relay B advertises the SAME revision 7 (independent relays) → must still refetch.
+  store.syncToRevision(7);
+  assert.equal(i, 2, "an equal revision from a DIFFERENT relay refetches after reset");
+  gates[1].resolve(payload(7, [{ id: "b", name: "Relay-B Project" }], { t2: "b" }));
+  await flush();
+  assert.deepEqual(store.getState().projects.map((p) => p.id), ["b"]);
+});
+
+test("reset() drops an in-flight fetch so a late previous-relay response can't apply", async () => {
+  const gates = [deferred(), deferred()];
+  let i = 0;
+  const store = createProjectsStore({ fetchProjects: () => gates[i++].promise });
+
+  // Relay A fetch is IN FLIGHT (unresolved).
+  store.syncToRevision(7);
+  await flush();
+  assert.equal(store.getState().loading, true);
+
+  // Switch relays mid-flight: reset clears loading and supersedes the in-flight fetch.
+  store.reset();
+  assert.equal(store.getState().loading, false, "reset clears the loading flag");
+
+  // Relay B fetches at the same revision.
+  store.syncToRevision(7);
+  assert.equal(i, 2, "relay B launches exactly one replacement fetch");
+  // Relay A's fetch resolves LATE — it must be dropped, not applied to relay B's view.
+  gates[0].resolve(payload(7, [{ id: "a", name: "Relay-A" }], { t1: "a" }));
+  await flush();
+  assert.equal(
+    store.getState().projects.some((p) => p.id === "a"),
+    false,
+    "a late response from the previous relay is dropped after reset"
+  );
+  // The generation-cleanup race: a same-revision snapshot arriving AFTER the stale A
+  // resolved but BEFORE B resolves must NOT launch a third fetch (A's finally must not
+  // have cleared B's in-flight marker).
+  store.syncToRevision(7);
+  assert.equal(i, 2, "no extra fetch is launched while relay B is still in flight");
+  // Relay B resolves and applies.
+  gates[1].resolve(payload(7, [{ id: "b", name: "Relay-B" }], { t2: "b" }));
+  await flush();
+  assert.deepEqual(store.getState().projects.map((p) => p.id), ["b"]);
+});
+
 test("reset() forces a refetch even at the same revision", async () => {
   let calls = 0;
   const store = createProjectsStore({

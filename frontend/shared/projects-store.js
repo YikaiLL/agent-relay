@@ -70,7 +70,13 @@ export function createProjectsStore({ fetchProjects }) {
       if (seq !== requestSeq) return;
       setState({ loading: false, error: error?.message || String(error) });
     } finally {
-      if (inFlightRevision === targetRevision) {
+      // Only the LATEST fetch may clear the in-flight marker. Guarding on the revision
+      // alone is buggy when two relays share a revision: a superseded fetch (same
+      // targetRevision) would clear the replacement's marker, letting the next
+      // same-revision snapshot launch a THIRD fetch and supersede the replacement —
+      // amplifying requests / keeping Projects fail-closed. The generation check makes
+      // a stale fetch a no-op here.
+      if (seq === requestSeq) {
         inFlightRevision = null;
       }
     }
@@ -97,10 +103,23 @@ export function createProjectsStore({ fetchProjects }) {
     },
     // Forget what's been fetched so the next syncToRevision refetches unconditionally.
     // Call this when the relay/channel identity changes: an equal revision advertised
-    // by a DIFFERENT relay must not be mistaken for already-applied state.
+    // by a DIFFERENT relay must not be mistaken for already-applied state. This is a
+    // full teardown, not just a revision reset: it CLEARS the payload and marks it
+    // unloaded (so consumers fail closed — no stale project names / rename-delete
+    // controls from the previous relay), INVALIDATES any in-flight fetch (a late
+    // response from the old relay must not write into the new one's view), and EMITS
+    // so subscribers re-render immediately.
     reset() {
       appliedRevision = null;
       inFlightRevision = null;
+      requestSeq += 1; // supersede any in-flight fetch (its captured seq is now stale)
+      setState({
+        projects: [],
+        threadProjectId: {},
+        loading: false,
+        error: null,
+        loaded: false,
+      });
     },
   };
 }

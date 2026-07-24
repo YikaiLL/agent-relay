@@ -209,6 +209,18 @@ function useThreadListStoreState(store) {
   );
 }
 
+// viewMode lives as a SIBLING field of `threadList`, so useThreadListStoreState (which
+// snapshots only `threadList`) never re-renders on setViewMode. Snapshot the viewMode
+// string directly so toggling Sessions/Projects updates the UI immediately. The string
+// is stable between changes, so this only re-renders when the mode actually flips.
+function useThreadListViewMode(store) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => readThreadListViewMode(store),
+    () => readThreadListViewMode(store)
+  );
+}
+
 function useRemoteUiStoreState(store) {
   return useSyncExternalStore(
     store.subscribe,
@@ -289,7 +301,7 @@ function RemoteApp() {
   // projects_revision via the `fetch_projects` broker action. Re-renders the sidebar
   // as it loads/errors.
   const remoteProjects = useRemoteProjects();
-  const threadViewMode = readThreadListViewMode(threadListStore);
+  const threadViewMode = useThreadListViewMode(threadListStore);
   const [progressVerb, setProgressVerb] = useState(null);
   const verbCyclerRef = useRef(null);
   if (!verbCyclerRef.current) verbCyclerRef.current = createVerbCycler();
