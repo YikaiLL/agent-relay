@@ -95,6 +95,14 @@ export function selectThreadsRenderModel({
   remoteAuth,
   relayDirectory,
   session,
+  // Projects grouping (mirrors the local surface). Defaults keep the pre-Projects
+  // behavior (session/cwd grouping) for any caller that doesn't pass them.
+  viewMode = "sessions",
+  projects = [],
+  threadProjectId = {},
+  projectsError = null,
+  projectsLoaded = false,
+  projectsLoading = false,
 }) {
   let normalizedThreads = Array.isArray(threads) ? [...threads] : [];
   if (
@@ -107,11 +115,12 @@ export function selectThreadsRenderModel({
     }
   }
 
-  const groups = buildNavigationThreadGroups(normalizedThreads);
+  const groupByProject = viewMode === "projects";
 
   if (!remoteAuth) {
     return {
       activeThreadId,
+      viewMode,
       countLabel: "Remote session history",
       emptyMessage: relayDirectory?.length
         ? "Open a relay to view its session history."
@@ -123,16 +132,46 @@ export function selectThreadsRenderModel({
   if (error) {
     return {
       activeThreadId,
+      viewMode,
       countLabel: "Error",
       emptyMessage: error,
       groups: [],
     };
   }
 
+  // Fail closed: in Projects mode, never present sessions as authoritative membership
+  // until the dedicated payload is fresh (mirrors the local renderer/menu guard).
+  if (groupByProject && (projectsError || !projectsLoaded || projectsLoading)) {
+    return {
+      activeThreadId,
+      viewMode,
+      countLabel: projectsError ? "Projects unavailable" : "Loading projects…",
+      emptyMessage: projectsError
+        ? `Failed to load projects: ${projectsError}`
+        : "Loading projects…",
+      groups: [],
+    };
+  }
+
+  const groups = groupByProject
+    ? buildNavigationThreadGroups(normalizedThreads, {
+        groupBy: "project",
+        projects,
+        threadProjectId,
+      })
+    : buildNavigationThreadGroups(normalizedThreads);
+
   return {
     activeThreadId,
-    countLabel: loading ? "Loading..." : summarizeThreadGroups(groups),
-    emptyMessage: groups.length ? null : "No remote sessions found yet.",
+    viewMode,
+    countLabel: loading
+      ? "Loading..."
+      : summarizeThreadGroups(groups, { groupBy: groupByProject ? "project" : "cwd" }),
+    emptyMessage: groups.length
+      ? null
+      : groupByProject
+        ? "No projects yet — create one to group sessions."
+        : "No remote sessions found yet.",
     groups,
   };
 }

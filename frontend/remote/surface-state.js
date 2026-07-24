@@ -5,6 +5,7 @@ import {
 import {
   createClearedTranscriptHydrationPatch as createSharedClearedTranscriptHydrationPatch,
 } from "../shared/transcript-hydration-store.js";
+import { resetRemoteProjectsStore } from "./projects-host.js";
 
 export function applyRemoteSurfacePatch(patch) {
   return patchRemoteState(patch);
@@ -36,6 +37,9 @@ export function createResetRemoteSurfaceStatePatch({
   clearClaimLifecycle();
   clearSessionRuntime();
   rejectPendingActions(reason);
+  // A different relay may advertise an equal projects_revision — forget fetched
+  // Projects so the next syncToRevision refetches unconditionally.
+  resetRemoteProjectsStore();
   return createClearedRemoteSurfaceSessionStatePatch();
 }
 
