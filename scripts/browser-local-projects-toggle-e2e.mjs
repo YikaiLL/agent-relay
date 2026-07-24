@@ -28,6 +28,19 @@ async function api(relayPort, method, apiPath, body) {
   return payload.data;
 }
 
+// Poll the dedicated Projects channel until a thread's membership matches (server
+// truth). `expectedProjectId = null` means "unassigned". Used to confirm a UI action
+// actually mutated state, without depending on the virtualized list's DOM shape.
+async function waitForMembership(relayPort, threadId, expectedProjectId) {
+  for (let i = 0; i < 100; i += 1) {
+    const data = await api(relayPort, "GET", "/api/projects");
+    const current = data.thread_project_id[threadId] ?? null;
+    if (current === (expectedProjectId ?? null)) return current;
+    await delay(150);
+  }
+  throw new Error(`membership for ${threadId} never became ${expectedProjectId ?? "unassigned"}`);
+}
+
 async function main() {
   const relayPort = await getFreePort();
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-relay-projects-toggle-e2e-"));
@@ -255,9 +268,119 @@ async function main() {
     }));
     await gatePage.close();
 
+    // Probe (CRUD UI): create a Project from the toolbar and assign/unassign a session
+    // through its context menu — the user-facing flow, not just the API.
+    const crudPage = await context.newPage();
+    let nextPrompt = "";
+    crudPage.on("dialog", (dialog) => {
+      void dialog.accept(dialog.type() === "prompt" ? nextPrompt : undefined);
+    });
+    await crudPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await crudPage.evaluate(() => {
+      const drawer = document.querySelector(".sidebar-drawer");
+      if (drawer && !drawer.open) drawer.open = true;
+    });
+    await crudPage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
+    await crudPage.evaluate(() => document.querySelector("#threads-view-projects").click());
+    // The create toolbar is shown only in the Projects view.
+    await crudPage.waitForFunction(() => {
+      const bar = document.querySelector("#projects-toolbar");
+      return bar && !bar.hidden;
+    }, null, { timeout: TIMEOUT_MS });
+
+    let menuItems = [];
+    let assignConfirmed = null;
+    let currentMarked = false;
+    let unassignConfirmed = "unset";
+    // Right-click a session row to open its context menu, then read the Project buttons.
+    const openThreadMenu = async (tid) => {
+      const target = crudPage.locator(`#threads-list [data-thread-id="${tid}"]`);
+      await target.waitFor({ state: "visible", timeout: TIMEOUT_MS });
+      await target.scrollIntoViewIfNeeded({ timeout: TIMEOUT_MS });
+      await target.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+      await crudPage.waitForFunction(() => {
+        const menu = document.querySelector("#thread-context-menu");
+        return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0;
+      }, null, { timeout: TIMEOUT_MS });
+      return crudPage.evaluate(() => [...document.querySelectorAll("#thread-project-actions button")].map((b) => b.textContent.trim()));
+    };
+    const clickProjectButton = (predicateArg) =>
+      crudPage.evaluate((arg) => {
+        const btn = [...document.querySelectorAll("#thread-project-actions button")].find((b) => {
+          const text = b.textContent.trim();
+          return arg.exact ? text.replace(/^✓\s*/, "") === arg.exact : text.includes(arg.includes);
+        });
+        btn?.click();
+      }, predicateArg);
+    // Reopen the menu until its Project buttons satisfy `match(labels)` (client caught
+    // up to the mutation), closing between tries. Returns the matching labels.
+    const waitForMenuState = async (tid, match) => {
+      for (let i = 0; i < 40; i += 1) {
+        const labels = await openThreadMenu(tid);
+        if (match(labels)) return labels;
+        await crudPage.keyboard.press("Escape");
+        await delay(200);
+      }
+      throw new Error("context menu never reached the expected Project state");
+    };
+    try {
+      // Create "UiCrudProj" via the toolbar (the prompt is answered by the dialog handler).
+      nextPrompt = "UiCrudProj";
+      await crudPage.evaluate(() => document.querySelector("#projects-create-button").click());
+      await crudPage.waitForFunction(
+        (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+        "UiCrudProj",
+        { timeout: TIMEOUT_MS }
+      );
+      // Resolve the new project's id for server-truth membership assertions.
+      const afterCreate = await api(relayPort, "GET", "/api/projects");
+      const uiProjId = afterCreate.projects.find((p) => p.name === "UiCrudProj")?.id;
+      assert.ok(uiProjId, `toolbar-created project id: ${JSON.stringify(afterCreate.projects.map((p) => p.name))}`);
+
+      // Assign the session to it via the context menu, then confirm server-side.
+      menuItems = await openThreadMenu(threadId);
+      await clickProjectButton({ exact: "UiCrudProj" });
+      assignConfirmed = await waitForMembership(relayPort, threadId, uiProjId);
+      // And confirm the UI reflects membership: reopen shows "✓ UiCrudProj" as current.
+      await waitForMenuState(threadId, (labels) => labels.some((t) => t.startsWith("✓ UiCrudProj")));
+      currentMarked = true;
+
+      // Unassign via the context menu ("Remove from project"), then confirm server-side.
+      await openThreadMenu(threadId);
+      await clickProjectButton({ includes: "Remove from project" });
+      unassignConfirmed = await waitForMembership(relayPort, threadId, null);
+    } catch (crudError) {
+      const dbg = await crudPage
+        .evaluate((tid) => ({
+          count: document.querySelector("#threads-count")?.textContent || null,
+          toolbarHidden: document.querySelector("#projects-toolbar")?.hidden ?? null,
+          groups: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+          menuHidden: document.querySelector("#thread-context-menu")?.hidden ?? null,
+          projectButtons: [...document.querySelectorAll("#thread-project-actions button")].map((b) => b.textContent.trim()),
+          rowExists: !!document.querySelector(`#threads-list [data-thread-id="${tid}"]`),
+          rowGroup: document.querySelector(`#threads-list [data-thread-id="${tid}"]`)?.closest(".thread-group")?.querySelector(".thread-group-name")?.textContent?.trim() || null,
+        }), threadId)
+        .catch(() => null);
+      console.error("[crudPage state] " + JSON.stringify(dbg));
+      throw crudError;
+    } finally {
+      await crudPage.close();
+    }
+
     console.log(
       JSON.stringify(
-        { relayPort, sessionsView, projectsView, backToSessions, afterUnassign, unassignPropagated, failClosed, gatePending, gateResolved },
+        {
+          relayPort,
+          sessionsView,
+          projectsView,
+          backToSessions,
+          afterUnassign,
+          unassignPropagated,
+          failClosed,
+          gatePending,
+          gateResolved,
+          crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed },
+        },
         null,
         2
       )
@@ -287,6 +410,15 @@ async function main() {
     assert.match(gatePending.countText, /Loading projects/, `pending refresh shows a loading placeholder: ${gatePending.countText}`);
     assert.deepEqual(gatePending.groupLabels, [], `no stale grouping while a newer revision is pending: ${JSON.stringify(gatePending.groupLabels)}`);
     assert.ok(gateResolved.groupLabels.includes("VerifyProj"), `grouping returns after the refresh resolves: ${JSON.stringify(gateResolved.groupLabels)}`);
+
+    // CRUD UI: toolbar create + context-menu assign/unassign drive the real flow.
+    assert.ok(
+      menuItems.some((t) => t.replace(/^✓\s*/, "") === "UiCrudProj"),
+      `the context menu lists the toolbar-created project: ${JSON.stringify(menuItems)}`
+    );
+    assert.ok(assignConfirmed, "assigning via the context menu recorded membership server-side");
+    assert.ok(currentMarked, "the assigned project is marked current (✓) in the UI on reopen");
+    assert.equal(unassignConfirmed, null, "removing via the context menu cleared membership server-side");
 
     console.log("PROJECTS_TOGGLE_E2E: PASS");
   } catch (error) {

@@ -68,6 +68,9 @@ import {
   agentWorkingIndicatorLabel,
   stopButton,
   threadContextMenu,
+  threadProjectActions,
+  projectsToolbar,
+  projectsCreateButton,
   threadsCount,
   threadsList,
   threadsRefreshButton,
@@ -139,7 +142,13 @@ import {
   readThreadListViewMode,
 } from "./shared/thread-list-store.js";
 import { createProjectsStore } from "./shared/projects-store.js";
-import { fetchProjectsPayload } from "./local/project-actions.js";
+import {
+  fetchProjectsPayload,
+  createProject,
+  assignThreadToProject,
+  unassignThread,
+} from "./local/project-actions.js";
+import { buildProjectMenuItems, pickNewProjectId, normalizeProjectName } from "./local/project-menu.js";
 import { installThreadListWheelProxy } from "./shared/thread-list-scroll.js";
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
@@ -1030,6 +1039,10 @@ function setThreadViewMode(mode) {
   state.threadListStore.getState().setViewMode(isProjects ? "projects" : "sessions");
   threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
   threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
+  // The create-a-Project toolbar belongs to the Projects view only.
+  if (projectsToolbar) {
+    projectsToolbar.hidden = !isProjects;
+  }
   // Ensure the Projects payload is loaded when switching in (no-op if already current).
   if (isProjects) {
     projectsStore.syncToRevision(state.session?.projects_revision || 0);
@@ -1038,6 +1051,101 @@ function setThreadViewMode(mode) {
 }
 threadsViewSessionsButton?.addEventListener("click", () => setThreadViewMode("sessions"));
 threadsViewProjectsButton?.addEventListener("click", () => setThreadViewMode("projects"));
+
+// Prompt for a Project name (trimmed; null aborts). Native prompt mirrors the
+// window.confirm flow the archive/delete affordances already use.
+function promptProjectName(current = "") {
+  return normalizeProjectName(window.prompt("Project name", current));
+}
+
+// Create a Project from the Projects toolbar. Membership/list refresh rides the
+// snapshot's projects_revision bump (project_action calls notify()), same as an
+// API-driven mutation — no manual store.refresh() needed.
+async function createProjectFromToolbar() {
+  const name = promptProjectName();
+  if (!name) {
+    return;
+  }
+  try {
+    await createProject(apiFetch, name);
+    logLine(`Created project "${name}".`);
+  } catch (error) {
+    logLine(`Failed to create project: ${error.message}`);
+  }
+}
+projectsCreateButton?.addEventListener("click", () => {
+  void createProjectFromToolbar();
+});
+
+// Run one context-menu Project action for a thread (assign / unassign / new+assign).
+async function runThreadProjectAction(threadId, item) {
+  closeThreadContextMenu();
+  if (!threadId || !item) {
+    return;
+  }
+  try {
+    if (item.kind === "unassign") {
+      await unassignThread(apiFetch, threadId);
+      logLine(`Removed session ${shortId(threadId)} from its project.`);
+      return;
+    }
+    if (item.kind === "assign") {
+      if (item.isCurrent) {
+        return; // already there — no-op
+      }
+      await assignThreadToProject(apiFetch, threadId, item.projectId);
+      logLine(`Moved session ${shortId(threadId)} to "${item.label}".`);
+      return;
+    }
+    if (item.kind === "create") {
+      const name = promptProjectName();
+      if (!name) {
+        return;
+      }
+      const before = state.projects || [];
+      const receipt = await createProject(apiFetch, name);
+      const projectId = pickNewProjectId(before, receipt?.projects);
+      if (!projectId) {
+        // Created, but the new id was ambiguous — leave the session unassigned rather
+        // than guess. The snapshot refresh still surfaces the new (empty) project.
+        logLine(`Created project "${name}" (assign the session from its menu).`);
+        return;
+      }
+      await assignThreadToProject(apiFetch, threadId, projectId);
+      logLine(`Created project "${name}" and moved session ${shortId(threadId)} into it.`);
+    }
+  } catch (error) {
+    logLine(`Failed to update project membership: ${error.message}`);
+  }
+}
+
+// Rebuild the context menu's per-session Project section for `threadId` from the
+// current Projects payload. Called each time the menu opens (openThreadContextMenu).
+function populateThreadProjectActions(threadId) {
+  if (!threadProjectActions) {
+    return;
+  }
+  threadProjectActions.textContent = ""; // drop prior buttons (and their listeners)
+  const currentProjectId = state.threadProjectId?.[threadId] || null;
+  const items = buildProjectMenuItems({ projects: state.projects || [], currentProjectId });
+  for (const item of items) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "context-menu-button context-menu-project-button";
+    if (item.isCurrent) {
+      button.classList.add("is-current");
+      button.setAttribute("aria-current", "true");
+    }
+    if (item.kind === "create") {
+      button.classList.add("context-menu-project-create");
+    }
+    button.textContent = item.isCurrent ? `✓ ${item.label}` : item.label;
+    button.addEventListener("click", () => {
+      void runThreadProjectAction(threadId, item);
+    });
+    threadProjectActions.appendChild(button);
+  }
+}
 
 closeSecurityModalBtn?.addEventListener("click", () => {
   securityModal?.close();
@@ -2232,6 +2340,9 @@ function openThreadContextMenu(threadId, clientX, clientY) {
   deleteThreadButton.textContent = isRunningActiveSession
     ? "Running session cannot be deleted"
     : "Delete permanently";
+  // Per-session Project assignment — rebuilt from the current Projects payload each
+  // open so the marked "current" project and the list stay fresh.
+  populateThreadProjectActions(threadId);
 
   threadContextMenu.hidden = false;
   const left = Math.max(12, Math.min(clientX, window.innerWidth - 220));
