@@ -158,6 +158,49 @@ test("reset() forces a refetch even at the same revision", async () => {
   assert.equal(calls, 2);
 });
 
+test("`loaded` gates fail-closed: false until a fetch actually succeeds", async () => {
+  // Fail closed is the whole point of the flag: the sidebar must not present
+  // sessions as authoritative Project membership (everything "Unassigned") until the
+  // dedicated payload has really arrived. A rejected or malformed fetch must leave
+  // `loaded` false so the consumer keeps showing a loading/error placeholder.
+  let mode = "reject";
+  const store = createProjectsStore({
+    fetchProjects: async () => {
+      if (mode === "reject") throw new Error("boom");
+      if (mode === "malformed") return null;
+      return payload(4, [{ id: "p", name: "P" }], { t1: "p" });
+    },
+  });
+
+  // Initial state before any fetch settles: not loaded, no error.
+  assert.equal(store.getState().loaded, false, "starts un-loaded");
+  assert.equal(store.getState().error, null);
+
+  // A rejected fetch surfaces an error but must NOT flip `loaded`.
+  store.syncToRevision(4);
+  await flush();
+  assert.equal(store.getState().loaded, false, "a rejected fetch stays un-loaded");
+  assert.equal(store.getState().error, "boom");
+
+  // A malformed payload likewise stays un-loaded (and, per the retry contract, the
+  // revision was not latched, so re-syncing retries).
+  mode = "malformed";
+  store.syncToRevision(4);
+  await flush();
+  assert.equal(store.getState().loaded, false, "a malformed fetch stays un-loaded");
+
+  // Only a real success flips `loaded` true and clears the error.
+  mode = "ok";
+  store.syncToRevision(4);
+  await flush();
+  assert.equal(store.getState().loaded, true, "a successful fetch is loaded");
+  assert.equal(store.getState().error, null);
+  assert.deepEqual(
+    store.getState().projects.map((project) => project.id),
+    ["p"]
+  );
+});
+
 test("the response's revision is latched, not the triggering one", async () => {
   let calls = 0;
   const store = createProjectsStore({

@@ -11,6 +11,9 @@ export function createProjectsStore({ fetchProjects }) {
     threadProjectId: {},
     loading: false,
     error: null,
+    // Whether a fetch has EVER succeeded. Lets consumers distinguish "not fetched
+    // yet" (must not render empty projects as authoritative) from "fetched, empty".
+    loaded: false,
   };
   const listeners = new Set();
   let appliedRevision = null; // sentinel: nothing fetched yet (forces the first fetch)
@@ -52,6 +55,7 @@ export function createProjectsStore({ fetchProjects }) {
         threadProjectId: data.thread_project_id || {},
         loading: false,
         error: null,
+        loaded: true,
       });
       // Latch the RESPONSE's revision (authoritative), not the triggering one — the
       // relay may have advanced between the snapshot and the fetch resolving.

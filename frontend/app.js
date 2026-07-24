@@ -264,6 +264,9 @@ const state = {
   threadGroups: [],
   projects: [],
   threadProjectId: {},
+  projectsLoading: false,
+  projectsError: null,
+  projectsLoaded: false,
   threadHistoryScrollTop: 0,
   threadListStore: createThreadListStore(),
   localUiStore: createLocalUiStore(),
@@ -301,9 +304,13 @@ const projectsStore = createProjectsStore({
 projectsStore.subscribe((projectsState) => {
   state.projects = projectsState.projects;
   state.threadProjectId = projectsState.threadProjectId;
-  // Re-render only when the Projects view is showing. `renderThreads` is a module
-  // const defined below; this callback only ever fires asynchronously (after a fetch
-  // resolves), by which point it is initialized.
+  state.projectsLoading = projectsState.loading;
+  state.projectsError = projectsState.error;
+  state.projectsLoaded = projectsState.loaded;
+  // Re-render on ANY change (loading/loaded/error transitions) while the Projects
+  // view is showing, so its loading/error placeholder resolves to the grouping.
+  // `renderThreads` is a module const defined below; this callback only ever fires
+  // asynchronously (after a fetch settles), by which point it is initialized.
   if (readThreadListViewMode(state.threadListStore) === "projects") {
     renderThreads();
   }

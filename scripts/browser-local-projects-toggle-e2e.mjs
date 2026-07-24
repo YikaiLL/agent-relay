@@ -161,7 +161,43 @@ async function main() {
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
     }));
 
-    console.log(JSON.stringify({ relayPort, sessionsView, projectsView, backToSessions, afterUnassign, unassignPropagated }, null, 2));
+    // Probe (fail closed): a FRESH page where GET /api/projects fails must NOT render
+    // sessions under a false "Unassigned" — it shows an explicit error placeholder.
+    const failPage = await context.newPage();
+    await failPage.route("**/api/projects*", (route) => {
+      if (route.request().method() === "GET") {
+        return route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ ok: false, error: { message: "boom" } }),
+        });
+      }
+      return route.continue();
+    });
+    await failPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await failPage.evaluate(() => {
+      const drawer = document.querySelector(".sidebar-drawer");
+      if (drawer && !drawer.open) drawer.open = true;
+    });
+    await failPage.waitForFunction(
+      () => document.querySelectorAll("#threads-list .thread-group").length >= 1,
+      null,
+      { timeout: TIMEOUT_MS }
+    );
+    await failPage.evaluate(() => document.querySelector("#threads-view-projects").click());
+    await failPage.waitForFunction(
+      () => (document.querySelector("#threads-count")?.textContent || "").includes("Projects unavailable"),
+      null,
+      { timeout: TIMEOUT_MS }
+    );
+    const failClosed = await failPage.evaluate(() => ({
+      countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
+      bodyText: document.querySelector("#threads-list")?.textContent?.trim() || "",
+      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+    }));
+    await failPage.close();
+
+    console.log(JSON.stringify({ relayPort, sessionsView, projectsView, backToSessions, afterUnassign, unassignPropagated, failClosed }, null, 2));
 
     assert.ok(projectsView.groupLabels.includes("VerifyProj"), "the VerifyProj group header renders in Projects mode");
     assert.ok(projectsView.threadVisible, "the assigned session is visible in Projects mode");
@@ -173,6 +209,13 @@ async function main() {
       unassignPropagated && afterUnassign.groupLabels.includes("Unassigned"),
       `an API unassign must propagate to the live UI (snapshot revision -> refetch): ${JSON.stringify(afterUnassign)}`
     );
+
+    // Fail closed: a failed Projects fetch shows an explicit error placeholder and NO
+    // grouping — never sessions falsely bucketed under "Unassigned".
+    assert.equal(failClosed.countText, "Projects unavailable", `fail-closed count: ${failClosed.countText}`);
+    assert.deepEqual(failClosed.groupLabels, [], `no grouping is rendered on fetch failure: ${JSON.stringify(failClosed.groupLabels)}`);
+    assert.ok(!failClosed.groupLabels.includes("Unassigned"), "must not present a false Unassigned grouping when the fetch failed");
+    assert.match(failClosed.bodyText, /Failed to load projects/, `error message shown: ${failClosed.bodyText}`);
 
     console.log("PROJECTS_TOGGLE_E2E: PASS");
   } catch (error) {

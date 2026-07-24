@@ -825,7 +825,7 @@ input:focus, textarea:focus, select:focus {
   gap: 2px;
   padding: 2px;
   border-radius: 8px;
-  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  background: var(--surface-2, var(--bg-surface));
 }
 
 .thread-view-toggle-button {
@@ -834,16 +834,17 @@ input:focus, textarea:focus, select:focus {
   padding: 5px 12px;
   border-radius: 6px;
   font: inherit;
-  font-size: 0.85em;
-  color: var(--text-muted, #888);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
   background: transparent;
   cursor: pointer;
 }
 
 .thread-view-toggle-button.is-active {
-  color: var(--text, inherit);
-  background: var(--surface, rgba(255, 255, 255, 0.08));
-  font-weight: 600;
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  font-weight: var(--weight-strong);
+  box-shadow: var(--shadow-segmented-selected);
 }
 
 /* THREAD LIST */

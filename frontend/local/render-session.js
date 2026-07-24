@@ -1458,6 +1458,22 @@ export function createSessionRenderer({
     // project groups are derived on the fly from the flat list + the fetched Projects.
     const viewMode = readThreadListViewMode(state.threadListStore);
     const groupBy = viewMode === "projects" ? "project" : "cwd";
+
+    // Fail closed: never render sessions as authoritative Project membership until the
+    // dedicated payload has actually loaded. Otherwise a delayed/failed
+    // GET /api/projects would show every session under "Unassigned" (false), and a
+    // failed revision refetch would present stale grouping as real.
+    if (viewMode === "projects" && (state.projectsError || !state.projectsLoaded)) {
+      renderWorkspaceSuggestions(state.session);
+      renderThreadListMessage(
+        state.projectsError ? "Projects unavailable" : "Loading projects…",
+        state.projectsError
+          ? `Failed to load projects: ${state.projectsError}`
+          : "Loading projects…"
+      );
+      return;
+    }
+
     const groups =
       viewMode === "projects"
         ? buildNavigationThreadGroups(state.threads, {
