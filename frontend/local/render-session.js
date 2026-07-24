@@ -1459,11 +1459,16 @@ export function createSessionRenderer({
     const viewMode = readThreadListViewMode(state.threadListStore);
     const groupBy = viewMode === "projects" ? "project" : "cwd";
 
-    // Fail closed: never render sessions as authoritative Project membership until the
-    // dedicated payload has actually loaded. Otherwise a delayed/failed
-    // GET /api/projects would show every session under "Unassigned" (false), and a
-    // failed revision refetch would present stale grouping as real.
-    if (viewMode === "projects" && (state.projectsError || !state.projectsLoaded)) {
+    // Fail closed: only render Project grouping when we hold a payload we can vouch
+    // for as CURRENT. Bail to a placeholder not just on error or before the first
+    // successful load (!projectsLoaded), but ALSO while a newer revision's fetch is
+    // in flight (projectsLoading) — otherwise a pending refresh would present the
+    // prior membership as if it were current, and a failing retry would oscillate
+    // stale grouping back in. A successful fetch is the only state that renders groups.
+    if (
+      viewMode === "projects" &&
+      (state.projectsError || !state.projectsLoaded || state.projectsLoading)
+    ) {
       renderWorkspaceSuggestions(state.session);
       renderThreadListMessage(
         state.projectsError ? "Projects unavailable" : "Loading projects…",

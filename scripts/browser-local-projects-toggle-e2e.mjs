@@ -197,7 +197,71 @@ async function main() {
     }));
     await failPage.close();
 
-    console.log(JSON.stringify({ relayPort, sessionsView, projectsView, backToSessions, afterUnassign, unassignPropagated, failClosed }, null, 2));
+    // Probe (fail closed on refresh): after a first successful load, a NEWER revision
+    // whose fetch is still in flight must blank to a loading placeholder — the prior
+    // grouping must NOT be presented as if it were current. Re-assign first so this
+    // page's initial load has a real project grouping to (not) go stale.
+    await api(relayPort, "POST", "/api/projects", { action: "assign", thread_id: threadId, project_id: projectId });
+    const gatePage = await context.newPage();
+    let holdRefresh = false;
+    let releaseRefresh;
+    const refreshGate = new Promise((resolve) => {
+      releaseRefresh = resolve;
+    });
+    await gatePage.route("**/api/projects*", async (route) => {
+      if (route.request().method() === "GET" && holdRefresh) {
+        await refreshGate; // hold the newer-revision fetch open so the UI stays pending
+      }
+      return route.continue();
+    });
+    await gatePage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await gatePage.evaluate(() => {
+      const drawer = document.querySelector(".sidebar-drawer");
+      if (drawer && !drawer.open) drawer.open = true;
+    });
+    await gatePage.waitForFunction(
+      () => document.querySelectorAll("#threads-list .thread-group").length >= 1,
+      null,
+      { timeout: TIMEOUT_MS }
+    );
+    await gatePage.evaluate(() => document.querySelector("#threads-view-projects").click());
+    await gatePage.waitForFunction(
+      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+      "VerifyProj",
+      { timeout: TIMEOUT_MS }
+    );
+    // Arm the gate, then bump the revision so the client refetches (and is held pending).
+    holdRefresh = true;
+    await api(relayPort, "POST", "/api/projects", { action: "create", name: "GateProj2" });
+    await gatePage.waitForFunction(
+      () => (document.querySelector("#threads-count")?.textContent || "").includes("Loading projects"),
+      null,
+      { timeout: TIMEOUT_MS }
+    );
+    const gatePending = await gatePage.evaluate(() => ({
+      countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
+      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+    }));
+    // Release the held fetch; the fresh grouping returns.
+    releaseRefresh();
+    holdRefresh = false;
+    await gatePage.waitForFunction(
+      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+      "VerifyProj",
+      { timeout: TIMEOUT_MS }
+    );
+    const gateResolved = await gatePage.evaluate(() => ({
+      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+    }));
+    await gatePage.close();
+
+    console.log(
+      JSON.stringify(
+        { relayPort, sessionsView, projectsView, backToSessions, afterUnassign, unassignPropagated, failClosed, gatePending, gateResolved },
+        null,
+        2
+      )
+    );
 
     assert.ok(projectsView.groupLabels.includes("VerifyProj"), "the VerifyProj group header renders in Projects mode");
     assert.ok(projectsView.threadVisible, "the assigned session is visible in Projects mode");
@@ -216,6 +280,13 @@ async function main() {
     assert.deepEqual(failClosed.groupLabels, [], `no grouping is rendered on fetch failure: ${JSON.stringify(failClosed.groupLabels)}`);
     assert.ok(!failClosed.groupLabels.includes("Unassigned"), "must not present a false Unassigned grouping when the fetch failed");
     assert.match(failClosed.bodyText, /Failed to load projects/, `error message shown: ${failClosed.bodyText}`);
+
+    // Fail closed on refresh: a pending newer-revision fetch shows the loading
+    // placeholder with NO grouping (prior membership is not presented as current),
+    // then the grouping returns once the fetch resolves.
+    assert.match(gatePending.countText, /Loading projects/, `pending refresh shows a loading placeholder: ${gatePending.countText}`);
+    assert.deepEqual(gatePending.groupLabels, [], `no stale grouping while a newer revision is pending: ${JSON.stringify(gatePending.groupLabels)}`);
+    assert.ok(gateResolved.groupLabels.includes("VerifyProj"), `grouping returns after the refresh resolves: ${JSON.stringify(gateResolved.groupLabels)}`);
 
     console.log("PROJECTS_TOGGLE_E2E: PASS");
   } catch (error) {

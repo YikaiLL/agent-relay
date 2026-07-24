@@ -40,7 +40,11 @@ export function createProjectsStore({ fetchProjects }) {
     // request that resolves late can't overwrite newer data.
     const seq = (requestSeq += 1);
     inFlightRevision = targetRevision;
-    setState({ loading: true, error: null });
+    // Do NOT clear `error` here. A retry after a failed fetch must keep the error
+    // latched until a fetch actually SUCCEEDS — otherwise the brief `error === null`
+    // window would let a consumer flash the prior (stale) grouping back in through its
+    // error guard before the retry resolves. Success clears it; failure re-sets it.
+    setState({ loading: true });
     try {
       const data = await fetchProjects();
       if (seq !== requestSeq) return; // superseded by a newer fetch

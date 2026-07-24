@@ -201,6 +201,80 @@ test("`loaded` gates fail-closed: false until a fetch actually succeeds", async 
   );
 });
 
+// The renderer's fail-closed predicate, replicated so these tests pin the exact
+// condition the sidebar guards on (render-session.js): show a placeholder unless we
+// hold a payload we can vouch for as current.
+const failsClosed = (s) => Boolean(s.error || !s.loaded || s.loading);
+
+test("a pending revision refresh signals loading so the renderer fails closed", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const store = createProjectsStore({
+    fetchProjects: () => {
+      calls += 1;
+      // rev 1 resolves immediately; rev 2's fetch is deferred (still in flight).
+      return calls === 1 ? Promise.resolve(payload(1, [{ id: "p", name: "P" }], { t1: "p" })) : gate.promise;
+    },
+  });
+
+  store.syncToRevision(1);
+  await flush();
+  assert.equal(store.getState().loaded, true);
+  assert.equal(failsClosed(store.getState()), false, "settled + loaded → render groups");
+
+  // A newer revision arrives; its fetch has not resolved yet.
+  store.syncToRevision(2);
+  await flush();
+  const mid = store.getState();
+  assert.equal(mid.loading, true, "the newer revision is in flight");
+  assert.equal(mid.loaded, true, "prior data is retained in the store (not wiped)…");
+  assert.deepEqual(mid.projects.map((p) => p.id), ["p"], "…but not yet advanced to rev 2");
+  assert.equal(failsClosed(mid), true, "…so the renderer must fail closed while it is pending");
+
+  gate.resolve(payload(2, [{ id: "p", name: "P" }, { id: "q", name: "Q" }], { t1: "p" }));
+  await flush();
+  assert.equal(failsClosed(store.getState()), false, "once the fetch resolves, groups render again");
+  assert.deepEqual(store.getState().projects.map((p) => p.id), ["p", "q"]);
+});
+
+test("a failed revision refresh keeps the error latched across retries (no stale-grouping flash)", async () => {
+  let calls = 0;
+  const store = createProjectsStore({
+    fetchProjects: () => {
+      calls += 1;
+      // rev 1 succeeds; every later revision fetch fails.
+      return calls === 1
+        ? Promise.resolve(payload(1, [{ id: "p", name: "P" }], { t1: "p" }))
+        : Promise.reject(new Error("boom"));
+    },
+  });
+
+  store.syncToRevision(1);
+  await flush();
+  assert.equal(store.getState().error, null);
+
+  // rev 2 fails → error surfaces, renderer fails closed.
+  store.syncToRevision(2);
+  await flush();
+  assert.equal(store.getState().error, "boom");
+  assert.equal(failsClosed(store.getState()), true);
+
+  // A retry (rev 3, still failing) must NOT transiently clear the error at fetch
+  // start — that `error === null` window is exactly what lets a renderer's error
+  // guard flash the prior (stale) grouping back in mid-retry. The store keeps the
+  // error latched until a fetch actually succeeds.
+  let errorEverCleared = false;
+  const unsub = store.subscribe((s) => {
+    if (s.error === null) errorEverCleared = true;
+  });
+  store.syncToRevision(3);
+  await flush();
+  unsub();
+  assert.equal(errorEverCleared, false, "error stays latched through the failing retry (no stale-grouping window)");
+  assert.equal(failsClosed(store.getState()), true);
+  assert.equal(store.getState().error, "boom");
+});
+
 test("the response's revision is latched, not the triggering one", async () => {
   let calls = 0;
   const store = createProjectsStore({
