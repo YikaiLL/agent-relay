@@ -276,6 +276,79 @@ mod path_scope_tests {
         )
     }
 
+    // Part A: the interactive diff must follow the *viewed* session's workspace,
+    // not the process-global/active one. Two runtimes at different cwds; thread-a is
+    // active, but viewing thread-b must diff B's checkout.
+    #[tokio::test]
+    async fn workspace_diff_follows_viewed_thread_not_active() {
+        let cwd_a_dir = TempDir::new().expect("cwd a");
+        let cwd_b_dir = TempDir::new().expect("cwd b");
+        let cwd_a = cwd_a_dir.path().to_string_lossy().to_string();
+        let cwd_b = cwd_b_dir.path().to_string_lossy().to_string();
+
+        let (app, _project, _outside) = build_app(&cwd_a).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = cwd_a.clone();
+            relay.ensure_runtime_for_thread("thread-b").current_cwd = cwd_b.clone();
+        }
+
+        // Absent selector → the global/active workspace (legacy back-compat).
+        let expected_global = { app.relay.read().await.current_cwd.clone() };
+        let global = app.workspace_diff(None, None).await.expect("global diff");
+        assert_eq!(global.cwd, expected_global);
+        assert_ne!(global.cwd, cwd_b);
+        assert!(!global.unavailable);
+
+        // Viewing thread-b returns B's workspace even though A is active — the fix.
+        let viewed_b = app
+            .workspace_diff(None, Some("thread-b".to_string()))
+            .await
+            .expect("viewed-b diff");
+        assert_eq!(
+            viewed_b.cwd, cwd_b,
+            "viewing session B must diff B's own workspace, not the active thread's"
+        );
+        assert!(!viewed_b.unavailable);
+
+        // Viewing thread-a returns A's workspace.
+        let viewed_a = app
+            .workspace_diff(None, Some("thread-a".to_string()))
+            .await
+            .expect("viewed-a diff");
+        assert_eq!(viewed_a.cwd, cwd_a);
+    }
+
+    // Part A fail-closed: a present-but-unresolvable selector must NOT fall back to
+    // the active/global cwd (that would re-open the bug and leak another workspace).
+    #[tokio::test]
+    async fn workspace_diff_fails_closed_on_unresolvable_thread() {
+        let cwd_a_dir = TempDir::new().expect("cwd a");
+        let cwd_a = cwd_a_dir.path().to_string_lossy().to_string();
+
+        let (app, _project, _outside) = build_app(&cwd_a).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = cwd_a.clone();
+        }
+
+        let ghost = app
+            .workspace_diff(None, Some("does-not-exist".to_string()))
+            .await
+            .expect("unresolvable selector returns unavailable, not an error");
+        assert!(
+            ghost.unavailable,
+            "an unresolvable viewed thread must fail closed (unavailable)"
+        );
+        assert_ne!(
+            ghost.cwd, cwd_a,
+            "fail-closed must NOT leak the active workspace's cwd"
+        );
+        assert!(ghost.file_changes.is_empty());
+    }
+
     async fn build_status_app(cwd: &str, read_status: &str) -> (AppState, TempDir, TempDir) {
         let project = TempDir::new().expect("project tempdir");
         let outside = TempDir::new().expect("outside tempdir");

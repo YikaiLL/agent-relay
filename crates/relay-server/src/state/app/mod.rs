@@ -736,6 +736,7 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
             diff: String::new(),
             truncated: false,
             not_a_git_repo: true,
+            unavailable: false,
             generated_at,
         });
     }
@@ -793,6 +794,7 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
         file_changes,
         truncated: tracked_truncated || untracked_truncated,
         not_a_git_repo: false,
+        unavailable: false,
         generated_at,
     })
 }

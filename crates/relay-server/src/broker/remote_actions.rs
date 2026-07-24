@@ -99,6 +99,10 @@ pub(super) enum RemoteActionRequest {
     FetchWorkspaceDiff {
         #[serde(default)]
         device_id: Option<String>,
+        /// The session the client is *viewing*; selects which workspace to diff.
+        /// `#[serde(default)]` keeps legacy clients (which send only `{}`) working.
+        #[serde(default)]
+        thread_id: Option<String>,
     },
     FetchReviews {
         #[serde(default)]
@@ -252,8 +256,10 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::ApplyFileChange { item_id, input }
             }
-            Self::FetchWorkspaceDiff { .. } => Self::FetchWorkspaceDiff {
+            Self::FetchWorkspaceDiff { thread_id, .. } => Self::FetchWorkspaceDiff {
                 device_id: Some(device_id),
+                // Preserve the viewed session selector; only device_id is stamped here.
+                thread_id,
             },
             Self::FetchReviews { .. } => Self::FetchReviews {
                 device_id: Some(device_id),
@@ -1152,8 +1158,11 @@ async fn execute_remote_action(
             .apply_file_change(&item_id, input)
             .await
             .map(|_| RemoteActionOutcome::default()),
-        RemoteActionRequest::FetchWorkspaceDiff { device_id } => state
-            .workspace_diff(device_id)
+        RemoteActionRequest::FetchWorkspaceDiff {
+            device_id,
+            thread_id,
+        } => state
+            .workspace_diff(device_id, thread_id)
             .await
             .map(|workspace_diff| RemoteActionOutcome {
                 workspace_diff: Some(workspace_diff),

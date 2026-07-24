@@ -107,6 +107,13 @@ struct ThreadEntryDetailQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct WorkspaceDiffQuery {
+    /// The session the client is *viewing*. Absent → the global/active workspace
+    /// (legacy behavior). Present → diff that session's own workspace.
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LocalSendMessageInput {
     #[serde(flatten)]
     message: SendMessageInput,
@@ -461,11 +468,12 @@ async fn workspace_diff(
     State(context): State<AppContext>,
     headers: HeaderMap,
     uri: Uri,
+    Query(query): Query<WorkspaceDiffQuery>,
 ) -> Result<Json<ApiEnvelope<WorkspaceDiffResponse>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
     context
         .app
-        .workspace_diff(None)
+        .workspace_diff(None, query.thread_id)
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(|error| classify_session_error(error))

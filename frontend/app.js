@@ -277,7 +277,16 @@ const apiFetch = createApiFetch({
   },
 });
 
-const workspaceDiffStore = createWorkspaceDiffStore({ apiFetch, surface: "local" });
+const viewedThreadId = () => state.viewThreadId || state.session?.active_thread_id || null;
+const workspaceDiffStore = createWorkspaceDiffStore({
+  apiFetch,
+  surface: "local",
+  // Diff follows the session the user is viewing, not whichever thread is active.
+  getThreadId: viewedThreadId,
+  // Reset identity = viewed thread + its cwd, so a same-thread cwd change also
+  // clears the stale diff during loading (not just a thread switch).
+  getWorkspaceKey: () => JSON.stringify([viewedThreadId() || "", state.session?.current_cwd || ""]),
+});
 let clientLogRootHandle = null;
 let clientLogRootElement = null;
 let forkSessionRoot = null;
@@ -387,6 +396,7 @@ document.addEventListener("keydown", (event) => {
 
 let lastTurnDiffItemId = null;
 let lastWorkspaceCwd = null;
+let lastViewThreadId = null;
 window.addEventListener("agent-relay:session-updated", () => {
   refreshWorkspaceDiffIfChanged();
 });
@@ -394,13 +404,20 @@ function refreshWorkspaceDiffIfChanged() {
   const session = state.session;
   if (!session) return;
   const cwd = session.current_cwd || "";
-  if (lastWorkspaceCwd !== null && cwd !== lastWorkspaceCwd) {
+  // The viewed session id is also part of the key: switching between two threads
+  // that share a cwd must still refetch (each has its own workspace state).
+  const viewThreadId = state.viewThreadId || session.active_thread_id || null;
+  const cwdChanged = lastWorkspaceCwd !== null && cwd !== lastWorkspaceCwd;
+  const viewChanged = lastViewThreadId !== null && viewThreadId !== lastViewThreadId;
+  if (cwdChanged || viewChanged) {
     lastWorkspaceCwd = cwd;
+    lastViewThreadId = viewThreadId;
     lastTurnDiffItemId = null;
     void workspaceDiffStore.refresh();
     return;
   }
   lastWorkspaceCwd = cwd;
+  lastViewThreadId = viewThreadId;
   const entries = session.transcript || [];
   let latest = null;
   for (let i = entries.length - 1; i >= 0; i -= 1) {

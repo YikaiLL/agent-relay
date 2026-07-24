@@ -1362,7 +1362,28 @@ pub struct WorkspaceDiffResponse {
     pub diff: String,
     pub truncated: bool,
     pub not_a_git_repo: bool,
+    /// The requested session's workspace could not be resolved (deleted / not-yet-loaded /
+    /// pending thread). Fail-closed marker: the panel renders "workspace unavailable" rather
+    /// than falling back to another workspace's diff. Distinct from a clean tree.
+    #[serde(default)]
+    pub unavailable: bool,
     pub generated_at: u64,
+}
+
+impl WorkspaceDiffResponse {
+    /// Fail-closed response for a viewed session whose workspace can't be resolved.
+    /// Deliberately carries no cwd/diff so it can never leak another workspace's state.
+    pub fn unavailable() -> Self {
+        Self {
+            cwd: String::new(),
+            file_changes: Vec::new(),
+            diff: String::new(),
+            truncated: false,
+            not_a_git_repo: false,
+            unavailable: true,
+            generated_at: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

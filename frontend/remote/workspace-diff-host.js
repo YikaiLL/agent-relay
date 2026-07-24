@@ -8,19 +8,28 @@ import {
   WorkspaceDiffSheetBody,
 } from "../local/workspace-diff.js";
 import { RightPanelTabs } from "../shared/right-panel-tabs.js";
-import { fetchRemoteWorkspaceDiff } from "./session-ops.js";
+import {
+  fetchRemoteWorkspaceDiff,
+  getRemoteViewedThreadId,
+  getRemoteViewedWorkspaceKey,
+} from "./session-ops.js";
 
 const h = React.createElement;
 
 let sharedStore = null;
 let lastRemoteTurnDiffId = null;
 let lastRemoteCwd = null;
+let lastRemoteViewThreadId = null;
 
 export function getRemoteWorkspaceDiffStore() {
   if (!sharedStore) {
     sharedStore = createWorkspaceDiffStore({
       apiFetch: null,
       surface: "remote",
+      // Keys the viewed-workspace identity (thread id + cwd) so a view switch OR a
+      // same-thread cwd change clears the previous diff; the actual fetch goes
+      // through fetchDiff below.
+      getWorkspaceKey: getRemoteViewedWorkspaceKey,
       fetchDiff: async () => {
         const data = await fetchRemoteWorkspaceDiff();
         if (!data) {
@@ -37,13 +46,20 @@ export function notifyRemoteSessionUpdated(session) {
   if (!sharedStore) return;
   if (!session) return;
   const cwd = session.current_cwd || "";
-  if (lastRemoteCwd !== null && cwd !== lastRemoteCwd) {
+  // Same-cwd thread switches must still refetch → key on the viewed thread too.
+  const viewThreadId = getRemoteViewedThreadId();
+  const cwdChanged = lastRemoteCwd !== null && cwd !== lastRemoteCwd;
+  const viewChanged =
+    lastRemoteViewThreadId !== null && viewThreadId !== lastRemoteViewThreadId;
+  if (cwdChanged || viewChanged) {
     lastRemoteCwd = cwd;
+    lastRemoteViewThreadId = viewThreadId;
     lastRemoteTurnDiffId = null;
     void sharedStore.refresh();
     return;
   }
   lastRemoteCwd = cwd;
+  lastRemoteViewThreadId = viewThreadId;
   const entries = session.transcript || [];
   let latest = null;
   for (let i = entries.length - 1; i >= 0; i -= 1) {

@@ -183,6 +183,54 @@ fn fork_session_action_round_trips_and_issues_session_claim() {
 }
 
 #[test]
+fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
+    // The client sends the viewed session's thread_id; bind_device must stamp the
+    // requesting device WITHOUT dropping the selector (regression guard for the
+    // "rebuild loses the field" bug the reviewer flagged).
+    let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "fetch_workspace_diff",
+        "thread_id": "thread-viewed"
+    }))
+    .expect("fetch_workspace_diff should parse");
+    assert_eq!(request.kind(), RemoteActionKind::FetchWorkspaceDiff);
+    assert_eq!(
+        RemoteActionKind::FetchWorkspaceDiff.as_str(),
+        "fetch_workspace_diff"
+    );
+
+    match request.bind_device("device-9".to_string()) {
+        RemoteActionRequest::FetchWorkspaceDiff {
+            device_id,
+            thread_id,
+        } => {
+            assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert_eq!(
+                thread_id.as_deref(),
+                Some("thread-viewed"),
+                "bind_device must preserve the viewed thread_id, not drop it"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // Legacy client that omits thread_id still parses (serde default) and binds.
+    let legacy: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "fetch_workspace_diff"
+    }))
+    .expect("legacy fetch_workspace_diff should parse");
+    match legacy.bind_device("device-1".to_string()) {
+        RemoteActionRequest::FetchWorkspaceDiff {
+            device_id,
+            thread_id,
+        } => {
+            assert_eq!(device_id.as_deref(), Some("device-1"));
+            assert_eq!(thread_id, None);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+}
+
+#[test]
 fn push_subscription_actions_round_trip_and_are_not_claim_gated() {
     let reg: RemoteActionRequest = serde_json::from_value(serde_json::json!({
         "type": "register_push_subscription",
