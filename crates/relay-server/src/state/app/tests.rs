@@ -419,6 +419,37 @@ mod path_scope_tests {
         assert!(receipt.thread_project_id.get("t1").is_none());
     }
 
+    // B4a: a project mutation must become visible through the snapshot channel (how
+    // both surfaces, incl. remote after an ack, learn project state).
+    #[tokio::test]
+    async fn snapshot_exposes_projects_and_membership() {
+        let (app, _project, _outside) = build_app("/tmp/project").await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "Sealwire".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create");
+        let project_id = receipt.projects[0].id.clone();
+        app.project_action(ProjectActionInput {
+            action: ProjectAction::Assign {
+                thread_id: "t1".to_string(),
+                project_id: project_id.clone(),
+            },
+            device_id: None,
+        })
+        .await
+        .expect("assign");
+
+        let snapshot = app.snapshot().await;
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.projects[0].name, "Sealwire");
+        assert_eq!(snapshot.thread_project_id.get("t1"), Some(&project_id));
+    }
+
     async fn build_status_app(cwd: &str, read_status: &str) -> (AppState, TempDir, TempDir) {
         let project = TempDir::new().expect("project tempdir");
         let outside = TempDir::new().expect("outside tempdir");

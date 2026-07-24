@@ -2003,6 +2003,8 @@ impl RelayState {
             active_workflow_runs: self.active_workflow_runs_view(),
             workflows_revision: self.workflows_revision(),
             push_vapid_public_key: self.push_vapid_public_key.clone(),
+            projects: self.projects_view(),
+            thread_project_id: self.thread_project_id.clone(),
         }
     }
 

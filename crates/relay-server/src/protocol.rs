@@ -172,6 +172,14 @@ pub struct SessionSnapshot {
     /// dispatcher is wired. Not secret — safe to publish in the snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_vapid_public_key: Option<String>,
+    /// Persisted Projects (named session groupings). Snapshot-embedded because the
+    /// payload is tiny; `#[serde(default)]` keeps older clients/frames decoding, and
+    /// `skip_serializing_if` keeps the empty (no-Projects) wire shape byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectView>,
+    /// Session (thread) -> project id membership. Absent id = "Unassigned".
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub thread_project_id: std::collections::HashMap<String, String>,
 }
 
 /// Uncompacted reviewer-panel payload served on demand (decoupled from the byte-budgeted
