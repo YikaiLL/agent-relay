@@ -23,6 +23,10 @@ const LIVE_TOOL_CALLS = 14;
 const LIVE_BARRIER = "hold-live-tail";
 const LIVE_SESSION_COUNT = 6;
 const LOST_FOLLOW_DISTANCE_PX = 160;
+// Force each 20KB transport tail to contain only a fraction of a tool-heavy
+// turn. In the UI those raw entries collapse into one short tool-group row,
+// matching the saved-session blank-space regression.
+const SEEDED_TOOL_PREVIEW = "seeded tool output ".repeat(70);
 
 function livePrompt(index) {
   return index === 0 ? LIVE_PROMPT : `${LIVE_PROMPT} ${index + 1}`;
@@ -43,9 +47,9 @@ function toolEntry(turn, i) {
       item_type: "command",
       name: "Bash",
       title: `ls -la path/number/${turn}/${i}`,
-      detail: `ran command ${i} in turn ${turn}`,
+      detail: `ran command ${i} in turn ${turn}\n${SEEDED_TOOL_PREVIEW}`,
       query: null, path: null, url: null, command: `ls -la ${i}`,
-      input_preview: `ls -la ${i}`, result_preview: `result ${i}`,
+      input_preview: `ls -la ${i}`, result_preview: `result ${i}\n${SEEDED_TOOL_PREVIEW}`,
       diff: null, file_changes: [],
     },
   };
@@ -93,6 +97,7 @@ function measure() {
     ).filter((row) => /working|agenting/i.test(row.textContent || "")).length,
     blankBelowVisibleContent: Math.round(trect.bottom - lowestVisibleBottom),
     virtualized: Boolean(document.querySelector(".thread-content-virtualized")),
+    viewLabel: document.querySelector("#workspace-subtitle")?.textContent || "",
     lastVisibleText: visible.length ? (visible[visible.length - 1].textContent || "").replace(/\s+/g, " ").trim().slice(0, 40) : null,
   };
 }
@@ -237,6 +242,16 @@ async function main() {
     assert.ok(
       heldStats.distance <= 4 && heldLaterStats.distance <= 4,
       `the held live thread did not settle at the tail (${heldStats.distance}px then ${heldLaterStats.distance}px)`
+    );
+    assert.ok(
+      heldLaterStats.scrollHeight - heldLaterStats.clientHeight > 160
+        && heldLaterStats.blankBelowVisibleContent <= 160,
+      `the read-only working refresh collapsed loaded history back to a short tail (${JSON.stringify(heldLaterStats)})`
+    );
+    assert.match(
+      heldLaterStats.viewLabel,
+      /read-only\s+·\s+saved session/i,
+      "the regression must exercise the saved read-only projection"
     );
 
     await scenarioHarness.releaseBarrier(LIVE_BARRIER);

@@ -49,6 +49,7 @@ export function buildViewOnlyPin({
   wasWorking = false,
   priorEntries = [],
   priorOlderCursor = null,
+  historyExtended = false,
   loading = false,
   error = false,
 }) {
@@ -78,6 +79,10 @@ export function buildViewOnlyPin({
     lastRefreshAt,
     lastRefreshServerTime,
     wasWorking,
+    // True once the top-sentinel loader has prepended at least one older page.
+    // Working-tail refreshes must preserve that prefix instead of collapsing
+    // the view back to the latest transport page every 300ms.
+    historyExtended,
     loading,
     // True when the last load for this pin FAILED (fetch error). Lets the
     // self-heal decision retry it after a backoff instead of treating the empty
@@ -172,7 +177,71 @@ export function mergeOlderViewOnlyPage(pin, page) {
   return {
     ...pin,
     entries: [...older, ...(pin.entries || [])],
+    historyExtended: true,
     olderCursor: page.prev_cursor ?? null,
+  };
+}
+
+// Reconcile a freshly fetched working-thread tail with history that the reader
+// already paged in above it. Transcript transport pages are byte-sized, while
+// dozens of adjacent tool calls collapse into one visual row; replacing the pin
+// with only the fresh tail can therefore turn a scrollable transcript back into
+// two or three rows on every 300ms refresh.
+//
+// Preserve the older prefix only after pagination actually extended the pin.
+// This keeps the normal live-tail window bounded for readers who never loaded
+// history, while retaining the reader's loaded context once they did.
+export function mergeRefreshedViewOnlyPage(pin, page) {
+  if (pin && page && page.thread_id !== pin.threadId) {
+    // A stale response must never be relabeled as the requested thread. Keep
+    // the current pin intact; the caller can reject/retry the mismatched load.
+    return {
+      entries: Array.isArray(pin.entries) ? pin.entries : [],
+      historyExtended: Boolean(pin.historyExtended),
+      olderCursor: pin.olderCursor ?? null,
+    };
+  }
+
+  const freshEntries = Array.isArray(page?.entries) ? page.entries : [];
+  const fallback = {
+    entries: freshEntries,
+    historyExtended: false,
+    olderCursor: page?.prev_cursor ?? null,
+  };
+  if (
+    !pin?.historyExtended
+    || !page
+    || freshEntries.length === 0
+  ) {
+    return fallback;
+  }
+
+  const priorEntries = Array.isArray(pin.entries) ? pin.entries : [];
+  const priorIndexById = new Map();
+  priorEntries.forEach((entry, index) => {
+    if (entry?.item_id) {
+      priorIndexById.set(entry.item_id, index);
+    }
+  });
+  const firstOverlap = freshEntries.find((entry) =>
+    Boolean(entry?.item_id && priorIndexById.has(entry.item_id))
+  );
+  if (!firstOverlap) {
+    // The tail advanced beyond every retained entry (or the provider rewrote
+    // item ids). We cannot prove contiguity, so fall back to the authoritative
+    // tail and let the top loader rebuild history from its cursor.
+    return fallback;
+  }
+
+  const overlapIndex = priorIndexById.get(firstOverlap.item_id);
+  const freshIds = new Set(freshEntries.map((entry) => entry?.item_id).filter(Boolean));
+  const retainedPrefix = priorEntries
+    .slice(0, overlapIndex)
+    .filter((entry) => !entry?.item_id || !freshIds.has(entry.item_id));
+  return {
+    entries: [...retainedPrefix, ...freshEntries],
+    historyExtended: true,
+    olderCursor: pin.olderCursor ?? null,
   };
 }
 

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildViewOnlyPin,
   mergeOlderViewOnlyPage,
+  mergeRefreshedViewOnlyPage,
   projectViewOnlySession,
   viewOnlyEligible,
   viewOnlyPinNextAction,
@@ -210,6 +211,7 @@ test("merging an older page prepends entries and advances the cursor", () => {
     merged.entries.map((entry) => entry.item_id),
     ["e1", "e2", "e3", "e4"]
   );
+  assert.equal(merged.historyExtended, true);
   assert.equal(merged.olderCursor, 0);
 });
 
@@ -241,6 +243,141 @@ test("merge dedupes overlapping item_ids and ignores wrong-thread pages", () => 
     prev_cursor: null,
   });
   assert.equal(wrongThread, pin, "wrong-thread page must be ignored");
+});
+
+test("working-tail refresh preserves a prefix loaded by pagination", () => {
+  const refreshed = mergeRefreshedViewOnlyPage(
+    pinFor("A", {
+      entries: [
+        { item_id: "older-1", status: "completed" },
+        { item_id: "older-2", status: "completed" },
+        { item_id: "tail-1", status: "running" },
+        { item_id: "tail-2", status: "running" },
+      ],
+      historyExtended: true,
+      olderCursor: 5,
+    }),
+    {
+      thread_id: "A",
+      entries: [
+        { item_id: "tail-1", status: "completed" },
+        { item_id: "tail-2", status: "completed" },
+        { item_id: "tail-3", status: "running" },
+      ],
+      prev_cursor: 7,
+    }
+  );
+  assert.deepEqual(
+    refreshed.entries.map((entry) => `${entry.item_id}:${entry.status}`),
+    [
+      "older-1:completed",
+      "older-2:completed",
+      "tail-1:completed",
+      "tail-2:completed",
+      "tail-3:running",
+    ]
+  );
+  assert.equal(refreshed.olderCursor, 5, "the retained prefix keeps its older cursor");
+  assert.equal(refreshed.historyExtended, true);
+});
+
+test("working-tail refresh preserves the current pin for a wrong-thread page", () => {
+  const pin = pinFor("A", {
+    entries: [
+      { item_id: "older-a", status: "completed" },
+      { item_id: "tail-a", status: "running" },
+    ],
+    historyExtended: true,
+    olderCursor: 5,
+  });
+  const refreshed = mergeRefreshedViewOnlyPage(pin, {
+    thread_id: "B",
+    entries: [{ item_id: "private-b", status: "completed" }],
+    prev_cursor: 99,
+  });
+
+  assert.deepEqual(refreshed.entries, pin.entries);
+  assert.equal(refreshed.olderCursor, 5);
+  assert.equal(refreshed.historyExtended, true);
+  assert.equal(
+    refreshed.entries.some((entry) => entry.item_id === "private-b"),
+    false,
+    "a mismatched response must never expose another thread's entries"
+  );
+});
+
+test("one overlapping item bridges an append-only tail when its cursor advances", () => {
+  const refreshed = mergeRefreshedViewOnlyPage(
+    pinFor("A", {
+      entries: [
+        { item_id: "older-1", status: "completed" },
+        { item_id: "shared", status: "running" },
+      ],
+      historyExtended: true,
+      olderCursor: 5,
+    }),
+    {
+      thread_id: "A",
+      entries: [
+        { item_id: "shared", status: "completed" },
+        { item_id: "new-tail", status: "running" },
+      ],
+      prev_cursor: 9,
+    }
+  );
+
+  assert.deepEqual(
+    refreshed.entries.map((entry) => `${entry.item_id}:${entry.status}`),
+    ["older-1:completed", "shared:completed", "new-tail:running"]
+  );
+  assert.equal(
+    refreshed.olderCursor,
+    5,
+    "cursor movement is expected for byte-sized tails; the shared item proves continuity"
+  );
+  assert.equal(refreshed.historyExtended, true);
+});
+
+test("working-tail refresh stays bounded until history was explicitly extended", () => {
+  const refreshed = mergeRefreshedViewOnlyPage(
+    pinFor("A", {
+      entries: [{ item_id: "old-tail" }, { item_id: "shared" }],
+      historyExtended: false,
+      olderCursor: 8,
+    }),
+    {
+      thread_id: "A",
+      entries: [{ item_id: "shared" }, { item_id: "new-tail" }],
+      prev_cursor: 9,
+    }
+  );
+  assert.deepEqual(
+    refreshed.entries.map((entry) => entry.item_id),
+    ["shared", "new-tail"]
+  );
+  assert.equal(refreshed.olderCursor, 9);
+  assert.equal(refreshed.historyExtended, false);
+});
+
+test("working-tail refresh falls back safely when the provider tail no longer overlaps", () => {
+  const refreshed = mergeRefreshedViewOnlyPage(
+    pinFor("A", {
+      entries: [{ item_id: "old-history" }, { item_id: "old-tail" }],
+      historyExtended: true,
+      olderCursor: null,
+    }),
+    {
+      thread_id: "A",
+      entries: [{ item_id: "rewritten-tail" }],
+      prev_cursor: 22,
+    }
+  );
+  assert.deepEqual(
+    refreshed.entries.map((entry) => entry.item_id),
+    ["rewritten-tail"]
+  );
+  assert.equal(refreshed.olderCursor, 22);
+  assert.equal(refreshed.historyExtended, false);
 });
 
 // ---------------------------------------------------------------------------

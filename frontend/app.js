@@ -173,11 +173,15 @@ import { isWorkflowInProgressForThread } from "./shared/workflow-state.js";
 import {
   buildViewOnlyPin,
   mergeOlderViewOnlyPage,
+  mergeRefreshedViewOnlyPage,
   viewOnlyEligible,
   viewOnlyPinNextAction,
   viewOnlySelfHealThreadId,
 } from "./local/view-only-thread.js";
-import { shouldRefreshViewedThread } from "./shared/viewed-thread-refresh.js";
+import {
+  createViewedThreadRefreshLatch,
+  shouldRefreshViewedThread,
+} from "./shared/viewed-thread-refresh.js";
 import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import {
@@ -774,6 +778,7 @@ async function loadViewOnlyTranscript(threadId) {
     wasWorking: isWorking,
     priorEntries: prior?.entries || [],
     priorOlderCursor: prior?.olderCursor ?? null,
+    historyExtended: Boolean(prior?.historyExtended),
     loading: true,
   });
   if (state.session) renderer.renderSession(state.session);
@@ -785,9 +790,21 @@ async function loadViewOnlyTranscript(threadId) {
       page && Array.isArray(page.entries)
         ? page
         : { thread_id: threadId, entries: Array.isArray(page) ? page : [], prev_cursor: null };
+    if (normalized.thread_id !== threadId) {
+      throw new Error(
+        `Transcript response thread mismatch (expected ${threadId}, received ${
+          normalized.thread_id || "missing"
+        })`
+      );
+    }
+    const refreshed = mergeRefreshedViewOnlyPage(prior, normalized);
     state.viewOnlyThread = buildViewOnlyPin({
       threadId,
-      page: normalized,
+      page: {
+        ...normalized,
+        entries: refreshed.entries,
+        prev_cursor: refreshed.olderCursor,
+      },
       generation,
       review,
       workflowLocked: Boolean(normalized.thread_state?.workflow_locked ?? workflowLocked),
@@ -813,6 +830,7 @@ async function loadViewOnlyTranscript(threadId) {
       lastRefreshAt: Date.now(),
       lastRefreshServerTime: normalized.server_time ?? null,
       wasWorking: isWorking,
+      historyExtended: refreshed.historyExtended,
     });
   } catch (error) {
     if (generation !== state.viewOnlyGeneration) return;
@@ -838,6 +856,7 @@ async function loadViewOnlyTranscript(threadId) {
       wasWorking: isWorking,
       priorEntries: prior?.entries || [],
       priorOlderCursor: prior?.olderCursor ?? null,
+      historyExtended: Boolean(prior?.historyExtended),
       // Mark the failure so the self-heal (viewOnlySelfHealThreadId) retries this
       // load after a backoff instead of treating the empty shell as settled.
       error: true,
@@ -852,6 +871,7 @@ async function loadViewOnlyTranscript(threadId) {
 // Deliberately separate from the active-thread hydration pipeline — that store
 // is keyed to the live thread and must not be re-keyed by a view-only visit.
 let viewOnlyOlderLoading = false;
+const viewOnlyRefreshLatch = createViewedThreadRefreshLatch();
 // Returns the same tri-state the active-thread loader uses so the history
 // loader can keep prefetching read-only pins within one intersection:
 //   true  → a page loaded and more remain
@@ -886,6 +906,17 @@ async function loadOlderViewOnlyTranscript() {
     return null;
   } finally {
     viewOnlyOlderLoading = false;
+    const deferredThreadId = viewOnlyRefreshLatch.take();
+    if (
+      deferredThreadId
+      && state.viewThreadId === deferredThreadId
+      && state.viewOnlyThread?.threadId === deferredThreadId
+    ) {
+      // Re-evaluate against the latest session. The viewed thread may have
+      // started working again or the user may have navigated while history was
+      // loading, so the deferred signal alone is not authority to fetch.
+      maybeRefreshViewOnly(state.session);
+    }
   }
 }
 
@@ -905,6 +936,8 @@ function maybeRefreshViewOnly(session) {
     if (action.kind === "release") {
       state.viewOnlyThread = null;
     } else if (action.kind === "refresh") {
+      // Review/workflow lifecycle transitions are authoritative and may be the
+      // final signal we receive, so do not defer them behind history loading.
       void loadViewOnlyTranscript(pin.threadId);
     } else {
       const working = Boolean(
@@ -912,11 +945,19 @@ function maybeRefreshViewOnly(session) {
       );
       if (shouldRefreshViewedThread({
         elapsedMs: Date.now() - (pin.lastRefreshAt || 0),
+        historyLoading: viewOnlyOlderLoading,
         loading: pin.loading,
         wasWorking: pin.wasWorking,
         working,
       })) {
-        void loadViewOnlyTranscript(pin.threadId);
+        if (viewOnlyOlderLoading) {
+          // Only the working→idle case passes shouldRefreshViewedThread while
+          // history is loading. Let that page land, then re-check the terminal
+          // state from the loader's finally block.
+          viewOnlyRefreshLatch.defer(pin.threadId);
+        } else {
+          void loadViewOnlyTranscript(pin.threadId);
+        }
       }
     }
   }
