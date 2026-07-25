@@ -593,6 +593,9 @@ function ChatShell() {
     { className: "chat-shell", "data-view": "console" },
     h(ChatHeader),
     h(OverviewStrip),
+    // Projects "card overview" main-area view. Filled by renderProjectOverview();
+    // shown only when data-view="project-overview" (CSS-gated like console/conversation).
+    h("section", { className: "project-overview-mount", id: "project-overview" }),
     h(ConsoleGrid),
     h("div", { className: "pending-action-banner", id: "pending-action-banner", hidden: true }),
     h(

@@ -137,6 +137,7 @@ import {
 } from "./shared/thread-groups.js";
 import {
   createThreadListStore,
+  readActiveProjectId,
   readThreadListContextMenu,
   readThreadListUi,
   readThreadListViewMode,
@@ -288,6 +289,11 @@ const state = {
   projectsLoading: false,
   projectsError: null,
   projectsLoaded: false,
+  // When a session is started via a project overview's "New agent" button, this holds
+  // that project's id so the freshly-created thread can be auto-assigned to it. Set at
+  // "New agent" time, consumed once by the next start, and cleared by any plain
+  // new-session opener so a normal launch never inherits a stale project.
+  pendingProjectAssignment: null,
   threadHistoryScrollTop: 0,
   threadListStore: createThreadListStore(),
   localUiStore: createLocalUiStore(),
@@ -335,10 +341,17 @@ projectsStore.subscribe((projectsState) => {
   projectsStateSeq += 1;
   // Re-render on ANY change (loading/loaded/error transitions) while the Projects
   // view is showing, so its loading/error placeholder resolves to the grouping.
-  // `renderThreads` is a module const defined below; this callback only ever fires
-  // asynchronously (after a fetch settles), by which point it is initialized.
+  // `renderThreads`/`renderSession` are module consts defined below; this callback
+  // only ever fires asynchronously (after a fetch settles), by which point they are
+  // initialized.
   if (readThreadListViewMode(state.threadListStore) === "projects") {
+    // Once projects arrive, land on one so the main area shows a card overview
+    // instead of the console home.
+    ensureActiveProjectSelected();
     renderThreads();
+    if (state.session) {
+      renderSession(state.session);
+    }
   }
   // Keep an OPEN context menu's Project section in sync regardless of view mode —
   // a settled refresh/failure must repopulate (fresh membership) or fall closed
@@ -671,6 +684,23 @@ const renderer = createSessionRenderer({
     // falling back to the console home). No-op / clears the projection when the
     // thread is the active one.
     void loadViewOnlyTranscript(threadId);
+  },
+  // Projects master-detail: select a project and show its card overview in the main
+  // area. Clears any open session so the overview (not a transcript) is what renders;
+  // renderSession derives data-view="project-overview" from the selected project.
+  enterProjectOverview(projectId) {
+    state.threadListStore.getState().setActiveProject(projectId);
+    clearThreadRoute();
+    if (state.session) {
+      renderer.renderSession(state.session);
+    }
+    renderer.renderThreads();
+  },
+  // "New agent" from a project overview: open the start-session dialog and remember
+  // the project, so the session created by the next Start is auto-assigned to it.
+  startProjectAgent(projectId) {
+    state.pendingProjectAssignment = projectId || null;
+    document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
   },
 });
 
@@ -1097,6 +1127,19 @@ openSecurityHeaderButton?.addEventListener("click", openSecurityModal);
 // Sessions/Projects sidebar grouping toggle (static-shell buttons wired by id).
 const threadsViewSessionsButton = document.getElementById("threads-view-sessions");
 const threadsViewProjectsButton = document.getElementById("threads-view-projects");
+// Land on a project (the first, by list order) when Projects mode is active but none
+// is selected yet, so the main area shows a card overview rather than the console
+// home. No-op once a project is selected, or when there are no projects.
+function ensureActiveProjectSelected() {
+  if (readActiveProjectId(state.threadListStore)) {
+    return;
+  }
+  const first = (state.projects || [])[0];
+  if (first) {
+    state.threadListStore.getState().setActiveProject(first.id);
+  }
+}
+
 function setThreadViewMode(mode) {
   const isProjects = mode === "projects";
   state.threadListStore.getState().setViewMode(isProjects ? "projects" : "sessions");
@@ -1109,8 +1152,14 @@ function setThreadViewMode(mode) {
   // Ensure the Projects payload is loaded when switching in (no-op if already current).
   if (isProjects) {
     projectsStore.syncToRevision(state.session?.projects_revision || 0);
+    ensureActiveProjectSelected();
   }
   renderThreads();
+  // Switch the main area too: entering Projects shows the card overview; leaving it
+  // returns to console/conversation. renderSession derives the view from the mode.
+  if (state.session) {
+    renderSession(state.session);
+  }
 }
 threadsViewSessionsButton?.addEventListener("click", () => setThreadViewMode("sessions"));
 threadsViewProjectsButton?.addEventListener("click", () => setThreadViewMode("projects"));
@@ -1439,13 +1488,50 @@ resumeLatestButton?.addEventListener("click", () => {
   void resumeLatestSession();
 });
 
+// A plain new-session opener (launcher, header compose, empty-state CTA) resets any
+// pending project assignment, so a session started from the normal launcher never
+// inherits a project the user only glanced at via "New agent".
+document.addEventListener("click", (event) => {
+  const el = event.target instanceof Element ? event.target : null;
+  if (!el) return;
+  if (
+    el.closest("#open-start-session-dialog") ||
+    el.closest("#new-session-compose-button") ||
+    el.closest("[data-start-session]")
+  ) {
+    state.pendingProjectAssignment = null;
+  }
+});
+
 document.addEventListener("click", (event) => {
   const target = event.target instanceof Element ? event.target : event.target?.parentElement;
   if (!target?.closest("#start-session-button")) {
     return;
   }
-  void startSession();
+  // Consume any pending "New agent" project synchronously (so a failed/cancelled
+  // start can't leave it dangling), then assign the freshly-created thread once
+  // startSession resolves with its id.
+  const assignToProject = state.pendingProjectAssignment;
+  state.pendingProjectAssignment = null;
+  void startSession().then((newThreadId) => {
+    if (newThreadId && assignToProject) {
+      void assignNewSessionToProject(newThreadId, assignToProject);
+    }
+  });
 });
+
+// Assign a just-started session to the project its "New agent" button belongs to. The
+// membership change rides the snapshot's projects_revision bump (assign calls notify),
+// same as every other project mutation, so the sidebar/overview refresh on their own.
+async function assignNewSessionToProject(threadId, projectId) {
+  try {
+    await assignThreadToProject(apiFetch, threadId, projectId);
+    const name = (state.projects || []).find((project) => project.id === projectId)?.name || "project";
+    logLine(`Added the new session to "${name}".`);
+  } catch (error) {
+    logLine(`Started the session, but couldn't add it to the project: ${error.message}`);
+  }
+}
 
 document.addEventListener("change", (event) => {
   const target = event.target;

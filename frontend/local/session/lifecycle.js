@@ -203,10 +203,11 @@ export function createLifecycleController(ctx) {
         throw new Error(payload?.error?.message || "Failed to start session");
       }
 
+      const newThreadId = payload.data.active_thread_id || null;
       state.defaultsSeeded = false;
       await runViewTransition(() => {
         setSelectedCwd(payload.data.current_cwd || cwd);
-        setThreadRoute(payload.data.active_thread_id || null);
+        setThreadRoute(newThreadId);
         seedDefaults(payload.data);
         applySessionSnapshot(payload.data);
       });
@@ -215,8 +216,12 @@ export function createLifecycleController(ctx) {
       }
       await loadThreads("post-start refresh");
       logLine(`Started a new ${agentName} session`);
+      // Return the new thread id so callers (e.g. "New agent" from a project
+      // overview) can act on the freshly-created session.
+      return newThreadId;
     } catch (error) {
       logLine(`Session start failed: ${error.message}`);
+      return null;
     } finally {
       setStartControlsBusy(false);
     }

@@ -55,6 +55,7 @@ export const startEffortInput = document.querySelector("#start-effort");
 export const startEffortLabel = document.querySelector("#start-effort-label");
 export const threadsList = document.querySelector("#threads-list");
 export const threadsCount = document.querySelector("#threads-count");
+export const projectOverviewMount = document.querySelector("#project-overview");
 export const threadContextMenu = document.querySelector("#thread-context-menu");
 export const forkThreadButton = document.querySelector("#fork-thread-button");
 export const archiveThreadButton = document.querySelector("#archive-thread-button");

@@ -23,6 +23,17 @@ export function createThreadListStore(initialThreadList = {}) {
     setViewMode(mode) {
       set({ viewMode: mode === "projects" ? "projects" : "sessions" });
     },
+    // Projects view is master-detail: the project whose card overview fills the main
+    // area. Null = no project selected yet. A display-only selection — never sent to
+    // the backend — so it holds a real project id or null (never the Unassigned
+    // sentinel, which the Projects view does not surface).
+    activeProjectId:
+      typeof initialThreadList.activeProjectId === "string"
+        ? initialThreadList.activeProjectId
+        : null,
+    setActiveProject(projectId) {
+      set({ activeProjectId: typeof projectId === "string" && projectId ? projectId : null });
+    },
     threadList: createThreadListUiState(initialThreadList),
     clearError() {
       set((state) => ({
@@ -99,4 +110,9 @@ export function readThreadListContextMenu(store) {
 
 export function readThreadListViewMode(store) {
   return store?.getState?.().viewMode === "projects" ? "projects" : "sessions";
+}
+
+export function readActiveProjectId(store) {
+  const value = store?.getState?.().activeProjectId;
+  return typeof value === "string" && value ? value : null;
 }

@@ -432,6 +432,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--right-rail-width);
 }
 
+/* Projects card overview: no session in focus, so the workspace-changes / reviewer
+   right rail has nothing to show — drop it and let the card list use the full width. */
+.app-shell[data-view="project-overview"],
+.app-shell-with-rail[data-view="project-overview"] {
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+}
+.app-shell[data-view="project-overview"] .right-rail {
+  display: none;
+}
+
 /* Suppress the column transition while the user is actively dragging a
  * resize handle — otherwise the column lags behind the cursor. */
 body.is-resizing-panel .app-shell {
@@ -1247,16 +1257,384 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-tertiary);
 }
 
-/* Projects toolbar (create a Project) — shown only in the Projects view. */
+/* Projects toolbar — a single prominent "New project" action, not an empty box. */
 .projects-toolbar {
-  display: flex;
-  justify-content: flex-end;
-  padding: 6px 2px 2px;
+  display: block;
+  padding: 2px 0 4px;
 }
 
-.projects-create-button {
+.projects-create-button.projects-create-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 9px 12px;
   font-size: var(--text-sm);
-  padding: 5px 12px;
+  font-weight: var(--weight-strong);
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  color: var(--accent-on);
+  background: var(--accent);
+  box-shadow: var(--shadow-1);
+  transition: filter 0.12s ease, transform 0.06s ease, box-shadow 0.12s ease;
+}
+.projects-create-button.projects-create-button:hover {
+  filter: brightness(1.08);
+  box-shadow: var(--shadow-2);
+}
+.projects-create-button.projects-create-button:active {
+  transform: translateY(1px);
+}
+
+/* ===== Projects-mode sidebar: a list of project rows (no sessions inline) ===== */
+.project-sidebar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.project-sidebar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  text-align: left;
+  color: var(--text-1);
+  position: relative;
+  cursor: pointer;
+}
+.project-sidebar-row:hover {
+  background: var(--surface-1);
+}
+.project-sidebar-row.is-active {
+  background: var(--accent-soft-bg);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.project-sidebar-row.is-active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 9px;
+  bottom: 9px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--accent);
+}
+.project-sidebar-icon {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.project-sidebar-row.is-active .project-sidebar-icon {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+}
+.project-sidebar-meta {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.project-sidebar-name {
+  font-size: var(--text-body);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-sidebar-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.project-sidebar-badge {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.project-sidebar-badge.is-working {
+  color: var(--accent);
+  background: var(--accent-soft-bg);
+}
+.project-sidebar-badge.is-attention {
+  color: var(--warn-fg);
+  background: var(--warn-bg);
+}
+
+/* ===== Projects card overview — the main-area view (data-view="project-overview") ===== */
+.chat-shell[data-view="project-overview"] {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.chat-shell[data-view="project-overview"] > * {
+  display: none;
+}
+.project-overview-mount {
+  display: none;
+}
+.chat-shell[data-view="project-overview"] > .project-overview-mount {
+  display: block;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.project-overview {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+.project-overview-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 28px 32px 18px;
+  border-bottom: 1px solid var(--border-faint);
+}
+.project-overview-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
+  letter-spacing: 0.2px;
+  color: var(--text-1);
+}
+.project-overview-sub {
+  margin: 6px 0 0;
+  color: var(--text-3);
+  font-size: var(--text-sm);
+}
+.project-overview-new {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: var(--accent-on);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-strong);
+  box-shadow: var(--shadow-1);
+  cursor: pointer;
+  transition: filter 0.12s ease;
+}
+.project-overview-new:hover {
+  filter: brightness(1.08);
+}
+
+.project-card-band-label {
+  margin: 20px 32px 8px;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-strong);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.project-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 32px 40px;
+}
+.project-card-band-label + .project-card-list {
+  padding-top: 0;
+}
+
+.project-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 14px 13px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.project-card:hover {
+  background: var(--surface-2);
+  border-color: var(--border-firm);
+}
+.project-card.is-pinned {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border-soft));
+}
+.project-card.is-pinned::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 13px;
+  bottom: 13px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--accent);
+}
+.project-card.is-dragging {
+  opacity: 0.5;
+}
+.project-card.is-drop-target {
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+.project-card-drag {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  color: var(--text-faint);
+  opacity: 0;
+  cursor: grab;
+  transition: opacity 0.12s ease;
+}
+.project-card:hover .project-card-drag {
+  opacity: 0.8;
+}
+.project-card-drag:active {
+  cursor: grabbing;
+}
+.project-card-body {
+  flex: 1;
+  min-width: 0;
+}
+.project-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.project-card-title {
+  font-size: var(--text-body);
+  font-weight: var(--weight-medium);
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-card-meta {
+  margin-top: 5px;
+  color: var(--text-3);
+  font-size: var(--text-sm);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.project-card-side {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.project-card-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.project-card-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.project-card-status.is-working {
+  color: var(--accent);
+  background: var(--accent-soft-bg);
+}
+.project-card-status.is-working .project-card-status-dot {
+  animation: agent-working-indicator-pulse 1.4s ease-in-out infinite;
+}
+.project-card-status.is-reviewing {
+  color: var(--accent);
+  background: var(--accent-soft-bg);
+}
+.project-card-status.is-needs_input {
+  color: var(--warn-fg);
+  background: var(--warn-bg);
+}
+.project-card-status.is-done,
+.project-card-status.is-idle {
+  color: var(--text-3);
+  background: var(--status-neutral-bg);
+}
+.project-card-time {
+  color: var(--text-faint);
+  font-size: var(--text-sm);
+  min-width: 32px;
+  text-align: right;
+}
+.project-card-pin {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: 8px;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.project-card:hover .project-card-pin {
+  opacity: 1;
+}
+.project-card-pin:hover {
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+.project-card-pin.is-pinned {
+  opacity: 1;
+  color: var(--accent);
+}
+.project-overview-empty {
+  margin: 48px auto;
+  max-width: 380px;
+  text-align: center;
+  color: var(--text-3);
+  border: 1px dashed var(--border-firm);
+  border-radius: var(--r-md);
+  padding: 40px 24px;
+}
+.project-overview-empty h3 {
+  margin: 0 0 6px;
+  color: var(--text-1);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
+}
+.project-overview-empty p {
+  margin: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .project-card-status.is-working .project-card-status-dot {
+    animation: none;
+  }
 }
 
 /* MAIN SHELL */

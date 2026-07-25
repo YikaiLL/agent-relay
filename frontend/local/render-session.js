@@ -30,6 +30,7 @@ import {
   stopButton,
   threadsCount,
   threadsList,
+  projectOverviewMount,
   transcript,
   workspaceTitle,
   workspaceSubtitle,
@@ -47,10 +48,22 @@ import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
 import { canForkInSession } from "../shared/fork-fields.js";
 import {
+  readActiveProjectId,
   readThreadListContextMenu,
   readThreadListUi,
   readThreadListViewMode,
 } from "../shared/thread-list-store.js";
+import { ProjectOverview, ProjectSidebarList } from "../shared/project-overview-react.js";
+import {
+  selectProjectAgents,
+  sortProjectCards,
+  summarizeProjectActivity,
+} from "../shared/project-overview-model.js";
+import {
+  loadProjectPrefs,
+  toggleProjectPin,
+  setProjectOrder,
+} from "./project-overview-prefs.js";
 import {
   readLocalUiState,
 } from "./ui-store.js";
@@ -221,6 +234,8 @@ export function createSessionRenderer({
   setReviewSlice,
   fetchReviews,
   viewThread,
+  enterProjectOverview,
+  startProjectAgent,
 }) {
   // Cached reviewer-panel data from the dedicated (uncompacted) channel, keyed by the
   // snapshot's `reviews_revision`. See reviews-cache.js / renderReviewSlice.
@@ -345,11 +360,23 @@ export function createSessionRenderer({
       workspaceSubtitle.textContent = "no workspace selected";
     }
 
+    // Three-way main view: a live/read-only conversation always wins; otherwise, in
+    // Projects mode with a selected project, the card overview replaces the console
+    // home. `mainView` drives the CSS show/hide of the three main-area layouts.
+    const projectsViewMode = readThreadListViewMode(state.threadListStore) === "projects";
+    const activeProjectId = readActiveProjectId(state.threadListStore);
+    const showProjectOverview =
+      !viewingConversation && projectsViewMode && Boolean(activeProjectId);
+    const mainView = viewingConversation
+      ? "conversation"
+      : showProjectOverview
+        ? "project-overview"
+        : "console";
     if (chatShell) {
-      chatShell.dataset.view = viewingConversation ? "conversation" : "console";
+      chatShell.dataset.view = mainView;
     }
     if (appShell) {
-      appShell.dataset.view = viewingConversation ? "conversation" : "console";
+      appShell.dataset.view = mainView;
     }
     if (sessionHistoryDrawer) {
       sessionHistoryDrawer.open = viewingConversation || Boolean(threadListUi.drawerOpen);
@@ -382,6 +409,9 @@ export function createSessionRenderer({
       renderOverviewState(session);
       renderLiveSurfaces(session, activeThread);
       renderAuditTimeline(session.logs || []);
+    }
+    if (showProjectOverview) {
+      renderProjectOverview();
     }
     if (!viewingConversation || viewingSessionDetails) {
       renderSessionMeta(session);
@@ -1481,14 +1511,56 @@ export function createSessionRenderer({
       return;
     }
 
-    const groups =
-      viewMode === "projects"
-        ? buildNavigationThreadGroups(state.threads, {
-            groupBy: "project",
-            projects: state.projects || [],
-            threadProjectId: state.threadProjectId || {},
-          })
-        : state.threadGroups || [];
+    // Projects mode: the sidebar lists projects (one row each) — the sessions
+    // themselves live in the main-area card overview, and the Unassigned bucket is
+    // intentionally not surfaced here. Selecting a row opens that project's overview.
+    if (viewMode === "projects") {
+      const activeProjectId = readActiveProjectId(state.threadListStore);
+      const activity = buildThreadActivityMap(state.session);
+      const attention = threadAttention.snapshotMap();
+      const reviewing = buildReviewingThreadSet(state.session);
+      const rows = (state.projects || []).map((project) => {
+        const agents = selectProjectAgents({
+          projectId: project.id,
+          threads: state.threads,
+          threadProjectId: state.threadProjectId || {},
+        });
+        const summary = summarizeProjectActivity({
+          agents,
+          threadActivity: activity,
+          threadAttention: attention,
+          threadReviewing: reviewing,
+        });
+        return {
+          id: project.id,
+          name: project.name || project.id,
+          working: summary.working,
+          needsInput: summary.needsInput,
+          total: summary.total,
+        };
+      });
+      renderWorkspaceSuggestions(state.session);
+      const projectCount = rows.length;
+      threadsCount.textContent = `${projectCount} ${projectCount === 1 ? "project" : "projects"}`;
+      threadsCount.title = rows.map((row) => row.name).join("\n");
+      resumeLatestButton.disabled = state.threads.length === 0;
+      renderReactContent(
+        threadsList,
+        h(ProjectSidebarList, {
+          rows,
+          activeProjectId,
+          emptyMessage: "No projects yet. Create one to group your sessions.",
+          onSelect(projectId) {
+            if (typeof enterProjectOverview === "function") {
+              enterProjectOverview(projectId);
+            }
+          },
+        })
+      );
+      return;
+    }
+
+    const groups = state.threadGroups || [];
     const totalThreads = state.threads.length;
 
     renderWorkspaceSuggestions(state.session);
@@ -1553,6 +1625,76 @@ export function createSessionRenderer({
         state.threadHistoryScrollTop = threadsList.scrollTop;
       }
     });
+  }
+
+  // Fill the main-area card overview for the active project. Callers gate this on
+  // mainView === "project-overview" (see renderSession); it owns pin/reorder writes
+  // (client-side, project-overview-prefs) and re-renders itself after each.
+  function renderProjectOverview() {
+    if (!projectOverviewMount) {
+      return;
+    }
+    const activeProjectId = readActiveProjectId(state.threadListStore);
+    // Loading / error states: only shown before the FIRST successful load, so a
+    // background refresh never blanks an already-rendered overview.
+    if (!state.projectsLoaded) {
+      renderReactContent(
+        projectOverviewMount,
+        h(
+          "div",
+          { className: "project-overview-empty" },
+          h("h3", null, state.projectsError ? "Projects unavailable" : "Loading projects…"),
+          state.projectsError ? h("p", null, String(state.projectsError)) : null
+        )
+      );
+      return;
+    }
+    const project = (state.projects || []).find((entry) => entry.id === activeProjectId) || null;
+    const prefs = loadProjectPrefs(activeProjectId);
+    const agents = sortProjectCards(
+      selectProjectAgents({
+        projectId: activeProjectId,
+        threads: state.threads,
+        threadProjectId: state.threadProjectId || {},
+      }),
+      prefs
+    );
+    renderReactContent(
+      projectOverviewMount,
+      h(ProjectOverview, {
+        project,
+        agents,
+        pinnedIds: new Set(prefs.pinned),
+        threadActivity: buildThreadActivityMap(state.session),
+        threadAttention: threadAttention.snapshotMap(),
+        threadReviewing: buildReviewingThreadSet(state.session),
+        formatMeta(thread) {
+          return formatRelativeTime(thread.updated_at);
+        },
+        onOpenAgent(threadId) {
+          // Opening clears the attention dot and doubles as the gesture that unlocks
+          // notification permission — mirrors the sidebar's onResumeThread.
+          threadAttention.clear(threadId);
+          void ensureNotificationPermission();
+          if (typeof viewThread === "function") {
+            viewThread(threadId);
+          }
+        },
+        onTogglePin(threadId) {
+          toggleProjectPin(activeProjectId, threadId);
+          renderProjectOverview();
+        },
+        onReorder(orderedIds) {
+          setProjectOrder(activeProjectId, orderedIds);
+          renderProjectOverview();
+        },
+        onNewAgent(projectId) {
+          if (typeof startProjectAgent === "function") {
+            startProjectAgent(projectId);
+          }
+        },
+      })
+    );
   }
 
   function renderWorkspaceSuggestions(session) {
