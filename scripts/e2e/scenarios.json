@@ -15,6 +15,7 @@
       "local-thread-settings",
       "local-thread-groups",
       "local-projects-toggle",
+      "local-shell-redesign",
       "local-rail-toggle-align",
       "local-permission-modes"
     ],
@@ -34,6 +35,7 @@
       "local-thread-settings",
       "local-thread-groups",
       "local-projects-toggle",
+      "local-shell-redesign",
       "local-rail-toggle-align",
       "local-delete",
       "local-permission-modes"
@@ -235,6 +237,20 @@
       "coverage": [
         "projects-toggle",
         "projects-fail-closed"
+      ]
+    },
+    "local-shell-redesign": {
+      "script": "browser-local-shell-redesign-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "icon-rail",
+        "settings-modal",
+        "mobile-settings",
+        "project-actions-menu",
+        "sidebar-collapse-expand",
+        "host-status"
       ]
     },
     "local-rail-toggle-align": {

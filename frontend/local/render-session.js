@@ -6,8 +6,8 @@ import {
   controlBanner,
   goConsoleHomeButton,
   goConsoleHomeSidebarButton,
-  liveSurfacesList,
-  liveSurfacesSummary,
+  sidebarHostStatus,
+  sidebarHostLabel,
   localModelBadge,
   messageForm,
   messageInput,
@@ -16,7 +16,6 @@ import {
   pairingApprovalHint,
   pairingApprovalModal,
   pendingActionBanner,
-  providerStatusPanel,
   providerStatusList,
   resumeLatestButton,
   sendButton,
@@ -117,7 +116,6 @@ import {
   ControlBannerContent,
   OverviewBadges,
   SessionMetaPanel,
-  SurfaceCards,
   TextContent,
 } from "./react-session-panels.js";
 import { ThreadGroupList } from "../shared/thread-list-react.js";
@@ -219,10 +217,8 @@ export function createSessionRenderer({
   canCurrentDeviceWrite,
   controllerLabel,
   controllerStateLabel,
-  sessionControllerState,
   isCurrentDeviceActiveController,
   isViewingConversation,
-  approvedDeviceCount,
   securityModeLabel,
   contentVisibilityLabel,
   brokerStatusLabel,
@@ -240,6 +236,7 @@ export function createSessionRenderer({
   viewThread,
   enterProjectOverview,
   startProjectAgent,
+  openProjectContextMenu,
 }) {
   // Notifications navigate locally; looking at a thread never resumes it.
   configureThreadNotifications({
@@ -335,7 +332,7 @@ export function createSessionRenderer({
     const workspaceName = workspace ? workspaceBasename(workspace) : "";
     const viewingSessionDetails = Boolean(sessionMeta?.closest("dialog")?.open);
     const viewingSecurityDetails = Boolean(
-      document.querySelector("#security-modal")?.open
+      document.querySelector("#settings-modal")?.open
     );
     const threadListUi = readThreadListUi(state.threadListStore);
     state.currentApprovalId = approval?.request_id || null;
@@ -405,12 +402,14 @@ export function createSessionRenderer({
     // Provider status is relay-global; read the real session, not the
     // (possibly view-only) projection above.
     renderProviderStatus(state.session);
+    renderHostStatus();
 
     if (!viewingConversation) {
       renderOverviewState(session);
-      renderLiveSurfaces(session, activeThread);
-      renderAuditTimeline(session.logs || []);
     }
+    // "Recent events" now lives in the Settings > Log tab; keep it fresh in every
+    // view (including while a conversation is open) so opening Settings shows current data.
+    renderAuditTimeline(session.logs || []);
     if (showProjectOverview) {
       renderProjectOverview();
     }
@@ -525,6 +524,7 @@ export function createSessionRenderer({
     renderWorkspaceSuggestions(null);
     renderHeaderModelBadge(null);
     renderProviderStatus(null);
+    renderHostStatus();
     statusBadge.textContent = "Offline";
     statusBadge.className = "status-badge status-badge-offline";
     if (sessionDetailsPath) {
@@ -562,6 +562,7 @@ export function createSessionRenderer({
       });
     }
     openSessionDetailsButton.disabled = true;
+    renderHostStatus();
     renderOverviewState(null, message);
     renderWorkspaceSuggestions(null);
     renderThreadListMessage("Sign in", "Enter RELAY_API_TOKEN to load sessions.");
@@ -689,6 +690,28 @@ export function createSessionRenderer({
   // snapshot's `provider_status`, including any that failed to spawn (with the
   // reason as a hover title). Independent of which thread is being viewed, so it
   // reads the real session, not the view-only projection.
+  // Sidebar footer reflects the LIVE (SSE) connection, matching its data source
+  // (state.streamConnected). When the stream drops the client keeps working via the
+  // /api/session polling fallback, so the degraded state is labelled "Polling" (the
+  // relay is still reachable) rather than a misleading "Offline"/"Reconnecting".
+  function renderHostStatus() {
+    if (!sidebarHostStatus) {
+      return;
+    }
+    // When auth is required but not yet completed, neither the stream nor the polling
+    // fallback runs — so don't claim "Polling". Show a signed-out state instead.
+    const signedOut = Boolean(state.authRequired && !state.authenticated);
+    const live = !signedOut && Boolean(state.streamConnected);
+    sidebarHostStatus.classList.toggle("is-degraded", !live);
+    if (sidebarHostLabel) {
+      sidebarHostLabel.textContent = signedOut
+        ? "Local relay · Signed out"
+        : live
+          ? "Local relay · Live"
+          : "Local relay · Polling";
+    }
+  }
+
   function renderProviderStatus(session) {
     if (!providerStatusList) {
       return;
@@ -696,10 +719,16 @@ export function createSessionRenderer({
     const rows = Array.isArray(session?.provider_status)
       ? session.provider_status
       : [];
-    if (providerStatusPanel) {
-      providerStatusPanel.hidden = rows.length === 0;
-    }
+    // The Settings tab strip owns panel visibility now, so never hide the panel;
+    // show an empty-state row instead of a blank tab when no providers are reported.
     providerStatusList.replaceChildren();
+    if (rows.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "provider-status-row provider-status-empty";
+      empty.textContent = "No providers connected.";
+      providerStatusList.append(empty);
+      return;
+    }
     for (const row of rows) {
       const meta = providerStatusMeta(row.status);
       const item = document.createElement("li");
@@ -726,93 +755,6 @@ export function createSessionRenderer({
       item.append(dot, name, statusEl);
       providerStatusList.append(item);
     }
-  }
-
-  function renderLiveSurfaces(session, activeThread) {
-    if (!liveSurfacesList || !liveSurfacesSummary) {
-      return;
-    }
-
-    const records = Array.isArray(session?.device_records) ? session.device_records : [];
-    const visibleRecords = records.filter((record) => record.lifecycle_state !== "revoked");
-    const revokedCount = records.length - visibleRecords.length;
-    const surfaces = [
-      buildLocalSurface(session, activeThread),
-      ...visibleRecords.map((record) => buildDeviceSurface(session, activeThread, record)),
-    ];
-
-    const approvedCount = approvedDeviceCount(session);
-    const pendingCount = session?.pending_pairing_requests?.length || 0;
-
-    const deviceCount = surfaces.length;
-    const parts = [`${deviceCount} device${deviceCount === 1 ? "" : "s"}`];
-    if (approvedCount > 0) parts.push(`${approvedCount} trusted`);
-    if (pendingCount > 0) parts.push(`${pendingCount} pending`);
-    if (revokedCount > 0) parts.push(`${revokedCount} revoked`);
-
-    renderReactContent(
-      liveSurfacesSummary,
-      h(TextContent, null, parts.join(" · "))
-    );
-
-    renderReactContent(liveSurfacesList, h(SurfaceCards, { surfaces }));
-  }
-
-  function buildLocalSurface(session, activeThread) {
-    const controllerState = sessionControllerState(session);
-    const hasControl = controllerState === "this_device";
-    const canClaim = Boolean(session?.active_thread_id) && controllerState === "unclaimed";
-    const status = hasControl ? "Controller" : canClaim ? "Open" : "Local";
-    const badgeClass = hasControl
-      ? "device-state-approved"
-      : canClaim
-        ? "device-state-pending"
-        : "device-state-approved";
-
-    return {
-      key: "local-browser",
-      title: "This browser",
-      copy: "",
-      badgeLabel: status,
-      badgeClass,
-      chips: [
-        { label: "Role", value: hasControl ? "Typing + approvals" : "Local console" },
-        {
-          label: "Workspace",
-          value: session?.current_cwd
-            ? workspaceBasename(session.current_cwd)
-            : state.selectedCwd
-              ? workspaceBasename(state.selectedCwd)
-              : "Unset",
-        },
-      ],
-    };
-  }
-
-  function buildDeviceSurface(session, activeThread, record) {
-    const isController = session?.active_controller_device_id === record.device_id;
-    const lifecycle = record.lifecycle_state || "approved";
-    const badgeLabel = isController ? "Controller" : humanizeLabel(lifecycle);
-    const badgeClass = isController
-      ? "device-state-approved"
-      : lifecycle === "pending"
-        ? "device-state-pending"
-        : lifecycle === "rejected" || lifecycle === "revoked"
-          ? "device-state-rejected"
-          : "device-state-approved";
-
-    return {
-      key: `device:${record.device_id}`,
-      title: record.label,
-      copy: "",
-      badgeLabel,
-      badgeClass,
-      chips: [
-        { label: "Device", value: shortId(record.device_id) },
-        { label: "Seen", value: record.last_seen_at ? formatTimestamp(record.last_seen_at) : "Never" },
-        { label: "Peer", value: record.last_peer_id ? shortId(record.last_peer_id) : "None" },
-      ],
-    };
   }
 
   function renderAuditTimeline(entries) {
@@ -1547,6 +1489,11 @@ export function createSessionRenderer({
           onSelect(projectId) {
             if (typeof enterProjectOverview === "function") {
               enterProjectOverview(projectId);
+            }
+          },
+          onContext(projectId, name, clientX, clientY) {
+            if (typeof openProjectContextMenu === "function") {
+              openProjectContextMenu(projectId, name, clientX, clientY);
             }
           },
         })

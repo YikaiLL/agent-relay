@@ -69,6 +69,18 @@ async function main() {
       "raw API token should not be stored before sign-in"
     );
 
+    // Footer reflects the signed-out state — NOT a misleading "Polling" (polling does
+    // not run before authentication).
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector("#sidebar-host-status");
+        const label = document.querySelector("#sidebar-host-label")?.textContent || "";
+        return /Signed out/.test(label) && Boolean(el?.classList.contains("is-degraded"));
+      },
+      null,
+      { timeout: LOCAL_TIMEOUT_MS }
+    );
+
     await page.fill("#api-token-input", API_TOKEN);
     await page.locator("#connection-form").evaluate((form) => form.requestSubmit());
 

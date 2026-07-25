@@ -101,6 +101,11 @@ export function createStreamController(ctx) {
         logLine("Session stream disconnected. Falling back to polling.");
         state.streamConnected = false;
         state.sessionStream = null;
+        // Reflect the dropped stream in the sidebar footer status promptly, rather
+        // than waiting for the next successful poll to re-render.
+        if (state.session) {
+          renderSession(state.session);
+        }
         scheduleSessionPoll();
         scheduleStreamReconnect();
       },

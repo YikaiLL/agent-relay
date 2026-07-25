@@ -1,34 +1,55 @@
 import assert from "node:assert/strict";
 
+// Devices/pairing now lives in the consolidated Settings modal's "Devices" tab
+// (#settings-modal), opened from the icon-rail gear (desktop) or the header gear
+// (mobile, where the rail is hidden). This helper opens Settings and activates the
+// Devices tab so the pairing controls (#start-pairing-button, #pairing-link-input, …)
+// are visible — same contract the callers relied on with the old #security-modal.
+async function ensureSettingsEntryClicked(page) {
+  const railVisible = await page
+    .$("#icon-rail-settings")
+    .then((el) => (el ? el.isVisible() : false));
+  await page.click(railVisible ? "#icon-rail-settings" : "#open-settings-header");
+}
+
 export async function openSecurityModal(page) {
-  const isOpen = await page.evaluate(() =>
-    Boolean(document.querySelector("#security-modal")?.open)
-  );
-  if (isOpen) {
+  const onDevices = await page.evaluate(() => {
+    const modal = document.querySelector("#settings-modal");
+    const panel = document.querySelector('[data-settings-panel="devices"]');
+    return Boolean(modal?.open) && Boolean(panel) && !panel.hidden;
+  });
+  if (onDevices) {
     return;
   }
 
-  await page.click("#open-security-header");
+  const modalOpen = await page.evaluate(() =>
+    Boolean(document.querySelector("#settings-modal")?.open)
+  );
+  if (!modalOpen) {
+    await ensureSettingsEntryClicked(page);
+    await page.waitForFunction(() =>
+      Boolean(document.querySelector("#settings-modal")?.open)
+    );
+  }
+
+  await page.click("#settings-tab-devices");
   await page.waitForFunction(() => {
-    const dialog = document.querySelector("#security-modal");
-    return Boolean(dialog?.open);
+    const panel = document.querySelector('[data-settings-panel="devices"]');
+    return Boolean(panel) && !panel.hidden;
   });
 }
 
 export async function closeSecurityModal(page, timeoutMs) {
   const isOpen = await page.evaluate(() =>
-    Boolean(document.querySelector("#security-modal")?.open)
+    Boolean(document.querySelector("#settings-modal")?.open)
   );
   if (!isOpen) {
     return;
   }
 
-  await page.click("#close-security-modal");
+  await page.click("#close-settings-modal");
   await page.waitForFunction(
-    () => {
-      const dialog = document.querySelector("#security-modal");
-      return !dialog?.open;
-    },
+    () => !document.querySelector("#settings-modal")?.open,
     null,
     { timeout: timeoutMs }
   );

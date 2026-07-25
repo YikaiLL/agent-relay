@@ -14,22 +14,26 @@ import {
   chatShell,
   clientLogRoot,
   closeLaunchSettingsModalButton,
-  closeSecurityModalBtn,
   closeSessionDetailsModalButton,
+  closeSettingsModalButton,
+  settingsModal,
+  iconRailHomeButton,
+  iconRailSettingsButton,
   composerAttachments,
   connectionForm,
   controlBanner,
   copyPairingLinkButton,
   cwdInput,
   deleteThreadButton,
+  projectContextMenu,
+  renameProjectMenuButton,
+  deleteProjectMenuButton,
   directoryForm,
   forkSessionDialogRoot,
   forkThreadButton,
   goConsoleHomeButton,
   goConsoleHomeSidebarButton,
   launchSettingsModal,
-  liveSurfacesList,
-  liveSurfacesSummary,
   loadDirectoryButton,
   messageEffort,
   messageForm,
@@ -38,9 +42,6 @@ import {
   modelInput,
   modelInputLabel,
   openLaunchSettingsButton,
-  openSecurityConsoleButton,
-  openSecurityHeaderButton,
-  openSecurityModalBtn,
   openSessionDetailsButton,
   overviewSecurityBadges,
   pairedDevicesList,
@@ -53,7 +54,6 @@ import {
   resumeLatestButton,
   sandboxInput,
   saveAllowedRootsButton,
-  securityModal,
   sendButton,
   sessionDetailsModal,
   sessionHistoryDrawer,
@@ -372,6 +372,10 @@ projectsStore.subscribe((projectsState) => {
   if (openContextThreadId && threadContextMenu && !threadContextMenu.hidden) {
     populateThreadProjectActions(openContextThreadId);
   }
+  // Fail closed: a projects transition (remote rename/delete, add, or a refresh/error)
+  // can invalidate the right-clicked project, so drop any open project menu rather than
+  // let Rename/Delete act on a now-stale target and clobber a concurrent change.
+  closeProjectContextMenu();
 });
 let clientLogRootHandle = null;
 let clientLogRootElement = null;
@@ -629,6 +633,7 @@ const renderer = createSessionRenderer({
   closeThreadContextMenu,
   onRenameProject: renameProjectFromHeader,
   onDeleteProject: deleteProjectFromHeader,
+  openProjectContextMenu,
   scheduleControllerHeartbeat(...args) {
     return controller.scheduleControllerHeartbeat(...args);
   },
@@ -1138,7 +1143,27 @@ startPairingButton.addEventListener("click", () => {
   void startPairing();
 });
 
-function openSecurityModal() {
+const SETTINGS_TABS = ["providers", "devices", "log", "appearance"];
+
+// Toggle which Settings tab is active (button `is-active` + panel `hidden`).
+// Panels are all mounted up front so their ids resolve at dom.js import time.
+function setSettingsTab(tab = "providers") {
+  const active = SETTINGS_TABS.includes(tab) ? tab : "providers";
+  for (const key of SETTINGS_TABS) {
+    const btn = document.getElementById(`settings-tab-${key}`);
+    btn?.classList.toggle("is-active", key === active);
+    btn?.setAttribute("aria-selected", key === active ? "true" : "false");
+    const panel = document.querySelector(`[data-settings-panel="${key}"]`);
+    if (panel) {
+      panel.hidden = key !== active;
+    }
+  }
+}
+
+function openSettingsModal(tab = "providers") {
+  // Devices sub-panels are also refreshed on every snapshot, but re-render on open
+  // so the modal reflects the latest state immediately. Providers + audit (Log tab)
+  // are kept fresh by the render loop (renderProviderStatus / renderAuditTimeline).
   state.localUiStore.getState().setAllowedRootsDraftDirty(false);
   renderAllowedRoots(state.session?.allowed_roots || [], {
     draftDirty: readLocalUiState(state.localUiStore).allowedRootsDraftDirty,
@@ -1149,26 +1174,40 @@ function openSecurityModal() {
     state.session?.pending_pairing_requests || [],
     state.pendingPairingDecisions || {}
   );
-  securityModal?.showModal();
+  setSettingsTab(tab);
+  settingsModal?.showModal();
 }
 
-openSecurityModalBtn?.addEventListener("click", openSecurityModal);
-openSecurityConsoleButton?.addEventListener("click", openSecurityModal);
-openSecurityHeaderButton?.addEventListener("click", openSecurityModal);
+iconRailSettingsButton?.addEventListener("click", () => openSettingsModal());
+// Mobile-only header gear (the rail is hidden ≤960px) opens the same Settings modal.
+document
+  .getElementById("open-settings-header")
+  ?.addEventListener("click", () => openSettingsModal());
+for (const key of SETTINGS_TABS) {
+  document
+    .getElementById(`settings-tab-${key}`)
+    ?.addEventListener("click", () => setSettingsTab(key));
+}
 
 // Sessions/Projects sidebar grouping toggle (static-shell buttons wired by id).
 const threadsViewSessionsButton = document.getElementById("threads-view-sessions");
 const threadsViewProjectsButton = document.getElementById("threads-view-projects");
 // Land on a project (the first, by list order) when Projects mode is active but none
-// is selected yet, so the main area shows a card overview rather than the console
-// home. No-op once a project is selected, or when there are no projects.
+// is validly selected — so the main area shows a card overview rather than the console
+// home. Also drops a STALE selection: if the active project was deleted (locally or by
+// a remote peer), its id lingers in the store and would keep the view stuck in a
+// project-overview for a project that no longer exists (rendering "Select a project"),
+// and block newly-created projects from auto-selecting. Re-point to the first remaining
+// project, or clear the selection when none remain.
 function ensureActiveProjectSelected() {
-  if (readActiveProjectId(state.threadListStore)) {
+  const projects = state.projects || [];
+  const activeId = readActiveProjectId(state.threadListStore);
+  if (activeId && projects.some((project) => project.id === activeId)) {
     return;
   }
-  const first = (state.projects || [])[0];
-  if (first) {
-    state.threadListStore.getState().setActiveProject(first.id);
+  const nextId = projects[0]?.id ?? null;
+  if (nextId !== activeId) {
+    state.threadListStore.getState().setActiveProject(nextId);
   }
 }
 
@@ -1177,7 +1216,11 @@ function setThreadViewMode(mode) {
   state.threadListStore.getState().setViewMode(isProjects ? "projects" : "sessions");
   threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
   threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
-  // The create-a-Project toolbar belongs to the Projects view only.
+  // Mode-gate the sidebar's primary actions via CSS: the Projects toolbar shows in
+  // Projects mode, the New session / Continue latest launch panel in Sessions mode.
+  if (sidebarElement) {
+    sidebarElement.dataset.threadView = isProjects ? "projects" : "sessions";
+  }
   if (projectsToolbar) {
     projectsToolbar.hidden = !isProjects;
   }
@@ -1258,6 +1301,47 @@ async function deleteProjectFromHeader(projectId, name) {
     logLine(`Failed to delete project: ${error.message}`);
   }
 }
+
+// Right-click menu for a project row in the sidebar (Projects mode). Positioned +
+// toggled imperatively like #thread-context-menu; the target project is held here so
+// the Rename/Delete buttons act on whatever row was right-clicked.
+let projectContextTarget = null;
+function openProjectContextMenu(projectId, name, clientX, clientY) {
+  if (!projectContextMenu || !projectId) {
+    return;
+  }
+  // Don't stack the two menus.
+  closeThreadContextMenu({ rerender: false });
+  projectContextTarget = { id: projectId, name: name || projectId };
+  projectContextMenu.hidden = false;
+  const left = Math.max(12, Math.min(clientX, window.innerWidth - 220));
+  const top = Math.max(12, Math.min(clientY, window.innerHeight - 96));
+  projectContextMenu.style.left = `${left}px`;
+  projectContextMenu.style.top = `${top}px`;
+}
+
+function closeProjectContextMenu() {
+  if (projectContextMenu) {
+    projectContextMenu.hidden = true;
+  }
+  projectContextTarget = null;
+}
+
+renameProjectMenuButton?.addEventListener("click", () => {
+  const target = projectContextTarget;
+  closeProjectContextMenu();
+  if (target) {
+    void renameProjectFromHeader(target.id, target.name);
+  }
+});
+
+deleteProjectMenuButton?.addEventListener("click", () => {
+  const target = projectContextTarget;
+  closeProjectContextMenu();
+  if (target) {
+    void deleteProjectFromHeader(target.id, target.name);
+  }
+});
 
 // Run one context-menu Project action for a thread (assign / unassign / new+assign).
 // `builtSeq` is the projectsStateSeq captured when the clicked button was built.
@@ -1364,13 +1448,13 @@ function populateThreadProjectActions(threadId) {
   }
 }
 
-closeSecurityModalBtn?.addEventListener("click", () => {
-  securityModal?.close();
+closeSettingsModalButton?.addEventListener("click", () => {
+  settingsModal?.close();
 });
 
-securityModal?.addEventListener("click", (event) => {
-  if (event.target === securityModal) {
-    securityModal.close();
+settingsModal?.addEventListener("click", (event) => {
+  if (event.target === settingsModal) {
+    settingsModal.close();
   }
 });
 
@@ -1439,20 +1523,23 @@ allowedRootsForm?.addEventListener("submit", (event) => {
   void saveAllowedRoots();
 });
 
-goConsoleHomeButton?.addEventListener("click", () => {
+// Exit the current session back to the list/overview. Bound to the in-conversation
+// header back arrow, the legacy sidebar back button, and the icon-rail home (folder).
+function goConsoleHome() {
   clearThreadRoute();
   if (state.session) {
     renderSession(state.session);
   }
   renderThreads();
-});
+}
 
-goConsoleHomeSidebarButton?.addEventListener("click", () => {
-  clearThreadRoute();
-  if (state.session) {
-    renderSession(state.session);
-  }
-  renderThreads();
+goConsoleHomeButton?.addEventListener("click", goConsoleHome);
+goConsoleHomeSidebarButton?.addEventListener("click", goConsoleHome);
+// The icon rail is always visible, so its folder is the reliable way to bring the
+// nav panel back after it's been collapsed: expand the sidebar, then go home.
+iconRailHomeButton?.addEventListener("click", () => {
+  leftPanelControl.open();
+  goConsoleHome();
 });
 
 threadsRefreshButton.addEventListener("click", () => {
@@ -1475,6 +1562,10 @@ deleteThreadButton?.addEventListener("click", () => {
 });
 
 document.addEventListener("click", (event) => {
+  if (projectContextMenu && !projectContextMenu.hidden && !event.target.closest("#project-context-menu")) {
+    closeProjectContextMenu();
+  }
+
   if (!threadContextMenu || threadContextMenu.hidden) {
     return;
   }
@@ -1489,15 +1580,18 @@ document.addEventListener("click", (event) => {
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     closeThreadContextMenu();
+    closeProjectContextMenu();
   }
 });
 
 window.addEventListener("blur", () => {
   closeThreadContextMenu();
+  closeProjectContextMenu();
 });
 
 window.addEventListener("resize", () => {
   closeThreadContextMenu();
+  closeProjectContextMenu();
   syncThreadHistoryScroll();
 });
 
@@ -1887,7 +1981,7 @@ pendingActionBanner?.addEventListener("click", (event) => {
 
   const openSecurity = event.target.closest("[data-open-security]");
   if (openSecurity) {
-    openSecurityModal();
+    openSettingsModal("devices");
   }
 });
 

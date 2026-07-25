@@ -1,6 +1,10 @@
-// Drives the local web UI to verify the Sessions/Projects sidebar toggle: create a
-// Project + assign a session via the API, click the Projects toggle, and confirm the
-// sidebar regroups by Project (and back). Run: AGENT_PROVIDERS=fake node scripts/browser-local-projects-toggle-e2e.mjs
+// Drives the local web UI to verify the Sessions/Projects experience against the
+// current flat-list Projects sidebar: the Sessions/Projects toggle, project rows +
+// counts, passive propagation of API membership changes, the fail-closed
+// placeholders (Projects unavailable / Loading projects), the thread context-menu
+// project actions (assign / unassign / new+assign) and their fail-closed/stale
+// guards, and project Rename/Delete via the project context menu (right-click / ⋯).
+// Run: AGENT_PROVIDERS=fake node scripts/browser-local-projects-toggle-e2e.mjs
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -29,8 +33,7 @@ async function api(relayPort, method, apiPath, body) {
 }
 
 // Poll the dedicated Projects channel until a thread's membership matches (server
-// truth). `expectedProjectId = null` means "unassigned". Used to confirm a UI action
-// actually mutated state, without depending on the virtualized list's DOM shape.
+// truth). `expectedProjectId = null` means "unassigned".
 async function waitForMembership(relayPort, threadId, expectedProjectId) {
   for (let i = 0; i < 100; i += 1) {
     const data = await api(relayPort, "GET", "/api/projects");
@@ -39,6 +42,76 @@ async function waitForMembership(relayPort, threadId, expectedProjectId) {
     await delay(150);
   }
   throw new Error(`membership for ${threadId} never became ${expectedProjectId ?? "unassigned"}`);
+}
+
+// The sessions/projects list lives in a collapsed <details> drawer off the
+// conversation view — open it so its rows are laid out.
+async function openDrawer(page) {
+  await page.evaluate(() => {
+    const drawer = document.querySelector(".sidebar-drawer");
+    if (drawer && !drawer.open) {
+      drawer.open = true;
+      drawer.dispatchEvent(new Event("toggle"));
+    }
+  });
+}
+
+const projectNames = (page) =>
+  page.evaluate(() =>
+    [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim())
+  );
+
+// Right-click a thread row (Sessions mode) and read its Project-section buttons.
+async function openThreadMenu(page, tid) {
+  await page.waitForFunction(
+    (t) => {
+      const count = document.querySelector("#threads-count")?.textContent || "";
+      if (count.includes("Loading projects")) return false;
+      return !!document.querySelector(`#threads-list [data-thread-id="${t}"]`);
+    },
+    tid,
+    { timeout: TIMEOUT_MS }
+  );
+  await page.locator(`#threads-list [data-thread-id="${tid}"]`).click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+  await page.waitForFunction(() => {
+    const menu = document.querySelector("#thread-context-menu");
+    return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0;
+  }, null, { timeout: TIMEOUT_MS });
+  return page.evaluate(() => [...document.querySelectorAll("#thread-project-actions button")].map((b) => b.textContent.trim()));
+}
+
+const clickThreadProjectButton = (page, predicate) =>
+  page.evaluate((arg) => {
+    const btn = [...document.querySelectorAll("#thread-project-actions button")].find((b) => {
+      const text = b.textContent.trim();
+      return arg.exact ? text.replace(/^✓\s*/, "") === arg.exact : text.includes(arg.includes);
+    });
+    btn?.click();
+  }, predicate);
+
+// Reopen a thread menu until its Project buttons satisfy `match(labels)`.
+async function waitForThreadMenuState(page, tid, match) {
+  for (let i = 0; i < 40; i += 1) {
+    const labels = await openThreadMenu(page, tid);
+    if (match(labels)) return labels;
+    await page.keyboard.press("Escape");
+    await delay(200);
+  }
+  throw new Error("thread context menu never reached the expected Project state");
+}
+
+// Right-click a project row (Projects mode) to open the project context menu.
+async function openProjectMenu(page, name) {
+  await page.waitForFunction(
+    (n) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].some((r) => r.textContent.trim() === n),
+    name,
+    { timeout: TIMEOUT_MS }
+  );
+  const row = page
+    .locator("#threads-list .project-sidebar-row", { hasText: name })
+    .first();
+  await row.click({ button: "right", timeout: TIMEOUT_MS });
+  await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
 }
 
 async function main() {
@@ -61,7 +134,7 @@ async function main() {
   let context;
   let page;
   try {
-    // 1. Start a fake session so a thread exists in the sidebar.
+    // 1. Start a fake session so a thread exists; 2-3. create + assign a Project.
     const started = await api(relayPort, "POST", "/api/session/start", {
       cwd: workspace,
       device_id: "projects-toggle-device",
@@ -74,75 +147,59 @@ async function main() {
     });
     const threadId = started.active_thread_id;
     assert.ok(threadId, "started thread id");
-
     for (let i = 0; i < 50; i += 1) {
       const list = await api(relayPort, "GET", "/api/threads?limit=50");
       if ((list.threads || []).some((t) => t.id === threadId)) break;
       await delay(200);
     }
 
-    // 2. Create a Project, 3. assign the session — both via POST /api/projects.
     const created = await api(relayPort, "POST", "/api/projects", { action: "create", name: "VerifyProj" });
     const projectId = created.projects.find((p) => p.name === "VerifyProj")?.id;
     assert.ok(projectId, `created project id: ${JSON.stringify(created)}`);
-
-    const assigned = await api(relayPort, "POST", "/api/projects", {
-      action: "assign",
-      thread_id: threadId,
-      project_id: projectId,
-    });
-    assert.equal(assigned.thread_project_id[threadId], projectId, "membership recorded server-side");
-
-    // 4. The dedicated GET channel reflects it with a nonzero revision.
+    await api(relayPort, "POST", "/api/projects", { action: "assign", thread_id: threadId, project_id: projectId });
     const fetched = await api(relayPort, "GET", "/api/projects");
     assert.ok(fetched.projects_revision > 0, `projects_revision > 0: ${fetched.projects_revision}`);
     assert.equal(fetched.thread_project_id[threadId], projectId, "GET /api/projects membership");
 
-    // 5. Load the UI.
+    // 4. Load the UI (Sessions mode by default).
     ({ browser, context } = await launchBrowser({ contextOptions: { viewport: { width: 1400, height: 1000 } } }));
     page = await context.newPage();
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await page.evaluate(() => {
-      const drawer = document.querySelector(".sidebar-drawer");
-      if (drawer && !drawer.open) drawer.open = true;
-    });
+    await openDrawer(page);
     await page.waitForFunction(
       () => document.querySelectorAll("#threads-list .thread-group").length >= 1,
       null,
       { timeout: TIMEOUT_MS }
     );
-
     const sessionsView = await page.evaluate(() => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
       groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
       hasToggle: !!document.querySelector("#threads-view-projects") && !!document.querySelector("#threads-view-sessions"),
     }));
     assert.ok(sessionsView.hasToggle, "the Sessions/Projects toggle buttons exist");
+    assert.match(sessionsView.countText, /folder/, `Sessions mode shows folder grouping: ${sessionsView.countText}`);
 
-    // 6. Switch to Projects (evaluate-click bypasses visibility quirks in the <details>).
+    // 5. Switch to Projects: the sidebar lists project ROWS (not thread groups).
     await page.evaluate(() => document.querySelector("#threads-view-projects").click());
     await page.waitForFunction(
-      (name) =>
-        [...document.querySelectorAll("#threads-list .thread-group-name")]
-          .map((n) => n.textContent.trim())
-          .includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
-
-    const projectsView = await page.evaluate((tid) => {
-      const groups = [...document.querySelectorAll("#threads-list .thread-group")];
-      const threadRow = document.querySelector(`#threads-list [data-thread-id="${tid}"]`);
+    const projectsView = await page.evaluate((name) => {
+      const row = [...document.querySelectorAll("#threads-list .project-sidebar-row")].find(
+        (r) => r.querySelector(".project-sidebar-name")?.textContent?.trim() === name
+      );
       return {
         countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
-        groupLabels: groups.map((g) => g.querySelector(".thread-group-name")?.textContent?.trim() || ""),
-        threadVisible: !!threadRow,
-        assignedThreadGroup: threadRow?.closest(".thread-group")?.querySelector(".thread-group-name")?.textContent?.trim() || null,
+        projectRows: [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()),
+        verifyBadge: row?.querySelector(".project-sidebar-badges")?.textContent?.trim() || "",
+        hasActionsButton: !!row?.closest(".project-sidebar-row-wrap")?.querySelector(".project-sidebar-more"),
         projectsButtonActive: document.querySelector("#threads-view-projects")?.classList.contains("is-active") || false,
       };
-    }, threadId);
+    }, "VerifyProj");
 
-    // 7. Switch back to Sessions.
+    // 6. Switch back to Sessions.
     await page.evaluate(() => document.querySelector("#threads-view-sessions").click());
     await delay(300);
     const backToSessions = await page.evaluate(() => ({
@@ -150,53 +207,52 @@ async function main() {
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
     }));
 
-    // Probe: passive-client propagation. Switch back to Projects, then unassign via
-    // the API with NO browser action, and confirm it flows through the snapshot's
-    // projects_revision -> store refetch -> regroup, moving the session to Unassigned.
+    // 7. Passive propagation: an API unassign (no browser action) flows through the
+    // snapshot's projects_revision -> refetch -> re-render, dropping the project's
+    // session count. Then re-assign restores it.
     await page.evaluate(() => document.querySelector("#threads-view-projects").click());
     await page.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
+    const verifyBadge = (page) =>
+      page.evaluate((name) => {
+        const row = [...document.querySelectorAll("#threads-list .project-sidebar-row")].find(
+          (r) => r.querySelector(".project-sidebar-name")?.textContent?.trim() === name
+        );
+        return row?.querySelector(".project-sidebar-badges")?.textContent?.trim() || "";
+      }, "VerifyProj");
     await api(relayPort, "POST", "/api/projects", { action: "unassign", thread_id: threadId });
     let unassignPropagated = false;
     try {
       await page.waitForFunction(
-        () => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes("Unassigned"),
-        null,
+        (name) => {
+          const row = [...document.querySelectorAll("#threads-list .project-sidebar-row")].find(
+            (r) => r.querySelector(".project-sidebar-name")?.textContent?.trim() === name
+          );
+          return /0\s+session/.test(row?.querySelector(".project-sidebar-badges")?.textContent || "");
+        },
+        "VerifyProj",
         { timeout: TIMEOUT_MS }
       );
       unassignPropagated = true;
     } catch {}
-    const afterUnassign = await page.evaluate(() => ({
-      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
-      countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
-    }));
+    const afterUnassignBadge = await verifyBadge(page);
+    await api(relayPort, "POST", "/api/projects", { action: "assign", thread_id: threadId, project_id: projectId });
 
-    // Probe (fail closed): a FRESH page where GET /api/projects fails must NOT render
-    // sessions under a false "Unassigned" — it shows an explicit error placeholder.
+    // 8. Fail closed: a failed Projects fetch shows an explicit error placeholder and
+    // NO project rows — never a false empty/"unassigned" grouping.
     const failPage = await context.newPage();
     await failPage.route("**/api/projects*", (route) => {
       if (route.request().method() === "GET") {
-        return route.fulfill({
-          status: 500,
-          contentType: "application/json",
-          body: JSON.stringify({ ok: false, error: { message: "boom" } }),
-        });
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ ok: false, error: { message: "boom" } }) });
       }
       return route.continue();
     });
     await failPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await failPage.evaluate(() => {
-      const drawer = document.querySelector(".sidebar-drawer");
-      if (drawer && !drawer.open) drawer.open = true;
-    });
-    await failPage.waitForFunction(
-      () => document.querySelectorAll("#threads-list .thread-group").length >= 1,
-      null,
-      { timeout: TIMEOUT_MS }
-    );
+    await openDrawer(failPage);
+    await failPage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
     await failPage.evaluate(() => document.querySelector("#threads-view-projects").click());
     await failPage.waitForFunction(
       () => (document.querySelector("#threads-count")?.textContent || "").includes("Projects unavailable"),
@@ -206,44 +262,29 @@ async function main() {
     const failClosed = await failPage.evaluate(() => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
       bodyText: document.querySelector("#threads-list")?.textContent?.trim() || "",
-      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+      projectRows: [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()),
     }));
     await failPage.close();
 
-    // Probe (fail closed on refresh): after a first successful load, a NEWER revision
-    // whose fetch is still in flight must blank to a loading placeholder — the prior
-    // grouping must NOT be presented as if it were current. Re-assign first so this
-    // page's initial load has a real project grouping to (not) go stale.
-    await api(relayPort, "POST", "/api/projects", { action: "assign", thread_id: threadId, project_id: projectId });
+    // 9. Fail closed on refresh: a newer-revision fetch held in flight shows the
+    // loading placeholder with NO rows, then the rows return once it resolves.
     const gatePage = await context.newPage();
     let holdRefresh = false;
     let releaseRefresh;
-    const refreshGate = new Promise((resolve) => {
-      releaseRefresh = resolve;
-    });
+    const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
     await gatePage.route("**/api/projects*", async (route) => {
-      if (route.request().method() === "GET" && holdRefresh) {
-        await refreshGate; // hold the newer-revision fetch open so the UI stays pending
-      }
+      if (route.request().method() === "GET" && holdRefresh) await refreshGate;
       return route.continue();
     });
     await gatePage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await gatePage.evaluate(() => {
-      const drawer = document.querySelector(".sidebar-drawer");
-      if (drawer && !drawer.open) drawer.open = true;
-    });
-    await gatePage.waitForFunction(
-      () => document.querySelectorAll("#threads-list .thread-group").length >= 1,
-      null,
-      { timeout: TIMEOUT_MS }
-    );
+    await openDrawer(gatePage);
+    await gatePage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
     await gatePage.evaluate(() => document.querySelector("#threads-view-projects").click());
     await gatePage.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
-    // Arm the gate, then bump the revision so the client refetches (and is held pending).
     holdRefresh = true;
     await api(relayPort, "POST", "/api/projects", { action: "create", name: "GateProj2" });
     await gatePage.waitForFunction(
@@ -253,40 +294,25 @@ async function main() {
     );
     const gatePending = await gatePage.evaluate(() => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
-      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+      projectRows: [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()),
     }));
-    // Release the held fetch; the fresh grouping returns.
     releaseRefresh();
     holdRefresh = false;
     await gatePage.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
-    const gateResolved = await gatePage.evaluate(() => ({
-      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
-    }));
     await gatePage.close();
 
-    // Probe (CRUD UI): create a Project from the toolbar and assign/unassign a session
-    // through its context menu — the user-facing flow, not just the API.
+    // 10. CRUD UI: toolbar create + thread-menu assign/unassign/new + project-menu
+    // rename/delete — the real user flows.
     const crudPage = await context.newPage();
     let nextPrompt = "";
-    crudPage.on("dialog", (dialog) => {
-      void dialog.accept(dialog.type() === "prompt" ? nextPrompt : undefined);
-    });
+    crudPage.on("dialog", (dialog) => { void dialog.accept(dialog.type() === "prompt" ? nextPrompt : undefined); });
     await crudPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await crudPage.evaluate(() => {
-      const drawer = document.querySelector(".sidebar-drawer");
-      if (drawer && !drawer.open) drawer.open = true;
-    });
+    await openDrawer(crudPage);
     await crudPage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
-    await crudPage.evaluate(() => document.querySelector("#threads-view-projects").click());
-    // The create toolbar is shown only in the Projects view.
-    await crudPage.waitForFunction(() => {
-      const bar = document.querySelector("#projects-toolbar");
-      return bar && !bar.hidden;
-    }, null, { timeout: TIMEOUT_MS });
 
     let menuItems = [];
     let assignConfirmed = null;
@@ -295,156 +321,87 @@ async function main() {
     let menuCreateAssign = null;
     let renameConfirmed = false;
     let deleteConfirmed = false;
-    // Click a rename/delete action on a Project group header (Projects view). Returns
-    // whether the button was found. The action's prompt/confirm is answered by the
-    // page's dialog handler.
-    const clickHeaderAction = (name, title) =>
-      crudPage.evaluate(
-        (arg) => {
-          const header = [...document.querySelectorAll(".thread-group-header-project")].find(
-            (hd) => hd.querySelector(".thread-group-name")?.textContent?.trim() === arg.name
-          );
-          const btn = header?.querySelector(`.thread-group-action[title="${arg.title}"]`);
-          btn?.click();
-          return !!btn;
-        },
-        { name, title }
-      );
-    // Right-click a session row to open its context menu, then read the Project buttons.
-    const openThreadMenu = async (tid) => {
-      // Wait for the list to SETTLE first (not mid-refetch "Loading projects…" blank),
-      // else the row detaches under the click when the fail-closed placeholder swaps in.
-      // Then let locator.click() auto-scroll/auto-retry (a manual scrollIntoViewIfNeeded
-      // on a pre-resolved handle throws "element is not attached" across a re-render).
-      await crudPage.waitForFunction(
-        (t) => {
-          const count = document.querySelector("#threads-count")?.textContent || "";
-          if (count.includes("Loading projects")) return false;
-          return !!document.querySelector(`#threads-list [data-thread-id="${t}"]`);
-        },
-        tid,
-        { timeout: TIMEOUT_MS }
-      );
-      const target = crudPage.locator(`#threads-list [data-thread-id="${tid}"]`);
-      await target.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
-      await crudPage.waitForFunction(() => {
-        const menu = document.querySelector("#thread-context-menu");
-        return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0;
-      }, null, { timeout: TIMEOUT_MS });
-      return crudPage.evaluate(() => [...document.querySelectorAll("#thread-project-actions button")].map((b) => b.textContent.trim()));
-    };
-    const clickProjectButton = (predicateArg) =>
-      crudPage.evaluate((arg) => {
-        const btn = [...document.querySelectorAll("#thread-project-actions button")].find((b) => {
-          const text = b.textContent.trim();
-          return arg.exact ? text.replace(/^✓\s*/, "") === arg.exact : text.includes(arg.includes);
-        });
-        btn?.click();
-      }, predicateArg);
-    // Reopen the menu until its Project buttons satisfy `match(labels)` (client caught
-    // up to the mutation), closing between tries. Returns the matching labels.
-    const waitForMenuState = async (tid, match) => {
-      for (let i = 0; i < 40; i += 1) {
-        const labels = await openThreadMenu(tid);
-        if (match(labels)) return labels;
-        await crudPage.keyboard.press("Escape");
-        await delay(200);
-      }
-      throw new Error("context menu never reached the expected Project state");
-    };
+    let projectMenuClosedOnBump = false;
     try {
-      // Create "UiCrudProj" via the toolbar (the prompt is answered by the dialog handler).
+      // Create "UiCrudProj" from the Projects toolbar.
+      await crudPage.evaluate(() => document.querySelector("#threads-view-projects").click());
+      await crudPage.waitForFunction(() => { const b = document.querySelector("#projects-toolbar"); return b && !b.hidden; }, null, { timeout: TIMEOUT_MS });
       nextPrompt = "UiCrudProj";
       await crudPage.evaluate(() => document.querySelector("#projects-create-button").click());
       await crudPage.waitForFunction(
-        (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+        (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
         "UiCrudProj",
         { timeout: TIMEOUT_MS }
       );
-      // Resolve the new project's id for server-truth membership assertions.
       const afterCreate = await api(relayPort, "GET", "/api/projects");
       const uiProjId = afterCreate.projects.find((p) => p.name === "UiCrudProj")?.id;
       assert.ok(uiProjId, `toolbar-created project id: ${JSON.stringify(afterCreate.projects.map((p) => p.name))}`);
 
-      // Assign the session to it via the context menu, then confirm server-side.
-      menuItems = await openThreadMenu(threadId);
-      await clickProjectButton({ exact: "UiCrudProj" });
+      // Assign / unassign / new+assign via the THREAD context menu (Sessions mode).
+      await crudPage.evaluate(() => document.querySelector("#threads-view-sessions").click());
+      menuItems = await openThreadMenu(crudPage, threadId);
+      await clickThreadProjectButton(crudPage, { exact: "UiCrudProj" });
       assignConfirmed = await waitForMembership(relayPort, threadId, uiProjId);
-      // And confirm the UI reflects membership: reopen shows "✓ UiCrudProj" as current.
-      await waitForMenuState(threadId, (labels) => labels.some((t) => t.startsWith("✓ UiCrudProj")));
+      await waitForThreadMenuState(crudPage, threadId, (labels) => labels.some((t) => t.startsWith("✓ UiCrudProj")));
       currentMarked = true;
 
-      // Unassign via the context menu ("Remove from project"), then confirm server-side.
-      await openThreadMenu(threadId);
-      await clickProjectButton({ includes: "Remove from project" });
+      await openThreadMenu(crudPage, threadId);
+      await clickThreadProjectButton(crudPage, { includes: "Remove from project" });
       unassignConfirmed = await waitForMembership(relayPort, threadId, null);
 
-      // Combined "New project…" (create + assign in one click) from the context menu.
-      await openThreadMenu(threadId);
+      await openThreadMenu(crudPage, threadId);
       nextPrompt = "UiMenuProj";
-      await clickProjectButton({ includes: "New project" });
+      await clickThreadProjectButton(crudPage, { includes: "New project" });
       for (let i = 0; i < 100; i += 1) {
         const data = await api(relayPort, "GET", "/api/projects");
         const proj = data.projects.find((p) => p.name === "UiMenuProj");
-        if (proj && data.thread_project_id[threadId] === proj.id) {
-          menuCreateAssign = proj.id;
-          break;
-        }
+        if (proj && data.thread_project_id[threadId] === proj.id) { menuCreateAssign = proj.id; break; }
         await delay(150);
       }
 
-      // Rename a Project via its group-header action, then delete it (Projects view).
-      const beforeRename = await api(relayPort, "GET", "/api/projects");
-      const renameTargetId = beforeRename.projects.find((p) => p.name === "UiCrudProj")?.id;
-      assert.ok(renameTargetId, "a UiCrudProj to rename exists");
+      // Rename + delete "UiCrudProj" via the PROJECT context menu (Projects mode).
+      await crudPage.evaluate(() => document.querySelector("#threads-view-projects").click());
+      const renameTargetId = uiProjId;
       nextPrompt = "UiRenamedProj";
-      assert.ok(await clickHeaderAction("UiCrudProj", "Rename project"), "rename action found on the project header");
+      await openProjectMenu(crudPage, "UiCrudProj");
+      await crudPage.click("#rename-project-button");
       for (let i = 0; i < 100; i += 1) {
         const data = await api(relayPort, "GET", "/api/projects");
         const renamed = data.projects.find((p) => p.id === renameTargetId);
-        if (renamed && renamed.name === "UiRenamedProj") {
-          renameConfirmed = true;
-          break;
-        }
+        if (renamed && renamed.name === "UiRenamedProj") { renameConfirmed = true; break; }
         await delay(150);
       }
-      // Wait for the renamed header to repaint, then delete it.
       await crudPage.waitForFunction(
-        (name) => [...document.querySelectorAll(".thread-group-name")].some((n) => n.textContent.trim() === name),
+        (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].some((n) => n.textContent.trim() === name),
         "UiRenamedProj",
         { timeout: TIMEOUT_MS }
       );
-      assert.ok(await clickHeaderAction("UiRenamedProj", "Delete project"), "delete action found on the project header");
+      await openProjectMenu(crudPage, "UiRenamedProj");
+      await crudPage.click("#delete-project-button");
       for (let i = 0; i < 100; i += 1) {
         const data = await api(relayPort, "GET", "/api/projects");
-        if (!data.projects.some((p) => p.id === renameTargetId)) {
-          deleteConfirmed = true;
-          break;
-        }
+        if (!data.projects.some((p) => p.id === renameTargetId)) { deleteConfirmed = true; break; }
         await delay(150);
       }
-    } catch (crudError) {
-      const dbg = await crudPage
-        .evaluate((tid) => ({
-          count: document.querySelector("#threads-count")?.textContent || null,
-          toolbarHidden: document.querySelector("#projects-toolbar")?.hidden ?? null,
-          groups: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
-          menuHidden: document.querySelector("#thread-context-menu")?.hidden ?? null,
-          projectButtons: [...document.querySelectorAll("#thread-project-actions button")].map((b) => b.textContent.trim()),
-          rowExists: !!document.querySelector(`#threads-list [data-thread-id="${tid}"]`),
-          rowGroup: document.querySelector(`#threads-list [data-thread-id="${tid}"]`)?.closest(".thread-group")?.querySelector(".thread-group-name")?.textContent?.trim() || null,
-        }), threadId)
-        .catch(() => null);
-      console.error("[crudPage state] " + JSON.stringify(dbg));
-      throw crudError;
+
+      // Project-menu fail-closed: with the menu OPEN, a projects-revision bump (remote
+      // create) must drop the menu rather than let Rename/Delete act on a stale target.
+      await openProjectMenu(crudPage, "UiMenuProj");
+      await api(relayPort, "POST", "/api/projects", { action: "create", name: "MenuBump" });
+      try {
+        await crudPage.waitForFunction(
+          () => Boolean(document.querySelector("#project-context-menu")?.hidden),
+          null,
+          { timeout: TIMEOUT_MS }
+        );
+        projectMenuClosedOnBump = true;
+      } catch {}
     } finally {
       await crudPage.close();
     }
 
-    // Probe (menu fail-closed): with GET /api/projects forced to fail, the context
-    // menu — even in Sessions mode — must expose NO actionable Project buttons, only a
-    // non-interactive "Projects unavailable" note. Otherwise it would falsely imply the
-    // session belongs to no project / that no projects exist.
+    // 11. Thread-menu fail-closed (Sessions mode, GET fails): NO actionable Project
+    // buttons, only a non-interactive "unavailable" note.
     const menuFailPage = await context.newPage();
     await menuFailPage.route("**/api/projects*", (route) => {
       if (route.request().method() === "GET") {
@@ -453,11 +410,7 @@ async function main() {
       return route.continue();
     });
     await menuFailPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await menuFailPage.evaluate(() => {
-      const drawer = document.querySelector(".sidebar-drawer");
-      if (drawer && !drawer.open) drawer.open = true;
-    });
-    // Stay in Sessions mode (default); the session row is grouped by folder.
+    await openDrawer(menuFailPage);
     const menuFailTarget = menuFailPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
     await menuFailTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
     await menuFailTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
@@ -473,46 +426,29 @@ async function main() {
     }));
     await menuFailPage.close();
 
-    // Probe (open menu goes stale): with the menu OPEN over valid data, a newer
-    // revision whose fetch is still in flight must withdraw the actionable buttons
-    // (repopulate to a fail-closed note) rather than leave stale assign/unassign
-    // controls exposed.
+    // 12. Open thread-menu goes stale: a held newer-revision refresh withdraws buttons.
     const staleMenuPage = await context.newPage();
     let holdMenuRefresh = false;
     let releaseMenuRefresh;
-    const menuRefreshGate = new Promise((resolve) => {
-      releaseMenuRefresh = resolve;
-    });
+    const menuRefreshGate = new Promise((resolve) => { releaseMenuRefresh = resolve; });
     await staleMenuPage.route("**/api/projects*", async (route) => {
-      if (route.request().method() === "GET" && holdMenuRefresh) {
-        await menuRefreshGate;
-      }
+      if (route.request().method() === "GET" && holdMenuRefresh) await menuRefreshGate;
       return route.continue();
     });
     await staleMenuPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await staleMenuPage.evaluate(() => {
-      const drawer = document.querySelector(".sidebar-drawer");
-      if (drawer && !drawer.open) drawer.open = true;
-    });
+    await openDrawer(staleMenuPage);
     const staleTarget = staleMenuPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
     await staleTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
     await staleTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
-    // Menu open with actionable buttons (valid data).
     await staleMenuPage.waitForFunction(
-      () => {
-        const menu = document.querySelector("#thread-context-menu");
-        return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0;
-      },
+      () => { const menu = document.querySelector("#thread-context-menu"); return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0; },
       null,
       { timeout: TIMEOUT_MS }
     );
-    // Arm the gate, bump the revision → the in-flight refresh is held pending.
     holdMenuRefresh = true;
     await api(relayPort, "POST", "/api/projects", { action: "create", name: "StaleBump" });
     await staleMenuPage.waitForFunction(
-      () =>
-        document.querySelectorAll("#thread-project-actions button").length === 0 &&
-        !!document.querySelector("#thread-project-actions .context-menu-note"),
+      () => document.querySelectorAll("#thread-project-actions button").length === 0 && !!document.querySelector("#thread-project-actions .context-menu-note"),
       null,
       { timeout: TIMEOUT_MS }
     );
@@ -525,92 +461,51 @@ async function main() {
     holdMenuRefresh = false;
     await staleMenuPage.close();
 
-    console.log(
-      JSON.stringify(
-        {
-          relayPort,
-          sessionsView,
-          projectsView,
-          backToSessions,
-          afterUnassign,
-          unassignPropagated,
-          failClosed,
-          gatePending,
-          gateResolved,
-          crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign, renameConfirmed, deleteConfirmed },
-          menuFailClosed,
-          staleMenu,
-        },
-        null,
-        2
-      )
-    );
+    console.log(JSON.stringify({
+      sessionsView, projectsView, backToSessions,
+      unassignPropagated, afterUnassignBadge, failClosed, gatePending,
+      crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign, renameConfirmed, deleteConfirmed, projectMenuClosedOnBump },
+      menuFailClosed, staleMenu,
+    }, null, 2));
 
-    assert.ok(projectsView.groupLabels.includes("VerifyProj"), "the VerifyProj group header renders in Projects mode");
-    assert.ok(projectsView.threadVisible, "the assigned session is visible in Projects mode");
-    assert.match(projectsView.countText, /1 project · \d+ session/, `count text = '1 project · N sessions': ${projectsView.countText}`);
+    // --- Assertions ---
+    assert.ok(projectsView.projectRows.includes("VerifyProj"), "VerifyProj row renders in Projects mode");
+    assert.match(projectsView.countText, /1 project\b/, `count text = '1 project': ${projectsView.countText}`);
+    assert.match(projectsView.verifyBadge, /[1-9]/, `the assigned session is reflected in the project row badge: ${projectsView.verifyBadge}`);
+    assert.ok(projectsView.hasActionsButton, "each project row exposes a visible ⋯ actions button (touch/keyboard reachable)");
     assert.ok(projectsView.projectsButtonActive, "Projects toggle button is active");
     assert.ok(backToSessions.sessionsButtonActive, "Sessions toggle re-activates");
     assert.match(backToSessions.countText, /folder/, `back to Sessions shows folder grouping: ${backToSessions.countText}`);
-    assert.ok(
-      unassignPropagated && afterUnassign.groupLabels.includes("Unassigned"),
-      `an API unassign must propagate to the live UI (snapshot revision -> refetch): ${JSON.stringify(afterUnassign)}`
-    );
+    assert.ok(unassignPropagated, `an API unassign propagates to the live project row count: ${afterUnassignBadge}`);
 
-    // Fail closed: a failed Projects fetch shows an explicit error placeholder and NO
-    // grouping — never sessions falsely bucketed under "Unassigned".
     assert.equal(failClosed.countText, "Projects unavailable", `fail-closed count: ${failClosed.countText}`);
-    assert.deepEqual(failClosed.groupLabels, [], `no grouping is rendered on fetch failure: ${JSON.stringify(failClosed.groupLabels)}`);
-    assert.ok(!failClosed.groupLabels.includes("Unassigned"), "must not present a false Unassigned grouping when the fetch failed");
+    assert.deepEqual(failClosed.projectRows, [], `no rows rendered on fetch failure: ${JSON.stringify(failClosed.projectRows)}`);
     assert.match(failClosed.bodyText, /Failed to load projects/, `error message shown: ${failClosed.bodyText}`);
 
-    // Fail closed on refresh: a pending newer-revision fetch shows the loading
-    // placeholder with NO grouping (prior membership is not presented as current),
-    // then the grouping returns once the fetch resolves.
     assert.match(gatePending.countText, /Loading projects/, `pending refresh shows a loading placeholder: ${gatePending.countText}`);
-    assert.deepEqual(gatePending.groupLabels, [], `no stale grouping while a newer revision is pending: ${JSON.stringify(gatePending.groupLabels)}`);
-    assert.ok(gateResolved.groupLabels.includes("VerifyProj"), `grouping returns after the refresh resolves: ${JSON.stringify(gateResolved.groupLabels)}`);
+    assert.deepEqual(gatePending.projectRows, [], `no stale rows while a newer revision is pending: ${JSON.stringify(gatePending.projectRows)}`);
 
-    // CRUD UI: toolbar create + context-menu assign/unassign drive the real flow.
-    assert.ok(
-      menuItems.some((t) => t.replace(/^✓\s*/, "") === "UiCrudProj"),
-      `the context menu lists the toolbar-created project: ${JSON.stringify(menuItems)}`
-    );
-    assert.ok(assignConfirmed, "assigning via the context menu recorded membership server-side");
-    assert.ok(currentMarked, "the assigned project is marked current (✓) in the UI on reopen");
-    assert.equal(unassignConfirmed, null, "removing via the context menu cleared membership server-side");
-    assert.ok(menuCreateAssign, "the context menu 'New project…' both creates the project and assigns the session");
-    assert.ok(renameConfirmed, "renaming via the project header action updates the project name server-side");
-    assert.ok(deleteConfirmed, "deleting via the project header action removes the project server-side");
+    assert.ok(menuItems.some((t) => t.replace(/^✓\s*/, "") === "UiCrudProj"), `thread menu lists the toolbar-created project: ${JSON.stringify(menuItems)}`);
+    assert.ok(assignConfirmed, "assigning via the thread menu recorded membership server-side");
+    assert.ok(currentMarked, "the assigned project is marked current (✓) on reopen");
+    assert.equal(unassignConfirmed, null, "removing via the thread menu cleared membership server-side");
+    assert.ok(menuCreateAssign, "'New project…' both creates the project and assigns the session");
+    assert.ok(renameConfirmed, "renaming via the project context menu updates the name server-side");
+    assert.ok(deleteConfirmed, "deleting via the project context menu removes the project server-side");
+    assert.ok(projectMenuClosedOnBump, "an open project menu closes fail-closed when the projects revision changes");
 
-    // Menu fail-closed: no actionable Project controls while the payload is unavailable.
-    assert.equal(menuFailClosed.sessionsActive, true, "menu fail-closed probe stays in Sessions mode");
+    assert.equal(menuFailClosed.sessionsActive, true, "thread-menu fail-closed probe stays in Sessions mode");
     assert.equal(menuFailClosed.buttonCount, 0, `no Project mutation buttons while the fetch is failing: ${menuFailClosed.buttonCount}`);
     assert.match(menuFailClosed.note || "", /Projects unavailable|Loading projects/, `a fail-closed note replaces the controls: ${menuFailClosed.note}`);
 
-    // Open menu goes stale: a held newer-revision refresh withdraws the buttons.
-    assert.equal(staleMenu.buttonCount, 0, `an open menu withdraws its buttons on a pending newer-revision refresh: ${staleMenu.buttonCount}`);
-    assert.match(staleMenu.note || "", /Loading projects/, `the open menu falls closed to a loading note: ${staleMenu.note}`);
-    assert.ok(staleMenu.menuOpen, "the menu stays open while its controls are withdrawn (not silently closed)");
+    assert.equal(staleMenu.buttonCount, 0, `an open thread menu withdraws its buttons on a pending refresh: ${staleMenu.buttonCount}`);
+    assert.match(staleMenu.note || "", /Loading projects/, `the open thread menu falls closed to a loading note: ${staleMenu.note}`);
+    assert.ok(staleMenu.menuOpen, "the thread menu stays open while its controls are withdrawn");
 
     console.log("PROJECTS_TOGGLE_E2E: PASS");
   } catch (error) {
     console.error("PROJECTS_TOGGLE_E2E: FAIL");
     console.error(error);
-    if (page) {
-      try {
-        console.error(
-          "[page state] " +
-            JSON.stringify(
-              await page.evaluate(() => ({
-                countText: document.querySelector("#threads-count")?.textContent || null,
-                groups: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
-                hasProjectsBtn: !!document.querySelector("#threads-view-projects"),
-              }))
-            )
-        );
-      } catch {}
-    }
     dumpProcessLogs(relay);
     process.exitCode = 1;
   } finally {

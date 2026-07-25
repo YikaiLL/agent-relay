@@ -4,9 +4,58 @@ import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
-import { PLUS_SVG, ARROW_RETURN_SVG, CHEVRON_RIGHT_SVG } from "../svg.js";
+import { PLUS_SVG, ARROW_RETURN_SVG, CHEVRON_RIGHT_SVG, SETTINGS_SVG } from "../svg.js";
 
 const h = React.createElement;
+
+// Far-left 64px icon rail: brand logo (top), a Projects/home button (middle,
+// gets `is-active`), and a Settings gear (bottom). The rail lives OUTSIDE the
+// .app-shell grid (in .local-frame) so the grid math is untouched. Home + gear
+// are wired imperatively in app.js by id (#icon-rail-home / #icon-rail-settings).
+function IconRail() {
+  return h(
+    "nav",
+    { className: "icon-rail", "aria-label": "Primary" },
+    h("img", {
+      className: "icon-rail-logo",
+      src: "/static/sealwire_logo.png",
+      alt: "Sealwire",
+      width: 30,
+      height: 30,
+    }),
+    h(
+      "button",
+      {
+        className: "icon-rail-button is-active",
+        id: "icon-rail-home",
+        type: "button",
+        title: "Projects",
+        "aria-label": "Projects",
+      },
+      h(FolderIcon)
+    ),
+    h("div", { className: "icon-rail-spacer" }),
+    h(
+      "button",
+      {
+        className: "icon-rail-button icon-rail-settings",
+        id: "icon-rail-settings",
+        type: "button",
+        title: "Settings",
+        "aria-label": "Settings",
+      },
+      h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: SETTINGS_SVG } })
+    )
+  );
+}
+
+function FolderIcon() {
+  return h(
+    "svg",
+    { "aria-hidden": "true", width: "20", height: "20", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.7", strokeLinecap: "round", strokeLinejoin: "round" },
+    h("path", { d: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" })
+  );
+}
 
 function iconNode(svgMarkup, extraClass = "") {
   return h("span", {
@@ -19,7 +68,7 @@ function iconNode(svgMarkup, extraClass = "") {
 function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
   return h(
     "aside",
-    { className: "sidebar" },
+    { className: "sidebar", "data-thread-view": "sessions" },
     h(
       "div",
       { className: "sidebar-top-bar" },
@@ -37,31 +86,49 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
       h(
         "div",
         { className: "sidebar-brand" },
-        h("img", {
-          className: "sidebar-brand-logo",
-          src: "/static/sealwire_logo.png",
-          alt: "",
-          width: 24,
-          height: 24,
-        }),
         h("span", { className: "sidebar-brand-name" }, "Sealwire")
       )
     ),
     h(AuthForm),
+    // Group the sidebar by cwd folders (Sessions) or by Project. Lifted to the top
+    // of the sidebar to match the projects mockup; wired imperatively in app.js by id.
+    h(
+      "div",
+      { className: "thread-view-toggle", role: "group", "aria-label": "Group sessions by" },
+      h(
+        "button",
+        { className: "thread-view-toggle-button is-active", id: "threads-view-sessions", type: "button" },
+        "Sessions"
+      ),
+      h(
+        "button",
+        { className: "thread-view-toggle-button", id: "threads-view-projects", type: "button" },
+        "Projects"
+      )
+    ),
+    // Mode-gated primary actions: Sessions → New session / Continue latest;
+    // Projects → + New project. Both stay mounted (ids intact); CSS hides the
+    // inactive one via the sidebar's data-thread-view attribute.
     h(LaunchPanel, { launchModel, onLaunchFieldChange, onLaunchStart }),
     h(
-      "section",
-      { className: "provider-status-panel", id: "provider-status-panel", hidden: true },
-      h("p", { className: "sidebar-caption" }, "Providers"),
-      h("ul", { className: "provider-status-list", id: "provider-status-list" })
+      "div",
+      { className: "projects-toolbar", id: "projects-toolbar" },
+      h(
+        "button",
+        { className: "start-session-button projects-create-button", id: "projects-create-button", type: "button" },
+        iconNode(PLUS_SVG),
+        h("span", null, "New project")
+      )
     ),
     h(ThreadDrawer),
     h(ThreadContextMenu),
+    h(ProjectContextMenu),
     h("div", { id: "fork-session-dialog-root" }),
     h(
       "div",
-      { className: "sidebar-bottom-bar" },
-      h(ThemePickerRow)
+      { className: "sidebar-bottom-bar sidebar-host-status", id: "sidebar-host-status" },
+      h("span", { className: "sidebar-host-dot", id: "sidebar-host-dot", "aria-hidden": "true" }),
+      h("span", { className: "sidebar-host-label", id: "sidebar-host-label" }, "Local relay · Live")
     ),
     h("div", {
       className: "sidebar-resize",
@@ -98,7 +165,6 @@ function LaunchPanel({ launchModel = null, onLaunchFieldChange = null, onLaunchS
   return h(
     "section",
     { className: "launch-panel" },
-    h("h2", { className: "launch-title" }, "Sessions"),
     h(
       "div",
       { className: "launch-actions" },
@@ -174,41 +240,6 @@ function ThreadDrawer() {
         id: "go-console-home-sidebar",
         type: "button",
       }, "Back to console"),
-      // Group the sidebar by cwd folders (Sessions) or by Project. Behavior is wired
-      // imperatively in app.js by these ids (like the refresh button above).
-      h(
-        "div",
-        { className: "thread-view-toggle", role: "group", "aria-label": "Group sessions by" },
-        h(
-          "button",
-          {
-            className: "thread-view-toggle-button is-active",
-            id: "threads-view-sessions",
-            type: "button",
-          },
-          "Sessions"
-        ),
-        h(
-          "button",
-          {
-            className: "thread-view-toggle-button",
-            id: "threads-view-projects",
-            type: "button",
-          },
-          "Projects"
-        )
-      ),
-      // Projects-only toolbar (create a Project). Shown only in Projects mode; the
-      // visibility is toggled imperatively in app.js by id (like the toggle above).
-      h(
-        "div",
-        { className: "projects-toolbar", id: "projects-toolbar", hidden: true },
-        h(
-          "button",
-          { className: "secondary-button projects-create-button", id: "projects-create-button", type: "button" },
-          "+ New project"
-        )
-      ),
       h(
         "div",
         {
@@ -239,6 +270,22 @@ function ThreadContextMenu() {
     h("div", { className: "context-menu-separator", role: "separator" }),
     h("p", { className: "context-menu-heading" }, "Project"),
     h("div", { className: "context-menu-projects", id: "thread-project-actions" })
+  );
+}
+
+// Right-click menu for a project row in the sidebar (Projects mode). Rename/Delete
+// reuse the existing renameProject/deleteProject handlers (app.js). Positioned +
+// toggled imperatively by id, mirroring #thread-context-menu.
+function ProjectContextMenu() {
+  return h(
+    "div",
+    { className: "context-menu", hidden: true, id: "project-context-menu" },
+    h("button", { className: "context-menu-button", id: "rename-project-button", type: "button" }, "Rename project"),
+    h("button", {
+      className: "context-menu-button context-menu-button-danger",
+      id: "delete-project-button",
+      type: "button",
+    }, "Delete project")
   );
 }
 
@@ -393,10 +440,20 @@ function ChatHeader() {
         id: "local-model-badge",
       }),
       h("span", { className: "status-badge", id: "status-badge" }, "Idle"),
+      // Mobile-only Settings entry: the icon rail (which holds the gear) is hidden
+      // ≤960px, so this keeps Providers/Devices/Log/Appearance reachable in every
+      // view (the header is always present, even in conversation where the sidebar
+      // collapses). Hidden on desktop via CSS.
       h(
         "button",
-        { className: "header-button", id: "open-security-header", type: "button" },
-        "Devices"
+        {
+          className: "header-button header-settings-button",
+          id: "open-settings-header",
+          type: "button",
+          title: "Settings",
+          "aria-label": "Settings",
+        },
+        iconNode(SETTINGS_SVG)
       ),
       h(
         "button",
@@ -425,44 +482,19 @@ function ConsoleGrid() {
   return h(
     "section",
     { className: "console-grid" },
-    h(LiveSurfacesCard),
-    h(AuditTimelineCard),
-    h(ConsoleFooterHint),
     h(ThreadPanel)
   );
 }
 
-function LiveSurfacesCard() {
-  return h(
-    "section",
-    { className: "console-card console-card-surfaces console-card-hero" },
-    h(
-      "div",
-      { className: "console-card-header" },
-      h(
-        "div",
-        { className: "console-card-title-row" },
-        h("h2", { className: "console-card-title" }, "Devices"),
-        h("span", { className: "console-card-hint", id: "live-surfaces-summary" })
-      ),
-      h(
-        "button",
-        { className: "load-button console-card-action", id: "open-security-console", type: "button" },
-        "Manage"
-      )
-    ),
-    h(
-      "div",
-      { className: "surface-list", id: "live-surfaces-list" },
-      h("p", { className: "sidebar-empty" }, "No devices paired yet.")
-    )
-  );
-}
-
+// "Recent events" audit — moved out of the retired console home into the
+// Settings > Log tab. Keeps ids #audit-timeline / #audit-summary so the
+// render-session.js populate path is unchanged.
 function AuditTimelineCard() {
   return h(
     "details",
-    { className: "console-card console-card-audit console-card-collapsible", open: true },
+    // Collapsed by default: Recent events is a curated subset of the relay log
+    // above, so it starts folded to avoid duplicating the same stream on open.
+    { className: "console-card console-card-audit console-card-collapsible" },
     h(
       "summary",
       { className: "console-card-summary" },
@@ -479,14 +511,6 @@ function AuditTimelineCard() {
       { className: "audit-list", id: "audit-timeline" },
       h("p", { className: "sidebar-empty" }, "No events yet.")
     )
-  );
-}
-
-function ConsoleFooterHint() {
-  return h(
-    "p",
-    { className: "console-footer-hint" },
-    "Continue a recent task or start a new one from the main panel."
   );
 }
 
@@ -651,18 +675,6 @@ function SessionDetailsModal() {
       h(
         "section",
         { className: "details-section" },
-        h("h3", { className: "details-heading" }, "Relay log"),
-        h(
-          "div",
-          { id: "client-log-root" },
-          h(ClientLog, {
-            lines: ["Booting web client..."],
-          })
-        )
-      ),
-      h(
-        "section",
-        { className: "details-section" },
         h("h3", { className: "details-heading" }, "Build"),
         h("p", { className: "build-info-inline", id: "build-info-local" }, "Loading...")
       )
@@ -702,24 +714,15 @@ function WorkspaceDiffModal() {
   );
 }
 
-function SecurityModal() {
+// The devices/security surface \u2014 extracted from the old standalone SecurityModal
+// so it can be embedded in the Settings modal's Devices tab. Keeps every id
+// (#pending-pairings-list, #pairing-panel, allowed-roots, #paired-devices-list\u2026)
+// so dom.js/render-security.js/app.js wiring resolves unchanged.
+function DevicesPanelBody() {
   return h(
-    "dialog",
-    { className: "security-modal", id: "security-modal" },
-    h(
-      "div",
-      { className: "modal-header" },
-      h("h2", null, "Remote devices"),
-      h("button", {
-        className: "header-button close-modal-btn",
-        id: "close-security-modal",
-        type: "button",
-      }, "\u00d7")
-    ),
-    h(
-      "section",
-      { className: "remote-access-shell" },
-      hSecuritySection("Pending Pairing Requests", "Approve or reject devices that are asking to pair."),
+    "section",
+    { className: "remote-access-shell" },
+    hSecuritySection("Pending Pairing Requests", "Approve or reject devices that are asking to pair."),
       h(
         "div",
         { className: "paired-devices-list", id: "pending-pairings-list" },
@@ -776,7 +779,6 @@ function SecurityModal() {
         { className: "paired-devices-list", id: "paired-devices-list" },
         h("p", { className: "sidebar-empty" }, "No remote devices have touched this relay yet.")
       )
-    )
   );
 }
 
@@ -812,6 +814,89 @@ function hAllowedRootsForm() {
   );
 }
 
+// Consolidated Settings modal opened from the icon-rail gear. Four always-mounted
+// tab panels (toggled by `hidden`, never conditionally rendered) so every id inside
+// resolves at dom.js import time. Tab switching is wired imperatively in app.js
+// (setSettingsTab) by the #settings-tab-* / data-settings-panel ids.
+function SettingsModal() {
+  const tab = (key, label, active = false) =>
+    h(
+      "button",
+      {
+        className: `settings-tab${active ? " is-active" : ""}`,
+        id: `settings-tab-${key}`,
+        type: "button",
+        role: "tab",
+        "aria-selected": active ? "true" : "false",
+        "data-settings-tab": key,
+      },
+      label
+    );
+  const panel = (key, active, ...children) =>
+    h(
+      "div",
+      { className: "settings-panel", "data-settings-panel": key, hidden: !active },
+      ...children
+    );
+  return h(
+    "dialog",
+    { className: "settings-modal panel-modal panel-modal-wide", id: "settings-modal" },
+    h(
+      "div",
+      { className: "modal-header" },
+      h("h2", null, "Settings"),
+      h("button", {
+        className: "header-button close-modal-btn",
+        id: "close-settings-modal",
+        type: "button",
+      }, "×")
+    ),
+    h(
+      "div",
+      { className: "settings-tabs", role: "tablist", "aria-label": "Settings sections" },
+      tab("providers", "Providers", true),
+      tab("devices", "Devices"),
+      tab("log", "Log"),
+      tab("appearance", "Appearance")
+    ),
+    h(
+      "section",
+      { className: "panel-modal-body settings-body" },
+      panel(
+        "providers",
+        true,
+        h(
+          "section",
+          { className: "provider-status-panel", id: "provider-status-panel" },
+          h("p", { className: "sidebar-caption" }, "Providers"),
+          h("ul", { className: "provider-status-list", id: "provider-status-list" })
+        )
+      ),
+      panel("devices", false, h(DevicesPanelBody)),
+      panel(
+        "log",
+        false,
+        h(
+          "section",
+          { className: "details-section" },
+          h("h3", { className: "details-heading" }, "Relay log"),
+          h(
+            "div",
+            { id: "client-log-root" },
+            h(ClientLog, { lines: ["Booting web client..."] })
+          )
+        ),
+        h("section", { className: "details-section" }, h(AuditTimelineCard))
+      ),
+      panel(
+        "appearance",
+        false,
+        h("section", { className: "details-section" }, h(ThemePickerRow))
+      )
+    )
+  );
+}
+
 function PairingApprovalModal() {
   return h(
     "dialog",
@@ -842,15 +927,20 @@ export function LocalShell({ launchModel = null, onLaunchFieldChange = null, onL
     null,
     h(
       "div",
-      { className: "app-shell app-shell-with-rail", "data-view": "console" },
-      h(Sidebar, { launchModel, onLaunchFieldChange, onLaunchStart }),
-      h(ChatShell),
-      h(WorkspaceChangesRail)
+      { className: "local-frame" },
+      h(IconRail),
+      h(
+        "div",
+        { className: "app-shell app-shell-with-rail", "data-view": "console" },
+        h(Sidebar, { launchModel, onLaunchFieldChange, onLaunchStart }),
+        h(ChatShell),
+        h(WorkspaceChangesRail)
+      )
     ),
     h(LaunchStartSessionDialog, { launchModel, onLaunchFieldChange }),
     h(SessionDetailsModal),
     h(WorkspaceDiffModal),
-    h(SecurityModal),
+    h(SettingsModal),
     h(PairingApprovalModal)
   );
 }

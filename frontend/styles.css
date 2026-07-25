@@ -411,6 +411,80 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   --right-rail-width: 320px;
 }
 
+/* Outer frame: the 64px icon rail sits OUTSIDE the .app-shell grid so none of the
+   grid-template-columns variants (base/conversation/project-overview/collapsed) change. */
+.local-frame {
+  display: flex;
+  min-height: 100dvh;
+  width: 100%;
+}
+
+.local-frame > .app-shell {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.icon-rail {
+  flex: 0 0 64px;
+  width: 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 0;
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border-subtle);
+  position: sticky;
+  top: 0;
+  height: 100dvh;
+}
+
+.icon-rail-logo {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  flex: none;
+}
+
+.icon-rail-button {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 12px;
+  position: relative;
+}
+
+.icon-rail-button:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.icon-rail-button.is-active {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.icon-rail-button.is-active::before {
+  content: "";
+  position: absolute;
+  left: -12px;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--accent);
+}
+
+.icon-rail-spacer {
+  flex: 1;
+}
+
 .app-shell {
   min-height: 100dvh;
   width: 100%;
@@ -1292,6 +1366,47 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+/* Row + its actions button share a relative wrapper so the button can overlay the
+   row's right edge without nesting a <button> inside the row <button>. */
+.project-sidebar-row-wrap {
+  position: relative;
+}
+.project-sidebar-row-wrap .project-sidebar-row {
+  padding-right: 34px;
+}
+.project-sidebar-more {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-mute, var(--text-secondary));
+  opacity: 0;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+}
+.project-sidebar-more:hover {
+  background: var(--surface-3);
+  color: var(--text-1);
+}
+/* Reveal on hover, keyboard focus, or when the menu target is focused within. */
+.project-sidebar-row-wrap:hover .project-sidebar-more,
+.project-sidebar-row-wrap:focus-within .project-sidebar-more,
+.project-sidebar-more:focus-visible {
+  opacity: 1;
+}
+/* Touch devices have no hover — keep the actions button always visible there. */
+@media (hover: none) {
+  .project-sidebar-more {
+    opacity: 1;
+  }
 }
 .project-sidebar-row {
   display: flex;
@@ -2573,10 +2688,37 @@ input:focus, textarea:focus, select:focus {
   color: var(--status-ready-text);
 }
 
-.chat-shell[data-view="console"] .thread-panel {
-  display: none;
+/* Console home is retired: nothing is selected → the transcript panel shows its
+   standby empty-state and fills the main area (same flex layout as conversation). */
+.chat-shell[data-view="console"] {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
+.chat-shell[data-view="console"] .console-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: block;
+  padding-top: 16px;
+  overflow: hidden;
+}
+
+.chat-shell[data-view="console"] .thread-panel {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-shell[data-view="console"] .thread-shell {
+  flex: 1 1 auto;
+  height: auto;
+}
+
+.chat-shell[data-view="console"] .overview-strip,
 .chat-shell[data-view="conversation"] .overview-strip {
   display: none;
 }
@@ -2587,14 +2729,6 @@ input:focus, textarea:focus, select:focus {
   min-height: 0;
   height: 100%;
   overflow: hidden;
-}
-
-.chat-shell[data-view="conversation"] .console-card-audit {
-  display: none;
-}
-
-.chat-shell[data-view="conversation"] .console-card-surfaces {
-  display: none;
 }
 
 .chat-shell[data-view="conversation"] .console-grid {
@@ -2720,11 +2854,6 @@ input:focus, textarea:focus, select:focus {
   .chat-shell[data-view="conversation"] .thread-content {
     max-width: 800px;
   }
-}
-
-.chat-shell[data-view="console"] .surface-list,
-.chat-shell[data-view="console"] .audit-list {
-  max-height: min(52vh, 620px);
 }
 
 .relay-home {
@@ -3121,6 +3250,11 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-secondary);
   max-height: 220px;
   overflow-y: auto;
+  /* Wrap long relay-log lines (e.g. broker-disconnect messages) instead of
+     overflowing the modal. macOS hides horizontal scrollbars, so a scroll box
+     just reads as "cut off" — wrapping keeps every line readable and contained. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .log-drawer {
@@ -3389,6 +3523,13 @@ input:focus, textarea:focus, select:focus {
 }
 
 @media (max-width: 960px) {
+  /* No room for the 64px rail on phones — hide it and surface Settings from the
+     always-present header gear instead. The flex frame collapses to just the app-shell. */
+  .icon-rail { display: none; }
+  .local-frame { display: block; }
+  /* Out-specify the base `.header-settings-button { display: none }` (which is later
+     in source order), so the mobile Settings entry actually shows. */
+  .app-shell .header-settings-button { display: inline-flex; }
   .app-shell { grid-template-columns: 1fr; height: auto; overflow: visible; }
   .app-shell[data-view="conversation"] {
     grid-template-columns: minmax(0, 1fr);
@@ -3664,6 +3805,106 @@ input:focus, textarea:focus, select:focus {
   margin-top: auto;
   padding-top: 12px;
   border-top: 1px solid var(--border-subtle);
+}
+
+/* Sidebar footer: relay host / online status line (replaces the theme picker,
+   which moved into Settings > Appearance). */
+.sidebar-host-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-mute, var(--text-secondary));
+  font-size: var(--text-sm, 12px);
+}
+.sidebar-host-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--status-ready-text, #47c07a);
+  box-shadow: 0 0 8px var(--status-ready-text, #47c07a);
+  flex: none;
+}
+.sidebar-host-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Footer reflects the live SSE stream (state.streamConnected): green when live,
+   amber while on the polling fallback (relay still reachable, just not real-time). */
+.sidebar-host-status.is-degraded .sidebar-host-dot {
+  background: var(--status-attention-text, #e0ac47);
+  box-shadow: 0 0 8px var(--status-attention-text, #e0ac47);
+}
+
+/* Settings entry: the icon-rail gear is the desktop entry; this header gear is the
+   mobile fallback (rail hidden ≤960px). Hidden on desktop, shown on mobile. */
+.header-settings-button {
+  display: none;
+}
+
+/* Sidebar mode gating: the primary action follows the Sessions/Projects toggle.
+   Nodes stay mounted (ids intact); only visibility flips. */
+.sidebar[data-thread-view="projects"] .launch-panel {
+  display: none;
+}
+.sidebar[data-thread-view="sessions"] #projects-toolbar {
+  display: none;
+}
+.projects-create-button {
+  width: 100%;
+}
+
+/* Settings modal: a definite width (not fit-content) so long log/audit content
+   wraps within the modal instead of stretching the dialog to its intrinsic width. */
+.settings-modal {
+  width: min(520px, calc(100vw - 32px));
+  max-width: min(520px, calc(100vw - 32px));
+}
+.settings-body {
+  min-width: 0;
+}
+.settings-panel {
+  min-width: 0;
+}
+
+/* Settings modal: tab strip + always-mounted panels toggled by [hidden]. */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 20px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.settings-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 8px 12px;
+  color: var(--text-secondary);
+  font-weight: var(--weight-medium);
+}
+.settings-tab:hover {
+  background: transparent;
+  color: var(--text-primary);
+}
+.settings-tab.is-active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent);
+}
+.settings-body {
+  min-height: 0;
+}
+.settings-panel[hidden] {
+  display: none;
+}
+.settings-panel {
+  display: block;
+}
+.provider-status-empty {
+  color: var(--text-mute, var(--text-secondary));
+  font-size: var(--text-sm, 12px);
 }
 
 /* Panel toggle header buttons */

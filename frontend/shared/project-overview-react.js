@@ -53,7 +53,7 @@ function FolderGlyph() {
 
 // The Projects-mode sidebar: one row per project (no sessions inline, no Unassigned).
 // `rows` is a precomputed view model [{ id, name, working, needsInput, total }].
-export function ProjectSidebarList({ rows = [], activeProjectId = null, onSelect = null, emptyMessage = "No projects yet." }) {
+export function ProjectSidebarList({ rows = [], activeProjectId = null, onSelect = null, onContext = null, emptyMessage = "No projects yet." }) {
   if (!rows.length) {
     return h("p", { className: "sidebar-empty" }, emptyMessage);
   }
@@ -72,13 +72,19 @@ export function ProjectSidebarList({ rows = [], activeProjectId = null, onSelect
         const total = row.total || 0;
         badges.push(h("span", { key: "t", className: "project-sidebar-badge" }, `${total} ${total === 1 ? "session" : "sessions"}`));
       }
-      return h(
+      const rowButton = h(
         "button",
         {
-          key: row.id,
           type: "button",
           className: `project-sidebar-row${row.id === activeProjectId ? " is-active" : ""}`,
           onClick: () => onSelect?.(row.id),
+          // Right-click (desktop) still opens the actions menu at the cursor.
+          onContextMenu: onContext
+            ? (event) => {
+                event.preventDefault();
+                onContext(row.id, row.name, event.clientX, event.clientY);
+              }
+            : undefined,
           title: row.name,
         },
         h("span", { className: "project-sidebar-icon", "aria-hidden": "true" }, h(FolderGlyph)),
@@ -89,7 +95,43 @@ export function ProjectSidebarList({ rows = [], activeProjectId = null, onSelect
           h("span", { className: "project-sidebar-badges" }, ...badges),
         ),
       );
+      // Without a menu handler there's nothing to reveal — keep the bare row.
+      if (!onContext) {
+        return h(React.Fragment, { key: row.id }, rowButton);
+      }
+      // A visible actions button (keyboard-focusable, tap-friendly on touch) opens the
+      // same Rename/Delete menu as right-click — so project management isn't mouse-only.
+      return h(
+        "div",
+        { key: row.id, className: "project-sidebar-row-wrap" },
+        rowButton,
+        h(
+          "button",
+          {
+            type: "button",
+            className: "project-sidebar-more",
+            "aria-label": `Actions for ${row.name}`,
+            title: "Project actions",
+            onClick: (event) => {
+              event.stopPropagation();
+              const rect = event.currentTarget.getBoundingClientRect();
+              onContext(row.id, row.name, rect.right, rect.bottom);
+            },
+          },
+          h(MoreGlyph),
+        ),
+      );
     }),
+  );
+}
+
+function MoreGlyph() {
+  return h(
+    "svg",
+    { "aria-hidden": "true", width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor" },
+    h("circle", { cx: "3", cy: "8", r: "1.3" }),
+    h("circle", { cx: "8", cy: "8", r: "1.3" }),
+    h("circle", { cx: "13", cy: "8", r: "1.3" }),
   );
 }
 
