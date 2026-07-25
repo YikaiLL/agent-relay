@@ -1,35 +1,66 @@
 # sealwire
 
-**TL;DR** — Run a long-lived **Codex** or **Claude Code** session on your own
-machine, control it from any browser or phone (over LAN or the public
-internet), and let one operator move between devices without losing the
-session.
+**Trust your agent to run on its own for a long time — and stay in control from
+anywhere.**
 
-- The local machine stays the source of truth; the relay is just the
-  control layer around it
-- Remote devices can pair through the **hosted public broker** at
-  `wss://agent-relay.up.railway.app` — no broker infrastructure to deploy
-- Default `private` mode keeps the broker as blind transport: it relays
-  encrypted traffic, it doesn't read your prompts, approvals, or code
-- **Rust** backend (`relay-server` + `relay-broker`), Node-based Claude Code
-  worker, Vite web UI — install with `npx sealwire` on macOS, or run from source
-  ([Quick start ↓](#quick-start))
+sealwire runs a long-lived **Codex** or **Claude Code** session on your own
+machine and turns it into something you can walk away from: point two agents at
+each other for a review, kick off a multi-step workflow that loops until it's
+done, then watch and steer the whole thing from any browser or phone — over LAN
+or the public internet — without losing the session.
+
+**The headline features:**
+
+- 🔍 **Request a review** — ask a *second* agent to review the current work.
+  Claude Code can review Codex, Codex can review Claude, in its own session, and
+  the findings land right back in your thread. Optionally loop reviewer ↔ author
+  for several rounds until the reviewer approves. [More ↓](#request-a-review)
+- 🔁 **Workflows** — run a saved pipeline of agent steps (execute → review →
+  revise) that **loops until a reviewer approves**. It's a long-lived, persisted,
+  backgroundable task: it keeps going while you're away, streams progress to your
+  phone, and survives a relay restart. [More ↓](#workflows)
+- 📱 **Control from everywhere** — one operator, many surfaces. Move between
+  browser, laptop, and phone without losing the session; approve, take over, or
+  redirect from wherever you are.
+
+The rest still holds: the local machine stays the source of truth, the relay is
+just the control layer around it, and remote devices pair through the **hosted
+public broker** (`wss://agent-relay.up.railway.app`) with no infrastructure to
+deploy. Default `private` mode keeps the broker as blind transport — it relays
+encrypted traffic, it doesn't read your prompts, approvals, or code.
+
+**Rust** backend (`relay-server` + `relay-broker`), Node-based Claude Code
+worker, Vite web UI — install with `npx sealwire` on macOS, or run from source
+([Quick start ↓](#quick-start)).
 
 ---
 
-`sealwire` is a local-first, privacy-first control plane for coding
-agents.
+## The vision
 
-The goal is to keep one agent session controllable, resumable, and
-trustworthy across browser, phone, and later other surfaces without turning a
-broker into the place where your workspace, prompts, and approvals have to
-live in plaintext.
+The bottleneck with coding agents isn't raw capability anymore — it's *trust*
+and *presence*. You can't fully trust a single agent to run unattended for long,
+and you have to be sitting at the terminal to catch it when it stalls or asks for
+an approval.
 
-The product supports both Codex and Claude Code today. The local machine
-remains the execution authority. The relay is the control layer around that
-execution:
+sealwire attacks both:
+
+- **Trust comes from a second agent, not blind faith.** A single model marking
+  its own homework is weak. `sealwire` makes cross-agent review and
+  review/revise loops first-class, so work gets checked by a *different* agent
+  before it reaches you — and can iterate on its own until it's actually good.
+- **Presence comes from the network, not the terminal.** Long-running work is
+  persisted and backgroundable; approvals, takeover, and progress follow you to
+  whatever device you're holding. The session doesn't die when you close the
+  laptop.
+
+The local machine stays the execution authority the whole time. The relay is the
+control layer around it — and the broker never has to become the place where your
+code, prompts, and approvals live in plaintext.
+
+`sealwire` supports both Codex and Claude Code today. The relay lets you:
 
 - start and resume a coding session against Codex or Claude Code
+- ask a second agent to review the work, or run a full review/revise workflow
 - see whether it is running, blocked, or waiting
 - handle approvals away from the terminal
 - move control between devices without losing the session
@@ -163,6 +194,10 @@ and the problem is control, continuity, and trust rather than raw execution.
 
 Good fits today:
 
+- you want a **second agent to review** the first one's work — cross-provider,
+  in its own session — instead of trusting a single model to grade itself
+- you want to **start a review/revise workflow and walk away**, watching it loop
+  toward approval from your phone rather than babysitting the terminal
 - you want to start or resume a Codex or Claude Code session from a browser
   without moving the workspace off the machine that already owns it
 - you want to review approval requests or take over a session from your phone
@@ -185,6 +220,10 @@ Not the current target:
 
 The design is intentionally opinionated:
 
+- trust through independent review: a second agent checking the first's work
+  (and iterating until it's good) earns more trust than one model grading itself
+- unattended by default: long-running work should persist, background, and
+  survive restart, so you can start it and walk away rather than babysit a terminal
 - local-first authority: the machine with the local workspace and the Codex or
   Claude Code session remains the source of truth
 - privacy-first defaults: the safe path should be the obvious path for people
@@ -220,10 +259,14 @@ Security is a core part of the product, not a later add-on.
 
 ## Current focus
 
+- **cross-agent review** — one agent reviews another's work, single-shot or as a
+  multi-round reviewer ↔ author loop
+- **workflows** — saved execute → review → revise pipelines that loop until a
+  reviewer approves, running as long-lived, restart-surviving background tasks
 - Codex via the official `codex app-server` JSON-RPC protocol
 - Claude Code via the official `@anthropic-ai/claude-agent-sdk`
 - single owner, multiple devices
-- approval-first remote workflow
+- approval-first remote control that follows you across devices
 - web first, native mobile later
 - local-first runtime with the hosted public broker at
   <https://agent-relay.up.railway.app/> as the default remote transport, and a
@@ -242,6 +285,13 @@ The repository currently includes:
 
 The current implementation supports:
 
+- **cross-agent review**: ask a second agent (any provider) to review the current
+  changes in its own session and post findings back into the thread, single-shot
+  or as a multi-round reviewer ↔ author loop until the reviewer approves
+- **workflows (Code Flow)**: a saved execute → review → revise pipeline that
+  loops until approval, running as a long-lived, persisted, backgroundable task
+  that streams progress to any device and is reconciled to a safe, re-runnable
+  state on relay restart
 - starting a Codex or Claude Code session from the browser
 - picking the provider per session from the launch panel
 - listing saved threads scoped by workspace
@@ -278,19 +328,26 @@ The current web UI is intentionally simple:
 
 The project is usable, but it is still early. It does not yet provide:
 
+- workflow templates beyond **Code Flow** — Design Flow (design-doc artifact), a
+  free-form graph editor for custom pipelines, and the long **task-list runner**
+  are in progress, not shipped
 - a formal event log with replay, cursor, and idempotency guarantees
 - push notifications or native mobile apps
 - team roles, org policy, or enterprise audit workflows
-- cloud runners or multi-agent orchestration
+- cloud runners / remote execution targets
 - providers beyond Codex and Claude Code
 - a hardened multi-user product surface for untrusted tenants
 
 ## Roadmap direction
 
-Near-term work is focused on making the control plane trustworthy:
+Near-term work is focused on going deeper on the trust-and-presence story:
 
+- grow workflows past Code Flow: the **task-list runner** (run a whole list of
+  tasks unattended, each as its own Code Flow), Design Flow, and a custom
+  pipeline editor
 - formalize the session and event model
 - define replay, cursor, and idempotency behavior
+- push notifications so long-running work can reach you when it needs a decision
 - make mobile web approval and resume fast and honest
 - strengthen device identity, pairing, and remote broker transport
 - clarify `private` versus `managed` security modes

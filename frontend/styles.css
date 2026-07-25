@@ -3820,8 +3820,8 @@ input:focus, textarea:focus, select:focus {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--status-ready-text, #47c07a);
-  box-shadow: 0 0 8px var(--status-ready-text, #47c07a);
+  background: var(--status-ready-text);
+  box-shadow: 0 0 8px var(--status-ready-text);
   flex: none;
 }
 .sidebar-host-label {
@@ -3833,8 +3833,8 @@ input:focus, textarea:focus, select:focus {
 /* Footer reflects the live SSE stream (state.streamConnected): green when live,
    amber while on the polling fallback (relay still reachable, just not real-time). */
 .sidebar-host-status.is-degraded .sidebar-host-dot {
-  background: var(--status-attention-text, #e0ac47);
-  box-shadow: 0 0 8px var(--status-attention-text, #e0ac47);
+  background: var(--warn-fg);
+  box-shadow: 0 0 8px var(--warn-fg);
 }
 
 /* Settings entry: the icon-rail gear is the desktop entry; this header gear is the

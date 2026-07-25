@@ -1519,6 +1519,7 @@ function RemoteApp() {
           threadListStore.getState().toggleExpandedGroup(cwd);
         },
         relayDirectoryModel,
+        remoteReviews,
         remoteUiState: remoteUi,
         session,
         sessionPanelModel,
@@ -1788,6 +1789,7 @@ function RemoteSidebar({
   onToggleExpandedGroup,
   onToggleGroup,
   relayDirectoryModel,
+  remoteReviews,
   session,
   sessionPanelModel,
   sessionPanelOpen,

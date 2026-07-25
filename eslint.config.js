@@ -11,8 +11,10 @@ export default [
   {
     ignores: [
       "web/**",
+      ".claude/**",
       "node_modules/**",
       "target/**",
+      "src-tauri/target/**",
       "dist*/**",
       "**/*.min.js",
     ],
