@@ -43,22 +43,40 @@ export function reviewStatusLabel(status) {
   return REVIEW_STATUS_LABELS[status] || status || "Reviewing";
 }
 
+export function reviewActivity(session) {
+  return Array.isArray(session?.review_activity)
+    ? session.review_activity
+    : session?.active_review_jobs || [];
+}
+
 export function isReviewInProgress(session) {
-  return (session?.active_review_jobs || []).some(
+  if (Number.isInteger(session?.review_activity_total)) {
+    return session.review_activity_total > 0;
+  }
+  return reviewActivity(session).some(
     (job) => !TERMINAL_REVIEW_STATUSES.has(job.status)
   );
 }
 
 export function isReviewBlocked(session) {
-  return (session?.active_review_jobs || []).some((job) => job.status === "blocked");
+  if (typeof session?.review_blocked === "boolean") {
+    return session.review_blocked;
+  }
+  return reviewActivity(session).some((job) => job.status === "blocked");
 }
 
 export function isWorkflowBlocked(session) {
-  return (session?.active_workflow_runs || []).some((run) => run?.status === "blocked");
+  const activity = Array.isArray(session?.workflow_activity)
+    ? session.workflow_activity
+    : session?.active_workflow_runs || [];
+  return activity.some((run) => run?.status === "blocked");
 }
 
 function isWorkflowInProgress(session) {
-  return (session?.active_workflow_runs || []).some(
+  const activity = Array.isArray(session?.workflow_activity)
+    ? session.workflow_activity
+    : session?.active_workflow_runs || [];
+  return activity.some(
     (run) => !TERMINAL_WORKFLOW_STATUSES.has(run?.status)
   );
 }
@@ -69,9 +87,16 @@ function isWorkflowInProgress(session) {
 // "this session isn't active" message.
 export function isReviewInProgressForThread(session, threadId) {
   if (!threadId) return false;
-  return (session?.active_review_jobs || []).some(
+  if (reviewActivity(session).some(
     (job) =>
       job.parent_thread_id === threadId && !TERMINAL_REVIEW_STATUSES.has(job.status)
+  )) {
+    return true;
+  }
+  return Boolean(
+    isReviewInProgress(session)
+    && session?.review_locked
+    && session?.active_thread_id === threadId
   );
 }
 
@@ -82,10 +107,17 @@ export function isReviewInProgressForThread(session, threadId) {
 // review in the background, so reviews on DIFFERENT threads may run concurrently.
 export function isThreadReviewLocked(session, threadId) {
   if (!threadId) return false;
-  return (session?.active_review_jobs || []).some(
+  if (reviewActivity(session).some(
     (job) =>
       !TERMINAL_REVIEW_STATUSES.has(job.status) &&
       (job.parent_thread_id === threadId || job.reviewer_thread_id === threadId)
+  )) {
+    return true;
+  }
+  return Boolean(
+    isReviewInProgress(session)
+    && session?.review_locked
+    && session?.active_thread_id === threadId
   );
 }
 
@@ -95,9 +127,12 @@ export function isThreadReviewLocked(session, threadId) {
 // `active_review_jobs` per thread (mirrors buildThreadActivityMap's shape). Keyed
 // by the parent — the reviewer thread itself already shows its own working dot via
 // `thread_activity`.
-export function buildReviewingThreadSet(session) {
+export function buildReviewingThreadSet(session, reviews = null) {
   const set = new Set();
-  for (const job of session?.active_review_jobs || []) {
+  const jobs = Array.isArray(reviews?.review_jobs)
+    ? reviews.review_jobs
+    : reviewActivity(session);
+  for (const job of jobs) {
     if (job?.parent_thread_id && !TERMINAL_REVIEW_STATUSES.has(job.status)) {
       set.add(job.parent_thread_id);
     }

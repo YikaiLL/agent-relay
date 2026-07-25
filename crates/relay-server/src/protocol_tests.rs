@@ -3,11 +3,12 @@ use crate::protocol::{
     truncate_utf8_bytes_with_ellipsis, truncate_with_ellipsis, ApprovalRequestView,
     AskUserOptionView, AskUserQuestionRequestView, AskUserQuestionView, DeleteThreadInput,
     DeviceLifecycleState, DeviceRecordView, FileChangeDiffView, LogEntryView, ReviewActionInput,
-    ReviewJobView, ReviewerThreadView, SecurityMode, SessionSnapshot,
+    ReviewActivityView, ReviewJobView, ReviewerThreadView, SecurityMode, SessionSnapshot,
     SessionSnapshotCompactProfile, ThreadEntriesResponse, ThreadEntryDetailResponse,
     ThreadSummaryView, ThreadTranscriptResponse, ThreadsResponse, ThreadsResponseCompactProfile,
     ToolCallView, TranscriptContentState, TranscriptEntryKind, TranscriptEntryView,
-    WorkflowRunView, WorkflowVerdictView, EMERGENCY_TRANSCRIPT_SHELL_CHARS,
+    WorkflowActivityView, WorkflowRunView, WorkflowVerdictView, EMERGENCY_TRANSCRIPT_SHELL_CHARS,
+    MAX_REVIEW_ACTIVITY_REMOTE_JOBS, MAX_WORKFLOW_ACTIVITY_REMOTE_LOCKED_THREAD_IDS,
 };
 
 const MAX_BROKER_LOGS: usize = 8;
@@ -76,6 +77,7 @@ fn make_snapshot() -> SessionSnapshot {
         device_records: vec![],
         paired_devices: vec![],
         pending_pairing_requests: vec![],
+        devices_revision: 0,
         pending_ask_user_questions: vec![],
         pending_approvals: vec![ApprovalRequestView {
             request_id: "approval-1".to_string(),
@@ -115,8 +117,12 @@ fn make_snapshot() -> SessionSnapshot {
             .collect(),
         active_review_jobs: vec![],
         reviewer_threads: vec![],
+        review_activity: vec![],
+        review_activity_total: 0,
+        review_blocked: false,
         reviews_revision: 0,
         active_workflow_runs: vec![],
+        workflow_activity: vec![],
         workflows_revision: 0,
         push_vapid_public_key: None,
         projects_revision: 0,
@@ -199,6 +205,99 @@ fn compaction_preserves_reviews_revision_so_the_panel_can_refetch() {
     assert_eq!(
         compacted.reviews_revision, 4242,
         "the reviews cache-key revision must survive compaction (it's the panel's refetch signal)"
+    );
+}
+
+#[test]
+fn workflow_activity_lock_flood_stays_inside_remote_snapshot_budget() {
+    let mut snapshot = make_snapshot();
+    snapshot.workflow_activity = (0..3)
+        .map(|run_index| WorkflowActivityView {
+            id: format!("workflow-{run_index}"),
+            parent_thread_id: "thread-1".to_string(),
+            status: "running".to_string(),
+            locked_thread_ids: std::iter::once("thread-1".to_string())
+                .chain(
+                    (0..2_000)
+                        .map(|index| format!("same-cwd-{run_index}-{index}-{}", "x".repeat(300))),
+                )
+                .collect(),
+        })
+        .collect();
+
+    let compacted = snapshot.compact_for(SessionSnapshotCompactProfile::RemoteSurface);
+    let serialized = serde_json::to_vec(&compacted).expect("serialize compacted snapshot");
+
+    assert!(
+        serialized.len() <= SESSION_SNAPSHOT_TARGET_BYTES,
+        "workflow activity must not push a remote frame over budget ({} bytes)",
+        serialized.len()
+    );
+    assert_eq!(
+        compacted.workflow_activity.len(),
+        1,
+        "only the globally-active workflow belongs in the live projection"
+    );
+    assert!(
+        compacted.workflow_activity[0].locked_thread_ids.len()
+            <= MAX_WORKFLOW_ACTIVITY_REMOTE_LOCKED_THREAD_IDS,
+        "the dedicated workflows channel, not the live snapshot, carries the complete lock set"
+    );
+    assert!(
+        compacted.workflow_activity[0]
+            .locked_thread_ids
+            .iter()
+            .any(|thread_id| thread_id == "thread-1"),
+        "the parent lock must survive activity compaction"
+    );
+}
+
+#[test]
+fn review_activity_flood_stays_inside_remote_snapshot_budget() {
+    let mut snapshot = make_snapshot();
+    snapshot.review_activity_total = 2_000;
+    snapshot.review_blocked = true;
+    snapshot.review_activity = (0..2_000)
+        .map(|index| ReviewActivityView {
+            id: format!("review-{index}-{}", "x".repeat(300)),
+            parent_thread_id: if index == 0 {
+                "thread-1".to_string()
+            } else {
+                format!("parent-{index}-{}", "p".repeat(300))
+            },
+            reviewer_thread_id: Some(format!("reviewer-{index}-{}", "r".repeat(300))),
+            status: if index == 1 {
+                "blocked"
+            } else {
+                "waiting_for_reviewer"
+            }
+            .to_string(),
+        })
+        .collect();
+
+    let compacted = snapshot.compact_for(SessionSnapshotCompactProfile::RemoteSurface);
+    let serialized = serde_json::to_vec(&compacted).expect("serialize compacted snapshot");
+
+    assert!(
+        serialized.len() <= SESSION_SNAPSHOT_TARGET_BYTES,
+        "review activity must not push a remote frame over budget ({} bytes)",
+        serialized.len()
+    );
+    assert!(
+        compacted.review_activity.len() <= MAX_REVIEW_ACTIVITY_REMOTE_JOBS,
+        "the dedicated Reviews channel, not the live snapshot, carries the complete job set"
+    );
+    assert_eq!(compacted.review_activity_total, 2_000);
+    assert!(
+        compacted.review_blocked,
+        "global blocked state must survive identity projection truncation"
+    );
+    assert!(
+        compacted
+            .review_activity
+            .iter()
+            .any(|job| job.parent_thread_id == "thread-1"),
+        "the active parent lock must survive activity compaction"
     );
 }
 
@@ -336,8 +435,9 @@ fn compact_for_broker_preserves_terminal_workflow_verdict_after_truncating() {
 }
 
 #[test]
-fn compact_for_broker_preserves_terminal_workflow_verdict_in_populated_snapshot() {
+fn compact_for_broker_drops_legacy_workflow_card_before_conversation_content() {
     let mut snapshot = workflow_budget_snapshot("escalated", 50_000);
+    snapshot.workflows_revision = 73;
     snapshot.current_cwd = "/tmp/".to_string() + &"超长路径".repeat(3_000);
     snapshot.transcript = (0..3)
         .map(|index| TranscriptEntryView {
@@ -358,17 +458,19 @@ fn compact_for_broker_preserves_terminal_workflow_verdict_in_populated_snapshot(
         bytes <= SESSION_SNAPSHOT_TARGET_BYTES,
         "compacted snapshot stayed over budget: {bytes}"
     );
-    assert_eq!(
-        compacted.active_workflow_runs.len(),
-        1,
-        "terminal workflow card is the only workflow findings surface"
+    assert!(
+        compacted.active_workflow_runs.is_empty(),
+        "the dedicated Workflows channel makes the legacy card expendable under pressure"
     );
-    let verdict = compacted.active_workflow_runs[0]
-        .last_verdict
-        .as_ref()
-        .expect("terminal workflow verdict remains visible");
-    assert_eq!(verdict.approved, false);
-    assert!(verdict.findings[0].contains("f"));
+    assert_eq!(
+        compacted.workflows_revision, 73,
+        "the cache key must survive so the full workflow card can be fetched"
+    );
+    assert_eq!(
+        compacted.transcript.len(),
+        3,
+        "legacy workflow metadata must be reclaimed before conversation entries"
+    );
 }
 
 #[test]
@@ -450,6 +552,9 @@ fn compact_for_broker_keeps_only_active_parent_reviewers() {
     // grow unbounded) never blows the frame budget. make_snapshot's active thread is
     // "thread-1".
     let mut snapshot = make_snapshot();
+    snapshot.transcript.clear();
+    snapshot.logs.clear();
+    snapshot.pending_approvals.clear();
     let reviewer = |id: &str, parent: &str| ReviewerThreadView {
         reviewer_thread_id: id.to_string(),
         parent_thread_id: parent.to_string(),
@@ -488,6 +593,9 @@ fn compact_for_broker_with_no_active_thread_keeps_reviewers() {
     // parent to scope by, the scoping should be a no-op (there's nothing to narrow to),
     // not a total wipe — otherwise the remote reuse picker / reviewer panel goes empty.
     let mut snapshot = make_snapshot();
+    snapshot.transcript.clear();
+    snapshot.logs.clear();
+    snapshot.pending_approvals.clear();
     snapshot.active_thread_id = None;
     let reviewer = |id: &str, parent: &str| ReviewerThreadView {
         reviewer_thread_id: id.to_string(),
@@ -514,6 +622,9 @@ fn compact_for_local_web_keeps_reviewer_threads() {
     // the frontend think there are no reviewers and silently skip the confirmation,
     // so LocalWeb must preserve the map.
     let mut snapshot = make_snapshot();
+    snapshot.transcript.clear();
+    snapshot.logs.clear();
+    snapshot.pending_approvals.clear();
     snapshot.reviewer_threads = vec![
         ReviewerThreadView {
             reviewer_thread_id: "reviewer-1".to_string(),

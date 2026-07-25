@@ -54,19 +54,25 @@ export function workflowChipTone(status) {
   return "active";
 }
 
+export function workflowActivity(session) {
+  return Array.isArray(session?.workflow_activity)
+    ? session.workflow_activity
+    : session?.active_workflow_runs || [];
+}
+
 function activeWorkflowRunning(session) {
-  return (session?.active_workflow_runs || []).some(
+  return workflowActivity(session).some(
     (run) => !TERMINAL_WORKFLOW_STATUSES.has(run?.status)
   );
 }
 
 export function isWorkflowBlocked(session) {
-  return (session?.active_workflow_runs || []).some((run) => run?.status === "blocked");
+  return workflowActivity(session).some((run) => run?.status === "blocked");
 }
 
 export function isWorkflowInProgressForThread(session, threadId) {
   if (!threadId) return false;
-  const runs = session?.active_workflow_runs || [];
+  const runs = workflowActivity(session);
   if (runs.some((run) => {
     if (TERMINAL_WORKFLOW_STATUSES.has(run?.status)) return false;
     if (run?.parent_thread_id === threadId) return true;
@@ -74,7 +80,8 @@ export function isWorkflowInProgressForThread(session, threadId) {
   })) {
     return true;
   }
-  const hasWorkflowSnapshot = Array.isArray(session?.active_workflow_runs);
+  const hasWorkflowSnapshot =
+    Array.isArray(session?.workflow_activity) || Array.isArray(session?.active_workflow_runs);
   const anyActiveWorkflow = runs.some((run) => !TERMINAL_WORKFLOW_STATUSES.has(run?.status));
   if (hasWorkflowSnapshot && !anyActiveWorkflow) {
     return false;
@@ -103,9 +110,12 @@ export function canStartWorkflow(session, viewedThreadId = null) {
   return true;
 }
 
-export function workflowRunsForThread(session, threadId) {
+export function workflowRunsForThread(workflows, threadId) {
   if (!threadId) return [];
-  return (session?.active_workflow_runs || []).filter(
+  const runs = Array.isArray(workflows?.workflow_runs)
+    ? workflows.workflow_runs
+    : workflows?.active_workflow_runs || [];
+  return runs.filter(
     (run) => run?.parent_thread_id === threadId
   );
 }

@@ -45,6 +45,7 @@ fn make_snapshot() -> SessionSnapshot {
         device_records: vec![],
         paired_devices: vec![],
         pending_pairing_requests: vec![],
+        devices_revision: 0,
         pending_approvals: vec![],
         pending_ask_user_questions: vec![],
         transcript_truncated: false,
@@ -62,8 +63,12 @@ fn make_snapshot() -> SessionSnapshot {
         logs: vec![],
         active_review_jobs: vec![],
         reviewer_threads: vec![],
+        review_activity: vec![],
+        review_activity_total: 0,
+        review_blocked: false,
         reviews_revision: 0,
         active_workflow_runs: vec![],
+        workflow_activity: vec![],
         workflows_revision: 0,
         push_vapid_public_key: None,
         projects_revision: 0,
@@ -325,6 +330,8 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        workflows: None,
+        devices: None,
         projects: None,
         ask_user_question_detail: None,
         session_claim: None,
@@ -359,6 +366,8 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        workflows: None,
+        devices: None,
         projects: None,
         ask_user_question_detail: None,
         session_claim: Some("claim-1".to_string()),
@@ -458,6 +467,10 @@ fn remote_action_result_size_breakdown_reports_large_thread_transcript_payloads(
         None,
         // reviews
         None,
+        // workflows
+        None,
+        // devices
+        None,
         // projects
         None,
         None,
@@ -509,6 +522,8 @@ fn make_large_thread_transcript_plaintext() -> RemoteActionResultPlaintext {
         }),
         workspace_diff: None,
         reviews: None,
+        workflows: None,
+        devices: None,
         projects: None,
         ask_user_question_detail: None,
         session_claim: None,
@@ -536,6 +551,8 @@ fn make_large_ask_user_detail_plaintext() -> RemoteActionResultPlaintext {
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        workflows: None,
+        devices: None,
         projects: None,
         ask_user_question_detail: Some(AskUserQuestionDetailResponse {
             request: AskUserQuestionRequestView::with_inline_questions(
@@ -674,6 +691,34 @@ fn fetch_reviews_action_round_trips_and_is_not_claim_gated() {
             assert_eq!(device_id.as_deref(), Some("device-7"));
         }
         other => panic!("unexpected bound request: {other:?}"),
+    }
+}
+
+#[test]
+fn dedicated_workflows_and_devices_actions_are_read_only_data_fetches() {
+    for (wire_type, expected_kind) in [
+        ("fetch_workflows", RemoteActionKind::FetchWorkflows),
+        ("fetch_devices", RemoteActionKind::FetchDevices),
+    ] {
+        let request: RemoteActionRequest =
+            serde_json::from_value(serde_json::json!({ "type": wire_type }))
+                .expect("dedicated fetch should parse");
+        assert_eq!(request.kind(), expected_kind);
+        assert!(!requires_session_claim(expected_kind));
+        assert_eq!(
+            remote_action_result_kind(expected_kind),
+            RemoteActionResultKind::RemoteTranscriptResult
+        );
+        match (expected_kind, request.bind_device("device-12".to_string())) {
+            (
+                RemoteActionKind::FetchWorkflows,
+                RemoteActionRequest::FetchWorkflows { device_id },
+            )
+            | (RemoteActionKind::FetchDevices, RemoteActionRequest::FetchDevices { device_id }) => {
+                assert_eq!(device_id.as_deref(), Some("device-12"))
+            }
+            (_, other) => panic!("unexpected bound request: {other:?}"),
+        }
     }
 }
 
@@ -875,6 +920,8 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         reviews: Some(reviews),
+        workflows: None,
+        devices: None,
         projects: None,
         ask_user_question_detail: None,
         session_claim: None,
@@ -900,6 +947,50 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         carried["reviewer_threads"][0]["reviewer_thread_id"], "reviewer-1",
         "the device needs the reviewer threads to populate the reuse picker"
     );
+}
+
+#[test]
+fn plain_dedicated_workflows_and_devices_payloads_reach_the_device() {
+    let result = RemoteActionResultPlaintext {
+        kind: RemoteActionResultKind::RemoteTranscriptResult,
+        action: RemoteActionKind::FetchWorkflows,
+        ok: true,
+        snapshot: None,
+        receipt: None,
+        ask_user_answer_receipt: None,
+        providers: None,
+        models: None,
+        threads: None,
+        thread_entries: None,
+        thread_entry_detail: None,
+        thread_transcript: None,
+        workspace_diff: None,
+        reviews: None,
+        workflows: Some(crate::protocol::WorkflowsResponse {
+            workflows_revision: 4,
+            workflow_runs: Vec::new(),
+        }),
+        devices: Some(crate::protocol::DevicesResponse {
+            devices_revision: 5,
+            device_records: Vec::new(),
+            paired_devices: Vec::new(),
+            pending_pairing_requests: Vec::new(),
+        }),
+        projects: None,
+        ask_user_question_detail: None,
+        session_claim: None,
+        session_claim_expires_at: None,
+        claim_challenge_id: None,
+        claim_challenge: None,
+        claim_challenge_expires_at: None,
+        error: None,
+    };
+
+    let payload = build_plain_remote_action_result_payload("action-data", "surface-1", &result)
+        .expect("dedicated data payload");
+    let json = serde_json::to_value(payload).expect("serialize payload");
+    assert_eq!(json["workflows"]["workflows_revision"], 4);
+    assert_eq!(json["devices"]["devices_revision"], 5);
 }
 
 #[test]
@@ -935,6 +1026,8 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        workflows: None,
+        devices: None,
         projects: Some(projects),
         ask_user_question_detail: None,
         session_claim: None,

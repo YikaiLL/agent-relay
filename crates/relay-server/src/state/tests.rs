@@ -289,6 +289,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             device_records: Vec::new(),
             paired_devices: Vec::new(),
             pending_pairing_requests: Vec::new(),
+            devices_revision: 0,
             pending_approvals: Vec::new(),
             pending_ask_user_questions: Vec::new(),
             transcript_truncated: false,
@@ -296,8 +297,12 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             logs: Vec::new(),
             active_review_jobs: Vec::new(),
             reviewer_threads: Vec::new(),
+            review_activity: Vec::new(),
+            review_activity_total: 0,
+            review_blocked: false,
             reviews_revision: 0,
             active_workflow_runs: Vec::new(),
+            workflow_activity: Vec::new(),
             workflows_revision: 0,
             push_vapid_public_key: None,
             projects_revision: 0,
@@ -319,6 +324,8 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         thread_transcript: None,
         workspace_diff: None,
         reviews: None,
+        workflows: None,
+        devices: None,
         projects: None,
         ask_user_question_detail: None,
         session_claim: Some("claim-1".to_string()),
@@ -1811,6 +1818,10 @@ fn review_jobs_view_keeps_an_in_progress_run_visible_over_a_same_second_terminal
         view[0].id, "job-live",
         "the in-progress run must be the visible card on a same-second tie"
     );
+    let activity = relay.review_activity_view();
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].id, "job-live");
+    assert_eq!(activity[0].parent_thread_id, "parent-1");
 }
 
 #[test]
@@ -2674,8 +2685,8 @@ fn revoking_paired_device_removes_it() {
     assert!(!relay.revoke_paired_device(&device.device_id, 102));
     assert!(relay.paired_devices.is_empty());
 
-    let snapshot = relay.snapshot();
-    let record = snapshot
+    let devices = relay.devices_response();
+    let record = devices
         .device_records
         .iter()
         .find(|record| record.device_id == device.device_id)
@@ -3448,7 +3459,7 @@ fn rejecting_pairing_request_returns_error_without_creating_device() {
 }
 
 #[test]
-fn snapshot_exposes_pending_device_record_metadata() {
+fn devices_response_exposes_pending_device_record_metadata() {
     let mut relay = test_state();
     let ticket = issue_test_pairing_ticket(
         &mut relay,
@@ -3469,8 +3480,8 @@ fn snapshot_exposes_pending_device_record_metadata() {
         )
         .expect("pairing request should register");
 
-    let snapshot = relay.snapshot();
-    let record = snapshot
+    let devices = relay.devices_response();
+    let record = devices
         .device_records
         .iter()
         .find(|record| record.device_id == "phone-pending")
@@ -3482,6 +3493,12 @@ fn snapshot_exposes_pending_device_record_metadata() {
     assert_eq!(record.last_peer_id.as_deref(), Some("surface-pending"));
     assert_eq!(record.broker_join_ticket_expires_at, None);
     assert!(record.fingerprint.is_some());
+
+    let snapshot = relay.snapshot();
+    assert!(snapshot.device_records.is_empty());
+    assert!(snapshot.paired_devices.is_empty());
+    assert!(snapshot.pending_pairing_requests.is_empty());
+    assert_eq!(snapshot.devices_revision, devices.devices_revision);
 }
 
 #[test]
@@ -3510,8 +3527,8 @@ fn approving_pairing_request_updates_device_record_metadata() {
         .decide_pairing_request(&ticket.pairing_id, true, Some(3600), 101)
         .expect("approval should succeed");
 
-    let snapshot = relay.snapshot();
-    let record = snapshot
+    let devices = relay.devices_response();
+    let record = devices
         .device_records
         .iter()
         .find(|record| record.device_id == "phone-approved")
@@ -3551,8 +3568,8 @@ fn rejecting_pairing_request_records_rejected_device_state() {
         .decide_pairing_request(&ticket.pairing_id, false, None, 101)
         .expect("rejection should succeed");
 
-    let snapshot = relay.snapshot();
-    let record = snapshot
+    let devices = relay.devices_response();
+    let record = devices
         .device_records
         .iter()
         .find(|record| record.device_id == "phone-rejected")
@@ -3617,13 +3634,13 @@ fn revoke_all_other_devices_keeps_selected_device_and_marks_others_revoked() {
     assert_eq!(relay.paired_devices.len(), 1);
     assert!(relay.paired_devices.contains_key(&keep_device.device_id));
 
-    let snapshot = relay.snapshot();
-    let kept_record = snapshot
+    let devices = relay.devices_response();
+    let kept_record = devices
         .device_records
         .iter()
         .find(|record| record.device_id == keep_device.device_id)
         .expect("kept device record should be present");
-    let revoked_record = snapshot
+    let revoked_record = devices
         .device_records
         .iter()
         .find(|record| record.device_id == drop_device.device_id)

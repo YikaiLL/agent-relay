@@ -66,7 +66,7 @@ pub enum SecurityMode {
     Managed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceLifecycleState {
     Pending,
@@ -129,42 +129,60 @@ pub struct SessionSnapshot {
     pub sandbox: String,
     pub reasoning_effort: String,
     pub allowed_roots: Vec<String>,
+    /// Deprecated compatibility shells. Full device data lives on the dedicated
+    /// Devices channel (`GET /api/devices` / `fetch_devices`) and these are empty
+    /// in newly-produced snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_records: Vec<DeviceRecordView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paired_devices: Vec<PairedDeviceView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_pairing_requests: Vec<PendingPairingRequestView>,
+    /// Cache key for the dedicated Devices channel.
+    #[serde(default)]
+    pub devices_revision: u64,
     pub pending_approvals: Vec<ApprovalRequestView>,
     #[serde(default)]
     pub pending_ask_user_questions: Vec<AskUserQuestionRequestView>,
     pub transcript_truncated: bool,
     pub transcript: Vec<TranscriptEntryView>,
     pub logs: Vec<LogEntryView>,
-    /// Active (and recently-finished) cross-agent review jobs. Lets the UI render
-    /// a small progress chip that updates live over the snapshot stream. Bounded:
-    /// review jobs are serialized one at a time and terminal jobs age out.
-    #[serde(default)]
+    /// Deprecated compatibility shell. Full review cards live on the dedicated
+    /// Reviews channel; newly-produced snapshots carry only `review_activity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_review_jobs: Vec<ReviewJobView>,
-    /// Durable reviewer→parent thread identity (persisted; survives restart). Lets
-    /// the UI hide reviewer threads and, when deleting a parent, prompt about its
-    /// reviewer thread(s). Independent of `active_review_jobs` (which is in-memory).
-    #[serde(default)]
+    /// Deprecated compatibility shell. Reviewer identities live on Reviews.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviewer_threads: Vec<ReviewerThreadView>,
+    /// Minimal synchronous review state used for locking, navigation badges, and
+    /// controller gating. Only a bounded projection of non-terminal jobs is
+    /// included; the full set lives on the Reviews channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_activity: Vec<ReviewActivityView>,
+    /// Fixed-size summary of the complete non-terminal review set. These remain
+    /// authoritative even when `review_activity` is capped.
+    #[serde(default)]
+    pub review_activity_total: usize,
+    #[serde(default)]
+    pub review_blocked: bool,
     /// Content revision of the reviewer-panel data (review jobs + reviewer threads). A
-    /// small scalar that NEVER gets dropped by byte-budget compaction (unlike
-    /// `active_review_jobs`, which is drained under transcript pressure). The reviewer
+    /// small scalar that NEVER gets dropped by byte-budget compaction. The reviewer
     /// panel reads its cards from a dedicated, uncompacted channel (`/api/session/reviews`
     /// locally, the `fetch_reviews` broker action remotely) and re-fetches ONLY when this
     /// revision changes — so the panel stays populated during live turns and the client
-    /// doesn't refetch on every frame. `active_review_jobs` above remains for synchronous
+    /// doesn't refetch on every frame. `review_activity` remains for synchronous
     /// liveness/lock gating only.
     #[serde(default)]
     pub reviews_revision: u64,
-    /// Active (and recently-finished) relay-owned workflow runs. Phase 1 exposes
-    /// built-in Code Flow runs here so local and broker-bound clients can render
-    /// progress without a second channel.
-    #[serde(default)]
+    /// Deprecated compatibility shell. Full workflow cards live on the dedicated
+    /// Workflows channel; newly-produced snapshots carry only `workflow_activity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_workflow_runs: Vec<WorkflowRunView>,
-    /// Content revision for `active_workflow_runs`, used by clients that want a
-    /// cheap change detector without diffing cards.
+    /// Minimal synchronous workflow state used for locking and launch gating.
+    /// Only non-terminal runs are included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_activity: Vec<WorkflowActivityView>,
+    /// Cache key for the dedicated Workflows channel.
     #[serde(default)]
     pub workflows_revision: u64,
     /// VAPID public key (base64url, uncompressed P-256 point) the remote app uses
@@ -195,6 +213,25 @@ pub struct ReviewsResponse {
     pub reviews_revision: u64,
     pub review_jobs: Vec<ReviewJobView>,
     pub reviewer_threads: Vec<ReviewerThreadView>,
+}
+
+/// Uncompacted device/security payload served on demand. Device records are
+/// intentionally outside the high-frequency session snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicesResponse {
+    pub devices_revision: u64,
+    pub device_records: Vec<DeviceRecordView>,
+    pub paired_devices: Vec<PairedDeviceView>,
+    pub pending_pairing_requests: Vec<PendingPairingRequestView>,
+}
+
+/// Minimal non-terminal review projection that remains in SessionSnapshot.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReviewActivityView {
+    pub id: String,
+    pub parent_thread_id: String,
+    pub reviewer_thread_id: Option<String>,
+    pub status: String,
 }
 
 /// One reviewer thread and the parent it reviews. Surfaced so the local UI can
@@ -289,6 +326,40 @@ fn compact_workflow_runs(
     }
 }
 
+fn compact_review_activity(
+    activity: &mut Vec<ReviewActivityView>,
+    max_jobs: usize,
+    max_field_bytes: usize,
+) {
+    activity.truncate(max_jobs);
+    for job in activity {
+        truncate_utf8_bytes_with_ellipsis(&mut job.id, max_field_bytes);
+        truncate_utf8_bytes_with_ellipsis(&mut job.parent_thread_id, max_field_bytes);
+        if let Some(reviewer_thread_id) = &mut job.reviewer_thread_id {
+            truncate_utf8_bytes_with_ellipsis(reviewer_thread_id, max_field_bytes);
+        }
+        truncate_utf8_bytes_with_ellipsis(&mut job.status, max_field_bytes);
+    }
+}
+
+fn compact_workflow_activity(
+    activity: &mut Vec<WorkflowActivityView>,
+    max_runs: usize,
+    max_locked_thread_ids: usize,
+    max_field_bytes: usize,
+) {
+    activity.truncate(max_runs);
+    for run in activity {
+        truncate_utf8_bytes_with_ellipsis(&mut run.id, max_field_bytes);
+        truncate_utf8_bytes_with_ellipsis(&mut run.parent_thread_id, max_field_bytes);
+        truncate_utf8_bytes_with_ellipsis(&mut run.status, max_field_bytes);
+        run.locked_thread_ids.truncate(max_locked_thread_ids);
+        for thread_id in &mut run.locked_thread_ids {
+            truncate_utf8_bytes_with_ellipsis(thread_id, max_field_bytes);
+        }
+    }
+}
+
 /// When even per-field fallback truncation can't get a snapshot under budget
 /// (e.g. an oversized non-transcript field such as a very long cwd), the
 /// surviving transcript tail is reduced to identity shells whose text is clipped
@@ -303,10 +374,25 @@ const EMERGENCY_TRANSCRIPT_CWD_CHARS: usize = 512;
 pub(crate) const WORKFLOW_ANCHOR_STORED_BYTES: usize = 512;
 const WORKFLOW_FIELD_REMOTE_BYTES: usize = 256;
 const WORKFLOW_FIELD_LOCAL_BYTES: usize = 512;
+const WORKFLOW_ACTIVITY_FIELD_BYTES: usize = 256;
 const WORKFLOW_VERDICT_REMOTE_BYTES: usize = 768;
 const WORKFLOW_VERDICT_LOCAL_BYTES: usize = 1_536;
 const WORKFLOW_VERDICT_REMOTE_FINDINGS: usize = 4;
 const WORKFLOW_VERDICT_LOCAL_FINDINGS: usize = 6;
+/// Reviews may run concurrently across unrelated threads, but the complete set
+/// belongs on the revision-keyed Reviews channel. The live snapshot keeps a
+/// bounded identity projection, prioritizing the active thread at the source.
+pub(crate) const MAX_REVIEW_ACTIVITY_JOBS: usize = 8;
+pub(crate) const MAX_REVIEW_ACTIVITY_REMOTE_JOBS: usize = 4;
+const REVIEW_ACTIVITY_FIELD_BYTES: usize = 256;
+/// Only one workflow may be active globally. Keep the invariant explicit at the
+/// snapshot boundary so corrupt/restored state cannot turn the live projection
+/// into an unbounded collection.
+pub(crate) const MAX_WORKFLOW_ACTIVITY_RUNS: usize = 1;
+/// The source projection is shared by local and remote compaction. It keeps a
+/// bounded superset for LocalWeb; broker compaction applies the smaller cap below.
+pub(crate) const MAX_WORKFLOW_ACTIVITY_LOCKED_THREAD_IDS: usize = 24;
+pub(crate) const MAX_WORKFLOW_ACTIVITY_REMOTE_LOCKED_THREAD_IDS: usize = 8;
 
 const SESSION_SNAPSHOT_REMOTE_SURFACE_BUDGET: SessionSnapshotCompactBudget =
     SessionSnapshotCompactBudget {
@@ -330,7 +416,10 @@ const SESSION_SNAPSHOT_REMOTE_SURFACE_BUDGET: SessionSnapshotCompactBudget =
         drop_operator_only_logs: true,
         emergency_shell_transcript: true,
         max_active_review_jobs: 8,
+        max_review_activity_jobs: MAX_REVIEW_ACTIVITY_REMOTE_JOBS,
         max_active_workflow_runs: 8,
+        max_workflow_activity_runs: MAX_WORKFLOW_ACTIVITY_RUNS,
+        max_workflow_activity_locked_thread_ids: MAX_WORKFLOW_ACTIVITY_REMOTE_LOCKED_THREAD_IDS,
         max_workflow_field_bytes: WORKFLOW_FIELD_REMOTE_BYTES,
         max_workflow_verdict_bytes: WORKFLOW_VERDICT_REMOTE_BYTES,
         max_workflow_verdict_findings: WORKFLOW_VERDICT_REMOTE_FINDINGS,
@@ -364,7 +453,10 @@ const SESSION_SNAPSHOT_LOCAL_WEB_BUDGET: SessionSnapshotCompactBudget =
         // transcript/inline field — not by accumulated review/device metadata.
         emergency_shell_transcript: true,
         max_active_review_jobs: 24,
+        max_review_activity_jobs: MAX_REVIEW_ACTIVITY_JOBS,
         max_active_workflow_runs: 24,
+        max_workflow_activity_runs: MAX_WORKFLOW_ACTIVITY_RUNS,
+        max_workflow_activity_locked_thread_ids: MAX_WORKFLOW_ACTIVITY_LOCKED_THREAD_IDS,
         max_workflow_field_bytes: WORKFLOW_FIELD_LOCAL_BYTES,
         max_workflow_verdict_bytes: WORKFLOW_VERDICT_LOCAL_BYTES,
         max_workflow_verdict_findings: WORKFLOW_VERDICT_LOCAL_FINDINGS,
@@ -488,8 +580,17 @@ struct SessionSnapshotCompactBudget {
     /// Hard cap on `active_review_jobs`. These are high-churn, low-value chips;
     /// without a bound they could displace transcript content from the snapshot.
     max_active_review_jobs: usize,
+    /// Hard cap on the minimal live review projection. Global liveness/blocked
+    /// semantics ride separate scalar summaries; exact background-thread state
+    /// comes from the Reviews and transcript channels.
+    max_review_activity_jobs: usize,
     /// Hard cap on workflow run cards. Non-terminal runs are never dropped.
     max_active_workflow_runs: usize,
+    /// Hard caps for the minimal live workflow projection. The dedicated
+    /// Workflows channel carries the complete lock set; the snapshot needs only
+    /// enough identity to gate its active/viewed thread synchronously.
+    max_workflow_activity_runs: usize,
+    max_workflow_activity_locked_thread_ids: usize,
     /// Hard caps for workflow card strings in the snapshot. Full reviewer
     /// transcripts live on the reviewer thread; the high-frequency snapshot must
     /// stay bounded even if a client submits a huge anchor or a reviewer emits a
@@ -597,6 +698,11 @@ impl SessionSnapshot {
             });
             self.active_review_jobs = kept;
         }
+        compact_review_activity(
+            &mut self.review_activity,
+            budget.max_review_activity_jobs,
+            REVIEW_ACTIVITY_FIELD_BYTES,
+        );
         if self.active_workflow_runs.len() > budget.max_active_workflow_runs {
             let max = budget.max_active_workflow_runs;
             let (non_terminal, terminal): (Vec<_>, Vec<_>) =
@@ -619,6 +725,12 @@ impl SessionSnapshot {
             budget.max_workflow_field_bytes,
             budget.max_workflow_verdict_bytes,
             budget.max_workflow_verdict_findings,
+        );
+        compact_workflow_activity(
+            &mut self.workflow_activity,
+            budget.max_workflow_activity_runs,
+            budget.max_workflow_activity_locked_thread_ids,
+            WORKFLOW_ACTIVITY_FIELD_BYTES,
         );
         if self.reviewer_threads.len() > budget.max_reviewer_threads {
             let active = self.active_thread_id.clone();
@@ -739,6 +851,36 @@ impl SessionSnapshot {
         }
 
         while serialized_len(&self) > budget.target_bytes {
+            // Reclaim data that already has an authoritative dedicated channel
+            // before touching conversation content. These fields are legacy
+            // compatibility shells in newly-produced snapshots, but keeping this
+            // order makes compaction safe for snapshots assembled by older code
+            // and for mixed-version tests:
+            //   Reviews/Workflows (revision-keyed caches) -> Devices -> transcript.
+            if !self.reviewer_threads.is_empty() {
+                self.reviewer_threads.pop();
+                continue;
+            }
+            if !self.active_workflow_runs.is_empty() {
+                self.active_workflow_runs.pop();
+                continue;
+            }
+            if !self.active_review_jobs.is_empty() {
+                self.active_review_jobs.pop();
+                continue;
+            }
+            if !self.device_records.is_empty() {
+                self.device_records.pop();
+                continue;
+            }
+            if !self.paired_devices.is_empty() {
+                self.paired_devices.pop();
+                continue;
+            }
+            if !self.pending_pairing_requests.is_empty() {
+                self.pending_pairing_requests.pop();
+                continue;
+            }
             if self.transcript.len() > budget.min_transcript_entries_before_text_shrink {
                 self.transcript.remove(0);
                 transcript_truncated = true;
@@ -848,36 +990,6 @@ impl SessionSnapshot {
             {
                 continue;
             }
-            // Last resort before shelling real conversation: reclaim the
-            // low-value control-plane collections. This runs AFTER transcript
-            // entry/text reduction so a snapshot whose bulk is the conversation
-            // still keeps these collections (e.g. LocalWeb's reviewer map for
-            // the delete prompt); it only drains them when they are themselves
-            // the over-budget bulk, protecting the transcript from the shell.
-            // Drain from each collection's least-important end (see the cap
-            // comment above): the oldest TERMINAL review job (never a non-terminal
-            // one — the blocked/running alert depends on it), the terminal device
-            // record (tail), and the non-active-parent reviewer (tail — the
-            // up-front cap floats active-parent reviewers to the front). Terminal
-            // workflow cards are held until after transcript shelling because they
-            // have no independent detail channel; dropping them is a true last
-            // resort.
-            if let Some(pos) = self
-                .active_review_jobs
-                .iter()
-                .rposition(|job| review_job_status_is_terminal(&job.status))
-            {
-                self.active_review_jobs.remove(pos);
-                continue;
-            }
-            if !self.device_records.is_empty() {
-                self.device_records.pop();
-                continue;
-            }
-            if !self.reviewer_threads.is_empty() {
-                self.reviewer_threads.pop();
-                continue;
-            }
             self.logs.clear();
             if budget.emergency_shell_transcript {
                 // Bound the one growable string identity field the earlier passes
@@ -927,16 +1039,6 @@ impl SessionSnapshot {
                             truncate_with_ellipsis(url, EMERGENCY_TRANSCRIPT_SHELL_CHARS);
                         }
                     }
-                }
-            }
-            if serialized_len(&self) > budget.target_bytes {
-                if let Some(pos) = self
-                    .active_workflow_runs
-                    .iter()
-                    .rposition(|run| workflow_run_status_is_terminal(&run.status))
-                {
-                    self.active_workflow_runs.remove(pos);
-                    continue;
                 }
             }
             break;
@@ -1076,7 +1178,7 @@ pub(crate) fn truncate_utf8_bytes_with_ellipsis(value: &mut String, max_bytes: u
     true
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct DeviceRecordView {
     pub device_id: String,
     pub label: String,
@@ -1091,7 +1193,7 @@ pub struct DeviceRecordView {
     pub path_scope: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct PairedDeviceView {
     pub device_id: String,
     pub label: String,
@@ -1105,7 +1207,7 @@ pub struct PairedDeviceView {
     pub path_scope: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub struct PendingPairingRequestView {
     pub pairing_id: String,
     pub device_id: String,
@@ -2107,6 +2209,22 @@ pub struct WorkflowRunView {
     pub requested_at: u64,
     pub updated_at: u64,
     pub error: Option<String>,
+}
+
+/// Minimal non-terminal workflow projection that remains in SessionSnapshot.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkflowActivityView {
+    pub id: String,
+    pub parent_thread_id: String,
+    pub status: String,
+    pub locked_thread_ids: Vec<String>,
+}
+
+/// Uncompacted workflow-card payload served on demand.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowsResponse {
+    pub workflows_revision: u64,
+    pub workflow_runs: Vec<WorkflowRunView>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

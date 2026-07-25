@@ -1576,7 +1576,7 @@ export async function fetchRemoteWorkspaceDiff() {
 }
 
 // Cross-agent review actions over the broker. Each ack carries no snapshot, so
-// we follow up with syncRemoteSnapshot to refresh active_review_jobs.
+// we follow up with syncRemoteSnapshot to refresh review_activity/revisions.
 export async function requestRemoteReview({
   reviewerProvider,
   reviewerModel,
@@ -1670,6 +1670,16 @@ export async function startRemoteWorkflow({
 export async function fetchRemoteReviews() {
   const result = await dispatchOrRecover("fetch_reviews", {});
   return result?.reviews || null;
+}
+
+export async function fetchRemoteWorkflows() {
+  const result = await dispatchOrRecover("fetch_workflows", {});
+  return result?.workflows || null;
+}
+
+export async function fetchRemoteDevices() {
+  const result = await dispatchOrRecover("fetch_devices", {});
+  return result?.devices || null;
 }
 
 export async function resolveRemoteReview(reviewJobId) {

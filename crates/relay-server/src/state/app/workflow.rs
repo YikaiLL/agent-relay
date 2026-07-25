@@ -121,6 +121,12 @@ impl Drop for WorkflowRecoveryGuard {
 }
 
 impl AppState {
+    /// Full workflow-card payload for the dedicated Workflows channel.
+    pub async fn workflows(&self, device_id: Option<String>) -> crate::protocol::WorkflowsResponse {
+        let relay = self.relay.read().await;
+        relay.workflows_response(device_id.as_deref())
+    }
+
     pub async fn start_code_workflow(
         &self,
         input: StartWorkflowInput,

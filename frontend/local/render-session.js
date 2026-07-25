@@ -93,6 +93,7 @@ import {
   reviewCardsForViewedThread,
   reusableReviewersFromReviews,
 } from "../shared/reviews-cache.js";
+import { createWorkflowsCache } from "../shared/workflows-cache.js";
 import {
   buildReviewingThreadSet,
   canRequestReview,
@@ -232,14 +233,14 @@ export function createSessionRenderer({
   requestReview,
   startWorkflow,
   setReviewSlice,
+  reviewsCache = createReviewsCache(),
+  workflowsCache = createWorkflowsCache(),
   fetchReviews,
+  fetchWorkflows,
   viewThread,
   enterProjectOverview,
   startProjectAgent,
 }) {
-  // Cached reviewer-panel data from the dedicated (uncompacted) channel, keyed by the
-  // snapshot's `reviews_revision`. See reviews-cache.js / renderReviewSlice.
-  const reviewsCache = createReviewsCache();
   // Notifications navigate locally; looking at a thread never resumes it.
   configureThreadNotifications({
     resolveThreadName: (threadId) => {
@@ -270,7 +271,7 @@ export function createSessionRenderer({
     // The session-details panel describes the active thread, so only surface its
     // OWN review(s) — not reviews running on (or lingering for) other threads.
     const activeThreadId = session?.active_thread_id || null;
-    return (session?.active_review_jobs || [])
+    return (reviewsCache?.current()?.review_jobs || [])
       .filter((job) => job.parent_thread_id === activeThreadId)
       .map((job) => metaChip("Review", reviewStatusLabel(job.status)));
   }
@@ -967,29 +968,30 @@ export function createSessionRenderer({
     // The Reviewer panel belongs to the thread you're looking at: a review (and its
     // lingering terminal error) must only show on its own parent thread, never bleed
     // into every other thread's panel. Scope the DISPLAY to the viewed thread; the
-    // session's global active_review_jobs stays authoritative for navigation/locking.
+    // the snapshot's review_activity stays authoritative for navigation/locking.
     const viewedThreadId = state.viewThreadId || session?.active_thread_id || null;
 
     // Refresh the dedicated (uncompacted) reviews channel only when the snapshot's
     // reviews_revision changes; re-render the slice when fresh data lands. This keeps the
-    // panel populated during live turns, which drain the snapshot's `active_review_jobs`.
+    // panel populated without making cards compete with transcript bytes.
     if (typeof fetchReviews === "function") {
       void reviewsCache.sync(
         session?.reviews_revision,
         () => fetchReviews(),
-        () => renderReviewSlice(state.session || session)
+        () => renderSession(state.session || session)
       );
     }
-    // Cards + reviewer threads come from the cache (the uncompacted channel) once it's
-    // loaded; until then fall back to the snapshot so the first paint isn't empty.
-    const reviewsData = reviewsCache.hasData()
-      ? reviewsCache.current()
-      : {
-          review_jobs: session?.active_review_jobs || [],
-          reviewer_threads: session?.reviewer_threads || [],
-    };
+    if (typeof fetchWorkflows === "function") {
+      void workflowsCache.sync(
+        session?.workflows_revision,
+        () => fetchWorkflows(),
+        () => renderSession(state.session || session)
+      );
+    }
+    const reviewsData = reviewsCache.current();
+    const workflowsData = workflowsCache.current();
     const threadReviewJobs = reviewCardsForViewedThread(reviewsData, viewedThreadId);
-    const threadWorkflowRuns = workflowRunsForThread(session, viewedThreadId);
+    const threadWorkflowRuns = workflowRunsForThread(workflowsData, viewedThreadId);
     const viewingWritableAuthor =
       typeof startWorkflow === "function" &&
       isViewingConversation(session) &&
@@ -1009,17 +1011,11 @@ export function createSessionRenderer({
       // The thread the panel is showing: sent as the review's parent so a review
       // targets the VIEWED thread, not the relay's active thread.
       parentThreadId: viewedThreadId,
-      // Liveness/lock gating still reads the snapshot's `active_review_jobs` (the small
-      // non-terminal set kept for synchronous gating).
       canRequest:
         typeof requestReview === "function" &&
         canRequestReview(session, state.deviceId, viewedThreadId),
       canStartWorkflow: viewingWritableAuthor && canStartWorkflow(session, viewedThreadId),
-      blocked: isReviewBlocked({
-        active_review_jobs: (session?.active_review_jobs || []).filter(
-          (job) => job.parent_thread_id === viewedThreadId
-        ),
-      }) || threadWorkflowRuns.some((run) => run?.status === "blocked"),
+      blocked: isReviewBlocked(session) || isWorkflowBlocked(session),
     });
   }
 
@@ -1060,9 +1056,7 @@ export function createSessionRenderer({
           // Source the reuse list from the dedicated reviews cache (same as the panel) so it
           // survives live-turn compaction; fall back to the snapshot until the cache loads.
           reusableReviewers: reusableReviewersFromReviews(
-            reviewsCache.hasData()
-              ? reviewsCache.current()
-              : { reviewer_threads: session?.reviewer_threads || [] },
+            reviewsCache.current(),
             state.viewThreadId || session?.active_thread_id || null,
             null
           ),
@@ -1518,7 +1512,7 @@ export function createSessionRenderer({
       const activeProjectId = readActiveProjectId(state.threadListStore);
       const activity = buildThreadActivityMap(state.session);
       const attention = threadAttention.snapshotMap();
-      const reviewing = buildReviewingThreadSet(state.session);
+      const reviewing = buildReviewingThreadSet(state.session, reviewsCache.current());
       const rows = (state.projects || []).map((project) => {
         const agents = selectProjectAgents({
           projectId: project.id,
@@ -1613,7 +1607,7 @@ export function createSessionRenderer({
         selectedCwd,
         threadActivity: buildThreadActivityMap(state.session),
         threadAttention: threadAttention.snapshotMap(),
-        threadReviewing: buildReviewingThreadSet(state.session),
+        threadReviewing: buildReviewingThreadSet(state.session, reviewsCache.current()),
       })
     );
 
@@ -1667,7 +1661,7 @@ export function createSessionRenderer({
         pinnedIds: new Set(prefs.pinned),
         threadActivity: buildThreadActivityMap(state.session),
         threadAttention: threadAttention.snapshotMap(),
-        threadReviewing: buildReviewingThreadSet(state.session),
+        threadReviewing: buildReviewingThreadSet(state.session, reviewsCache.current()),
         formatMeta(thread) {
           return formatRelativeTime(thread.updated_at);
         },

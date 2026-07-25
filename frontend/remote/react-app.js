@@ -94,6 +94,7 @@ import { remoteNotificationsHint, shouldAutoSubscribe } from "./notifications-vi
 import {
   fetchTranscriptEntryDetail as fetchRemoteTranscriptEntryDetail,
   fetchRemoteReviews,
+  fetchRemoteWorkflows,
   maybeLoadOlderTranscriptHistory,
   sendHeartbeat,
 } from "./session-ops.js";
@@ -133,6 +134,7 @@ import {
 } from "../shared/review-state.js";
 import {
   canStartWorkflow,
+  isWorkflowBlocked,
   selectWorkflowLaunchModel,
   workflowRunsForThread,
 } from "../shared/workflow-state.js";
@@ -142,6 +144,7 @@ import {
   reviewCardsForViewedThread,
   reusableReviewersFromReviews,
 } from "../shared/reviews-cache.js";
+import { createWorkflowsCache } from "../shared/workflows-cache.js";
 import { createPanelControl } from "../local/panel-controls.js";
 import { setupHeaderBandSync } from "../local/header-band-sync.js";
 import {
@@ -881,18 +884,9 @@ function RemoteApp() {
   // Push the review slice onto the remote workspace-diff store so the Reviewer
   // tab (rail + modal) and the mobile chip badge stay in sync with the session.
   const remoteDeviceId = currentState.remoteAuth?.deviceId;
-  // A review (and its lingering terminal error) belongs to its parent thread, so the
-  // Reviewer panel must only surface jobs for the thread in view — never bleed onto
-  // every other thread. The session's global active_review_jobs stays authoritative
-  // for navigation/locking; only the DISPLAY is scoped here.
   const remoteViewedThreadId = session?.active_thread_id || null;
-  const remoteThreadReviewJobs = (session?.active_review_jobs || []).filter(
-    (job) => job.parent_thread_id === remoteViewedThreadId
-  );
-  const remoteThreadWorkflowRuns = workflowRunsForThread(session, remoteViewedThreadId);
   // Reviewer-panel data over the dedicated (uncompacted) `fetch_reviews` channel, cached and
-  // re-fetched only when the snapshot's `reviews_revision` changes — so the panel survives
-  // live-turn compaction (which drains the snapshot's `active_review_jobs`).
+  // re-fetched only when the snapshot's `reviews_revision` changes.
   const remoteReviewsCacheRef = useRef(null);
   if (!remoteReviewsCacheRef.current) {
     remoteReviewsCacheRef.current = createReviewsCache();
@@ -905,16 +899,25 @@ function RemoteApp() {
       () => setRemoteReviews(remoteReviewsCacheRef.current.current())
     );
   }, [session?.reviews_revision]);
+  const remoteWorkflowsCacheRef = useRef(null);
+  if (!remoteWorkflowsCacheRef.current) {
+    remoteWorkflowsCacheRef.current = createWorkflowsCache();
+  }
+  const [remoteWorkflows, setRemoteWorkflows] = useState(null);
   useEffect(() => {
-    // Cards + reviewer threads come from the cache once loaded; until then fall back to the
-    // snapshot so the first paint isn't empty. Gating still reads the snapshot.
-    const reviewsData = remoteReviews || {
-      review_jobs: session?.active_review_jobs || [],
-      reviewer_threads: session?.reviewer_threads || [],
-    };
-      getRemoteWorkspaceDiffStore().setReview({
-        reviewJobs: reviewCardsForViewedThread(reviewsData, remoteViewedThreadId),
-        workflowRuns: remoteThreadWorkflowRuns,
+    void remoteWorkflowsCacheRef.current.sync(
+      session?.workflows_revision,
+      () => fetchRemoteWorkflows(),
+      () => setRemoteWorkflows(remoteWorkflowsCacheRef.current.current())
+    );
+  }, [session?.workflows_revision]);
+  useEffect(() => {
+    const reviewsData = remoteReviews || { review_jobs: [], reviewer_threads: [] };
+    const workflowsData = remoteWorkflows || { workflow_runs: [] };
+    const remoteThreadWorkflowRuns = workflowRunsForThread(workflowsData, remoteViewedThreadId);
+    getRemoteWorkspaceDiffStore().setReview({
+      reviewJobs: reviewCardsForViewedThread(reviewsData, remoteViewedThreadId),
+      workflowRuns: remoteThreadWorkflowRuns,
       reviewModel: {
         ...selectReviewLaunchModel({
           providers: remoteUi.providers,
@@ -947,12 +950,12 @@ function RemoteApp() {
       canRequest: canRequestReview(session, remoteDeviceId, remoteViewedThreadId),
       canStartWorkflow: hasControllerLease && canStartWorkflow(session, remoteViewedThreadId),
       blocked:
-        isReviewBlocked({ active_review_jobs: remoteThreadReviewJobs }) ||
-        remoteThreadWorkflowRuns.some((run) => run?.status === "blocked"),
+        isReviewBlocked(session) || isWorkflowBlocked(session),
     });
   }, [
     session,
     remoteReviews,
+    remoteWorkflows,
     remoteUi.providers,
     remoteUi.providerModels,
     remoteUi.providerModelsStatus,
@@ -1633,7 +1636,7 @@ function RemoteApp() {
             // cache (same as the panel) so it survives live-turn compaction; fall back to the
             // snapshot until the cache loads.
             reusableReviewers: reusableReviewersFromReviews(
-              remoteReviews || { reviewer_threads: session?.reviewer_threads || [] },
+              remoteReviews || { reviewer_threads: [] },
               remoteViewedThreadId,
               null
             ),
@@ -2025,7 +2028,7 @@ function RemoteSidebar({
           onToggleGroup,
           threadActivity: buildThreadActivityMap(session),
           threadAttention: threadAttention.snapshotMap(),
-          threadReviewing: buildReviewingThreadSet(session),
+          threadReviewing: buildReviewingThreadSet(session, remoteReviews),
         })
       )
     ),

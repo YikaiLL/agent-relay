@@ -445,6 +445,30 @@ test("a review pin refreshes when the review advances and is quiet while loading
   );
 });
 
+test("a review pin outside the bounded snapshot projection stays pinned via Reviews cache", () => {
+  const session = realSession({
+    review_activity_total: 12,
+    review_activity: [
+      {
+        id: "inside-cap",
+        status: "waiting_for_reviewer",
+        parent_thread_id: "B",
+      },
+    ],
+  });
+  const signature = () => "waiting_for_reviewer:1";
+
+  assert.deepEqual(
+    viewOnlyPinNextAction(
+      session,
+      pinFor("A", { review: true, reviewSig: "waiting_for_reviewer:1" }),
+      { viewThreadId: "A", reviewSignature: signature }
+    ),
+    { kind: "none" },
+    "the complete Reviews cache prevents a cap-excluded review pin from refresh-looping"
+  );
+});
+
 test("no pin or no session → nothing to do", () => {
   assert.deepEqual(viewOnlyPinNextAction(realSession(), null, { viewThreadId: "A" }), {
     kind: "none",

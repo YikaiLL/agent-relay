@@ -15,7 +15,10 @@
 // applies projectViewOnlySession() to the rendered session only — state.session
 // always stays the REAL session so heartbeat/lease/controller logic is untouched.
 
-import { isReviewInProgressForThread } from "../shared/review-state.js";
+import {
+  isReviewInProgress,
+  isReviewInProgressForThread,
+} from "../shared/review-state.js";
 import { isWorkingThreadStatus } from "../shared/thread-status.js";
 
 // Any non-active thread can be viewed read-only. (The active thread is live —
@@ -343,13 +346,26 @@ export function viewOnlyPinNextAction(session, pin, { viewThreadId, reviewSignat
     return { kind: "release" };
   }
   if (pin.review) {
-    if (!isReviewInProgressForThread(session, pin.threadId)) {
+    const signature =
+      typeof reviewSignature === "function"
+        ? reviewSignature(session, pin.threadId)
+        : null;
+    const dedicatedReviewKnown = signature != null;
+    const dedicatedReviewActive = dedicatedReviewKnown && signature !== "none";
+    const reviewStillActive =
+      isReviewInProgress(session)
+      && (
+        isReviewInProgressForThread(session, pin.threadId)
+        || dedicatedReviewActive
+        || (!dedicatedReviewKnown && pin.review)
+      );
+    if (!reviewStillActive) {
       return viewThreadId === pin.threadId ? { kind: "refresh" } : { kind: "release" };
     }
     if (
       !pin.loading &&
-      typeof reviewSignature === "function" &&
-      pin.reviewSig !== reviewSignature(session, pin.threadId)
+      dedicatedReviewActive &&
+      pin.reviewSig !== signature
     ) {
       return { kind: "refresh" };
     }

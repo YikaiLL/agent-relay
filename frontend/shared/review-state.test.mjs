@@ -5,8 +5,78 @@ import {
   REVIEW_BLOCKED_BADGE,
   REVIEW_IN_PROGRESS_BADGE,
   buildReviewingThreadSet,
+  canRequestReview,
+  isReviewBlocked,
+  isReviewInProgress,
+  isReviewInProgressForThread,
+  isThreadReviewLocked,
   reviewStatusBadge,
 } from "./review-state.js";
+
+test("review activity projection is authoritative over the legacy full-card field", () => {
+  const session = {
+    review_activity: [{ id: "live", status: "blocked", parent_thread_id: "t1" }],
+    active_review_jobs: [{ id: "legacy", status: "complete", parent_thread_id: "t1" }],
+  };
+  assert.equal(isReviewInProgress(session), true);
+  assert.equal(isReviewBlocked(session), true);
+  assert.equal(isReviewInProgressForThread(session, "t1"), true);
+});
+
+test("a capped review projection uses global summaries and the viewed thread's exact lock bit", () => {
+  const session = {
+    active_thread_id: "parent-outside-cap",
+    current_status: "idle",
+    review_activity_total: 64,
+    review_blocked: true,
+    review_locked: true,
+    review_activity: [
+      {
+        id: "inside-cap",
+        status: "waiting_for_reviewer",
+        parent_thread_id: "other-parent",
+        reviewer_thread_id: "other-reviewer",
+      },
+    ],
+    workflow_activity: [],
+    pending_approvals: [],
+  };
+
+  assert.equal(isReviewInProgress(session), true);
+  assert.equal(isReviewBlocked(session), true);
+  assert.equal(isReviewInProgressForThread(session, "parent-outside-cap"), true);
+  assert.equal(isThreadReviewLocked(session, "parent-outside-cap"), true);
+  assert.equal(canRequestReview(session, "device-1", "parent-outside-cap"), false);
+  assert.equal(
+    canRequestReview(
+      { ...session, active_thread_id: "unrelated", review_locked: false },
+      "device-1",
+      "unrelated"
+    ),
+    true,
+    "concurrent reviews on other threads must not globally disable the review CTA"
+  );
+});
+
+test("the dedicated reviews payload supplies the complete reviewing-thread set", () => {
+  const set = buildReviewingThreadSet(
+    {
+      review_activity_total: 64,
+      review_activity: [
+        { parent_thread_id: "inside-cap", status: "waiting_for_reviewer" },
+      ],
+    },
+    {
+      review_jobs: [
+        { parent_thread_id: "inside-cap", status: "waiting_for_reviewer" },
+        { parent_thread_id: "outside-cap", status: "blocked" },
+      ],
+    }
+  );
+
+  assert.ok(set.has("inside-cap"));
+  assert.ok(set.has("outside-cap"));
+});
 
 // reviewStatusBadge is the single source of truth for the header "under review" badge
 // shared by the local and remote surfaces, so its precedence/scoping must be pinned.

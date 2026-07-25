@@ -10,6 +10,45 @@ import {
   isTerminalWorkflowStatus,
   workflowStatusLabel,
 } from "./workflow-state.js";
+
+test("workflow activity projection drives locking without full workflow cards", () => {
+  const session = {
+    active_thread_id: "parent-1",
+    workflow_activity: [
+      {
+        id: "run-activity",
+        status: "running",
+        parent_thread_id: "parent-1",
+        locked_thread_ids: ["parent-1", "reviewer-1"],
+      },
+    ],
+    active_workflow_runs: [],
+  };
+  assert.equal(isWorkflowInProgressForThread(session, "parent-1"), true);
+  assert.equal(isWorkflowInProgressForThread(session, "reviewer-1"), true);
+});
+
+test("a capped workflow activity list defers to the viewed thread's exact lock bit", () => {
+  const session = {
+    active_thread_id: "same-cwd-outside-cap",
+    workflow_locked: true,
+    workflow_activity: [
+      {
+        id: "run-activity",
+        status: "running",
+        parent_thread_id: "parent-1",
+        locked_thread_ids: ["parent-1", "same-cwd-inside-cap"],
+      },
+    ],
+  };
+
+  assert.equal(
+    isWorkflowInProgressForThread(session, "same-cwd-outside-cap"),
+    true,
+    "thread_state.workflow_locked remains authoritative when its id is outside the bounded list"
+  );
+});
+
 import { canRequestReview } from "./review-state.js";
 import { WorkflowRunCard, workflowSubmitPayload } from "./workflow-panel.js";
 

@@ -101,7 +101,9 @@ import {
   createAuthSession,
   deleteAuthSession,
   fetchAuthSession,
+  getDevices,
   getReviews,
+  getWorkflows,
 } from "./local/api.js";
 import {
   createWorkspaceDiffStore,
@@ -143,6 +145,9 @@ import {
   readThreadListViewMode,
 } from "./shared/thread-list-store.js";
 import { createProjectsStore } from "./shared/projects-store.js";
+import { createDevicesCache } from "./shared/devices-cache.js";
+import { createReviewsCache } from "./shared/reviews-cache.js";
+import { createWorkflowsCache } from "./shared/workflows-cache.js";
 import {
   fetchProjectsPayload,
   createProject,
@@ -169,7 +174,10 @@ import {
   resolveForkSourceThread,
   threadIsBusyForFork,
 } from "./shared/fork-fields.js";
-import { isReviewInProgressForThread } from "./shared/review-state.js";
+import {
+  isReviewInProgressForThread,
+  isTerminalReviewStatus,
+} from "./shared/review-state.js";
 import { isWorkflowInProgressForThread } from "./shared/workflow-state.js";
 import {
   buildViewOnlyPin,
@@ -311,6 +319,10 @@ const apiFetch = createApiFetch({
     handleUnauthorized(message);
   },
 });
+
+const devicesCache = createDevicesCache();
+const reviewsCache = createReviewsCache();
+const workflowsCache = createWorkflowsCache();
 
 const viewedThreadId = () => state.viewThreadId || state.session?.active_thread_id || null;
 const workspaceDiffStore = createWorkspaceDiffStore({
@@ -476,6 +488,13 @@ window.addEventListener("agent-relay:session-updated", () => {
   // Fetch the dedicated Projects payload when the snapshot's revision changes (a
   // no-op otherwise; unconditional on the first observation).
   projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  void devicesCache.sync(
+    state.session?.devices_revision,
+    () => getDevices(apiFetch),
+    () => {
+      if (state.session) renderer.renderSession(state.session);
+    }
+  );
 });
 function refreshWorkspaceDiffIfChanged() {
   const session = state.session;
@@ -660,13 +679,17 @@ const renderer = createSessionRenderer({
   setReviewSlice(slice) {
     workspaceDiffStore.setReview(slice);
   },
-  // The reviewer panel's dedicated, UNCOMPACTED data channel (review cards + reviewer
-  // threads + revision). Decoupled from the byte-budgeted snapshot so the panel survives
-  // live-turn compaction (which drains `active_review_jobs`).
+  reviewsCache,
+  workflowsCache,
+  // Dedicated, uncompacted reviewer data. The snapshot carries only its revision
+  // plus the minimal non-terminal gating projection.
   fetchReviews() {
     // Local is the operator surface (full access): the endpoint resolves reviews with no
     // device scope, so don't append a (dead) ?device_id query.
     return getReviews(apiFetch);
+  },
+  fetchWorkflows() {
+    return getWorkflows(apiFetch);
   },
   // View-only navigation: just update the URL/viewThreadId without calling the
   // backend resume_session, which is mutating (it moves the relay's single
@@ -710,6 +733,9 @@ const renderer = createSessionRenderer({
 // through the wrapper.
 const _baseRenderSession = renderer.renderSession;
 renderer.renderSession = function wrappedRenderSession(session) {
+  if (devicesCache.hasData()) {
+    session = { ...session, ...devicesCache.current() };
+  }
   const previousLiveSession = state.session;
   const viewedThreadWasLive = Boolean(
     state.viewThreadId
@@ -750,8 +776,13 @@ renderer.renderSession = function wrappedRenderSession(session) {
 // re-fetches when the review advances (a new round, a posted-back result) and is
 // released when it ends.
 function viewOnlyReviewSignature(session, threadId) {
-  const job = (session?.active_review_jobs || []).find(
-    (entry) => entry.parent_thread_id === threadId
+  if (!reviewsCache.hasData()) {
+    return null;
+  }
+  const job = (reviewsCache.current()?.review_jobs || []).find(
+    (entry) =>
+      entry.parent_thread_id === threadId
+      && !isTerminalReviewStatus(entry.status)
   );
   return job ? `${job.status}:${job.round ?? 0}:${job.updated_at ?? 0}` : "none";
 }
@@ -828,6 +859,7 @@ async function loadViewOnlyTranscript(threadId) {
       );
     }
     const refreshed = mergeRefreshedViewOnlyPage(prior, normalized);
+    const exactReview = Boolean(normalized.thread_state?.review_locked ?? review);
     state.viewOnlyThread = buildViewOnlyPin({
       threadId,
       page: {
@@ -836,9 +868,9 @@ async function loadViewOnlyTranscript(threadId) {
         prev_cursor: refreshed.olderCursor,
       },
       generation,
-      review,
+      review: exactReview,
       workflowLocked: Boolean(normalized.thread_state?.workflow_locked ?? workflowLocked),
-      reviewSig,
+      reviewSig: exactReview ? viewOnlyReviewSignature(session, threadId) : reviewSig,
       cwd: normalized.thread_state?.current_cwd ?? cwd,
       provider: normalized.thread_state?.provider ?? provider,
       status,
@@ -2612,6 +2644,20 @@ function closeThreadContextMenu({ rerender = true } = {}) {
   }
 }
 
+async function reviewerThreadsForDestructiveAction() {
+  if (reviewsCache.hasData()) {
+    return reviewsCache.current().reviewer_threads || [];
+  }
+  try {
+    const reviews = await getReviews(apiFetch);
+    return reviews?.reviewer_threads || [];
+  } catch (_error) {
+    // The backend still performs the authoritative reviewer cleanup. If this
+    // read fails, continue without a client-side count prompt.
+    return [];
+  }
+}
+
 async function archiveThreadFromContextMenu() {
   const threadId = readThreadListContextMenu(state.threadListStore).threadId;
   closeThreadContextMenu();
@@ -2631,7 +2677,7 @@ async function archiveThreadFromContextMenu() {
   // delete vs keep-as-normal — same prompt as permanent delete. Default (OK) deletes
   // them; Cancel keeps them as normal threads.
   const reviewerCount = countReviewerThreadsForParent(
-    state.session?.reviewer_threads,
+    await reviewerThreadsForDestructiveAction(),
     threadId
   );
   let deleteReviewers;
@@ -2689,7 +2735,7 @@ async function deleteThreadFromContextMenu() {
   // If this thread is the parent of hidden reviewer thread(s), ask what to do with
   // them. Default (OK) deletes them too; Cancel keeps them as normal threads.
   const reviewerCount = countReviewerThreadsForParent(
-    state.session?.reviewer_threads,
+    await reviewerThreadsForDestructiveAction(),
     threadId
   );
   let deleteReviewers;

@@ -7905,9 +7905,9 @@ mod review_tests {
             wait_for_workflow_status(&app, &receipt.workflow_run_id, WORKFLOW_TERMINAL).await;
         assert_eq!(status, "done");
 
-        let snapshot = app.snapshot().await;
-        let view = snapshot
-            .active_workflow_runs
+        let workflows = app.workflows(None).await;
+        let view = workflows
+            .workflow_runs
             .iter()
             .find(|run| run.id == receipt.workflow_run_id)
             .expect("workflow run should be in snapshot");
@@ -8259,9 +8259,9 @@ settings update: {error}"
         let status = wait_for_workflow_status(&app, &run_id, WORKFLOW_TERMINAL).await;
         assert_eq!(status, "escalated");
 
-        let snapshot = app.snapshot().await;
-        let view = snapshot
-            .active_workflow_runs
+        let workflows = app.workflows(None).await;
+        let view = workflows
+            .workflow_runs
             .iter()
             .find(|run| run.id == run_id)
             .expect("workflow card should remain visible");
@@ -11085,12 +11085,16 @@ turn) must allow a review: {error:?}"
             "a long-finished terminal review must remain visible until deleted"
         );
         assert!(
-            app.snapshot()
+            app.reviews(None)
                 .await
-                .active_review_jobs
+                .review_jobs
                 .iter()
                 .any(|job| job.id == receipt.review_job_id),
-            "the snapshot must keep surfacing the terminal review job"
+            "the dedicated Reviews channel must keep surfacing the terminal review job"
+        );
+        assert!(
+            app.snapshot().await.review_activity.is_empty(),
+            "terminal reviews do not belong in the snapshot's gating projection"
         );
     }
 

@@ -167,14 +167,32 @@ export async function deleteReview(apiFetch, reviewId, deviceId) {
   return payload.data;
 }
 
-// List active (and recently finished) review jobs. The same data also rides the
-// session snapshot as `active_review_jobs`; this endpoint is a direct poll.
+// List active (and recently finished) review jobs from the dedicated Reviews channel.
 export async function getReviews(apiFetch, deviceId) {
   const suffix = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "";
   const response = await apiFetch(`/api/session/reviews${suffix}`, { method: "GET" });
   const payload = await response.json();
   if (!response.ok || !payload?.ok) {
     throw new Error(payload?.error?.message || "Failed to load reviews");
+  }
+  return payload.data;
+}
+
+export async function getWorkflows(apiFetch, deviceId) {
+  const suffix = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "";
+  const response = await apiFetch(`/api/session/workflows${suffix}`, { method: "GET" });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to load workflows");
+  }
+  return payload.data;
+}
+
+export async function getDevices(apiFetch) {
+  const response = await apiFetch("/api/devices", { method: "GET" });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to load devices");
   }
   return payload.data;
 }

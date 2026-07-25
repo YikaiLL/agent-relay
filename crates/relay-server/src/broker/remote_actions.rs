@@ -8,13 +8,14 @@ use tracing::{info, warn};
 use crate::{
     protocol::{
         ApplyFileChangeInput, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
-        AskUserQuestionDetailResponse, ForkSessionInput, HeartbeatInput, ModelOptionView,
-        ProjectActionInput, ProjectsResponse, ReadThreadEntriesInput, ReadThreadEntryDetailInput,
-        ReadThreadTranscriptInput, RequestReviewInput, ResumeSessionInput, ReviewsResponse,
-        SendMessageInput, SessionSnapshot, StartSessionInput, StartWorkflowInput, StopTurnInput,
-        SubmitAskUserAnswerInput, TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse,
-        ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput,
-        WorkflowActionInput, WorkspaceDiffResponse,
+        AskUserQuestionDetailResponse, DevicesResponse, ForkSessionInput, HeartbeatInput,
+        ModelOptionView, ProjectActionInput, ProjectsResponse, ReadThreadEntriesInput,
+        ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RequestReviewInput,
+        ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot, StartSessionInput,
+        StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
+        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse, ThreadsQuery,
+        ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput, WorkflowsResponse,
+        WorkspaceDiffResponse,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
@@ -113,6 +114,14 @@ pub(super) enum RemoteActionRequest {
         #[serde(default)]
         device_id: Option<String>,
     },
+    FetchWorkflows {
+        #[serde(default)]
+        device_id: Option<String>,
+    },
+    FetchDevices {
+        #[serde(default)]
+        device_id: Option<String>,
+    },
     /// Manual Projects read (list + membership). Not session-scoped; mirrors
     /// FetchReviews. `device_id` is stamped for path-scope/logging only.
     FetchProjects {
@@ -185,6 +194,8 @@ impl RemoteActionRequest {
             Self::ProjectAction { .. } => RemoteActionKind::ProjectAction,
             Self::FetchWorkspaceDiff { .. } => RemoteActionKind::FetchWorkspaceDiff,
             Self::FetchReviews { .. } => RemoteActionKind::FetchReviews,
+            Self::FetchWorkflows { .. } => RemoteActionKind::FetchWorkflows,
+            Self::FetchDevices { .. } => RemoteActionKind::FetchDevices,
             Self::FetchProjects { .. } => RemoteActionKind::FetchProjects,
             Self::FetchAskUserQuestionDetail { .. } => RemoteActionKind::FetchAskUserQuestionDetail,
             Self::SubmitAskUserAnswer { .. } => RemoteActionKind::SubmitAskUserAnswer,
@@ -281,6 +292,12 @@ impl RemoteActionRequest {
             Self::FetchReviews { .. } => Self::FetchReviews {
                 device_id: Some(device_id),
             },
+            Self::FetchWorkflows { .. } => Self::FetchWorkflows {
+                device_id: Some(device_id),
+            },
+            Self::FetchDevices { .. } => Self::FetchDevices {
+                device_id: Some(device_id),
+            },
             Self::FetchProjects { .. } => Self::FetchProjects {
                 device_id: Some(device_id),
             },
@@ -355,6 +372,8 @@ pub(super) enum RemoteActionKind {
     ProjectAction,
     FetchWorkspaceDiff,
     FetchReviews,
+    FetchWorkflows,
+    FetchDevices,
     FetchProjects,
     FetchAskUserQuestionDetail,
     SubmitAskUserAnswer,
@@ -391,6 +410,8 @@ impl RemoteActionKind {
             Self::ProjectAction => "project_action",
             Self::FetchWorkspaceDiff => "fetch_workspace_diff",
             Self::FetchReviews => "fetch_reviews",
+            Self::FetchWorkflows => "fetch_workflows",
+            Self::FetchDevices => "fetch_devices",
             Self::FetchProjects => "fetch_projects",
             Self::FetchAskUserQuestionDetail => "fetch_ask_user_question_detail",
             Self::SubmitAskUserAnswer => "submit_ask_user_answer",
@@ -425,6 +446,10 @@ struct RemoteActionResultPlaintext {
     #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<ReviewsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    workflows: Option<WorkflowsResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devices: Option<DevicesResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     projects: Option<ProjectsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ask_user_question_detail: Option<AskUserQuestionDetailResponse>,
@@ -436,7 +461,7 @@ struct RemoteActionResultPlaintext {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum RemoteActionResultKind {
     RemoteActionAck,
@@ -466,6 +491,8 @@ struct RemoteActionResultSizeBreakdown {
     thread_transcript_bytes: usize,
     workspace_diff_bytes: usize,
     reviews_bytes: usize,
+    workflows_bytes: usize,
+    devices_bytes: usize,
     projects_bytes: usize,
     ask_user_question_detail_bytes: usize,
     session_claim_bytes: usize,
@@ -486,6 +513,8 @@ pub(super) struct RemoteActionOutcome {
     pub(super) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(super) workspace_diff: Option<WorkspaceDiffResponse>,
     pub(super) reviews: Option<ReviewsResponse>,
+    pub(super) workflows: Option<WorkflowsResponse>,
+    pub(super) devices: Option<DevicesResponse>,
     pub(super) projects: Option<ProjectsResponse>,
     pub(super) ask_user_question_detail: Option<AskUserQuestionDetailResponse>,
     pub(super) session_claim: Option<String>,
@@ -1207,6 +1236,14 @@ async fn execute_remote_action(
             reviews: Some(state.reviews(device_id).await),
             ..RemoteActionOutcome::default()
         }),
+        RemoteActionRequest::FetchWorkflows { device_id } => Ok(RemoteActionOutcome {
+            workflows: Some(state.workflows(device_id).await),
+            ..RemoteActionOutcome::default()
+        }),
+        RemoteActionRequest::FetchDevices { device_id: _ } => Ok(RemoteActionOutcome {
+            devices: Some(state.devices().await),
+            ..RemoteActionOutcome::default()
+        }),
         RemoteActionRequest::FetchProjects { device_id: _ } => Ok(RemoteActionOutcome {
             // The dedicated Projects payload (list + membership + revision). Read-only;
             // Projects are global (not device-scoped) and not gated on a session claim.
@@ -1271,6 +1308,8 @@ fn remote_action_emits_info_log(action: RemoteActionKind) -> bool {
             | RemoteActionKind::FetchThreadTranscript
             | RemoteActionKind::FetchWorkspaceDiff
             | RemoteActionKind::FetchReviews
+            | RemoteActionKind::FetchWorkflows
+            | RemoteActionKind::FetchDevices
             | RemoteActionKind::FetchProjects
             | RemoteActionKind::FetchAskUserQuestionDetail
     )
@@ -1567,6 +1606,8 @@ async fn publish_plain_remote_action_result(
         thread_transcript,
         workspace_diff,
         reviews,
+        workflows,
+        devices,
         projects,
         ask_user_question_detail,
         session_claim,
@@ -1589,6 +1630,8 @@ async fn publish_plain_remote_action_result(
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
         reviews.as_ref(),
+        workflows.as_ref(),
+        devices.as_ref(),
         projects.as_ref(),
         ask_user_question_detail.as_ref(),
         session_claim.as_ref(),
@@ -1613,6 +1656,8 @@ async fn publish_plain_remote_action_result(
         thread_transcript,
         workspace_diff,
         reviews,
+        workflows,
+        devices,
         projects,
         ask_user_question_detail,
         session_claim,
@@ -1750,6 +1795,8 @@ fn build_plain_remote_action_result_payload(
                 thread_transcript: result.thread_transcript.clone(),
                 workspace_diff: result.workspace_diff.clone(),
                 reviews: result.reviews.clone(),
+                workflows: result.workflows.clone(),
+                devices: result.devices.clone(),
                 projects: result.projects.clone(),
                 ask_user_question_detail: result.ask_user_question_detail.clone(),
                 error: result.error.clone(),
@@ -1782,6 +1829,8 @@ async fn replay_plain_remote_action_result(
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
             reviews: cached.reviews,
+            workflows: cached.workflows,
+            devices: cached.devices,
             projects: cached.projects,
             ask_user_question_detail: cached.ask_user_question_detail,
             session_claim: cached.session_claim,
@@ -1848,6 +1897,8 @@ async fn publish_remote_action_result_private(
         thread_transcript,
         workspace_diff,
         reviews,
+        workflows,
+        devices,
         projects,
         ask_user_question_detail,
         session_claim,
@@ -1874,6 +1925,8 @@ async fn publish_remote_action_result_private(
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
         reviews.as_ref(),
+        workflows.as_ref(),
+        devices.as_ref(),
         projects.as_ref(),
         ask_user_question_detail.as_ref(),
         session_claim.as_ref(),
@@ -1898,6 +1951,8 @@ async fn publish_remote_action_result_private(
         thread_transcript,
         workspace_diff,
         reviews,
+        workflows,
+        devices,
         projects,
         ask_user_question_detail,
         session_claim,
@@ -1979,6 +2034,8 @@ async fn replay_encrypted_remote_action_result(
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
             reviews: cached.reviews,
+            workflows: cached.workflows,
+            devices: cached.devices,
             projects: cached.projects,
             ask_user_question_detail: cached.ask_user_question_detail,
             session_claim: cached.session_claim,
@@ -2172,6 +2229,8 @@ fn cached_remote_action_result(
         thread_transcript: outcome.thread_transcript,
         workspace_diff: outcome.workspace_diff,
         reviews: outcome.reviews,
+        workflows: outcome.workflows,
+        devices: outcome.devices,
         projects: outcome.projects,
         ask_user_question_detail: outcome.ask_user_question_detail,
         session_claim: outcome.session_claim,
@@ -2197,6 +2256,8 @@ fn measure_remote_action_result_sizes(
     thread_transcript: Option<&ThreadTranscriptResponse>,
     workspace_diff: Option<&WorkspaceDiffResponse>,
     reviews: Option<&ReviewsResponse>,
+    workflows: Option<&WorkflowsResponse>,
+    devices: Option<&DevicesResponse>,
     projects: Option<&ProjectsResponse>,
     ask_user_question_detail: Option<&AskUserQuestionDetailResponse>,
     session_claim: Option<&String>,
@@ -2220,6 +2281,8 @@ fn measure_remote_action_result_sizes(
         thread_transcript,
         workspace_diff,
         reviews,
+        workflows,
+        devices,
         projects,
         ask_user_question_detail,
         session_claim,
@@ -2238,6 +2301,8 @@ fn measure_remote_action_result_sizes(
         thread_transcript_bytes: maybe_serialized_json_bytes(thread_transcript),
         workspace_diff_bytes: maybe_serialized_json_bytes(workspace_diff),
         reviews_bytes: maybe_serialized_json_bytes(reviews),
+        workflows_bytes: maybe_serialized_json_bytes(workflows),
+        devices_bytes: maybe_serialized_json_bytes(devices),
         projects_bytes: maybe_serialized_json_bytes(projects),
         ask_user_question_detail_bytes: maybe_serialized_json_bytes(ask_user_question_detail),
         session_claim_bytes: session_claim
@@ -2278,6 +2343,8 @@ fn log_remote_action_result_sizes(
         thread_transcript_bytes = breakdown.thread_transcript_bytes,
         workspace_diff_bytes = breakdown.workspace_diff_bytes,
         reviews_bytes = breakdown.reviews_bytes,
+        workflows_bytes = breakdown.workflows_bytes,
+        devices_bytes = breakdown.devices_bytes,
         projects_bytes = breakdown.projects_bytes,
         ask_user_question_detail_bytes = breakdown.ask_user_question_detail_bytes,
         session_claim_bytes = breakdown.session_claim_bytes,
@@ -2352,6 +2419,10 @@ struct RemoteActionResultPlaintextRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<&'a ReviewsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    workflows: Option<&'a WorkflowsResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devices: Option<&'a DevicesResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     projects: Option<&'a ProjectsResponse>,
     ask_user_question_detail: Option<&'a AskUserQuestionDetailResponse>,
     session_claim: Option<&'a String>,
@@ -2388,6 +2459,8 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         | RemoteActionKind::FetchThreadTranscript
         | RemoteActionKind::FetchWorkspaceDiff
         | RemoteActionKind::FetchReviews
+        | RemoteActionKind::FetchWorkflows
+        | RemoteActionKind::FetchDevices
         | RemoteActionKind::FetchProjects
         | RemoteActionKind::FetchAskUserQuestionDetail => {
             RemoteActionResultKind::RemoteTranscriptResult

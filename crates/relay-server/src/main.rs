@@ -37,16 +37,16 @@ use protocol::{
     AllowedRootsInput, AllowedRootsReceipt, ApiEnvelope, ApiError, ApplyFileChangeInput,
     ApplyFileChangeReceipt, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
     AuthSessionInput, AuthSessionView, BulkRevokeDevicesReceipt, DeleteThreadInput,
-    ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView, PairingDecisionInput,
-    PairingDecisionReceipt, PairingStartInput, PairingTicketView, ProjectActionInput,
-    ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput, ReadThreadTranscriptInput,
-    RequestReviewInput, RequestReviewReceipt, ResumeSessionInput, ReviewActionInput,
-    ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-    SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput, StartWorkflowReceipt,
-    StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt,
-    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadTranscriptResponse, ThreadsQuery,
-    ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput, WorkflowActionReceipt,
-    WorkspaceDiffResponse,
+    DevicesResponse, ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView,
+    PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
+    ProjectActionInput, ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput,
+    ReadThreadTranscriptInput, RequestReviewInput, RequestReviewReceipt, ResumeSessionInput,
+    ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput,
+    SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput,
+    StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
+    ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadTranscriptResponse,
+    ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
+    WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -204,6 +204,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         )
         .route("/api/allowed-roots", post(update_allowed_roots))
         .route("/api/projects", get(fetch_projects).post(project_action))
+        .route("/api/devices", get(list_devices))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
             "/api/threads/:thread_id/delete",
@@ -226,6 +227,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/session/review/resolve", post(resolve_review))
         .route("/api/session/workflow/resolve", post(resolve_workflow))
         .route("/api/session/reviews", get(list_reviews))
+        .route("/api/session/workflows", get(list_workflows))
         .route(
             "/api/session/reviews/:review_id/delete",
             post(delete_review),
@@ -911,6 +913,24 @@ async fn list_reviews(
     // so the panel survives live-turn compaction (which drains `active_review_jobs`).
     // `None`: this is the local operator surface (full access), mirroring `workspace_diff`.
     Ok(Json(ApiEnvelope::ok(context.app.reviews(None).await)))
+}
+
+async fn list_workflows(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<WorkflowsResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.workflows(None).await)))
+}
+
+async fn list_devices(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<DevicesResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.devices().await)))
 }
 
 async fn delete_review(

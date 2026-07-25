@@ -172,6 +172,8 @@ pub(crate) struct CachedRemoteActionResult {
     pub(crate) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(crate) workspace_diff: Option<crate::protocol::WorkspaceDiffResponse>,
     pub(crate) reviews: Option<crate::protocol::ReviewsResponse>,
+    pub(crate) workflows: Option<crate::protocol::WorkflowsResponse>,
+    pub(crate) devices: Option<crate::protocol::DevicesResponse>,
     pub(crate) projects: Option<crate::protocol::ProjectsResponse>,
     pub(crate) ask_user_question_detail: Option<crate::protocol::AskUserQuestionDetailResponse>,
     pub(crate) session_claim: Option<String>,
@@ -1612,6 +1614,56 @@ impl RelayState {
         }
     }
 
+    /// Minimal, non-terminal review state that must arrive synchronously with a
+    /// session frame for locking and navigation decisions. Full cards and
+    /// reviewer identities are fetched from `reviews_response()`.
+    pub(crate) fn review_activity_view(&self) -> Vec<crate::protocol::ReviewActivityView> {
+        let active_thread_id = self.active_thread_id.as_deref();
+        let mut jobs = self
+            .review_jobs
+            .values()
+            .filter(|job| !job.status.is_terminal())
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            let involves_active = |job: &ReviewJob| {
+                active_thread_id.is_some_and(|active| {
+                    job.parent_thread_id == active
+                        || job.reviewer_thread_id.as_deref() == Some(active)
+                })
+            };
+            involves_active(right)
+                .cmp(&involves_active(left))
+                .then_with(|| {
+                    (right.status.as_str() == "blocked").cmp(&(left.status.as_str() == "blocked"))
+                })
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        jobs.truncate(crate::protocol::MAX_REVIEW_ACTIVITY_JOBS);
+        jobs.into_iter()
+            .map(|job| crate::protocol::ReviewActivityView {
+                id: job.id.clone(),
+                parent_thread_id: job.parent_thread_id.clone(),
+                reviewer_thread_id: job.reviewer_thread_id.clone(),
+                status: job.status.as_str().to_string(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn review_activity_summary(&self) -> (usize, bool) {
+        let mut total = 0;
+        let mut blocked = false;
+        for job in self
+            .review_jobs
+            .values()
+            .filter(|job| !job.status.is_terminal())
+        {
+            total += 1;
+            blocked |= job.status.as_str() == "blocked";
+        }
+        (total, blocked)
+    }
+
     /// Compact views of retained workflow runs for the snapshot. Workflow runs
     /// are serialized one at a time in phase 1 but terminal runs remain visible
     /// briefly, mirroring review cards.
@@ -1657,6 +1709,57 @@ impl RelayState {
         acc
     }
 
+    /// Minimal, non-terminal workflow state retained in SessionSnapshot.
+    pub(crate) fn workflow_activity_view(&self) -> Vec<crate::protocol::WorkflowActivityView> {
+        let mut runs = self
+            .workflow_jobs
+            .values()
+            .filter(|run| !run.status.is_terminal())
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        runs.truncate(crate::protocol::MAX_WORKFLOW_ACTIVITY_RUNS);
+        runs.into_iter()
+            .map(|run| crate::protocol::WorkflowActivityView {
+                id: run.id.clone(),
+                parent_thread_id: run.parent_thread_id.clone(),
+                status: run.status.as_str().to_string(),
+                locked_thread_ids: self.workflow_activity_locked_thread_ids(run),
+            })
+            .collect()
+    }
+
+    /// Full workflow cards, served outside the byte-budgeted snapshot.
+    pub(crate) fn workflows_response(
+        &self,
+        device_id: Option<&str>,
+    ) -> crate::protocol::WorkflowsResponse {
+        let scope = device_id
+            .map(|id| self.device_path_scope(id))
+            .unwrap_or_default();
+        let in_scope = |parent_thread_id: &str| -> bool {
+            match self.thread_cwd(parent_thread_id) {
+                Some(cwd) => {
+                    crate::state::ensure_path_within_device_scope(&cwd, &scope, &self.allowed_roots)
+                        .is_ok()
+                }
+                None => scope.is_empty() && self.allowed_roots.is_empty(),
+            }
+        };
+        crate::protocol::WorkflowsResponse {
+            workflows_revision: self.workflows_revision(),
+            workflow_runs: self
+                .active_workflow_runs_view()
+                .into_iter()
+                .filter(|run| in_scope(&run.parent_thread_id))
+                .collect(),
+        }
+    }
+
     fn workflow_locked_thread_ids(&self, run: &WorkflowRun) -> Vec<String> {
         let mut ids = vec![run.parent_thread_id.clone()];
         ids.extend(run.step_threads.values().cloned());
@@ -1681,6 +1784,42 @@ impl RelayState {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    fn workflow_activity_locked_thread_ids(&self, run: &WorkflowRun) -> Vec<String> {
+        let all_locked = self.workflow_locked_thread_ids(run);
+        let mut prioritized = Vec::new();
+        let mut add_if_locked = |candidate: Option<&String>| {
+            let Some(candidate) = candidate else {
+                return;
+            };
+            if all_locked.binary_search(candidate).is_ok()
+                && !prioritized.iter().any(|existing| existing == candidate)
+            {
+                prioritized.push(candidate.clone());
+            }
+        };
+
+        // Exact state for the workflow parent and the currently rendered thread
+        // must survive the cap. Background/view-only threads get their exact
+        // lock bit from the transcript channel's `thread_state.workflow_locked`.
+        add_if_locked(Some(&run.parent_thread_id));
+        add_if_locked(self.active_thread_id.as_ref());
+        for thread_id in run.step_threads.values() {
+            add_if_locked(Some(thread_id));
+        }
+        drop(add_if_locked);
+
+        for thread_id in all_locked {
+            if !prioritized.contains(&thread_id) {
+                prioritized.push(thread_id);
+            }
+            if prioritized.len() >= crate::protocol::MAX_WORKFLOW_ACTIVITY_LOCKED_THREAD_IDS {
+                break;
+            }
+        }
+        prioritized.truncate(crate::protocol::MAX_WORKFLOW_ACTIVITY_LOCKED_THREAD_IDS);
+        prioritized
     }
 
     pub(crate) fn ensure_runtime_for_thread(&mut self, thread_id: &str) -> &mut ThreadRuntime {
@@ -1838,8 +1977,14 @@ impl RelayState {
         activity
     }
 
-    pub fn snapshot(&self) -> SessionSnapshot {
-        let now = unix_now();
+    fn device_views(
+        &self,
+        now: u64,
+    ) -> (
+        Vec<crate::protocol::DeviceRecordView>,
+        Vec<crate::protocol::PairedDeviceView>,
+        Vec<crate::protocol::PendingPairingRequestView>,
+    ) {
         let live_requests = self
             .pending_pairing_requests
             .values()
@@ -1885,7 +2030,41 @@ impl RelayState {
             .map(|request| request.to_view())
             .collect::<Vec<_>>();
         pending_pairing_requests.sort_by(|left, right| left.requested_at.cmp(&right.requested_at));
+        (device_records, paired_devices, pending_pairing_requests)
+    }
 
+    fn devices_revision_for(
+        device_records: &[crate::protocol::DeviceRecordView],
+        paired_devices: &[crate::protocol::PairedDeviceView],
+        pending_pairing_requests: &[crate::protocol::PendingPairingRequestView],
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        device_records.hash(&mut hasher);
+        paired_devices.hash(&mut hasher);
+        pending_pairing_requests.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub(crate) fn devices_response(&self) -> crate::protocol::DevicesResponse {
+        let (device_records, paired_devices, pending_pairing_requests) =
+            self.device_views(unix_now());
+        let devices_revision =
+            Self::devices_revision_for(&device_records, &paired_devices, &pending_pairing_requests);
+        crate::protocol::DevicesResponse {
+            devices_revision,
+            device_records,
+            paired_devices,
+            pending_pairing_requests,
+        }
+    }
+
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let devices_revision = {
+            let (records, paired, pending) = self.device_views(unix_now());
+            Self::devices_revision_for(&records, &paired, &pending)
+        };
+        let (review_activity_total, review_blocked) = self.review_activity_summary();
         let selected = self.selected_runtime();
         let transcript_revision = selected
             .map(|runtime| runtime.transcript_revision)
@@ -1997,9 +2176,10 @@ impl RelayState {
             sandbox,
             reasoning_effort,
             allowed_roots: self.allowed_roots.clone(),
-            device_records,
-            paired_devices,
-            pending_pairing_requests,
+            device_records: Vec::new(),
+            paired_devices: Vec::new(),
+            pending_pairing_requests: Vec::new(),
+            devices_revision,
             pending_approvals: self
                 .pending_approvals
                 .values()
@@ -2025,15 +2205,14 @@ impl RelayState {
             transcript_truncated: false,
             transcript,
             logs: self.logs.clone(),
-            // Keep this the FULL (global) review-job list — do NOT scope it to the active
-            // thread for the remote/broker frame. The remote header's "Review blocked —
-            // action needed" badge derives from `isReviewBlocked`, which must see a blocked
-            // review on a BACKGROUND thread; scoping this per active thread would silently
-            // drop that badge on remote.
-            active_review_jobs: self.active_review_jobs_view(),
-            reviewer_threads: self.reviewer_thread_views(),
+            active_review_jobs: Vec::new(),
+            reviewer_threads: Vec::new(),
+            review_activity: self.review_activity_view(),
+            review_activity_total,
+            review_blocked,
             reviews_revision: self.reviews_revision(),
-            active_workflow_runs: self.active_workflow_runs_view(),
+            active_workflow_runs: Vec::new(),
+            workflow_activity: self.workflow_activity_view(),
             workflows_revision: self.workflows_revision(),
             push_vapid_public_key: self.push_vapid_public_key.clone(),
             projects_revision: self.projects_revision,
@@ -3335,10 +3514,11 @@ fn remote_action_cache_key(device_id: &str, action_id: &str) -> String {
 mod tests {
     use super::{
         BrokerPendingMessage, PendingPairingResult, PendingTranscriptDelta, PersistedRelayState,
-        RelayState, SecurityProfile, TranscriptDeltaKind, WorkflowRun, MAX_WORKFLOW_RUNS,
+        RelayState, ReviewJob, SecurityProfile, TranscriptDeltaKind, WorkflowRun,
+        MAX_WORKFLOW_RUNS,
     };
     use crate::protocol::ThreadSummaryView;
-    use crate::state::RunStatus;
+    use crate::state::{ReviewMode, RunStatus};
     use std::collections::HashMap;
     use tokio::sync::watch;
 
@@ -3547,6 +3727,12 @@ mod tests {
         assert!(view.locked_thread_ids.contains(&"parent".to_string()));
         assert!(view.locked_thread_ids.contains(&"same-cwd".to_string()));
         assert!(!view.locked_thread_ids.contains(&"other-cwd".to_string()));
+        let activity = relay.workflow_activity_view();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].id, "running");
+        assert!(activity[0]
+            .locked_thread_ids
+            .contains(&"same-cwd".to_string()));
 
         relay.insert_workflow_run(run_with_status("done", RunStatus::Done));
         let done = relay
@@ -3557,6 +3743,87 @@ mod tests {
         assert!(
             done.locked_thread_ids.is_empty(),
             "terminal runs should not publish live lock metadata"
+        );
+        assert!(
+            relay
+                .workflow_activity_view()
+                .iter()
+                .all(|run| run.id != "done"),
+            "terminal workflow cards stay on the dedicated channel, not the gating projection"
+        );
+    }
+
+    #[test]
+    fn workflow_activity_bounds_same_cwd_locks_and_prioritizes_active_thread() {
+        let mut relay = test_relay();
+        relay.threads = (0..500)
+            .map(|index| test_thread(&format!("same-cwd-{index:03}"), "/tmp/project"))
+            .chain(std::iter::once(test_thread("parent", "/tmp/project")))
+            .collect();
+        relay.active_thread_id = Some("same-cwd-499".to_string());
+        relay.insert_workflow_run(run_with_status("running", RunStatus::Running));
+
+        let full = relay
+            .active_workflow_runs_view()
+            .into_iter()
+            .find(|run| run.id == "running")
+            .expect("full workflow view");
+        assert!(
+            full.locked_thread_ids.len() > 500,
+            "the dedicated workflow channel retains the complete lock set"
+        );
+
+        let activity = relay.workflow_activity_view();
+        assert_eq!(activity.len(), 1);
+        assert!(
+            activity[0].locked_thread_ids.len()
+                <= crate::protocol::MAX_WORKFLOW_ACTIVITY_LOCKED_THREAD_IDS
+        );
+        assert!(activity[0]
+            .locked_thread_ids
+            .contains(&"parent".to_string()));
+        assert!(
+            activity[0]
+                .locked_thread_ids
+                .contains(&"same-cwd-499".to_string()),
+            "the currently rendered thread must survive the bounded live projection"
+        );
+    }
+
+    #[test]
+    fn review_activity_bounds_concurrent_jobs_and_prioritizes_active_thread() {
+        let mut relay = test_relay();
+        relay.active_thread_id = Some("parent-63".to_string());
+        for index in 0..64 {
+            let mut job = ReviewJob::new(
+                format!("review-{index:02}"),
+                format!("parent-{index:02}"),
+                "codex".to_string(),
+                "codex".to_string(),
+                None,
+                ReviewMode::CleanThread,
+                "/tmp/project".to_string(),
+                "device".to_string(),
+                None,
+                1,
+            );
+            job.reviewer_thread_id = Some(format!("reviewer-{index:02}"));
+            relay.insert_review_job(job);
+        }
+
+        let activity = relay.review_activity_view();
+        let (total, blocked) = relay.review_activity_summary();
+        assert_eq!(total, 64);
+        assert!(!blocked);
+        assert!(
+            activity.len() <= crate::protocol::MAX_REVIEW_ACTIVITY_JOBS,
+            "the full concurrent set belongs on the Reviews channel"
+        );
+        assert!(
+            activity
+                .iter()
+                .any(|job| job.parent_thread_id == "parent-63"),
+            "the active thread's exact lock identity must survive the bounded projection"
         );
     }
 

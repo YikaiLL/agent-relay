@@ -1,6 +1,12 @@
 use super::*;
 
 impl AppState {
+    /// Full device/security payload for the dedicated Devices channel.
+    pub async fn devices(&self) -> crate::protocol::DevicesResponse {
+        let relay = self.relay.read().await;
+        relay.devices_response()
+    }
+
     pub async fn start_pairing(
         &self,
         input: PairingStartInput,
