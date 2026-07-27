@@ -75,6 +75,28 @@ function captureStdout(fn) {
     });
 }
 
+// Same as captureStdout but for stderr — the worker's log() (MCP status etc.)
+// writes there, which the relay forwards into its log panel.
+function captureStderr(fn) {
+  const lines = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => {
+    lines.push(...String(chunk).split("\n").filter(Boolean));
+    return true;
+  };
+  return Promise.resolve()
+    .then(fn)
+    .then(
+      () => lines,
+      (error) => {
+        throw error;
+      },
+    )
+    .finally(() => {
+      process.stderr.write = originalWrite;
+    });
+}
+
 function makeTracker() {
   const records = [];
   return {
@@ -181,6 +203,72 @@ test("flushEvents records liveness against the owning session tracker", async ()
   assert.deepEqual(
     trackerB.records.map((event) => event.provider_session_id),
     ["session-b", "session-b"],
+  );
+});
+
+test("flushEvents logs MCP server status from a system/init message", async () => {
+  const initMsg = {
+    type: "system",
+    subtype: "init",
+    session_id: "s1",
+    model: "m",
+    cwd: "/x",
+    tools: [],
+    mcp_servers: [
+      { name: "fs", status: "connected" },
+      { name: "github", status: "failed" },
+    ],
+  };
+  let stderr;
+  // Swallow the session_started line on stdout; assert on the stderr MCP log.
+  await captureStdout(async () => {
+    stderr = await captureStderr(async () => {
+      await flushEvents(
+        streamMessages([initMsg]),
+        { current: false },
+        null,
+        null,
+        null,
+        null,
+        null,
+        makeTracker(),
+      );
+    });
+  });
+  assert.ok(stderr.includes("MCP: 1/2 server(s) connected"), stderr.join(" | "));
+  assert.ok(
+    stderr.some((l) => l.includes('MCP server "github" failed to connect')),
+    stderr.join(" | "),
+  );
+});
+
+test("flushEvents emits no MCP log when init has no servers", async () => {
+  const initMsg = {
+    type: "system",
+    subtype: "init",
+    session_id: "s1",
+    model: "m",
+    cwd: "/x",
+    tools: [],
+  };
+  let stderr;
+  await captureStdout(async () => {
+    stderr = await captureStderr(async () => {
+      await flushEvents(
+        streamMessages([initMsg]),
+        { current: false },
+        null,
+        null,
+        null,
+        null,
+        null,
+        makeTracker(),
+      );
+    });
+  });
+  assert.ok(
+    !stderr.some((l) => l.startsWith("MCP:")),
+    stderr.join(" | "),
   );
 });
 

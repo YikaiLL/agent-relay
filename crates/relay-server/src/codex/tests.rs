@@ -3,6 +3,85 @@ use crate::{protocol::SessionSnapshot, state::SecurityProfile};
 use tokio::sync::{watch, RwLock};
 
 #[test]
+fn summarize_codex_mcp_servers_reports_enabled_and_disabled() {
+    let json = r#"[
+        {"name":"github","enabled":true,"disabled_reason":null},
+        {"name":"computer-use","enabled":false,"disabled_reason":null},
+        {"name":"node_repl","enabled":true},
+        {"name":"broken","enabled":false,"disabled_reason":"startup failed"}
+    ]"#;
+    let lines = summarize_codex_mcp_servers(json).expect("valid json");
+    assert_eq!(lines[0], "MCP: 4 configured (2 enabled, 2 disabled)");
+    assert!(lines.iter().any(|l| l == "MCP enabled: github, node_repl"));
+    // disabled servers keep their reason when present
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("computer-use") && l.contains("broken (startup failed)")));
+}
+
+#[test]
+fn summarize_codex_mcp_servers_no_servers_is_silent() {
+    assert_eq!(
+        summarize_codex_mcp_servers("[]").unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn summarize_codex_mcp_servers_rejects_bad_json() {
+    assert!(summarize_codex_mcp_servers("not json at all").is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn collect_codex_mcp_lines_times_out_without_hanging() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    // A fake "codex" that ignores its args and never returns within the window.
+    // `exec sleep` makes the sleeper the direct child, so kill_on_drop's SIGKILL
+    // actually stops it rather than orphaning a grandchild.
+    let script = std::env::temp_dir().join(format!("codex-mcp-sleeper-{}.sh", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&script).unwrap();
+        writeln!(file, "#!/bin/sh\nexec sleep 30").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+
+    let start = Instant::now();
+    let lines = collect_codex_mcp_lines(script.to_str().unwrap(), Duration::from_millis(200)).await;
+    let elapsed = start.elapsed();
+    std::fs::remove_file(&script).ok();
+
+    // Returned promptly at the timeout — did NOT block for the 30s sleeper. The
+    // child is killed and reaped by kill_on_drop when the future is dropped.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "probe hung for {elapsed:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("timed out")),
+        "expected a timeout note, got {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn collect_codex_mcp_lines_reports_a_missing_binary() {
+    let lines = collect_codex_mcp_lines(
+        "definitely-not-a-real-codex-binary-xyz",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        lines.iter().any(|line| line.contains("could not run")),
+        "expected a spawn-failure note, got {lines:?}"
+    );
+}
+
+#[test]
 fn parse_transcript_preserves_tool_and_reasoning_items() {
     let thread = json!({
         "turns": [

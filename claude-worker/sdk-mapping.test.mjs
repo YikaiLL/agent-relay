@@ -8,6 +8,7 @@ import {
   mapModelInfos,
   mapSdkMessage,
   mapSessionMessages,
+  mcpStatusLogLines,
 } from "./sdk-mapping.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -761,4 +762,83 @@ test("a live tool result is still mapped", () => {
   const events = Array.isArray(mapped) ? mapped : [mapped];
   assert.equal(events[0].type, "tool_call_result");
   assert.equal(events[0].id, "toolu_live");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP server status logging — the SDK's `system/init` message reports each
+// configured MCP server's connection status. Surfacing failures here is the
+// only signal a user gets that an MCP server didn't load (the relay forwards
+// worker stderr into its log panel).
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("mcpStatusLogLines: no MCP servers -> no log noise", () => {
+  assert.deepEqual(mcpStatusLogLines(undefined), []);
+  assert.deepEqual(mcpStatusLogLines([]), []);
+});
+
+test("mcpStatusLogLines: all connected -> a single summary line, no failures", () => {
+  const lines = mcpStatusLogLines([
+    { name: "fs", status: "connected" },
+    { name: "github", status: "connected" },
+  ]);
+  assert.deepEqual(lines, ["MCP: 2/2 server(s) connected"]);
+});
+
+test("mcpStatusLogLines: failed / needs-auth are surfaced as connection failures", () => {
+  const lines = mcpStatusLogLines([
+    { name: "fs", status: "connected" },
+    { name: "github", status: "failed" },
+    { name: "linear", status: "needs-auth" },
+  ]);
+  assert.equal(lines[0], "MCP: 1/3 server(s) connected");
+  assert.ok(lines.includes('MCP server "github" failed to connect (status=failed)'));
+  assert.ok(lines.includes('MCP server "linear" failed to connect (status=needs-auth)'));
+  assert.equal(lines.length, 3);
+});
+
+test("mcpStatusLogLines: a disabled server is counted apart, not a failure", () => {
+  // All non-disabled servers are up, so this must read as fully connected — the
+  // disabled toggle is noted separately, not as "0/N connected" with an alarm.
+  const lines = mcpStatusLogLines([
+    { name: "fs", status: "connected" },
+    { name: "off", status: "disabled" },
+  ]);
+  assert.deepEqual(lines, ["MCP: 1/1 server(s) connected (1 disabled)"]);
+});
+
+test("mcpStatusLogLines: all-disabled reads as configured-but-disabled, no ratio", () => {
+  const lines = mcpStatusLogLines([
+    { name: "a", status: "disabled" },
+    { name: "b", status: "disabled" },
+  ]);
+  assert.deepEqual(lines, ["MCP: 2 server(s) configured, all disabled"]);
+});
+
+test("mcpStatusLogLines: pending is shown as connecting, not a failure", () => {
+  const lines = mcpStatusLogLines([
+    { name: "fs", status: "connected" },
+    { name: "slow", status: "pending" },
+  ]);
+  assert.equal(lines[0], "MCP: 1/2 server(s) connected");
+  assert.ok(lines.includes('MCP server "slow" still connecting (status=pending)'));
+  assert.ok(!lines.some((l) => l.includes("failed to connect")));
+});
+
+test("mcpStatusLogLines: mixed statuses each bucket correctly", () => {
+  const lines = mcpStatusLogLines([
+    { name: "ok", status: "connected" },
+    { name: "bad", status: "failed" },
+    { name: "slow", status: "pending" },
+    { name: "off", status: "disabled" },
+  ]);
+  // active = 3 (disabled excluded), 1 connected, 1 disabled noted in summary
+  assert.equal(lines[0], "MCP: 1/3 server(s) connected (1 disabled)");
+  assert.ok(lines.includes('MCP server "bad" failed to connect (status=failed)'));
+  assert.ok(lines.includes('MCP server "slow" still connecting (status=pending)'));
+});
+
+test("mcpStatusLogLines: tolerates malformed entries as failures without throwing", () => {
+  const lines = mcpStatusLogLines([{}, { name: "x" }]);
+  assert.equal(lines[0], "MCP: 0/2 server(s) connected");
+  assert.ok(lines.some((l) => l.includes("failed to connect (status=unknown)")));
 });

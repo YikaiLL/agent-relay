@@ -58,6 +58,7 @@ import {
   mapSdkMessage,
   mapSessionInfo,
   mapSessionMessages,
+  mcpStatusLogLines,
   userMessageTranscriptText,
 } from "./sdk-mapping.mjs";
 import { buildSessionOptionsBase } from "./session-options.mjs";
@@ -189,6 +190,13 @@ async function flushEvents(
       // buildSdkMsgProbe is content-safe (shape + scalars only) — see its docs.
       if (STREAM_DIAG) {
         diag("sdk_msg", buildSdkMsgProbe(msg));
+      }
+
+      // Surface MCP server connection status once, on session init, so a
+      // failed/needs-auth MCP server shows up in the relay log panel (worker
+      // stderr is forwarded there). Silent when no MCP servers are configured.
+      if (msg?.type === "system" && msg?.subtype === "init") {
+        for (const line of mcpStatusLogLines(msg.mcp_servers)) log(line);
       }
 
       const mapped = mapSdkMessage(msg);

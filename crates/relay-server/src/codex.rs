@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     process::Stdio,
     sync::{atomic::AtomicU64, Arc},
+    time::Duration,
 };
 
 use serde_json::{json, Value};
@@ -195,6 +196,96 @@ impl ProviderBridge for CodexBridge {
     }
 }
 
+// Turn `codex mcp list --json` output into operator log lines. Codex's
+// app-server does NOT expose runtime MCP connection status (verified by probing
+// the real app-server: the initialize response and startup notifications carry
+// no MCP data), so this config-level view — which servers are configured and
+// whether each is enabled — is the only structured MCP signal the relay can
+// surface. Runtime failures, if codex prints them, arrive via its forwarded
+// stderr. Returns Err on unparseable JSON; Ok(vec![]) when nothing is configured.
+fn summarize_codex_mcp_servers(json: &str) -> Result<Vec<String>, String> {
+    let servers: Vec<Value> = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    if servers.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut enabled: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    for server in &servers {
+        let name = server.get("name").and_then(Value::as_str).unwrap_or("?");
+        if server
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            enabled.push(name.to_string());
+        } else {
+            match server.get("disabled_reason").and_then(Value::as_str) {
+                Some(reason) => disabled.push(format!("{name} ({reason})")),
+                None => disabled.push(name.to_string()),
+            }
+        }
+    }
+    let mut lines = vec![format!(
+        "MCP: {} configured ({} enabled, {} disabled)",
+        servers.len(),
+        enabled.len(),
+        disabled.len()
+    )];
+    if !enabled.is_empty() {
+        lines.push(format!("MCP enabled: {}", enabled.join(", ")));
+    }
+    if !disabled.is_empty() {
+        lines.push(format!("MCP disabled: {}", disabled.join(", ")));
+    }
+    Ok(lines)
+}
+
+// Run `codex mcp list --json` (bounded by `timeout`) and turn it into operator
+// log lines. Best-effort: a spawn failure, timeout, non-zero exit, or
+// unparseable output produces a note (or nothing) rather than an error.
+// `kill_on_drop(true)` matters: on Tokio, cancelling `output()` at the timeout
+// only stops awaiting — without it a genuinely hung CLI keeps running as an
+// orphan. With it, the child is killed and reaped when the future is dropped.
+async fn collect_codex_mcp_lines(binary_name: &str, timeout: Duration) -> Vec<String> {
+    let mut command = Command::new(binary_name);
+    command
+        .arg("mcp")
+        .arg("list")
+        .arg("--json")
+        .kill_on_drop(true);
+
+    match tokio::time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            match summarize_codex_mcp_servers(&String::from_utf8_lossy(&output.stdout)) {
+                Ok(lines) => lines,
+                Err(error) => vec![format!("MCP: could not parse `mcp list` output: {error}")],
+            }
+        }
+        // Non-zero exit: `mcp list` unsupported or errored — stay quiet rather than noisy.
+        Ok(Ok(_)) => vec![],
+        Ok(Err(error)) => vec![format!(
+            "MCP: could not run `{binary_name} mcp list`: {error}"
+        )],
+        // Timed out: `command.output()` is dropped here → kill_on_drop kills+reaps the child.
+        Err(_) => vec![format!("MCP: `{binary_name} mcp list` timed out")],
+    }
+}
+
+// Push the configured-MCP summary into the relay log panel. Spawned off the
+// provider-startup critical path (see the `tokio::spawn` call site), so a slow
+// or hung `codex mcp list` never delays bridge creation or later providers.
+async fn log_codex_mcp_config(binary_name: &'static str, state: Arc<RwLock<RelayState>>) {
+    let lines = collect_codex_mcp_lines(binary_name, Duration::from_secs(5)).await;
+    if lines.is_empty() {
+        return;
+    }
+    let mut relay = state.write().await;
+    for line in lines {
+        relay.push_log("codex", line);
+    }
+    relay.notify();
+}
+
 impl CodexBridge {
     pub async fn spawn(
         state: Arc<RwLock<RelayState>>,
@@ -255,6 +346,14 @@ impl CodexBridge {
             relay.push_log("info", format!("Connected to {display_name} app-server."));
             relay.notify();
         }
+
+        // Surface the configured MCP servers (enabled/disabled) once at startup.
+        // Codex's app-server reports no runtime MCP status, so this is the only
+        // structured MCP visibility available on the codex side. Run it in the
+        // background: it's a diagnostic, and awaiting it here would delay this
+        // bridge (and, since providers start sequentially, later ones + the HTTP
+        // listener) by up to the probe timeout if the CLI hangs.
+        tokio::spawn(log_codex_mcp_config(binary_name, bridge.state.clone()));
 
         Ok(bridge)
     }

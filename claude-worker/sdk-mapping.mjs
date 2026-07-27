@@ -294,6 +294,56 @@ export function failedTurnReason(subtype) {
   return "Claude turn reported an error";
 }
 
+// Turn the `mcp_servers` array from an SDK `system/init` message into human log
+// lines for the relay log panel. The SDK reports each configured server's status
+// ('connected' | 'failed' | 'needs-auth' | 'pending' | 'disabled'), and the
+// worker logs these to stderr, which the relay forwards. Returns [] when no MCP
+// servers are configured (no noise). Server NAMES are user-authored config keys
+// (safe to log); statuses are a closed enum. No provider content is included.
+//
+// Status handling is deliberate so intentional/transient states don't read as
+// failures: `disabled` is a user toggle (counted apart, never an alarm) and is
+// excluded from the connected/active ratio; `pending` is "still connecting" at
+// this init snapshot, not a final failure; only `failed`/`needs-auth` (and any
+// unknown status) are surfaced as connection failures.
+export function mcpStatusLogLines(mcpServers) {
+  if (!Array.isArray(mcpServers) || mcpServers.length === 0) return [];
+
+  const connected = [];
+  const disabled = [];
+  const pending = [];
+  const failed = [];
+  for (const server of mcpServers) {
+    const status = server?.status;
+    if (status === "connected") connected.push(server);
+    else if (status === "disabled") disabled.push(server);
+    else if (status === "pending") pending.push(server);
+    else failed.push(server); // failed | needs-auth | unknown → treat as a failure
+  }
+
+  // The ratio is over servers that are *meant* to be up (disabled excluded).
+  const active = mcpServers.length - disabled.length;
+  const lines = [];
+  if (active === 0) {
+    lines.push(`MCP: ${disabled.length} server(s) configured, all disabled`);
+  } else {
+    let summary = `MCP: ${connected.length}/${active} server(s) connected`;
+    if (disabled.length) summary += ` (${disabled.length} disabled)`;
+    lines.push(summary);
+  }
+
+  const nameOf = (server) => server?.name ?? "?";
+  for (const server of failed) {
+    lines.push(
+      `MCP server "${nameOf(server)}" failed to connect (status=${server?.status ?? "unknown"})`,
+    );
+  }
+  for (const server of pending) {
+    lines.push(`MCP server "${nameOf(server)}" still connecting (status=pending)`);
+  }
+  return lines;
+}
+
 export function mapSdkMessage(msg) {
   switch (msg.type) {
     case "system": {
