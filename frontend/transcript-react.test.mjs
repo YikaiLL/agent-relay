@@ -1106,6 +1106,10 @@ function makeReasoning(id) {
   return { item_id: id, kind: "reasoning", status: "completed", text: id };
 }
 
+function makeEmptyReasoning(id) {
+  return { item_id: id, kind: "reasoning", status: "completed", text: "" };
+}
+
 test("groupToolEntries returns empty for empty or missing input", () => {
   assert.deepEqual(groupToolEntries([]), []);
   assert.deepEqual(groupToolEntries(undefined), []);
@@ -1143,9 +1147,110 @@ test("groupToolEntries splits when text or reasoning breaks the run", () => {
   assert.equal(result[1].kind, "agent_text");
   assert.equal(result[2].type, "tool-group");
   assert.deepEqual(result[2].entries.map((e) => e.item_id), ["c"]);
-  assert.equal(result[3].kind, "reasoning");
+  // Reasoning that carries a summary body folds into its own reasoning-group,
+  // and still breaks the surrounding tool run.
+  assert.equal(result[3].type, "reasoning-group");
+  assert.deepEqual(result[3].entries.map((e) => e.item_id), ["r1"]);
   assert.equal(result[4].type, "tool-group");
   assert.deepEqual(result[4].entries.map((e) => e.item_id), ["d"]);
+});
+
+test("groupToolEntries drops empty reasoning and merges the tools around it", () => {
+  // A bare "Reasoning completed" marker (no summary body) carries no
+  // information: it is removed entirely, and — because it is invisible — the
+  // tool calls it sat between merge into a single group instead of splitting.
+  const result = groupToolEntries([
+    makeTool("a"),
+    makeEmptyReasoning("r0"),
+    makeTool("b"),
+  ]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, "tool-group");
+  assert.deepEqual(result[0].entries.map((e) => e.item_id), ["a", "b"]);
+});
+
+test("groupToolEntries removes a run of standalone empty reasoning entirely", () => {
+  const result = groupToolEntries([
+    makeEmptyReasoning("r0"),
+    makeEmptyReasoning("r1"),
+  ]);
+  assert.deepEqual(result, []);
+});
+
+test("groupToolEntries folds consecutive text reasoning into one reasoning-group", () => {
+  const result = groupToolEntries([makeReasoning("r0"), makeReasoning("r1")]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, "reasoning-group");
+  assert.deepEqual(result[0].entries.map((e) => e.item_id), ["r0", "r1"]);
+});
+
+test("groupToolEntries merges text reasoning separated only by an empty reasoning", () => {
+  const result = groupToolEntries([
+    makeReasoning("r0"),
+    makeEmptyReasoning("gap"),
+    makeReasoning("r1"),
+  ]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, "reasoning-group");
+  assert.deepEqual(result[0].entries.map((e) => e.item_id), ["r0", "r1"]);
+});
+
+test("groupToolEntries keeps a still-running text reasoning inline (renders live)", () => {
+  const running = { ...makeReasoning("live"), status: "running" };
+  const result = groupToolEntries([running]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].kind, "reasoning");
+  assert.equal(result[0].status, "running");
+});
+
+test("groupToolEntries keeps an EMPTY running reasoning inline and never merges tools across it", () => {
+  // A running reasoning whose body has not arrived yet must NOT be discarded:
+  // dropping it would merge the tools on either side, then un-merge with churn
+  // once the text streams in. It stays inline and breaks the tool run.
+  const runningEmpty = { item_id: "live", kind: "reasoning", status: "running", text: "" };
+  const result = groupToolEntries([makeTool("a"), runningEmpty, makeTool("b")]);
+  assert.equal(result.length, 3);
+  assert.equal(result[0].type, "tool-group");
+  assert.deepEqual(result[0].entries.map((e) => e.item_id), ["a"]);
+  assert.equal(result[1].kind, "reasoning");
+  assert.equal(result[1].status, "running");
+  assert.equal(result[2].type, "tool-group");
+  assert.deepEqual(result[2].entries.map((e) => e.item_id), ["b"]);
+});
+
+test("groupToolEntries keeps a failed/cancelled empty reasoning inline (only completed is discarded)", () => {
+  const failed = { item_id: "boom", kind: "reasoning", status: "failed", text: "" };
+  const result = groupToolEntries([failed]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].kind, "reasoning");
+  assert.equal(result[0].status, "failed");
+});
+
+test("groupToolEntries never drops or groups omitted reasoning (keeps its loading slot)", () => {
+  // Body dropped to null to fit the snapshot budget must survive as a standalone
+  // entry so TranscriptEntry can render the loading placeholder; a clipped
+  // identity shell (nonempty text) must not be mistaken for a real summary.
+  const omittedNull = {
+    item_id: "o1",
+    kind: "reasoning",
+    status: "completed",
+    text: null,
+    content_state: "omitted",
+  };
+  const omittedShell = {
+    item_id: "o2",
+    kind: "reasoning",
+    status: "completed",
+    text: "Reason",
+    content_state: "omitted",
+  };
+  const result = groupToolEntries([makeTool("a"), omittedNull, omittedShell, makeTool("b")]);
+  assert.deepEqual(
+    result.map((item) => item.type || item.kind),
+    ["tool-group", "reasoning", "reasoning", "tool-group"]
+  );
+  assert.equal(result[1].item_id, "o1");
+  assert.equal(result[2].item_id, "o2");
 });
 
 test("groupToolEntries leaves running tools ungrouped and breaks the run", () => {
@@ -1307,6 +1412,60 @@ test("TranscriptContent renders a collapsed group chip for consecutive completed
   assert.match(markup, /··· 3 tool calls/);
   // Members should NOT render when the group is collapsed.
   assert.doesNotMatch(markup, /chat-message-system[^>]*>(?:(?!chat-message-tool-group)[\s\S])*?Bash/);
+});
+
+test("TranscriptContent renders a collapsed reasoning-group chip and hides empty reasoning", () => {
+  const markup = renderTranscriptContentMarkup([
+    makeReasoning("r0"),
+    makeEmptyReasoning("gap"),
+    makeReasoning("r1"),
+  ]);
+  assert.match(markup, /chat-message-reasoning-group/);
+  assert.match(markup, /data-expand-key="group:r0"/);
+  assert.match(markup, /data-transcript-toggle="group"/);
+  assert.match(markup, /··· 2 reasoning steps/);
+  // Collapsed: the member reasoning bodies must not be visible yet.
+  assert.doesNotMatch(markup, /message-card-reasoning">/);
+});
+
+test("TranscriptContent never renders a bare 'Reasoning completed' card for empty reasoning", () => {
+  const markup = renderTranscriptContentMarkup([makeEmptyReasoning("r0")]);
+  assert.doesNotMatch(markup, /message-card-reasoning/);
+  assert.doesNotMatch(markup, /Reasoning/);
+});
+
+test("TranscriptContent renders reasoning-group members when expanded", () => {
+  const markup = renderTranscriptContentMarkup(
+    [makeReasoning("r0"), makeReasoning("r1")],
+    null,
+    { expandedKeys: new Set(["group:r0"]) }
+  );
+  assert.match(markup, /reasoning-group-chip-open/);
+  const bodyCount = (markup.match(/message-card-reasoning/g) || []).length;
+  assert.equal(bodyCount, 2);
+});
+
+test("TranscriptContent uses the singular label for a lone text reasoning", () => {
+  const markup = renderTranscriptContentMarkup([makeReasoning("r0")]);
+  assert.match(markup, /··· 1 reasoning step</);
+});
+
+test("TranscriptContent renders the loading placeholder for omitted reasoning, not a chip", () => {
+  const markup = renderTranscriptContentMarkup([
+    { item_id: "o1", kind: "reasoning", status: "completed", text: null, content_state: "omitted" },
+  ]);
+  assert.match(markup, /data-transcript-pending="true"/);
+  assert.match(markup, /message-body-loading/);
+  assert.doesNotMatch(markup, /reasoning-group/);
+  assert.doesNotMatch(markup, /message-card-reasoning/);
+});
+
+test("TranscriptContent keeps an empty running reasoning visible inline (not dropped, not grouped)", () => {
+  const markup = renderTranscriptContentMarkup([
+    { item_id: "live", kind: "reasoning", status: "running", text: "" },
+  ]);
+  assert.doesNotMatch(markup, /reasoning-group/);
+  assert.match(markup, /message-card-reasoning-empty/);
 });
 
 test("TranscriptContent renders group members when the group is expanded", () => {

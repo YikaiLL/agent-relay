@@ -1356,6 +1356,40 @@ function FallbackEntry({ entry, isJustPrepended = false }) {
   );
 }
 
+function reasoningText(entry) {
+  return String(entry?.text || "").trim();
+}
+
+// A reasoning entry that has fully settled AND is fully loaded — the only state
+// we are allowed to reshape (drop when empty, fold when it has a body). Three
+// exclusions keep us from acting on entries that must stay standalone:
+//   - content_state "omitted": the body was dropped to `null`/a clipped shell to
+//     fit the snapshot budget. TranscriptEntry must render its loading
+//     placeholder until hydration — never drop it, never mistake a clipped shell
+//     for a real summary and fold it into a chip.
+//   - status !== "completed": a running reasoning may not have streamed its text
+//     yet (Codex `item/started` creates it empty); a failed/cancelled one is
+//     still meaningful. These stay inline so they render live / remain visible.
+function isSettledReasoning(entry) {
+  return (
+    entry?.kind === "reasoning" &&
+    entry.content_state !== "omitted" &&
+    (entry.status || "completed") === "completed"
+  );
+}
+
+// An empty reasoning entry ("Reasoning completed" with no summary body) carries
+// no information — it is dropped from the transcript entirely.
+function isEmptyReasoning(entry) {
+  return isSettledReasoning(entry) && reasoningText(entry) === "";
+}
+
+// A settled reasoning entry that DOES carry a summary body. Consecutive ones
+// fold into a collapsible reasoning-group, mirroring the tool-call group.
+function isGroupableReasoning(entry) {
+  return isSettledReasoning(entry) && reasoningText(entry) !== "";
+}
+
 function isGroupableCompletedTool(entry) {
   if (!entry || entry.kind !== "tool_call") {
     return false;
@@ -1410,6 +1444,13 @@ export function groupToolEntries(entries) {
   const pendingByTurn = new Map();
 
   list.forEach((entry, index) => {
+    // Empty reasoning markers are pure noise: drop them without disturbing the
+    // current adjacency group. Because they never render, tool calls (or text
+    // reasoning) that sat on either side of one become adjacent and merge.
+    if (isEmptyReasoning(entry)) {
+      return;
+    }
+
     const diffEntry = isGroupableDiff(entry);
     const turnId = entry?.turn_id;
 
@@ -1437,6 +1478,8 @@ export function groupToolEntries(entries) {
       nextType = "tool-group";
     } else if (diffEntry) {
       nextType = "diff-group";
+    } else if (isGroupableReasoning(entry)) {
+      nextType = "reasoning-group";
     }
 
     if (nextType) {
@@ -1569,6 +1612,39 @@ function ToolGroupEntry({ group, options = null }) {
       removed > 0
         ? h("span", { className: "tool-group-chip-del" }, `−${removed}`)
         : null
+    )
+  );
+}
+
+// Collapsed chip for a run of consecutive reasoning summaries, mirroring the
+// tool-call group. Empty reasoning is dropped before grouping, so every member
+// here carries a real summary body; the chip expands to reveal those cards.
+function ReasoningGroupEntry({ group, options = null }) {
+  const expandKey = groupExpandKey(group);
+  const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
+  const count = group?.entries?.length || 0;
+  const label = `··· ${count} reasoning ${count === 1 ? "step" : "steps"}`;
+
+  return h(
+    "article",
+    {
+      className: "chat-message chat-message-system chat-message-reasoning-group",
+      ...(expandKey ? { "data-reasoning-group-key": expandKey } : {}),
+    },
+    h(
+      "button",
+      {
+        className: `reasoning-group-chip${expanded ? " reasoning-group-chip-open" : ""}`,
+        ...(expandKey ? { "data-expand-key": expandKey } : {}),
+        "data-transcript-toggle": "group",
+        type: "button",
+      },
+      h(
+        "span",
+        { "aria-hidden": "true", className: "reasoning-group-chevron" },
+        expanded ? "▾" : "▸"
+      ),
+      h("span", { className: "reasoning-group-count" }, label)
     )
   );
 }
@@ -1995,6 +2071,33 @@ export function TranscriptContent({
       const groupKey = expandKey || `tool-group:${index}`;
       nodes.push(
         h(ToolGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
+      );
+      if (expanded) {
+        item.entries.forEach((memberEntry, memberIndex) => {
+          const memberId = memberEntry.item_id || "";
+          nodes.push(
+            h(TranscriptEntry, {
+              entry: memberEntry,
+              isJustPrepended: Boolean(memberId && justPrependedItemIds.has(memberId)),
+              isLatestUser: false,
+              key:
+                memberId
+                || memberEntry.id
+                || `${groupKey}:member:${memberIndex}`,
+              options: effectiveOptions,
+            })
+          );
+        });
+      }
+      return;
+    }
+
+    if (item?.type === "reasoning-group") {
+      const expandKey = groupExpandKey(item);
+      const expanded = Boolean(expandKey && effectiveOptions?.expandedKeys?.has(expandKey));
+      const groupKey = expandKey || `reasoning-group:${index}`;
+      nodes.push(
+        h(ReasoningGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
       );
       if (expanded) {
         item.entries.forEach((memberEntry, memberIndex) => {
