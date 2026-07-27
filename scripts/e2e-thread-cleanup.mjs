@@ -28,6 +28,21 @@ export async function fetchSession(relayPort, { bearerToken } = {}) {
   return payload.data;
 }
 
+// Device records / paired devices / pending pairing requests moved OUT of the
+// high-frequency session snapshot into the dedicated Devices channel
+// (`GET /api/devices`); `/api/session` now always reports them empty. Tests that
+// assert device lifecycle state must read this channel, not `fetchSession`.
+export async function fetchDevices(relayPort, { bearerToken } = {}) {
+  const response = await fetch(`http://127.0.0.1:${relayPort}/api/devices`, {
+    headers: authHeaders(bearerToken),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.message || payload?.error || "failed to fetch relay devices");
+  }
+  return payload.data;
+}
+
 export async function listThreads(relayPort, { bearerToken, cwd } = {}) {
   const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
   const response = await fetch(`http://127.0.0.1:${relayPort}/api/threads${query}`, {

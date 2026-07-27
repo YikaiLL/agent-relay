@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { deleteThreadsForCwdAndWait, fetchSession } from "./e2e-thread-cleanup.mjs";
+import { deleteThreadsForCwdAndWait, fetchDevices, fetchSession } from "./e2e-thread-cleanup.mjs";
 import { prepareSeededCodexHome } from "./e2e-codex-home.mjs";
 import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
 import {
@@ -245,6 +245,7 @@ async function main() {
     logStep("revoked device refresh rejected");
 
     const relaySession = await fetchSession(relayPort);
+    const relayDevices = await fetchDevices(relayPort);
     logStep("finished successfully", {
       refreshRequestCount: refreshRequests.length,
       activeThreadId: relaySession.active_thread_id,
@@ -259,7 +260,7 @@ async function main() {
           workspaceDir,
           activeThreadId: relaySession.active_thread_id,
           refreshRequestCount: refreshRequests.length,
-          deviceStates: relaySession.device_records?.map((device) => ({
+          deviceStates: relayDevices.device_records?.map((device) => ({
             deviceId: device.device_id,
             state: device.lifecycle_state,
             lastPeerId: device.last_peer_id,

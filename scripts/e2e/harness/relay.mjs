@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { fetchSession } from "../../e2e-thread-cleanup.mjs";
+import { fetchDevices, fetchSession } from "../../e2e-thread-cleanup.mjs";
 import { resolveRelayServerCommand } from "./binaries.mjs";
 import { spawnManagedProcess } from "./process.mjs";
 
@@ -125,8 +125,8 @@ export async function waitForSingleStartedThread(
 export async function waitForRevokedDevice(relayPort, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const session = await fetchSession(relayPort);
-    if (session.device_records?.some((device) => device.lifecycle_state === "revoked")) {
+    const devices = await fetchDevices(relayPort);
+    if (devices.device_records?.some((device) => device.lifecycle_state === "revoked")) {
       return;
     }
     await delay(300);

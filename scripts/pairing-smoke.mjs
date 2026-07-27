@@ -55,10 +55,13 @@ function claimProofMessage(challengeId, challenge, deviceId, peerId) {
 async function waitForPendingPairing(pairingId) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const session = await fetch(`${relayBase}/api/session`)
+    // Pending pairing requests moved out of /api/session into the dedicated
+    // Devices channel (GET /api/devices); the session snapshot now reports them
+    // empty.
+    const devices = await fetch(`${relayBase}/api/devices`)
       .then((response) => response.json())
       .then((response) => response.data);
-    const request = session.pending_pairing_requests?.find(
+    const request = devices.pending_pairing_requests?.find(
       (entry) => entry.pairing_id === pairingId
     );
     if (request) {

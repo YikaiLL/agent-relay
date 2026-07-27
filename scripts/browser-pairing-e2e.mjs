@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-import { deleteThreadAndWait, fetchSession } from "./e2e-thread-cleanup.mjs";
+import { deleteThreadAndWait, fetchDevices, fetchSession } from "./e2e-thread-cleanup.mjs";
 import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
 import { startSelfHostedBroker } from "./e2e/harness/broker.mjs";
 import {
@@ -160,6 +160,7 @@ async function main() {
     const remoteStatus = await remotePage.textContent("#remote-status-badge");
     const remoteDeviceMeta = await remotePage.textContent("#device-meta");
     const relaySession = await fetchSession(relayPort);
+    const relayDevices = await fetchDevices(relayPort);
     createdThreadId = relaySession.active_thread_id;
 
     console.log(
@@ -175,7 +176,7 @@ async function main() {
           activeThreadId: relaySession.active_thread_id,
           currentCwd: relaySession.current_cwd,
           fakeProvider: USE_FAKE_PROVIDER,
-          pairedDevices: relaySession.paired_devices?.map((device) => ({
+          pairedDevices: relayDevices.paired_devices?.map((device) => ({
             deviceId: device.device_id,
             label: device.label,
             lastPeerId: device.last_peer_id,

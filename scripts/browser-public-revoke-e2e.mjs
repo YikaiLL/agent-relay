@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { fetchSession } from "./e2e-thread-cleanup.mjs";
+import { fetchDevices } from "./e2e-thread-cleanup.mjs";
 import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
 import {
   attachPageDebugLogging,
@@ -144,7 +144,7 @@ async function main() {
       "the kept device should still be able to refresh after bulk revoke"
     );
 
-    const relaySession = await fetchSession(relayPort);
+    const relayDevices = await fetchDevices(relayPort);
     console.log(
       JSON.stringify(
         {
@@ -153,7 +153,7 @@ async function main() {
           pairingOrigin: `http://${lanIp}:${brokerPort}`,
           keptDeviceId: deviceB.auth.deviceId,
           revokedDeviceIds: [deviceA.auth.deviceId, deviceC.auth.deviceId],
-          lifecycleStates: relaySession.device_records?.map((device) => ({
+          lifecycleStates: relayDevices.device_records?.map((device) => ({
             deviceId: device.device_id,
             state: device.lifecycle_state,
           })),
@@ -280,8 +280,8 @@ async function waitForDeviceState(relayPort, deviceId, lifecycleState, timeoutMs
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const session = await fetchSession(relayPort);
-    const record = session.device_records?.find((device) => device.device_id === deviceId);
+    const devices = await fetchDevices(relayPort);
+    const record = devices.device_records?.find((device) => device.device_id === deviceId);
     if (record?.lifecycle_state === lifecycleState) {
       return record;
     }
@@ -295,12 +295,12 @@ async function waitForDeviceLifecycleCount(relayPort, lifecycleState, count, tim
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const session = await fetchSession(relayPort);
-    const matchingCount = (session.device_records || []).filter(
+    const devices = await fetchDevices(relayPort);
+    const matchingCount = (devices.device_records || []).filter(
       (device) => device.lifecycle_state === lifecycleState
     ).length;
     if (matchingCount >= count) {
-      return session;
+      return devices;
     }
     await delay(300);
   }
