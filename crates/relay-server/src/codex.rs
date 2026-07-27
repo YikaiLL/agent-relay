@@ -736,6 +736,85 @@ fn parse_model_option(model: &Value) -> Result<ModelOptionView, String> {
     })
 }
 
+/// Stable per-turn id for the synthetic failure entry so that a re-delivered
+/// live completion OR a rehydrated history turn upserts (never duplicates) the
+/// same entry. Mirrors the Claude path (`turn-error:<turn_id>`), so both
+/// providers share the frontend's `ErrorEntry` renderer.
+pub(crate) fn codex_turn_error_item_id(turn_id: Option<&str>) -> String {
+    format!("turn-error:{}", turn_id.unwrap_or("unknown"))
+}
+
+/// Map codex's `codexErrorInfo` (the app-server `CodexErrorInfo` enum,
+/// `#[serde(rename_all = "camelCase")]`) to a bounded, user-facing label. On the
+/// wire, unit variants arrive as a bare camelCase string
+/// (`"usageLimitExceeded"`) and data-carrying variants as an externally-tagged
+/// single-key object (`{"httpConnectionFailed":{"httpStatusCode":503}}`). This
+/// closed classification is the ONLY provider-derived text safe to surface
+/// cross-device — the failure entry rides broker-bound snapshots to every paired
+/// device, so it must stay subtype-only, never free-form model/conversation
+/// content. Returns `None` for `other` or any unknown/future variant so the
+/// caller falls back to a generic bounded reason (NEVER the raw `error.message`).
+pub(crate) fn codex_error_info_label(info: &Value) -> Option<String> {
+    let (variant, http_status) = match info {
+        Value::String(variant) => (variant.as_str(), None),
+        Value::Object(map) => {
+            let (variant, data) = map.iter().next()?;
+            (
+                variant.as_str(),
+                data.get("httpStatusCode").and_then(Value::as_u64),
+            )
+        }
+        _ => return None,
+    };
+    let base = match variant {
+        "usageLimitExceeded" => "Usage limit reached",
+        "sessionBudgetExceeded" => "Session budget exhausted",
+        "contextWindowExceeded" => "The context window was exceeded",
+        "serverOverloaded" => "The model provider is overloaded",
+        "cyberPolicy" => "Blocked by the provider's safety policy",
+        "unauthorized" => "Authentication failed",
+        "badRequest" => "The request was rejected",
+        "internalServerError" => "The model provider had an internal error",
+        "threadRollbackFailed" => "Thread rollback failed",
+        "sandboxError" => "A sandbox error occurred",
+        "httpConnectionFailed" | "responseStreamConnectionFailed" => {
+            "The connection to the model failed"
+        }
+        "responseStreamDisconnected" => "The model stream disconnected mid-turn",
+        "responseTooManyFailedAttempts" => "The model failed after repeated attempts",
+        "activeTurnNotSteerable" => "The active turn could not be steered",
+        // "other" and any unknown/future variant fall through to a generic,
+        // bounded reason in the caller — never the raw provider message.
+        _ => return None,
+    };
+    Some(match http_status {
+        Some(code) => format!("{base} (HTTP {code})"),
+        None => base.to_string(),
+    })
+}
+
+/// Derive a BOUNDED failure reason from a codex `turn` object (a live
+/// `turn/completed` payload's `turn`, or a rehydrated history turn), or `None`
+/// if the turn did not fail. A turn is failed when `status == "failed"` OR it
+/// carries a non-null `error` (codex only populates `error` on failure). The
+/// reason is ALWAYS bounded: the closed `codexErrorInfo` label, or a generic
+/// notice. The raw `error.message` is deliberately NEVER surfaced here — this
+/// text rides broker-bound snapshots to every paired device and must remain
+/// subtype-only (see `TranscriptEntryKind::Error`). The live handler logs the
+/// raw message separately, operator-only.
+pub(crate) fn codex_turn_failure_reason(turn: &Value) -> Option<String> {
+    let status = value_at(turn, &["status"]).and_then(Value::as_str);
+    let error = value_at(turn, &["error"]).filter(|error| !error.is_null());
+    let failed = status == Some("failed") || error.is_some();
+    if !failed {
+        return None;
+    }
+    let label = error
+        .and_then(|error| value_at(error, &["codexErrorInfo"]))
+        .and_then(codex_error_info_label);
+    Some(label.unwrap_or_else(|| "The turn ended with an error.".to_string()))
+}
+
 fn parse_transcript(thread: &Value) -> Vec<TranscriptEntryView> {
     let mut transcript = Vec::new();
     let turns = match value_at(thread, &["turns"]).and_then(Value::as_array) {
@@ -758,6 +837,22 @@ fn parse_transcript(thread: &Value) -> Vec<TranscriptEntryView> {
 
         if let Some(entry) = build_turn_file_summary(turn_id.clone(), items) {
             transcript.push(entry);
+        }
+
+        // Re-synthesize the failed-turn entry on rehydrate: persisted history
+        // carries per-turn `status`/`error`, so a failure that happened before a
+        // relay restart stays visible IN THE TRANSCRIPT (not just as a lost live
+        // push). Same stable id as the live path, so no duplication when both run.
+        if let Some(reason) = codex_turn_failure_reason(turn) {
+            transcript.push(TranscriptEntryView {
+                item_id: Some(codex_turn_error_item_id(turn_id.as_deref())),
+                kind: TranscriptEntryKind::Error,
+                text: Some(reason),
+                status: "failed".to_string(),
+                turn_id: turn_id.clone(),
+                tool: None,
+                content_state: crate::protocol::TranscriptContentState::default(),
+            });
         }
     }
 

@@ -641,6 +641,580 @@ async fn superseded_turn_error_does_not_enqueue_push() {
     );
 }
 
+// A unique marker only ever present in the RAW provider `error.message`. It must
+// NEVER appear in a transcript Error entry (which rides broker-bound snapshots to
+// every paired device); the entry must carry only the bounded, closed-enum
+// reason. See `TranscriptEntryKind::Error` and `codex_turn_failure_reason`.
+const RAW_MSG_SENTINEL: &str = "RAW-9f3-/Users/secret/leak";
+
+// A failed codex turn must leave a DURABLE, remote-visible failure entry in the
+// transcript (kind Error, status "failed"), not settle as a clean success.
+// Operator logs are stripped from broker-bound snapshots, so the pre-existing
+// push/log alone let a failed turn look like a clean success on the transcript
+// surface. Mirrors the Claude path. Uses the REAL wire shape: `codexErrorInfo`
+// is a camelCase string (`CodexErrorInfo`'s serde repr). The bounded label must
+// be surfaced and the raw provider message must NOT leak into the entry.
+#[tokio::test]
+async fn turn_completed_with_error_injects_transcript_error_entry() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+        relay.set_active_turn(Some("turn-1".to_string()));
+    }
+
+    handle_notification(
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {
+                        "message": format!("upstream said {RAW_MSG_SENTINEL}"),
+                        "codexErrorInfo": "usageLimitExceeded"
+                    }
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let snapshot = relay.snapshot();
+    let entry = snapshot
+        .transcript
+        .iter()
+        .find(|entry| entry.kind == TranscriptEntryKind::Error)
+        .expect("a failed codex turn must inject an Error transcript entry");
+    assert_eq!(entry.status, "failed");
+    assert_eq!(
+        entry.item_id.as_deref(),
+        Some("turn-error:turn-1"),
+        "stable per-turn id so a re-delivered completion upserts, not duplicates"
+    );
+    assert_eq!(
+        entry.text.as_deref(),
+        Some("Usage limit reached"),
+        "the reason must be the bounded camelCase-classified label"
+    );
+    assert!(
+        !entry
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains(RAW_MSG_SENTINEL),
+        "the raw provider message must NEVER leak into the remote-visible entry"
+    );
+}
+
+// Data-carrying `codexErrorInfo` variants arrive as an externally-tagged
+// single-key object with an inner `httpStatusCode` — the real wire shape for
+// e.g. `HttpConnectionFailed`. The bounded label must be produced (with the
+// status code, itself bounded), never a raw string.
+#[tokio::test]
+async fn turn_completed_http_error_object_injects_bounded_entry() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+        relay.set_active_turn(Some("turn-1".to_string()));
+    }
+
+    handle_notification(
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {
+                        "message": RAW_MSG_SENTINEL,
+                        "codexErrorInfo": { "httpConnectionFailed": { "httpStatusCode": 503 } }
+                    }
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let snapshot = relay.snapshot();
+    let entry = snapshot
+        .transcript
+        .iter()
+        .find(|entry| entry.kind == TranscriptEntryKind::Error)
+        .expect("an externally-tagged codexErrorInfo object must be classified");
+    assert_eq!(
+        entry.text.as_deref(),
+        Some("The connection to the model failed (HTTP 503)")
+    );
+    assert!(!entry
+        .text
+        .as_deref()
+        .unwrap_or("")
+        .contains(RAW_MSG_SENTINEL));
+}
+
+// `other`/unknown/future classifications must fall back to a GENERIC bounded
+// reason — never the raw provider message — and that bounded reason must survive
+// remote-surface snapshot compaction without ever exposing the raw text.
+#[tokio::test]
+async fn turn_completed_unknown_error_never_leaks_raw_message() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+        relay.set_active_turn(Some("turn-1".to_string()));
+    }
+
+    handle_notification(
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": { "message": RAW_MSG_SENTINEL, "codexErrorInfo": "other" }
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let snapshot = relay.snapshot();
+    let entry = snapshot
+        .transcript
+        .iter()
+        .find(|entry| entry.kind == TranscriptEntryKind::Error)
+        .expect("an unknown classification must still inject a generic Error entry");
+    assert_eq!(entry.text.as_deref(), Some("The turn ended with an error."));
+
+    // The raw message must not appear ANYWHERE in the remote-surface-compacted
+    // snapshot (compaction truncates but never sanitizes — so the invariant must
+    // hold at the source).
+    let remote =
+        snapshot.compact_for(crate::protocol::SessionSnapshotCompactProfile::RemoteSurface);
+    let leaked = remote.transcript.iter().any(|entry| {
+        entry
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains(RAW_MSG_SENTINEL)
+    });
+    assert!(
+        !leaked,
+        "raw provider text must never reach a broker-bound snapshot"
+    );
+    // ...and the bounded failure entry must SURVIVE remote compaction — that is
+    // the whole point (operator logs get stripped; this entry must not).
+    assert!(
+        remote
+            .transcript
+            .iter()
+            .any(|entry| entry.kind == TranscriptEntryKind::Error),
+        "the bounded failure entry must remain visible in the remote snapshot"
+    );
+}
+
+// Same DURABLE failure entry on a BACKGROUND thread (symmetric with the active
+// path and with Claude's fg+bg handling). Here the error carries ONLY the
+// closed-enum classification, no free-text message — the bounded reason must
+// still be produced.
+#[tokio::test]
+async fn background_turn_completed_with_error_injects_transcript_error_entry() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("active-thread".to_string());
+        relay.set_active_turn(Some("turn-active".to_string()));
+        relay.bg_set_active_turn(
+            "bg-thread",
+            Some("turn-bg".to_string()),
+            crate::state::unix_now(),
+        );
+    }
+
+    handle_notification(
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "bg-thread",
+                "turn": {
+                    "id": "turn-bg",
+                    "status": "failed",
+                    "error": { "codexErrorInfo": "usageLimitExceeded" }
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let runtime = relay.runtime_for_thread("bg-thread").expect("bg runtime");
+    let entry = runtime
+        .transcript
+        .iter()
+        .find(|entry| entry.kind == TranscriptEntryKind::Error)
+        .expect("a failed background codex turn must inject an Error transcript entry");
+    assert_eq!(entry.status, "failed");
+    assert_eq!(entry.item_id, "turn-error:turn-bg");
+    assert_eq!(entry.text.as_deref(), Some("Usage limit reached"));
+}
+
+// A turn whose only failure signal is `status: "failed"` (no error object at
+// all — e.g. codex's own silent early-returns) must STILL surface a generic
+// failure entry, rather than settling as a clean success. This is the exact
+// "the turn just ends with nothing shown" case.
+#[tokio::test]
+async fn turn_completed_failed_status_without_detail_still_injects_error_entry() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+        relay.set_active_turn(Some("turn-1".to_string()));
+    }
+
+    handle_notification(
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "failed" }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let snapshot = relay.snapshot();
+    let entry = snapshot
+        .transcript
+        .iter()
+        .find(|entry| entry.kind == TranscriptEntryKind::Error)
+        .expect("a status:failed turn must inject an Error entry even with no detail");
+    assert_eq!(entry.status, "failed");
+    assert!(
+        !entry.text.as_deref().unwrap_or("").is_empty(),
+        "the generic failure entry must carry some user-facing text"
+    );
+}
+
+// A normal (successful) completion must NOT inject any Error entry — the failure
+// path must be gated strictly on a failed status / present error.
+#[tokio::test]
+async fn turn_completed_success_injects_no_error_entry() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+        relay.set_active_turn(Some("turn-1".to_string()));
+    }
+
+    handle_notification(
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "completed" }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    let snapshot = relay.snapshot();
+    assert!(
+        !snapshot
+            .transcript
+            .iter()
+            .any(|entry| entry.kind == TranscriptEntryKind::Error),
+        "a successful completion must not inject an Error entry"
+    );
+}
+
+// A re-delivered completion for the same turn must UPSERT the failure entry, not
+// duplicate it (stable `turn-error:<turn_id>` id).
+#[tokio::test]
+async fn turn_completed_error_entry_is_idempotent() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    let notification = json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {
+                "id": "turn-1",
+                "status": "failed",
+                "error": { "codexErrorInfo": "usageLimitExceeded" }
+            }
+        }
+    });
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+        relay.set_active_turn(Some("turn-1".to_string()));
+    }
+
+    handle_notification(notification.clone(), &state).await;
+    handle_notification(notification, &state).await;
+
+    let relay = state.read().await;
+    let snapshot = relay.snapshot();
+    let error_entries = snapshot
+        .transcript
+        .iter()
+        .filter(|entry| entry.kind == TranscriptEntryKind::Error)
+        .count();
+    assert_eq!(
+        error_entries, 1,
+        "a re-delivered completion must upsert, not duplicate, the failure entry"
+    );
+}
+
+// F3 (restart durability): persisted thread history carries per-turn
+// `status`/`error`, so rehydration must RE-SYNTHESIZE the bounded failure entry
+// (with the same stable id) — otherwise a failure that predates a relay restart
+// vanishes on reopen. Goes beyond Claude, which cannot rebuild its error card.
+#[test]
+fn parse_transcript_synthesizes_failed_turn_error_entry() {
+    let thread = json!({
+        "turns": [
+            {
+                "id": "turn-1",
+                "status": "failed",
+                "error": {
+                    "message": RAW_MSG_SENTINEL,
+                    "codexErrorInfo": "usageLimitExceeded"
+                },
+                "items": [
+                    { "id": "item-user", "type": "userMessage", "content": [{ "text": "hi" }] }
+                ]
+            }
+        ]
+    });
+
+    let transcript = parse_transcript(&thread);
+    let entry = transcript
+        .iter()
+        .find(|entry| entry.kind == TranscriptEntryKind::Error)
+        .expect("a failed history turn must rehydrate an Error entry");
+    assert_eq!(entry.item_id.as_deref(), Some("turn-error:turn-1"));
+    assert_eq!(entry.status, "failed");
+    assert_eq!(entry.text.as_deref(), Some("Usage limit reached"));
+    assert!(
+        !entry
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains(RAW_MSG_SENTINEL),
+        "rehydration must also keep the raw provider message out of the entry"
+    );
+
+    // A successful history turn must NOT synthesize an error entry.
+    let ok_thread = json!({
+        "turns": [
+            { "id": "turn-2", "status": "completed", "items": [] }
+        ]
+    });
+    assert!(
+        !parse_transcript(&ok_thread)
+            .iter()
+            .any(|entry| entry.kind == TranscriptEntryKind::Error),
+        "a completed history turn must not synthesize an error entry"
+    );
+}
+
+// Table-driven guard against a single-variant mapping typo: every known
+// `CodexErrorInfo` variant (unit strings + externally-tagged HTTP objects + the
+// `turnKind` object) must resolve to a bounded label, while `other`/unknown must
+// NOT (so the caller uses the generic fallback).
+#[test]
+fn codex_error_info_label_maps_every_known_variant() {
+    let unit_variants = [
+        "usageLimitExceeded",
+        "sessionBudgetExceeded",
+        "contextWindowExceeded",
+        "serverOverloaded",
+        "cyberPolicy",
+        "unauthorized",
+        "badRequest",
+        "internalServerError",
+        "threadRollbackFailed",
+        "sandboxError",
+    ];
+    for variant in unit_variants {
+        assert!(
+            codex_error_info_label(&json!(variant)).is_some(),
+            "unit variant {variant:?} must map to a bounded label"
+        );
+    }
+
+    let http_variants = [
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+    ];
+    for variant in http_variants {
+        let label = codex_error_info_label(&json!({ variant: { "httpStatusCode": 503 } }))
+            .unwrap_or_else(|| panic!("http variant {variant:?} must map"));
+        assert!(
+            label.contains("(HTTP 503)"),
+            "http variant {variant:?} must fold in the bounded status code, got {label:?}"
+        );
+        // A null/absent status code must still map, just without the suffix.
+        assert!(codex_error_info_label(&json!({ variant: { "httpStatusCode": null } })).is_some());
+    }
+
+    assert!(
+        codex_error_info_label(&json!({ "activeTurnNotSteerable": { "turnKind": "review" } }))
+            .is_some(),
+        "the turnKind-carrying variant must map"
+    );
+
+    // `other` and any unknown/future variant must NOT map (generic fallback).
+    assert_eq!(codex_error_info_label(&json!("other")), None);
+    assert_eq!(
+        codex_error_info_label(&json!("someUnknownFutureVariant")),
+        None
+    );
+    assert_eq!(
+        codex_error_info_label(&json!({ "brandNewVariant": {} })),
+        None
+    );
+}
+
+// The Web Push reason (a remote-bound channel) must carry the BOUNDED reason,
+// never the raw provider message — closing the loop the transcript tests cover.
+#[tokio::test]
+async fn turn_error_push_reason_is_bounded_not_raw() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut relay = state.write().await;
+        relay.set_push_runtime(push_tx, "test-key".to_string());
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.set_thread_status("thread-1", "active".to_string(), Vec::new());
+        relay.set_active_turn(Some("turn-1".to_string()));
+    }
+
+    handle_notification(
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": {
+                        "message": format!("upstream said {RAW_MSG_SENTINEL}"),
+                        "codexErrorInfo": "usageLimitExceeded"
+                    }
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let job = push_rx
+        .try_recv()
+        .expect("a turn error must enqueue a push");
+    assert_eq!(job.kind, crate::state::PushKind::Error);
+    let reason = job.reason.as_deref().unwrap_or("");
+    assert_eq!(reason, "Usage limit reached");
+    assert!(
+        !reason.contains(RAW_MSG_SENTINEL),
+        "the push reason must never carry the raw provider message"
+    );
+}
+
+// Exercise the restore path exactly as `read_thread` does after its RPC returns:
+// unwrap the `thread` from the `thread/read` result envelope, then hydrate. This
+// covers the `result -> thread -> parse_transcript` chain, not just the pure
+// parser, without needing a live app-server child.
+#[test]
+fn read_thread_result_envelope_rehydrates_failed_turn_entry() {
+    let result = json!({
+        "thread": {
+            "id": "thread-1",
+            "turns": [
+                {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": { "codexErrorInfo": "usageLimitExceeded" },
+                    "items": []
+                }
+            ]
+        }
+    });
+
+    let thread = value_at(&result, &["thread"]).expect("thread/read envelope carries a thread");
+    let transcript = parse_transcript(thread);
+    let entry = transcript
+        .iter()
+        .find(|entry| entry.kind == TranscriptEntryKind::Error)
+        .expect("restore path must rehydrate the failed-turn Error entry");
+    assert_eq!(entry.item_id.as_deref(), Some("turn-error:turn-1"));
+    assert_eq!(entry.text.as_deref(), Some("Usage limit reached"));
+}
+
 // P0a / review #3 regression: a delayed turn/completed for an OLD turn must not
 // clear the newer active turn or idle a working thread (which would also let the
 // server permit an overlapping turn).

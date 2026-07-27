@@ -371,14 +371,34 @@ async fn handle_notification_for_provider(
                     // follow-up thread/status/changed is missing — a ghost "working"
                     // badge that also blocks reviews on that thread.
                     relay.bg_set_thread_status(&bg_thread_id, "idle".to_string(), Vec::new(), now);
-                    // A failed turn notifies — but only for the CURRENT turn. A
-                    // superseded (stale) completion must not push/suppress, or it
-                    // would swallow the newer turn's real "completed".
-                    if let Some(turn_error) =
-                        value_at(&params, &["turn", "error", "message"]).and_then(Value::as_str)
+                    // A failed turn notifies AND leaves a durable, remote-visible
+                    // failure entry — but only for the CURRENT turn. A superseded
+                    // (stale) completion must not push/suppress, or it would
+                    // swallow the newer turn's real "completed".
+                    if let Some(reason) =
+                        value_at(&params, &["turn"]).and_then(codex_turn_failure_reason)
                     {
-                        relay.push_log("error", turn_error.to_string());
-                        relay.enqueue_error_push(&bg_thread_id, turn_error);
+                        // Operator log keeps the RAW provider message when present
+                        // (never rides remote snapshots).
+                        if let Some(raw) =
+                            value_at(&params, &["turn", "error", "message"]).and_then(Value::as_str)
+                        {
+                            relay.push_log("error", raw.to_string());
+                        }
+                        relay.enqueue_error_push(&bg_thread_id, reason.clone());
+                        // DURABLE failure entry on the background thread's runtime,
+                        // present when the user switches back (and in its
+                        // broker-bound snapshot). Mirrors the Claude bg path.
+                        relay.bg_upsert_transcript_item(
+                            &bg_thread_id,
+                            codex_turn_error_item_id(completed_turn.as_deref()),
+                            crate::protocol::TranscriptEntryKind::Error,
+                            Some(reason),
+                            "failed".to_string(),
+                            completed_turn.clone(),
+                            None,
+                            now,
+                        );
                     }
                 }
                 if let Some(turn_id) = completed_turn.as_deref() {
@@ -412,15 +432,35 @@ async fn handle_notification_for_provider(
                         relay.set_thread_status(&thread_id, "idle".to_string(), Vec::new());
                     }
                     relay.clear_progress();
-                    // A failed turn notifies — but only for the CURRENT turn. A
-                    // superseded (stale) completion must not push/suppress, or it
-                    // would swallow the newer turn's real "completed".
-                    if let Some(turn_error) =
-                        value_at(&params, &["turn", "error", "message"]).and_then(Value::as_str)
+                    // A failed turn notifies AND leaves a durable, remote-visible
+                    // failure entry — but only for the CURRENT turn. A superseded
+                    // (stale) completion must not push/suppress, or it would
+                    // swallow the newer turn's real "completed".
+                    if let Some(reason) =
+                        value_at(&params, &["turn"]).and_then(codex_turn_failure_reason)
                     {
-                        relay.push_log("error", turn_error.to_string());
+                        // Operator log keeps the RAW provider message when present
+                        // (never rides remote snapshots).
+                        if let Some(raw) =
+                            value_at(&params, &["turn", "error", "message"]).and_then(Value::as_str)
+                        {
+                            relay.push_log("error", raw.to_string());
+                        }
                         if let Some(thread_id) = relay.active_thread_id.clone() {
-                            relay.enqueue_error_push(&thread_id, turn_error);
+                            relay.enqueue_error_push(&thread_id, reason.clone());
+                            // DURABLE failure entry: operator logs are stripped
+                            // from broker-bound snapshots, so a log line alone
+                            // would let a remote/mobile client see the failed turn
+                            // settle as a clean success. Mirrors the Claude path.
+                            relay.upsert_transcript_item_for_thread(
+                                &thread_id,
+                                codex_turn_error_item_id(completed_turn.as_deref()),
+                                crate::protocol::TranscriptEntryKind::Error,
+                                Some(reason),
+                                "failed".to_string(),
+                                completed_turn.clone(),
+                                None,
+                            );
                         }
                     }
                     changed = true;
