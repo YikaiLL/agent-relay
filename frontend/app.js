@@ -33,6 +33,7 @@ import {
   forkThreadButton,
   goConsoleHomeButton,
   goConsoleHomeSidebarButton,
+  launchStartSessionDialog,
   launchSettingsModal,
   loadDirectoryButton,
   messageEffort,
@@ -61,6 +62,7 @@ import {
   startEffortInput,
   startEffortLabel,
   startPairingButton,
+  startPromptAttachments,
   startPromptInput,
   startSessionButton,
   statusBadge,
@@ -265,6 +267,9 @@ const state = {
   composerSubmitInFlight: false,
   composerImageAttachments: [],
   nextComposerImageAttachmentId: 1,
+  newSessionSubmitInFlight: false,
+  newSessionImageAttachments: [],
+  nextNewSessionImageAttachmentId: 1,
   sessionStream: null,
   streamConnected: false,
   transcriptEntryDetailCache: new Map(),
@@ -1634,15 +1639,30 @@ document.addEventListener("click", (event) => {
   if (!target?.closest("#start-session-button")) {
     return;
   }
+  if (state.newSessionSubmitInFlight) {
+    return;
+  }
   // Consume any pending "New agent" project synchronously (so a failed/cancelled
   // start can't leave it dangling), then assign the freshly-created thread once
   // startSession resolves with its id.
   const assignToProject = state.pendingProjectAssignment;
   state.pendingProjectAssignment = null;
-  void startSession().then((newThreadId) => {
+  const imageAttachments = state.newSessionImageAttachments.slice();
+  state.newSessionSubmitInFlight = true;
+  renderNewSessionImageAttachments();
+  void startSession(imageAttachments).then((newThreadId) => {
+    if (newThreadId) {
+      const sentIds = new Set(imageAttachments.map((attachment) => attachment.id));
+      state.newSessionImageAttachments = state.newSessionImageAttachments.filter(
+        (attachment) => !sentIds.has(attachment.id)
+      );
+    }
     if (newThreadId && assignToProject) {
       void assignNewSessionToProject(newThreadId, assignToProject);
     }
+  }).finally(() => {
+    state.newSessionSubmitInFlight = false;
+    renderNewSessionImageAttachments();
   });
 });
 
@@ -1716,6 +1736,95 @@ function clearComposerImageAttachments() {
   state.composerImageAttachments = [];
   renderComposerImageAttachments();
 }
+
+function renderNewSessionImageAttachments() {
+  if (!startPromptAttachments) return;
+  startPromptAttachments.replaceChildren();
+  startPromptAttachments.hidden = state.newSessionImageAttachments.length === 0;
+
+  for (const attachment of state.newSessionImageAttachments) {
+    const chip = document.createElement("span");
+    chip.className = "composer-attachment";
+
+    const name = document.createElement("span");
+    name.className = "composer-attachment-name";
+    name.textContent = `${attachment.file.name || "Pasted image"} · ${formatAttachmentBytes(attachment.file.size)}`;
+    chip.append(name);
+
+    const remove = document.createElement("button");
+    remove.className = "composer-attachment-remove";
+    remove.dataset.removeNewSessionImageAttachment = attachment.id;
+    remove.disabled = state.newSessionSubmitInFlight;
+    remove.type = "button";
+    remove.title = "Remove image";
+    remove.setAttribute("aria-label", `Remove ${attachment.file.name || "pasted image"}`);
+    remove.textContent = "×";
+    chip.append(remove);
+
+    startPromptAttachments.append(chip);
+  }
+}
+
+function clearNewSessionImageAttachments() {
+  if (state.newSessionImageAttachments.length === 0) return;
+  state.newSessionImageAttachments = [];
+  renderNewSessionImageAttachments();
+}
+
+// Treat each opening as a fresh attachment draft. In particular, reopening
+// after dismissing the dialog or after a failed start cannot silently carry a
+// screenshot into an unrelated workspace/session. An in-flight start already
+// captured its own attachment slice before the dialog closed.
+if (launchStartSessionDialog && typeof MutationObserver === "function") {
+  const newSessionDialogObserver = new MutationObserver(() => {
+    if (launchStartSessionDialog.hasAttribute("open")) {
+      clearNewSessionImageAttachments();
+    }
+  });
+  newSessionDialogObserver.observe(launchStartSessionDialog, {
+    attributeFilter: ["open"],
+    attributes: true,
+  });
+}
+
+startPromptInput?.addEventListener("paste", (event) => {
+  const files = pastedImageFiles(event.clipboardData);
+  if (files.length === 0) return;
+  event.preventDefault();
+
+  const { accepted, errors } = validateImageAttachments(
+    state.newSessionImageAttachments,
+    files
+  );
+  for (const file of accepted) {
+    state.newSessionImageAttachments.push({
+      file,
+      id: `new-session-image-${state.nextNewSessionImageAttachmentId++}`,
+    });
+  }
+  for (const error of errors) {
+    logLine(`New session image rejected: ${error}`);
+  }
+  if (accepted.length > 0) {
+    logLine(
+      `Attached ${accepted.length} pasted image${accepted.length === 1 ? "" : "s"} to the new session.`
+    );
+    renderNewSessionImageAttachments();
+  }
+});
+
+startPromptAttachments?.addEventListener("click", (event) => {
+  const button =
+    event.target instanceof Element
+      ? event.target.closest("[data-remove-new-session-image-attachment]")
+      : null;
+  if (!button || state.newSessionSubmitInFlight) return;
+  state.newSessionImageAttachments = state.newSessionImageAttachments.filter(
+    (attachment) => attachment.id !== button.dataset.removeNewSessionImageAttachment
+  );
+  renderNewSessionImageAttachments();
+  startPromptInput.focus();
+});
 
 messageInput?.addEventListener("paste", (event) => {
   const files = pastedImageFiles(event.clipboardData);

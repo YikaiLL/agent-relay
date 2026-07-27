@@ -37,6 +37,7 @@ import {
 } from "../transcript/store.js";
 import { threadAttention } from "../../shared/thread-attention.js";
 import { isDocumentForeground, notifyThreadEvents } from "../../shared/thread-notify.js";
+import { imageFileToDataUrl } from "../image-attachments.js";
 
 export function createLifecycleController(ctx) {
   const {
@@ -154,7 +155,7 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  async function startSession() {
+  async function startSession(imageAttachments = []) {
     const liveCwdInput = liveElement("cwd-input", cwdInput);
     const liveStartPromptInput = liveElement("start-prompt", startPromptInput);
     const liveProviderInput = liveElement("provider-input", providerInput);
@@ -171,7 +172,7 @@ export function createLifecycleController(ctx) {
     if (!cwd) {
       logLine("Choose a directory before starting a session.");
       liveCwdInput.focus();
-      return;
+      return null;
     }
 
     setSelectedCwd(cwd);
@@ -181,6 +182,11 @@ export function createLifecycleController(ctx) {
     logLine(`Starting a new ${agentName} session in ${cwd}`);
 
     try {
+      const images = await Promise.all(
+        imageAttachments.map(async (attachment) => ({
+          data_url: await imageFileToDataUrl(attachment.file),
+        }))
+      );
       const response = await apiFetch("/api/session/start", {
         method: "POST",
         headers: {
@@ -195,6 +201,7 @@ export function createLifecycleController(ctx) {
           effort: liveStartEffortInput.value,
           device_id: state.deviceId,
           provider: liveProviderInput?.value || null,
+          images,
         }),
       });
       const payload = await response.json();

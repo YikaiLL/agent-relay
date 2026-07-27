@@ -66,6 +66,23 @@ test("remote: generates dynamic IDs from dialog id", () => {
   assert.match(html, /id="remote-start-session-dialog-suggestions"/, "datalist id is derived from dialog id");
 });
 
+test("local can opt into an initial-prompt image attachment mount without adding it remotely", () => {
+  const localHtml = renderDialog({
+    initialPromptAttachmentsId: "start-prompt-attachments",
+    labels: {
+      initialPromptPlaceholder: "Optional first task. Paste an image to attach it.",
+    },
+  });
+  assert.match(localHtml, /id="start-prompt-attachments"/);
+  assert.match(localHtml, /Paste an image to attach it\./);
+
+  const remoteHtml = renderDialog({
+    id: "remote-start-session-dialog",
+  });
+  assert.doesNotMatch(remoteHtml, /start-prompt-attachments/);
+  assert.doesNotMatch(remoteHtml, /Paste an image to attach it\./);
+});
+
 test("input list attribute always matches datalist id", () => {
   // This is the core invariant: input[list] must point to a datalist[id]
   // that exists in the same dialog. Otherwise autocomplete silently breaks.
