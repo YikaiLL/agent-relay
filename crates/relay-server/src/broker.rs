@@ -1587,6 +1587,29 @@ async fn load_public_relay_registration(
     }))
 }
 
+/// Write `payload` to `path` through a temp sibling and an atomic rename,
+/// creating the temp file *exclusively* (`create_new`). That refuses a symlink
+/// or hard link pre-planted at the temp path instead of following it to an
+/// external target: the relay isn't sandboxed, so without this a
+/// workspace-write-confined agent could redirect these broker cache / key
+/// writes to a fixed filename outside the workspace. Callers create the parent
+/// directory first. Mirrors `state::persistence::save`; `write_new_exclusive`
+/// is sync I/O, hence the blocking pool.
+async fn persist_bytes_atomically(path: &Path, payload: Vec<u8>) -> Result<(), String> {
+    let temporary_path = path.with_extension("tmp");
+    let write_path = temporary_path.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::instance_lock::write_new_exclusive(&write_path, &payload)
+    })
+    .await
+    .map_err(|error| format!("temp file write task panicked: {error}"))?
+    .map_err(|error| format!("failed to write {}: {error}", temporary_path.display()))?;
+    tokio::fs::rename(&temporary_path, path)
+        .await
+        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
 async fn save_public_relay_registration(
     path: &Path,
     control_url: &str,
@@ -1606,14 +1629,7 @@ async fn save_public_relay_registration(
         relay_refresh_token: registration.relay_refresh_token.clone(),
     })
     .map_err(|error| format!("failed to encode broker registration cache: {error}"))?;
-    let temporary_path = path.with_extension("tmp");
-    tokio::fs::write(&temporary_path, payload)
-        .await
-        .map_err(|error| format!("failed to write {}: {error}", temporary_path.display()))?;
-    tokio::fs::rename(&temporary_path, path)
-        .await
-        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
-    Ok(())
+    persist_bytes_atomically(path, payload).await
 }
 
 async fn load_or_create_public_relay_identity(
@@ -1700,14 +1716,7 @@ async fn save_public_relay_identity(
         relay_signing_seed: STANDARD.encode(identity.signing_key.to_bytes()),
     })
     .map_err(|error| format!("failed to encode broker relay identity: {error}"))?;
-    let temporary_path = path.with_extension("tmp");
-    tokio::fs::write(&temporary_path, payload)
-        .await
-        .map_err(|error| format!("failed to write {}: {error}", temporary_path.display()))?;
-    tokio::fs::rename(&temporary_path, path)
-        .await
-        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
-    Ok(())
+    persist_bytes_atomically(path, payload).await
 }
 
 fn http_control_url(broker_ws_url: &str) -> String {

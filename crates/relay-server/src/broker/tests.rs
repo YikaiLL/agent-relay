@@ -1116,3 +1116,47 @@ fn summarize_thread_transcript_response_reports_entry_and_char_counts() {
     assert!(summary.contains("next_cursor=8"));
     assert!(summary.contains("prev_cursor=3"));
 }
+
+// A workspace-write-sandboxed agent can't write outside the workspace on its
+// own, but the relay (which isn't sandboxed) can. The registration cache is
+// written through a `<name>.tmp` sibling; a symlink pre-planted there would let
+// a plain write land the cache bytes on the symlink's external target. Creating
+// the temp file exclusively must refuse the symlink rather than write through
+// it.
+#[cfg(unix)]
+#[tokio::test]
+async fn save_public_relay_registration_refuses_a_preplanted_temp_symlink() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch me").unwrap();
+
+    let registration_path = dir.path().join("public-broker-registration.json");
+    let temp_path = registration_path.with_extension("tmp");
+    std::os::unix::fs::symlink(&victim, &temp_path).unwrap();
+
+    let registration = PublicRelayRegistration {
+        relay_id: "relay-x".into(),
+        broker_room_id: "room-x".into(),
+        relay_refresh_token: "refresh-x".into(),
+    };
+    let result = save_public_relay_registration(
+        &registration_path,
+        "https://control.example",
+        &registration,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "save must refuse to write through a pre-planted symlink at the temp path"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"do not touch me",
+        "the external file the planted symlink points to must be untouched"
+    );
+    assert!(
+        !registration_path.exists(),
+        "save must not have completed the rename onto the real registration path"
+    );
+}

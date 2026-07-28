@@ -35,14 +35,27 @@
 //! pre-planted symlink/hard-link at that exact name.
 //!
 //! What's *not* defended: an agent session actively racing relay-server
-//! after startup (e.g. swapping `.agent-relay` for a symlink mid-session).
-//! Closing that needs every write pinned to a directory handle opened once
-//! (`openat`-style, e.g. via `cap-std`) rather than a path re-resolved fresh
-//! each time. Not built: relay-server runs agent shell commands as the same
-//! OS user with no privilege boundary, so an agent capable of winning that
-//! race could just write the external file directly — going through
-//! relay-server buys it nothing. Revisit if that ever changes (elevated
-//! privileges, or one process serving multiple users' workspaces).
+//! after startup — e.g. swapping `.agent-relay` for a symlink mid-session so
+//! the next persistence save re-resolves the path through it and lands
+//! `session.json` outside the workspace. Closing that needs every write pinned
+//! to a directory handle opened once (`openat`-style, e.g. via `cap-std`)
+//! rather than a path re-resolved fresh on each save.
+//!
+//! This is a deliberate risk-acceptance, not an oversight — but note the
+//! reason is narrower than "the agent has no privilege boundary anyway". Under
+//! a `workspace-write` sandbox the agent genuinely *cannot* write outside the
+//! workspace itself, so relay-server (which runs unsandboxed) is a confused
+//! deputy here: an in-workspace action (the symlink swap) yields an
+//! out-of-workspace write the agent couldn't perform directly. What keeps it
+//! out of scope regardless: the escape is a *fixed* filename with
+//! relay-controlled content (not an arbitrary-path write, not RCE); the
+//! default `untrusted` approval policy makes the shell commands that swap the
+//! directory prompt the user, so it only opens up under autonomous /
+//! no-approval operation against untrusted input; and this is a single-user
+//! local tool with no cross-tenant boundary. Revisit — and reach for the
+//! `openat` pinning above — if that calculus changes: agents run unattended
+//! against untrusted repos by default, elevated privileges, or one process
+//! serving multiple users' workspaces.
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};

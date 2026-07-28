@@ -376,17 +376,32 @@ pub fn load_or_generate_vapid(path: &Path) -> Result<VapidKeys, String> {
     let subject =
         std::env::var("RELAY_VAPID_SUBJECT").unwrap_or_else(|_| DEFAULT_VAPID_SUBJECT.to_string());
 
-    if let Ok(contents) = std::fs::read_to_string(path) {
-        let scalar = b64url_decode(contents.trim())
-            .map_err(|e| format!("failed to decode VAPID key at {}: {e}", path.display()))?;
-        let signing_key = SigningKey::from_slice(&scalar)
-            .map_err(|e| format!("invalid VAPID key at {}: {e}", path.display()))?;
-        let public_b64url = vapid_public_b64url(&signing_key);
-        return Ok(VapidKeys {
-            signing_key,
-            public_b64url,
-            subject,
-        });
+    // Only a genuine "not found" means we should mint a new key. Any other read
+    // failure (permission, transient I/O, non-UTF-8, ...) must NOT fall through
+    // to regeneration: deleting or overwriting a key we merely failed to read
+    // would rotate the VAPID identity and silently break every existing push
+    // subscription. Surface it instead — the caller treats an error as "run
+    // without push" and leaves the on-disk key untouched.
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let scalar = b64url_decode(contents.trim())
+                .map_err(|e| format!("failed to decode VAPID key at {}: {e}", path.display()))?;
+            let signing_key = SigningKey::from_slice(&scalar)
+                .map_err(|e| format!("invalid VAPID key at {}: {e}", path.display()))?;
+            let public_b64url = vapid_public_b64url(&signing_key);
+            return Ok(VapidKeys {
+                signing_key,
+                public_b64url,
+                subject,
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to read VAPID key at {}: {error}",
+                path.display()
+            ));
+        }
     }
 
     let signing_key = SigningKey::random(&mut OsRng);
@@ -394,7 +409,22 @@ pub fn load_or_generate_vapid(path: &Path) -> Result<VapidKeys, String> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(error) = std::fs::write(path, URL_SAFE_NO_PAD.encode(scalar)) {
+    // Persist with an exclusive create (`create_new`): it writes only when the
+    // path is truly absent, so it refuses to follow a pre-planted symlink (an
+    // agent could dangle one here to redirect the private key outside the
+    // workspace), and — unlike a stale-leftover cleanup that unlinks what it
+    // finds — it never deletes or replaces an existing entry, which for
+    // permanent key material could destroy a still-valid key that appeared
+    // between the read above and this write.
+    let persisted = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(URL_SAFE_NO_PAD.encode(scalar).as_bytes())
+        });
+    if let Err(error) = persisted {
         warn!(
             "failed to persist VAPID key to {}: {error}; push subscriptions will not survive restart",
             path.display()
@@ -1194,5 +1224,71 @@ mod tests {
         // Round-trip with the receiver private key recovers the plaintext.
         let recovered = decrypt_aes128gcm(&ua_secret, &auth, &body);
         assert_eq!(recovered, plaintext);
+    }
+
+    // A workspace-write-sandboxed agent can't write outside the workspace on
+    // its own, but the relay (which isn't sandboxed) can. If `vapid.key` is
+    // pre-planted as a symlink to an external, not-yet-existing path, a plain
+    // write on first run would follow the dangling link and drop the private
+    // key at the attacker-chosen location. Creating the file exclusively must
+    // refuse the symlink rather than write through it.
+    #[cfg(unix)]
+    #[test]
+    fn load_or_generate_vapid_refuses_to_write_through_a_preplanted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("stolen.key");
+        let key_path = dir.path().join("vapid.key");
+        std::os::unix::fs::symlink(&external, &key_path).unwrap();
+
+        // The dangling link means no key is readable yet, so this hits the
+        // generate-and-persist branch. The call still returns a usable
+        // in-memory key even when persistence is refused.
+        let keys = load_or_generate_vapid(&key_path).expect("in-memory key is returned");
+        assert!(!keys.public_b64url().is_empty());
+
+        assert!(
+            !external.exists(),
+            "the private key must not be written through the symlink to an external path"
+        );
+    }
+
+    // A present-but-unreadable key (transient I/O, permission, ...) is NOT
+    // "missing": regenerating in that case would rotate the VAPID identity and
+    // silently break every existing push subscription. Only `NotFound` may lead
+    // to minting a new key; every other read error must leave the key on disk
+    // untouched.
+    #[cfg(unix)]
+    #[test]
+    fn load_or_generate_vapid_preserves_an_existing_key_that_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("vapid.key");
+
+        // A real, previously-generated key.
+        let original = load_or_generate_vapid(&key_path).expect("first run generates a key");
+        let original_bytes = std::fs::read(&key_path).expect("key was persisted");
+
+        // Make it unreadable while the parent dir stays writable — so a
+        // delete/replace WOULD succeed if the code wrongly took that path.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = load_or_generate_vapid(&key_path);
+
+        // Restore perms before any assertion can panic and skip cleanup.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a non-NotFound read error must surface, not silently regenerate"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            original_bytes,
+            "an unreadable existing key must be preserved, not deleted/regenerated"
+        );
+        // Once readable again, the SAME key still loads.
+        let reloaded = load_or_generate_vapid(&key_path).expect("original key reloads");
+        assert_eq!(reloaded.public_b64url(), original.public_b64url());
     }
 }
