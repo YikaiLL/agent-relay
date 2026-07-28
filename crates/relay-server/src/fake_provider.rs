@@ -52,6 +52,12 @@ struct FakeTurnScenario {
     #[serde(default)]
     tool_calls: usize,
     tool_call_delay_ms: Option<u64>,
+    /// Kind the fake `tool_calls` are emitted as. `tool_call` (default) mirrors
+    /// Claude tool uses; `command` mirrors Codex shell commands
+    /// (`TranscriptEntryKind::Command`, no `ToolCallView`), so e2e can exercise
+    /// command-group folding.
+    #[serde(default)]
+    tool_kind: FakeToolKind,
     pause_after_chunks: Option<usize>,
     barrier: Option<String>,
     #[serde(default)]
@@ -85,6 +91,14 @@ enum FakeStopBehavior {
     Complete,
     Reject,
     Ignore,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FakeToolKind {
+    #[default]
+    ToolCall,
+    Command,
 }
 
 #[derive(Serialize)]
@@ -483,6 +497,10 @@ impl ProviderBridge for FakeProviderBridge {
             .as_ref()
             .map(|scenario| scenario.tool_calls)
             .unwrap_or_default();
+        let tool_kind = scenario
+            .as_ref()
+            .map(|scenario| scenario.tool_kind)
+            .unwrap_or_default();
         let tool_call_delay = Duration::from_millis(
             scenario
                 .as_ref()
@@ -703,17 +721,32 @@ impl ProviderBridge for FakeProviderBridge {
                 }
 
                 let tool_number = index + 1;
+                let is_command = matches!(tool_kind, FakeToolKind::Command);
+                let entry_kind = if is_command {
+                    TranscriptEntryKind::Command
+                } else {
+                    TranscriptEntryKind::ToolCall
+                };
+                let command_text = format!("echo fake-command-{tool_number}");
                 let running_tool = fake_tool_call_view(tool_number, false);
                 {
                     let mut relay = state.write().await;
                     relay.upsert_transcript_item_for_thread(
                         &thread_id,
                         tool_item_id.clone(),
-                        TranscriptEntryKind::ToolCall,
-                        None,
+                        entry_kind,
+                        if is_command {
+                            Some(command_text.clone())
+                        } else {
+                            None
+                        },
                         "running".to_string(),
                         Some(turn_id_for_task.clone()),
-                        Some(running_tool.clone()),
+                        if is_command {
+                            None
+                        } else {
+                            Some(running_tool.clone())
+                        },
                     );
                     if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
                         relay.touch_progress(Some("tool"), Some(&running_tool.name));
@@ -744,11 +777,19 @@ impl ProviderBridge for FakeProviderBridge {
                     relay.upsert_transcript_item_for_thread(
                         &thread_id,
                         tool_item_id.clone(),
-                        TranscriptEntryKind::ToolCall,
-                        None,
+                        entry_kind,
+                        if is_command {
+                            Some(command_text.clone())
+                        } else {
+                            None
+                        },
                         "completed".to_string(),
                         Some(turn_id_for_task.clone()),
-                        Some(completed_tool.clone()),
+                        if is_command {
+                            None
+                        } else {
+                            Some(completed_tool.clone())
+                        },
                     );
                     if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
                         relay.touch_progress(None, None);
@@ -772,11 +813,19 @@ impl ProviderBridge for FakeProviderBridge {
                 .await;
                 tool_entries.push(TranscriptEntryView {
                     item_id: Some(tool_item_id),
-                    kind: TranscriptEntryKind::ToolCall,
-                    text: None,
+                    kind: entry_kind,
+                    text: if is_command {
+                        Some(command_text.clone())
+                    } else {
+                        None
+                    },
                     status: "completed".to_string(),
                     turn_id: Some(turn_id_for_task.clone()),
-                    tool: Some(completed_tool),
+                    tool: if is_command {
+                        None
+                    } else {
+                        Some(completed_tool)
+                    },
                     content_state: crate::protocol::TranscriptContentState::Full,
                 });
             }
@@ -1787,6 +1836,70 @@ mod tests {
                 .filter(|event| event["event"] == "tool_call_completed")
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_emits_command_kind_entries_when_tool_kind_is_command() {
+        // Mirrors the Codex shell path: `tool_kind: command` must emit
+        // `TranscriptEntryKind::Command` entries (with a command in `text` and
+        // no `ToolCallView`) rather than `ToolCall`, so the frontend can fold
+        // them into the collapsible tool-group.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = test_scenario_harness(
+            &temp,
+            HashMap::from([(
+                "commands".to_string(),
+                FakeTurnScenario {
+                    reply: Some("done".to_string()),
+                    chunks: Some(vec!["done".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    tool_calls: 2,
+                    tool_call_delay_ms: Some(0),
+                    tool_kind: FakeToolKind::Command,
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        );
+        let (bridge, _state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(ACTIVE_THREAD, "commands", "fake-echo", "medium", &[])
+            .await
+            .expect("turn");
+        assert!(
+            wait_for_scenario_event(&harness, "terminal_completed").await,
+            "the turn should settle after both commands"
+        );
+
+        let stored = bridge.read_thread(ACTIVE_THREAD).await.expect("thread");
+        let commands = stored
+            .transcript
+            .iter()
+            .filter(|entry| entry.kind == TranscriptEntryKind::Command)
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2, "both commands should be recorded");
+        assert!(
+            commands.iter().all(|entry| entry.status == "completed"),
+            "commands settle as completed"
+        );
+        assert!(
+            commands.iter().all(|entry| entry.tool.is_none()),
+            "command entries carry no ToolCallView"
+        );
+        assert!(
+            commands.iter().all(|entry| entry
+                .text
+                .as_deref()
+                .is_some_and(|t| t.contains("fake-command"))),
+            "the command text drives the CommandEntry preview"
+        );
+        assert!(
+            !stored
+                .transcript
+                .iter()
+                .any(|entry| entry.kind == TranscriptEntryKind::ToolCall),
+            "no tool_call entries when tool_kind is command"
         );
     }
 

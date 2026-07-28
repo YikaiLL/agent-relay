@@ -9,6 +9,7 @@
       "local-auth",
       "local-allowed-roots",
       "local-file-diff",
+      "local-command-group",
       "local-history-scroll",
       "local-drawer-scroll",
       "local-transcript-load",
@@ -29,6 +30,7 @@
       "local-auth",
       "local-allowed-roots",
       "local-file-diff",
+      "local-command-group",
       "local-history-scroll",
       "local-drawer-scroll",
       "local-transcript-load",
@@ -182,6 +184,16 @@
       "transport": "local",
       "coverage": [
         "file-diff"
+      ]
+    },
+    "local-command-group": {
+      "script": "browser-local-command-group-e2e.mjs",
+      "tier": "core",
+      "provider": "fake-compatible",
+      "transport": "local",
+      "coverage": [
+        "tool-group",
+        "command"
       ]
     },
     "local-history-scroll": {

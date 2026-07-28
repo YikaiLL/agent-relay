@@ -1110,6 +1110,18 @@ function makeEmptyReasoning(id) {
   return { item_id: id, kind: "reasoning", status: "completed", text: "" };
 }
 
+// Codex shell commands arrive as kind "command" (not "tool_call"). They should
+// group into the same collapsible tool-group as tool calls do for Claude.
+function makeCommand(id, overrides = {}) {
+  return {
+    item_id: id,
+    kind: "command",
+    status: "completed",
+    text: id,
+    ...overrides,
+  };
+}
+
 test("groupToolEntries returns empty for empty or missing input", () => {
   assert.deepEqual(groupToolEntries([]), []);
   assert.deepEqual(groupToolEntries(undefined), []);
@@ -1130,6 +1142,62 @@ test("groupToolEntries fuses consecutive completed tools into one group", () => 
     result[0].entries.map((e) => e.item_id),
     ["a", "b", "c"]
   );
+});
+
+test("groupToolEntries wraps a single completed command in a one-item group", () => {
+  // Codex emits shell commands as kind "command"; a lone completed one still
+  // collapses into the tool-group chip, mirroring a lone Claude tool call.
+  const result = groupToolEntries([makeCommand("cmd-a")]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, "tool-group");
+  assert.deepEqual(result[0].entries.map((e) => e.item_id), ["cmd-a"]);
+});
+
+test("groupToolEntries fuses consecutive completed commands into one group", () => {
+  // The reported Codex bug: a run of shell commands rendered as separate cards
+  // instead of one collapsible group. They must fuse like tool calls do.
+  const result = groupToolEntries([
+    makeCommand("cmd-a"),
+    makeCommand("cmd-b"),
+    makeCommand("cmd-c"),
+  ]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, "tool-group");
+  assert.deepEqual(
+    result[0].entries.map((e) => e.item_id),
+    ["cmd-a", "cmd-b", "cmd-c"]
+  );
+});
+
+test("groupToolEntries merges adjacent commands and tool calls into one group", () => {
+  // A mixed run (command → tool_call → command) is still one adjacency group.
+  const result = groupToolEntries([
+    makeCommand("cmd-a"),
+    makeTool("tool-b"),
+    makeCommand("cmd-c"),
+  ]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, "tool-group");
+  assert.deepEqual(
+    result[0].entries.map((e) => e.item_id),
+    ["cmd-a", "tool-b", "cmd-c"]
+  );
+});
+
+test("groupToolEntries keeps a still-running command inline (renders live)", () => {
+  const running = makeCommand("cmd-run", { status: "running" });
+  const result = groupToolEntries([running]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].kind, "command");
+  assert.equal(result[0].item_id, "cmd-run");
+});
+
+test("groupToolEntries keeps a failed command inline (stays visible)", () => {
+  const failed = makeCommand("cmd-fail", { status: "failed" });
+  const result = groupToolEntries([failed]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].kind, "command");
+  assert.equal(result[0].item_id, "cmd-fail");
 });
 
 test("groupToolEntries splits when text or reasoning breaks the run", () => {
@@ -1412,6 +1480,34 @@ test("TranscriptContent renders a collapsed group chip for consecutive completed
   assert.match(markup, /··· 3 tool calls/);
   // Members should NOT render when the group is collapsed.
   assert.doesNotMatch(markup, /chat-message-system[^>]*>(?:(?!chat-message-tool-group)[\s\S])*?Bash/);
+});
+
+test("TranscriptContent collapses consecutive Codex commands into one group chip", () => {
+  // Regression: Codex shell commands (kind "command") used to stack as loose
+  // cards because only kind "tool_call" was groupable. They must fold into the
+  // same collapsed chip as Claude tool calls, hiding the command previews.
+  const markup = renderTranscriptContentMarkup([
+    makeCommand("cmd-a"),
+    makeCommand("cmd-b"),
+    makeCommand("cmd-c"),
+  ]);
+  assert.match(markup, /chat-message-tool-group/);
+  assert.match(markup, /data-expand-key="group:cmd-a"/);
+  assert.match(markup, /··· 3 tool calls/);
+  // Collapsed: the individual command previews must not be visible yet.
+  assert.doesNotMatch(markup, /command-preview/);
+  assert.doesNotMatch(markup, /data-transcript-entry-kind="command"/);
+});
+
+test("TranscriptContent renders Codex command group members when expanded", () => {
+  const markup = renderTranscriptContentMarkup(
+    [makeCommand("cmd-a"), makeCommand("cmd-b")],
+    null,
+    { expandedKeys: new Set(["group:cmd-a"]) }
+  );
+  assert.match(markup, /tool-group-chip-open/);
+  const previewCount = (markup.match(/command-preview/g) || []).length;
+  assert.equal(previewCount, 2);
 });
 
 test("TranscriptContent renders a collapsed reasoning-group chip and hides empty reasoning", () => {

@@ -1391,7 +1391,11 @@ function isGroupableReasoning(entry) {
 }
 
 function isGroupableCompletedTool(entry) {
-  if (!entry || entry.kind !== "tool_call") {
+  // Claude routes every tool use through kind "tool_call"; Codex routes shell
+  // commands through kind "command" (its file edits are tool_call/fileChange).
+  // Fold both into the same collapsible tool-group so Codex command runs
+  // collapse just like Claude tool calls instead of stacking as loose cards.
+  if (!entry || (entry.kind !== "tool_call" && entry.kind !== "command")) {
     return false;
   }
   const status = entry.status || "completed";
