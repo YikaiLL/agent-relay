@@ -5,6 +5,7 @@ mod codex;
 mod codex_local;
 mod fake_provider;
 mod file_changes;
+mod instance_lock;
 mod protocol;
 #[cfg(test)]
 mod protocol_tests;
@@ -166,6 +167,53 @@ async fn main() {
         info!("relay-server API auth is disabled because the server is bound to loopback only");
     }
 
+    // One live relay-server per RELAY_STATE_PATH: a second process for the
+    // same session file must not become a concurrent writer (that corrupts /
+    // forks session.json). The dev restart scripts `pkill` the previous relay
+    // before starting, so they never find the lock held. `npx sealwire` and
+    // the desktop app don't, so for them a second start for the same workspace
+    // refuses with a clear message pointing at the one already running. See
+    // instance_lock's module docs (real OS file lock; refuse, don't attach).
+    // Escape hatch (RELAY_DISABLE_INSTANCE_LOCK) for anything that genuinely
+    // needs multiple instances on one state path (e.g. some test harnesses).
+    let state_path = state::resolved_state_path();
+    // Resolve (canonicalize) RELAY_STATE_PATH and pin the env var to the
+    // result BEFORE AppState::new() (and therefore PersistenceStore) reads it
+    // — see instance_lock::resolve_identity: otherwise persistence's first
+    // atomic save (rename onto an existing symlink replaces the symlink) would
+    // sever a symlinked state path, and a later process re-resolving it would
+    // take a different lock, reintroducing the duplicate-writer bug.
+    let state_path = instance_lock::resolve_identity(&state_path).unwrap_or_else(|error| {
+        eprintln!("relay-server: {error}");
+        std::process::exit(1);
+    });
+    std::env::set_var("RELAY_STATE_PATH", &state_path);
+
+    let lock_guard = if instance_lock::disabled_via_env() {
+        None
+    } else {
+        match instance_lock::acquire(&state_path) {
+            Ok(instance_lock::LockOutcome::Acquired(guard)) => Some(guard),
+            Ok(instance_lock::LockOutcome::AlreadyRunning(owner)) => {
+                let location = owner
+                    .map(|owner| format!(" (pid {}, port {})", owner.pid, owner.port))
+                    .unwrap_or_default();
+                eprintln!(
+                    "relay-server: another relay is already running for this workspace{location}. \
+                     Refusing to start a second instance for the same RELAY_STATE_PATH ({}) — stop \
+                     it first, or use the one that's already running.",
+                    state_path.display()
+                );
+                std::process::exit(1);
+            }
+            Err(error) => {
+                panic!(
+                    "failed to acquire the relay-server instance lock for {state_path:?}: {error}"
+                );
+            }
+        }
+    };
+
     let state = AppState::new()
         .await
         .expect("failed to initialize Codex app-server bridge");
@@ -185,9 +233,20 @@ async fn main() {
         .await
         .expect("failed to bind tcp listener");
 
+    // Best-effort {pid, port} so a later process that loses the lock can point
+    // the user at this one; never load-bearing (the OS lock is the guarantee).
+    if let Some(guard) = &lock_guard {
+        if let Err(error) = guard.record_owner(port) {
+            warn!("failed to record relay-server instance lock owner info: {error}");
+        }
+    }
+
     axum::serve(listener, app)
         .await
         .expect("server exited unexpectedly");
+    // `lock_guard` (if any) is dropped here, releasing the OS lock as the
+    // process exits — kept alive up to this point on purpose (see
+    // InstanceLockGuard's doc comment).
 }
 
 fn build_router(context: AppContext, web_assets: WebAssets) -> Router {

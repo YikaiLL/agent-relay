@@ -452,14 +452,22 @@ independent: `auth_mode=public` + `security=private` is the recommended
 combination — use the hosted broker for transport, keep payloads end-to-end
 encrypted so the broker stays blind to content.
 
-Optional, but useful in practice:
+By default, **don't** set `RELAY_STATE_PATH` here: leaving it unset means a
+public-broker relay and a localhost-only relay started from the same
+workspace share the same `.agent-relay/session.json` — so reviewer threads,
+projects, and paired devices survive switching between the two, instead of
+silently forking into two separate histories. (Only one relay can run against
+a given state file at a time: if you try to start a second one for the same
+workspace, it refuses with a message pointing at the one already running,
+rather than corrupting the shared file. Stop the first, or just use it.)
+
+Only set your own `RELAY_STATE_PATH` if you deliberately want an isolated,
+throwaway environment (e.g. a scratch/test workspace whose state you don't
+want mixed with your regular one):
 
 ```ini
 RELAY_STATE_PATH=.agent-relay/public-session.json
 ```
-
-This isolates state from any other localhost-only relay you may already run in
-the same workspace.
 
 Notes:
 

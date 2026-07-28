@@ -63,6 +63,18 @@ const MAX_LOG_LINES: usize = 200;
 const PERSISTED_STATE_VERSION: u32 = 2;
 const DEFAULT_STATE_FILE: &str = ".agent-relay/session.json";
 
+/// The absolute-ish path this process would persist its session state to,
+/// resolved the exact same way `AppState::new` resolves it (`RELAY_STATE_PATH`
+/// env override, else `<cwd>/.agent-relay/session.json`). Exposed so `main`
+/// can compute a settings fingerprint and check for an already-running
+/// instance *before* paying for `AppState::new()`'s full async init.
+pub(crate) fn resolved_state_path() -> PathBuf {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    persistence::PersistenceStore::resolve(&cwd)
+        .path()
+        .to_path_buf()
+}
+
 /// Shared session-settings invariants for the test harness.
 ///
 /// Every config bug we have hit was the same shape: a per-session setting

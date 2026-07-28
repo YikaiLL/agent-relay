@@ -238,9 +238,18 @@ impl PersistenceStore {
             .map_err(|error| format!("failed to encode persisted state: {error}"))?;
         let temporary_path = self.path.with_extension("tmp");
 
-        tokio::fs::write(&temporary_path, serialized)
-            .await
-            .map_err(|error| format!("failed to write temporary persisted state file: {error}"))?;
+        // Atomic exclusive-create, not check-then-write: closes both a
+        // TOCTOU race and a hard-link bypass a plain write would leave open.
+        // Runs on the blocking pool since it's sync I/O shared with
+        // `instance_lock::record_owner`.
+        let write_path = temporary_path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::instance_lock::write_new_exclusive(&write_path, &serialized)
+        })
+        .await
+        .map_err(|error| format!("temp file write task panicked: {error}"))?
+        .map_err(|error| format!("failed to write temporary persisted state file: {error}"))?;
+
         tokio::fs::rename(&temporary_path, &self.path)
             .await
             .map_err(|error| format!("failed to replace persisted state file: {error}"))?;
@@ -283,4 +292,129 @@ pub(super) fn spawn_persistence_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only the fields WITHOUT `#[serde(default)]` need to be supplied here —
+    // everything else (maps/vecs the rest of the struct carries) defaults to
+    // empty, which is fine for a save() round-trip test that only cares about
+    // the temp-file write path, not the content.
+    fn sample_state() -> PersistedRelayState {
+        serde_json::from_str(
+            r#"{
+                "schema_version": 2,
+                "active_thread_id": null,
+                "active_controller_device_id": null,
+                "active_controller_last_seen_at": null,
+                "current_status": "idle",
+                "active_flags": [],
+                "current_cwd": "/tmp",
+                "model": "test-model",
+                "approval_policy": "untrusted",
+                "sandbox": "workspace-write",
+                "reasoning_effort": "medium"
+            }"#,
+        )
+        .expect("sample_state JSON must match PersistedRelayState's non-defaulted fields")
+    }
+
+    // `session.tmp` is a different filename than the state path itself, so
+    // the startup-time symlink check on the state path doesn't cover it.
+    #[tokio::test]
+    async fn save_refuses_a_preplanted_symlink_at_the_temp_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"do not touch me").unwrap();
+
+        let state_path = dir.path().join("session.json");
+        let temp_path = state_path.with_extension("tmp");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &temp_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&victim, &temp_path).unwrap();
+
+        let store = PersistenceStore::from_path(state_path.clone());
+        let result = store.save(&sample_state()).await;
+
+        assert!(
+            result.is_err(),
+            "save() must refuse to write through a pre-planted symlink at the temp file path"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"do not touch me",
+            "the external file the planted symlink points to must be untouched"
+        );
+        assert!(
+            !state_path.exists(),
+            "save() must not have completed the rename onto the real state path either"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_succeeds_when_no_temp_file_symlink_is_planted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("session.json");
+        let store = PersistenceStore::from_path(state_path.clone());
+
+        store.save(&sample_state()).await.unwrap();
+
+        assert!(state_path.exists(), "save() must write the real state path");
+        assert!(
+            !state_path.with_extension("tmp").exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+    }
+
+    // A hard link passes a symlink-only check but shares content with its
+    // victim via the inode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_refuses_a_preplanted_hard_link_at_the_temp_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"do not touch me").unwrap();
+
+        let state_path = dir.path().join("session.json");
+        let temp_path = state_path.with_extension("tmp");
+        std::fs::hard_link(&victim, &temp_path).unwrap();
+
+        let store = PersistenceStore::from_path(state_path.clone());
+        let result = store.save(&sample_state()).await;
+
+        assert!(
+            result.is_err(),
+            "save() must refuse to write through a pre-planted hard link at the temp file path"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"do not touch me",
+            "the external file the planted hard link points to must be untouched"
+        );
+        assert!(
+            !state_path.exists(),
+            "save() must not have completed the rename onto the real state path either"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_recovers_from_an_ordinary_stale_leftover_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("session.json");
+        let temp_path = state_path.with_extension("tmp");
+        std::fs::write(&temp_path, b"stale leftover from a previous crash").unwrap();
+
+        let store = PersistenceStore::from_path(state_path.clone());
+        store.save(&sample_state()).await.unwrap();
+
+        assert!(state_path.exists(), "save() must write the real state path");
+        assert!(
+            !temp_path.exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+    }
 }
