@@ -942,7 +942,70 @@ fn app_with_web_root_and_verifier_and_hardening_and_licenses(
             security_headers,
             with_security_headers,
         ))
+        .layer(middleware::from_fn(with_cache_headers))
         .layer(TraceLayer::new_for_http())
+}
+
+/// Cache policy for the broker's HTTP surface (the remote/PWA UI plus the
+/// control-plane API). Without this the HTML shell is served with no
+/// `Cache-Control`, so browsers heuristically cache `remote.html` — which pins
+/// them to the OLD content-hashed asset filenames it references, so a rebuilt
+/// bundle never loads even though the broker has already redeployed (a
+/// fresh/incognito profile has no cached entry, so it always looks fine — which
+/// is what made this hard to notice). Mirrors `cache_control_for` in
+/// `relay-server/src/main.rs`, hardened for the broker's authenticated API:
+///
+/// - `/api/*` is `no-store` on every status. These responses are client-specific
+///   and often cookie-authenticated (e.g. `GET /api/public/relays` returns a
+///   per-client relay directory). With no `Cache-Control`, a browser or shared
+///   intermediary is free to store and reuse them, risking stale data or
+///   cross-client disclosure. `no-store` also covers error bodies. It's a
+///   security invariant, so `with_cache_headers` FORCES it — no `/api/` handler
+///   can weaken it to a cacheable policy.
+/// - Content-hashed bundles under `/static/assets/` are immutable; the HTML shell,
+///   `sw.js`, and every other non-hashed static file always revalidate
+///   (`no-cache`). This applies to a `200` AND to the `304 Not Modified` a
+///   conditional request produces — RFC 9110 §15.4.5 requires the 304 to carry
+///   the same `Cache-Control` the 200 would, and tower-http's ServeDir/ServeFile
+///   emit 304s without one.
+/// - Any other non-success static response (a `404` for a missing asset, a `5xx`)
+///   is `no-store`: never `immutable` (a year-long negative cache) and never bare
+///   (RFC 9110 §15.5.5 lets a bare 404 be heuristically negative-cached).
+fn cache_control_for(path: &str, status: StatusCode) -> Option<&'static str> {
+    if path.starts_with("/api/") {
+        return Some("no-store");
+    }
+    // A conditional request revalidates to `304 Not Modified`; treat it exactly
+    // like the success it stands in for so the policy survives revalidation.
+    let cacheable = status.is_success() || status == StatusCode::NOT_MODIFIED;
+    if !cacheable {
+        return Some("no-store");
+    }
+    if path.starts_with("/static/assets/") {
+        Some("public, max-age=31536000, immutable")
+    } else {
+        Some("no-cache")
+    }
+}
+
+async fn with_cache_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    if let Some(value) = cache_control_for(&path, response.status()) {
+        let value = HeaderValue::from_static(value);
+        if path.starts_with("/api/") {
+            // Security invariant: force `no-store` so no `/api/` handler can leave
+            // client-specific data cacheable, even by mistake.
+            response.headers_mut().insert(header::CACHE_CONTROL, value);
+        } else {
+            // Static surface: leave a handler's own `Cache-Control` intact.
+            response
+                .headers_mut()
+                .entry(header::CACHE_CONTROL)
+                .or_insert(value);
+        }
+    }
+    response
 }
 
 async fn health(State(state): State<BrokerAppState>) -> impl IntoResponse {

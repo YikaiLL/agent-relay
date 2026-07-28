@@ -365,6 +365,11 @@ fn test_web_root() -> PathBuf {
     )
     .expect("icon should write");
     fs::write(assets.join("remote-test.js"), "console.log('remote');").expect("asset should write");
+    // A non-hashed static file served from the web root (not /static/assets/):
+    // the frontend fetches this at runtime to detect new builds, so it must
+    // revalidate rather than be cached immutable.
+    fs::write(root.join("build-meta.json"), r#"{"build":"test"}"#)
+        .expect("build meta should write");
     root
 }
 
@@ -967,6 +972,230 @@ async fn security_headers_are_present_on_static_and_api_routes() {
     }
 }
 
+// Regression test for the "broker feels like it's still serving the old UI"
+// bug: without an explicit Cache-Control, browsers heuristically cache the
+// HTML shell (and sw.js), pinning them to stale content-hashed asset
+// filenames after a redeploy — a fresh/incognito profile (no cached entry)
+// always looked fine, masking the bug. relay-server already carries this
+// fix (see `cache_control_for` there); the broker never got it even though
+// it serves the actual remote/PWA surface users hit.
+#[tokio::test]
+async fn cache_control_headers_are_set_across_the_broker_surface() {
+    let address = spawn_app().await;
+
+    let root = http_get(address, "/").await.to_ascii_lowercase();
+    assert!(
+        root.contains("cache-control: no-cache"),
+        "expected the HTML shell to always revalidate, got: {root}"
+    );
+
+    let sw = http_get(address, "/sw.js").await.to_ascii_lowercase();
+    assert!(
+        sw.contains("cache-control: no-cache"),
+        "expected sw.js to always revalidate, got: {sw}"
+    );
+
+    let asset = http_get(address, "/static/assets/remote-test.js")
+        .await
+        .to_ascii_lowercase();
+    assert!(
+        asset.contains("cache-control: public, max-age=31536000, immutable"),
+        "expected a content-hashed asset to be cached forever, got: {asset}"
+    );
+
+    // A non-hashed static file (served from the web root, not /static/assets/)
+    // must revalidate too, so a redeploy is picked up.
+    let build_meta = http_get(address, "/static/build-meta.json")
+        .await
+        .to_ascii_lowercase();
+    assert!(
+        build_meta.contains("cache-control: no-cache"),
+        "expected a non-hashed static file to always revalidate, got: {build_meta}"
+    );
+
+    // A missing hashed asset (404) must be no-store — not stamped immutable, and
+    // not left bare (a bare 404 can be heuristically negative-cached).
+    let missing = http_get(address, "/static/assets/does-not-exist-deadbeef.js")
+        .await
+        .to_ascii_lowercase();
+    assert!(
+        missing.contains("404"),
+        "expected a missing asset to 404, got: {missing}"
+    );
+    assert!(
+        missing.contains("cache-control: no-store"),
+        "expected a 404 asset to be no-store, got: {missing}"
+    );
+
+    // API responses are client-specific / cookie-authenticated — never cache.
+    let health = http_get(address, "/api/health").await.to_ascii_lowercase();
+    assert!(
+        health.contains("cache-control: no-store"),
+        "expected /api/* to be no-store, got: {health}"
+    );
+}
+
+// A conditional request for a static asset comes back 304 Not Modified. Per
+// RFC 9110 §15.4.5 the 304 must carry the same Cache-Control the 200 would,
+// otherwise a revalidating cache can lose the policy. tower-http's
+// ServeDir/ServeFile emit 304s without any Cache-Control, so the middleware has
+// to supply it.
+#[tokio::test]
+async fn conditional_static_request_304_keeps_cache_policy() {
+    let address = spawn_app().await;
+
+    // Learn the validator from the first (200) fetch.
+    let first = http_get(address, "/static/assets/remote-test.js").await;
+    assert!(
+        first.starts_with("HTTP/1.1 200"),
+        "expected first asset fetch to be 200, got: {first}"
+    );
+    let last_modified =
+        raw_header_value(&first, "last-modified").expect("asset 200 should carry Last-Modified");
+
+    // Revalidate → 304, which must still be immutable.
+    let revalidated = http_get_with_headers(
+        address,
+        "/static/assets/remote-test.js",
+        &[("If-Modified-Since", &last_modified)],
+    )
+    .await;
+    assert!(
+        revalidated.starts_with("HTTP/1.1 304"),
+        "expected a conditional asset request to 304, got: {revalidated}"
+    );
+    assert!(
+        revalidated
+            .to_ascii_lowercase()
+            .contains("cache-control: public, max-age=31536000, immutable"),
+        "expected the 304 to keep the immutable policy, got: {revalidated}"
+    );
+}
+
+/// Extract a single header value (case-insensitive name) from a raw HTTP/1.1
+/// response string, returning the trimmed value with its original casing.
+fn raw_header_value(raw_response: &str, name: &str) -> Option<String> {
+    raw_response
+        .split("\r\n")
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+}
+
+// Pins the security-critical asymmetry in `with_cache_headers`: for `/api/*` it
+// FORCES `no-store` over whatever the handler set (so a handler can never leave
+// private data cacheable, even by mistake), while for the static surface it
+// PRESERVES a handler's own `Cache-Control`. Without this, a future refactor
+// collapsing the two branches into a uniform "don't overwrite" would silently
+// reopen the private-API caching hole with every existing test still green.
+#[tokio::test]
+async fn with_cache_headers_forces_no_store_over_a_handler_set_api_policy() {
+    async fn cacheable_api() -> impl IntoResponse {
+        // A misbehaving API handler trying to make a private response cacheable.
+        ([(header::CACHE_CONTROL, "public, max-age=999")], "secret")
+    }
+    async fn opinionated_static() -> impl IntoResponse {
+        ([(header::CACHE_CONTROL, "public, max-age=42")], "asset")
+    }
+
+    let app = Router::new()
+        .route("/api/misconfigured", get(cacheable_api))
+        .route("/static/opinionated", get(opinionated_static))
+        .layer(middleware::from_fn(with_cache_headers));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .expect("test router should serve");
+    });
+
+    // API: the handler's `public` policy is overridden with the forced no-store.
+    let api = http_get(address, "/api/misconfigured")
+        .await
+        .to_ascii_lowercase();
+    assert!(
+        api.contains("cache-control: no-store"),
+        "expected /api/* to be forced to no-store, got: {api}"
+    );
+    assert!(
+        !api.contains("max-age=999"),
+        "expected the handler's cacheable policy to be dropped, got: {api}"
+    );
+
+    // Static: the middleware leaves a handler's explicit policy intact.
+    let stat = http_get(address, "/static/opinionated")
+        .await
+        .to_ascii_lowercase();
+    assert!(
+        stat.contains("cache-control: public, max-age=42"),
+        "expected a static handler's own policy to be preserved, got: {stat}"
+    );
+}
+
+#[test]
+fn cache_control_policy_for_static_surface() {
+    // Hashed bundles are immutable on success...
+    assert_eq!(
+        cache_control_for("/static/assets/remote-deadbeef.js", StatusCode::OK),
+        Some("public, max-age=31536000, immutable")
+    );
+    // ...and a 304 Not Modified on revalidation must carry the SAME policy the
+    // 200 would (RFC 9110 §15.4.5), so a conditional request doesn't drop it.
+    assert_eq!(
+        cache_control_for(
+            "/static/assets/remote-deadbeef.js",
+            StatusCode::NOT_MODIFIED
+        ),
+        Some("public, max-age=31536000, immutable")
+    );
+    // A missing hashed asset must NOT be cached at all — not immutable (a
+    // year-long positive-then-negative cache) and not heuristically (RFC 9110
+    // §15.5.5 lets a 404 be heuristically cached). `no-store` forbids both.
+    assert_eq!(
+        cache_control_for("/static/assets/remote-deadbeef.js", StatusCode::NOT_FOUND),
+        Some("no-store")
+    );
+    // The HTML shell, sw.js, and other non-hashed static files revalidate —
+    // on both the 200 and its 304.
+    assert_eq!(cache_control_for("/", StatusCode::OK), Some("no-cache"));
+    assert_eq!(
+        cache_control_for("/", StatusCode::NOT_MODIFIED),
+        Some("no-cache")
+    );
+    assert_eq!(
+        cache_control_for("/sw.js", StatusCode::OK),
+        Some("no-cache")
+    );
+    // Any other non-success static response is no-store, never left unset.
+    assert_eq!(
+        cache_control_for("/missing", StatusCode::NOT_FOUND),
+        Some("no-store")
+    );
+    // Every API response is no-store — client-specific and often
+    // cookie-authenticated, so it must never be cached by a browser or a shared
+    // intermediary. This holds even for error statuses.
+    assert_eq!(
+        cache_control_for("/api/health", StatusCode::OK),
+        Some("no-store")
+    );
+    assert_eq!(
+        cache_control_for("/api/public/relays", StatusCode::OK),
+        Some("no-store")
+    );
+    assert_eq!(
+        cache_control_for("/api/public/relays", StatusCode::UNAUTHORIZED),
+        Some("no-store")
+    );
+}
+
 #[tokio::test]
 async fn strict_transport_security_is_only_sent_for_secure_requests_when_enabled() {
     let address = spawn_app_with(
@@ -1471,6 +1700,63 @@ async fn public_client_session_cookie_can_list_relays() {
     assert_eq!(relays.client_id, grant.client_id);
     assert_eq!(relays.relays.len(), 1);
     assert_eq!(relays.relays[0].relay_id, "relay-1");
+}
+
+// Regression test: the cookie-authenticated relay directory is client-specific
+// private data. If the origin sends no `Cache-Control`, a browser or shared
+// intermediary is free to store and reuse it, risking stale data or
+// cross-client disclosure. Every `/api/*` response must be `no-store` so
+// authenticated JSON is never cached.
+#[tokio::test]
+async fn cookie_authenticated_relay_directory_is_no_store() {
+    let address = spawn_public_mode_app().await;
+    let signing_key = SigningKey::from_bytes(&[24_u8; 32]);
+
+    let grant: ClientGrantResponse = public_post(
+        address,
+        "/api/public/clients/grants",
+        "relay-refresh-1",
+        &ClientGrantRequest {
+            relay_id: "relay-1".to_string(),
+            broker_room_id: "room-a".to_string(),
+            device_id: "device-no-store".to_string(),
+            client_verify_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+            client_label: Some("Tablet".to_string()),
+            device_label: Some("Tablet".to_string()),
+        },
+    )
+    .await;
+
+    let session_response = public_post_response(
+        address,
+        "/api/public/client/session",
+        &grant.client_refresh_token,
+        &serde_json::json!({}),
+    )
+    .await
+    .error_for_status()
+    .expect("client session request should succeed");
+    let cookie = set_cookie_name_value(&session_response);
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/api/public/relays"))
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .await
+        .expect("cookie relay directory request should complete")
+        .error_for_status()
+        .expect("cookie relay directory request should succeed");
+
+    let cache_control = response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    assert_eq!(
+        cache_control.as_deref(),
+        Some("no-store"),
+        "cookie-authenticated relay directory must not be cacheable"
+    );
 }
 
 #[tokio::test]
