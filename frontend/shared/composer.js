@@ -1,6 +1,11 @@
 import React from "react";
 
 import { SEND_SVG } from "../svg.js";
+import {
+  createComposerKeydownHandler,
+  defaultEnterSubmits,
+  defaultRemapHomeEnd,
+} from "./composer-keys.js";
 
 const h = React.createElement;
 
@@ -45,6 +50,7 @@ export function ConversationComposer({
   composerDisabled = false,
   currentDraft,
   currentModelValue,
+  enterSubmits,
   messageId = "remote-message-input",
   messagePlaceholder = "",
   modelId = "remote-message-model",
@@ -52,6 +58,7 @@ export function ConversationComposer({
   onDraftChange = null,
   onModelChange = null,
   onStop = null,
+  remapHomeEnd,
   sendDisabled = false,
   sendButtonId = "remote-send-button",
   sendLabel = "Send",
@@ -70,6 +77,17 @@ export function ConversationComposer({
     placeholder: messagePlaceholder,
     rows: 1,
   };
+
+  // Desktop: Enter sends, Shift+Enter is a newline. Apple platforms: remap
+  // Home/End to move the caret to the logical-line start/end (native macOS
+  // moves it nowhere useful). Both policies resolve to the environment default
+  // unless the surface passes an explicit prop. See composer-keys.js.
+  const submitOnEnter = typeof enterSubmits === "boolean" ? enterSubmits : defaultEnterSubmits();
+  const remapCaretKeys = typeof remapHomeEnd === "boolean" ? remapHomeEnd : defaultRemapHomeEnd();
+  textareaProps.onKeyDown = createComposerKeydownHandler({
+    enterSubmits: submitOnEnter,
+    remapHomeEnd: remapCaretKeys,
+  });
   const modelSelectProps = {
     id: modelId,
     className: "composer-model-chip",

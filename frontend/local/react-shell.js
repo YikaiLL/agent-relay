@@ -573,6 +573,8 @@ function ComposerShell() {
           hidden: true,
           id: "composer-attachments",
         }),
+        // The local surface is always desktop: Enter sends, Shift+Enter is a newline.
+        enterSubmits: true,
         messageId: "message-input",
         messagePlaceholder: "Start or open a session first.",
         modelId: "message-model",
