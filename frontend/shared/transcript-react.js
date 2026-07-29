@@ -4,6 +4,7 @@ import React, {
   useReducer,
   useRef,
 } from "react";
+import { canApplyPatch } from "./file-change-actions.js";
 import {
   Virtualizer,
   elementScroll,
@@ -1243,7 +1244,13 @@ function GenericToolEntry({ entry, isJustPrepended = false, options = null }) {
               const isTurnDiff = tool.item_type === "turnDiff";
               const isLastTurnDiff =
                 isTurnDiff && itemId && itemId === options?.lastTurnDiffItemId;
-              if (!options?.enableFileChangeActions || !isLastTurnDiff) {
+              // A patch git cannot apply makes this control a guaranteed failure —
+              // check the patch itself, not the provider (see canApplyPatch).
+              if (
+                !options?.enableFileChangeActions ||
+                !isLastTurnDiff ||
+                !canApplyPatch(tool)
+              ) {
                 return null;
               }
               return turnDiffUndoAction(itemId, tool.apply_state);
@@ -1699,10 +1706,12 @@ function DiffGroupEntry({ group, options = null }) {
     (entry) => entry?.tool?.item_type !== "turnDiff"
   );
   const turnDiffRendersAsMember = expanded && !hasFileChangeMembers;
-  const undoEntry =
+  const undoCandidate =
     !turnDiffRendersAsMember && options?.enableFileChangeActions && lastTurnDiffItemId
       ? (group?.entries || []).find((entry) => entry?.item_id === lastTurnDiffItemId)
       : null;
+  // Same rule as the expanded entry: a patch git cannot apply must not offer the action.
+  const undoEntry = canApplyPatch(undoCandidate?.tool) ? undoCandidate : null;
 
   return h(
     "article",

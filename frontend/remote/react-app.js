@@ -10,7 +10,6 @@ import React, {
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { fetchBuildInfo } from "../shared/build-badge.js";
-import { canApplyFileChanges } from "../shared/file-change-actions.js";
 import { ClientLog } from "../shared/client-log.js";
 import { createAskUserQuestionDetailLoader } from "../shared/ask-user-question-detail-loader.js";
 import {
@@ -2585,7 +2584,7 @@ function RemoteTranscriptPanel({
       transcriptOptions: {
         currentCwd: session?.current_cwd || "",
         detailEntries: transcriptDetailEntries,
-        enableFileChangeActions: sessionView.canWrite && canApplyFileChanges(session),
+        enableFileChangeActions: sessionView.canWrite,
         expandedItemIds: uiState.transcriptExpandedItemIds,
         expandedKeys: uiState.transcriptExpandedItemIds,
         loadingItemIds: uiState.transcriptLoadingItemIds,

@@ -458,3 +458,86 @@ function gitApply(cwd, diff, args = []) {
     child.stdin.end(diff);
   });
 }
+
+// The stored diff is piped straight to `git apply` for Undo/Reapply. Claude Code always
+// passes ABSOLUTE file paths, and rendering those into the patch header produced
+// `diff --git a//Users/...`, which git refuses outright as `invalid path` — so Undo could
+// never work on a Claude thread. The header must be repo-relative.
+//
+// The `path` FIELD stays absolute on purpose: it is a separate field, and it is what
+// lets the relay tell which worktree a thread has been writing in.
+test("the patch header is relative to the session cwd while path stays absolute", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hdr-"));
+  const abs = path.join(root, "x.js");
+  await fs.writeFile(abs, "line1\n");
+
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Edit",
+    args: { file_path: abs, old_string: "line1", new_string: "CHANGED" },
+  });
+  await fs.writeFile(abs, "CHANGED\n");
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+
+  const change = out.tool.file_changes[0];
+  assert.equal(change.path, abs, "the path field must stay absolute for worktree attribution");
+  assert.match(
+    change.diff,
+    /^diff --git a\/x\.js b\/x\.js$/m,
+    `the header must be repo-relative; got:\n${change.diff.split("\n").slice(0, 3).join("\n")}`
+  );
+  assert.doesNotMatch(change.diff, /a\/\//, "an absolute header is what git rejects");
+});
+
+test("a file in a subdirectory keeps its subdirectory in the header", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hdr-"));
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  const abs = path.join(root, "src", "y.js");
+  await fs.writeFile(abs, "line1\n");
+
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Edit",
+    args: { file_path: abs, old_string: "line1", new_string: "CHANGED" },
+  });
+  await fs.writeFile(abs, "CHANGED\n");
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+
+  assert.match(out.tool.file_changes[0].diff, /^diff --git a\/src\/y\.js b\/src\/y\.js$/m);
+});
+
+// A file OUTSIDE the session cwd (an agent working in a linked worktree) cannot be
+// expressed relative to this repo — `../other/x.js` is refused by git just the same.
+// Applying it needs to run in the worktree that owns the file, which is separate work;
+// until then the header stays absolute so it is honestly unappliable rather than
+// looking valid and corrupting the wrong tree.
+test("a file outside the session cwd keeps an absolute (unappliable) header", async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), "hdr-"));
+  const root = path.join(base, "repo");
+  const outside = path.join(base, "linked");
+  await fs.mkdir(root, { recursive: true });
+  await fs.mkdir(outside, { recursive: true });
+  const abs = path.join(outside, "z.js");
+  await fs.writeFile(abs, "line1\n");
+
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Edit",
+    args: { file_path: abs, old_string: "line1", new_string: "CHANGED" },
+  });
+  await fs.writeFile(abs, "CHANGED\n");
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+
+  const change = out.tool.file_changes[0];
+  assert.equal(change.path, abs);
+  assert.ok(
+    change.diff.includes(`a${abs}`) || change.diff.includes(`a/${abs}`),
+    `an out-of-tree file must not be rewritten to an escaping relative path; got:\n${change.diff.split("\n")[0]}`
+  );
+});

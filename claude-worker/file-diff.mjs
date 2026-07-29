@@ -121,7 +121,12 @@ export function createFileDiffTracker(cwd) {
           ? null
           : intendedPostimage(call.toolName, call.input, call.before.content);
         const reconstructed = postimage != null
-          ? buildFileChange(call.filePath, call.before.content, postimage)
+          ? buildFileChange(
+              call.filePath,
+              call.before.content,
+              postimage,
+              patchHeaderPath(root, call.filePath)
+            )
           : { path: call.filePath, change_type: "modify", diff: "" };
         const tool = fileChangeTool({
           toolName: call.toolName,
@@ -142,7 +147,8 @@ export function createFileDiffTracker(cwd) {
           : buildFileChange(
               call.filePath,
               call.before.exists ? call.before.content : null,
-              after.exists ? after.content : null
+              after.exists ? after.content : null,
+              patchHeaderPath(root, call.filePath)
             );
 
       // Fill in from the input-reconstructed fallback only when the on-disk diff
@@ -188,17 +194,38 @@ async function readTextSnapshot(filePath) {
   }
 }
 
-function buildFileChange(filePath, oldContent, newContent) {
+// `headerPath` is what goes INSIDE the patch (`diff --git a/<headerPath> ...`), which
+// git requires to be repo-relative. It is deliberately separate from `path`, the field
+// consumers read to know WHICH file changed — that one stays absolute so the relay can
+// tell which worktree a thread has been writing in. Defaults to filePath for callers
+// with no repo root to relativize against.
+function buildFileChange(filePath, oldContent, newContent, headerPath = filePath) {
   const oldExists = oldContent !== null && oldContent !== undefined;
   const newExists = newContent !== null && newContent !== undefined;
   return {
     path: filePath,
     change_type: changeType(oldExists, newExists),
-    diff: renderFileDiff(filePath, oldExists ? oldContent : "", newExists ? newContent : "", {
+    diff: renderFileDiff(headerPath, oldExists ? oldContent : "", newExists ? newContent : "", {
       oldExists,
       newExists,
     }),
   };
+}
+
+// The path to write into the patch header. Relative to the repo root when the file is
+// inside it — the case `git apply` can actually handle. A file OUTSIDE the root (an
+// agent working in a linked worktree) has no valid relative form: `../other/x.js`
+// escapes the repo and git refuses it just as it refuses an absolute path. Keep it
+// absolute there so the patch is honestly unappliable rather than looking valid and
+// being applied against the wrong tree. Undoing those needs to run git in the worktree
+// that owns the file, which is separate work.
+function patchHeaderPath(root, filePath) {
+  if (!root || !path.isAbsolute(filePath)) return filePath;
+  const relative = path.relative(root, filePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return filePath;
+  }
+  return relative;
 }
 
 function changeType(oldExists, newExists) {
