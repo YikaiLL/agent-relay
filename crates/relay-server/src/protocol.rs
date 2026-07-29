@@ -1606,25 +1606,51 @@ pub(crate) fn patch_is_appliable(diff: &str) -> bool {
     if diff.is_empty() {
         return false;
     }
+
+    fn absolute_target(value: &str) -> bool {
+        value.starts_with("a//") || value.starts_with("b//")
+    }
+    fn bad_side(rest: &str) -> bool {
+        absolute_target(rest) || (rest.starts_with('/') && rest != "/dev/null")
+    }
+
+    // Validated per FILE SECTION, not once for the whole patch: a section that satisfies
+    // nothing of its own still rides along on an earlier section's headers under a global
+    // check, and git rejects it with `patch fragment without header`.
+    let mut sections = 0usize;
     let mut has_old = false;
     let mut has_new = false;
+    let mut section_open = false;
+
     for line in diff.lines() {
-        let absolute_target = |value: &str| value.starts_with("a//") || value.starts_with("b//");
         if let Some(rest) = line.strip_prefix("diff --git ") {
+            if section_open && !(has_old && has_new) {
+                return false;
+            }
             if rest.split_whitespace().any(absolute_target) {
                 return false;
             }
+            sections += 1;
+            section_open = true;
+            has_old = false;
+            has_new = false;
         } else if let Some(rest) = line.strip_prefix("--- ") {
-            if absolute_target(rest) || rest.starts_with('/') && rest != "/dev/null" {
+            if bad_side(rest) {
                 return false;
             }
             has_old = true;
         } else if let Some(rest) = line.strip_prefix("+++ ") {
-            if absolute_target(rest) || rest.starts_with('/') && rest != "/dev/null" {
+            if bad_side(rest) {
                 return false;
             }
             has_new = true;
         }
+    }
+
+    // A headerless patch (a bare hunk) has no section at all; the final section must be
+    // complete just like every earlier one.
+    if sections == 0 {
+        return has_old && has_new;
     }
     has_old && has_new
 }

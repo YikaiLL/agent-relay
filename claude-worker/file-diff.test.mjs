@@ -564,11 +564,12 @@ test("the input-reconstruction fallback also renders a relative header", async (
 
   const change = out.tool.file_changes[0];
   assert.equal(change.path, abs, "path stays absolute");
-  if (change.diff) {
-    assert.doesNotMatch(
-      change.diff,
-      /a\/\//,
-      `the fallback must not emit an absolute header; got:\n${change.diff.split("\n")[0]}`
-    );
-  }
+  // Assert the fallback actually produced a patch: guarding this with `if (change.diff)`
+  // would let the test pass silently if the fallback ever stopped emitting one.
+  assert.ok(change.diff, "the fallback must still produce a patch to check");
+  assert.doesNotMatch(
+    change.diff,
+    /a\/\//,
+    `the fallback must not emit an absolute header; got:\n${change.diff.split("\n")[0]}`
+  );
 });

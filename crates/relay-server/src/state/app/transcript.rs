@@ -31,7 +31,31 @@ impl AppState {
                 let entries = page.sync.transcript;
                 let mut relay = self.relay.write().await;
                 let runtime = relay.ensure_runtime_for_thread(&input.thread_id);
+                let page_item_ids = entries
+                    .iter()
+                    .filter_map(|entry| entry.item_id.clone())
+                    .collect::<Vec<_>>();
                 runtime.prepend_provider_history(entries.clone(), input.before, page.prev_cursor);
+                // Return the MERGED records, not the raw page. A page holding only a
+                // tool's request carries a non-terminal status and no result, because the
+                // result sits on another page; shipping that raw lets the client overwrite
+                // the settled entry it already has and show a finished edit as running.
+                let merged = page_item_ids
+                    .iter()
+                    .filter_map(|item_id| {
+                        runtime
+                            .transcript
+                            .iter()
+                            .find(|record| &record.item_id == item_id)
+                            .map(|record| record.to_view())
+                    })
+                    .collect::<Vec<_>>();
+                let entries = if merged.len() == entries.len() {
+                    merged
+                } else {
+                    // Some entry had no id to match on; fall back rather than drop rows.
+                    entries
+                };
                 return Ok(ThreadTranscriptResponse::from_provider_page(
                     input.thread_id,
                     entries,

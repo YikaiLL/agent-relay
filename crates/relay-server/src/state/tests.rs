@@ -4233,6 +4233,29 @@ mod paged_history_merge_tests {
         }
     }
 
+    fn make_runtime() -> ThreadRuntime {
+        ThreadRuntime::new(
+            crate::protocol::ThreadSummaryView {
+                id: "thread-1".to_string(),
+                name: None,
+                preview: String::new(),
+                cwd: "/repo".to_string(),
+                updated_at: 1,
+                source: "local".to_string(),
+                status: "idle".to_string(),
+                model_provider: "anthropic".to_string(),
+                provider: "claude_code".to_string(),
+                forked_from: None,
+            },
+            "/repo",
+            "sonnet",
+            "default",
+            "workspace-write",
+            "medium",
+            1,
+        )
+    }
+
     fn blank_tool(item_type: &str, name: &str) -> ToolCallView {
         ToolCallView {
             item_type: item_type.to_string(),
@@ -4253,6 +4276,34 @@ mod paged_history_merge_tests {
         }
     }
 
+    // A page cannot know that a tool finished — its result may simply be on another page.
+    // So an older page's non-terminal status must never overwrite a terminal one already
+    // recorded from a newer page, or a successful edit shows as running forever.
+    #[test]
+    fn an_older_page_never_downgrades_a_settled_status() {
+        let mut runtime = make_runtime();
+        runtime.prepend_provider_history(
+            vec![view("tool:t1", "completed", blank_tool("toolCall", "tool"))],
+            None,
+            None,
+        );
+        runtime.prepend_provider_history(
+            vec![view("tool:t1", "running", blank_tool("fileChange", "Edit"))],
+            None,
+            None,
+        );
+
+        let record = runtime
+            .transcript
+            .iter()
+            .find(|record| record.item_id == "tool:t1")
+            .expect("entry");
+        assert_eq!(
+            record.status, "completed",
+            "an older page must not un-settle an edit that already completed"
+        );
+    }
+
     // Paging can split a tool's request from its result. The newer page carries only the
     // RESULT, which replays as a generic entry with no path and no diff; the real
     // fileChange metadata lives on the older page's request. Dropping the older record as
@@ -4260,7 +4311,8 @@ mod paged_history_merge_tests {
     // evidence for the worktree suggestion — even though it succeeded.
     #[test]
     fn an_older_page_enriches_a_result_only_entry_instead_of_being_dropped() {
-        let mut runtime = ThreadRuntime::new(
+        let mut runtime = make_runtime();
+        let _unused = ThreadRuntime::new(
             crate::protocol::ThreadSummaryView {
                 id: "thread-1".to_string(),
                 name: None,

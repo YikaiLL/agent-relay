@@ -2692,6 +2692,31 @@ mod can_apply_flag_tests {
         );
     }
 
+    // Appliability is per FILE SECTION, not a property of the patch as a whole. A patch
+    // whose first file has a complete header and whose second has only `diff --git` plus
+    // a hunk satisfies a global "saw a --- and a +++" check, but `git apply` rejects it:
+    // `patch fragment without header`.
+    #[test]
+    fn a_later_section_missing_its_header_makes_the_patch_unappliable() {
+        let mut entry = turn_diff_entry("");
+        {
+            let tool = entry.tool.as_mut().unwrap();
+            tool.diff = Some(
+                "diff --git a/f1.js b/f1.js\n--- a/f1.js\n+++ b/f1.js\n@@ -1 +1 @@\n-a\n+b\n\
+                 diff --git a/f2.js b/f2.js\n@@ -1 +1 @@\n-a\n+b\n"
+                    .to_string(),
+            );
+            tool.file_changes = Vec::new();
+        }
+        let mut transcript = vec![entry];
+        strip_file_change_diffs_for_snapshot(&mut transcript);
+        assert_eq!(
+            transcript[0].tool.as_ref().unwrap().can_apply,
+            Some(false),
+            "one header-less section makes the whole patch unappliable"
+        );
+    }
+
     // Undo applies ONE patch built from all of the entry's changes, so appliability is a
     // property of that combined patch — not of any single change. A turn touching both
     // the session cwd and an outside worktree yields one relative and one absolute
