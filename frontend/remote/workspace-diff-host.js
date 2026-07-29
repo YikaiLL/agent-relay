@@ -30,8 +30,11 @@ export function getRemoteWorkspaceDiffStore() {
       // same-thread cwd change clears the previous diff; the actual fetch goes
       // through fetchDiff below.
       getWorkspaceKey: getRemoteViewedWorkspaceKey,
-      fetchDiff: async () => {
-        const data = await fetchRemoteWorkspaceDiff();
+      // Also needed so a pinned worktree root is remembered PER THREAD; without it
+      // every remote thread would share one pin.
+      getThreadId: getRemoteViewedThreadId,
+      fetchDiff: async (root) => {
+        const data = await fetchRemoteWorkspaceDiff(root);
         if (!data) {
           throw new Error("workspace_diff missing in remote response");
         }

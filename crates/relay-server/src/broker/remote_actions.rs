@@ -109,6 +109,10 @@ pub(super) enum RemoteActionRequest {
         /// `#[serde(default)]` keeps legacy clients (which send only `{}`) working.
         #[serde(default)]
         thread_id: Option<String>,
+        /// Which working tree to diff, from the roots enumerated for that session's
+        /// repo. Validated relay-side; a foreign path fails closed.
+        #[serde(default)]
+        root: Option<String>,
     },
     FetchReviews {
         #[serde(default)]
@@ -284,10 +288,14 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::ProjectAction { input }
             }
-            Self::FetchWorkspaceDiff { thread_id, .. } => Self::FetchWorkspaceDiff {
+            Self::FetchWorkspaceDiff {
+                thread_id, root, ..
+            } => Self::FetchWorkspaceDiff {
                 device_id: Some(device_id),
-                // Preserve the viewed session selector; only device_id is stamped here.
+                // Preserve the viewed session + root selectors; only device_id is
+                // stamped here.
                 thread_id,
+                root,
             },
             Self::FetchReviews { .. } => Self::FetchReviews {
                 device_id: Some(device_id),
@@ -1222,8 +1230,9 @@ async fn execute_remote_action(
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
+            root,
         } => state
-            .workspace_diff(device_id, thread_id)
+            .workspace_diff(device_id, thread_id, root)
             .await
             .map(|workspace_diff| RemoteActionOutcome {
                 workspace_diff: Some(workspace_diff),

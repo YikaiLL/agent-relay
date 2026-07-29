@@ -1470,6 +1470,21 @@ pub struct FileChangeDiffView {
     pub diff: String,
 }
 
+/// One selectable git working tree for the diff panel: the repository's main
+/// worktree plus every linked `git worktree`. Enumerated from the viewed session's
+/// own cwd, so the set can never name a repo the session has no access to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRootView {
+    /// Absolute path of the working tree root. This is the exact string a client
+    /// echoes back as the `root` selector, so it is compared verbatim (no
+    /// normalization, which would open a canonicalization bypass).
+    pub path: String,
+    /// Short branch name (`refs/heads/` stripped), or `None` for a detached HEAD.
+    pub branch: Option<String>,
+    /// True for the repository's main (non-linked) worktree.
+    pub is_main: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceDiffResponse {
     pub cwd: String,
@@ -1477,6 +1492,10 @@ pub struct WorkspaceDiffResponse {
     pub diff: String,
     pub truncated: bool,
     pub not_a_git_repo: bool,
+    /// Every working tree the viewed session's repo exposes, for the panel's root
+    /// picker. `#[serde(default)]` keeps older clients/persisted payloads readable.
+    #[serde(default)]
+    pub roots: Vec<WorkspaceRootView>,
     /// The requested session's workspace could not be resolved (deleted / not-yet-loaded /
     /// pending thread). Fail-closed marker: the panel renders "workspace unavailable" rather
     /// than falling back to another workspace's diff. Distinct from a clean tree.
@@ -1495,6 +1514,9 @@ impl WorkspaceDiffResponse {
             diff: String::new(),
             truncated: false,
             not_a_git_repo: false,
+            // No roots either: the picker must not reveal a repo layout for a
+            // workspace the caller was just refused.
+            roots: Vec::new(),
             unavailable: true,
             generated_at: 0,
         }

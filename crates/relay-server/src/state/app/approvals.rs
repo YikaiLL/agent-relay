@@ -183,8 +183,9 @@ impl AppState {
         &self,
         device_id: Option<String>,
         thread_id: Option<String>,
+        root: Option<String>,
     ) -> Result<WorkspaceDiffResponse, String> {
-        let cwd = {
+        let (cwd, device_scope, allowed_roots) = {
             let relay = self.relay.read().await;
             // Resolve which workspace to diff:
             // - absent selector       → the global/active cwd (legacy back-compat)
@@ -204,9 +205,52 @@ impl AppState {
                 .map(|id| relay.device_path_scope(id))
                 .unwrap_or_default();
             ensure_path_within_device_scope(&resolved, &device_scope, &relay.allowed_roots)?;
-            resolved
+            (resolved, device_scope, relay.allowed_roots.clone())
         };
-        collect_workspace_diff(&cwd).await
+
+        // Enumerate from the session's OWN cwd, which has just cleared the scope
+        // check. This is the only source of selectable roots, so the picker can
+        // never name a repo the viewed session has no access to.
+        //
+        // Then drop every root the caller may not see. A linked worktree routinely
+        // lives OUTSIDE the session cwd's subtree, so "is a worktree of this repo" is
+        // not on its own permission to know it exists: for a narrow-scoped device the
+        // path and branch name are themselves privileged topology. Filtering here (not
+        // just at selection time) also keeps the picker honest — every option it shows
+        // is one that will actually load.
+        let roots: Vec<WorkspaceRootView> = super::list_worktrees(&cwd)
+            .await
+            .into_iter()
+            .filter(|candidate| {
+                path_within_device_scope(&candidate.path, &device_scope, &allowed_roots)
+            })
+            .collect();
+
+        let target = match root {
+            None => cwd,
+            Some(requested) => {
+                // Gate 1 — membership: the request must name a worktree we just
+                // enumerated. Resolve to the ENUMERATED path and hand *that* to git;
+                // the caller's own string is never used as a filesystem path, so a
+                // crafted selector cannot reach a tree we did not enumerate.
+                let Some(matched) = roots
+                    .iter()
+                    .find(|candidate| super::paths_equivalent(&candidate.path, &requested))
+                else {
+                    return Ok(WorkspaceDiffResponse::unavailable());
+                };
+                // Gate 2 — device scope. Redundant by construction now that `roots` is
+                // pre-filtered, and deliberately kept: it is the check that actually
+                // enforces the boundary, so it must not depend on a caller elsewhere
+                // remembering to filter first.
+                ensure_path_within_device_scope(&matched.path, &device_scope, &allowed_roots)?;
+                matched.path.clone()
+            }
+        };
+
+        let mut response = collect_workspace_diff(&target).await?;
+        response.roots = roots;
+        Ok(response)
     }
 
     pub async fn apply_file_change(

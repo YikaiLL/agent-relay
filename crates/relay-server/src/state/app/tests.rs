@@ -127,6 +127,121 @@ mod workspace_diff_tests {
     }
 
     #[test]
+    fn porcelain_parses_main_linked_and_detached() {
+        let text = "\
+worktree /repo/main
+HEAD aaaa1111
+branch refs/heads/main
+
+worktree /repo/feature
+HEAD bbbb2222
+branch refs/heads/feature
+
+worktree /repo/detached
+HEAD cccc3333
+detached
+";
+        let roots = super::super::parse_worktree_porcelain(text);
+        assert_eq!(roots.len(), 3, "got {roots:?}");
+
+        assert_eq!(roots[0].path, "/repo/main");
+        assert_eq!(roots[0].branch.as_deref(), Some("main"));
+        assert!(roots[0].is_main, "first record is the main worktree");
+
+        assert_eq!(roots[1].path, "/repo/feature");
+        assert_eq!(
+            roots[1].branch.as_deref(),
+            Some("feature"),
+            "refs/heads/ prefix must be stripped"
+        );
+        assert!(!roots[1].is_main);
+
+        assert_eq!(roots[2].path, "/repo/detached");
+        assert_eq!(roots[2].branch, None, "a detached HEAD has no branch name");
+    }
+
+    #[test]
+    fn porcelain_skips_bare_repo_which_has_no_working_tree() {
+        // A bare main repo still emits a record, but there is nothing to diff in it;
+        // it must not become a selectable root (and must not steal the is_main flag).
+        let text = "\
+worktree /repo/bare
+bare
+
+worktree /repo/feature
+HEAD bbbb2222
+branch refs/heads/feature
+";
+        let roots = super::super::parse_worktree_porcelain(text);
+        assert_eq!(
+            roots.len(),
+            1,
+            "bare worktree must be skipped; got {roots:?}"
+        );
+        assert_eq!(roots[0].path, "/repo/feature");
+        assert!(
+            !roots[0].is_main,
+            "skipping the bare record must not promote the next one to main"
+        );
+    }
+
+    // Review finding 3: git recommends `--porcelain -z` precisely because a worktree path
+    // may contain a newline (or trailing whitespace); the newline-split form corrupts it.
+    #[test]
+    fn porcelain_z_preserves_paths_with_newlines_and_trailing_space() {
+        // NUL-terminated lines; an empty line (i.e. "\0\0") separates records.
+        let text = "worktree /repo/we\nird\0HEAD aaaa\0branch refs/heads/main\0\0worktree /repo/trailing \0HEAD bbbb\0branch refs/heads/f\0\0";
+        let roots = super::super::parse_worktree_porcelain_z(text);
+        assert_eq!(roots.len(), 2, "got {roots:?}");
+        assert_eq!(
+            roots[0].path, "/repo/we\nird",
+            "a newline inside a path must survive"
+        );
+        assert!(roots[0].is_main);
+        assert_eq!(
+            roots[1].path, "/repo/trailing ",
+            "trailing whitespace is part of the path and must not be trimmed"
+        );
+        assert_eq!(roots[1].branch.as_deref(), Some("f"));
+    }
+
+    // A worktree whose directory was deleted with `rm -rf` (rather than
+    // `git worktree remove`) STAYS in `git worktree list` until pruned, marked
+    // `prunable`. It has no working tree, so offering it in the picker is an option
+    // that is guaranteed to fail — the same defect as listing an out-of-scope root.
+    #[test]
+    fn porcelain_skips_prunable_worktrees_with_no_working_tree() {
+        let text = "\
+worktree /repo/main
+HEAD aaaa
+branch refs/heads/main
+
+worktree /repo/deleted
+HEAD bbbb
+branch refs/heads/gone
+prunable gitdir file points to non-existent location
+
+worktree /repo/alive
+HEAD cccc
+branch refs/heads/alive
+";
+        let roots = super::super::parse_worktree_porcelain(text);
+        let paths: Vec<&str> = roots.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["/repo/main", "/repo/alive"], "got {roots:?}");
+        assert!(roots[0].is_main);
+        assert!(
+            !roots[1].is_main,
+            "skipping a prunable record must not shift the main flag"
+        );
+    }
+
+    #[test]
+    fn porcelain_handles_empty_and_trailing_whitespace() {
+        assert!(super::super::parse_worktree_porcelain("").is_empty());
+        assert!(super::super::parse_worktree_porcelain("\n\n\n").is_empty());
+    }
+
+    #[test]
     fn truncate_caps_and_marks_truncated() {
         let bytes = vec![b'a'; 10];
         let (text, truncated) = truncate_to_char_boundary(bytes, 4);
@@ -296,14 +411,17 @@ mod path_scope_tests {
 
         // Absent selector → the global/active workspace (legacy back-compat).
         let expected_global = { app.relay.read().await.current_cwd.clone() };
-        let global = app.workspace_diff(None, None).await.expect("global diff");
+        let global = app
+            .workspace_diff(None, None, None)
+            .await
+            .expect("global diff");
         assert_eq!(global.cwd, expected_global);
         assert_ne!(global.cwd, cwd_b);
         assert!(!global.unavailable);
 
         // Viewing thread-b returns B's workspace even though A is active — the fix.
         let viewed_b = app
-            .workspace_diff(None, Some("thread-b".to_string()))
+            .workspace_diff(None, Some("thread-b".to_string()), None)
             .await
             .expect("viewed-b diff");
         assert_eq!(
@@ -314,7 +432,7 @@ mod path_scope_tests {
 
         // Viewing thread-a returns A's workspace.
         let viewed_a = app
-            .workspace_diff(None, Some("thread-a".to_string()))
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("viewed-a diff");
         assert_eq!(viewed_a.cwd, cwd_a);
@@ -335,7 +453,7 @@ mod path_scope_tests {
         }
 
         let ghost = app
-            .workspace_diff(None, Some("does-not-exist".to_string()))
+            .workspace_diff(None, Some("does-not-exist".to_string()), None)
             .await
             .expect("unresolvable selector returns unavailable, not an error");
         assert!(
@@ -347,6 +465,270 @@ mod path_scope_tests {
             "fail-closed must NOT leak the active workspace's cwd"
         );
         assert!(ghost.file_changes.is_empty());
+    }
+
+    // ---- L1: worktree roots in the diff panel ----------------------------------
+    //
+    // Build a repo with one linked worktree, and return (main_path, linked_path).
+    // The linked worktree is created OUTSIDE the main worktree so the two trees are
+    // genuinely distinct paths (mirrors `git worktree add ../foo`).
+    async fn init_repo_with_worktree(root: &std::path::Path) -> (String, String) {
+        async fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let main = root.join("mainwt");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]).await;
+        git(&main, &["config", "user.email", "t@example.com"]).await;
+        git(&main, &["config", "user.name", "T"]).await;
+        std::fs::write(main.join("seed.txt"), "line1\n").unwrap();
+        git(&main, &["add", "seed.txt"]).await;
+        git(&main, &["commit", "-q", "-m", "seed"]).await;
+
+        let linked = root.join("linkedwt");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        (
+            main.to_string_lossy().to_string(),
+            linked.to_string_lossy().to_string(),
+        )
+    }
+
+    // git reports worktree paths with symlinks resolved (macOS `/var` → `/private/var`),
+    // so compare by identity rather than by literal string.
+    fn same_path(a: &str, b: &str) -> bool {
+        a == b
+            || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+    }
+
+    // L1: the panel must offer every working tree of the viewed session's repo,
+    // so the user can look at a worktree the agent went off and worked in.
+    #[tokio::test]
+    async fn workspace_diff_enumerates_worktree_roots() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
+
+        let paths: Vec<&str> = response.roots.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| same_path(p, &main_cwd)),
+            "main worktree must be offered; got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| same_path(p, &linked_cwd)),
+            "linked worktree must be offered; got {paths:?}"
+        );
+
+        let main_root = response
+            .roots
+            .iter()
+            .find(|r| same_path(&r.path, &main_cwd))
+            .expect("main root present");
+        assert!(
+            main_root.is_main,
+            "the repo's main worktree must be flagged"
+        );
+        let linked_root = response
+            .roots
+            .iter()
+            .find(|r| same_path(&r.path, &linked_cwd))
+            .expect("linked root present");
+        assert!(!linked_root.is_main);
+        assert_eq!(linked_root.branch.as_deref(), Some("feature"));
+    }
+
+    // L1: selecting a root re-points the diff at THAT working tree. This is the whole
+    // feature — a change made only in the linked worktree is invisible from the
+    // session's own cwd, and must become visible once that root is selected.
+    #[tokio::test]
+    async fn workspace_diff_selected_root_diffs_that_worktree() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        // A change that exists ONLY in the linked worktree.
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nCHANGED-IN-WORKTREE\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        // Session cwd (main worktree) is clean — this is the symptom being fixed.
+        let unselected = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
+        assert!(same_path(&unselected.cwd, &main_cwd));
+        assert!(
+            unselected.file_changes.is_empty(),
+            "the agent's worktree edit must NOT show up in the session's own cwd"
+        );
+
+        // Selecting the linked worktree surfaces it.
+        let selected = app
+            .workspace_diff(None, Some("thread-a".to_string()), Some(linked_cwd.clone()))
+            .await
+            .expect("diff");
+        assert!(!selected.unavailable, "a legitimate root must resolve");
+        assert!(
+            same_path(&selected.cwd, &linked_cwd),
+            "diff must re-point at the root: got {}",
+            selected.cwd
+        );
+        assert_eq!(selected.file_changes.len(), 1);
+        assert!(
+            selected.file_changes[0]
+                .diff
+                .contains("CHANGED-IN-WORKTREE"),
+            "must show the linked worktree's own change"
+        );
+    }
+
+    // L1 fail-closed (security): the `root` selector must only ever name a worktree of
+    // the viewed session's own repo. An arbitrary path — even a perfectly valid git repo
+    // the caller happens to know about — must be refused, never diffed. Without this the
+    // selector becomes an arbitrary-path read primitive over the broker.
+    #[tokio::test]
+    async fn workspace_diff_rejects_root_outside_the_session_repo() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, _linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        // A separate repo, unrelated to the session's repo, holding a secret.
+        let other = TempDir::new().expect("other repo");
+        let (other_cwd, _) = init_repo_with_worktree(other.path()).await;
+        std::fs::write(
+            std::path::Path::new(&other_cwd).join("seed.txt"),
+            "line1\nTOP-SECRET-FROM-OTHER-REPO\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        let refused = app
+            .workspace_diff(None, Some("thread-a".to_string()), Some(other_cwd.clone()))
+            .await
+            .expect("a foreign root fails closed rather than erroring");
+
+        assert!(
+            refused.unavailable,
+            "a root outside the session's repo must fail closed"
+        );
+        assert!(
+            !same_path(&refused.cwd, &other_cwd),
+            "must not diff the foreign repo"
+        );
+        assert!(refused.file_changes.is_empty());
+        assert!(
+            !refused.diff.contains("TOP-SECRET-FROM-OTHER-REPO"),
+            "must never leak a foreign repo's contents"
+        );
+    }
+
+    // Review finding 1: a linked worktree OUTSIDE a narrow device scope must not even be
+    // LISTED. Returning it leaks repo topology (absolute path + branch name) across an
+    // access-control boundary, and selecting it is a guaranteed failure that also hides the
+    // picker (the panel clears `data` on error), stranding the user with no way back.
+    #[tokio::test]
+    async fn workspace_diff_omits_roots_outside_the_device_scope() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+        // This device may see the main worktree only, not its sibling.
+        pair_device(&app, "device-narrow", vec![main_cwd.clone()]).await;
+
+        let response = app
+            .workspace_diff(
+                Some("device-narrow".to_string()),
+                Some("thread-a".to_string()),
+                None,
+            )
+            .await
+            .expect("diff");
+
+        let paths: Vec<&str> = response.roots.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| same_path(p, &main_cwd)),
+            "the in-scope root must still be offered; got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| same_path(p, &linked_cwd)),
+            "a worktree outside the device scope must not be listed; got {paths:?}"
+        );
+
+        // ...and it must remain unselectable.
+        let refused = app
+            .workspace_diff(
+                Some("device-narrow".to_string()),
+                Some("thread-a".to_string()),
+                Some(linked_cwd.clone()),
+            )
+            .await
+            .expect("out-of-scope root fails closed rather than erroring");
+        assert!(refused.unavailable, "out-of-scope root must fail closed");
+
+        // A device with no narrow scope still sees both (the filter is scope-driven,
+        // not a blanket removal of linked worktrees).
+        let unscoped = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
+        assert_eq!(
+            unscoped.roots.len(),
+            2,
+            "an unscoped caller keeps every worktree"
+        );
     }
 
     // B3: the manual Projects write path end to end through AppState.

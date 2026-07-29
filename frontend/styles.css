@@ -4141,6 +4141,26 @@ body.is-resizing-panel {
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
+/* Worktree root picker. Only rendered when the repo actually has more than one
+ * working tree, so it must not reserve space in the common single-worktree case. */
+.workspace-root-picker {
+  padding: 8px 8px 0;
+}
+.workspace-root-select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-raised, var(--bg-base));
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-family: inherit;
+  cursor: pointer;
+}
+.workspace-root-select:focus-visible {
+  outline: 2px solid var(--accent, currentColor);
+  outline-offset: 1px;
+}
 .workspace-changes-list {
   display: flex;
   flex-direction: column;

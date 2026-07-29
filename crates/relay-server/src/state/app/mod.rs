@@ -27,7 +27,7 @@ use crate::{
         SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
         ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadStateView,
         ThreadTranscriptResponse, ThreadsResponse, UpdateSessionSettingsInput,
-        WorkspaceDiffResponse,
+        WorkspaceDiffResponse, WorkspaceRootView,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -728,6 +728,115 @@ async fn apply_unified_diff(
 const WORKSPACE_DIFF_MAX_BYTES: usize = 4 * 1024 * 1024;
 const WORKSPACE_DIFF_UNTRACKED_MAX_BYTES: usize = 64 * 1024;
 
+/// Enumerate every working tree of the repo containing `cwd` (main + linked
+/// `git worktree`s). Best-effort: a non-repo / git failure yields an empty list,
+/// which degrades the panel to "no picker", never to an error.
+pub(crate) async fn list_worktrees(cwd: &str) -> Vec<WorkspaceRootView> {
+    // `-z` is what makes a path containing a newline (or trailing whitespace)
+    // parseable at all — it is git's own documented answer for exactly that case.
+    // `worktree list -z` landed in git 2.36, so fall back to the newline form for
+    // older gits rather than silently losing the picker there.
+    if let Ok(output) = run_git_capture(cwd, &["worktree", "list", "--porcelain", "-z"]).await {
+        if output.status.success() {
+            return parse_worktree_porcelain_z(&String::from_utf8_lossy(&output.stdout));
+        }
+    }
+    match run_git_capture(cwd, &["worktree", "list", "--porcelain"]).await {
+        Ok(output) if output.status.success() => {
+            parse_worktree_porcelain(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Parse the NUL-terminated (`-z`) form: every field ends with `\0`, and an empty
+/// field separates records. Preferred because it is unambiguous for any path.
+fn parse_worktree_porcelain_z(text: &str) -> Vec<WorkspaceRootView> {
+    parse_worktree_records(text.split('\0'))
+}
+
+/// Parse the newline form. Fallback only: a path containing a newline cannot be
+/// recovered from this encoding.
+fn parse_worktree_porcelain(text: &str) -> Vec<WorkspaceRootView> {
+    parse_worktree_records(text.split('\n'))
+}
+
+/// Shared record assembly for both encodings. An empty field/line closes the current
+/// record; the first record is always the repository's main worktree.
+fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<WorkspaceRootView> {
+    let mut records: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for field in fields {
+        if field.is_empty() {
+            if !current.is_empty() {
+                records.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(field);
+        }
+    }
+    if !current.is_empty() {
+        records.push(current);
+    }
+
+    let mut roots = Vec::new();
+    for (index, record) in records.into_iter().enumerate() {
+        let mut path: Option<&str> = None;
+        let mut branch: Option<String> = None;
+        let mut bare = false;
+        let mut prunable = false;
+        for field in record {
+            if let Some(value) = field.strip_prefix("worktree ") {
+                // Taken VERBATIM: trimming would corrupt a path that legitimately ends
+                // in whitespace.
+                path = Some(value);
+            } else if let Some(value) = field.strip_prefix("branch ") {
+                branch = Some(
+                    value
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(value)
+                        .to_string(),
+                );
+            } else if field == "bare" {
+                bare = true;
+            } else if field == "prunable" || field.starts_with("prunable ") {
+                prunable = true;
+            }
+            // `detached` needs no handling: branch simply stays None.
+        }
+        // Neither a bare repo nor a prunable entry has a working tree to diff. Prunable
+        // is the `rm -rf`-without-`git worktree remove` case: git keeps listing it until
+        // pruned, and offering it would be an option guaranteed to fail. Note `is_main`
+        // keys off the RECORD index, so skipping a record cannot promote the next
+        // worktree to "main".
+        if bare || prunable {
+            continue;
+        }
+        if let Some(path) = path {
+            roots.push(WorkspaceRootView {
+                path: path.to_string(),
+                branch,
+                is_main: index == 0,
+            });
+        }
+    }
+    roots
+}
+
+/// Whether two paths name the same directory. Falls back to canonicalization so a
+/// symlinked prefix (macOS `/var` → `/private/var`) still matches. Only ever used to
+/// look a requested root UP in an already-enumerated set — the value actually handed
+/// to git is the enumerated entry's own path — so this can never widen access.
+pub(crate) fn paths_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, String> {
     let generated_at = unix_now();
     let inside = run_git_capture(cwd, &["rev-parse", "--is-inside-work-tree"]).await?;
@@ -738,6 +847,8 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
             diff: String::new(),
             truncated: false,
             not_a_git_repo: true,
+            // Roots are attached by the caller, which owns the picker's scope rules.
+            roots: Vec::new(),
             unavailable: false,
             generated_at,
         });
@@ -796,6 +907,8 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
         file_changes,
         truncated: tracked_truncated || untracked_truncated,
         not_a_git_repo: false,
+        // Roots are attached by the caller, which owns the picker's scope rules.
+        roots: Vec::new(),
         unavailable: false,
         generated_at,
     })

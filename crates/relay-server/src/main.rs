@@ -113,6 +113,9 @@ struct WorkspaceDiffQuery {
     /// The session the client is *viewing*. Absent → the global/active workspace
     /// (legacy behavior). Present → diff that session's own workspace.
     thread_id: Option<String>,
+    /// Which working tree to diff. Absent → the session's own cwd. Present → must be
+    /// one of the roots enumerated for that session's repo, else it fails closed.
+    root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,7 +550,7 @@ async fn workspace_diff(
     authorize_api(&context, &headers, &uri)?;
     context
         .app
-        .workspace_diff(None, query.thread_id)
+        .workspace_diff(None, query.thread_id, query.root)
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(|error| classify_session_error(error))

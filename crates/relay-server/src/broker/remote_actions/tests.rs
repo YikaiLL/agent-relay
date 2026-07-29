@@ -195,7 +195,8 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
     // "rebuild loses the field" bug the reviewer flagged).
     let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
         "type": "fetch_workspace_diff",
-        "thread_id": "thread-viewed"
+        "thread_id": "thread-viewed",
+        "root": "/repo/linked"
     }))
     .expect("fetch_workspace_diff should parse");
     assert_eq!(request.kind(), RemoteActionKind::FetchWorkspaceDiff);
@@ -208,12 +209,18 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
+            root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-9"));
             assert_eq!(
                 thread_id.as_deref(),
                 Some("thread-viewed"),
                 "bind_device must preserve the viewed thread_id, not drop it"
+            );
+            assert_eq!(
+                root.as_deref(),
+                Some("/repo/linked"),
+                "bind_device must preserve the worktree root selector too"
             );
         }
         other => panic!("unexpected bound request: {other:?}"),
@@ -228,9 +235,11 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
+            root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-1"));
             assert_eq!(thread_id, None);
+            assert_eq!(root, None, "an omitted root must default to None");
         }
         other => panic!("unexpected variant: {other:?}"),
     }

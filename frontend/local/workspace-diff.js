@@ -33,11 +33,27 @@ export function createWorkspaceDiffStore({
   getWorkspaceKey = null,
 }) {
   const tabStorageKey = `agent-relay:right-panel-tab:${surface}`;
+  // Which worktree root each thread is pinned to. Keyed PER THREAD on purpose: a root
+  // picked while viewing A must not follow you to B, whose repo may not even contain
+  // that path — the panel would then show a completely unrelated tree. `null`/absent
+  // means "that thread's own workspace cwd", which is what the server defaults to.
+  const rootByThread = new Map();
+
+  function threadKey() {
+    const id = typeof getThreadId === "function" ? getThreadId() : null;
+    return id ?? "";
+  }
+
+  function currentRoot() {
+    return rootByThread.get(threadKey()) ?? null;
+  }
+
   let state = {
     status: "idle",
     data: null,
     error: null,
     expanded: false,
+    selectedRoot: null,
     activeTab: readStoredTab(tabStorageKey),
     review: {
       reviewJobs: [],
@@ -82,7 +98,11 @@ export function createWorkspaceDiffStore({
         : typeof getThreadId === "function"
           ? getThreadId
           : null;
-    const key = keyFn ? keyFn() : null;
+    // The selected root is part of the viewed-workspace identity: switching root is
+    // just as much a view change as switching thread, and must drop the previous
+    // root's diff rather than paint it into the new root's panel while it loads.
+    const root = currentRoot();
+    const key = JSON.stringify([keyFn ? keyFn() : null, root]);
     const viewChanged = key !== lastKey;
     lastKey = key;
     // Different workspace → clear stale data so we never render another session's
@@ -90,17 +110,35 @@ export function createWorkspaceDiffStore({
     // keep prior data so the panel doesn't flicker on every refresh.
     setState(
       viewChanged
-        ? { status: "loading", error: null, data: null }
-        : { status: "loading", error: null }
+        ? { status: "loading", error: null, data: null, selectedRoot: root }
+        : { status: "loading", error: null, selectedRoot: root }
     );
     try {
       const data = fetchDiff
-        ? await fetchDiff()
-        : await fetchViaApi(apiFetch, getThreadId);
+        ? await fetchDiff(root)
+        : await fetchViaApi(apiFetch, getThreadId, root);
       if (seq !== requestSeq) return; // superseded by a newer refresh
+      // A pinned root the relay refuses (worktree removed/pruned, or this thread moved
+      // to another repo) comes back `unavailable` and — by the fail-closed contract —
+      // carries no roots. The picker hides itself without them, so the pin would be
+      // unreachable AND resent on every later refresh. Drop it and retry unpinned; the
+      // session's own workspace always resolves. Only ever retries when a pin WAS set,
+      // so the unpinned response below is terminal.
+      if (data?.unavailable && root) {
+        rootByThread.delete(threadKey());
+        setState({ selectedRoot: null });
+        return refresh();
+      }
       setState({ status: "loaded", data, error: null });
     } catch (error) {
       if (seq !== requestSeq) return; // superseded by a newer refresh
+      // Same self-heal for a hard failure on a pinned root: an error response also
+      // leaves no picker to recover through.
+      if (root) {
+        rootByThread.delete(threadKey());
+        setState({ selectedRoot: null });
+        return refresh();
+      }
       setState({
         status: "error",
         error: error?.message || String(error),
@@ -119,6 +157,15 @@ export function createWorkspaceDiffStore({
     },
     toggleExpanded() {
       setState({ expanded: !state.expanded });
+    },
+    getSelectedRoot: () => currentRoot(),
+    /// Pin the viewed thread to a worktree root. Falsy clears the pin, returning the
+    /// panel to that thread's own workspace cwd.
+    setRoot(path) {
+      const key = threadKey();
+      if (path) rootByThread.set(key, path);
+      else rootByThread.delete(key);
+      setState({ selectedRoot: currentRoot() });
     },
     setActiveTab(tab) {
       const next = tab === "reviewer" ? "reviewer" : "changes";
@@ -153,12 +200,16 @@ function writeStoredTab(key, value) {
   }
 }
 
-async function fetchViaApi(apiFetch, getThreadId = null) {
+async function fetchViaApi(apiFetch, getThreadId = null, root = null) {
   // Diff the session the user is *viewing*, not the process-global/active one.
   const threadId = typeof getThreadId === "function" ? getThreadId() : null;
-  const path = threadId
-    ? `/api/workspace/diff?thread_id=${encodeURIComponent(threadId)}`
-    : "/api/workspace/diff";
+  const params = new URLSearchParams();
+  if (threadId) params.set("thread_id", threadId);
+  // Absent → the session's own cwd. The server validates any root against the
+  // worktrees it enumerated for that session, so a stale pin fails closed.
+  if (root) params.set("root", root);
+  const query = params.toString();
+  const path = query ? `/api/workspace/diff?${query}` : "/api/workspace/diff";
   const response = await apiFetch(path, { method: "GET" });
   const payload = await response.json().catch(() => null);
   if (!response.ok || !payload?.ok) {
@@ -289,10 +340,47 @@ export function WorkspaceChangesPanel({ store }) {
       { className: "workspace-changes-header" },
       h("h2", { className: "workspace-changes-title" }, "Environment")
     ),
+    h(WorkspaceRootPicker, { store, state }),
     h(
       "div",
       { className: "workspace-changes-list" },
       h(WorkspaceChangesEntry, { store, state, stats, expanded })
+    )
+  );
+}
+
+function rootLabel(root) {
+  const name = root.path.split("/").filter(Boolean).pop() || root.path;
+  const branch = root.branch || "detached";
+  return root.is_main ? `${branch} · ${name}` : `${branch} · ${name} (worktree)`;
+}
+
+// Lets the user point the diff at any working tree of the viewed session's repo —
+// the case this exists for is an agent that went off and worked in a `git worktree`,
+// whose changes are invisible from the session's own cwd. Hidden for the common
+// single-worktree repo, where a one-entry picker would be pure noise.
+function WorkspaceRootPicker({ store, state }) {
+  const roots = state.data?.roots || [];
+  if (roots.length < 2) return null;
+  return h(
+    "div",
+    { className: "workspace-root-picker" },
+    h(
+      "select",
+      {
+        className: "workspace-root-select",
+        // `selectedRoot` is the explicit pin; empty means "follow the session's cwd".
+        value: state.selectedRoot || "",
+        "aria-label": "Which working tree to show changes for",
+        onChange: (event) => {
+          store.setRoot(event.target.value || null);
+          void store.refresh();
+        },
+      },
+      h("option", { value: "" }, "Session workspace (auto)"),
+      roots.map((root) =>
+        h("option", { key: root.path, value: root.path }, rootLabel(root))
+      )
     )
   );
 }
