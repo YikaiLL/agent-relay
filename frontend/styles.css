@@ -4119,43 +4119,39 @@ body.is-resizing-panel {
   flex-direction: column;
   min-height: 100%;
 }
-.workspace-changes-header {
-  position: sticky;
-  top: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  /* A slim SECONDARY eyebrow now: it sits BELOW the tabs band (which carries the
-   * chat-header alignment), so making it a second full-height band would stack two
-   * tall headers on the Changes tab. Just enough padding to read as a section label. */
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--border-subtle);
-  background: var(--bg-base);
-  z-index: 2;
-}
-.workspace-changes-title {
-  margin: 0;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-strong);
-  color: var(--text-3, var(--text-secondary));
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
 /* Worktree root picker. Only rendered when the repo actually has more than one
- * working tree, so it must not reserve space in the common single-worktree case. */
+ * working tree, so it must not reserve space in the common single-worktree case.
+ * Borderless: a full-width boxed control read as the panel's primary subject
+ * when it is only ever a qualifier on the list below it. */
 .workspace-root-picker {
-  padding: 8px 8px 0;
+  padding: 6px 8px 0;
 }
 .workspace-root-select {
-  width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  background: var(--bg-raised, var(--bg-base));
-  color: var(--text-primary);
+  /* Sized to its label, not to the panel: a full-width control reads as the
+   * panel's subject, and the native full-width drop arrow was the heaviest mark
+   * on the whole tab. `appearance: none` + a drawn caret keeps it a text button. */
+  width: auto;
+  max-width: 100%;
+  padding: 3px 18px 3px 6px;
+  margin-left: -6px;
+  border: none;
+  border-radius: 5px;
+  color: var(--text-secondary);
   font-size: var(--text-xs);
   font-family: inherit;
   cursor: pointer;
+  appearance: none;
+  background-color: transparent;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: right 9px top 50%, right 6px top 50%;
+  background-size: 3px 3px, 3px 3px;
+  background-repeat: no-repeat;
+}
+.workspace-root-select:hover {
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
 }
 .workspace-root-select:focus-visible {
   outline: 2px solid var(--accent, currentColor);
@@ -4165,30 +4161,32 @@ body.is-resizing-panel {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 8px;
+  padding: 2px 6px 8px;
 }
 .workspace-changes-entry {
   display: flex;
   flex-direction: column;
   border-radius: 8px;
 }
+/* Demoted from a body-size row with an icon to a quiet section header: the file
+ * list below it is the content, and this line only labels and totals it. */
 .workspace-changes-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
   background: transparent;
   border: none;
-  padding: 8px 10px;
-  border-radius: 8px;
+  padding: 7px 6px 5px;
+  border-radius: 5px;
   cursor: pointer;
   color: inherit;
   text-align: left;
   box-shadow: none;
 }
-.workspace-changes-row:hover {
-  background: var(--bg-elevated);
+.workspace-changes-row:hover .workspace-changes-row-label {
+  color: var(--text-secondary);
 }
 .workspace-changes-row:focus-visible {
   outline: 2px solid var(--accent);
@@ -4200,32 +4198,28 @@ body.is-resizing-panel {
   gap: 8px;
   min-width: 0;
 }
-.workspace-changes-row-icon {
-  width: 16px;
-  text-align: center;
-  font-weight: var(--weight-strong);
-  color: var(--text-secondary);
-}
 .workspace-changes-row-label {
-  font-size: var(--text-body);
+  font-size: var(--text-xs);
   font-weight: var(--weight-medium);
+  color: var(--text-tertiary);
 }
 .workspace-changes-row-stats {
   display: inline-flex;
   gap: 6px;
-  margin-left: 4px;
+  margin-left: 2px;
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
 }
 .workspace-changes-add { color: var(--diff-add-fg); }
 .workspace-changes-del { color: var(--diff-del-fg); }
 .workspace-changes-row-pending,
 .workspace-changes-row-empty {
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   color: var(--text-tertiary, var(--text-secondary));
 }
 .workspace-changes-row-chevron {
-  color: var(--text-secondary);
+  color: var(--text-faint, var(--text-secondary));
+  font-size: var(--text-xs);
 }
 .workspace-changes-refresh {
   display: inline-flex;
@@ -4262,14 +4256,140 @@ body.is-resizing-panel {
   to { transform: rotate(360deg); }
 }
 .workspace-changes-body {
-  padding: 4px 4px 12px;
-  border-top: 1px solid var(--border-subtle);
-  margin-top: 4px;
+  padding: 0 0 10px;
 }
 .workspace-changes-body .file-diff-panel {
   font-size: var(--text-sm);
 }
-.workspace-changes-body .diff-file-section { font-size: var(--text-sm); }
+
+/* Rail file rows ---------------------------------------------------------
+ * The compact list behind `variant: "rail"`. Deliberately borderless: ten
+ * bordered cards read as ten containers rather than one list, and the chrome
+ * outweighed the one line of content each of them held. Structure here comes
+ * from alignment (a fixed status column, a right-aligned stats column) and
+ * whitespace instead. The transcript's `.diff-file-section` card is untouched. */
+.file-diff-panel.is-rail .diff-file-sections {
+  gap: 0;
+}
+.diff-file-section.is-rail {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+}
+.diff-file-section.is-rail > .diff-file-section-header {
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 5px;
+}
+.diff-file-section.is-rail > .diff-file-section-header:hover {
+  background: var(--bg-elevated);
+}
+.diff-file-section.is-rail[open] > .diff-file-section-header {
+  background: var(--accent-soft-bg);
+}
+.diff-file-section.is-rail[open] .diff-file-base {
+  font-weight: var(--weight-medium);
+}
+/* Status column — git's own A/M/D vocabulary, doubling as the rail the eye
+ * tracks down the list. */
+.diff-file-glyph {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-strong);
+  line-height: var(--leading-none);
+  text-align: center;
+}
+.diff-file-glyph.is-add { color: var(--diff-add-fg); }
+.diff-file-glyph.is-mod { color: var(--warn-fg); }
+.diff-file-glyph.is-del { color: var(--diff-del-fg); }
+/* Name — the directory gives up space first and the basename stays whole,
+ * because the basename is what's being scanned for. The asymmetric shrink
+ * factors (1000 vs 1) are what enforce that order; a plain `text-overflow` on
+ * the whole string would eat the basename instead. */
+.diff-file-name {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-none);
+}
+.diff-file-dir,
+.diff-file-base {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.diff-file-dir {
+  color: var(--text-faint, var(--text-tertiary));
+  flex: 0 1000 auto;
+}
+.diff-file-base {
+  color: var(--text-primary);
+  flex: 0 1 auto;
+}
+.diff-file-stats {
+  display: inline-flex;
+  gap: 6px;
+  justify-content: flex-end;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-none);
+  font-variant-numeric: tabular-nums;
+}
+.diff-file-stat-add { color: var(--diff-add-fg); }
+.diff-file-stat-del { color: var(--diff-del-fg); }
+/* Expanding is the one place a container appears — and it's a rail, not a box.
+ * The diff itself therefore drops its own border/radius here: rail + box would
+ * be two containers for one thing, which is the nesting this restyle removes. */
+.diff-file-section.is-rail > .diff-file-section-body {
+  margin: 2px 0 8px 6px;
+  padding: 0 0 0 8px;
+  border-left: 2px solid var(--accent);
+}
+.diff-file-section.is-rail > .diff-file-section-body .diff-view {
+  border: none;
+  border-radius: 0;
+}
+
+/* Touch density -----------------------------------------------------------
+ * The phone sheet and the remote modal (both `.workspace-diff-sheet-body`, and
+ * both only reachable from the <=960px composer chip) show the SAME compact row
+ * as the desktop rail — same glyph column, same directory-first name, same
+ * right-aligned stats — but sized for a thumb instead of a cursor. 26px is a
+ * fine pointer target and a bad touch one, so the row grows to the 44px
+ * minimum and the type steps up one notch with it. Only the scale changes;
+ * keeping the markup identical is what makes local and remote read the same. */
+.workspace-diff-sheet-body .diff-file-section.is-rail > .diff-file-section-header {
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  gap: 10px;
+  height: auto;
+  min-height: 44px;
+  padding: 0 10px;
+  border-radius: 8px;
+}
+.workspace-diff-sheet-body .diff-file-glyph {
+  font-size: var(--text-sm);
+}
+.workspace-diff-sheet-body .diff-file-name {
+  font-size: var(--text-ui);
+}
+.workspace-diff-sheet-body .diff-file-stats {
+  font-size: var(--text-sm);
+}
+/* Touch has no hover to preview a target with, so the press itself has to
+ * answer. Without this the row gives no feedback at all on a phone. */
+.workspace-diff-sheet-body .diff-file-section.is-rail > .diff-file-section-header:active {
+  background: var(--bg-hover);
+}
+.workspace-diff-sheet-body .diff-file-section.is-rail > .diff-file-section-body {
+  margin: 4px 0 10px 10px;
+}
 .workspace-changes-error-inline {
   margin: 0 10px 8px;
   font-size: var(--text-sm);

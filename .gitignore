@@ -44,3 +44,6 @@ node_modules/
 # Editors
 .idea/
 .vscode/
+
+# Local design explorations / static preview mocks — not part of the app build.
+design/

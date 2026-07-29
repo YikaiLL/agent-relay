@@ -445,15 +445,45 @@ export function shouldAutoLoadFileChangeDiffs(tool, hasResolvedDetail, isExpande
   );
 }
 
+// Git's own one-letter status vocabulary, reused so the column reads like the
+// `git status --short` people already know. Anything that isn't explicitly an
+// add or a delete is a modification — providers spell that several ways
+// ("update", "modify", …) and the glyph shouldn't care which.
+const CHANGE_GLYPHS = {
+  add: { letter: "A", label: "Added", modifier: "is-add" },
+  create: { letter: "A", label: "Added", modifier: "is-add" },
+  delete: { letter: "D", label: "Deleted", modifier: "is-del" },
+  remove: { letter: "D", label: "Deleted", modifier: "is-del" },
+};
+const MODIFIED_GLYPH = { letter: "M", label: "Modified", modifier: "is-mod" };
+
+export function changeGlyph(changeType) {
+  return CHANGE_GLYPHS[String(changeType || "").toLowerCase()] || MODIFIED_GLYPH;
+}
+
+// Split "a/b/c.js" into ["a/b/", "c.js"] so the two halves can be styled — and,
+// more importantly, TRUNCATED — separately: the directory is what gives up space
+// when the row is too narrow, never the basename you're scanning for.
+export function splitDisplayPath(displayPath) {
+  const path = String(displayPath || "");
+  const cut = path.lastIndexOf("/");
+  return cut < 0 ? ["", path] : [path.slice(0, cut + 1), path.slice(cut + 1)];
+}
+
 function FileDiffSection({
   change,
   displayPath,
   diffsOmitted,
   itemId,
   onEnsureDetail,
+  variant,
 }) {
   const [opened, setOpened] = React.useState(false);
-  const { added, removed } = opened ? diffStats(change.diff) : { added: 0, removed: 0 };
+  // Computed for every row, open or not: the collapsed list is what people scan,
+  // and gating this on `opened` left that list's stats column blank even though
+  // the diff it counts was already in hand. Memoised on the diff text so a large
+  // multi-file change doesn't re-count on unrelated re-renders.
+  const { added, removed } = React.useMemo(() => diffStats(change.diff), [change.diff]);
   const onToggle = (event) => {
     const isOpen = Boolean(event.currentTarget.open);
     setOpened(isOpen);
@@ -470,28 +500,56 @@ function FileDiffSection({
     }
   };
 
+  const isRail = variant === "rail";
+  const glyph = changeGlyph(change.change_type);
+  const [dir, base] = splitDisplayPath(displayPath);
+
+  // The rail's row is a different shape, not just different paint: a fixed
+  // status column, a two-part name that truncates directory-first, and a
+  // right-aligned stats column. The transcript keeps the original markup so this
+  // restyle cannot leak into the conversation.
+  const railHeader = h(
+    "summary",
+    { className: "diff-file-section-header", title: change.path || "unknown" },
+    h("span", { className: `diff-file-glyph ${glyph.modifier}`, title: glyph.label }, glyph.letter),
+    h(
+      "span",
+      { className: "diff-file-name" },
+      dir ? h("span", { className: "diff-file-dir" }, dir) : null,
+      h("span", { className: "diff-file-base" }, base)
+    ),
+    h(
+      "span",
+      { className: "diff-file-stats" },
+      added > 0 ? h("span", { className: "diff-file-stat-add" }, `+${added}`) : null,
+      removed > 0 ? h("span", { className: "diff-file-stat-del" }, `−${removed}`) : null
+    )
+  );
+
+  const transcriptHeader = h(
+    "summary",
+    { className: "diff-file-section-header" },
+    h(
+      "div",
+      { className: "diff-file-section-meta", title: change.path || "unknown" },
+      h(
+        "div",
+        { className: "diff-file-section-primary" },
+        h("strong", { className: "diff-file-section-name" }, displayPath),
+        added > 0 ? h("span", { className: "file-change-chip-add" }, `+${added}`) : null,
+        removed > 0 ? h("span", { className: "file-change-chip-del" }, `-${removed}`) : null
+      )
+    ),
+    h("span", { className: "diff-file-section-chevron", "aria-hidden": "true" }, "▾")
+  );
+
   return h(
     "details",
     {
-      className: "diff-file-section",
+      className: isRail ? "diff-file-section is-rail" : "diff-file-section",
       onToggle,
     },
-    h(
-      "summary",
-      { className: "diff-file-section-header" },
-      h(
-        "div",
-        { className: "diff-file-section-meta", title: change.path || "unknown" },
-        h(
-          "div",
-          { className: "diff-file-section-primary" },
-          h("strong", { className: "diff-file-section-name" }, displayPath),
-          added > 0 ? h("span", { className: "file-change-chip-add" }, `+${added}`) : null,
-          removed > 0 ? h("span", { className: "file-change-chip-del" }, `-${removed}`) : null
-        )
-      ),
-      h("span", { className: "diff-file-section-chevron", "aria-hidden": "true" }, "▾")
-    ),
+    isRail ? railHeader : transcriptHeader,
     opened
       ? h(
           "div",
@@ -508,7 +566,9 @@ function FileDiffSection({
   );
 }
 
-export function FileChangeDiff({ tool, itemId = "", onEnsureDetail = null }) {
+// `variant: "rail"` opts into the right panel's compact row. Everything else
+// (the transcript's inline file-change entries) gets the original card.
+export function FileChangeDiff({ tool, itemId = "", onEnsureDetail = null, variant = "transcript" }) {
   const fileChanges = getFileChanges(tool);
   const displayPaths = buildFileDisplayPathMap(fileChanges, tool?.display_options || null);
   const diffsOmitted = Boolean(tool?.file_changes_omitted);
@@ -519,7 +579,7 @@ export function FileChangeDiff({ tool, itemId = "", onEnsureDetail = null }) {
 
   return h(
     "div",
-    { className: "file-diff-panel" },
+    { className: variant === "rail" ? "file-diff-panel is-rail" : "file-diff-panel" },
     h(
       "div",
       { className: "diff-file-sections" },
@@ -531,6 +591,7 @@ export function FileChangeDiff({ tool, itemId = "", onEnsureDetail = null }) {
           itemId,
           key: `${change.path || "unknown"}:${index}`,
           onEnsureDetail,
+          variant,
         })
       )
     )
