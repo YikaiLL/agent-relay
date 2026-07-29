@@ -133,17 +133,18 @@ npm install                            # vite + frontend tooling
 (cd claude-worker && npm install)      # only needed for Claude Code sessions
 
 # Config for attaching to the hosted public broker. This file is gitignored.
-cat > .env.public.local <<'EOF'
+cat > .env.cloud.local <<'EOF'
 RELAY_BROKER_URL=wss://agent-relay.up.railway.app
 RELAY_BROKER_AUTH_MODE=public
 EOF
 
-npm run dev:restart:public
+npm run dev:restart:cloud
 ```
 
-`npm run dev:restart:public` sources `.env.public.local`, rebuilds the web UI,
-and starts `relay-server`. Re-run it anytime to pick up code or config
-changes — it kills the previous process first.
+`npm run dev:restart:cloud` sources `.env.cloud.local` (falling back to the
+legacy `.env.public.local`), rebuilds the web UI, and starts `relay-server`.
+Re-run it anytime to pick up code or config changes — it kills the previous
+process first.
 
 Open <http://localhost:8787> and pair a phone or remote browser from the
 Settings panel. If you only want a localhost-only setup with no remote pairing,
@@ -401,9 +402,11 @@ to a broker unless you tell it to. Commands and flags:
 
 ```bash
 # pair remote devices through the hosted public broker
-sealwire --broker wss://agent-relay.up.railway.app
+sealwire cloud                          # attach to the hosted broker (default
+                                        # wss://agent-relay.up.railway.app)
+sealwire --broker wss://agent-relay.up.railway.app  # or point at your own
 
-sealwire local                          # no public broker (alias for --no-broker)
+sealwire local                          # no broker (alias for --no-broker)
 sealwire --no-broker                    # same: run without a broker
 sealwire --host 127.0.0.1 --port 8787   # bind address / port
 ```
@@ -421,12 +424,12 @@ the bind host; pass `--host` if you need to control network exposure.
 To attach to the hosted public broker, only two variables are required:
 
 ```ini
-# .env.public.local — gitignored; read by `npm run dev:restart:public`
+# .env.cloud.local — gitignored; read by `npm run dev:restart:cloud`
 RELAY_BROKER_URL=wss://agent-relay.up.railway.app
 RELAY_BROKER_AUTH_MODE=public
 ```
 
-`scripts/restart-dev-public.sh` (run via `npm run dev:restart:public`) sources
+`scripts/restart-dev-cloud.sh` (run via `npm run dev:restart:cloud`) sources
 this file before launching `relay-server`. The `relay-server` binary itself
 reads from the process environment and does not auto-load `.env` files, so if
 you launch it without the script you will need to `export` the vars or feed

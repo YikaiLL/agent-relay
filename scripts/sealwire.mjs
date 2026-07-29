@@ -14,9 +14,14 @@ const userCwd = process.cwd();
 const require = createRequire(import.meta.url);
 
 const DEFAULT_PUBLIC_BROKER_ORIGIN = "";
+// The hosted public broker `sealwire cloud` dials when the user has not
+// configured a broker origin of their own. `cloud` is an explicit "go online"
+// request (the mirror image of `local`), so it defaults to the hosted broker
+// rather than falling back to a localhost-only relay.
+const HOSTED_PUBLIC_BROKER_ORIGIN = "wss://agent-relay.up.railway.app";
 const defaultPort = "8787";
 const defaultHost = "127.0.0.1";
-const KNOWN_COMMANDS = new Set(["local"]);
+const KNOWN_COMMANDS = new Set(["local", "cloud"]);
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -28,6 +33,15 @@ if (args.help) {
 if (args.rest.length > 0) {
   console.error(`sealwire: unknown argument: ${args.rest[0]}`);
   console.error("Run `sealwire --help` for usage.");
+  process.exit(2);
+}
+
+if (args.cloud && args.noBroker) {
+  // `cloud` (go online) and `local`/`--no-broker` (stay offline) are opposite
+  // intents; accepting both would silently pick one and surprise the user.
+  console.error(
+    "sealwire: `cloud` cannot be combined with `local`/`--no-broker`; pick one."
+  );
   process.exit(2);
 }
 
@@ -52,7 +66,7 @@ const brokerOrigin =
   process.env.AGENT_RELAY_PUBLIC_BROKER_ORIGIN ||
   process.env.npm_package_config_public_broker_origin ||
   readPackagedBrokerOrigin() ||
-  DEFAULT_PUBLIC_BROKER_ORIGIN;
+  (args.cloud ? HOSTED_PUBLIC_BROKER_ORIGIN : DEFAULT_PUBLIC_BROKER_ORIGIN);
 const brokerConfig = args.noBroker || !brokerOrigin ? null : normalizeBrokerOrigin(brokerOrigin);
 
 const env = {
@@ -75,11 +89,34 @@ if (!process.env.CLAUDE_WORKER_PATH && existsSync(packagedClaudeWorker)) {
 }
 
 if (brokerConfig) {
-  env.RELAY_BROKER_URL = process.env.RELAY_BROKER_URL || brokerConfig.websocketUrl;
-  env.RELAY_BROKER_PUBLIC_URL = process.env.RELAY_BROKER_PUBLIC_URL || brokerConfig.websocketUrl;
-  env.RELAY_BROKER_CONTROL_URL =
-    process.env.RELAY_BROKER_CONTROL_URL || brokerConfig.controlUrl;
-  env.RELAY_BROKER_AUTH_MODE = process.env.RELAY_BROKER_AUTH_MODE || "public";
+  // The resolved origin (--broker, `cloud`'s hosted default, or a configured/
+  // packaged origin — the resolution above never consults an ambient
+  // RELAY_BROKER_URL) is authoritative for the websocket CONNECTION URL: an
+  // explicit --broker or configured broker origin wins over a stray ambient
+  // RELAY_BROKER_URL, so the live connection can never land on a broker you
+  // didn't ask for.
+  env.RELAY_BROKER_URL = brokerConfig.websocketUrl;
+
+  if (args.cloud) {
+    // `cloud` == the hosted public broker: a single, fully-managed coherent set
+    // (mirrors the desktop launcher) — public/control follow the same origin and
+    // it always uses public auth (an inherited self_hosted would dial the hosted
+    // broker with the wrong auth). Custom self-hosted brokers go through plain
+    // `--broker`.
+    env.RELAY_BROKER_PUBLIC_URL = brokerConfig.websocketUrl;
+    env.RELAY_BROKER_CONTROL_URL = brokerConfig.controlUrl;
+    env.RELAY_BROKER_AUTH_MODE = "public";
+  } else {
+    // Generic `--broker` / configured origin: still honor explicit endpoint/auth
+    // overrides so documented split-horizon setups (an externally reachable
+    // RELAY_BROKER_PUBLIC_URL for pairing links, a separate control host) and
+    // self-hosted auth keep working. Only the websocket URL above is pinned to
+    // the resolved origin.
+    env.RELAY_BROKER_PUBLIC_URL = process.env.RELAY_BROKER_PUBLIC_URL || brokerConfig.websocketUrl;
+    env.RELAY_BROKER_CONTROL_URL =
+      process.env.RELAY_BROKER_CONTROL_URL || brokerConfig.controlUrl;
+    env.RELAY_BROKER_AUTH_MODE = process.env.RELAY_BROKER_AUTH_MODE || "public";
+  }
 } else if (args.noBroker) {
   // Explicit local intent (`sealwire local` / `--no-broker`): the relay-server
   // connects to a broker whenever RELAY_BROKER_URL is present in its environment
@@ -143,6 +180,7 @@ child.on("exit", (code, signal) => {
 function parseArgs(argv) {
   const parsed = {
     broker: null,
+    cloud: false,
     command: null,
     help: false,
     host: null,
@@ -162,12 +200,17 @@ function parseArgs(argv) {
       !arg.startsWith("-") &&
       KNOWN_COMMANDS.has(arg)
     ) {
-      // The only positional we accept is a leading subcommand. `local` is a
-      // friendly alias for `--no-broker`: run a localhost-only relay and never
-      // reach for a public broker, even if one is configured.
+      // The only positional we accept is a leading subcommand.
+      //   `local` — friendly alias for `--no-broker`: run a localhost-only
+      //     relay and never reach for a broker, even if one is configured.
+      //   `cloud` — the mirror image: an explicit "go online" request that
+      //     attaches to the hosted public broker (defaulting to it when the
+      //     user has configured no broker origin of their own).
       parsed.command = arg;
       if (arg === "local") {
         parsed.noBroker = true;
+      } else if (arg === "cloud") {
+        parsed.cloud = true;
       }
     } else if (arg === "--broker") {
       parsed.broker = requireValue(argv, (index += 1), arg);
@@ -346,14 +389,19 @@ function printHelp() {
 Run a local relay-server from the npm package.
 
 Usage:
-  sealwire [local] [--broker <url>] [--port <port>] [--host <ip>] [--no-broker]
+  sealwire [local|cloud] [--broker <url>] [--port <port>] [--host <ip>] [--no-broker]
 
 Commands:
-  local         Run with no public broker; remote pairing is disabled (alias for
+  local         Run with no broker; remote pairing is disabled (alias for
                 --no-broker). Ignores any configured broker origin and strips
                 every RELAY_BROKER_* variable (case-insensitively) so the relay
                 never dials out. Does not change the bind host — pass --host to
                 control network exposure.
+  cloud         Attach to the hosted public broker so remote devices can pair
+                (the opposite of local). Uses a configured broker origin if one
+                is set (--broker / AGENT_RELAY_PUBLIC_BROKER_URL / packaged
+                default); otherwise falls back to ${HOSTED_PUBLIC_BROKER_ORIGIN}.
+                Cannot be combined with local/--no-broker.
 
 Defaults:
   --host        127.0.0.1
@@ -368,6 +416,7 @@ Binary resolution:
 Examples:
   sealwire
   sealwire local
+  sealwire cloud
   sealwire --broker https://broker.example.com
   AGENT_RELAY_PUBLIC_BROKER_URL=https://broker.example.com npx sealwire
   sealwire --no-broker
