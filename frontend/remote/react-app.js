@@ -2505,10 +2505,10 @@ function RemoteTranscriptPanel({
       restoredScrollPosition,
       scrollElement: transcript,
     });
-    // A new-user-message jump-bottom carries userEntryId: record it so we only
-    // jump to the bottom once per sent message (a reader who scrolls up
-    // mid-stream is not yanked back down). Thread-switch jump-bottom carries no
-    // userEntryId and is one-shot on its own.
+    // Record the latest user entry handled by this action. New-message actions
+    // use this to avoid re-jumping mid-stream; thread-transition actions use it
+    // to establish the loaded transcript as a baseline so the next snapshot
+    // cannot mistake retained history for a newly-sent message.
     if (action?.userEntryId) {
       anchorsForThread.add(action.userEntryId);
       anchoredUserIdsRef.current.set(remoteScrollKey, anchorsForThread);

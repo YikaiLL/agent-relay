@@ -233,23 +233,32 @@ export function decideTranscriptScrollAction({
   // Thread switch (or first ever view): land the user at the latest message
   // on first visit. On switch-back, preserve the semantic bottom-follow state
   // for readers who left at the tail; only restore an exact offset when they
-  // were intentionally reading history.
+  // were intentionally reading history. Seed the current latest user entry as
+  // already handled on every thread transition: otherwise the next unrelated
+  // render would mistake retained history for a newly-arrived user message and
+  // jump to the bottom, undoing a restore-thread action.
   if (!prevThreadId || prevThreadId !== nextThreadId) {
+    const handledUserEntry = nextLatestUserId
+      ? { userEntryId: nextLatestUserId }
+      : {};
     if (restoredScrollPosition?.followBottom) {
       return {
         kind: "jump-bottom",
         scrollTop: Math.max(0, liveScrollHeight - clientHeight),
+        ...handledUserEntry,
       };
     }
     if (Number.isFinite(restoredScrollPosition?.scrollTop)) {
       return {
         kind: "restore-thread",
         scrollTop: Math.max(0, restoredScrollPosition.scrollTop),
+        ...handledUserEntry,
       };
     }
     return {
       kind: "jump-bottom",
       scrollTop: Math.max(0, liveScrollHeight - clientHeight),
+      ...handledUserEntry,
     };
   }
 

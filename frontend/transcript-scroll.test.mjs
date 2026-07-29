@@ -106,7 +106,11 @@ test("switching back to a retained thread restores its exact scroll offset", () 
     },
     scrollElement: target,
   });
-  assert.deepEqual(action, { kind: "restore-thread", scrollTop: 437 });
+  assert.deepEqual(action, {
+    kind: "restore-thread",
+    scrollTop: 437,
+    userEntryId: "u1",
+  });
 });
 
 test("switching back to a retained bottom-following thread follows its grown tail", () => {
@@ -143,7 +147,11 @@ test("switching back to a retained bottom-following thread follows its grown tai
     restoredScrollPosition,
     scrollElement: target,
   });
-  assert.deepEqual(action, { kind: "jump-bottom", scrollTop: 6600 });
+  assert.deepEqual(action, {
+    kind: "jump-bottom",
+    scrollTop: 6600,
+    userEntryId: "u1",
+  });
 });
 
 test("a reader who escaped by one wheel step retains history-reading intent", () => {
@@ -163,6 +171,54 @@ test("a reader who escaped by one wheel step retains history-reading intent", ()
     followBottom: false,
     scrollTop: 2560,
   });
+});
+
+test("switch-back baselines retained users so a later snapshot does not undo the restore", () => {
+  const anchorsForThread = new Set();
+  const entries = [userEntry("u1"), agentEntry("a1")];
+  const firstTarget = makeScrollElement({
+    scrollHeight: 379,
+    clientHeight: 266,
+    scrollTop: 0,
+  }).target;
+  const restored = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: anchorsForThread,
+    nextEntries: entries,
+    nextThreadId: "thread-1",
+    previousSnapshot: {
+      activeThreadId: "thread-2",
+      entries: [userEntry("u2")],
+    },
+    restoredScrollPosition: {
+      followBottom: false,
+      scrollTop: 73,
+    },
+    scrollElement: firstTarget,
+  });
+  assert.deepEqual(restored, {
+    kind: "restore-thread",
+    scrollTop: 73,
+    userEntryId: "u1",
+  });
+  anchorsForThread.add(restored.userEntryId);
+
+  const nextSnapshot = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: anchorsForThread,
+    nextEntries: entries,
+    nextThreadId: "thread-1",
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries,
+      scrollHeight: 379,
+      scrollTop: 73,
+    },
+    scrollElement: makeScrollElement({
+      scrollHeight: 379,
+      clientHeight: 266,
+      scrollTop: 73,
+    }).target,
+  });
+  assert.deepEqual(nextSnapshot, { kind: "preserve" });
 });
 
 test("per-thread scroll positions use bounded LRU retention", () => {
