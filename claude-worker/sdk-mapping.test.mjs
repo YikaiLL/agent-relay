@@ -269,7 +269,10 @@ test("mapModelInfo includes the current concrete model in the default alias labe
   );
 });
 
-test("mapModelInfos marks exactly one default, preferring the first sonnet", () => {
+test("mapModelInfos falls back to the first sonnet when the SDK omits a default row", () => {
+  // No `value: "default"` row here, so the recommended-default signal is absent
+  // and selection falls back to the first sonnet (the conservative pick). See
+  // "mapModelInfos respects the SDK's own default row" for the primary path.
   const models = mapModelInfos([
     { value: "claude-opus-4-8", displayName: "Opus" },
     { value: "claude-sonnet-4-6", displayName: "Sonnet" },
@@ -284,7 +287,11 @@ test("mapModelInfos marks exactly one default, preferring the first sonnet", () 
   assert.equal(models.filter((model) => model.isDefault).length, 1);
 });
 
-test("mapModelInfos treats Claude SDK sonnet aliases as sonnet defaults", () => {
+test("mapModelInfos respects the SDK's own default row over sonnet", () => {
+  // supportedModels() emits a dedicated `value: "default"` row (displayName
+  // "Default (recommended)") whose resolvedModel is whatever Claude currently
+  // recommends (Opus 5 today). Honor it so sealwire's default tracks the CLI's
+  // /model picker across model bumps instead of pinning users to sonnet.
   const models = mapModelInfos([
     { value: "default", displayName: "Default (recommended)" },
     { value: "sonnet", displayName: "Sonnet" },
@@ -294,7 +301,23 @@ test("mapModelInfos treats Claude SDK sonnet aliases as sonnet defaults", () => 
   // portion so the default-selection invariant stays independent of them.
   assert.deepEqual(
     models.slice(0, 3).map((model) => model.isDefault),
-    [false, true, false]
+    [true, false, false]
+  );
+  assert.equal(models.filter((model) => model.isDefault).length, 1);
+});
+
+test("mapModelInfos falls back to the first row when neither default nor sonnet is present", () => {
+  // No `value: "default"` recommended row and no sonnet — selection lands on
+  // the first row so even a reduced/unusual catalog still marks exactly one
+  // default. (Curated fable appends after the SDK rows and never steals it.)
+  const models = mapModelInfos([
+    { value: "opus[1m]", displayName: "Opus (1M context)" },
+    { value: "haiku", displayName: "Haiku" },
+  ]);
+  assert.equal(models[0].model, "opus[1m]");
+  assert.deepEqual(
+    models.slice(0, 2).map((model) => model.isDefault),
+    [true, false]
   );
   assert.equal(models.filter((model) => model.isDefault).length, 1);
 });
@@ -314,10 +337,10 @@ test("mapModelInfos surfaces the curated fable model when supportedModels omits 
   assert.equal(fable.displayName, "Fable 5");
   assert.equal(fable.provider, "anthropic");
   assert.equal(fable.isDefault, false);
-  // The curated entry never steals the default from sonnet.
+  // The curated entry never steals the default from the SDK's recommended row.
   assert.deepEqual(
     models.filter((model) => model.isDefault).map((model) => model.model),
-    ["sonnet"]
+    ["default"]
   );
 });
 
