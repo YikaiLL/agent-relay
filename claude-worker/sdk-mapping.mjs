@@ -217,11 +217,23 @@ function withExtraModels(modelInfos) {
 export function mapModelInfos(modelInfos) {
   const models = withExtraModels(modelInfos)
     .map((modelInfo) => mapModelInfo(modelInfo, { isDefault: false }));
-  const defaultIndex = models.findIndex((model) => isSonnetModel(model.model));
+  // Respect the Claude SDK's own recommendation. supportedModels() emits a
+  // dedicated `value: "default"` row (displayName "Default (recommended)")
+  // whose resolvedModel is whatever Claude currently recommends (Opus 5 today,
+  // and it moves on its own as Anthropic ships new models). Marking that row
+  // keeps sealwire's default in lockstep with the CLI's `/model` picker with no
+  // code change when the recommendation shifts. If the catalog has no default
+  // row (an older or curated-only list), fall back to the first sonnet — the
+  // conservative pick — then to the first row.
+  let defaultIndex = models.findIndex((model) => model.model === "default");
+  if (defaultIndex < 0) {
+    defaultIndex = models.findIndex((model) => isSonnetModel(model.model));
+  }
+  if (defaultIndex < 0 && models.length > 0) {
+    defaultIndex = 0;
+  }
   if (defaultIndex >= 0) {
     models[defaultIndex].isDefault = true;
-  } else if (models.length > 0) {
-    models[0].isDefault = true;
   }
   return models;
 }
