@@ -676,9 +676,29 @@ impl RelayState {
         true
     }
 
+    /// The turn's changes as they stand right now, INCLUDING edits still in flight —
+    /// that is the "files being changed" feedback while a turn runs.
     pub fn turn_file_change_summary(
         &self,
         turn_id: &str,
+    ) -> Vec<crate::protocol::FileChangeDiffView> {
+        self.collect_turn_file_changes(turn_id, false)
+    }
+
+    /// The turn's changes once it has ENDED. An edit still marked running at that point
+    /// never landed, so counting it would claim a finished change to a file nothing
+    /// wrote — and hand it an Undo control.
+    pub fn settled_turn_file_change_summary(
+        &self,
+        turn_id: &str,
+    ) -> Vec<crate::protocol::FileChangeDiffView> {
+        self.collect_turn_file_changes(turn_id, true)
+    }
+
+    fn collect_turn_file_changes(
+        &self,
+        turn_id: &str,
+        settled: bool,
     ) -> Vec<crate::protocol::FileChangeDiffView> {
         let mut file_changes = Vec::new();
 
@@ -700,6 +720,10 @@ impl RelayState {
             // Only a terminal FAILURE is excluded: an edit still in flight has no diff
             // yet but is a real pending change and must stay listed.
             if matches!(entry.status.as_str(), "failed" | "error") {
+                continue;
+            }
+            // Once the turn is over, "still running" means it never landed.
+            if settled && entry.status != "completed" {
                 continue;
             }
             let Some(tool) = entry.tool.as_ref() else {

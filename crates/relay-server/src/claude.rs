@@ -1486,10 +1486,16 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                         },
                     );
                     if let Some(turn_id) = completed_turn_id.as_deref() {
-                        relay.set_transcript_item_status(
-                            &format!("turn-diff:{turn_id}"),
-                            "completed",
-                        );
+                        // REBUILD rather than just restatus: the summary was captured
+                        // while the turn ran, so it may still carry an edit that was in
+                        // flight then and never landed. Falls back to a plain status
+                        // change when nothing completed (no entry to rebuild).
+                        if !ensure_claude_turn_diff_entry(&mut relay, turn_id, "completed") {
+                            relay.set_transcript_item_status(
+                                &format!("turn-diff:{turn_id}"),
+                                "completed",
+                            );
+                        }
                     }
                     // A failed terminal must leave a DURABLE, visible failure in
                     // the transcript: operator-only logs are stripped from
@@ -1716,7 +1722,13 @@ fn inject_turn_diff_entries(transcript: Vec<TranscriptEntryView>) -> Vec<Transcr
 /// dedicated `turn/diff/updated` notification. No-op if the turn has no
 /// file-change tools yet.
 fn ensure_claude_turn_diff_entry(relay: &mut RelayState, turn_id: &str, status: &str) -> bool {
-    let fallback_file_changes = relay.turn_file_change_summary(turn_id);
+    // A settled turn recomputes from completed entries only; a live one keeps in-flight
+    // edits visible.
+    let fallback_file_changes = if status == "completed" {
+        relay.settled_turn_file_change_summary(turn_id)
+    } else {
+        relay.turn_file_change_summary(turn_id)
+    };
     if fallback_file_changes.is_empty() {
         return false;
     }
@@ -2944,6 +2956,97 @@ mod tests {
         assert!(
             !paths.contains(&"bad.rs"),
             "a failed edit must not replay as a file change; got {paths:?}"
+        );
+    }
+
+    fn pending_file_change(id: &str, path: &str) -> serde_json::Value {
+        json!({
+            "type": "tool_call_requested",
+            "provider_session_id": "thread-b",
+            "id": id,
+            "turn_id": "turn-b",
+            "tool": {
+                "item_type": "fileChange", "name": "Edit", "title": "Edit",
+                "detail": null, "query": null, "path": path,
+                "url": null, "command": null, "input_preview": null,
+                "result_preview": null, "diff": null, "file_changes": []
+            }
+        })
+    }
+
+    // An edit still in flight belongs in the LIVE summary — that is the "files being
+    // changed right now" feedback. But once the turn ends it never landed, so it must
+    // not survive into the settled summary: the turn diff is marked completed at that
+    // point, which would claim a finished change to a file nothing ever wrote, and hand
+    // it an Undo control.
+    //
+    // Order matters: the turn diff is (re)built from the summary, so a pending edit only
+    // leaks in when it is already present as the diff is built — which is why this is
+    // intermittent in practice.
+    #[tokio::test]
+    async fn an_edit_still_running_when_the_turn_ends_is_not_a_completed_change() {
+        let state = test_relay_with_active_b().await;
+        {
+            let mut relay = state.write().await;
+            relay.set_active_turn(Some("turn-b".to_string()));
+        }
+
+        handle_worker_event(pending_file_change("pending", "/tmp/b/pending.rs"), &state).await;
+        handle_worker_event(
+            file_change_result(
+                "ok",
+                "/tmp/b/good.rs",
+                "--- a/good.rs\n+++ b/good.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                false,
+            ),
+            &state,
+        )
+        .await;
+
+        // While the turn runs, the in-flight edit is legitimately listed.
+        let live = state.read().await.turn_file_change_summary("turn-b");
+        assert!(
+            live.iter().any(|change| change.path.contains("pending.rs")),
+            "an in-flight edit must stay visible during the turn; got {:?}",
+            live.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+
+        handle_worker_event(
+            json!({
+                "type": "done",
+                "provider_session_id": "thread-b",
+                "turn_id": "turn-b"
+            }),
+            &state,
+        )
+        .await;
+
+        let snapshot = state.read().await.snapshot();
+        let turn_diff = snapshot
+            .transcript
+            .iter()
+            .find(|entry| {
+                entry
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.item_type == "turnDiff")
+            })
+            .expect("the landed edit still needs a turn diff");
+        let paths: Vec<&str> = turn_diff
+            .tool
+            .as_ref()
+            .unwrap()
+            .file_changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert!(
+            paths.iter().any(|path| path.contains("good.rs")),
+            "the edit that landed must remain; got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.contains("pending.rs")),
+            "an edit that never completed must not settle as a finished change; got {paths:?}"
         );
     }
 
