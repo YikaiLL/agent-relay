@@ -184,6 +184,7 @@ impl AppState {
         device_id: Option<String>,
         thread_id: Option<String>,
         root: Option<String>,
+        auto_root: bool,
     ) -> Result<WorkspaceDiffResponse, String> {
         let (cwd, device_scope, allowed_roots) = {
             let relay = self.relay.read().await;
@@ -226,7 +227,52 @@ impl AppState {
             })
             .collect();
 
+        // Where this thread has actually been writing, derived (never stored) from its
+        // own transcript tail. Reported for the picker; only ACTED on when the client
+        // explicitly asks via `auto_root`, so a plain refresh can never move the panel
+        // out from under someone reading it.
+        // `known` distinguishes "looked, nothing to suggest" from "could not look yet"
+        // (a cold thread whose transcript has not loaded). Without that distinction a
+        // client burns its one-shot auto-resolve on a thread whose history has not
+        // arrived, and never re-resolves.
+        let (suggested, suggested_root_known) = match thread_id.as_deref() {
+            // No thread selected: nothing to attribute, and that IS the final answer.
+            None => (None, true),
+            Some(tid) => {
+                let relay = self.relay.read().await;
+                match relay.runtime_for_thread(tid) {
+                    None => (None, false),
+                    Some(runtime) => (
+                        super::suggested_root_from_tools(
+                            runtime
+                                .transcript
+                                .iter()
+                                .rev()
+                                .take(super::SUGGESTED_ROOT_SCAN_LIMIT)
+                                .filter_map(|record| {
+                                    // Status travels WITH the tool: whether a write landed
+                                    // is the deciding factor, and dropping it here is what
+                                    // let a failed edit count as evidence.
+                                    record
+                                        .tool
+                                        .as_ref()
+                                        .map(|tool| (tool, record.status.as_str()))
+                                }),
+                            &roots,
+                        ),
+                        true,
+                    ),
+                }
+            }
+        };
+        // Only a root DIFFERENT from the session's own cwd is worth suggesting; the
+        // panel already defaults there.
+        let suggested = suggested.filter(|candidate| !super::paths_equivalent(candidate, &cwd));
+
         let target = match root {
+            // Adopt the suggestion only on an explicit opt-in from the client, which
+            // sends it once per thread switch (see the picker's auto-resolve).
+            None if auto_root => suggested.clone().unwrap_or(cwd),
             None => cwd,
             Some(requested) => {
                 // Gate 1 — membership: the request must name a worktree we just
@@ -250,6 +296,8 @@ impl AppState {
 
         let mut response = collect_workspace_diff(&target).await?;
         response.roots = roots;
+        response.suggested_root = suggested;
+        response.suggested_root_known = suggested_root_known;
         Ok(response)
     }
 

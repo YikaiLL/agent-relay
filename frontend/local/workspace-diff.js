@@ -38,13 +38,34 @@ export function createWorkspaceDiffStore({
   // that path — the panel would then show a completely unrelated tree. `null`/absent
   // means "that thread's own workspace cwd", which is what the server defaults to.
   const rootByThread = new Map();
+  // Roots the RELAY suggested, kept apart from the user's own picks above. The
+  // distinction matters on re-entry: a user's choice is theirs and must survive
+  // leaving and returning, while an auto pin is just a cached answer to "where is this
+  // thread working?" and has to be re-asked — otherwise an agent that moved from one
+  // worktree to another while you were away stays invisible behind the stale pin.
+  const autoRootByThread = new Map();
+  // Threads whose one-shot auto-resolve has already run. Deliberately once per thread
+  // SWITCH, not per refresh: the relay can tell us where a thread has been writing on
+  // every fetch, but acting on that every time would let the panel re-target itself
+  // while someone is reading it. So we ask once on entering a thread, and from then on
+  // it is an ordinary pin — while leaving and returning re-arms it, so a worktree the
+  // agent moved into while you were away is still picked up.
+  const autoResolved = new Set();
+  // Which thread the previous refresh was for, so entering a thread can re-arm it.
+  let lastAutoThread = null;
 
   function threadKey() {
     const id = typeof getThreadId === "function" ? getThreadId() : null;
     return id ?? "";
   }
 
+  // The user's pick wins over anything derived.
   function currentRoot() {
+    const key = threadKey();
+    return rootByThread.get(key) ?? autoRootByThread.get(key) ?? null;
+  }
+
+  function manualRoot() {
     return rootByThread.get(threadKey()) ?? null;
   }
 
@@ -101,6 +122,19 @@ export function createWorkspaceDiffStore({
     // The selected root is part of the viewed-workspace identity: switching root is
     // just as much a view change as switching thread, and must drop the previous
     // root's diff rather than paint it into the new root's panel while it loads.
+    // Entering a thread re-arms its one-shot AND drops the previously derived root, so
+    // the question is genuinely re-asked rather than answered from a stale cache.
+    if (threadKey() !== lastAutoThread) {
+      autoResolved.delete(threadKey());
+      autoRootByThread.delete(threadKey());
+      lastAutoThread = threadKey();
+    }
+    // Only a thread with no pick OF THE USER'S asks the relay where it has been
+    // writing; a previous auto answer must not suppress the new question. Auto-resolve
+    // is a per-thread notion, so the no-thread (legacy/global) fetch never opts in.
+    const wantsAuto = !manualRoot() && !!threadKey() && !autoResolved.has(threadKey());
+    // Read the effective root only after the re-arm above, so a dropped auto pin is not
+    // resent.
     const root = currentRoot();
     const key = JSON.stringify([keyFn ? keyFn() : null, root]);
     const viewChanged = key !== lastKey;
@@ -115,9 +149,22 @@ export function createWorkspaceDiffStore({
     );
     try {
       const data = fetchDiff
-        ? await fetchDiff(root)
-        : await fetchViaApi(apiFetch, getThreadId, root);
+        ? await fetchDiff(root, wantsAuto)
+        : await fetchViaApi(apiFetch, getThreadId, root, wantsAuto);
       if (seq !== requestSeq) return; // superseded by a newer refresh
+      if (wantsAuto) {
+        // Spend the one shot only on a DETERMINED answer. `suggested_root_known: false`
+        // means the thread's transcript had not loaded yet, so "no suggestion" is not an
+        // answer — spending the shot there would strand the thread on its own cwd.
+        if (data?.suggested_root_known !== false) {
+          autoResolved.add(threadKey());
+        }
+        if (data?.suggested_root) {
+          // Derived, not chosen: stored separately so re-entry can re-ask.
+          autoRootByThread.set(threadKey(), data.suggested_root);
+          setState({ selectedRoot: currentRoot() });
+        }
+      }
       // A pinned root the relay refuses (worktree removed/pruned, or this thread moved
       // to another repo) comes back `unavailable` and — by the fail-closed contract —
       // carries no roots. The picker hides itself without them, so the pin would be
@@ -126,6 +173,10 @@ export function createWorkspaceDiffStore({
       // so the unpinned response below is terminal.
       if (data?.unavailable && root) {
         rootByThread.delete(threadKey());
+        autoRootByThread.delete(threadKey());
+        // Burn the auto-resolve too: recovery should land plainly on the session
+        // workspace, not bounce straight into re-pinning somewhere else.
+        autoResolved.add(threadKey());
         setState({ selectedRoot: null });
         return refresh();
       }
@@ -136,7 +187,16 @@ export function createWorkspaceDiffStore({
       // leaves no picker to recover through.
       if (root) {
         rootByThread.delete(threadKey());
+        autoRootByThread.delete(threadKey());
+        autoResolved.add(threadKey());
         setState({ selectedRoot: null });
+        return refresh();
+      }
+      // Auto-resolve is best effort. If the opted-in request itself failed, retry once
+      // without it rather than surfacing an error the user cannot act on — and burn the
+      // shot so a persistently rejected auto cannot fail on every future refresh.
+      if (wantsAuto) {
+        autoResolved.add(threadKey());
         return refresh();
       }
       setState({
@@ -163,6 +223,9 @@ export function createWorkspaceDiffStore({
     /// panel to that thread's own workspace cwd.
     setRoot(path) {
       const key = threadKey();
+      // An explicit pick supersedes the derived one, and clearing it means "go back to
+      // the session workspace" — not "fall back to whatever was auto-detected".
+      autoRootByThread.delete(key);
       if (path) rootByThread.set(key, path);
       else rootByThread.delete(key);
       setState({ selectedRoot: currentRoot() });
@@ -200,7 +263,7 @@ function writeStoredTab(key, value) {
   }
 }
 
-async function fetchViaApi(apiFetch, getThreadId = null, root = null) {
+async function fetchViaApi(apiFetch, getThreadId = null, root = null, autoRoot = false) {
   // Diff the session the user is *viewing*, not the process-global/active one.
   const threadId = typeof getThreadId === "function" ? getThreadId() : null;
   const params = new URLSearchParams();
@@ -208,6 +271,10 @@ async function fetchViaApi(apiFetch, getThreadId = null, root = null) {
   // Absent → the session's own cwd. The server validates any root against the
   // worktrees it enumerated for that session, so a stale pin fails closed.
   if (root) params.set("root", root);
+  // One-shot opt-in: land on where this thread has actually been writing. Must be
+  // "true", not "1": the relay deserializes this as a Rust bool via serde_urlencoded,
+  // which accepts only true/false and 400s on anything else.
+  if (autoRoot) params.set("auto_root", "true");
   const query = params.toString();
   const path = query ? `/api/workspace/diff?${query}` : "/api/workspace/diff";
   const response = await apiFetch(path, { method: "GET" });

@@ -33,8 +33,8 @@ export function getRemoteWorkspaceDiffStore() {
       // Also needed so a pinned worktree root is remembered PER THREAD; without it
       // every remote thread would share one pin.
       getThreadId: getRemoteViewedThreadId,
-      fetchDiff: async (root) => {
-        const data = await fetchRemoteWorkspaceDiff(root);
+      fetchDiff: async (root, autoRoot) => {
+        const data = await fetchRemoteWorkspaceDiff(root, autoRoot);
         if (!data) {
           throw new Error("workspace_diff missing in remote response");
         }

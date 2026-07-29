@@ -105,7 +105,8 @@ test("workspace diff request carries ?thread_id= for the viewed session", async 
   });
   await store.refresh();
   assert.equal(calls.length, 1);
-  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-xyz");
+  // First view of a thread also opts in to the one-shot auto-resolve (L2).
+  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-xyz&auto_root=true");
 });
 
 test("workspace diff request omits thread_id when no session is viewed (back-compat)", async () => {
@@ -354,7 +355,7 @@ test("selecting a root sends it as ?root= alongside the viewed thread", async ()
   });
 
   await store.refresh();
-  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-a");
+  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-a&auto_root=true");
 
   store.setRoot("/repo/linked");
   await store.refresh();
@@ -419,7 +420,7 @@ test("selected root is remembered per thread, not carried across threads", async
   await store.refresh();
   assert.equal(
     calls.at(-1),
-    "/api/workspace/diff?thread_id=thread-b",
+    "/api/workspace/diff?thread_id=thread-b&auto_root=true",
     "thread B must start at its own workspace, not A's picked root"
   );
 
@@ -528,4 +529,295 @@ test("unavailable with no pin set is reported, not retried", async () => {
   await store.refresh();
   assert.equal(calls, 1, "no pin → no retry");
   assert.equal(store.getState().data.unavailable, true);
+});
+
+// ---- L2: land on the worktree the thread has been working in ------------------
+
+test("first view of a thread asks for auto-resolve and adopts the suggested root", async () => {
+  const calls = [];
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { cwd: "/repo/linked", file_changes: [], roots: [], suggested_root: "/repo/linked" },
+        }),
+      };
+    },
+    getThreadId: () => "thread-a",
+  });
+
+  await store.refresh();
+  assert.equal(
+    calls[0],
+    "/api/workspace/diff?thread_id=thread-a&auto_root=true",
+    "the first view opts in to auto-resolve"
+  );
+  assert.equal(store.getSelectedRoot(), "/repo/linked", "the suggestion becomes the pin");
+
+  // Thereafter it is an ordinary pin — and crucially NOT re-resolved.
+  await store.refresh();
+  assert.equal(
+    calls[1],
+    "/api/workspace/diff?thread_id=thread-a&root=%2Frepo%2Flinked",
+    "later refreshes send the pin, not another auto-resolve"
+  );
+});
+
+// This is the whole point of picking "once per thread switch" over "follow always":
+// a later refresh must never re-target the panel under someone reading it.
+test("auto-resolve happens once per thread, even when it suggests nothing", async () => {
+  const calls = [];
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { cwd: "/repo/main", file_changes: [], roots: [], suggested_root: null },
+        }),
+      };
+    },
+    getThreadId: () => "thread-a",
+  });
+
+  await store.refresh();
+  assert.ok(calls[0].includes("auto_root=true"));
+  assert.equal(store.getSelectedRoot(), null, "nothing to suggest → no pin");
+
+  await store.refresh();
+  assert.equal(
+    calls[1],
+    "/api/workspace/diff?thread_id=thread-a",
+    "a second refresh must NOT re-ask for auto-resolve"
+  );
+});
+
+test("a thread the user already pinned is never auto-resolved", async () => {
+  const calls = [];
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      return { ok: true, json: async () => ({ ok: true, data: { cwd: "/x", roots: [] } }) };
+    },
+    getThreadId: () => "thread-a",
+  });
+
+  store.setRoot("/repo/chosen");
+  await store.refresh();
+  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-a&root=%2Frepo%2Fchosen");
+  assert.ok(!calls[0].includes("auto_root"), "a manual pin outranks auto-resolve");
+});
+
+// Each thread gets its own one-shot resolve; switching threads must not inherit A's.
+test("switching to a new thread triggers its own auto-resolve", async () => {
+  const calls = [];
+  let viewed = "thread-a";
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      const suggested = path.includes("thread-b") ? "/repo/b-wt" : null;
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { cwd: "/x", file_changes: [], roots: [], suggested_root: suggested },
+        }),
+      };
+    },
+    getThreadId: () => viewed,
+  });
+
+  await store.refresh();
+  viewed = "thread-b";
+  await store.refresh();
+  assert.equal(
+    calls[1],
+    "/api/workspace/diff?thread_id=thread-b&auto_root=true",
+    "thread B gets its own auto-resolve"
+  );
+  assert.equal(store.getSelectedRoot(), "/repo/b-wt");
+});
+
+// A thread navigated to before its transcript loads answers "don't know yet". Burning
+// the one-shot on that answer strands the thread on its own cwd forever.
+test("an unknown suggestion does not burn the one-shot auto-resolve", async () => {
+  const calls = [];
+  let loaded = false;
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      const data = loaded
+        ? { cwd: "/repo/wt", file_changes: [], roots: [], suggested_root: "/repo/wt", suggested_root_known: true }
+        : { cwd: "/repo/main", file_changes: [], roots: [], suggested_root: null, suggested_root_known: false };
+      return { ok: true, json: async () => ({ ok: true, data }) };
+    },
+    getThreadId: () => "thread-a",
+  });
+
+  await store.refresh();
+  assert.ok(calls[0].includes("auto_root=true"));
+  assert.equal(store.getSelectedRoot(), null, "nothing known yet → no pin");
+
+  // Transcript arrives; the next refresh must still be allowed to auto-resolve.
+  loaded = true;
+  await store.refresh();
+  assert.ok(
+    calls[1].includes("auto_root=true"),
+    "an unknown answer must leave the one-shot armed"
+  );
+  assert.equal(store.getSelectedRoot(), "/repo/wt");
+
+  // Now it is known, so the shot is spent.
+  await store.refresh();
+  assert.ok(!calls[2].includes("auto_root"));
+});
+
+// "Once per thread SWITCH", which is what the picker documents: leaving A and coming
+// back re-resolves, so a worktree the agent moved into while you were away is picked up.
+test("returning to a thread re-arms its auto-resolve", async () => {
+  const calls = [];
+  let viewed = "thread-a";
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { cwd: "/x", file_changes: [], roots: [], suggested_root: null, suggested_root_known: true },
+        }),
+      };
+    },
+    getThreadId: () => viewed,
+  });
+
+  await store.refresh();
+  assert.ok(calls[0].includes("auto_root=true"));
+  await store.refresh();
+  assert.ok(!calls[1].includes("auto_root"), "same thread → spent");
+
+  viewed = "thread-b";
+  await store.refresh();
+  viewed = "thread-a";
+  await store.refresh();
+  assert.ok(
+    calls[3].includes("auto_root=true"),
+    "coming back to A must re-resolve; the agent may have moved worktrees meanwhile"
+  );
+});
+
+// Auto-resolve is best effort: a failing auto request must degrade to a plain fetch
+// rather than erroring on every refresh forever.
+test("a failing auto-resolve falls back to a plain fetch instead of wedging", async () => {
+  const calls = [];
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      if (path.includes("auto_root")) throw new Error("HTTP 400");
+      return {
+        ok: true,
+        json: async () => ({ ok: true, data: { cwd: "/repo/main", file_changes: [], roots: [] } }),
+      };
+    },
+    getThreadId: () => "thread-a",
+  });
+
+  await store.refresh();
+  assert.equal(store.getState().status, "loaded", "must recover, not sit in error");
+  assert.equal(store.getState().data.cwd, "/repo/main");
+  assert.ok(!calls.at(-1).includes("auto_root"), "the retry drops the auto opt-in");
+});
+
+// The core scenario the previous re-arm test missed: A DID get an auto suggestion, so it
+// has a pin — and `wantsAuto` requires no pin, so returning to A re-sent the stale pin
+// instead of re-resolving. The agent moving wt1 → wt2 while you were away was invisible.
+test("returning to a thread re-resolves even when it was auto-pinned", async () => {
+  const calls = [];
+  let viewed = "thread-a";
+  let evidence = "/repo/wt-1";
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: {
+            cwd: evidence,
+            file_changes: [],
+            roots: [],
+            suggested_root: path.includes("auto_root") ? evidence : null,
+            suggested_root_known: true,
+          },
+        }),
+      };
+    },
+    getThreadId: () => viewed,
+  });
+
+  await store.refresh();
+  assert.ok(calls[0].includes("auto_root=true"));
+  assert.equal(store.getSelectedRoot(), "/repo/wt-1", "auto-pinned to wt-1");
+
+  // Away to B, meanwhile the agent moves to wt-2.
+  viewed = "thread-b";
+  await store.refresh();
+  evidence = "/repo/wt-2";
+
+  viewed = "thread-a";
+  await store.refresh();
+  assert.ok(
+    calls[2].includes("auto_root=true"),
+    `returning to A must re-resolve, not resend the stale auto pin; got ${calls[2]}`
+  );
+  assert.equal(
+    store.getSelectedRoot(),
+    "/repo/wt-2",
+    "the panel must follow the agent to its new worktree"
+  );
+});
+
+// ...but a root the USER chose is theirs, and must survive leaving and returning.
+test("a manually chosen root survives a thread switch and is never re-resolved", async () => {
+  const calls = [];
+  let viewed = "thread-a";
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: {
+            cwd: "/x",
+            file_changes: [],
+            roots: [],
+            suggested_root: "/repo/somewhere-else",
+            suggested_root_known: true,
+          },
+        }),
+      };
+    },
+    getThreadId: () => viewed,
+  });
+
+  store.setRoot("/repo/my-choice");
+  await store.refresh();
+  assert.ok(calls[0].includes("root=%2Frepo%2Fmy-choice"));
+
+  viewed = "thread-b";
+  await store.refresh();
+  viewed = "thread-a";
+  await store.refresh();
+
+  assert.ok(
+    !calls[2].includes("auto_root"),
+    "a user's own pick must not be re-resolved away"
+  );
+  assert.ok(calls[2].includes("root=%2Frepo%2Fmy-choice"));
+  assert.equal(store.getSelectedRoot(), "/repo/my-choice");
 });

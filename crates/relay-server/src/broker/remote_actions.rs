@@ -113,6 +113,9 @@ pub(super) enum RemoteActionRequest {
         /// repo. Validated relay-side; a foreign path fails closed.
         #[serde(default)]
         root: Option<String>,
+        /// Opt in to landing on `suggested_root` rather than the session's own cwd.
+        #[serde(default)]
+        auto_root: bool,
     },
     FetchReviews {
         #[serde(default)]
@@ -289,13 +292,17 @@ impl RemoteActionRequest {
                 Self::ProjectAction { input }
             }
             Self::FetchWorkspaceDiff {
-                thread_id, root, ..
+                thread_id,
+                root,
+                auto_root,
+                ..
             } => Self::FetchWorkspaceDiff {
                 device_id: Some(device_id),
                 // Preserve the viewed session + root selectors; only device_id is
                 // stamped here.
                 thread_id,
                 root,
+                auto_root,
             },
             Self::FetchReviews { .. } => Self::FetchReviews {
                 device_id: Some(device_id),
@@ -1231,8 +1238,9 @@ async fn execute_remote_action(
             device_id,
             thread_id,
             root,
+            auto_root,
         } => state
-            .workspace_diff(device_id, thread_id, root)
+            .workspace_diff(device_id, thread_id, root, auto_root)
             .await
             .map(|workspace_diff| RemoteActionOutcome {
                 workspace_diff: Some(workspace_diff),

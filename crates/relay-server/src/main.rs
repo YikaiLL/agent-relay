@@ -116,6 +116,11 @@ struct WorkspaceDiffQuery {
     /// Which working tree to diff. Absent → the session's own cwd. Present → must be
     /// one of the roots enumerated for that session's repo, else it fails closed.
     root: Option<String>,
+    /// Opt in to landing on `suggested_root` (where this thread has actually been
+    /// writing) instead of its own cwd. The client sends this once per thread switch,
+    /// so the panel never re-targets itself underneath a reader.
+    #[serde(default)]
+    auto_root: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,7 +555,7 @@ async fn workspace_diff(
     authorize_api(&context, &headers, &uri)?;
     context
         .app
-        .workspace_diff(None, query.thread_id, query.root)
+        .workspace_diff(None, query.thread_id, query.root, query.auto_root)
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(|error| classify_session_error(error))

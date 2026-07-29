@@ -26,7 +26,7 @@ use crate::{
         RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput, StopTurnInput,
         SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
         ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadStateView,
-        ThreadTranscriptResponse, ThreadsResponse, UpdateSessionSettingsInput,
+        ThreadTranscriptResponse, ThreadsResponse, ToolCallView, UpdateSessionSettingsInput,
         WorkspaceDiffResponse, WorkspaceRootView,
     },
     provider::{
@@ -823,6 +823,112 @@ fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<Work
     roots
 }
 
+/// How far back through a thread's transcript to look for evidence of where it has
+/// been writing. Bounded so a long thread cannot make the diff endpoint expensive.
+const SUGGESTED_ROOT_SCAN_LIMIT: usize = 200;
+
+/// Which enumerated root a thread's recent writes actually landed in, given its tool
+/// calls most-recent-first. Returns `None` when there is no usable evidence.
+///
+/// Only ABSOLUTE paths count. Claude Code's edit tools always pass absolute
+/// `file_path`s (verified against real session transcripts), but a provider that
+/// reports paths relative to the session cwd carries no worktree information at all —
+/// guessing from those would silently mis-attribute, so they are ignored.
+///
+/// Matching is longest-root-wins, which is required rather than cosmetic: worktrees
+/// nest (this repo keeps them under `.claude/worktrees/`), so a nested worktree's
+/// files also sit under the main worktree and a first-match scan would always answer
+/// "main".
+/// Evidence is restricted to file changes that actually LANDED:
+/// - `item_type == "fileChange"`, because a read-only tool (Read/Glob/…) carries an
+///   absolute `path` too, and treating that as evidence makes the panel jump to
+///   whichever tree the agent merely glanced at;
+/// - a terminal-success status, because a failed or still-running edit never hit disk.
+pub(crate) fn suggested_root_from_tools<'a>(
+    tools: impl Iterator<Item = (&'a ToolCallView, &'a str)>,
+    roots: &[WorkspaceRootView],
+) -> Option<String> {
+    if roots.is_empty() {
+        return None;
+    }
+    // Normalize once, not per candidate. `roots` already comes from git in canonical
+    // form, but the agent may have reached the same tree through a symlinked prefix.
+    let normalized: Vec<(&str, std::path::PathBuf)> = roots
+        .iter()
+        .map(|root| {
+            (
+                root.path.as_str(),
+                std::path::PathBuf::from(normalize_cwd(&root.path)),
+            )
+        })
+        .collect();
+
+    for (tool, status) in tools {
+        if !is_landed_file_change(tool, status) {
+            continue;
+        }
+        // Only the changes that actually carry content — an entry may mix a landed
+        // write with one that did not. `tool.path` is consulted solely as the
+        // single-file shorthand when the entry carries no per-change paths at all
+        // (see claude.rs's fallback), and only for an entry already judged landed.
+        let landed_changes = tool
+            .file_changes
+            .iter()
+            .filter(|change| tool.file_changes_omitted || !change.diff.is_empty())
+            .map(|change| change.path.as_str());
+        let shorthand = tool
+            .file_changes
+            .is_empty()
+            .then(|| tool.path.as_deref())
+            .flatten();
+        let candidates = landed_changes.chain(shorthand);
+        for candidate in candidates {
+            if let Some(matched) = match_longest_root(candidate, &normalized) {
+                return Some(matched);
+            }
+        }
+    }
+    None
+}
+
+/// Whether this transcript entry represents a file write that actually reached disk.
+///
+/// Status alone is NOT sufficient: `claude.rs` records every `tool_call_result` as
+/// "completed" and never inspects `is_error`, so a failed edit is indistinguishable by
+/// status on that path. The signal that does survive is the diff body — the worker
+/// re-reads the file and emits an EMPTY diff for an edit that never landed (the
+/// input-reconstructed fallback is deliberately suppressed for a failed result). So
+/// require actual diff content, which is also provider-agnostic.
+fn is_landed_file_change(tool: &ToolCallView, status: &str) -> bool {
+    if tool.item_type != "fileChange" {
+        return false;
+    }
+    // Honour an explicit non-terminal/failed status where a provider does set one.
+    if !matches!(status, "completed") {
+        return false;
+    }
+    // `file_changes_omitted` is only ever set for an entry that HAD a diff body
+    // (see strip_file_change_diffs_for_snapshot), so it counts as landed.
+    tool.file_changes_omitted
+        || tool
+            .file_changes
+            .iter()
+            .any(|change| !change.diff.is_empty())
+}
+
+fn match_longest_root(path: &str, roots: &[(&str, std::path::PathBuf)]) -> Option<String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return None;
+    }
+    let normalized = std::path::PathBuf::from(normalize_cwd(path));
+    roots
+        .iter()
+        .filter(|(_, root)| normalized.starts_with(root))
+        // Longest wins: a nested worktree's files also live under the outer one.
+        .max_by_key(|(_, root)| root.as_os_str().len())
+        .map(|(original, _)| (*original).to_string())
+}
+
 /// Whether two paths name the same directory. Falls back to canonicalization so a
 /// symlinked prefix (macOS `/var` → `/private/var`) still matches. Only ever used to
 /// look a requested root UP in an already-enumerated set — the value actually handed
@@ -849,6 +955,8 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
             not_a_git_repo: true,
             // Roots are attached by the caller, which owns the picker's scope rules.
             roots: Vec::new(),
+            suggested_root: None,
+            suggested_root_known: true,
             unavailable: false,
             generated_at,
         });
@@ -903,12 +1011,14 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
 
     Ok(WorkspaceDiffResponse {
         cwd: cwd.to_string(),
+        suggested_root_known: true,
         diff: tracked_diff,
         file_changes,
         truncated: tracked_truncated || untracked_truncated,
         not_a_git_repo: false,
         // Roots are attached by the caller, which owns the picker's scope rules.
         roots: Vec::new(),
+        suggested_root: None,
         unavailable: false,
         generated_at,
     })

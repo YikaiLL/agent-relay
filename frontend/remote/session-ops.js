@@ -1566,13 +1566,15 @@ export function getRemoteViewedWorkspaceKey() {
   return JSON.stringify([getRemoteViewedThreadId() || "", state.session?.current_cwd || ""]);
 }
 
-export async function fetchRemoteWorkspaceDiff(root = null) {
+export async function fetchRemoteWorkspaceDiff(root = null, autoRoot = false) {
   const threadId = getRemoteViewedThreadId();
   const payload = {};
   if (threadId) payload.thread_id = threadId;
   // The relay validates this against the worktrees it enumerated for that session,
   // so a stale pin fails closed rather than reading a foreign tree.
   if (root) payload.root = root;
+  // One-shot opt-in: land on where this thread has actually been writing.
+  if (autoRoot) payload.auto_root = true;
   const result = await dispatchOrRecover("fetch_workspace_diff", payload);
   return result.workspace_diff;
 }

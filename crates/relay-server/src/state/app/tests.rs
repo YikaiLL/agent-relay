@@ -412,7 +412,7 @@ mod path_scope_tests {
         // Absent selector → the global/active workspace (legacy back-compat).
         let expected_global = { app.relay.read().await.current_cwd.clone() };
         let global = app
-            .workspace_diff(None, None, None)
+            .workspace_diff(None, None, None, false)
             .await
             .expect("global diff");
         assert_eq!(global.cwd, expected_global);
@@ -421,7 +421,7 @@ mod path_scope_tests {
 
         // Viewing thread-b returns B's workspace even though A is active — the fix.
         let viewed_b = app
-            .workspace_diff(None, Some("thread-b".to_string()), None)
+            .workspace_diff(None, Some("thread-b".to_string()), None, false)
             .await
             .expect("viewed-b diff");
         assert_eq!(
@@ -432,7 +432,7 @@ mod path_scope_tests {
 
         // Viewing thread-a returns A's workspace.
         let viewed_a = app
-            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
             .await
             .expect("viewed-a diff");
         assert_eq!(viewed_a.cwd, cwd_a);
@@ -453,7 +453,7 @@ mod path_scope_tests {
         }
 
         let ghost = app
-            .workspace_diff(None, Some("does-not-exist".to_string()), None)
+            .workspace_diff(None, Some("does-not-exist".to_string()), None, false)
             .await
             .expect("unresolvable selector returns unavailable, not an error");
         assert!(
@@ -540,7 +540,7 @@ mod path_scope_tests {
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
             .await
             .expect("diff");
 
@@ -572,6 +572,119 @@ mod path_scope_tests {
         assert_eq!(linked_root.branch.as_deref(), Some("feature"));
     }
 
+    // A real repo with SEVERAL linked worktrees, including a detached one. Every other
+    // real-git test here has exactly one linked worktree, so nothing guarded the case
+    // this feature actually ships into (this checkout has six siblings): all of them
+    // present, exactly one flagged main, main first, branches carried through.
+    #[tokio::test]
+    async fn enumerates_every_linked_worktree_including_detached() {
+        async fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let tmp = TempDir::new().expect("tmp");
+        let main = tmp.path().join("mainwt");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]).await;
+        git(&main, &["config", "user.email", "t@e.com"]).await;
+        git(&main, &["config", "user.name", "T"]).await;
+        std::fs::write(main.join("seed.txt"), "line1\n").unwrap();
+        git(&main, &["add", "seed.txt"]).await;
+        git(&main, &["commit", "-q", "-m", "seed"]).await;
+
+        // Three siblings of the main worktree, mirroring the real `agent-relay-*` layout.
+        for (dir, branch) in [("wt-alpha", "feat/alpha"), ("wt-beta", "fix/beta")] {
+            let path = tmp.path().join(dir);
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                ],
+            )
+            .await;
+        }
+        let detached = tmp.path().join("wt-detached");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                detached.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        let main_cwd = main.to_string_lossy().to_string();
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .await
+            .expect("diff");
+
+        assert_eq!(
+            response.roots.len(),
+            4,
+            "main + 3 linked must all be enumerated; got {:?}",
+            response.roots
+        );
+        assert!(
+            same_path(&response.roots[0].path, &main_cwd) && response.roots[0].is_main,
+            "the main worktree must come first and be the only one flagged"
+        );
+        assert_eq!(
+            response.roots.iter().filter(|r| r.is_main).count(),
+            1,
+            "exactly one root may be flagged main"
+        );
+
+        let by_branch: Vec<Option<&str>> =
+            response.roots.iter().map(|r| r.branch.as_deref()).collect();
+        assert!(by_branch.contains(&Some("feat/alpha")), "got {by_branch:?}");
+        assert!(by_branch.contains(&Some("fix/beta")), "got {by_branch:?}");
+        assert!(
+            by_branch.contains(&None),
+            "the detached worktree must appear with no branch; got {by_branch:?}"
+        );
+
+        // Every enumerated root must actually be selectable — the picker must not offer
+        // an option that fails to load.
+        for root in &response.roots {
+            let selected = app
+                .workspace_diff(
+                    None,
+                    Some("thread-a".to_string()),
+                    Some(root.path.clone()),
+                    false,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("root {} should load: {error}", root.path));
+            assert!(!selected.unavailable, "root {} must resolve", root.path);
+            assert!(same_path(&selected.cwd, &root.path));
+        }
+    }
+
     // L1: selecting a root re-points the diff at THAT working tree. This is the whole
     // feature — a change made only in the linked worktree is invisible from the
     // session's own cwd, and must become visible once that root is selected.
@@ -596,7 +709,7 @@ mod path_scope_tests {
 
         // Session cwd (main worktree) is clean — this is the symptom being fixed.
         let unselected = app
-            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
             .await
             .expect("diff");
         assert!(same_path(&unselected.cwd, &main_cwd));
@@ -607,7 +720,12 @@ mod path_scope_tests {
 
         // Selecting the linked worktree surfaces it.
         let selected = app
-            .workspace_diff(None, Some("thread-a".to_string()), Some(linked_cwd.clone()))
+            .workspace_diff(
+                None,
+                Some("thread-a".to_string()),
+                Some(linked_cwd.clone()),
+                false,
+            )
             .await
             .expect("diff");
         assert!(!selected.unavailable, "a legitimate root must resolve");
@@ -651,7 +769,12 @@ mod path_scope_tests {
         }
 
         let refused = app
-            .workspace_diff(None, Some("thread-a".to_string()), Some(other_cwd.clone()))
+            .workspace_diff(
+                None,
+                Some("thread-a".to_string()),
+                Some(other_cwd.clone()),
+                false,
+            )
             .await
             .expect("a foreign root fails closed rather than erroring");
 
@@ -693,6 +816,7 @@ mod path_scope_tests {
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 None,
+                false,
             )
             .await
             .expect("diff");
@@ -713,6 +837,7 @@ mod path_scope_tests {
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 Some(linked_cwd.clone()),
+                false,
             )
             .await
             .expect("out-of-scope root fails closed rather than erroring");
@@ -721,13 +846,526 @@ mod path_scope_tests {
         // A device with no narrow scope still sees both (the filter is scope-driven,
         // not a blanket removal of linked worktrees).
         let unscoped = app
-            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
             .await
             .expect("diff");
         assert_eq!(
             unscoped.roots.len(),
             2,
             "an unscoped caller keeps every worktree"
+        );
+    }
+
+    // ---- L2: suggest the root where the thread has actually been writing ----------
+
+    fn file_tool(paths: &[&str]) -> crate::protocol::ToolCallView {
+        crate::protocol::ToolCallView {
+            item_type: "fileChange".to_string(),
+            name: "Edit".to_string(),
+            title: "Edit".to_string(),
+            detail: None,
+            query: None,
+            path: None,
+            url: None,
+            command: None,
+            input_preview: None,
+            result_preview: None,
+            diff: None,
+            file_changes: paths
+                .iter()
+                .map(|path| crate::protocol::FileChangeDiffView {
+                    path: path.to_string(),
+                    change_type: "update".to_string(),
+                    // A write that LANDED carries a diff body — that is what the worker
+                    // emits after re-reading the file. An empty diff means it did not
+                    // reach disk, which is how a failed edit is distinguishable at all
+                    // (see failed_file_tool).
+                    diff: format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"),
+                })
+                .collect(),
+            apply_state: None,
+            file_changes_omitted: false,
+        }
+    }
+
+    // A plain Read: `item_type: "toolCall"` with an absolute `path` and NO file_changes.
+    // Shaped exactly like claude-worker/sdk-mapping.mjs emits for read-only tools.
+    fn read_tool(path: &str) -> crate::protocol::ToolCallView {
+        crate::protocol::ToolCallView {
+            item_type: "toolCall".to_string(),
+            name: "Read".to_string(),
+            title: "Read".to_string(),
+            detail: None,
+            query: None,
+            path: Some(path.to_string()),
+            url: None,
+            command: None,
+            input_preview: None,
+            result_preview: None,
+            diff: None,
+            file_changes: Vec::new(),
+            apply_state: None,
+            file_changes_omitted: false,
+        }
+    }
+
+    fn seed_transcript_with_status(
+        app_relay: &mut crate::state::RelayState,
+        thread: &str,
+        entries: Vec<(crate::protocol::ToolCallView, &str)>,
+    ) {
+        let runtime = app_relay.ensure_runtime_for_thread(thread);
+        for (index, (tool, status)) in entries.into_iter().enumerate() {
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: format!("item-{index}"),
+                    kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                    text: None,
+                    status: status.to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    tool: Some(tool),
+                });
+        }
+    }
+
+    fn seed_transcript(
+        app_relay: &mut crate::state::RelayState,
+        thread: &str,
+        tools: Vec<crate::protocol::ToolCallView>,
+    ) {
+        let runtime = app_relay.ensure_runtime_for_thread(thread);
+        for (index, tool) in tools.into_iter().enumerate() {
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: format!("item-{index}"),
+                    kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                    text: None,
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    tool: Some(tool),
+                });
+        }
+    }
+
+    // The feature: the agent went off and edited files in a linked worktree, so that is
+    // where the panel should land — but only when the client opts in via `auto_root`.
+    #[tokio::test]
+    async fn auto_root_lands_on_the_worktree_the_thread_wrote_to() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nEDITED-IN-WORKTREE\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        // Reported as a fact even without opting in — but the target is untouched, so a
+        // plain refresh can never move the panel under a reader.
+        let plain = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(plain.suggested_root.as_deref().unwrap_or(""), &linked_cwd),
+            "the worktree the thread wrote to must be suggested; got {:?}",
+            plain.suggested_root
+        );
+        assert!(
+            same_path(&plain.cwd, &main_cwd),
+            "without auto_root the target must stay the session cwd"
+        );
+
+        // Opting in lands there.
+        let auto = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(&auto.cwd, &linked_cwd),
+            "auto_root must target the observed worktree; got {}",
+            auto.cwd
+        );
+        assert!(auto.file_changes[0].diff.contains("EDITED-IN-WORKTREE"));
+    }
+
+    // No evidence, or evidence pointing at the session's own cwd, is nothing to suggest:
+    // the panel already defaults there and a self-suggestion would pin every thread.
+    #[tokio::test]
+    async fn no_suggestion_when_the_thread_writes_in_its_own_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert_eq!(response.suggested_root, None);
+        assert!(same_path(&response.cwd, &main_cwd));
+    }
+
+    // Relative paths carry no worktree information (they are relative to the session
+    // cwd), so guessing from them would silently mis-attribute.
+    #[tokio::test]
+    async fn relative_paths_are_never_used_as_evidence() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&["src/x.rs"])]);
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert_eq!(response.suggested_root, None);
+    }
+
+    // Reading a file is not working in it. A plain Read carries an absolute `path` just
+    // like an Edit does, so treating any tool path as evidence makes the panel jump to
+    // whichever worktree the agent last GLANCED at.
+    #[tokio::test]
+    async fn a_read_only_tool_is_not_evidence_of_writing() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let looked_at = format!("{linked_cwd}/seed.txt");
+            seed_transcript_with_status(
+                &mut relay,
+                "thread-a",
+                vec![(read_tool(&looked_at), "completed")],
+            );
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert_eq!(
+            response.suggested_root, None,
+            "a Read must not be treated as writing there"
+        );
+        assert!(same_path(&response.cwd, &main_cwd));
+    }
+
+    // An edit that failed or is still running never landed on disk, so it is not
+    // evidence either — and a later Read of the session cwd must not mask an EARLIER
+    // real edit in the worktree by matching first.
+    #[tokio::test]
+    async fn only_completed_file_changes_count_as_evidence() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nREAL-EDIT\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let in_worktree = format!("{linked_cwd}/seed.txt");
+            let in_main = format!("{main_cwd}/seed.txt");
+            seed_transcript_with_status(
+                &mut relay,
+                "thread-a",
+                vec![
+                    // Oldest → newest. The only COMPLETED write is in the worktree.
+                    (file_tool(&[&in_worktree]), "completed"),
+                    (file_tool(&[&in_main]), "failed"),
+                    (read_tool(&in_main), "completed"),
+                    (file_tool(&[&in_main]), "running"),
+                ],
+            );
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(
+                response.suggested_root.as_deref().unwrap_or(""),
+                &linked_cwd
+            ),
+            "the completed worktree edit must win over a failed/running/read on main; got {:?}",
+            response.suggested_root
+        );
+    }
+
+    // A thread the client just navigated to may have a cwd (from its summary) but no
+    // loaded transcript yet. "No evidence" and "could not look yet" are different
+    // answers: conflating them makes the client burn its one-shot auto-resolve on a
+    // thread whose history has not arrived, and it never re-resolves.
+    #[tokio::test]
+    async fn a_cold_thread_reports_the_suggestion_as_not_yet_known() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            // Summary only — deliberately NO runtime for this thread.
+            relay.threads = vec![ThreadSummaryView {
+                id: "cold-thread".to_string(),
+                name: None,
+                preview: String::new(),
+                cwd: main_cwd.clone(),
+                updated_at: 1,
+                source: "local".to_string(),
+                status: "idle".to_string(),
+                model_provider: "anthropic".to_string(),
+                provider: "claude_code".to_string(),
+                forked_from: None,
+            }];
+        }
+
+        let cold = app
+            .workspace_diff(None, Some("cold-thread".to_string()), None, true)
+            .await
+            .expect("a cold thread still diffs its own cwd");
+        assert!(same_path(&cold.cwd, &main_cwd));
+        assert_eq!(cold.suggested_root, None);
+        assert!(
+            !cold.suggested_root_known,
+            "an unloaded transcript must report the suggestion as UNKNOWN, not as none"
+        );
+
+        // Once the transcript is loaded the answer becomes known.
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("cold-thread").current_cwd = main_cwd.clone();
+            seed_transcript_with_status(&mut relay, "cold-thread", vec![]);
+        }
+        let warm = app
+            .workspace_diff(None, Some("cold-thread".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert!(
+            warm.suggested_root_known,
+            "a loaded thread with no worktree evidence is a KNOWN 'nothing to suggest'"
+        );
+        assert_eq!(warm.suggested_root, None);
+    }
+
+    // The shape a REAL failed Claude edit takes. `claude.rs` records every
+    // `tool_call_result` with status "completed" and never looks at `is_error`, so the
+    // status field cannot distinguish a failed edit — the previous guard checked a value
+    // the Claude path never emits. What DOES distinguish it: the worker re-reads the file
+    // and, for an edit that never landed, emits the fileChange with an EMPTY diff
+    // (`useFallback` is suppressed for a failed result, see claude-worker/file-diff.mjs).
+    fn failed_file_tool(path: &str) -> crate::protocol::ToolCallView {
+        let mut tool = file_tool(&[path]);
+        // Exactly what the worker produces for a failed edit: the change is reported,
+        // but with no diff body because nothing reached disk.
+        tool.file_changes[0].diff = String::new();
+        tool
+    }
+
+    // Guards the real failure mode: a failed edit in a CLEAN worktree must not drag the
+    // panel over there, and a newer failed edit in main must not mask an older real
+    // write in the worktree. Both arrive with status "completed".
+    #[tokio::test]
+    async fn a_failed_edit_is_not_evidence_even_though_it_records_as_completed() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let in_worktree = format!("{linked_cwd}/seed.txt");
+            seed_transcript_with_status(
+                &mut relay,
+                "thread-a",
+                // A failed edit, recorded the way claude.rs actually records it.
+                vec![(failed_file_tool(&in_worktree), "completed")],
+            );
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert_eq!(
+            response.suggested_root, None,
+            "an edit that never landed must not suggest that worktree"
+        );
+        assert!(same_path(&response.cwd, &main_cwd));
+    }
+
+    #[tokio::test]
+    async fn a_newer_failed_edit_does_not_mask_an_older_real_write() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nREAL-EDIT\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let in_worktree = format!("{linked_cwd}/seed.txt");
+            let in_main = format!("{main_cwd}/seed.txt");
+            seed_transcript_with_status(
+                &mut relay,
+                "thread-a",
+                vec![
+                    // Oldest: a real write that landed in the worktree.
+                    (file_tool(&[&in_worktree]), "completed"),
+                    // Newest: a FAILED write in main, also recorded as "completed".
+                    (failed_file_tool(&in_main), "completed"),
+                ],
+            );
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(
+                response.suggested_root.as_deref().unwrap_or(""),
+                &linked_cwd
+            ),
+            "the older LANDED write must win over a newer failed one; got {:?}",
+            response.suggested_root
+        );
+    }
+
+    // Worktrees NEST — this repo keeps them under `.claude/worktrees/` — so a nested
+    // worktree's files also sit under the main worktree. A first-match scan would always
+    // answer "main"; longest-root-wins is required for the feature to work at all here.
+    #[tokio::test]
+    async fn nested_worktree_wins_over_the_enclosing_one() {
+        let tmp = TempDir::new().expect("tmp");
+        let main_cwd = tmp.path().join("mainwt").to_string_lossy().to_string();
+        {
+            async fn git(dir: &std::path::Path, args: &[&str]) {
+                let out = tokio::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .output()
+                    .await
+                    .expect("git runs");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let main = std::path::Path::new(&main_cwd);
+            std::fs::create_dir_all(main).unwrap();
+            git(main, &["init", "-q", "-b", "main"]).await;
+            git(main, &["config", "user.email", "t@e.com"]).await;
+            git(main, &["config", "user.name", "T"]).await;
+            std::fs::write(main.join("seed.txt"), "line1\n").unwrap();
+            git(main, &["add", "seed.txt"]).await;
+            git(main, &["commit", "-q", "-m", "seed"]).await;
+            // The nested worktree lives INSIDE the main one.
+            let nested = main.join(".nested/wt");
+            git(
+                main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "nested",
+                    nested.to_str().unwrap(),
+                ],
+            )
+            .await;
+        }
+        let nested_cwd = std::path::Path::new(&main_cwd)
+            .join(".nested/wt")
+            .to_string_lossy()
+            .to_string();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{nested_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(
+                response.suggested_root.as_deref().unwrap_or(""),
+                &nested_cwd
+            ),
+            "the NESTED worktree must win over the enclosing main one; got {:?}",
+            response.suggested_root
+        );
+    }
+
+    // Safety: auto-selection must obey the same boundary as manual selection. An
+    // out-of-scope worktree is not in `roots`, so it can never be suggested either.
+    #[tokio::test]
+    async fn auto_root_never_escapes_the_device_scope() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        pair_device(&app, "device-narrow", vec![main_cwd.clone()]).await;
+
+        let response = app
+            .workspace_diff(
+                Some("device-narrow".to_string()),
+                Some("thread-a".to_string()),
+                None,
+                true,
+            )
+            .await
+            .expect("diff");
+        assert_eq!(
+            response.suggested_root, None,
+            "an out-of-scope worktree must not be suggested"
+        );
+        assert!(
+            same_path(&response.cwd, &main_cwd),
+            "auto must fall back to the session cwd, not escape scope"
         );
     }
 

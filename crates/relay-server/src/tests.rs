@@ -555,3 +555,48 @@ fn session_errors_are_classified_by_cause_not_lumped_into_502() {
         assert_eq!(body.0.error.code, "provider_bridge_error");
     }
 }
+
+// Regression guard for the layer neither side's unit tests covered: the frontend
+// builds a query string and the backend deserializes it, and NOTHING exercised the
+// contract between them. `serde_urlencoded` parses a Rust `bool` with `str::parse`,
+// which accepts only "true"/"false" — so a query built with `auto_root=1` 400s before
+// the handler ever runs, and the panel just errors.
+#[test]
+fn workspace_diff_query_parses_the_url_the_client_actually_builds() {
+    use axum::extract::Query;
+
+    // Exactly what frontend/local/workspace-diff.js emits for a first thread view.
+    let uri: Uri = "/api/workspace/diff?thread_id=thread-a&auto_root=true"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::WorkspaceDiffQuery> =
+        Query::try_from_uri(&uri).expect("the client's own URL must deserialize");
+    assert_eq!(query.0.thread_id.as_deref(), Some("thread-a"));
+    assert!(query.0.auto_root);
+
+    // Absent flag stays false (legacy clients).
+    let uri: Uri = "/api/workspace/diff?thread_id=thread-a"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::WorkspaceDiffQuery> = Query::try_from_uri(&uri).expect("legacy url");
+    assert!(!query.0.auto_root);
+    assert_eq!(query.0.root, None);
+
+    // The bug this guards: "1" is NOT a urlencoded bool. Proven here so the guard
+    // above can never be "fixed" by loosening the client back to `1`.
+    let uri: Uri = "/api/workspace/diff?thread_id=t&auto_root=1"
+        .parse()
+        .expect("uri");
+    assert!(
+        Query::<crate::WorkspaceDiffQuery>::try_from_uri(&uri).is_err(),
+        "serde_urlencoded accepts only true/false for bool — if this ever starts \
+         passing, the client may use 1 again"
+    );
+
+    // And an explicit root round-trips url-decoded.
+    let uri: Uri = "/api/workspace/diff?thread_id=t&root=%2Frepo%2Flinked"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::WorkspaceDiffQuery> = Query::try_from_uri(&uri).expect("root url");
+    assert_eq!(query.0.root.as_deref(), Some("/repo/linked"));
+}

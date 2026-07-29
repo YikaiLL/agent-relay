@@ -196,7 +196,8 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
     let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
         "type": "fetch_workspace_diff",
         "thread_id": "thread-viewed",
-        "root": "/repo/linked"
+        "root": "/repo/linked",
+        "auto_root": true
     }))
     .expect("fetch_workspace_diff should parse");
     assert_eq!(request.kind(), RemoteActionKind::FetchWorkspaceDiff);
@@ -210,8 +211,13 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
             device_id,
             thread_id,
             root,
+            auto_root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert!(
+                auto_root,
+                "bind_device must preserve the auto-resolve opt-in too"
+            );
             assert_eq!(
                 thread_id.as_deref(),
                 Some("thread-viewed"),
@@ -236,10 +242,12 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
             device_id,
             thread_id,
             root,
+            auto_root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-1"));
             assert_eq!(thread_id, None);
             assert_eq!(root, None, "an omitted root must default to None");
+            assert!(!auto_root, "an omitted auto_root must default to false");
         }
         other => panic!("unexpected variant: {other:?}"),
     }

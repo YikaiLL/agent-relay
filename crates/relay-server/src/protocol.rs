@@ -1496,6 +1496,20 @@ pub struct WorkspaceDiffResponse {
     /// picker. `#[serde(default)]` keeps older clients/persisted payloads readable.
     #[serde(default)]
     pub roots: Vec<WorkspaceRootView>,
+    /// Where this thread's recent file writes actually landed, when that is a
+    /// DIFFERENT root than its own cwd — i.e. the agent went off and worked in a
+    /// worktree. `None` means "no evidence, or it is already working in its own cwd",
+    /// so there is nothing to suggest. Purely derived: reporting it never changes
+    /// which tree got diffed (see the `auto_root` request flag for that).
+    #[serde(default)]
+    pub suggested_root: Option<String>,
+    /// Whether `suggested_root` was actually DETERMINED, as opposed to unknown because
+    /// the thread's transcript is not loaded yet (a cold thread the client just
+    /// navigated to). `false` means "ask again later" — without this a client cannot
+    /// tell "this thread works in its own cwd" from "we could not look", and would burn
+    /// its one-shot auto-resolve on a thread whose history had not arrived.
+    #[serde(default = "default_true")]
+    pub suggested_root_known: bool,
     /// The requested session's workspace could not be resolved (deleted / not-yet-loaded /
     /// pending thread). Fail-closed marker: the panel renders "workspace unavailable" rather
     /// than falling back to another workspace's diff. Distinct from a clean tree.
@@ -1517,6 +1531,8 @@ impl WorkspaceDiffResponse {
             // No roots either: the picker must not reveal a repo layout for a
             // workspace the caller was just refused.
             roots: Vec::new(),
+            suggested_root: None,
+            suggested_root_known: false,
             unavailable: true,
             generated_at: 0,
         }
