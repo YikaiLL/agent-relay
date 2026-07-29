@@ -1685,8 +1685,13 @@ fn inject_turn_diff_entries(transcript: Vec<TranscriptEntryView>) -> Vec<Transcr
             );
             current_turn = entry.turn_id.clone();
         }
+        // A failed edit changed nothing, so it is not part of the turn's changes — same
+        // rule as the live collector in RelayState::turn_file_change_summary. Without it
+        // a reloaded session shows failed edits as real modifications, and the
+        // input-reconstructed diff can make one look like a genuine change.
+        let entry_failed = matches!(entry.status.as_str(), "failed" | "error");
         if let Some(tool) = entry.tool.as_ref() {
-            if tool.item_type == "fileChange" {
+            if tool.item_type == "fileChange" && !entry_failed {
                 current_changes.extend(tool.file_changes.iter().cloned());
                 if current_changes.is_empty() {
                     if let Some(path) = tool.path.clone() {
@@ -2871,6 +2876,179 @@ mod tests {
             .find(|entry| entry.item_id.as_deref() == Some("tool:toolu_ok"))
             .expect("tool entry");
         assert_eq!(entry.status, "completed");
+    }
+
+    // Replay builds turn summaries through a SEPARATE collector, so the live-path filter
+    // does not cover it: a reloaded session would still show a failed edit as a change.
+    #[test]
+    fn hydration_excludes_failed_edits_from_the_turn_summary() {
+        fn file_change_entry(
+            item_id: &str,
+            path: &str,
+            diff: &str,
+            status: &str,
+        ) -> TranscriptEntryView {
+            TranscriptEntryView {
+                item_id: Some(item_id.to_string()),
+                kind: TranscriptEntryKind::ToolCall,
+                text: None,
+                status: status.to_string(),
+                turn_id: Some("turn-1".to_string()),
+                tool: Some(crate::protocol::ToolCallView {
+                    item_type: "fileChange".to_string(),
+                    name: "Edit".to_string(),
+                    title: "Edit".to_string(),
+                    detail: None,
+                    query: None,
+                    path: Some(path.to_string()),
+                    url: None,
+                    command: None,
+                    input_preview: None,
+                    result_preview: None,
+                    diff: None,
+                    file_changes: vec![crate::protocol::FileChangeDiffView {
+                        path: path.to_string(),
+                        change_type: "update".to_string(),
+                        diff: diff.to_string(),
+                    }],
+                    apply_state: None,
+                    file_changes_omitted: false,
+                }),
+                content_state: crate::protocol::TranscriptContentState::Full,
+            }
+        }
+
+        let out = inject_turn_diff_entries(vec![
+            file_change_entry("tool:ok", "good.rs", "-old\n+new\n", "completed"),
+            file_change_entry("tool:bad", "bad.rs", "", "failed"),
+        ]);
+
+        let summary = out
+            .iter()
+            .find(|entry| {
+                entry
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.item_type == "turnDiff")
+            })
+            .expect("the landed edit still needs a turn diff");
+        let paths: Vec<&str> = summary
+            .tool
+            .as_ref()
+            .unwrap()
+            .file_changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert!(paths.contains(&"good.rs"), "got {paths:?}");
+        assert!(
+            !paths.contains(&"bad.rs"),
+            "a failed edit must not replay as a file change; got {paths:?}"
+        );
+    }
+
+    fn file_change_result(id: &str, path: &str, diff: &str, is_error: bool) -> serde_json::Value {
+        json!({
+            "type": "tool_call_result",
+            "provider_session_id": "thread-b",
+            "id": id,
+            "turn_id": "turn-b",
+            "is_error": is_error,
+            "tool": {
+                "item_type": "fileChange",
+                "name": "Edit",
+                "title": "Edit",
+                "detail": null,
+                "query": null,
+                "path": path,
+                "url": null,
+                "command": null,
+                "input_preview": null,
+                "result_preview": null,
+                "diff": null,
+                "file_changes": [
+                    { "path": path, "change_type": "update", "diff": diff }
+                ]
+            }
+        })
+    }
+
+    fn turn_diff_paths(snapshot: &crate::protocol::SessionSnapshot) -> Option<Vec<String>> {
+        snapshot
+            .transcript
+            .iter()
+            .find(|entry| {
+                entry
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.item_type == "turnDiff")
+            })
+            .map(|entry| {
+                entry
+                    .tool
+                    .as_ref()
+                    .unwrap()
+                    .file_changes
+                    .iter()
+                    .map(|change| change.path.clone())
+                    .collect()
+            })
+    }
+
+    // A turn whose only edit FAILED changed nothing, so it must not produce a turn
+    // summary at all — otherwise the transcript claims "1 file change" for a turn that
+    // touched nothing, and the synthetic turnDiff carries an Undo control for an edit
+    // that was never applied.
+    #[tokio::test]
+    async fn a_turn_whose_only_edit_failed_produces_no_turn_diff() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            file_change_result("toolu_fail", "/tmp/b/x.rs", "", true),
+            &state,
+        )
+        .await;
+
+        let snapshot = state.read().await.snapshot();
+        assert_eq!(
+            turn_diff_paths(&snapshot),
+            None,
+            "a failed-only turn must not synthesize a turn diff"
+        );
+    }
+
+    // Mixed turn: the summary must keep the edit that landed and drop the one that did
+    // not, rather than discarding the whole summary or listing both.
+    #[tokio::test]
+    async fn a_turn_summary_keeps_landed_edits_and_drops_failed_ones() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            file_change_result(
+                "toolu_ok",
+                "/tmp/b/good.rs",
+                "--- a/good.rs\n+++ b/good.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                false,
+            ),
+            &state,
+        )
+        .await;
+        handle_worker_event(
+            file_change_result("toolu_bad", "/tmp/b/bad.rs", "", true),
+            &state,
+        )
+        .await;
+
+        let snapshot = state.read().await.snapshot();
+        let paths = turn_diff_paths(&snapshot).expect("the landed edit still needs a turn diff");
+        assert!(
+            paths.iter().any(|path| path.contains("good.rs")),
+            "the edit that landed must stay in the summary; got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.contains("bad.rs")),
+            "the failed edit must not appear as a file change; got {paths:?}"
+        );
     }
 
     #[tokio::test]

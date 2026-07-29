@@ -691,6 +691,17 @@ impl RelayState {
             if entry.turn_id.as_deref() != Some(turn_id) {
                 continue;
             }
+            // An edit that FAILED changed nothing, so it is not part of this turn's
+            // changes. Including it made the transcript claim a file count for a turn
+            // that touched nothing, and gave the synthetic turnDiff an Undo control for
+            // an edit that was never applied. Filtering at the collector means every
+            // consumer (live synthesis, hydration, the snapshot) inherits it.
+            //
+            // Only a terminal FAILURE is excluded: an edit still in flight has no diff
+            // yet but is a real pending change and must stay listed.
+            if matches!(entry.status.as_str(), "failed" | "error") {
+                continue;
+            }
             let Some(tool) = entry.tool.as_ref() else {
                 continue;
             };

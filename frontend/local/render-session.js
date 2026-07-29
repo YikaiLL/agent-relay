@@ -46,6 +46,7 @@ import {
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
 import { canForkInSession } from "../shared/fork-fields.js";
+import { canApplyFileChanges } from "../shared/file-change-actions.js";
 import {
   readActiveProjectId,
   readThreadListContextMenu,
@@ -1343,6 +1344,7 @@ export function createSessionRenderer({
           // acting from a saved-thread view would mutate the wrong/live thread),
           // and while the active thread is itself under review.
           enableFileChangeActions:
+            canApplyFileChanges(session) &&
             !session.view_only &&
             !isReviewInProgressForThread(session, session.active_thread_id) &&
             !isWorkflowInProgressForThread(session, session.active_thread_id),
