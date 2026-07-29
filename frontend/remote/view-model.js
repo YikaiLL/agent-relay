@@ -1,5 +1,6 @@
 import {
   buildNavigationThreadGroups,
+  isUnassignedProject,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
 import { isReviewInProgressForThread } from "../shared/review-state.js";
@@ -153,12 +154,19 @@ export function selectThreadsRenderModel({
     };
   }
 
+  // Projects mode must not surface the "Unassigned" bucket. Shared grouping always
+  // creates one for any thread without a project (shared/thread-groups.js:124-126),
+  // which flooded the phone's Projects view with every unassigned session. The
+  // local sidebar avoids this by listing projects only and moving sessions into a
+  // main-area card overview (local/render-session.js:1445); remote has no such
+  // main area yet, so it keeps the grouped list and drops the bucket instead —
+  // otherwise Projects mode would show rows with no way to open a session.
   const groups = groupByProject
     ? buildNavigationThreadGroups(normalizedThreads, {
         groupBy: "project",
         projects,
         threadProjectId,
-      })
+      }).filter((group) => !isUnassignedProject(group.key))
     : buildNavigationThreadGroups(normalizedThreads);
 
   return {
