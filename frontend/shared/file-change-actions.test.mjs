@@ -69,10 +69,25 @@ test("an absolute header inside file_changes is caught too", () => {
   );
 });
 
-// Large transcripts ship with diff bodies stripped. With nothing to inspect we must not
-// hide a control that probably works — the relay still rejects a bad patch with a
-// visible error, which is strictly better than silently removing the affordance.
-test("a stripped diff body stays enabled rather than guessing", () => {
-  assert.equal(canApplyPatch({ diff: null, file_changes: [], file_changes_omitted: true }), true);
+// EVERY snapshot drops diff bodies, not just large ones — so in the normal collapsed
+// view there is no patch to inspect and the client must use the relay's verdict, which
+// was computed while the diff was still present.
+test("the relay's verdict wins over inspecting a stripped body", () => {
+  assert.equal(
+    canApplyPatch({ diff: null, file_changes: [], file_changes_omitted: true, can_apply: false }),
+    false,
+    "a stripped entry the relay judged unappliable must not offer Undo"
+  );
+  assert.equal(
+    canApplyPatch({ diff: null, file_changes: [], file_changes_omitted: true, can_apply: true }),
+    true
+  );
+});
+
+// No verdict and nothing to inspect: the authoritative read/detail paths carry the real
+// diff and are judged directly, so this is the genuinely-unknown case. Keep the control
+// rather than removing it on no evidence — the relay still rejects a bad patch visibly.
+test("no verdict and no body stays enabled rather than guessing", () => {
+  assert.equal(canApplyPatch({ diff: null, file_changes: [] }), true);
   assert.equal(canApplyPatch(null), true);
 });

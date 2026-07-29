@@ -22,6 +22,10 @@ function headerLooksAbsolute(diff) {
 
 export function canApplyPatch(tool) {
   if (!tool) return true;
+  // The relay's verdict, computed while the diff was still present. Authoritative:
+  // every snapshot drops diff bodies, so in the normal collapsed view there is nothing
+  // here to inspect and guessing from an empty string would always say "fine".
+  if (typeof tool.can_apply === "boolean") return tool.can_apply;
   if (headerLooksAbsolute(tool.diff)) return false;
   const changes = Array.isArray(tool.file_changes) ? tool.file_changes : [];
   if (changes.some((change) => headerLooksAbsolute(change?.diff))) return false;

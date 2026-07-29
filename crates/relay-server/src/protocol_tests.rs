@@ -1755,6 +1755,7 @@ fn compact_for_broker_shells_tool_entries_dropping_heavy_content() {
                 .collect(),
             apply_state: None,
             file_changes_omitted: false,
+            can_apply: None,
         }),
         content_state: crate::protocol::TranscriptContentState::Full,
     }];
@@ -1810,6 +1811,7 @@ fn strip_file_change_diffs_keeps_summary_and_flags_entry() {
                 ],
                 apply_state: None,
                 file_changes_omitted: false,
+                can_apply: None,
             }),
             content_state: crate::protocol::TranscriptContentState::Full,
         },
@@ -1879,6 +1881,7 @@ fn compact_for_broker_shells_bring_oversized_transcript_under_budget() {
                     .collect(),
                 apply_state: None,
                 file_changes_omitted: false,
+                can_apply: None,
             }),
             content_state: crate::protocol::TranscriptContentState::Full,
         })
@@ -1945,6 +1948,7 @@ fn compact_for_broker_trims_many_file_changes_without_clearing_transcript() {
                 .collect(),
             apply_state: None,
             file_changes_omitted: false,
+            can_apply: None,
         }),
         content_state: crate::protocol::TranscriptContentState::Full,
     }];
@@ -2454,6 +2458,7 @@ fn thread_transcript_history_externalizes_large_file_change_diffs() {
             }],
             apply_state: None,
             file_changes_omitted: false,
+            can_apply: None,
         }),
         content_state: crate::protocol::TranscriptContentState::Full,
     }];
@@ -2587,6 +2592,7 @@ fn thread_entry_detail_response_chunks_large_nested_file_change_diff() {
             }],
             apply_state: None,
             file_changes_omitted: false,
+            can_apply: None,
         }),
         content_state: crate::protocol::TranscriptContentState::Full,
     };
@@ -2616,4 +2622,93 @@ fn thread_entry_detail_response_chunks_large_nested_file_change_diff() {
     )
     .expect("synthetic nested diff chunk");
     assert!(!chunk.chunk.expect("chunk").text.is_empty());
+}
+
+#[cfg(test)]
+mod can_apply_flag_tests {
+    use crate::protocol::{
+        strip_file_change_diffs_for_snapshot, FileChangeDiffView, ToolCallView,
+        TranscriptContentState, TranscriptEntryKind, TranscriptEntryView,
+    };
+
+    fn turn_diff_entry(diff: &str) -> TranscriptEntryView {
+        TranscriptEntryView {
+            item_id: Some("turn-diff:t1".to_string()),
+            kind: TranscriptEntryKind::ToolCall,
+            text: None,
+            status: "completed".to_string(),
+            turn_id: Some("t1".to_string()),
+            tool: Some(ToolCallView {
+                item_type: "turnDiff".to_string(),
+                name: "diff".to_string(),
+                title: "Changes".to_string(),
+                detail: None,
+                query: None,
+                path: None,
+                url: None,
+                command: None,
+                input_preview: None,
+                result_preview: None,
+                diff: Some(diff.to_string()),
+                file_changes: vec![FileChangeDiffView {
+                    path: "x.js".to_string(),
+                    change_type: "update".to_string(),
+                    diff: diff.to_string(),
+                }],
+                apply_state: None,
+                file_changes_omitted: false,
+                can_apply: None,
+            }),
+            content_state: TranscriptContentState::Full,
+        }
+    }
+
+    // Snapshots ALWAYS drop diff bodies, so a client cannot inspect the patch to decide
+    // whether Undo can work — it would be judging an empty string. The verdict has to be
+    // computed here, while the diff is still present, and travel with the entry.
+    #[test]
+    fn stripping_stamps_whether_the_patch_could_be_applied() {
+        let appliable = "diff --git a/x.js b/x.js\n--- a/x.js\n+++ b/x.js\n@@ -1 +1 @@\n-a\n+b\n";
+        let mut transcript = vec![turn_diff_entry(appliable)];
+        strip_file_change_diffs_for_snapshot(&mut transcript);
+        let tool = transcript[0].tool.as_ref().unwrap();
+        assert!(tool.file_changes_omitted, "the body is dropped as before");
+        assert_eq!(
+            tool.can_apply,
+            Some(true),
+            "a repo-relative patch must be marked appliable before its body is dropped"
+        );
+    }
+
+    #[test]
+    fn stripping_marks_an_absolute_header_as_not_appliable() {
+        let absolute = "diff --git a//Users/me/x.js b//Users/me/x.js\n--- a//Users/me/x.js\n+++ b//Users/me/x.js\n@@ -1 +1 @@\n-a\n+b\n";
+        let mut transcript = vec![turn_diff_entry(absolute)];
+        strip_file_change_diffs_for_snapshot(&mut transcript);
+        assert_eq!(
+            transcript[0].tool.as_ref().unwrap().can_apply,
+            Some(false),
+            "git refuses an absolute path, so Undo must not be offered"
+        );
+    }
+
+    // The other two shapes git rejects, both of which read as "has a header".
+    #[test]
+    fn stripping_marks_headerless_patches_as_not_appliable() {
+        for (label, diff) in [
+            ("bare hunk", "@@ -1 +1 @@\n-a\n+b\n"),
+            (
+                "diff --git without ---/+++",
+                "diff --git a/x.js b/x.js\n@@ -1 +1 @@\n-a\n+b\n",
+            ),
+        ] {
+            let mut transcript = vec![turn_diff_entry(diff)];
+            strip_file_change_diffs_for_snapshot(&mut transcript);
+            assert_eq!(
+                transcript[0].tool.as_ref().unwrap().can_apply,
+                Some(false),
+                "{label}: git cannot apply this"
+            );
+        }
+    }
 }

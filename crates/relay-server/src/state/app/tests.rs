@@ -975,6 +975,7 @@ mod path_scope_tests {
                 .collect(),
             apply_state: None,
             file_changes_omitted: false,
+            can_apply: None,
         }
     }
 
@@ -996,6 +997,7 @@ mod path_scope_tests {
             file_changes: Vec::new(),
             apply_state: None,
             file_changes_omitted: false,
+            can_apply: None,
         }
     }
 
@@ -2184,6 +2186,7 @@ mod path_scope_tests {
                     }],
                     apply_state: None,
                     file_changes_omitted: false,
+                    can_apply: None,
                 }),
             );
         }

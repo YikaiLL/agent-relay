@@ -238,8 +238,13 @@ export function mapModelInfos(modelInfos) {
   return models;
 }
 
-function mapToolCall(block, msg, status = "running", { provisionalFileChange = false } = {}) {
-  const baseChange = fileChangeFromToolInput(block.name, block.input);
+function mapToolCall(
+  block,
+  msg,
+  status = "running",
+  { provisionalFileChange = false, cwd = null } = {}
+) {
+  const baseChange = fileChangeFromToolInput(block.name, block.input, cwd);
   // On the LIVE request path the edit hasn't landed yet, so any diff derived from
   // the tool input (old_string/new_string, or a Write's full content) is only a
   // guess that the worker's file-diff tracker replaces with the real on-disk diff
@@ -551,7 +556,10 @@ export function lastMessageActivitySeconds(messages) {
   return maxMs > 0 ? Math.floor(maxMs / 1000) : null;
 }
 
-export function mapSessionMessages(messages) {
+// `cwd` is the session's working directory. It is what makes replayed patch headers
+// repo-relative — without it a reloaded thread re-renders absolute headers and its
+// Undo/Reapply stops working, even for edits the live path recorded correctly.
+export function mapSessionMessages(messages, cwd = null) {
   const entries = [];
   const toolEntryById = new Map();
 
@@ -646,12 +654,16 @@ export function mapSessionMessages(messages) {
       }
       for (const block of Array.isArray(blocks) ? blocks : []) {
         if (block?.type !== "tool_use") continue;
-        const event = mapToolCall(block, { uuid: itemId }, "completed");
+        // "running", not "completed": at this point only the REQUEST has been seen.
+        // upsertToolResult settles it when the matching tool_result shows up; an
+        // interrupted turn leaves none, and claiming that write landed would both show a
+        // phantom change and let the worktree suggestion follow it.
+        const event = mapToolCall(block, { uuid: itemId }, "running", { cwd });
         entries.push({
           item_id: event.item_id,
           kind: "tool_call",
           text: null,
-          status: "completed",
+          status: "running",
           turn_id: itemId,
           tool: event.tool,
         });

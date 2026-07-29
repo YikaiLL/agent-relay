@@ -1389,6 +1389,7 @@ fn fake_tool_call_view(index: usize, completed: bool) -> ToolCallView {
         file_changes: Vec::new(),
         apply_state: None,
         file_changes_omitted: false,
+        can_apply: None,
     }
 }
 

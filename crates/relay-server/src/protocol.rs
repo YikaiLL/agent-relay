@@ -1567,6 +1567,44 @@ pub struct ToolCallView {
     /// authoritative read/detail paths.
     #[serde(default, skip_serializing_if = "is_false")]
     pub file_changes_omitted: bool,
+    /// Whether this entry's patch is one `git apply` would accept — computed while the
+    /// diff is still present, because snapshots ALWAYS drop diff bodies and a client
+    /// would otherwise be judging an empty string. `None` means "not evaluated" (the
+    /// authoritative read/detail paths, which still carry the real diff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_apply: Option<bool>,
+}
+
+/// Whether a stored patch is one `git apply` will accept. Mirrors the three shapes the
+/// apply-path tests pin as rejected: an absolute path in the header (git: `invalid
+/// path`), a bare hunk with no header, and a `diff --git` line without the `---`/`+++`
+/// pair — the last of which reads as "has a header" but is still refused.
+pub(crate) fn patch_is_appliable(diff: &str) -> bool {
+    let diff = diff.trim();
+    if diff.is_empty() {
+        return false;
+    }
+    let mut has_old = false;
+    let mut has_new = false;
+    for line in diff.lines() {
+        let absolute_target = |value: &str| value.starts_with("a//") || value.starts_with("b//");
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if rest.split_whitespace().any(absolute_target) {
+                return false;
+            }
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            if absolute_target(rest) || rest.starts_with('/') && rest != "/dev/null" {
+                return false;
+            }
+            has_old = true;
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            if absolute_target(rest) || rest.starts_with('/') && rest != "/dev/null" {
+                return false;
+            }
+            has_new = true;
+        }
+    }
+    has_old && has_new
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1589,6 +1627,18 @@ fn strip_file_change_diffs_for_transport(transcript: &mut [TranscriptEntryView])
         if !has_diff_body {
             continue;
         }
+        // Decide BEFORE dropping the body — this is the last point where the patch is
+        // still visible, and the client needs the verdict to know whether to offer Undo.
+        let appliable = tool
+            .diff
+            .as_deref()
+            .map(patch_is_appliable)
+            .unwrap_or(false)
+            || tool
+                .file_changes
+                .iter()
+                .any(|change| patch_is_appliable(&change.diff));
+        tool.can_apply = Some(appliable);
         tool.diff = None;
         for change in &mut tool.file_changes {
             change.diff.clear();

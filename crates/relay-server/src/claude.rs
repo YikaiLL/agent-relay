@@ -1204,6 +1204,7 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                         file_changes: Vec::new(),
                         apply_state: None,
                         file_changes_omitted: false,
+                        can_apply: None,
                     });
                 let status =
                     string_at(&payload, &["status"]).unwrap_or_else(|| "running".to_string());
@@ -1261,6 +1262,7 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                         file_changes: Vec::new(),
                         apply_state: None,
                         file_changes_omitted: false,
+                        can_apply: None,
                     });
                 if tool.result_preview.is_none() {
                     tool.result_preview = string_at(&payload, &["content"]);
@@ -1695,9 +1697,13 @@ fn inject_turn_diff_entries(transcript: Vec<TranscriptEntryView>) -> Vec<Transcr
         // rule as the live collector in RelayState::turn_file_change_summary. Without it
         // a reloaded session shows failed edits as real modifications, and the
         // input-reconstructed diff can make one look like a genuine change.
-        let entry_failed = matches!(entry.status.as_str(), "failed" | "error");
+        // Replay is inherently settled: nothing is still executing in a reloaded
+        // transcript, so anything that is not `completed` never finished — a failed edit,
+        // or one whose result never arrived because the turn was interrupted. Either way
+        // it is not one of this turn's changes.
+        let entry_landed = entry.status == "completed";
         if let Some(tool) = entry.tool.as_ref() {
-            if tool.item_type == "fileChange" && !entry_failed {
+            if tool.item_type == "fileChange" && entry_landed {
                 current_changes.extend(tool.file_changes.iter().cloned());
                 if current_changes.is_empty() {
                     if let Some(path) = tool.path.clone() {
@@ -2925,6 +2931,7 @@ mod tests {
                     }],
                     apply_state: None,
                     file_changes_omitted: false,
+                    can_apply: None,
                 }),
                 content_state: crate::protocol::TranscriptContentState::Full,
             }

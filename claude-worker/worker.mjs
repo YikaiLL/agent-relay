@@ -1341,7 +1341,7 @@ async function main() {
           if (lastActivity) thread.updated_at = lastActivity;
           emitResponse(cmd.id, {
             thread,
-            transcript: mapSessionMessages(messages),
+            transcript: mapSessionMessages(messages, cmd.cwd || undefined),
           });
         } catch (err) {
           emitErrorResponse(cmd.id, String(err));
@@ -1375,7 +1375,7 @@ async function main() {
               paged: false,
               prev_cursor: null,
               thread,
-              transcript: mapSessionMessages(messages),
+              transcript: mapSessionMessages(messages, cmd.cwd || undefined),
             });
             break;
           }
@@ -1400,7 +1400,7 @@ async function main() {
             paged: true,
             prev_cursor: page.nextCursor,
             thread,
-            transcript: mapSessionMessages(page.messages),
+            transcript: mapSessionMessages(page.messages, cmd.cwd || undefined),
           });
         } catch (err) {
           emitErrorResponse(cmd.id, String(err));

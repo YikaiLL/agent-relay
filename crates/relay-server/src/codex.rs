@@ -1206,6 +1206,7 @@ fn build_tool_call_view(item: &Value, item_type: &str) -> ToolCallView {
         file_changes,
         apply_state: None,
         file_changes_omitted: false,
+        can_apply: None,
     }
 }
 
@@ -1268,6 +1269,7 @@ fn build_tool_call_detail_view(item: &Value, item_type: &str) -> ToolCallView {
         file_changes,
         apply_state: None,
         file_changes_omitted: false,
+        can_apply: None,
     }
 }
 
@@ -1351,6 +1353,7 @@ pub(crate) fn build_turn_diff_entry_with_fallback(
             file_changes,
             apply_state: None,
             file_changes_omitted: false,
+            can_apply: None,
         }),
         content_state: crate::protocol::TranscriptContentState::Full,
     }

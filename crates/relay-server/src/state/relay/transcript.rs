@@ -796,6 +796,7 @@ pub(super) fn merge_tool_call_view(
                 apply_state: incoming.apply_state.or(existing.apply_state),
                 file_changes_omitted: incoming.file_changes_omitted
                     || existing.file_changes_omitted,
+                can_apply: None,
             })
         }
     }

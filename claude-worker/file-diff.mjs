@@ -11,15 +11,19 @@ const DIFF_CONTEXT_LINES = 3;
 const MAX_LCS_CELLS = 4_000_000;
 const FILE_EDIT_TOOLS = new Set(["edit", "multiedit", "write", "notebookedit"]);
 
-export function fileChangeFromToolInput(toolName, input) {
+// `root` (the session cwd) is what lets the patch header be repo-relative, which is
+// what `git apply` requires. Optional because some callers genuinely have no root; the
+// header then stays absolute and the patch is honestly unappliable.
+export function fileChangeFromToolInput(toolName, input, root = null) {
   if (!isFileEditTool(toolName)) return null;
   const filePath = filePathFromInput(input);
   if (!filePath) return null;
+  const header = patchHeaderPath(root, filePath);
 
   const normalizedName = normalizeToolName(toolName);
   if (normalizedName === "write") {
     const content = typeof input?.content === "string" ? input.content : "";
-    return buildFileChange(filePath, null, content);
+    return buildFileChange(filePath, null, content, header);
   }
 
   if (normalizedName === "multiedit" && Array.isArray(input?.edits)) {
@@ -29,14 +33,15 @@ export function fileChangeFromToolInput(toolName, input) {
     const newContent = input.edits
       .map((edit) => (typeof edit?.new_string === "string" ? edit.new_string : ""))
       .join("\n");
-    return buildFileChange(filePath, oldContent, newContent);
+    return buildFileChange(filePath, oldContent, newContent, header);
   }
 
   if (typeof input?.old_string === "string" || typeof input?.new_string === "string") {
     return buildFileChange(
       filePath,
       typeof input.old_string === "string" ? input.old_string : "",
-      typeof input.new_string === "string" ? input.new_string : ""
+      typeof input.new_string === "string" ? input.new_string : "",
+      header
     );
   }
 
@@ -47,8 +52,14 @@ export function fileChangeFromToolInput(toolName, input) {
   };
 }
 
-export function fileChangeTool({ toolName, input, resultPreview = null, fileChange = null }) {
-  const change = fileChange ?? fileChangeFromToolInput(toolName, input);
+export function fileChangeTool({
+  toolName,
+  input,
+  resultPreview = null,
+  fileChange = null,
+  root = null,
+}) {
+  const change = fileChange ?? fileChangeFromToolInput(toolName, input, root);
   if (!change) return null;
   const title = summarizeFileChange(toolName, change.path);
   return {
@@ -219,7 +230,7 @@ function buildFileChange(filePath, oldContent, newContent, headerPath = filePath
 // absolute there so the patch is honestly unappliable rather than looking valid and
 // being applied against the wrong tree. Undoing those needs to run git in the worktree
 // that owns the file, which is separate work.
-function patchHeaderPath(root, filePath) {
+export function patchHeaderPath(root, filePath) {
   if (!root || !path.isAbsolute(filePath)) return filePath;
   const relative = path.relative(root, filePath);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {

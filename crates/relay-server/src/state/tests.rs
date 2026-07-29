@@ -549,6 +549,7 @@ fn snapshot_strips_file_change_diffs_but_keeps_stored_diffs() {
         }],
         apply_state: None,
         file_changes_omitted: false,
+        can_apply: None,
     };
     relay.upsert_transcript_item(
         "turn-diff:turn-1".to_string(),

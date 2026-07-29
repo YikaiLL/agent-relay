@@ -924,3 +924,80 @@ test("mapSessionMessages keeps a successful tool result completed", () => {
   const tool = entries.find((entry) => entry.item_id === "tool:toolu_2");
   assert.equal(tool.status, "completed");
 });
+
+// Replay must produce the SAME appliable patch the live path does. Without a cwd,
+// hydration re-renders the header from Claude's absolute `file_path`, so an edit that
+// was undoable while the session was live becomes unappliable the moment the thread is
+// reloaded — the live fix alone only holds until the next cold load.
+test("mapSessionMessages renders repo-relative patch headers when given the cwd", () => {
+  const entries = mapSessionMessages(
+    [
+      {
+        uuid: "u1",
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_1",
+              name: "Edit",
+              input: {
+                file_path: "/repo/src/x.js",
+                old_string: "old",
+                new_string: "new",
+              },
+            },
+          ],
+        },
+      },
+      {
+        uuid: "u2",
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }],
+        },
+      },
+    ],
+    "/repo"
+  );
+
+  const tool = entries.find((entry) => entry.item_id === "tool:toolu_1");
+  const change = tool?.tool?.file_changes?.[0];
+  assert.ok(change, "the edit must replay as a file change");
+  assert.equal(change.path, "/repo/src/x.js", "path stays absolute for worktree attribution");
+  assert.match(
+    change.diff,
+    /^diff --git a\/src\/x\.js b\/src\/x\.js$/m,
+    `header must be repo-relative; got:\n${change.diff.split("\n")[0]}`
+  );
+});
+
+// A turn interrupted mid-edit leaves a tool_use with no tool_result. Replaying it as
+// "completed" claims a write that may never have reached disk — which both shows a
+// phantom change and lets the worktree suggestion jump to a tree nothing was written to.
+test("a tool_use with no tool_result does not replay as completed", () => {
+  const entries = mapSessionMessages([
+    {
+      uuid: "u1",
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_orphan",
+            name: "Edit",
+            input: { file_path: "/repo/src/x.js", old_string: "old", new_string: "new" },
+          },
+        ],
+      },
+    },
+  ], "/repo");
+
+  const tool = entries.find((entry) => entry.item_id === "tool:toolu_orphan");
+  assert.ok(tool, "the entry itself should still be visible");
+  assert.notEqual(
+    tool.status,
+    "completed",
+    "an edit whose result never arrived must not replay as a landed write"
+  );
+});
