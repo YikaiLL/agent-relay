@@ -2,13 +2,14 @@ use crate::protocol::strip_file_change_diffs_for_snapshot;
 use crate::protocol::{
     truncate_utf8_bytes_with_ellipsis, truncate_with_ellipsis, ApprovalRequestView,
     AskUserOptionView, AskUserQuestionRequestView, AskUserQuestionView, DeleteThreadInput,
-    DeviceLifecycleState, DeviceRecordView, FileChangeDiffView, LogEntryView, ReviewActionInput,
-    ReviewActivityView, ReviewJobView, ReviewerThreadView, SecurityMode, SessionSnapshot,
-    SessionSnapshotCompactProfile, ThreadEntriesResponse, ThreadEntryDetailResponse,
-    ThreadSummaryView, ThreadTranscriptResponse, ThreadsResponse, ThreadsResponseCompactProfile,
-    ToolCallView, TranscriptContentState, TranscriptEntryKind, TranscriptEntryView,
-    WorkflowActivityView, WorkflowRunView, WorkflowVerdictView, EMERGENCY_TRANSCRIPT_SHELL_CHARS,
-    MAX_REVIEW_ACTIVITY_REMOTE_JOBS, MAX_WORKFLOW_ACTIVITY_REMOTE_LOCKED_THREAD_IDS,
+    DeviceLifecycleState, DeviceRecordView, FileChangeDiffView, HealthResponse, LogEntryView,
+    ReviewActionInput, ReviewActivityView, ReviewJobView, ReviewerThreadView, SecurityMode,
+    SessionSnapshot, SessionSnapshotCompactProfile, ThreadEntriesResponse,
+    ThreadEntryDetailResponse, ThreadSummaryView, ThreadTranscriptResponse, ThreadsResponse,
+    ThreadsResponseCompactProfile, ToolCallView, TranscriptContentState, TranscriptEntryKind,
+    TranscriptEntryView, WorkflowActivityView, WorkflowRunView, WorkflowVerdictView,
+    EMERGENCY_TRANSCRIPT_SHELL_CHARS, MAX_REVIEW_ACTIVITY_REMOTE_JOBS,
+    MAX_WORKFLOW_ACTIVITY_REMOTE_LOCKED_THREAD_IDS,
 };
 
 const MAX_BROKER_LOGS: usize = 8;
@@ -19,6 +20,32 @@ const MAX_BROKER_THREAD_PREVIEW_CHARS: usize = 160;
 const SESSION_SNAPSHOT_TARGET_BYTES: usize = 8_000;
 const LOCAL_SESSION_SNAPSHOT_TARGET_BYTES: usize = 16_000;
 const THREADS_RESPONSE_TARGET_BYTES: usize = 20_000;
+
+#[test]
+fn health_response_only_exposes_launch_id_when_the_launcher_supplies_one() {
+    let without_launch_id = serde_json::to_value(HealthResponse {
+        status: "ok",
+        service: "relay-server",
+        provider: "fake".to_string(),
+        launch_id: None,
+    })
+    .expect("health response should serialize");
+    assert_eq!(without_launch_id.get("launch_id"), None);
+
+    let with_launch_id = serde_json::to_value(HealthResponse {
+        status: "ok",
+        service: "relay-server",
+        provider: "fake".to_string(),
+        launch_id: Some("launch-123".to_string()),
+    })
+    .expect("health response should serialize");
+    assert_eq!(
+        with_launch_id
+            .get("launch_id")
+            .and_then(|value| value.as_str()),
+        Some("launch-123")
+    );
+}
 
 #[test]
 fn review_action_input_supports_an_explicit_job_and_keeps_legacy_omission() {

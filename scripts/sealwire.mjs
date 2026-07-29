@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import http from "node:http";
 import { createRequire } from "node:module";
+import { isIP } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+import { browserOpenerFor } from "./sealwire-browser.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const packageRoot = path.resolve(path.dirname(scriptPath), "..");
@@ -21,6 +26,7 @@ const DEFAULT_PUBLIC_BROKER_ORIGIN = "";
 const HOSTED_PUBLIC_BROKER_ORIGIN = "wss://agent-relay.up.railway.app";
 const defaultPort = "8787";
 const defaultHost = "127.0.0.1";
+const LAUNCH_ID_ENV = "SEALWIRE_LAUNCH_ID";
 const KNOWN_COMMANDS = new Set(["local", "cloud"]);
 
 const args = parseArgs(process.argv.slice(2));
@@ -68,6 +74,7 @@ const brokerOrigin =
   readPackagedBrokerOrigin() ||
   (args.cloud ? HOSTED_PUBLIC_BROKER_ORIGIN : DEFAULT_PUBLIC_BROKER_ORIGIN);
 const brokerConfig = args.noBroker || !brokerOrigin ? null : normalizeBrokerOrigin(brokerOrigin);
+const launchId = randomUUID();
 
 const env = {
   ...process.env,
@@ -76,6 +83,7 @@ const env = {
   RELAY_SECURITY_MODE: process.env.RELAY_SECURITY_MODE || "private",
   RELAY_BROKER_PEER_ID: process.env.RELAY_BROKER_PEER_ID || defaultPeerId(),
   CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || defaultCargoTargetDir(),
+  [LAUNCH_ID_ENV]: launchId,
 };
 
 // Point the relay-server at the Claude worker shipped inside this package.
@@ -169,6 +177,10 @@ const child = spawn(command, commandArgs, {
   stdio: "inherit",
 });
 
+if (!args.noOpen && !isCiEnvironment()) {
+  openBrowserWhenRelayIsReady(child, env.BIND_HOST, env.PORT, launchId);
+}
+
 child.on("exit", (code, signal) => {
   if (signal) {
     process.kill(process.pid, signal);
@@ -185,6 +197,7 @@ function parseArgs(argv) {
     help: false,
     host: null,
     noBroker: false,
+    noOpen: false,
     port: null,
     rest: [],
   };
@@ -195,6 +208,8 @@ function parseArgs(argv) {
       parsed.help = true;
     } else if (arg === "--no-broker") {
       parsed.noBroker = true;
+    } else if (arg === "--no-open") {
+      parsed.noOpen = true;
     } else if (
       parsed.command === null &&
       !arg.startsWith("-") &&
@@ -297,6 +312,152 @@ function hasCommand(command) {
   return result.error?.code !== "ENOENT";
 }
 
+function isCiEnvironment() {
+  const value = process.env.CI?.trim().toLowerCase();
+  return Boolean(value && !["0", "false", "no", "off"].includes(value));
+}
+
+function openBrowserWhenRelayIsReady(relayChild, bindHost, portValue, launchId) {
+  const target = localBrowserTarget(bindHost, portValue);
+  if (!target) {
+    console.warn(
+      "sealwire: cannot auto-open the browser when PORT is 0; open the relay URL manually."
+    );
+    return;
+  }
+
+  let stopped = false;
+  let retryTimer = null;
+  const stop = () => {
+    stopped = true;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+    }
+  };
+  relayChild.once("exit", stop);
+
+  const check = async () => {
+    if (stopped) {
+      return;
+    }
+    if (await isRelayReady(target.healthUrl, launchId)) {
+      if (!stopped) {
+        relayChild.off("exit", stop);
+        openBrowser(target.browserUrl);
+      }
+      return;
+    }
+    retryTimer = setTimeout(check, 250);
+  };
+
+  // Let immediately-failing launches exit before probing. This also avoids
+  // mistaking an unrelated process already on the requested port for the
+  // relay in the common bind-conflict case.
+  retryTimer = setTimeout(check, 100);
+}
+
+function localBrowserTarget(bindHost, portValue) {
+  const parsedPort = parseRelayPort(portValue);
+  if (parsedPort === 0) {
+    return null;
+  }
+
+  const parsedHost = isIP(bindHost) ? bindHost : defaultHost;
+  let browserHost = parsedHost;
+  if (parsedHost === "0.0.0.0") {
+    browserHost = defaultHost;
+  } else if (parsedHost === "::") {
+    browserHost = "::1";
+  }
+  const urlHost = isIP(browserHost) === 6 ? `[${browserHost}]` : browserHost;
+  const browserUrl = `http://${urlHost}:${parsedPort}`;
+  return {
+    browserUrl,
+    healthUrl: `${browserUrl}/api/health`,
+  };
+}
+
+function parseRelayPort(value) {
+  const text = String(value);
+  if (/^\d+$/.test(text)) {
+    const parsed = Number(text);
+    if (parsed <= 65535) {
+      return parsed;
+    }
+  }
+  // Match relay-server's current behavior: an invalid PORT falls back to 8787.
+  return Number(defaultPort);
+}
+
+function isRelayReady(healthUrl, launchId) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ready) => {
+      if (!settled) {
+        settled = true;
+        resolve(ready);
+      }
+    };
+    const request = http.get(
+      healthUrl,
+      { headers: { accept: "application/json" } },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 64 * 1024) {
+            request.destroy();
+          }
+        });
+        response.on("end", () => {
+          try {
+            const payload = JSON.parse(body);
+            finish(
+              response.statusCode === 200 &&
+                payload?.ok === true &&
+                payload?.data?.status === "ok" &&
+                payload?.data?.service === "relay-server" &&
+                payload?.data?.launch_id === launchId
+            );
+          } catch {
+            finish(false);
+          }
+        });
+        response.on("aborted", () => finish(false));
+        response.on("error", () => finish(false));
+      }
+    );
+    request.setTimeout(750, () => request.destroy());
+    request.on("error", () => finish(false));
+  });
+}
+
+function openBrowser(url) {
+  const { command, args: commandArgs } = browserOpenerFor(process.platform, url);
+
+  const opener = spawn(command, commandArgs, {
+    detached: true,
+    stdio: "ignore",
+  });
+  opener.once("spawn", () => {
+    console.log(`sealwire: opening ${url} in your default browser`);
+  });
+  opener.once("error", (error) => {
+    console.warn(
+      `sealwire: could not open the browser (${error.message}); open ${url} manually.`
+    );
+  });
+  opener.once("exit", (code) => {
+    if (code && code !== 0) {
+      console.warn(
+        `sealwire: browser opener exited with code ${code}; open ${url} manually.`
+      );
+    }
+  });
+  opener.unref();
+}
+
 function resolveRelayServerBinary() {
   const override = process.env.AGENT_RELAY_SERVER_BIN;
   if (override) {
@@ -389,7 +550,7 @@ function printHelp() {
 Run a local relay-server from the npm package.
 
 Usage:
-  sealwire [local|cloud] [--broker <url>] [--port <port>] [--host <ip>] [--no-broker]
+  sealwire [local|cloud] [--broker <url>] [--port <port>] [--host <ip>] [--no-broker] [--no-open]
 
 Commands:
   local         Run with no broker; remote pairing is disabled (alias for
@@ -407,6 +568,8 @@ Defaults:
   --host        127.0.0.1
   --port        8787
   --broker      AGENT_RELAY_PUBLIC_BROKER_URL, if set by the package publisher or user
+  browser       Opens the local web UI once the relay is ready; pass --no-open
+                to keep it closed (browser opening is also skipped in CI)
 
 Binary resolution:
   Uses AGENT_RELAY_SERVER_BIN, a package-local bin/<platform>-<arch>/relay-server,
@@ -420,5 +583,6 @@ Examples:
   sealwire --broker https://broker.example.com
   AGENT_RELAY_PUBLIC_BROKER_URL=https://broker.example.com npx sealwire
   sealwire --no-broker
+  sealwire --no-open
 `);
 }

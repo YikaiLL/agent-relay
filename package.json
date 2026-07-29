@@ -32,6 +32,7 @@
     "claude-worker/file-diff.mjs",
     "claude-worker/native-binary-check.mjs",
     "claude-worker/package.json",
+    "scripts/sealwire-browser.mjs",
     "scripts/sealwire.mjs",
     "web/**"
   ],

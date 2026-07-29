@@ -244,7 +244,7 @@ test("the packed launcher points relay-server at a worker that exists in the pac
   };
 
   const captured = await new Promise((resolve) => {
-    const child = spawn(process.execPath, [launcher, "--no-broker"], {
+    const child = spawn(process.execPath, [launcher, "--no-broker", "--no-open"], {
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });

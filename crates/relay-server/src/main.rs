@@ -68,6 +68,7 @@ use axum::http::HeaderValue;
 const CSP_CONNECT_SRC_ENV: &str = "RELAY_CSP_CONNECT_SRC";
 const ENABLE_HSTS_ENV: &str = "RELAY_ENABLE_HSTS";
 const HSTS_VALUE_ENV: &str = "RELAY_HSTS_VALUE";
+const LAUNCH_ID_ENV: &str = "SEALWIRE_LAUNCH_ID";
 const WEB_ROOT_ENV: &str = "RELAY_WEB_ROOT";
 const CSRF_HEADER_NAME: &str = "x-agent-relay-csrf";
 const CSRF_HEADER_VALUE: &str = "1";
@@ -93,6 +94,7 @@ enum WebAssets {
 struct AppContext {
     app: AppState,
     auth: AuthConfig,
+    launch_id: Option<String>,
     security_headers: SecurityHeadersConfig,
 }
 
@@ -230,6 +232,9 @@ async fn main() {
     let context = AppContext {
         app: state,
         auth,
+        launch_id: std::env::var(LAUNCH_ID_ENV)
+            .ok()
+            .filter(|value| !value.is_empty()),
         security_headers,
     };
     let app = build_router(context, web_assets);
@@ -459,6 +464,7 @@ async fn health(State(context): State<AppContext>) -> Json<ApiEnvelope<HealthRes
         status: "ok",
         service: "relay-server",
         provider: snapshot.provider,
+        launch_id: context.launch_id.clone(),
     }))
 }
 

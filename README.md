@@ -75,9 +75,9 @@ toolchain:
 npx sealwire
 ```
 
-That starts a **localhost-only** relay at <http://localhost:8787>. To pair a
-phone or remote browser through the hosted public broker, point it at the
-broker:
+That starts a **localhost-only** relay at <http://localhost:8787> and opens the
+web UI in your default browser as soon as the relay is ready. To pair a phone
+or remote browser through the hosted public broker, point it at the broker:
 
 ```bash
 npx sealwire --broker wss://agent-relay.up.railway.app
@@ -409,9 +409,14 @@ sealwire --broker wss://agent-relay.up.railway.app  # or point at your own
 sealwire local                          # no broker (alias for --no-broker)
 sealwire --no-broker                    # same: run without a broker
 sealwire --host 127.0.0.1 --port 8787   # bind address / port
+sealwire --no-open                      # do not open the browser automatically
 ```
 
 You can also set `AGENT_RELAY_PUBLIC_BROKER_URL` instead of passing `--broker`.
+By default the launcher waits for the newly started relay to identify itself
+through its health check, then opens its local web UI in your default browser.
+It skips browser opening in CI; pass `--no-open` to disable it explicitly in
+any environment.
 
 The `local` command (and `--no-broker`) is an explicit "stay offline" request:
 it ignores any configured broker origin **and** strips every `RELAY_BROKER_*`

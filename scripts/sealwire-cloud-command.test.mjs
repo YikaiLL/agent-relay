@@ -54,7 +54,7 @@ function runLauncher({ extraEnv = {}, args = [] } = {}) {
   };
 
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [launcher, ...args], {
+    const child = spawn(process.execPath, [launcher, ...args, "--no-open"], {
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
