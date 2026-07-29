@@ -85,8 +85,10 @@ statuses aren't misread as busy:\n  {line}",
 #[cfg(test)]
 mod workspace_diff_tests {
     use super::super::{
-        collect_workspace_diff, synthesize_untracked_diff, truncate_to_char_boundary,
+        apply_unified_diff, collect_workspace_diff, synthesize_untracked_diff,
+        truncate_to_char_boundary,
     };
+    use crate::protocol::FileChangeApplyDirection;
     use tempfile::TempDir;
     use tokio::process::Command;
 
@@ -239,6 +241,94 @@ branch refs/heads/alive
     fn porcelain_handles_empty_and_trailing_whitespace() {
         assert!(super::super::parse_worktree_porcelain("").is_empty());
         assert!(super::super::parse_worktree_porcelain("\n\n\n").is_empty());
+    }
+
+    // The Undo / Reapply control ends here: the stored diff is piped to `git apply`
+    // verbatim, with no header repair. Everything else about file changes is covered by
+    // parsing tests, so nothing checked that a stored diff can ACTUALLY be applied — a
+    // patch shape git rejects would make the button a silent no-op.
+    //
+    // This pins the shape Codex actually emits (relative paths, full `---`/`+++`
+    // headers, confirmed against real session logs) all the way through to the file on
+    // disk. Claude's shape is known-broken and deliberately not asserted here: it embeds
+    // an ABSOLUTE path, which git rejects as `invalid path` (see the malformed-shape
+    // test below for why that surfaces as an error rather than a silent success).
+    #[tokio::test]
+    async fn a_codex_shaped_diff_actually_rolls_back_and_reapplies() {
+        let dir = init_repo().await;
+        let cwd = dir.path().to_string_lossy().to_string();
+        let file = dir.path().join("seed.txt");
+        // The edit the agent made: line2 → LINE2.
+        std::fs::write(&file, "line1\nLINE2\n").unwrap();
+
+        let diff = "diff --git a/seed.txt b/seed.txt\n\
+                    --- a/seed.txt\n\
+                    +++ b/seed.txt\n\
+                    @@ -1,2 +1,2 @@\n\
+                    \x20line1\n\
+                    -line2\n\
+                    +LINE2\n";
+
+        apply_unified_diff(&cwd, diff, FileChangeApplyDirection::Rollback)
+            .await
+            .expect("rollback must succeed");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "line1\nline2\n",
+            "Undo must actually revert the file, not just report success"
+        );
+
+        apply_unified_diff(&cwd, diff, FileChangeApplyDirection::Reapply)
+            .await
+            .expect("reapply must succeed");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "line1\nLINE2\n",
+            "Reapply must restore the agent's edit"
+        );
+    }
+
+    // A patch git cannot apply must surface as an error the UI can show. The failure
+    // modes are easy to produce by accident and all look plausible: an absolute path in
+    // the header (what the Claude worker emits today), a bare hunk with no header, and
+    // a `diff --git` line WITHOUT the `---`/`+++` pair — the last of which reads as
+    // "has a header" but git still rejects.
+    #[tokio::test]
+    async fn a_patch_git_cannot_apply_reports_an_error_instead_of_silently_doing_nothing() {
+        let dir = init_repo().await;
+        let cwd = dir.path().to_string_lossy().to_string();
+        let file = dir.path().join("seed.txt");
+        std::fs::write(&file, "line1\nLINE2\n").unwrap();
+        let absolute = format!("{cwd}/seed.txt");
+
+        for (label, diff) in [
+            (
+                "absolute path in the header",
+                format!(
+                    "diff --git a/{absolute} b/{absolute}\n--- a/{absolute}\n+++ b/{absolute}\n@@ -1,2 +1,2 @@\n line1\n-line2\n+LINE2\n"
+                ),
+            ),
+            (
+                "no header at all",
+                "@@ -1,2 +1,2 @@\n line1\n-line2\n+LINE2\n".to_string(),
+            ),
+            (
+                "diff --git without ---/+++",
+                "diff --git a/seed.txt b/seed.txt\n@@ -1,2 +1,2 @@\n line1\n-line2\n+LINE2\n"
+                    .to_string(),
+            ),
+        ] {
+            let result = apply_unified_diff(&cwd, &diff, FileChangeApplyDirection::Rollback).await;
+            assert!(
+                result.is_err(),
+                "{label}: git cannot apply this, so it must report an error"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "line1\nLINE2\n",
+                "{label}: a rejected patch must leave the file untouched"
+            );
+        }
     }
 
     #[test]
