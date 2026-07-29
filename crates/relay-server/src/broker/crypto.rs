@@ -1,11 +1,11 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rand::RngCore;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use xsalsa20poly1305::{
+use crypto_secretbox::{
     aead::{Aead, KeyInit},
     Key, Nonce, XSalsa20Poly1305,
 };
+use rand::RngCore;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct EncryptedEnvelope {
@@ -35,9 +35,9 @@ fn encrypt_bytes(secret: &str, plaintext: &[u8]) -> Result<EncryptedEnvelope, St
     let cipher = cipher(secret);
     let mut nonce_bytes = [0_u8; 24];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|error| format!("encryption failed: {error}"))?;
 
     Ok(EncryptedEnvelope {
@@ -57,17 +57,18 @@ fn decrypt_bytes(secret: &str, envelope: &EncryptedEnvelope) -> Result<Vec<u8>, 
     let ciphertext = STANDARD
         .decode(&envelope.ciphertext)
         .map_err(|error| format!("invalid envelope ciphertext: {error}"))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|_| "invalid envelope nonce length".to_string())?;
 
     cipher
-        .decrypt(nonce, ciphertext.as_ref())
+        .decrypt(&nonce, ciphertext.as_ref())
         .map_err(|error| format!("decryption failed: {error}"))
 }
 
 fn cipher(secret: &str) -> XSalsa20Poly1305 {
     let digest = Sha256::digest(secret.as_bytes());
-    let key = Key::from_slice(&digest);
-    XSalsa20Poly1305::new(key)
+    let key = Key::from(<[u8; 32]>::from(digest));
+    XSalsa20Poly1305::new(&key)
 }
 
 #[cfg(test)]

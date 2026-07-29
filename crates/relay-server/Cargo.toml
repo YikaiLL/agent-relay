@@ -31,7 +31,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
-xsalsa20poly1305.workspace = true
+crypto_secretbox.workspace = true
 fs4 = "1.1.0"
 
 [dev-dependencies]
