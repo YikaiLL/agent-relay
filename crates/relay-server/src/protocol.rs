@@ -1575,6 +1575,28 @@ pub struct ToolCallView {
     pub can_apply: Option<bool>,
 }
 
+/// The single patch an Undo/Reapply would hand to `git apply` for this entry: the
+/// entry-level diff when it has one, otherwise every non-empty per-file diff joined.
+/// Shared with the apply path on purpose — appliability must be judged on exactly the
+/// bytes that get applied, or the verdict and the action can disagree.
+pub(crate) fn patch_for_apply(tool: &ToolCallView) -> Option<String> {
+    if let Some(diff) = tool
+        .diff
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+    {
+        return Some(diff);
+    }
+    let parts = tool
+        .file_changes
+        .iter()
+        .filter(|change| !change.diff.trim().is_empty())
+        .map(|change| change.diff.clone())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
 /// Whether a stored patch is one `git apply` will accept. Mirrors the three shapes the
 /// apply-path tests pin as rejected: an absolute path in the header (git: `invalid
 /// path`), a bare hunk with no header, and a `diff --git` line without the `---`/`+++`
@@ -1629,15 +1651,9 @@ fn strip_file_change_diffs_for_transport(transcript: &mut [TranscriptEntryView])
         }
         // Decide BEFORE dropping the body — this is the last point where the patch is
         // still visible, and the client needs the verdict to know whether to offer Undo.
-        let appliable = tool
-            .diff
-            .as_deref()
-            .map(patch_is_appliable)
-            .unwrap_or(false)
-            || tool
-                .file_changes
-                .iter()
-                .any(|change| patch_is_appliable(&change.diff));
+        let appliable = patch_for_apply(tool)
+            .map(|patch| patch_is_appliable(&patch))
+            .unwrap_or(false);
         tool.can_apply = Some(appliable);
         tool.diff = None;
         for change in &mut tool.file_changes {

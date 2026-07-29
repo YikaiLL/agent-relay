@@ -293,12 +293,32 @@ impl ThreadRuntime {
                 tool: entry.tool,
             })
             .collect::<Vec<_>>();
-        let mut seen_item_ids = self
+        // Paging can split a tool's request from its result across pages. The newer page
+        // then holds a RESULT-only stub (no path, no diff) while the older page holds the
+        // request that actually describes the change — so dropping the older record as a
+        // duplicate loses that edit outright. Merge into the existing entry instead: the
+        // older page supplies the tool metadata, the newer one keeps the settled status
+        // it already recorded.
+        let mut index_by_item_id = self
             .transcript
             .iter()
-            .map(|record| record.item_id.clone())
-            .collect::<HashSet<_>>();
-        records.retain(|record| seen_item_ids.insert(record.item_id.clone()));
+            .enumerate()
+            .map(|(index, record)| (record.item_id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        records.retain(|record| match index_by_item_id.get(&record.item_id) {
+            Some(&existing_index) => {
+                let existing = &mut self.transcript[existing_index];
+                existing.tool = super::transcript::merge_tool_call_view(
+                    existing.tool.take(),
+                    record.tool.clone(),
+                );
+                false
+            }
+            None => {
+                index_by_item_id.insert(record.item_id.clone(), usize::MAX);
+                true
+            }
+        });
         records.extend(std::mem::take(&mut self.transcript));
         self.transcript = records;
         self.provider_history_cursor = prev_cursor;

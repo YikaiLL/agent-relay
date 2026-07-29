@@ -2692,6 +2692,38 @@ mod can_apply_flag_tests {
         );
     }
 
+    // Undo applies ONE patch built from all of the entry's changes, so appliability is a
+    // property of that combined patch — not of any single change. A turn touching both
+    // the session cwd and an outside worktree yields one relative and one absolute
+    // header; `git apply` refuses the whole thing, so the control must not be offered.
+    #[test]
+    fn a_mixed_patch_is_not_appliable_even_though_one_part_is() {
+        let mut entry = turn_diff_entry("");
+        {
+            let tool = entry.tool.as_mut().unwrap();
+            tool.diff = None;
+            tool.file_changes = vec![
+                FileChangeDiffView {
+                    path: "in-tree.js".to_string(),
+                    change_type: "update".to_string(),
+                    diff: "diff --git a/in-tree.js b/in-tree.js\n--- a/in-tree.js\n+++ b/in-tree.js\n@@ -1 +1 @@\n-a\n+b\n".to_string(),
+                },
+                FileChangeDiffView {
+                    path: "/elsewhere/out.js".to_string(),
+                    change_type: "update".to_string(),
+                    diff: "diff --git a//elsewhere/out.js b//elsewhere/out.js\n--- a//elsewhere/out.js\n+++ b//elsewhere/out.js\n@@ -1 +1 @@\n-a\n+b\n".to_string(),
+                },
+            ];
+        }
+        let mut transcript = vec![entry];
+        strip_file_change_diffs_for_snapshot(&mut transcript);
+        assert_eq!(
+            transcript[0].tool.as_ref().unwrap().can_apply,
+            Some(false),
+            "one unappliable part makes the whole patch unappliable"
+        );
+    }
+
     // The other two shapes git rejects, both of which read as "has a header".
     #[test]
     fn stripping_marks_headerless_patches_as_not_appliable() {

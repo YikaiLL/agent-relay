@@ -107,7 +107,10 @@ export function createFileDiffTracker(cwd) {
       calls.delete(event.id);
 
       const after = await readTextSnapshot(call.absolutePath);
-      const fallbackChange = fileChangeFromToolInput(call.toolName, call.input);
+      // Must carry the root too: this fallback is what ships whenever the on-disk read
+      // is unusable (file over the snapshot cap, or a success with no visible diff), and
+      // without it those edits keep the absolute header the rest of this fix removes.
+      const fallbackChange = fileChangeFromToolInput(call.toolName, call.input, root);
       // A failed tool result never landed on disk, so the input-derived
       // reconstruction must never stand in for it — otherwise a failed Edit (the
       // common no/non-unique-match case that leaves the file untouched) would be

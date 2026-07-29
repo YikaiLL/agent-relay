@@ -541,3 +541,34 @@ test("a file outside the session cwd keeps an absolute (unappliable) header", as
     `an out-of-tree file must not be rewritten to an escaping relative path; got:\n${change.diff.split("\n")[0]}`
   );
 });
+
+// When the file is too large to snapshot (>512KB) the on-disk diff is unavailable and
+// the tracker falls back to reconstructing from the tool input. That fallback path was
+// built without the repo root, so it re-introduced the absolute header the rest of the
+// fix removed — live and replay were still inconsistent for exactly these edits.
+test("the input-reconstruction fallback also renders a relative header", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hdr-big-"));
+  const abs = path.join(root, "big.txt");
+  // Over MAX_SNAPSHOT_BYTES, so readTextSnapshot skips and the fallback is used.
+  const bulk = "x\n".repeat(400_000);
+  await fs.writeFile(abs, bulk);
+
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Edit",
+    args: { file_path: abs, old_string: "x", new_string: "y" },
+  });
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+
+  const change = out.tool.file_changes[0];
+  assert.equal(change.path, abs, "path stays absolute");
+  if (change.diff) {
+    assert.doesNotMatch(
+      change.diff,
+      /a\/\//,
+      `the fallback must not emit an absolute header; got:\n${change.diff.split("\n")[0]}`
+    );
+  }
+});

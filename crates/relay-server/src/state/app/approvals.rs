@@ -341,19 +341,9 @@ impl AppState {
                 .tool
                 .as_ref()
                 .ok_or_else(|| format!("entry `{item_id}` is not a file change"))?;
-            let diff = tool
-                .diff
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| {
-                    let parts = tool
-                        .file_changes
-                        .iter()
-                        .filter(|change| !change.diff.trim().is_empty())
-                        .map(|change| change.diff.clone())
-                        .collect::<Vec<_>>();
-                    (!parts.is_empty()).then(|| parts.join("\n"))
-                })
+            // Same selector the snapshot's `can_apply` verdict is computed from, so the
+            // two cannot disagree about what "this patch" means.
+            let diff = crate::protocol::patch_for_apply(tool)
                 .ok_or_else(|| format!("file change `{item_id}` has no diff to apply"))?;
             (thread_id, runtime.current_cwd.clone(), diff)
         };

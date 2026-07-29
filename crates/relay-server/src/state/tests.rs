@@ -4212,3 +4212,115 @@ fn pairing_start_input_deserializes_path_scope() {
         serde_json::from_str("{}").expect("empty body should deserialize");
     assert!(empty.path_scope.is_none());
 }
+
+#[cfg(test)]
+mod paged_history_merge_tests {
+    use crate::protocol::{
+        FileChangeDiffView, ToolCallView, TranscriptContentState, TranscriptEntryKind,
+        TranscriptEntryView,
+    };
+    use crate::state::relay::ThreadRuntime;
+
+    fn view(item_id: &str, status: &str, tool: ToolCallView) -> TranscriptEntryView {
+        TranscriptEntryView {
+            item_id: Some(item_id.to_string()),
+            kind: TranscriptEntryKind::ToolCall,
+            text: None,
+            status: status.to_string(),
+            turn_id: Some("turn-1".to_string()),
+            tool: Some(tool),
+            content_state: TranscriptContentState::Full,
+        }
+    }
+
+    fn blank_tool(item_type: &str, name: &str) -> ToolCallView {
+        ToolCallView {
+            item_type: item_type.to_string(),
+            name: name.to_string(),
+            title: name.to_string(),
+            detail: None,
+            query: None,
+            path: None,
+            url: None,
+            command: None,
+            input_preview: None,
+            result_preview: None,
+            diff: None,
+            file_changes: Vec::new(),
+            apply_state: None,
+            file_changes_omitted: false,
+            can_apply: None,
+        }
+    }
+
+    // Paging can split a tool's request from its result. The newer page carries only the
+    // RESULT, which replays as a generic entry with no path and no diff; the real
+    // fileChange metadata lives on the older page's request. Dropping the older record as
+    // a duplicate loses that edit entirely — no file change, no turn diff, and no
+    // evidence for the worktree suggestion — even though it succeeded.
+    #[test]
+    fn an_older_page_enriches_a_result_only_entry_instead_of_being_dropped() {
+        let mut runtime = ThreadRuntime::new(
+            crate::protocol::ThreadSummaryView {
+                id: "thread-1".to_string(),
+                name: None,
+                preview: String::new(),
+                cwd: "/repo".to_string(),
+                updated_at: 1,
+                source: "local".to_string(),
+                status: "idle".to_string(),
+                model_provider: "anthropic".to_string(),
+                provider: "claude_code".to_string(),
+                forked_from: None,
+            },
+            "/repo",
+            "sonnet",
+            "default",
+            "workspace-write",
+            "medium",
+            1,
+        );
+
+        // Newest page first: only the tool_result was on it.
+        runtime.prepend_provider_history(
+            vec![view("tool:t1", "completed", blank_tool("toolCall", "tool"))],
+            None,
+            None,
+        );
+
+        // Older page carries the request, with the actual file change.
+        let mut rich = blank_tool("fileChange", "Edit");
+        rich.path = Some("/repo/src/x.rs".to_string());
+        rich.file_changes = vec![FileChangeDiffView {
+            path: "/repo/src/x.rs".to_string(),
+            change_type: "update".to_string(),
+            diff: "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1 +1 @@\n-a\n+b\n".to_string(),
+        }];
+        runtime.prepend_provider_history(vec![view("tool:t1", "running", rich)], None, None);
+
+        let record = runtime
+            .transcript
+            .iter()
+            .find(|record| record.item_id == "tool:t1")
+            .expect("the tool entry must survive");
+        let tool = record.tool.as_ref().expect("tool");
+        assert_eq!(
+            tool.item_type, "fileChange",
+            "the older page's real tool metadata must win over the result-only stub"
+        );
+        assert_eq!(tool.file_changes.len(), 1, "the edit must not be lost");
+        assert_eq!(
+            record.status, "completed",
+            "the newer page's settled status must be kept"
+        );
+        assert_eq!(
+            runtime
+                .transcript
+                .iter()
+                .filter(|r| r.item_id == "tool:t1")
+                .count(),
+            1,
+            "still exactly one entry"
+        );
+    }
+}
