@@ -821,3 +821,169 @@ test("a manually chosen root survives a thread switch and is never re-resolved",
   assert.ok(calls[2].includes("root=%2Frepo%2Fmy-choice"));
   assert.equal(store.getSelectedRoot(), "/repo/my-choice");
 });
+
+// The per-file +/- counts are the densest signal this panel carries, and every
+// byte needed to compute them already ships in `file_changes[].diff`. They were
+// nevertheless computed only for a file the user had ALREADY opened
+// (`opened ? diffStats(...) : {added: 0, removed: 0}`), so the collapsed list —
+// which is what you actually scan — showed a blank stats column and forced a
+// click per file just to learn how big each change was. Collapsed rows must
+// report their own size.
+//
+// Two files with DIFFERENT counts, asserted against the per-file list only: the
+// panel's aggregate badge (+7/-4 here) would otherwise satisfy a naive
+// "does +2 appear anywhere" check and let the regression pass.
+function fileChange(path, added, removed) {
+  return {
+    path,
+    change_type: "update",
+    diff: [
+      `diff --git a/${path} b/${path}`,
+      `--- a/${path}`,
+      `+++ b/${path}`,
+      "@@ -1,9 +1,9 @@",
+      ...Array.from({ length: removed }, (_, i) => `-old${i}`),
+      ...Array.from({ length: added }, (_, i) => `+new${i}`),
+    ].join("\n"),
+  };
+}
+
+test("collapsed file rows still show their own +/- counts", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(WorkspaceChangesPanel, {
+      store: fakeStore({
+        status: "loaded",
+        expanded: true,
+        data: {
+          cwd: "/repo",
+          file_changes: [fileChange("src/a.txt", 2, 1), fileChange("src/b.txt", 5, 3)],
+        },
+      }),
+    })
+  );
+
+  // Scope to the per-file list; the aggregate badge above it sums to +7/-4 and
+  // must not be what satisfies these assertions.
+  const listStart = html.indexOf("diff-file-sections");
+  assert.ok(listStart > -1, "the per-file list should render");
+  const list = html.slice(listStart);
+
+  // Nothing is opened, so this is the collapsed-list rendering.
+  assert.doesNotMatch(list, /<details[^>]*\sopen/);
+  assert.ok(list.includes("a.txt") && list.includes("b.txt"), "both files should be listed");
+  assert.match(list, /\+2/, "a.txt's collapsed row must show its added-line count");
+  assert.match(list, /\+5/, "b.txt's collapsed row must show its added-line count");
+  assert.match(list, /[-−]1\b/, "a.txt's collapsed row must show its removed-line count");
+  assert.match(list, /[-−]3\b/, "b.txt's collapsed row must show its removed-line count");
+});
+
+// The rail's compact row and the transcript's card share one component, so the
+// only thing keeping this restyle out of the conversation is the `variant` prop.
+// Lock both sides: the rail must get the new structure, and the transcript must
+// keep the exact markup it had before (name in a <strong>, no status glyph).
+test("the compact row is opt-in — the transcript keeps its original card markup", async () => {
+  const { FileChangeDiff } = await import("../shared/transcript-react.js");
+  const tool = {
+    item_type: "workspaceDiff",
+    file_changes: [
+      {
+        path: "src/deep/a.txt",
+        change_type: "add",
+        diff: ["--- /dev/null", "+++ b/src/deep/a.txt", "@@ -0,0 +1 @@", "+hello"].join("\n"),
+      },
+    ],
+  };
+
+  const rail = renderToStaticMarkup(React.createElement(FileChangeDiff, { tool, variant: "rail" }));
+  assert.match(rail, /diff-file-glyph/, "the rail row carries a status glyph");
+  assert.match(rail, />A</, "an added file is glyphed A, like git status --short");
+  // Directory and basename are separate elements so the directory can be the
+  // half that truncates.
+  assert.match(rail, /diff-file-dir[^>]*>src\/deep\/</);
+  assert.match(rail, /diff-file-base[^>]*>a\.txt</);
+  assert.doesNotMatch(rail, /<strong/, "the rail row drops the bold full-path treatment");
+
+  const transcript = renderToStaticMarkup(React.createElement(FileChangeDiff, { tool }));
+  assert.doesNotMatch(transcript, /diff-file-glyph/, "the transcript card gains no glyph column");
+  assert.doesNotMatch(transcript, /diff-file-dir/, "the transcript card keeps one whole path");
+  assert.match(transcript, /<strong class="diff-file-section-name">src\/deep\/a\.txt<\/strong>/);
+});
+
+// Which half of the path survives a narrow rail is a design decision, not an
+// accident: the directory is split off so IT can be the part that truncates.
+// An earlier attempt truncated the whole string from the left instead, which ate
+// the front of long dirless names ("…EMOTE_PENDING_MESSAGE_VISIBILITY.md") —
+// exactly the characters you read first.
+test("splitDisplayPath separates the directory so it can truncate independently", async () => {
+  const { splitDisplayPath } = await import("../shared/transcript-react.js");
+  assert.deepEqual(splitDisplayPath("frontend/local/workspace-diff.js"), [
+    "frontend/local/",
+    "workspace-diff.js",
+  ]);
+  // No directory: the whole thing is the basename, so nothing is styled faint.
+  assert.deepEqual(splitDisplayPath("MESSAGE_DROP_TODO.md"), ["", "MESSAGE_DROP_TODO.md"]);
+  assert.deepEqual(splitDisplayPath(""), ["", ""]);
+  assert.deepEqual(splitDisplayPath(undefined), ["", ""]);
+  // A trailing slash means there is no basename left to protect.
+  assert.deepEqual(splitDisplayPath("design/"), ["design/", ""]);
+});
+
+test("changeGlyph speaks git's A/M/D, defaulting unknown kinds to modified", async () => {
+  const { changeGlyph } = await import("../shared/transcript-react.js");
+  assert.equal(changeGlyph("add").letter, "A");
+  assert.equal(changeGlyph("create").letter, "A");
+  assert.equal(changeGlyph("delete").letter, "D");
+  assert.equal(changeGlyph("remove").letter, "D");
+  assert.equal(changeGlyph("update").letter, "M");
+  assert.equal(changeGlyph("modify").letter, "M");
+  // Unknown / absent kinds must still render a glyph rather than a blank column.
+  assert.equal(changeGlyph("").letter, "M");
+  assert.equal(changeGlyph(undefined).letter, "M");
+  assert.equal(changeGlyph("ADD").letter, "A", "provider casing must not matter");
+});
+
+// Every workspace-diff surface shows the same compact row, so the panel reads
+// the same whether you're on the desktop rail or on your phone. Local and remote
+// share these two components outright (`RemoteWorkspaceChangesRail` renders
+// `WorkspaceChangesPanel`; the remote modal renders `WorkspaceDiffSheetBody`),
+// so surface parity is structural rather than something CSS has to keep in sync.
+//
+// What differs between them is DENSITY, not markup: the rail is a pointer target
+// at 26px, the phone sheet a touch target at 44px. That split lives in CSS,
+// keyed off the surface wrapper — see `.workspace-diff-sheet-body` in styles.css.
+test("every workspace-diff surface uses the same compact row markup", async () => {
+  const { WorkspaceDiffSheetBody } = await import("./workspace-diff.js");
+  const state = {
+    status: "loaded",
+    expanded: true,
+    data: {
+      cwd: "/repo",
+      file_changes: [
+        {
+          path: "/repo/src/a.txt",
+          change_type: "update",
+          diff: ["--- a/src/a.txt", "+++ b/src/a.txt", "@@ -1 +1 @@", "-old", "+new"].join("\n"),
+        },
+      ],
+    },
+  };
+
+  for (const [name, Component] of [
+    ["desktop rail (local + remote)", WorkspaceChangesPanel],
+    ["phone sheet / remote modal", WorkspaceDiffSheetBody],
+  ]) {
+    const html = renderToStaticMarkup(
+      React.createElement(Component, { store: fakeStore(state) })
+    );
+    assert.match(html, /file-diff-panel is-rail/, `${name} uses the compact row`);
+    assert.match(html, /diff-file-glyph/, `${name} shows the A/M/D column`);
+    assert.match(html, /diff-file-dir[^>]*>src\/</, `${name} splits the directory off`);
+    assert.doesNotMatch(html, /<strong/, `${name} drops the bold full-path card treatment`);
+  }
+
+  // The sheet is the surface that carries the touch-density hook.
+  const sheet = renderToStaticMarkup(
+    React.createElement(WorkspaceDiffSheetBody, { store: fakeStore(state) })
+  );
+  assert.match(sheet, /workspace-diff-sheet-body/, "the density hook is present");
+});

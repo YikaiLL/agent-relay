@@ -399,14 +399,12 @@ export function WorkspaceChangesPanel({ store }) {
   const state = useStoreState(store);
   const stats = computeChangeStats(state.data);
   const expanded = state.expanded;
+  // No "Environment" eyebrow band: the tab strip directly above already says
+  // "Changes", so a second full-width header only stacked chrome on top of the
+  // list without naming anything new.
   return h(
     "section",
     { className: "workspace-changes-panel" },
-    h(
-      "header",
-      { className: "workspace-changes-header" },
-      h("h2", { className: "workspace-changes-title" }, "Environment")
-    ),
     h(WorkspaceRootPicker, { store, state }),
     h(
       "div",
@@ -498,10 +496,16 @@ function WorkspaceChangesEntry({ store, state, stats, expanded }) {
         "aria-expanded": expanded ? "true" : "false",
         "aria-label": expandLabel,
       },
+      // Disclosure caret leads now, so the row reads as the small section header
+      // it has become rather than a list item with a control parked on the end.
+      h(
+        "span",
+        { className: "workspace-changes-row-chevron", "aria-hidden": "true" },
+        expanded ? "▾" : "▸"
+      ),
       h(
         "span",
         { className: "workspace-changes-row-main" },
-        h("span", { className: "workspace-changes-row-icon", "aria-hidden": "true" }, "±"),
         // Always the workspace git working tree (path-scoped, never session-scoped) — name
         // that subject so it doesn't read as "the current agent's output" when idle. Matches
         // the modal's "Workspace diff" title.
@@ -523,18 +527,16 @@ function WorkspaceChangesEntry({ store, state, stats, expanded }) {
           "data-workspace-changes-skip": "true",
         },
         h(RefreshIcon)
-      ),
-      h(
-        "span",
-        { className: "workspace-changes-row-chevron", "aria-hidden": "true" },
-        expanded ? "▾" : "▸"
       )
     ),
     expanded
       ? h(
           "div",
           { className: "workspace-changes-body" },
-          renderDiffContent(state)
+          // Only here: the desktop right rail is the narrow surface the compact
+          // row (status glyph, directory-first truncation, right-aligned stats)
+          // was designed for.
+          renderDiffContent(state, "rail")
         )
       : null,
     !expanded && isError
@@ -575,7 +577,11 @@ function renderStatsBadge(state, stats) {
   );
 }
 
-function renderDiffContent(state) {
+// `variant` stays the CALLER's choice even though both current callers pass
+// "rail": the transcript renders file changes through the same component, and
+// defaulting to the wide card is what keeps a future caller from silently
+// inheriting a layout nobody checked on that surface.
+function renderDiffContent(state, variant = "transcript") {
   if (state.status === "loading" && !state.data) {
     return h("p", { className: "diff-file-empty" }, "Loading…");
   }
@@ -613,6 +619,7 @@ function renderDiffContent(state) {
     );
   }
   return h(FileChangeDiff, {
+    variant,
     tool: {
       item_type: "workspaceDiff",
       file_changes: fileChanges,
@@ -774,6 +781,9 @@ export function WorkspaceDiffSheetBody({ store }) {
             : null
         )
       : null,
-    renderDiffContent(state)
+    // Same compact row as the rail, so the panel reads identically on desktop
+    // and phone. `.workspace-diff-sheet-body` is what scales it up to touch
+    // targets — this surface is only ever reached from the mobile chip.
+    renderDiffContent(state, "rail")
   );
 }
