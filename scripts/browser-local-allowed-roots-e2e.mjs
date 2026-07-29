@@ -160,12 +160,15 @@ async function main() {
     });
 
     await page.waitForFunction(
-      (expectedWorkspace) => {
+      () => {
         const transcript = document.querySelector("#transcript")?.textContent || "";
         const title = document.querySelector("#workspace-title")?.textContent || "";
-        return transcript.includes("Session ready") && title.includes(expectedWorkspace);
+        // The header no longer echoes the workspace basename; "Session ready" is the
+        // signal the allowed-root session started, and the title just needs to render
+        // (the cwd itself is asserted separately below).
+        return transcript.includes("Session ready") && title.trim().length > 0;
       },
-      path.basename(ROOT),
+      null,
       { timeout: LOCAL_TIMEOUT_MS }
     );
 

@@ -63,10 +63,10 @@ async function main() {
       const log = document.querySelector("#client-log-root")?.textContent || "";
       return log.includes("Relay booted");
     });
-    // The active-state title is the workspace name, which is the relay cwd's
-    // basename — "sealwire" in CI, whatever the checkout dir is locally — so
-    // derive it from ROOT instead of hardcoding the old repo name. (The
-    // post-launch check below already uses path.basename(ROOT) the same way.)
+    // Before any conversation is open the header shows the product name ("Relay
+    // console"), never the workspace basename — under the new rules the workspace name
+    // is not a header title. We still accept the basename / a transient "Ready in …"
+    // so this stays robust across shell states.
     const launchWorkspaceTitle = (await page.textContent("#workspace-title")) || "";
     const expectedWorkspaceName = path.basename(ROOT);
     assert.ok(
@@ -94,17 +94,23 @@ async function main() {
       return transcript.includes("Session ready");
     }, null, { timeout: LOCAL_TIMEOUT_MS });
     await page.waitForFunction(
-      (expectedWorkspace) => {
+      () => {
         const title = document.querySelector("#workspace-title")?.textContent || "";
         const subtitle = document.querySelector("#workspace-subtitle")?.textContent || "";
         const status = document.querySelector("#status-badge")?.textContent || "";
+        // New header rules: the workspace basename is no longer the title, and the
+        // "live" word is gone (it collided with the run-state badge). A running session
+        // now shows a non-empty status badge and identifies itself as EITHER the
+        // conversation title (the thread label, i.e. not "Relay console") OR the
+        // console-home "session · …" subtitle.
+        const identifiesSession = title !== "Relay console" || /session ·/i.test(subtitle);
         return (
-          title.includes(expectedWorkspace) &&
-          subtitle.toLowerCase().includes("live") &&
-          status.trim().length > 0
+          status.trim().length > 0 &&
+          !subtitle.toLowerCase().includes("live") &&
+          identifiesSession
         );
       },
-      path.basename(ROOT),
+      null,
       { timeout: LOCAL_TIMEOUT_MS }
     );
     // Session details used to live behind the header overflow menu. Newer

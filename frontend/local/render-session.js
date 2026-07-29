@@ -66,7 +66,7 @@ import {
 import {
   readLocalUiState,
 } from "./ui-store.js";
-import { providerLabel } from "../shared/provider-labels.js";
+import { providerLabel, selectModelBadge } from "../shared/provider-labels.js";
 import { providerStatusMeta } from "../shared/provider-status.js";
 import { isProgressStalled } from "../progress-verbs.js";
 import {
@@ -122,6 +122,7 @@ import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap } from "../shared/thread-activity.js";
 import { describeStatusChips } from "../shared/session-status.js";
 import { selectStatusBadge } from "./status-badge.js";
+import { selectHeaderLabels } from "./header-labels.js";
 import { selectStandbyEmptyModel, buildStandbyEmptyActions } from "./standby-empty-state.js";
 import { sessionIsWorking, threadAttention } from "../shared/thread-attention.js";
 import {
@@ -329,7 +330,6 @@ export function createSessionRenderer({
     const workspace = session.view_only
       ? session.current_cwd || ""
       : session.current_cwd || state.selectedCwd || "";
-    const workspaceName = workspace ? workspaceBasename(workspace) : "";
     const viewingSessionDetails = Boolean(sessionMeta?.closest("dialog")?.open);
     const viewingSecurityDetails = Boolean(
       document.querySelector("#settings-modal")?.open
@@ -337,26 +337,22 @@ export function createSessionRenderer({
     const threadListUi = readThreadListUi(state.threadListStore);
     state.currentApprovalId = approval?.request_id || null;
 
-    workspaceTitle.textContent = workspaceName || "Relay console";
-    if (session.view_only && session.active_thread_id) {
-      const threadLabel =
-        activeThread?.name || activeThread?.preview || shortId(session.active_thread_id);
-      workspaceSubtitle.textContent = state.viewOnlyThread?.review
-        ? `read-only · review in progress · ${threadLabel}`
-        : `read-only · saved session · ${threadLabel}`;
-    } else if (viewingConversation && session.active_thread_id) {
-      const threadLabel =
-        activeThread?.name || activeThread?.preview || shortId(session.active_thread_id);
-      workspaceSubtitle.textContent = `live · ${threadLabel}`;
-    } else if (session.active_thread_id) {
-      const threadLabel =
-        activeThread?.name || activeThread?.preview || shortId(session.active_thread_id);
-      workspaceSubtitle.textContent = `live session · ${threadLabel}`;
-    } else if (workspace) {
-      workspaceSubtitle.textContent = "standby";
-    } else {
-      workspaceSubtitle.textContent = "no workspace selected";
-    }
+    // Title/subtitle rules live in one tested place (header-labels.js): title = the
+    // thread you're viewing (never the workspace basename), subtitle drops "live" and
+    // keeps only the read-only warning. See that module for the rationale.
+    const threadLabel = session.active_thread_id
+      ? activeThread?.name || activeThread?.preview || shortId(session.active_thread_id)
+      : "";
+    const headerLabels = selectHeaderLabels({
+      hasWorkspace: Boolean(workspace),
+      activeThreadId: session.active_thread_id,
+      viewingConversation,
+      viewOnly: session.view_only,
+      reviewInProgress: Boolean(state.viewOnlyThread?.review),
+      threadLabel,
+    });
+    workspaceTitle.textContent = headerLabels.title;
+    workspaceSubtitle.textContent = headerLabels.subtitle;
 
     // Three-way main view: a live/read-only conversation always wins; otherwise, in
     // Projects mode with a selected project, the card overview replaces the console
@@ -674,16 +670,15 @@ export function createSessionRenderer({
     // On the console/home view, the model badge is noise (session state leaking into
     // the monitor surface). Session details modal still surfaces it on demand.
     const inConversationView = chatShell?.dataset.view === "conversation";
-    const shouldShow = Boolean(inConversationView && session?.active_thread_id && session.model);
-    const provider = providerLabel(session?.provider);
-    const modelLabel = provider ? `${provider} · ${session.model}` : session?.model || "";
+    const badge = selectModelBadge({
+      provider: session?.provider,
+      model: session?.model,
+      reasoningEffort: session?.reasoning_effort,
+    });
+    const shouldShow = Boolean(inConversationView && session?.active_thread_id && badge.show);
     localModelBadge.hidden = !shouldShow;
-    localModelBadge.textContent = shouldShow ? modelLabel : "";
-    localModelBadge.title = shouldShow
-      ? session.reasoning_effort
-        ? `${modelLabel} · effort ${session.reasoning_effort}`
-        : modelLabel
-      : "";
+    localModelBadge.textContent = shouldShow ? badge.text : "";
+    localModelBadge.title = shouldShow ? badge.title : "";
   }
 
   // Sidebar "Providers" panel: one row per configured provider from the

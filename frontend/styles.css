@@ -1825,6 +1825,25 @@ input:focus, textarea:focus, select:focus {
   display: none;
 }
 
+/* Local surface only — `.local-frame` wraps the local shell; remote has no such
+   wrapper, so remote is left entirely on its own (cwd-centric) header design for now.
+   Unifying remote's header is a deliberate follow-up (its title/subtitle/badge differ
+   by design). Both rules here are driven by LOCAL-only header changes:
+   - The title is now the arbitrary-length thread label, so it must truncate instead
+     of shoving the info button or blowing out the header grid.
+   - The subtitle is human status text ("read-only · saved session"), so it reads as
+     sans; mono made it look wide and terminal-ish. */
+.local-frame .chat-heading h1 {
+  min-width: 0;
+  max-width: min(60vw, 640px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.local-frame .chat-subtitle {
+  font-family: var(--font-sans);
+}
+
 .chat-header-actions {
   display: flex;
   align-items: center;
