@@ -893,12 +893,16 @@ pub(crate) fn suggested_root_from_tools<'a>(
 
 /// Whether this transcript entry represents a file write that actually reached disk.
 ///
-/// Status alone is NOT sufficient: `claude.rs` records every `tool_call_result` as
-/// "completed" and never inspects `is_error`, so a failed edit is indistinguishable by
-/// status on that path. The signal that does survive is the diff body — the worker
-/// re-reads the file and emits an EMPTY diff for an edit that never landed (the
-/// input-reconstructed fallback is deliberately suppressed for a failed result). So
-/// require actual diff content, which is also provider-agnostic.
+/// Two independent signals, because neither is sufficient alone:
+/// - status, which the providers now set correctly (`claude.rs` propagates the worker's
+///   `is_error`; codex has always had a failed status);
+/// - a non-empty diff body, which is what actually proves the write reached disk. The
+///   worker re-reads the file and emits an EMPTY diff for an edit that never landed
+///   (the input-reconstructed fallback is deliberately suppressed for a failed result).
+///
+/// The diff check is kept as the provider-agnostic backstop: it holds even for a
+/// provider that reports no failure status at all, and it is what caught this case
+/// while the Claude path was still settling every result as "completed".
 fn is_landed_file_change(tool: &ToolCallView, status: &str) -> bool {
     if tool.item_type != "fileChange" {
         return false;

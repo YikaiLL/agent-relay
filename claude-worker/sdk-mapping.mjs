@@ -555,16 +555,20 @@ export function mapSessionMessages(messages) {
   const entries = [];
   const toolEntryById = new Map();
 
-  function upsertToolResult(toolUseId, content) {
+  // `isError` must survive replay: without it a session reloaded from disk shows every
+  // failed tool as a success, which is both wrong to read and wrong for anything that
+  // reasons about whether a write actually landed.
+  function upsertToolResult(toolUseId, content, isError = false) {
     if (!toolUseId) return;
     const itemId = `tool:${toolUseId}`;
+    const status = isError ? "failed" : "completed";
     const resultPreview = typeof content === "string"
       ? content
       : JSON.stringify(content ?? "");
     const existingIndex = toolEntryById.get(itemId);
     if (existingIndex != null) {
       const existing = entries[existingIndex];
-      existing.status = "completed";
+      existing.status = status;
       existing.tool = {
         ...existing.tool,
         result_preview: resultPreview,
@@ -575,7 +579,7 @@ export function mapSessionMessages(messages) {
       item_id: itemId,
       kind: "tool_call",
       text: null,
-      status: "completed",
+      status,
       turn_id: toolUseId,
       tool: {
         item_type: "toolCall",
@@ -602,7 +606,7 @@ export function mapSessionMessages(messages) {
       const blocks = Array.isArray(message.content) ? message.content : [];
       for (const block of blocks) {
         if (block?.type === "tool_result") {
-          upsertToolResult(block.tool_use_id, block.content);
+          upsertToolResult(block.tool_use_id, block.content, block.is_error === true);
         }
       }
       const text = blocks.some((block) => block?.type === "tool_result")

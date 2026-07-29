@@ -865,3 +865,62 @@ test("mcpStatusLogLines: tolerates malformed entries as failures without throwin
   assert.equal(lines[0], "MCP: 0/2 server(s) connected");
   assert.ok(lines.some((l) => l.includes("failed to connect (status=unknown)")));
 });
+
+// Replaying history must not turn a failed tool into a successful one. `upsertToolResult`
+// dropped `block.is_error`, so a session reloaded from disk showed every failed Edit as
+// completed — the same defect the live path had, but surviving a restart.
+test("mapSessionMessages preserves a failed tool result as failed", () => {
+  const entries = mapSessionMessages([
+    {
+      uuid: "u1",
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", id: "toolu_1", name: "Edit", input: { file_path: "/repo/a.rs" } },
+        ],
+      },
+    },
+    {
+      uuid: "u2",
+      type: "user",
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_1",
+            is_error: true,
+            content: "String to replace not found",
+          },
+        ],
+      },
+    },
+  ]);
+
+  const tool = entries.find((entry) => entry.item_id === "tool:toolu_1");
+  assert.ok(tool, "the tool entry must exist");
+  assert.equal(tool.status, "failed", "a tool_result with is_error must replay as failed");
+});
+
+test("mapSessionMessages keeps a successful tool result completed", () => {
+  const entries = mapSessionMessages([
+    {
+      uuid: "u1",
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", id: "toolu_2", name: "Edit", input: { file_path: "/repo/a.rs" } },
+        ],
+      },
+    },
+    {
+      uuid: "u2",
+      type: "user",
+      message: {
+        content: [{ type: "tool_result", tool_use_id: "toolu_2", content: "ok" }],
+      },
+    },
+  ]);
+
+  const tool = entries.find((entry) => entry.item_id === "tool:toolu_2");
+  assert.equal(tool.status, "completed");
+});

@@ -1268,13 +1268,26 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                 let turn_id =
                     string_at(&payload, &["turn_id"]).or_else(|| relay.active_turn_id.clone());
                 let is_file_change = tool.item_type == "fileChange";
+                // The worker reports a failed tool with `is_error: true`. Settling every
+                // result as "completed" made a failed Edit indistinguishable from a
+                // successful one — both to the reader and to anything reasoning about
+                // whether a write actually landed. Matches codex.rs's "failed".
+                let status = if payload
+                    .get("is_error")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "failed"
+                } else {
+                    "completed"
+                };
                 if let ClaudeThreadRoute::Background(thread_id) = route.clone() {
                     relay.bg_upsert_transcript_item(
                         &thread_id,
                         item_id,
                         TranscriptEntryKind::ToolCall,
                         None,
-                        "completed".to_string(),
+                        status.to_string(),
                         turn_id,
                         Some(tool),
                         crate::state::unix_now(),
@@ -1284,7 +1297,7 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                         item_id,
                         TranscriptEntryKind::ToolCall,
                         None,
-                        "completed".to_string(),
+                        status.to_string(),
                         turn_id.clone(),
                         Some(tool),
                     );
@@ -2772,6 +2785,92 @@ mod tests {
         assert_eq!(fork_point_message_uuid("tool:toolu_1"), None);
         assert_eq!(fork_point_message_uuid("abc-123"), None);
         assert_eq!(fork_point_message_uuid("assistant:"), None);
+    }
+
+    // A tool that FAILED must not settle as "completed". The worker already reports
+    // `is_error: true` on the result event (see sdk-mapping.mjs), but the relay recorded
+    // every tool result with a hardcoded "completed" and never read the flag — so a
+    // failed Edit rendered exactly like a successful one, and anything downstream that
+    // reasons about whether a write landed (e.g. the workspace-diff root suggestion)
+    // saw a success.
+    #[tokio::test]
+    async fn a_failed_tool_result_is_recorded_as_failed_not_completed() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            json!({
+                "type": "tool_call_result",
+                "provider_session_id": "thread-b",
+                "id": "toolu_fail",
+                "turn_id": "turn-b",
+                "is_error": true,
+                "tool": {
+                    "item_type": "fileChange",
+                    "name": "Edit",
+                    "title": "Edit",
+                    "detail": null,
+                    "query": null,
+                    "path": "/tmp/b/x.rs",
+                    "url": null,
+                    "command": null,
+                    "input_preview": null,
+                    "result_preview": "String to replace not found",
+                    "diff": null,
+                    "file_changes": []
+                }
+            }),
+            &state,
+        )
+        .await;
+
+        let snapshot = state.read().await.snapshot();
+        let entry = snapshot
+            .transcript
+            .iter()
+            .find(|entry| entry.item_id.as_deref() == Some("tool:toolu_fail"))
+            .expect("the failed tool must still appear in the transcript");
+        assert_eq!(
+            entry.status, "failed",
+            "a tool result carrying is_error must be recorded as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_tool_result_stays_completed() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            json!({
+                "type": "tool_call_result",
+                "provider_session_id": "thread-b",
+                "id": "toolu_ok",
+                "turn_id": "turn-b",
+                "tool": {
+                    "item_type": "fileChange",
+                    "name": "Edit",
+                    "title": "Edit",
+                    "detail": null,
+                    "query": null,
+                    "path": "/tmp/b/x.rs",
+                    "url": null,
+                    "command": null,
+                    "input_preview": null,
+                    "result_preview": "ok",
+                    "diff": null,
+                    "file_changes": []
+                }
+            }),
+            &state,
+        )
+        .await;
+
+        let snapshot = state.read().await.snapshot();
+        let entry = snapshot
+            .transcript
+            .iter()
+            .find(|entry| entry.item_id.as_deref() == Some("tool:toolu_ok"))
+            .expect("tool entry");
+        assert_eq!(entry.status, "completed");
     }
 
     #[tokio::test]

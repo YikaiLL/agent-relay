@@ -1175,12 +1175,12 @@ mod path_scope_tests {
         assert_eq!(warm.suggested_root, None);
     }
 
-    // The shape a REAL failed Claude edit takes. `claude.rs` records every
-    // `tool_call_result` with status "completed" and never looks at `is_error`, so the
-    // status field cannot distinguish a failed edit — the previous guard checked a value
-    // the Claude path never emits. What DOES distinguish it: the worker re-reads the file
-    // and, for an edit that never landed, emits the fileChange with an EMPTY diff
-    // (`useFallback` is suppressed for a failed result, see claude-worker/file-diff.mjs).
+    // A failed edit that still arrives with status "completed". `claude.rs` now maps the
+    // worker's `is_error` to "failed", but this stays as the provider-agnostic guard:
+    // what actually proves a write landed is the diff body, and the worker emits an EMPTY
+    // one for an edit that never reached disk (`useFallback` is suppressed for a failed
+    // result — see claude-worker/file-diff.mjs). A provider that reports no failure
+    // status at all is still handled correctly here.
     fn failed_file_tool(path: &str) -> crate::protocol::ToolCallView {
         let mut tool = file_tool(&[path]);
         // Exactly what the worker produces for a failed edit: the change is reported,
@@ -1193,7 +1193,7 @@ mod path_scope_tests {
     // panel over there, and a newer failed edit in main must not mask an older real
     // write in the worktree. Both arrive with status "completed".
     #[tokio::test]
-    async fn a_failed_edit_is_not_evidence_even_though_it_records_as_completed() {
+    async fn a_write_that_never_landed_is_not_evidence_even_if_status_says_completed() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
