@@ -57,6 +57,40 @@ function assertCoherent(state, label) {
   if (state.focusedTabThreadId) {
     throw new Error(`${label}: a tab claims focus while no session is routed — ${where}`);
   }
+  // Cross-check against the renderer: with no view route the main area must not be a
+  // conversation.
+  //
+  // Only this direction is asserted. The converse does NOT hold — the renderer's
+  // `isViewingConversation` is `viewThreadId === active_thread_id`, so a routed but
+  // NON-active session renders read-only inside the console view, and demanding
+  // "route ⇒ conversation" would fail on every view-only tab.
+  if (state.mainView === "conversation") {
+    throw new Error(`${label}: a conversation is rendered with no session routed — ${where}`);
+  }
+}
+
+/**
+ * Wait until the strip, the route and the main area agree, then assert it.
+ *
+ * The invariant is EVENTUAL, not instantaneous: React renders asynchronously, and the
+ * route is written inside a view transition, so sampling one moment after a navigation
+ * catches a legitimate in-between frame. Polling still fails loudly — the final
+ * assertion runs on the last sample if it never settles.
+ */
+async function waitForCoherent(page, label, timeoutMs = TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let last = await coherence(page);
+  while (Date.now() < deadline) {
+    try {
+      assertCoherent(last, label);
+      return last;
+    } catch {
+      await page.waitForTimeout(100);
+      last = await coherence(page);
+    }
+  }
+  assertCoherent(last, `${label} (never settled)`);
+  return last;
 }
 
 function tabState(page) {
@@ -218,6 +252,16 @@ async function run() {
     // The strip used to adopt the relay's active thread whenever the route was
     // empty, so emptying the strip immediately refilled it.
     await page.click(`.session-tab[data-thread-id="${threadB}"] .session-tab-pin`);
+    // Unpinning re-renders the strip, so wait for that to land before clicking the
+    // close button — otherwise the second click races the re-render.
+    await page.waitForFunction(
+      (id) =>
+        !document
+          .querySelector(`.session-tab[data-thread-id="${id}"]`)
+          ?.className.includes("is-pinned"),
+      threadB,
+      { timeout: TIMEOUT_MS }
+    );
     await page.click(`.session-tab[data-thread-id="${threadB}"] .session-tab-close`);
     await page.waitForFunction(() => document.querySelectorAll(".session-tab").length === 0, {
       timeout: TIMEOUT_MS,
@@ -260,6 +304,9 @@ async function run() {
     await page.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
     await openThreadDrawer(page);
 
+    await page.waitForSelector(`button.conversation-item[data-thread-id="${threadA}"]`, {
+      timeout: TIMEOUT_MS,
+    });
     await page.click(`button.conversation-item[data-thread-id="${threadA}"]`);
     await page.waitForFunction(
       (id) => [...document.querySelectorAll(".session-tab")].some((tab) => tab.dataset.threadId === id),
@@ -269,7 +316,7 @@ async function run() {
     const sessionsTabs = (await tabState(page)).threadIds;
     assert.deepEqual(sessionsTabs, [threadA], "Sessions mode holds exactly the opened session");
 
-    assertCoherent(await coherence(page), "sessions mode with one open session");
+    await waitForCoherent(page, "sessions mode with one open session");
 
     await page.click("#threads-view-projects");
     await page.waitForFunction(() => document.querySelectorAll(".session-tab").length === 0, {
@@ -284,7 +331,7 @@ async function run() {
     // Leaving it pointed at the Sessions thread would render that transcript under an
     // empty strip — the strip and the main area describing different things.
     const inProjects = await coherence(page);
-    assertCoherent(inProjects, "after switching to Projects");
+    await waitForCoherent(page, "after switching to Projects");
     assert.equal(
       inProjects.routedThreadId,
       null,
@@ -300,7 +347,7 @@ async function run() {
     );
     // Coming back restores that workspace's focused session, route included.
     const backInSessions = await coherence(page);
-    assertCoherent(backInSessions, "after switching back to Sessions");
+    await waitForCoherent(page, "after switching back to Sessions");
     assert.equal(
       backInSessions.routedThreadId,
       threadA,
@@ -317,6 +364,9 @@ async function run() {
     // History entries outlive threads, so backing onto a deleted session's entry
     // used to re-create the very tab the delete had just swept.
     await openThreadDrawer(page);
+    await page.waitForSelector(`button.conversation-item[data-thread-id="${threadB}"]`, {
+      timeout: TIMEOUT_MS,
+    });
     await page.click(`button.conversation-item[data-thread-id="${threadB}"]`);
     await page.waitForFunction(
       (id) => new URL(window.location.href).searchParams.get("thread") === id,
@@ -325,6 +375,9 @@ async function run() {
     );
 
     page.once("dialog", (dialog) => dialog.accept());
+    await page.waitForSelector(`button.conversation-item[data-thread-id="${threadA}"]`, {
+      timeout: TIMEOUT_MS,
+    });
     await page.click(`button.conversation-item[data-thread-id="${threadA}"]`, { button: "right" });
     await page.waitForSelector("#delete-thread-button", { timeout: TIMEOUT_MS });
     await page.click("#delete-thread-button");
@@ -349,7 +402,7 @@ async function run() {
       threadA,
       "the route must not stay on a deleted session"
     );
-    assertCoherent(afterBackOntoDeleted, "after backing onto a deleted session");
+    await waitForCoherent(page, "after backing onto a deleted session");
 
     await page.goForward({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(600);
@@ -358,7 +411,7 @@ async function run() {
       !afterForward.tabThreadIds.includes(threadA),
       "forward navigation must not resurrect it either"
     );
-    assertCoherent(afterForward, "after forward navigation");
+    await waitForCoherent(page, "after forward navigation");
     await shoot(page, "09-deleted-not-resurrected");
 
     // --- The tombstone has to survive a reload ---
@@ -373,7 +426,7 @@ async function run() {
       !afterReloadBack.tabThreadIds.includes(threadA),
       `a reload must not lose the tombstone, got ${JSON.stringify(afterReloadBack.tabThreadIds)}`
     );
-    assertCoherent(afterReloadBack, "after delete → reload → back");
+    await waitForCoherent(page, "after delete → reload → back");
 
     // --- Home shows no session, so no tab may be highlighted ---
     // Even with a live relay session: an empty route means Home, not the active
@@ -381,13 +434,16 @@ async function run() {
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
     await openThreadDrawer(page);
+    await page.waitForSelector(`button.conversation-item[data-thread-id="${threadB}"]`, {
+      timeout: TIMEOUT_MS,
+    });
     await page.click(`button.conversation-item[data-thread-id="${threadB}"]`);
     await page.waitForFunction(
       (id) => new URL(window.location.href).searchParams.get("thread") === id,
       threadB,
       { timeout: TIMEOUT_MS }
     );
-    assertCoherent(await coherence(page), "viewing a session before going Home");
+    await waitForCoherent(page, "viewing a session before going Home");
 
     await page.click("#go-console-home-sidebar");
     await page.waitForFunction(
@@ -397,8 +453,75 @@ async function run() {
     await page.waitForTimeout(400);
     const atHome = await coherence(page);
     assert.ok(atHome.tabThreadIds.length > 0, "the strip still lists the open sessions at Home");
-    assertCoherent(atHome, "at Home with an open session");
+    await waitForCoherent(page, "at Home with an open session");
     await shoot(page, "10-home-no-focus");
+
+    // --- Launching straight onto a deleted session's URL ---
+    // The initial load adopts `?thread=` from the address bar without going through
+    // any navigation handler, so it needs the same tombstone reconciliation that
+    // back/forward does — this used to be the one entry point that skipped it and
+    // created a dead tab on startup.
+    await page.goto(`http://127.0.0.1:${relayPort}/?thread=${encodeURIComponent(threadA)}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
+    await page.waitForTimeout(1200);
+    const launchedOnDeleted = await coherence(page);
+    assert.ok(
+      !launchedOnDeleted.tabThreadIds.includes(threadA),
+      `launching on a deleted session must not create its tab, got `
+        + JSON.stringify(launchedOnDeleted.tabThreadIds)
+    );
+    assert.notEqual(
+      launchedOnDeleted.routedThreadId,
+      threadA,
+      "the dead route must be replaced, not kept"
+    );
+    await waitForCoherent(page, "after launching on a deleted session's URL");
+    await shoot(page, "11-launch-on-deleted");
+
+    // --- A deletion in one window is honoured by another already-open window ---
+    // The tombstone check reads storage on every navigation instead of caching a copy
+    // at page init, so window B does not need a reload to learn about A's deletion.
+    const pageB = await launched.context.newPage();
+    pageB.on("pageerror", (error) => pageErrors.push(`[pageB] ${error.stack || error.message}`));
+    await pageB.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await pageB.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
+    await openThreadDrawer(pageB);
+    await pageB.waitForSelector(`button.conversation-item[data-thread-id="${threadB}"]`, {
+      timeout: TIMEOUT_MS,
+    });
+    await pageB.click(`button.conversation-item[data-thread-id="${threadB}"]`);
+    await pageB.waitForFunction(
+      (id) => new URL(window.location.href).searchParams.get("thread") === id,
+      threadB,
+      { timeout: TIMEOUT_MS }
+    );
+
+    // Window A deletes the session window B is sitting on.
+    await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
+    await openThreadDrawer(page);
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.waitForSelector(`button.conversation-item[data-thread-id="${threadB}"]`, {
+      timeout: TIMEOUT_MS,
+    });
+    await page.click(`button.conversation-item[data-thread-id="${threadB}"]`, { button: "right" });
+    await page.waitForSelector("#delete-thread-button", { timeout: TIMEOUT_MS });
+    await page.click("#delete-thread-button");
+    await page.waitForTimeout(1000);
+
+    // B navigates back onto the now-dead session; no reload, no storage event.
+    await pageB.goBack({ waitUntil: "domcontentloaded" });
+    await pageB.waitForTimeout(1000);
+    const windowB = await coherence(pageB);
+    assert.ok(
+      !windowB.tabThreadIds.includes(threadB),
+      `another window's deletion must be honoured without a reload, got `
+        + JSON.stringify(windowB.tabThreadIds)
+    );
+    await waitForCoherent(pageB, "second window after the first deleted the session");
+    await pageB.close();
 
     assert.deepEqual(pageErrors, [], `no page errors: ${pageErrors.join("\n")}`);
     console.log("local session tabs e2e: OK");

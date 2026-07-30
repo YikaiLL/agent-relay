@@ -1,13 +1,23 @@
 // Tombstones for sessions this browser archived or deleted.
 //
 // Browser history entries outlive threads: a `?thread=<id>` entry survives the
-// session it names, so back/forward can land on one that no longer exists. Without a
-// tombstone the navigation handler helpfully re-opens a tab for a dead session.
+// session it names, so navigating (or launching) onto one can land on a session that
+// no longer exists. Without a tombstone the navigation handler helpfully re-opens a
+// tab for a dead session.
 //
 // Persisted because the same history entries survive a reload — an in-memory set is
 // empty again on the next page load, exactly when the stale entries are still there.
-// Note this is per-browser-profile: another window shares it, a different profile
-// does not, which matches how the history it guards is scoped.
+//
+// Reads go to storage EVERY time rather than caching: a cached copy loaded at page
+// init never learns about a deletion made in another window, which is precisely the
+// case a shared store is supposed to cover. Checks happen on navigation, so the cost
+// of a parse is irrelevant.
+//
+// What this does and does not guarantee: any window of the same profile sees a
+// tombstone as soon as it looks (no event plumbing needed). Writes are
+// read-merge-write over a shared key, so two windows deleting different sessions in
+// the same instant could still have one entry lose the race; the consequence is
+// bounded to one stale tombstone, i.e. one dead tab that can be closed by hand.
 //
 // Bounded and fail-soft, like the other prefs modules: storage being unavailable,
 // full, or corrupt degrades to "no tombstones" and never throws.
@@ -42,23 +52,45 @@ export function loadRemovedThreadIds() {
 /**
  * Record `threadId` as removed and return the resulting id list (newest last).
  * Re-recording an id moves it to the newest slot rather than duplicating it.
+ *
+ * Merges against a fresh read so a concurrent deletion in another window is kept
+ * rather than overwritten wholesale.
  */
-export function rememberRemovedThreadId(threadId, existing = null) {
+export function rememberRemovedThreadId(threadId) {
   if (!threadId) {
-    return existing || loadRemovedThreadIds();
+    return loadRemovedThreadIds();
   }
 
-  const current = existing || loadRemovedThreadIds();
-  const next = [...current.filter((id) => id !== threadId), threadId].slice(-MAX_TOMBSTONES);
+  const next = [
+    ...loadRemovedThreadIds().filter((id) => id !== threadId),
+    threadId,
+  ].slice(-MAX_TOMBSTONES);
 
   const store = storage();
   if (store) {
     try {
       store.setItem(STORAGE_KEY, JSON.stringify(next));
     } catch {
-      // Quota or private-mode failures are non-fatal; the caller keeps its in-memory
-      // copy for this page load.
+      // Quota or private-mode failures are non-fatal; the caller's in-session
+      // fallback still covers this page load.
     }
   }
   return next;
+}
+
+/**
+ * Is this session known to be removed?
+ *
+ * Reads storage fresh so a deletion made in another window is honoured immediately.
+ * `sessionFallback` covers the case where storage is unavailable (private mode, quota)
+ * and the only record is this page's own in-memory set.
+ */
+export function isRemovedThreadId(threadId, sessionFallback = null) {
+  if (!threadId) {
+    return false;
+  }
+  if (sessionFallback?.has?.(threadId)) {
+    return true;
+  }
+  return loadRemovedThreadIds().includes(threadId);
 }

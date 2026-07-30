@@ -199,14 +199,18 @@ import {
 import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
-import { focusedTab, layoutThreadIds } from "./shared/tab-layout.js";
+import { focusedTab, layoutThreadIds, openThreadIds } from "./shared/tab-layout.js";
 import {
   NO_PROJECT_KEY,
   SESSIONS_KEY,
   createTabWorkspaceStore,
 } from "./shared/tab-workspace-store.js";
 import { browserTabWorkspacePersistence } from "./shared/tab-workspace-prefs.js";
-import { loadRemovedThreadIds, rememberRemovedThreadId } from "./shared/removed-threads.js";
+import {
+  isRemovedThreadId,
+  loadRemovedThreadIds,
+  rememberRemovedThreadId,
+} from "./shared/removed-threads.js";
 import {
   loadLastApprovalPolicy,
   loadLastEffort,
@@ -1626,17 +1630,9 @@ window.addEventListener("popstate", () => {
   // setThreadRoute (it must not push another history entry), so re-open the tab
   // here. Navigating back to a session you had merely CLOSED re-opens it, which keeps
   // the strip and the transcript agreeing.
-  if (state.removedThreadIds.has(state.viewThreadId)) {
-    // The entry names a session that was archived or deleted. Refusing to create its
-    // tab is not enough — leaving the route pointed at it puts the main area on a dead
-    // session with no tab, the exact mismatch this is meant to prevent. Settle onto
-    // whatever this workspace has focused, or Home when it has nothing, replacing the
-    // dead entry rather than pushing another one.
-    state.viewThreadId = null;
-    syncRouteToCurrentWorkspace({ replace: true });
-  } else {
-    openSessionTab(state.viewThreadId);
-  }
+  // A history entry can name a session that was archived or deleted since; refusing to
+  // create its tab is not enough, the route must not be left pointing at it either.
+  adoptRoutedThread();
   if (state.session) {
     renderSession(state.session);
   }
@@ -2173,9 +2169,12 @@ async function boot() {
 
   await loadSession("initial boot");
   await loadThreads("initial boot");
-  // A `?thread=` deep link sets viewThreadId directly, without going through
-  // viewThread, so give it a tab once the thread list is known.
-  openSessionTab(state.viewThreadId);
+  // A `?thread=` deep link (address bar, restored tab, reload) sets viewThreadId
+  // directly, without going through viewThread. Same reconciliation as back/forward:
+  // launching straight onto a deleted session must not create a dead tab.
+  adoptRoutedThread();
+  // Nothing else renders between here and the first snapshot, so refresh the strip.
+  renderSessionTabs();
   connectSessionStream();
   scheduleThreadsPoll();
 }
@@ -3579,13 +3578,74 @@ function syncRouteToCurrentWorkspace({ replace = false } = {}) {
   }
 }
 
-/** Open (or focus) a tab for a session in the current project's workspace. */
+/**
+ * Give the currently routed session a tab, unless that session has been archived or
+ * deleted — in which case the route is settled onto whatever this workspace has
+ * focused (or Home when it has nothing) instead.
+ *
+ * Shared by EVERY entry point that adopts a route it did not create: the initial load
+ * (`?thread=` straight from the address bar, a restored tab, a reload) and
+ * back/forward. Having only the popstate path do this left the launch path resurrecting
+ * dead tabs, so the reconciliation lives in one place rather than being duplicated.
+ */
+function adoptRoutedThread() {
+  // Another window may have removed a session that this one still has open. Refusing to
+  // re-create a dead tab is not enough on its own — the already-open copy has to go
+  // too, or this window keeps showing a tab for a session that no longer exists.
+  // Swept here (on navigation) rather than via a storage event: navigation is when a
+  // stale tab can actually be acted on, and it keeps the read-through model with no
+  // listener lifecycle to get wrong.
+  sweepRemovedTabs();
+  // Read-through, so a deletion made in another window of this profile counts; the
+  // in-session set is the fallback for when storage can't persist at all.
+  if (isRemovedThreadId(state.viewThreadId, state.removedThreadIds)) {
+    state.viewThreadId = null;
+    syncRouteToCurrentWorkspace({ replace: true });
+    return;
+  }
+  openSessionTab(state.viewThreadId);
+}
+
+/**
+ * Close any open tab whose session has since been archived or deleted — including
+ * removals performed by another window of this profile, which this window only learns
+ * about by reading the shared tombstones.
+ *
+ * Only the loaded workspaces need sweeping: the removing window already rewrote the
+ * persisted copies, so a workspace this window has not opened yet arrives clean.
+ */
+function sweepRemovedTabs() {
+  const tabs = state.tabWorkspaceStore.getState();
+  const openIds = new Set(
+    Object.values(tabs.workspaces).flatMap((workspace) => openThreadIds(workspace))
+  );
+  if (!openIds.size) {
+    return;
+  }
+
+  const tombstoned = new Set([...loadRemovedThreadIds(), ...state.removedThreadIds]);
+  for (const threadId of openIds) {
+    if (tombstoned.has(threadId)) {
+      tabs.closeThreadEverywhere(threadId);
+    }
+  }
+}
+
+/**
+ * Open (or focus) a tab for a session in the current project's workspace.
+ *
+ * Mutates the store ONLY — it deliberately does not render. React's root.render() is
+ * asynchronous, so a render scheduled here lands after any `startViewTransition` the
+ * caller goes on to start, which makes the browser skip that transition; its callback
+ * is what writes the route, so the URL silently stopped following the tabs. Every
+ * caller already re-renders through renderThreads/renderSession (or calls
+ * renderSessionTabs itself), so the strip still refreshes.
+ */
 function openSessionTab(threadId) {
   if (!threadId) {
     return;
   }
   state.tabWorkspaceStore.getState().openThread(currentTabProjectId(), threadId);
-  renderSessionTabs();
 }
 
 function escapeHtml(value) {
