@@ -4956,3 +4956,35 @@ body.is-resizing-panel {
     opacity: 1;
   }
 }
+
+/* The project group name is a <button> so selecting a project is keyboard- and
+ * tap-reachable (the header also hosts action buttons, so it can't be one itself).
+ * Strip the global button chrome — it must read as the heading it replaced, not as a
+ * control. Typography/colour still come from `.thread-group-name`. */
+.thread-group-name-button {
+  background: transparent;
+  border: none;
+  padding: 0;
+  justify-content: flex-start;
+  text-align: left;
+}
+.thread-group-name-button:hover {
+  background: transparent;
+  color: var(--accent-primary);
+}
+/* The selected project decides which tab set a new session joins, so it needs to be
+ * visible at a glance. */
+.thread-group-header-project.is-active .thread-group-name,
+.thread-group-header-project.is-active .thread-group-icon::before {
+  color: var(--accent-primary);
+}
+
+/* Activity roll-up on a project group header. Reuses the badge pills the project rows
+ * used, so the counts read the same after sessions moved into the tree. */
+.thread-group-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  margin-left: auto;
+}

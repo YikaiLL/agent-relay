@@ -58,7 +58,7 @@ async function openDrawer(page) {
 
 const projectNames = (page) =>
   page.evaluate(() =>
-    [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim())
+    [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim())
   );
 
 // Right-click a thread row (Sessions mode) and read its Project-section buttons.
@@ -103,12 +103,12 @@ async function waitForThreadMenuState(page, tid, match) {
 // Right-click a project row (Projects mode) to open the project context menu.
 async function openProjectMenu(page, name) {
   await page.waitForFunction(
-    (n) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].some((r) => r.textContent.trim() === n),
+    (n) => [...document.querySelectorAll("#threads-list .thread-group-name")].some((r) => r.textContent.trim() === n),
     name,
     { timeout: TIMEOUT_MS }
   );
   const row = page
-    .locator("#threads-list .project-sidebar-row", { hasText: name })
+    .locator("#threads-list .thread-group-header-project", { hasText: name })
     .first();
   await row.click({ button: "right", timeout: TIMEOUT_MS });
   await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
@@ -179,22 +179,23 @@ async function main() {
     assert.ok(sessionsView.hasToggle, "the Sessions/Projects toggle buttons exist");
     assert.match(sessionsView.countText, /folder/, `Sessions mode shows folder grouping: ${sessionsView.countText}`);
 
-    // 5. Switch to Projects: the sidebar lists project ROWS (not thread groups).
+    // 5. Switch to Projects: the sidebar lists each project as a group header,
+    //    with its sessions nested underneath.
     await page.evaluate(() => document.querySelector("#threads-view-projects").click());
     await page.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
     const projectsView = await page.evaluate((name) => {
-      const row = [...document.querySelectorAll("#threads-list .project-sidebar-row")].find(
-        (r) => r.querySelector(".project-sidebar-name")?.textContent?.trim() === name
+      const row = [...document.querySelectorAll("#threads-list .thread-group-header-project")].find(
+        (r) => r.querySelector(".thread-group-name")?.textContent?.trim() === name
       );
       return {
         countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
-        projectRows: [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()),
-        verifyBadge: row?.querySelector(".project-sidebar-badges")?.textContent?.trim() || "",
-        hasActionsButton: !!row?.closest(".project-sidebar-row-wrap")?.querySelector(".project-sidebar-more"),
+        projectRows: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+        verifyBadge: row?.querySelector(".thread-group-badges")?.textContent?.trim() || "",
+        hasActionsButton: !!row?.closest(".thread-group-header-project")?.querySelector(".thread-group-action"),
         projectsButtonActive: document.querySelector("#threads-view-projects")?.classList.contains("is-active") || false,
       };
     }, "VerifyProj");
@@ -212,26 +213,26 @@ async function main() {
     // session count. Then re-assign restores it.
     await page.evaluate(() => document.querySelector("#threads-view-projects").click());
     await page.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
     const verifyBadge = (page) =>
       page.evaluate((name) => {
-        const row = [...document.querySelectorAll("#threads-list .project-sidebar-row")].find(
-          (r) => r.querySelector(".project-sidebar-name")?.textContent?.trim() === name
+        const row = [...document.querySelectorAll("#threads-list .thread-group-header-project")].find(
+          (r) => r.querySelector(".thread-group-name")?.textContent?.trim() === name
         );
-        return row?.querySelector(".project-sidebar-badges")?.textContent?.trim() || "";
+        return row?.querySelector(".thread-group-badges")?.textContent?.trim() || "";
       }, "VerifyProj");
     await api(relayPort, "POST", "/api/projects", { action: "unassign", thread_id: threadId });
     let unassignPropagated = false;
     try {
       await page.waitForFunction(
         (name) => {
-          const row = [...document.querySelectorAll("#threads-list .project-sidebar-row")].find(
-            (r) => r.querySelector(".project-sidebar-name")?.textContent?.trim() === name
+          const row = [...document.querySelectorAll("#threads-list .thread-group-header-project")].find(
+            (r) => r.querySelector(".thread-group-name")?.textContent?.trim() === name
           );
-          return /0\s+session/.test(row?.querySelector(".project-sidebar-badges")?.textContent || "");
+          return /0\s+session/.test(row?.querySelector(".thread-group-badges")?.textContent || "");
         },
         "VerifyProj",
         { timeout: TIMEOUT_MS }
@@ -262,7 +263,7 @@ async function main() {
     const failClosed = await failPage.evaluate(() => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
       bodyText: document.querySelector("#threads-list")?.textContent?.trim() || "",
-      projectRows: [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()),
+      projectRows: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
     }));
     await failPage.close();
 
@@ -281,7 +282,7 @@ async function main() {
     await gatePage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
     await gatePage.evaluate(() => document.querySelector("#threads-view-projects").click());
     await gatePage.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
@@ -294,12 +295,12 @@ async function main() {
     );
     const gatePending = await gatePage.evaluate(() => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
-      projectRows: [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()),
+      projectRows: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
     }));
     releaseRefresh();
     holdRefresh = false;
     await gatePage.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
+      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
@@ -329,7 +330,7 @@ async function main() {
       nextPrompt = "UiCrudProj";
       await crudPage.evaluate(() => document.querySelector("#projects-create-button").click());
       await crudPage.waitForFunction(
-        (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim()).includes(name),
+        (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
         "UiCrudProj",
         { timeout: TIMEOUT_MS }
       );
@@ -372,7 +373,7 @@ async function main() {
         await delay(150);
       }
       await crudPage.waitForFunction(
-        (name) => [...document.querySelectorAll("#threads-list .project-sidebar-name")].some((n) => n.textContent.trim() === name),
+        (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].some((n) => n.textContent.trim() === name),
         "UiRenamedProj",
         { timeout: TIMEOUT_MS }
       );
@@ -472,7 +473,7 @@ async function main() {
     assert.ok(projectsView.projectRows.includes("VerifyProj"), "VerifyProj row renders in Projects mode");
     assert.match(projectsView.countText, /1 project\b/, `count text = '1 project': ${projectsView.countText}`);
     assert.match(projectsView.verifyBadge, /[1-9]/, `the assigned session is reflected in the project row badge: ${projectsView.verifyBadge}`);
-    assert.ok(projectsView.hasActionsButton, "each project row exposes a visible ⋯ actions button (touch/keyboard reachable)");
+    assert.ok(projectsView.hasActionsButton, "each project header exposes visible action buttons (touch/keyboard reachable)");
     assert.ok(projectsView.projectsButtonActive, "Projects toggle button is active");
     assert.ok(backToSessions.sessionsButtonActive, "Sessions toggle re-activates");
     assert.match(backToSessions.countText, /folder/, `back to Sessions shows folder grouping: ${backToSessions.countText}`);

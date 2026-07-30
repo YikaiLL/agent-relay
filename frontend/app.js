@@ -3593,8 +3593,12 @@ function renderSessionTabs() {
  * Module-level so every entry point shares it — the sidebar row handler and the tab
  * strip previously each carried their own copy of this body.
  */
-async function viewThreadById(threadId, { transition = true, replace = false } = {}) {
-  const update = () => setThreadRoute(threadId, { replace });
+async function viewThreadById(threadId, { transition = true, replace = false, context = null } = {}) {
+  // `context` lets a caller open a session INTO a specific context in one command —
+  // the Projects sidebar needs it, because clicking a session nested under project P
+  // must land in P's tab set even when another project is currently selected. Doing it
+  // as one dispatch keeps state and history ordered; selecting then opening would be two.
+  const update = () => setThreadRoute(threadId, { replace, context });
   if (transition) {
     await runViewTransition(update);
   } else {

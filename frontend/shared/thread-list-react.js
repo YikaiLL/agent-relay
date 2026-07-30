@@ -78,7 +78,10 @@ export function ThreadGroupList({
   includePreview = false,
   onContextThread = null,
   onDeleteProject = null,
+  activeProjectId = null,
+  onContextProject = null,
   onRenameProject = null,
+  onSelectProject = null,
   onResumeThread = null,
   onSelectWorkspace = null,
   onToggleExpandedGroup = null,
@@ -145,7 +148,10 @@ export function ThreadGroupList({
             normalizedSelectedCwd,
             onContextThread,
             onDeleteProject,
+            activeProjectId,
+            onContextProject,
             onRenameProject,
+            onSelectProject,
             onResumeThread,
             onSelectWorkspace,
             onToggleExpandedGroup,
@@ -170,7 +176,10 @@ function ThreadListRow({
   normalizedSelectedCwd,
   onContextThread,
   onDeleteProject,
+  activeProjectId,
+  onContextProject,
   onRenameProject,
+  onSelectProject,
   onResumeThread,
   onSelectWorkspace,
   onToggleExpandedGroup,
@@ -195,7 +204,10 @@ function ThreadListRow({
         isCollapsed: row.isCollapsed,
         normalizedCwd: row.normalizedCwd,
         onDeleteProject,
+        activeProjectId,
+        onContextProject,
         onRenameProject,
+        onSelectProject,
         onSelectWorkspace,
         onToggleGroup,
       })
@@ -337,12 +349,15 @@ function measureScrollMargin(node, scrollElement) {
 // Exported for unit tests: the list itself virtualizes and renders nothing
 // under SSR, so the sentinel guard below cannot be observed through it.
 export function ThreadGroupHeader({
+  activeProjectId = null,
   collapsible,
   group,
   isCollapsed,
   normalizedCwd,
   onDeleteProject,
+  onContextProject = null,
   onRenameProject,
+  onSelectProject = null,
   onSelectWorkspace,
   onToggleGroup,
 }) {
@@ -356,14 +371,74 @@ export function ThreadGroupHeader({
   // <button>s are valid children and there's no header-level click to fight.
   const projectId = group.projectId || null;
   if (projectId && (onRenameProject || onDeleteProject)) {
+    const isActiveProject = Boolean(activeProjectId) && activeProjectId === projectId;
     return h(
       "div",
       {
-        className: "thread-group-header thread-group-header-static thread-group-header-project",
+        className:
+          "thread-group-header thread-group-header-static thread-group-header-project"
+          + (isActiveProject ? " is-active" : ""),
+        "data-project-id": projectId,
         title: headerTitle,
+        // Right-click opens the same project actions the inline buttons expose. The
+        // inline buttons keep it reachable without a mouse; this keeps the mouse path
+        // that the previous project-row sidebar had.
+        onContextMenu: onContextProject
+          ? (event) => {
+              event.preventDefault();
+              onContextProject(projectId, group.label, event.clientX, event.clientY);
+            }
+          : undefined,
       },
       h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
-      h("span", { className: "thread-group-name" }, group.label),
+      // The NAME is the click target rather than the whole header: the header also hosts
+      // action <button>s, and a header-level handler would fight them. Selecting a project
+      // is what tells the tab strip which set a new session belongs to, so it has to be
+      // reachable without opening a session first.
+      onSelectProject
+        ? h(
+            "button",
+            {
+              type: "button",
+              className: "thread-group-name thread-group-name-button",
+              onClick: (event) => {
+                event.stopPropagation();
+                onSelectProject(projectId);
+              },
+            },
+            group.label
+          )
+        : h("span", { className: "thread-group-name" }, group.label),
+      // At-a-glance activity for the project, carried on the group as `summary`. The
+      // nested sessions are right there, but the group can be collapsed and the list
+      // truncates past a limit — the counts must not depend on either.
+      group.summary
+        ? h(
+            "span",
+            { className: "thread-group-badges" },
+            group.summary.working
+              ? h(
+                  "span",
+                  { className: "project-sidebar-badge is-working" },
+                  `${group.summary.working} working`
+                )
+              : null,
+            group.summary.needsInput
+              ? h(
+                  "span",
+                  { className: "project-sidebar-badge is-attention" },
+                  `${group.summary.needsInput} needs input`
+                )
+              : null,
+            !group.summary.working && !group.summary.needsInput
+              ? h(
+                  "span",
+                  { className: "project-sidebar-badge" },
+                  `${group.summary.total || 0} ${group.summary.total === 1 ? "session" : "sessions"}`
+                )
+              : null
+          )
+        : null,
       h(
         "span",
         { className: "thread-group-actions" },
