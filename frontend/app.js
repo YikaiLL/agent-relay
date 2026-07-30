@@ -206,6 +206,7 @@ import {
   createTabWorkspaceStore,
 } from "./shared/tab-workspace-store.js";
 import { browserTabWorkspacePersistence } from "./shared/tab-workspace-prefs.js";
+import { loadRemovedThreadIds, rememberRemovedThreadId } from "./shared/removed-threads.js";
 import {
   loadLastApprovalPolicy,
   loadLastEffort,
@@ -319,12 +320,13 @@ const state = {
   // new-session opener so a normal launch never inherits a stale project.
   pendingProjectAssignment: null,
   threadHistoryScrollTop: 0,
-  // Sessions this client archived/deleted. History entries outlive threads, so
+  // Sessions this browser archived/deleted. History entries outlive threads, so
   // back/forward can land on a `?thread=` that no longer exists; without a tombstone
   // the popstate handler would helpfully re-create a tab for a dead session.
   // Tracked rather than inferred from `state.threads`, which is capped at 120 and
-  // would false-negative a live-but-old session.
-  removedThreadIds: new Set(),
+  // would false-negative a live-but-old session. Restored from storage because the
+  // stale history entries survive a reload too.
+  removedThreadIds: new Set(loadRemovedThreadIds()),
   threadListStore: createThreadListStore(),
   // Per-project open-session tabs. Persistence is browser-local for now; the store
   // takes it as an injected adapter so moving to server-persisted (cross-device)
@@ -1623,10 +1625,16 @@ window.addEventListener("popstate", () => {
   // Back/forward writes viewThreadId directly rather than going through
   // setThreadRoute (it must not push another history entry), so re-open the tab
   // here. Navigating back to a session you had merely CLOSED re-opens it, which keeps
-  // the strip and the transcript agreeing. A session that was archived or deleted is
-  // the exception: re-creating its tab would resurrect a dead one that the removal
-  // just swept.
-  if (!state.removedThreadIds.has(state.viewThreadId)) {
+  // the strip and the transcript agreeing.
+  if (state.removedThreadIds.has(state.viewThreadId)) {
+    // The entry names a session that was archived or deleted. Refusing to create its
+    // tab is not enough — leaving the route pointed at it puts the main area on a dead
+    // session with no tab, the exact mismatch this is meant to prevent. Settle onto
+    // whatever this workspace has focused, or Home when it has nothing, replacing the
+    // dead entry rather than pushing another one.
+    state.viewThreadId = null;
+    syncRouteToCurrentWorkspace({ replace: true });
+  } else {
     openSessionTab(state.viewThreadId);
   }
   if (state.session) {
@@ -2931,6 +2939,7 @@ async function archiveThreadFromContextMenu() {
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
     state.removedThreadIds.add(threadId);
+    rememberRemovedThreadId(threadId);
     state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
     // Archiving the session you were VIEWING has to move the route as well, or the
     // main area keeps rendering a session the strip no longer has a tab for. The
@@ -2998,6 +3007,7 @@ async function deleteThreadFromContextMenu() {
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
     state.removedThreadIds.add(threadId);
+    rememberRemovedThreadId(threadId);
     state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
@@ -3443,17 +3453,15 @@ function renderSessionTabs() {
   sessionTabsRootHandle.render(
     React.createElement(SessionTabStrip, {
       items,
-      // The highlight means "this is the session on screen", so it is derived from
-      // what the main area actually renders — the explicitly viewed thread, else the
-      // relay's active one (an empty route means "showing the active session", which
-      // is what resuming from the sidebar produces).
+      // The highlight means "this session is on screen", and the ONLY thing that puts
+      // a session on screen is the view route: with no `?thread=` the renderer shows
+      // the console home or a project overview, not the active conversation — home
+      // even offers an explicit "Open live conversation" button (render-session.js).
       //
-      // Deliberately no fallback to `workspace.focusedTabId`: that made a tab claim
-      // focus while the main area showed something else entirely.
-      focusedTabId:
-        items.find(
-          (item) => item.threadId === (state.viewThreadId || state.session?.active_thread_id)
-        )?.tabId || null,
+      // So no fallbacks here. Falling back to `workspace.focusedTabId` let a tab claim
+      // focus while the main area showed something else; falling back to
+      // `active_thread_id` did the same on Home and in a project overview.
+      focusedTabId: items.find((item) => item.threadId === state.viewThreadId)?.tabId || null,
       // NOTE on the missing trailing renderSessionTabs() in the navigating paths:
       // viewThreadById defers its route update into runViewTransition. Re-rendering
       // this React root synchronously afterwards makes the browser skip that pending
@@ -3516,13 +3524,13 @@ function renderSessionTabs() {
  * Module-level so every entry point shares it — the sidebar row handler and the tab
  * strip previously each carried their own copy of this body.
  */
-function viewThreadById(threadId, { transition = true } = {}) {
+function viewThreadById(threadId, { transition = true, replace = false } = {}) {
   // Viewing a session is what puts it in the tab strip: the strip records "what I
   // have open", so it has to cover however the user got here (sidebar click, deep
   // link, tab click).
   openSessionTab(threadId);
   const update = () => {
-    setThreadRoute(threadId);
+    setThreadRoute(threadId, { replace });
     if (state.session) {
       renderer.renderSession(state.session);
     }
@@ -3559,15 +3567,15 @@ function focusedThreadIdForCurrentWorkspace() {
  * has focused, clearing it when that workspace is empty. Renders are left to the
  * caller so a navigation's view transition isn't skipped by a trailing re-render.
  */
-function syncRouteToCurrentWorkspace() {
+function syncRouteToCurrentWorkspace({ replace = false } = {}) {
   const nextThreadId = focusedThreadIdForCurrentWorkspace();
   if (nextThreadId === (state.viewThreadId || null)) {
     return;
   }
   if (nextThreadId) {
-    viewThreadById(nextThreadId, { transition: false });
+    viewThreadById(nextThreadId, { transition: false, replace });
   } else {
-    clearThreadRoute();
+    clearThreadRoute({ replace });
   }
 }
 

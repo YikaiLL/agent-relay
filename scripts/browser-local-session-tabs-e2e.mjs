@@ -19,47 +19,43 @@ import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
 const SHOT_DIR = process.env.BROWSER_E2E_SHOT_DIR || "";
 
-// What the main area is actually rendering is `?thread=` when set, otherwise the
-// relay's active session — an empty route means "showing the active one", which is
-// what resuming from the sidebar produces. The strip's highlight must agree with it.
-function coherence(page, relayPort) {
-  return page.evaluate(async (port) => {
-    const response = await fetch(`http://127.0.0.1:${port}/api/session`);
-    const body = await response.json();
-    const activeThreadId = body.data?.active_thread_id || null;
-    const routedThreadId = new URL(window.location.href).searchParams.get("thread");
-    return {
-      routedThreadId,
-      activeThreadId,
-      shownThreadId: routedThreadId || activeThreadId,
-      focusedTabThreadId:
-        document.querySelector(".session-tab.is-focused")?.dataset.threadId || null,
-      tabThreadIds: [...document.querySelectorAll(".session-tab")].map(
-        (tab) => tab.dataset.threadId || ""
-      ),
-    };
-  }, relayPort);
+// The view route is the ONLY thing that puts a session on screen: with no `?thread=`
+// the renderer shows the console home or a project overview, never the active
+// conversation. So coherence is read from the route and the DOM — deliberately NOT
+// from `active_thread_id`, which says nothing about what is displayed.
+function coherence(page) {
+  return page.evaluate(() => ({
+    routedThreadId: new URL(window.location.href).searchParams.get("thread"),
+    mainView: document.querySelector(".chat-shell")?.dataset.view || null,
+    focusedTabThreadId:
+      document.querySelector(".session-tab.is-focused")?.dataset.threadId || null,
+    tabThreadIds: [...document.querySelectorAll(".session-tab")].map(
+      (tab) => tab.dataset.threadId || ""
+    ),
+  }));
 }
 
 function assertCoherent(state, label) {
-  // A routed session must be present in the strip: the route is how a tab is opened,
-  // so a route with no tab means the strip lost track of what is on screen.
-  if (state.routedThreadId && !state.tabThreadIds.includes(state.routedThreadId)) {
-    throw new Error(
-      `${label}: the routed session ${state.routedThreadId} has no tab `
-        + `(tabs: ${JSON.stringify(state.tabThreadIds)})`
-    );
+  const where = `route=${state.routedThreadId} view=${state.mainView} `
+    + `focus=${state.focusedTabThreadId} tabs=${JSON.stringify(state.tabThreadIds)}`;
+
+  if (state.routedThreadId) {
+    // The route is how a tab gets opened, so a routed session with no tab means the
+    // strip lost track of what is on screen.
+    if (!state.tabThreadIds.includes(state.routedThreadId)) {
+      throw new Error(`${label}: the routed session has no tab — ${where}`);
+    }
+    if (state.focusedTabThreadId !== state.routedThreadId) {
+      throw new Error(`${label}: the highlight disagrees with the route — ${where}`);
+    }
+    return;
   }
-  // The highlight must name the session on screen — or nothing, when that session
-  // has no tab in this workspace (e.g. the active thread belongs to another project).
-  const expectedFocus = state.tabThreadIds.includes(state.shownThreadId)
-    ? state.shownThreadId
-    : null;
-  if (state.focusedTabThreadId !== expectedFocus) {
-    throw new Error(
-      `${label}: focused tab ${state.focusedTabThreadId} disagrees with the session on `
-        + `screen ${state.shownThreadId} (expected focus ${expectedFocus})`
-    );
+
+  // No route means Home or a project overview is showing. Nothing is on screen for a
+  // tab to be "current" for, so nothing may be highlighted — including when a relay
+  // session is active, which is exactly where the old active-thread fallback lied.
+  if (state.focusedTabThreadId) {
+    throw new Error(`${label}: a tab claims focus while no session is routed — ${where}`);
   }
 }
 
@@ -273,7 +269,7 @@ async function run() {
     const sessionsTabs = (await tabState(page)).threadIds;
     assert.deepEqual(sessionsTabs, [threadA], "Sessions mode holds exactly the opened session");
 
-    assertCoherent(await coherence(page, relayPort), "sessions mode with one open session");
+    assertCoherent(await coherence(page), "sessions mode with one open session");
 
     await page.click("#threads-view-projects");
     await page.waitForFunction(() => document.querySelectorAll(".session-tab").length === 0, {
@@ -287,7 +283,7 @@ async function run() {
     // The mode switch changed which sessions are "open", so the route had to follow.
     // Leaving it pointed at the Sessions thread would render that transcript under an
     // empty strip — the strip and the main area describing different things.
-    const inProjects = await coherence(page, relayPort);
+    const inProjects = await coherence(page);
     assertCoherent(inProjects, "after switching to Projects");
     assert.equal(
       inProjects.routedThreadId,
@@ -303,7 +299,7 @@ async function run() {
       { timeout: TIMEOUT_MS }
     );
     // Coming back restores that workspace's focused session, route included.
-    const backInSessions = await coherence(page, relayPort);
+    const backInSessions = await coherence(page);
     assertCoherent(backInSessions, "after switching back to Sessions");
     assert.equal(
       backInSessions.routedThreadId,
@@ -340,19 +336,69 @@ async function run() {
 
     await page.goBack({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(800);
-    const afterBackOntoDeleted = await coherence(page, relayPort);
+    const afterBackOntoDeleted = await coherence(page);
     assert.ok(
       !afterBackOntoDeleted.tabThreadIds.includes(threadA),
       `history must not resurrect a deleted session's tab, got `
         + JSON.stringify(afterBackOntoDeleted.tabThreadIds)
     );
+    // Refusing the tab is not enough: the route must not be left pointing at the dead
+    // session either, or the main area shows it with no tab to match.
+    assert.notEqual(
+      afterBackOntoDeleted.routedThreadId,
+      threadA,
+      "the route must not stay on a deleted session"
+    );
+    assertCoherent(afterBackOntoDeleted, "after backing onto a deleted session");
+
     await page.goForward({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(600);
+    const afterForward = await coherence(page);
     assert.ok(
-      !(await coherence(page, relayPort)).tabThreadIds.includes(threadA),
+      !afterForward.tabThreadIds.includes(threadA),
       "forward navigation must not resurrect it either"
     );
+    assertCoherent(afterForward, "after forward navigation");
     await shoot(page, "09-deleted-not-resurrected");
+
+    // --- The tombstone has to survive a reload ---
+    // History entries outlive the page, so an in-memory-only tombstone is empty again
+    // exactly when the stale entries are still in the back stack.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
+    await page.goBack({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(800);
+    const afterReloadBack = await coherence(page);
+    assert.ok(
+      !afterReloadBack.tabThreadIds.includes(threadA),
+      `a reload must not lose the tombstone, got ${JSON.stringify(afterReloadBack.tabThreadIds)}`
+    );
+    assertCoherent(afterReloadBack, "after delete → reload → back");
+
+    // --- Home shows no session, so no tab may be highlighted ---
+    // Even with a live relay session: an empty route means Home, not the active
+    // conversation, which is where the old active-thread fallback lied.
+    await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
+    await openThreadDrawer(page);
+    await page.click(`button.conversation-item[data-thread-id="${threadB}"]`);
+    await page.waitForFunction(
+      (id) => new URL(window.location.href).searchParams.get("thread") === id,
+      threadB,
+      { timeout: TIMEOUT_MS }
+    );
+    assertCoherent(await coherence(page), "viewing a session before going Home");
+
+    await page.click("#go-console-home-sidebar");
+    await page.waitForFunction(
+      () => !new URL(window.location.href).searchParams.get("thread"),
+      { timeout: TIMEOUT_MS }
+    );
+    await page.waitForTimeout(400);
+    const atHome = await coherence(page);
+    assert.ok(atHome.tabThreadIds.length > 0, "the strip still lists the open sessions at Home");
+    assertCoherent(atHome, "at Home with an open session");
+    await shoot(page, "10-home-no-focus");
 
     assert.deepEqual(pageErrors, [], `no page errors: ${pageErrors.join("\n")}`);
     console.log("local session tabs e2e: OK");
