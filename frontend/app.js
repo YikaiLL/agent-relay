@@ -199,7 +199,7 @@ import {
 import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
-import { layoutThreadIds } from "./shared/tab-layout.js";
+import { focusedTab, layoutThreadIds } from "./shared/tab-layout.js";
 import {
   NO_PROJECT_KEY,
   SESSIONS_KEY,
@@ -319,6 +319,12 @@ const state = {
   // new-session opener so a normal launch never inherits a stale project.
   pendingProjectAssignment: null,
   threadHistoryScrollTop: 0,
+  // Sessions this client archived/deleted. History entries outlive threads, so
+  // back/forward can land on a `?thread=` that no longer exists; without a tombstone
+  // the popstate handler would helpfully re-create a tab for a dead session.
+  // Tracked rather than inferred from `state.threads`, which is capped at 120 and
+  // would false-negative a live-but-old session.
+  removedThreadIds: new Set(),
   threadListStore: createThreadListStore(),
   // Per-project open-session tabs. Persistence is browser-local for now; the store
   // takes it as an injected adapter so moving to server-persisted (cross-device)
@@ -1239,6 +1245,13 @@ function setThreadViewMode(mode) {
     projectsStore.syncToRevision(state.session?.projects_revision || 0);
     ensureActiveProjectSelected();
   }
+  // Each mode owns its own tab workspace, so switching mode switches which sessions
+  // are "open" — and the route has to follow. Without this the main area kept showing
+  // the previous mode's session while the strip already showed the target mode's tabs
+  // (or none), leaving the transcript and the strip describing different things.
+  // Runs BEFORE the renders below, and with the transition disabled, so those renders
+  // can't skip a pending route update.
+  syncRouteToCurrentWorkspace();
   renderThreads();
   // Switch the main area too: entering Projects shows the card overview; leaving it
   // returns to console/conversation. renderSession derives the view from the mode.
@@ -1609,10 +1622,13 @@ window.addEventListener("popstate", () => {
   state.viewThreadId = readThreadIdFromUrl();
   // Back/forward writes viewThreadId directly rather than going through
   // setThreadRoute (it must not push another history entry), so re-open the tab
-  // here. Navigating back to a session you had closed re-opens it, which keeps the
-  // strip and the transcript agreeing — the alternative, showing a session with no
-  // tab, contradicts the strip's whole premise.
-  openSessionTab(state.viewThreadId);
+  // here. Navigating back to a session you had merely CLOSED re-opens it, which keeps
+  // the strip and the transcript agreeing. A session that was archived or deleted is
+  // the exception: re-creating its tab would resurrect a dead one that the removal
+  // just swept.
+  if (!state.removedThreadIds.has(state.viewThreadId)) {
+    openSessionTab(state.viewThreadId);
+  }
   if (state.session) {
     renderSession(state.session);
   }
@@ -2914,7 +2930,14 @@ async function archiveThreadFromContextMenu() {
 
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
+    state.removedThreadIds.add(threadId);
     state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
+    // Archiving the session you were VIEWING has to move the route as well, or the
+    // main area keeps rendering a session the strip no longer has a tab for. The
+    // permanent-delete path below does this via its own fallback logic.
+    if (threadId === state.viewThreadId) {
+      syncRouteToCurrentWorkspace();
+    }
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
     await loadSession("post-archive refresh");
@@ -2974,6 +2997,7 @@ async function deleteThreadFromContextMenu() {
 
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
+    state.removedThreadIds.add(threadId);
     state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
@@ -3419,10 +3443,17 @@ function renderSessionTabs() {
   sessionTabsRootHandle.render(
     React.createElement(SessionTabStrip, {
       items,
-      // The focused tab follows the thread actually being viewed, so the strip can
-      // never disagree with the transcript below it.
-      focusedTabId: items.find((item) => item.threadId === state.viewThreadId)?.tabId
-        || workspace.focusedTabId,
+      // The highlight means "this is the session on screen", so it is derived from
+      // what the main area actually renders — the explicitly viewed thread, else the
+      // relay's active one (an empty route means "showing the active session", which
+      // is what resuming from the sidebar produces).
+      //
+      // Deliberately no fallback to `workspace.focusedTabId`: that made a tab claim
+      // focus while the main area showed something else entirely.
+      focusedTabId:
+        items.find(
+          (item) => item.threadId === (state.viewThreadId || state.session?.active_thread_id)
+        )?.tabId || null,
       // NOTE on the missing trailing renderSessionTabs() in the navigating paths:
       // viewThreadById defers its route update into runViewTransition. Re-rendering
       // this React root synchronously afterwards makes the browser skip that pending
@@ -3485,22 +3516,59 @@ function renderSessionTabs() {
  * Module-level so every entry point shares it — the sidebar row handler and the tab
  * strip previously each carried their own copy of this body.
  */
-function viewThreadById(threadId) {
+function viewThreadById(threadId, { transition = true } = {}) {
   // Viewing a session is what puts it in the tab strip: the strip records "what I
   // have open", so it has to cover however the user got here (sidebar click, deep
   // link, tab click).
   openSessionTab(threadId);
-  void runViewTransition(() => {
+  const update = () => {
     setThreadRoute(threadId);
     if (state.session) {
       renderer.renderSession(state.session);
     }
     renderer.syncThreadSelection();
-  });
+  };
+  // `transition: false` for callers that must keep rendering afterwards. A pending
+  // view transition is skipped by any synchronous re-render, and its callback — the
+  // thing that writes the route — then never runs, silently desyncing the URL.
+  if (transition) {
+    void runViewTransition(update);
+  } else {
+    update();
+  }
   // Fetch the viewed thread's transcript so it renders read-only (instead of
   // falling back to the console home). No-op / clears the projection when the
   // thread is the active one.
   void loadViewOnlyTranscript(threadId);
+}
+
+/**
+ * The session the CURRENT workspace considers focused, or null when it has no tabs.
+ * Used to keep the route and the main area in step with whichever workspace is in
+ * scope — switching mode or removing a session must not leave the transcript showing
+ * something the strip no longer holds.
+ */
+function focusedThreadIdForCurrentWorkspace() {
+  const workspace = state.tabWorkspaceStore.getState().ensureWorkspace(currentTabProjectId());
+  const focused = focusedTab(workspace);
+  return focused ? layoutThreadIds(focused.layout)[0] || null : null;
+}
+
+/**
+ * Point the route (and therefore the main area) at whatever the current workspace
+ * has focused, clearing it when that workspace is empty. Renders are left to the
+ * caller so a navigation's view transition isn't skipped by a trailing re-render.
+ */
+function syncRouteToCurrentWorkspace() {
+  const nextThreadId = focusedThreadIdForCurrentWorkspace();
+  if (nextThreadId === (state.viewThreadId || null)) {
+    return;
+  }
+  if (nextThreadId) {
+    viewThreadById(nextThreadId, { transition: false });
+  } else {
+    clearThreadRoute();
+  }
 }
 
 /** Open (or focus) a tab for a session in the current project's workspace. */
