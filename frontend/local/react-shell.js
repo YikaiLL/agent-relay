@@ -622,6 +622,10 @@ function ChatShell() {
     "main",
     { className: "chat-shell", "data-view": "console" },
     h(ChatHeader),
+    // Tab strip for the active project's open sessions. Filled by
+    // renderSessionTabs() through its own React sub-root, like #client-log-root —
+    // the shell is rendered once, so anything data-driven needs its own root.
+    h("div", { className: "session-tab-strip-mount", id: "session-tab-strip-mount" }),
     h(OverviewStrip),
     // Projects "card overview" main-area view. Filled by renderProjectOverview();
     // shown only when data-view="project-overview" (CSS-gated like console/conversation).

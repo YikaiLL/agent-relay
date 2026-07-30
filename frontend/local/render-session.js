@@ -235,6 +235,9 @@ export function createSessionRenderer({
   fetchReviews,
   fetchWorkflows,
   viewThread,
+  // Re-render the open-session tab strip. Injected (rather than imported) because
+  // it owns its own React sub-root over in app.js, same as the client log.
+  renderSessionTabs = () => {},
   enterProjectOverview,
   startProjectAgent,
   openProjectContextMenu,
@@ -1397,6 +1400,9 @@ export function createSessionRenderer({
   }
 
   function renderThreads() {
+    // The session tab strip shows the same per-thread activity as this list, so it
+    // refreshes on the same beat — otherwise a tab's dot would lag the sidebar's.
+    renderSessionTabs();
     const threadListUi = readThreadListUi(state.threadListStore);
     const selectedCwd = canonicalizeWorkspace(threadListUi.selectedCwd || state.selectedCwd);
     const viewedThreadId = state.viewThreadId || null;

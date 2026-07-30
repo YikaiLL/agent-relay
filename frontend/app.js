@@ -177,9 +177,12 @@ import {
   threadIsBusyForFork,
 } from "./shared/fork-fields.js";
 import {
+  buildReviewingThreadSet,
   isReviewInProgressForThread,
   isTerminalReviewStatus,
 } from "./shared/review-state.js";
+import { buildThreadActivityMap } from "./shared/thread-activity.js";
+import { threadAttention } from "./shared/thread-attention.js";
 import { isWorkflowInProgressForThread } from "./shared/workflow-state.js";
 import {
   buildViewOnlyPin,
@@ -195,6 +198,10 @@ import {
 } from "./shared/viewed-thread-refresh.js";
 import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
+import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
+import { layoutThreadIds } from "./shared/tab-layout.js";
+import { createTabWorkspaceStore } from "./shared/tab-workspace-store.js";
+import { browserTabWorkspacePersistence } from "./shared/tab-workspace-prefs.js";
 import {
   loadLastApprovalPolicy,
   loadLastEffort,
@@ -309,6 +316,12 @@ const state = {
   pendingProjectAssignment: null,
   threadHistoryScrollTop: 0,
   threadListStore: createThreadListStore(),
+  // Per-project open-session tabs. Persistence is browser-local for now; the store
+  // takes it as an injected adapter so moving to server-persisted (cross-device)
+  // needs no change here or in the UI.
+  tabWorkspaceStore: createTabWorkspaceStore({
+    persistence: browserTabWorkspacePersistence,
+  }),
   localUiStore: createLocalUiStore(),
   streamReconnectTimer: null,
   sessionPollTimer: null,
@@ -701,23 +714,11 @@ const renderer = createSessionRenderer({
   fetchWorkflows() {
     return getWorkflows(apiFetch);
   },
-  // View-only navigation: just update the URL/viewThreadId without calling the
-  // backend resume_session, which is mutating (it moves the relay's single
-  // active thread for EVERY connected client). Any non-active thread renders
-  // from the client-local pin; an idle viewed thread can be sent to directly.
-  viewThread(threadId) {
-    void runViewTransition(() => {
-      setThreadRoute(threadId);
-      if (state.session) {
-        renderer.renderSession(state.session);
-      }
-      renderer.syncThreadSelection();
-    });
-    // Fetch the viewed thread's transcript so it renders read-only (instead of
-    // falling back to the console home). No-op / clears the projection when the
-    // thread is the active one.
-    void loadViewOnlyTranscript(threadId);
-  },
+  // Hoisted module-level declarations below. `viewThread` is shared rather than a
+  // method here because several call sites (sidebar rows, tab strip) need the one
+  // implementation — they used to each inline a copy of its body.
+  viewThread: viewThreadById,
+  renderSessionTabs,
   // Projects master-detail: select a project and show its card overview in the main
   // area. Clears any open session so the overview (not a transcript) is what renders;
   // renderSession derives data-view="project-overview" from the selected project.
@@ -2019,14 +2020,10 @@ transcript.addEventListener("click", (event) => {
   if (openThreadButton) {
     const threadId = openThreadButton.dataset.openThreadId;
     if (threadId) {
-      void runViewTransition(() => {
-        setThreadRoute(threadId);
-        if (state.session) {
-          renderSession(state.session);
-        }
-        syncThreadSelection();
-      });
-      void loadViewOnlyTranscript(threadId);
+      // Was a line-for-line copy of controller.viewThread. Routed through the one
+      // implementation so every way of opening a session shares its behaviour —
+      // including landing in the tab strip.
+      viewThreadById(threadId);
     }
     return;
   }
@@ -2142,6 +2139,9 @@ async function boot() {
 
   await loadSession("initial boot");
   await loadThreads("initial boot");
+  // A `?thread=` deep link sets viewThreadId directly, without going through
+  // viewThread, so give it a tab once the thread list is known.
+  openSessionTab(state.viewThreadId);
   connectSessionStream();
   scheduleThreadsPoll();
 }
@@ -2903,6 +2903,8 @@ async function archiveThreadFromContextMenu() {
     }
 
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
+    // A tab pointing at a deleted session is dead — drop it before re-rendering.
+    state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
     await loadSession("post-archive refresh");
@@ -2961,6 +2963,8 @@ async function deleteThreadFromContextMenu() {
     }
 
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
+    // A tab pointing at a deleted session is dead — drop it before re-rendering.
+    state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
     await loadThreads("post-delete refresh");
@@ -3240,6 +3244,11 @@ function setThreadRoute(threadId, options = {}) {
     window.history.pushState({}, "", next);
   }
   state.viewThreadId = nextThreadId;
+  // The single choke point for "which session am I viewing", so it's also the right
+  // place to guarantee that session has a tab — covering starting a session, a
+  // fallback route after a delete, and anything else that navigates without going
+  // through viewThread. Clearing the route (null) opens nothing.
+  openSessionTab(nextThreadId);
   if (threadChanged) {
     clearComposerImageAttachments();
   }
@@ -3327,6 +3336,152 @@ function renderClientLogLines(lines) {
   flushSync(() => {
     clientLogRootHandle.render(React.createElement(ClientLog, { lines }));
   });
+}
+
+// ── Session tabs ────────────────────────────────────────────────────────────
+// The strip lives in the static shell, so like #client-log-root it needs its own
+// React sub-root to be data-driven. Tabs are scoped to the active project; with no
+// project selected they fall back to a shared bucket so Sessions mode keeps tabs.
+//
+// Focusing a tab goes through `viewThread`, the view-only path. It must NOT call
+// resume_session, which moves the relay's single active thread for EVERY connected
+// client — a tab is a per-client view, not a claim on the relay.
+let sessionTabsRootHandle = null;
+let sessionTabsRootElement = null;
+
+function currentTabProjectId() {
+  return readActiveProjectId(state.threadListStore);
+}
+
+function resolveTabThread(threadId) {
+  const thread = (state.threads || []).find((entry) => entry.id === threadId);
+  if (!thread) {
+    // A tab can outlive its thread (deleted elsewhere, or a stale stored
+    // workspace); label it rather than rendering a blank tab.
+    return { title: shortId(threadId), tooltip: threadId };
+  }
+  return {
+    title: thread.name || thread.preview || shortId(thread.id),
+    tooltip: thread.cwd || thread.name || thread.id,
+  };
+}
+
+function renderSessionTabs() {
+  const mount = document.getElementById("session-tab-strip-mount");
+  if (!mount) {
+    return;
+  }
+
+  if (sessionTabsRootElement !== mount) {
+    sessionTabsRootHandle?.unmount();
+    sessionTabsRootHandle = createRoot(mount);
+    sessionTabsRootElement = mount;
+  }
+
+  const projectId = currentTabProjectId();
+  const tabs = state.tabWorkspaceStore.getState();
+  // A freshly started session becomes the relay's active thread WITHOUT ever
+  // setting `viewThreadId`, so it would otherwise never appear in the strip. Give
+  // it a tab here — but only in that exact case (no thread explicitly viewed).
+  //
+  // Deliberately NOT "whatever is shown gets a tab": route updates run inside
+  // runViewTransition, which defers in browsers that support startViewTransition.
+  // Closing the focused tab would then still read the closed thread as "shown" and
+  // resurrect the tab the user just dismissed.
+  const workspace = !state.viewThreadId && state.session?.active_thread_id
+    ? tabs.openThread(projectId, state.session.active_thread_id)
+    : tabs.ensureWorkspace(projectId);
+  const items = buildSessionTabItems({
+    workspace,
+    layoutThreadIds,
+    resolveThread: resolveTabThread,
+    threadActivity: buildThreadActivityMap(state.session),
+    threadAttention: threadAttention.snapshotMap(),
+    threadReviewing: buildReviewingThreadSet(state.session, reviewsCache.current()),
+  });
+
+  sessionTabsRootHandle.render(
+    React.createElement(SessionTabStrip, {
+      items,
+      // The focused tab follows the thread actually being viewed, so the strip can
+      // never disagree with the transcript below it.
+      focusedTabId: items.find((item) => item.threadId === state.viewThreadId)?.tabId
+        || workspace.focusedTabId,
+      onFocus(tabId) {
+        const item = items.find((entry) => entry.tabId === tabId);
+        tabs.focusTabId(projectId, tabId);
+        if (item?.threadId) {
+          viewThreadById(item.threadId);
+        }
+        renderSessionTabs();
+      },
+      onClose(tabId) {
+        const item = items.find((entry) => entry.tabId === tabId);
+        const next = tabs.closeTabId(projectId, tabId);
+        // Closing the tab you were viewing should land on the neighbour the model
+        // picked, not leave the transcript showing a closed session.
+        if (item?.threadId === state.viewThreadId) {
+          const nextThreadId = next.focusedTabId
+            ? layoutThreadIds(next.tabs.find((tab) => tab.id === next.focusedTabId)?.layout)[0]
+            : null;
+          if (nextThreadId) {
+            viewThreadById(nextThreadId);
+          } else {
+            clearThreadRoute();
+            if (state.session) {
+              renderSession(state.session);
+            }
+          }
+        }
+        renderSessionTabs();
+      },
+      onTogglePin(tabId, pinned) {
+        tabs.setPinned(projectId, tabId, pinned);
+        renderSessionTabs();
+      },
+      onMove(tabId, toIndex) {
+        tabs.moveTabId(projectId, tabId, toIndex);
+        renderSessionTabs();
+      },
+      emptyMessage: "No open sessions. Pick one from the sidebar.",
+    })
+  );
+}
+
+/**
+ * View-only navigation: update the URL/viewThreadId WITHOUT calling the backend
+ * resume_session, which is mutating (it moves the relay's single active thread for
+ * EVERY connected client). Any non-active thread renders from the client-local pin;
+ * an idle viewed thread can be sent to directly.
+ *
+ * Module-level so every entry point shares it — the sidebar row handler and the tab
+ * strip previously each carried their own copy of this body.
+ */
+function viewThreadById(threadId) {
+  // Viewing a session is what puts it in the tab strip: the strip records "what I
+  // have open", so it has to cover however the user got here (sidebar click, deep
+  // link, tab click).
+  openSessionTab(threadId);
+  void runViewTransition(() => {
+    setThreadRoute(threadId);
+    if (state.session) {
+      renderer.renderSession(state.session);
+    }
+    renderer.syncThreadSelection();
+  });
+  // Fetch the viewed thread's transcript so it renders read-only (instead of
+  // falling back to the console home). No-op / clears the projection when the
+  // thread is the active one.
+  void loadViewOnlyTranscript(threadId);
+}
+
+/** Open (or focus) a tab for a session in the current project's workspace. */
+function openSessionTab(threadId) {
+  if (!threadId) {
+    return;
+  }
+  state.tabWorkspaceStore.getState().openThread(currentTabProjectId(), threadId);
+  renderSessionTabs();
 }
 
 function escapeHtml(value) {

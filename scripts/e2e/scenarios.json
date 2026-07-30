@@ -17,6 +17,7 @@
       "local-thread-groups",
       "local-projects-toggle",
       "local-shell-redesign",
+      "local-session-tabs",
       "local-rail-toggle-align",
       "local-permission-modes"
     ],
@@ -38,6 +39,7 @@
       "local-thread-groups",
       "local-projects-toggle",
       "local-shell-redesign",
+      "local-session-tabs",
       "local-rail-toggle-align",
       "local-delete",
       "local-permission-modes"
@@ -263,6 +265,19 @@
         "project-actions-menu",
         "sidebar-collapse-expand",
         "host-status"
+      ]
+    },
+    "local-session-tabs": {
+      "script": "browser-local-session-tabs-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "session-tabs",
+        "tab-focus-switch",
+        "tab-pin",
+        "tab-close",
+        "tab-persistence"
       ]
     },
     "local-rail-toggle-align": {

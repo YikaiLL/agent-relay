@@ -213,3 +213,38 @@ export function focusedTab(workspace) {
 export function openThreadIds(workspace) {
   return (workspace?.tabs || []).flatMap((tab) => layoutThreadIds(tab.layout));
 }
+
+/**
+ * Structural equality, for change detection.
+ *
+ * Reference equality is useless here: every operation normalizes through
+ * `createTabWorkspace`, so a no-op still yields a fresh object. Callers that
+ * persist or re-render on change need to know whether anything actually moved.
+ */
+export function sameWorkspace(left, right) {
+  if (left === right) {
+    return true;
+  }
+  const a = left || {};
+  const b = right || {};
+  if ((a.focusedTabId || null) !== (b.focusedTabId || null)) {
+    return false;
+  }
+
+  const aTabs = a.tabs || [];
+  const bTabs = b.tabs || [];
+  if (aTabs.length !== bTabs.length) {
+    return false;
+  }
+
+  return aTabs.every((tab, index) => {
+    const other = bTabs[index];
+    return (
+      tab.id === other.id
+      && Boolean(tab.pinned) === Boolean(other.pinned)
+      // Layout trees are a handful of nodes; a serialized compare keeps this honest
+      // about nested splits without hand-rolling a tree walk.
+      && JSON.stringify(tab.layout) === JSON.stringify(other.layout)
+    );
+  });
+}
