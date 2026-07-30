@@ -1996,11 +1996,12 @@ function RemoteSidebar({
               "button",
               {
                 type: "button",
-                className: "secondary-button projects-create-button",
+                className: "start-session-button",
                 id: "remote-projects-create-button",
                 onClick: () => onCreateProject(),
               },
-              "+ New project"
+              h("span", { className: "inline-icon", "aria-hidden": "true" }, h(RemotePlusIcon)),
+              h("span", null, "New project")
             )
           )
         : null,
@@ -2010,8 +2011,9 @@ function RemoteSidebar({
         h(ThreadGroupList, {
           activeThreadId: threadsModel.activeThreadId,
           collapsedGroupCwds: threadListUi?.collapsedGroupCwds || new Set(),
-          // Sessions (cwd) groups collapse; Project groups render header actions instead.
-          collapsible: threadViewMode !== "projects",
+          // Both group kinds fold away — a project header carries its collapse
+          // chevron alongside the rename/delete actions.
+          collapsible: true,
           emptyMessage: threadsModel.emptyMessage,
           expandedGroupCwds: threadListUi?.expandedGroupCwds || new Set(),
           formatThreadMeta(thread) {
@@ -2047,6 +2049,29 @@ function RemoteSidebar({
       "aria-label": "Resize navigation panel",
       tabIndex: 0,
     })
+  );
+}
+
+// Geometry copied from PLUS_SVG in ../svg.js so "New project" is pixel-identical
+// to local's. Re-declared as a React element rather than imported, because the
+// shared constant is a markup string and this surface renders zero
+// dangerouslySetInnerHTML — worth keeping that way for one icon.
+function RemotePlusIcon() {
+  return h(
+    "svg",
+    {
+      "aria-hidden": "true",
+      fill: "none",
+      height: "14",
+      viewBox: "0 0 24 24",
+      width: "14",
+      stroke: "currentColor",
+      strokeWidth: "2",
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+    },
+    h("path", { d: "M5 12h14" }),
+    h("path", { d: "M12 5v14" })
   );
 }
 

@@ -25,7 +25,7 @@ import { detectDeferredThreadPromotion } from "../../shared/thread-promotion.js"
 import { resolveOutgoingEffort } from "../../shared/reasoning-efforts.js";
 import { providerLabel } from "../../shared/provider-labels.js";
 import { forkFieldsToPayload } from "../../shared/fork-fields.js";
-import { buildNavigationThreadGroups, findLatestThread } from "../../shared/thread-groups.js";
+import { buildNavigationThreadGroups } from "../../shared/thread-groups.js";
 import { createThreadListQueryOptions } from "../../shared/thread-queries.js";
 import { readThreadListUi } from "../../shared/thread-list-store.js";
 import { shouldRenderThreadListLoadingPlaceholder } from "../../shared/thread-list-state.js";
@@ -398,29 +398,6 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  async function resumeLatestSession() {
-    const cwd = cwdInput.value.trim();
-
-    if (cwd && cwd !== state.selectedCwd) {
-      setSelectedCwd(cwd);
-      await loadThreads("continue latest");
-    } else if (!state.threads.length) {
-      await loadThreads("continue latest");
-    }
-
-    const latestThread = findLatestThread(state.threads, cwd || state.selectedCwd);
-    if (!latestThread) {
-      logLine(
-        cwd || state.selectedCwd
-          ? "No recent sessions were found for this workspace."
-          : "No recent sessions were found."
-      );
-      return;
-    }
-
-    await runViewTransition(() => setThreadRoute(latestThread.id));
-  }
-
   async function sendMessage(textOverride, threadId, images = []) {
     // Accept an explicit, already-captured message (the composer captures the draft
     // at submit time so a later edit can't change what is sent). Fall back to the
@@ -744,7 +721,6 @@ export function createLifecycleController(ctx) {
     forkSession,
     resumeSession,
     updateSessionSettings,
-    resumeLatestSession,
     sendMessage,
     requestReview,
     startWorkflow,

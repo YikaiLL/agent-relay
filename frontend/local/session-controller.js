@@ -6,7 +6,6 @@ import {
   modelInput,
   openLaunchSettingsButton,
   providerInput,
-  resumeLatestButton,
   saveAllowedRootsButton,
   sandboxInput,
   startEffortInput,
@@ -44,7 +43,6 @@ export function createSessionController({
     [
       loadDirectoryButton,
       startSessionButton,
-      resumeLatestButton,
       openLaunchSettingsButton,
       cwdInput,
       startPromptInput,
@@ -183,7 +181,6 @@ export function createSessionController({
     loadThreads: controller.loadThreads,
     maybeLoadOlderTranscript: controller.maybeLoadOlderTranscript,
     forkSession: controller.forkSession,
-    resumeLatestSession: controller.resumeLatestSession,
     resumeSession: controller.resumeSession,
     revokeOtherDevices: controller.revokeOtherDevices,
     revokePairedDevice: controller.revokePairedDevice,

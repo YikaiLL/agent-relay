@@ -465,22 +465,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--text-primary);
 }
 
-.icon-rail-button.is-active {
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-}
-
-.icon-rail-button.is-active::before {
-  content: "";
-  position: absolute;
-  left: -12px;
-  top: 12px;
-  bottom: 12px;
-  width: 3px;
-  border-radius: 3px;
-  background: var(--accent);
-}
-
 .icon-rail-spacer {
   flex: 1;
 }
@@ -899,10 +883,6 @@ input:focus, textarea:focus, select:focus {
   gap: 12px;
 }
 
-.sidebar-home-button {
-  width: 100%;
-}
-
 /* Sessions / Projects grouping toggle */
 .thread-view-toggle {
   display: inline-flex;
@@ -988,6 +968,10 @@ input:focus, textarea:focus, select:focus {
   justify-content: flex-start;
   gap: 10px;
   color: var(--text-primary);
+  /* A cwd header IS a <button>, so it inherits the UA's text-align: center and
+     centred its label — while a project header (a <div>) sat left. Now that both
+     kinds carry a collapse chevron they read as siblings, so the mismatch shows. */
+  text-align: left;
 }
 
 .thread-group-header:hover,
@@ -1085,6 +1069,39 @@ input:focus, textarea:focus, select:focus {
 
 .thread-group.is-collapsed .thread-group-chevron {
   transform: rotate(-45deg);
+}
+
+/* The collapse control on a PROJECT header. That header is a <div> (it hosts the
+   rename/delete buttons), so the chevron carries the button semantics and
+   aria-expanded. Wraps the plain .thread-group-chevron span so the triangle keeps
+   its own border-drawn styling instead of fighting the base button rule. */
+.thread-group-header-project.is-clickable {
+  cursor: pointer;
+}
+
+/* justify-content is flex-END, not center: the button is widened to a usable tap
+   target, but the chevron inside has to sit flush with the row's right edge — the
+   same place the bare `margin-left: auto` chevron lands on a cwd header. Centring
+   it left ~6px of dead space and read as "not quite right-aligned". */
+.thread-group-chevron-button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 20px;
+  height: 20px;
+  margin-left: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.thread-group-chevron-button:hover {
+  background: transparent;
+}
+
+.thread-group-chevron-button .thread-group-chevron {
+  margin-left: 0;
 }
 
 .thread-group-show-more {
@@ -1331,34 +1348,16 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-tertiary);
 }
 
-/* Projects toolbar — a single prominent "New project" action, not an empty box. */
+/* Projects toolbar — a single prominent "New project" action, not an empty box.
+   The button is a plain .start-session-button (the shared PRIMARY archetype), so
+   it is pixel-identical to "New session"; the two only ever differ by label. It
+   used to carry a .projects-create-button.projects-create-button override
+   (12px/600/9px-12px/r-md/shadow) that opted out of the button system above.
+   Padding is 0 to match .launch-panel, so switching Sessions↔Projects doesn't
+   nudge the thread list. */
 .projects-toolbar {
   display: block;
-  padding: 2px 0 4px;
-}
-
-.projects-create-button.projects-create-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  width: 100%;
-  padding: 9px 12px;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-strong);
-  border-radius: var(--r-md);
-  border: 1px solid transparent;
-  color: var(--accent-on);
-  background: var(--accent);
-  box-shadow: var(--shadow-1);
-  transition: filter 0.12s ease, transform 0.06s ease, box-shadow 0.12s ease;
-}
-.projects-create-button.projects-create-button:hover {
-  filter: brightness(1.08);
-  box-shadow: var(--shadow-2);
-}
-.projects-create-button.projects-create-button:active {
-  transform: translateY(1px);
+  padding: 0;
 }
 
 /* ===== Projects-mode sidebar: a list of project rows (no sessions inline) ===== */
@@ -2770,10 +2769,6 @@ input:focus, textarea:focus, select:focus {
   height: auto;
 }
 
-.app-shell[data-view="conversation"] .launch-panel {
-  display: none;
-}
-
 .app-shell[data-view="conversation"] .sidebar {
   gap: 12px;
   overflow-y: hidden;
@@ -3869,9 +3864,6 @@ input:focus, textarea:focus, select:focus {
 }
 .sidebar[data-thread-view="sessions"] #projects-toolbar {
   display: none;
-}
-.projects-create-button {
-  width: 100%;
 }
 
 /* Settings modal: a definite width (not fit-content) so long log/audit content

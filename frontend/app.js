@@ -17,7 +17,6 @@ import {
   closeSessionDetailsModalButton,
   closeSettingsModalButton,
   settingsModal,
-  iconRailHomeButton,
   iconRailSettingsButton,
   composerAttachments,
   connectionForm,
@@ -32,7 +31,6 @@ import {
   forkSessionDialogRoot,
   forkThreadButton,
   goConsoleHomeButton,
-  goConsoleHomeSidebarButton,
   launchStartSessionDialog,
   launchSettingsModal,
   loadDirectoryButton,
@@ -52,7 +50,6 @@ import {
   pendingActionBanner,
   pendingPairingsList,
   providerInput,
-  resumeLatestButton,
   sandboxInput,
   saveAllowedRootsButton,
   sendButton,
@@ -1226,7 +1223,6 @@ const {
   forkSession,
   loadSession,
   loadThreads,
-  resumeLatestSession,
   resumeSession,
   revokeOtherDevices,
   revokePairedDevice,
@@ -1703,19 +1699,13 @@ allowedRootsForm?.addEventListener("submit", (event) => {
 });
 
 // Exit the current session back to the list/overview. Bound to the in-conversation
-// header back arrow, the legacy sidebar back button, and the icon-rail home (folder).
+// header back arrow. A collapsed nav panel comes back via the header's
+// #toggle-left-panel (⌘B), which is what the icon-rail folder used to cover.
 function goConsoleHome() {
   void clearThreadRoute();
 }
 
 goConsoleHomeButton?.addEventListener("click", goConsoleHome);
-goConsoleHomeSidebarButton?.addEventListener("click", goConsoleHome);
-// The icon rail is always visible, so its folder is the reliable way to bring the
-// nav panel back after it's been collapsed: expand the sidebar, then go home.
-iconRailHomeButton?.addEventListener("click", () => {
-  leftPanelControl.open();
-  goConsoleHome();
-});
 
 threadsRefreshButton.addEventListener("click", () => {
   void loadThreads("manual refresh");
@@ -1782,10 +1772,6 @@ directoryForm?.addEventListener("submit", (event) => {
   void clearThreadRoute();
   setSelectedCwd(cwdInput.value.trim());
   void loadThreads("directory change");
-});
-
-resumeLatestButton?.addEventListener("click", () => {
-  void resumeLatestSession();
 });
 
 // A plain new-session opener (launcher, header compose, empty-state CTA) resets any

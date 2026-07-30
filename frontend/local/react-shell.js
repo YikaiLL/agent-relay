@@ -4,14 +4,13 @@ import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
-import { PLUS_SVG, ARROW_RETURN_SVG, CHEVRON_RIGHT_SVG, SETTINGS_SVG } from "../svg.js";
+import { PLUS_SVG, CHEVRON_RIGHT_SVG, SETTINGS_SVG } from "../svg.js";
 
 const h = React.createElement;
 
-// Far-left 64px icon rail: brand logo (top), a Projects/home button (middle,
-// gets `is-active`), and a Settings gear (bottom). The rail lives OUTSIDE the
-// .app-shell grid (in .local-frame) so the grid math is untouched. Home + gear
-// are wired imperatively in app.js by id (#icon-rail-home / #icon-rail-settings).
+// Far-left 64px icon rail: brand logo (top) and a Settings gear (bottom). The
+// rail lives OUTSIDE the .app-shell grid (in .local-frame) so the grid math is
+// untouched. The gear is wired imperatively in app.js by id (#icon-rail-settings).
 function IconRail() {
   return h(
     "nav",
@@ -23,17 +22,6 @@ function IconRail() {
       width: 30,
       height: 30,
     }),
-    h(
-      "button",
-      {
-        className: "icon-rail-button is-active",
-        id: "icon-rail-home",
-        type: "button",
-        title: "Projects",
-        "aria-label": "Projects",
-      },
-      h(FolderIcon)
-    ),
     h("div", { className: "icon-rail-spacer" }),
     h(
       "button",
@@ -46,14 +34,6 @@ function IconRail() {
       },
       h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: SETTINGS_SVG } })
     )
-  );
-}
-
-function FolderIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", width: "20", height: "20", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.7", strokeLinecap: "round", strokeLinejoin: "round" },
-    h("path", { d: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" })
   );
 }
 
@@ -106,16 +86,17 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
         "Projects"
       )
     ),
-    // Mode-gated primary actions: Sessions → New session / Continue latest;
-    // Projects → + New project. Both stay mounted (ids intact); CSS hides the
-    // inactive one via the sidebar's data-thread-view attribute.
+    // Mode-gated primary actions: Sessions → New session; Projects → + New
+    // project. Both stay mounted (ids intact); CSS hides the inactive one via
+    // the sidebar's data-thread-view attribute. Neither is hidden in the
+    // conversation view — the primary action stays reachable from a session.
     h(LaunchPanel, { launchModel, onLaunchFieldChange, onLaunchStart }),
     h(
       "div",
       { className: "projects-toolbar", id: "projects-toolbar" },
       h(
         "button",
-        { className: "start-session-button projects-create-button", id: "projects-create-button", type: "button" },
+        { className: "start-session-button", id: "projects-create-button", type: "button" },
         iconNode(PLUS_SVG),
         h("span", null, "New project")
       )
@@ -178,12 +159,6 @@ function LaunchPanel({ launchModel = null, onLaunchFieldChange = null, onLaunchS
         },
         iconNode(PLUS_SVG),
         h("span", null, "New session")
-      ),
-      h(
-        "button",
-        { className: "secondary-button", id: "resume-latest-button", type: "button" },
-        iconNode(ARROW_RETURN_SVG),
-        h("span", null, "Continue latest")
       )
     ),
   );
@@ -238,12 +213,6 @@ function ThreadDrawer() {
     h(
       "div",
       { className: "sidebar-drawer-body" },
-      h("button", {
-        className: "secondary-button sidebar-home-button",
-        hidden: true,
-        id: "go-console-home-sidebar",
-        type: "button",
-      }, "Back to console"),
       h(
         "div",
         {

@@ -5,7 +5,6 @@ import {
   chatShell,
   controlBanner,
   goConsoleHomeButton,
-  goConsoleHomeSidebarButton,
   sidebarHostStatus,
   sidebarHostLabel,
   localModelBadge,
@@ -17,7 +16,6 @@ import {
   pairingApprovalModal,
   pendingActionBanner,
   providerStatusList,
-  resumeLatestButton,
   sendButton,
   sessionHistoryDrawer,
   sessionMeta,
@@ -472,9 +470,6 @@ export function createSessionRenderer({
     openSessionDetailsButton.disabled = false;
     if (goConsoleHomeButton) {
       goConsoleHomeButton.hidden = !viewingConversation;
-    }
-    if (goConsoleHomeSidebarButton) {
-      goConsoleHomeSidebarButton.hidden = !viewingConversation;
     }
     messageForm.hidden = !viewingConversation;
     // An idle thread is open to either local or remote. The targeted send is the
@@ -1498,7 +1493,6 @@ export function createSessionRenderer({
       const projectCount = rows.length;
       threadsCount.textContent = `${projectCount} ${projectCount === 1 ? "project" : "projects"}`;
       threadsCount.title = rows.map((row) => row.name).join("\n");
-      resumeLatestButton.disabled = state.threads.length === 0;
       // One group per project, sessions nested. Built from the project list (not from
       // thread grouping) so an empty project still shows — it is a place to drop
       // sessions into, and hiding it would make it unreachable.
@@ -1584,18 +1578,21 @@ export function createSessionRenderer({
     }
 
     const groups = state.threadGroups || [];
-    const totalThreads = state.threads.length;
 
     renderWorkspaceSuggestions(state.session);
     threadsCount.textContent = summarizeThreadGroups(groups, { groupBy });
     threadsCount.title = groups.map((group) => group.cwd || group.label).join("\n");
-    resumeLatestButton.disabled = totalThreads === 0;
 
     renderReactContent(
       threadsList,
       h(ThreadGroupList, {
         activeThreadId: viewedThreadId,
         contextMenuThreadId: openCtxThreadId,
+        // Workspace ("folder") groups fold away, same as remote and as Projects
+        // mode. The header click still sets the active workspace — see
+        // ThreadGroupHeader's collapsible branch.
+        collapsible: true,
+        collapsedGroupCwds: threadListUi.collapsedGroupCwds || new Set(),
         emptyMessage: "Start or open a session to build workspace groups.",
         expandedGroupCwds: threadListUi.expandedGroupCwds || new Set(),
         formatThreadMeta(thread) {
@@ -1631,6 +1628,10 @@ export function createSessionRenderer({
         },
         onToggleExpandedGroup(cwd) {
           state.threadListStore.getState().toggleExpandedGroup(cwd);
+          renderThreads();
+        },
+        onToggleGroup(cwd) {
+          state.threadListStore.getState().toggleCollapsedGroup(cwd);
           renderThreads();
         },
         selectedCwd,
@@ -1747,7 +1748,6 @@ export function createSessionRenderer({
     closeThreadContextMenu({ rerender: false });
     threadsCount.textContent = countLabel;
     threadsCount.title = "";
-    resumeLatestButton.disabled = true;
     renderReactContent(
       threadsList,
       h(ThreadGroupList, {

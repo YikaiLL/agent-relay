@@ -370,16 +370,33 @@ export function ThreadGroupHeader({
   // rename/delete affordances. Rendered as a <div> (not a button) so the action
   // <button>s are valid children and there's no header-level click to fight.
   const projectId = group.projectId || null;
+  // Collapse is only offered where a surface actually wired it; otherwise the
+  // chevron would be a control that does nothing.
+  const canToggle = Boolean(collapsible && onToggleGroup);
   if (projectId && (onRenameProject || onDeleteProject)) {
     const isActiveProject = Boolean(activeProjectId) && activeProjectId === projectId;
+    // Selecting the project and folding it away are BOTH row-level: the name is
+    // only a few characters wide, and a user aiming at "the project" hits the row.
+    // Hanging selection off the name alone meant the tab strip only followed a
+    // pixel-perfect click. The chevron opts out (see below) — it means fold, only.
+    const activateRow = () => {
+      onSelectProject?.(projectId);
+      if (canToggle) {
+        onToggleGroup(normalizedCwd);
+      }
+    };
+    const rowClickable = Boolean(onSelectProject) || canToggle;
     return h(
       "div",
       {
         className:
           "thread-group-header thread-group-header-static thread-group-header-project"
-          + (isActiveProject ? " is-active" : ""),
+          + (isActiveProject ? " is-active" : "")
+          // A <div> gets no pointer cursor for free.
+          + (rowClickable ? " is-clickable" : ""),
         "data-project-id": projectId,
         title: headerTitle,
+        onClick: rowClickable ? activateRow : undefined,
         // Right-click opens the same project actions the inline buttons expose. The
         // inline buttons keep it reachable without a mouse; this keeps the mouse path
         // that the previous project-row sidebar had.
@@ -391,10 +408,10 @@ export function ThreadGroupHeader({
           : undefined,
       },
       h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
-      // The NAME is the click target rather than the whole header: the header also hosts
-      // action <button>s, and a header-level handler would fight them. Selecting a project
-      // is what tells the tab strip which set a new session belongs to, so it has to be
-      // reachable without opening a session first.
+      // Still a real <button> so the row's action is keyboard-reachable — the
+      // header itself is a <div> (it hosts the action <button>s) and cannot be
+      // one. stopPropagation keeps it from ALSO firing the row handler, which
+      // would double-toggle straight back to where it started.
       onSelectProject
         ? h(
             "button",
@@ -403,16 +420,18 @@ export function ThreadGroupHeader({
               className: "thread-group-name thread-group-name-button",
               onClick: (event) => {
                 event.stopPropagation();
-                onSelectProject(projectId);
+                activateRow();
               },
             },
             group.label
           )
         : h("span", { className: "thread-group-name" }, group.label),
-      // At-a-glance activity for the project, carried on the group as `summary`. The
-      // nested sessions are right there, but the group can be collapsed and the list
-      // truncates past a limit — the counts must not depend on either.
-      group.summary
+      // At-a-glance activity, carried on the group as `summary`. Only the states
+      // worth acting on: a plain "N sessions" restated what the nested rows
+      // already show, and it crowded the collapse chevron off the right edge.
+      // These two must NOT be derived from the visible rows — the group collapses
+      // and the list truncates past a limit, and the counts have to survive both.
+      group.summary && (group.summary.working || group.summary.needsInput)
         ? h(
             "span",
             { className: "thread-group-badges" },
@@ -428,13 +447,6 @@ export function ThreadGroupHeader({
                   "span",
                   { className: "project-sidebar-badge is-attention" },
                   `${group.summary.needsInput} needs input`
-                )
-              : null,
-            !group.summary.working && !group.summary.needsInput
-              ? h(
-                  "span",
-                  { className: "project-sidebar-badge" },
-                  `${group.summary.total || 0} ${group.summary.total === 1 ? "session" : "sessions"}`
                 )
               : null
           )
@@ -472,7 +484,26 @@ export function ThreadGroupHeader({
             },
             deleteGlyph()
           )
-      )
+      ),
+      // The header is a <div> (it hosts action <button>s), so it cannot itself be
+      // the ARIA disclosure control — the chevron carries the button semantics and
+      // aria-expanded. The row-level onClick above is the mouse convenience.
+      canToggle
+        ? h(
+            "button",
+            {
+              type: "button",
+              className: "thread-group-chevron-button",
+              "aria-expanded": isCollapsed ? "false" : "true",
+              "aria-label": `${isCollapsed ? "Expand" : "Collapse"} project ${group.label}`,
+              onClick: (event) => {
+                event.stopPropagation();
+                onToggleGroup(normalizedCwd);
+              },
+            },
+            h("span", { "aria-hidden": "true", className: "thread-group-chevron" })
+          )
+        : null
     );
   }
 
@@ -482,7 +513,16 @@ export function ThreadGroupHeader({
       {
         "aria-expanded": isCollapsed ? "false" : "true",
         className: "thread-group-header",
-        onClick: () => onToggleGroup?.(normalizedCwd),
+        onClick: () => {
+          onToggleGroup?.(normalizedCwd);
+          // This header is also what points new sessions at a workspace, so
+          // collapsing must not swallow the selection. The Unknown-workspace key
+          // is a display sentinel rather than a directory — it would be sent to
+          // the relay as a path, so it never leaves the display layer.
+          if (onSelectWorkspace && group.cwd && !isUnknownWorkspace(group.cwd)) {
+            onSelectWorkspace(group.cwd);
+          }
+        },
         title: headerTitle,
         type: "button",
       },
