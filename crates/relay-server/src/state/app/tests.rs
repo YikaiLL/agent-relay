@@ -82,6 +82,22 @@ statuses aren't misread as busy:\n  {line}",
     }
 }
 
+/// Shared provider-double contract: a thread keeps the cwd it was created with, and
+/// provider operations that drive it fail once that directory has been removed.
+fn require_live_test_cwd(
+    provider: &str,
+    thread_id: &str,
+    action: &str,
+    recorded: Option<String>,
+) -> Result<(), String> {
+    match recorded {
+        Some(cwd) if !std::path::Path::new(&cwd).is_dir() => Err(format!(
+            "{provider}: cannot {action} '{thread_id}': its workspace {cwd} no longer exists"
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod workspace_diff_tests {
     use super::super::{
@@ -444,6 +460,7 @@ branch refs/heads/alive
 #[cfg(test)]
 mod path_scope_tests {
     use super::super::*;
+    use super::require_live_test_cwd;
     use crate::codex::CodexBridge;
     use crate::fake_provider::FakeProviderBridge;
     use crate::protocol::{
@@ -2771,7 +2788,14 @@ got {}",
             _approval_policy: &str,
             _sandbox: &str,
         ) -> Result<(), String> {
-            if self.threads.lock().await.contains_key(thread_id) {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            if recorded.is_some() {
+                require_live_test_cwd(self.name, thread_id, "resume", recorded)?;
                 self.resume_thread_ids
                     .lock()
                     .await
@@ -2847,6 +2871,13 @@ got {}",
             effort: &str,
             images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
             self.turn_thread_ids
                 .lock()
                 .await
@@ -4860,10 +4891,17 @@ got {}",
 
         async fn resume_thread(
             &self,
-            _thread_id: &str,
+            thread_id: &str,
             _approval_policy: &str,
             _sandbox: &str,
         ) -> Result<(), String> {
+            let recorded = self
+                .threads
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "resume", recorded)?;
             Ok(())
         }
 
@@ -4918,6 +4956,13 @@ got {}",
             _effort: &str,
             _images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
             Ok(Some(format!("{thread_id}-turn")))
         }
 
@@ -5107,7 +5152,14 @@ got {}",
             _approval_policy: &str,
             _sandbox: &str,
         ) -> Result<(), String> {
-            if self.threads.lock().await.contains_key(thread_id) {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.summary.cwd.clone());
+            if recorded.is_some() {
+                require_live_test_cwd("consumed-initial", thread_id, "resume", recorded)?;
                 Ok(())
             } else {
                 Err(format!(
@@ -5164,12 +5216,19 @@ got {}",
 
         async fn start_turn(
             &self,
-            _thread_id: &str,
+            thread_id: &str,
             _text: &str,
             _model: &str,
             _effort: &str,
             _images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.summary.cwd.clone());
+            require_live_test_cwd("consumed-initial", thread_id, "start a turn for", recorded)?;
             Err("consumed-initial provider does not support follow-up turns".to_string())
         }
 
@@ -6888,7 +6947,14 @@ got {}",
             })
         }
 
-        async fn resume_thread(&self, _t: &str, _a: &str, _s: &str) -> Result<(), String> {
+        async fn resume_thread(&self, thread_id: &str, _a: &str, _s: &str) -> Result<(), String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "resume", recorded)?;
             Ok(())
         }
 
@@ -6935,12 +7001,19 @@ got {}",
 
         async fn start_turn(
             &self,
-            _t: &str,
+            thread_id: &str,
             _text: &str,
             model: &str,
             _e: &str,
             _images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
             self.seen_models.lock().await.push(model.to_string());
             if let Some(err) = self.reject(model) {
                 return Err(err);
@@ -7076,6 +7149,7 @@ got {}",
 #[cfg(test)]
 mod review_tests {
     use super::super::*;
+    use super::require_live_test_cwd;
     use crate::protocol::{
         ModelOptionView, RequestReviewInput, SendMessageInput, StartSessionInput,
         StartWorkflowInput, StopTurnInput, TakeOverInput, ThreadSummaryView, TranscriptEntryKind,
@@ -7280,13 +7354,7 @@ mod review_tests {
                 .iter()
                 .find(|(id, _)| id == thread_id)
                 .map(|(_, cwd)| cwd.clone());
-            match recorded {
-                Some(cwd) if !std::path::Path::new(&cwd).is_dir() => Err(format!(
-                    "{}: cannot {action} '{thread_id}': its workspace {cwd} no longer exists",
-                    self.name
-                )),
-                _ => Ok(()),
-            }
+            require_live_test_cwd(self.name, thread_id, action, recorded)
         }
     }
 
