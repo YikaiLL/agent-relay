@@ -159,6 +159,10 @@ pub(super) struct ReviewWorkspace {
     pub(super) cwd: String,
     /// The reviewed thread's OWN recorded cwd, which may be gone or a different tree.
     pub(super) recorded_cwd: String,
+    /// The recorded cwd when `cwd` is a read-only substitute for a deleted workspace.
+    /// Kept distinct from a live cross-tree suggestion so callers never infer deletion
+    /// merely from two paths being different.
+    pub(super) fallback_from: Option<String>,
     /// Every in-scope working tree of that repo, for naming the branch/kind in the prompt.
     pub(super) roots: Vec<WorkspaceRootView>,
 }
@@ -332,10 +336,11 @@ reviewer thread"
         // Which working tree this review reads (see `resolve_review_workspace`). Resolved
         // once here so an unresolvable workspace is refused with a clear message at request
         // time, and re-resolved per round by the orchestrator.
-        let cwd = self
+        let review_workspace = self
             .resolve_review_workspace(&parent_thread_id, &device_id)
-            .await?
-            .cwd;
+            .await?;
+        let cwd = review_workspace.cwd.clone();
+        let initial_fallback_from = review_workspace.fallback_from.clone();
 
         // An explicitly requested reviewer thread must live IN the tree we are about to
         // review. A provider thread cannot be relocated, so "reuse" across trees would hand it
@@ -343,13 +348,17 @@ reviewer thread"
         // a caveat the reviewer may ignore, or (worse) silently substituting a different
         // reviewer than the receipt promises.
         if let Some(reviewer_id) = &reuse_thread_id {
-            if let Some(reviewer_cwd) = self.reviewer_thread_cwd(reviewer_id).await {
-                if !paths_equivalent(&reviewer_cwd, &cwd) {
-                    return Err(format!(
-                        "that reviewer thread works in {reviewer_cwd}, but the work to review is \
+            let reviewer_cwd = self
+                .thread_recorded_cwd(reviewer_id)
+                .await
+                .map_err(|error| {
+                    format!("failed to resolve the reviewer thread's workspace: {error}")
+                })?;
+            if !paths_equivalent(&reviewer_cwd, &cwd) {
+                return Err(format!(
+                    "that reviewer thread works in {reviewer_cwd}, but the work to review is \
 in {cwd} — start a clean reviewer instead"
-                    ));
-                }
+                ));
             }
         }
 
@@ -420,6 +429,15 @@ reviewer thread"
                 "info",
                 format!("Review {job_id} requested for thread {parent_thread_id}."),
             );
+            if let Some(recorded) = initial_fallback_from {
+                relay.push_log(
+                    "info",
+                    format!(
+                        "Review {job_id}: the reviewed thread's workspace ({recorded}) no longer \
+exists, so this review runs read-only — no recap, fix or post-back turns will be driven on it."
+                    ),
+                );
+            }
             relay.notify();
         }
 
@@ -724,11 +742,38 @@ last message (no recap turn)."
                 && matches!(&reviewer_mode, ReviewMode::ExistingThread { .. });
             let mut prepared: Option<(String, Option<String>, Option<String>)> = None;
             if let Some(existing) = existing_reviewer {
-                let mut usable = self.thread_is_in_tree(&existing, &round_cwd).await;
+                let mut usable = match self.thread_is_in_tree(&existing, &round_cwd).await {
+                    Ok(usable) => usable,
+                    // A reviewer whose workspace disappeared can be replaced by a clean
+                    // reviewer. A provider lookup failure says nothing about tree topology.
+                    Err(error) if error.is_workspace_gone() => false,
+                    Err(error) => {
+                        self.fail_job(
+                            &job_id,
+                            format!("failed to resolve the reviewer thread's workspace: {error}"),
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 if usable {
                     match self.prepare_reused_reviewer_thread(&existing).await {
                         Ok((model, effort)) => {
-                            usable = self.thread_is_in_tree(&existing, &round_cwd).await;
+                            usable = match self.thread_is_in_tree(&existing, &round_cwd).await {
+                                Ok(usable) => usable,
+                                Err(error) if error.is_workspace_gone() => false,
+                                Err(error) => {
+                                    self.fail_job(
+                                        &job_id,
+                                        format!(
+                                            "failed to resolve the reviewer thread's workspace: \
+{error}"
+                                        ),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            };
                             if usable {
                                 prepared = Some((
                                     existing.clone(),
@@ -754,10 +799,20 @@ last message (no recap turn)."
                 }
                 if !usable {
                     if explicit_reuse {
-                        let reviewer_cwd = self
-                            .reviewer_thread_cwd(&existing)
-                            .await
-                            .unwrap_or_else(|| "an unknown workspace".to_string());
+                        let reviewer_cwd = match self.thread_recorded_cwd(&existing).await {
+                            Ok(cwd) => cwd,
+                            Err(error) => {
+                                self.fail_job(
+                                    &job_id,
+                                    format!(
+                                        "failed to resolve the reviewer thread's workspace: \
+{error}"
+                                    ),
+                                )
+                                .await;
+                                return;
+                            }
+                        };
                         self.fail_job(
                             &job_id,
                             format!(
@@ -1399,7 +1454,7 @@ started ({error}); finishing with round {round}'s findings."
             )
         };
 
-        let (usable, _) =
+        let (usable, fallback_from) =
             resolve_workspace_cwd(&recorded_cwd, &relay_cwd, &device_scope, &allowed_roots)
                 .await
                 .into_readable()
@@ -1421,6 +1476,7 @@ workspace related to it is available to review instead"
         Ok(ReviewWorkspace {
             cwd,
             recorded_cwd,
+            fallback_from,
             roots,
         })
     }
@@ -1463,16 +1519,6 @@ workspace related to it is available to review instead"
         }
     }
 
-    /// A reviewer thread's own workspace, ASKING THE PROVIDER when the relay has no row for it.
-    ///
-    /// After a restart the reviewer's runtime and cached row are gone, so a purely local
-    /// lookup answers "unknown" — and treating unknown as "fine" is what let an explicit
-    /// cross-tree reuse slip past the request-time check and be silently downgraded to a
-    /// different reviewer later. The provider still knows, so ask it.
-    async fn reviewer_thread_cwd(&self, reviewer_thread_id: &str) -> Option<String> {
-        self.thread_recorded_cwd(reviewer_thread_id).await.ok()
-    }
-
     /// Resolve a thread's immutable provider cwd, probing the provider when the relay's
     /// runtime/summary row is absent after restart.
     async fn thread_recorded_cwd(&self, thread_id: &str) -> Result<String, String> {
@@ -1497,11 +1543,15 @@ workspace related to it is available to review instead"
 
     /// Whether `thread_id`'s own workspace IS `tree`, and still exists. When the relay
     /// has no row after restart, use the same provider-backed lookup as the drive gate.
-    async fn thread_is_in_tree(&self, thread_id: &str, tree: &str) -> bool {
-        let Ok(cwd) = self.thread_recorded_cwd(thread_id).await else {
-            return false;
-        };
-        LiveWorkspace::from_path(&cwd).is_some() && paths_equivalent(&cwd, tree)
+    async fn thread_is_in_tree(
+        &self,
+        thread_id: &str,
+        tree: &str,
+    ) -> Result<bool, ThreadDriveError> {
+        let recorded = self.thread_recorded_cwd(thread_id).await?;
+        let workspace = LiveWorkspace::from_path(&recorded)
+            .ok_or_else(|| ThreadDriveError::WorkspaceGone { recorded })?;
+        Ok(paths_equivalent(workspace.as_str(), tree))
     }
 
     /// Start a turn on `thread_id` and seed its active-turn marker so the wait

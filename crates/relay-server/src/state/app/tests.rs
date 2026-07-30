@@ -7216,6 +7216,10 @@ mod review_tests {
         // other thread deletes fine. Lets a test fail ONLY a reviewer delete while
         // the parent delete still succeeds (the F1 un-hide-on-failure path).
         fail_delete_thread_ids: Arc<Mutex<std::collections::HashSet<String>>>,
+        // Thread ids whose provider-backed hydration probe should fail. Used to
+        // prove a transient `read_thread` error is surfaced as a provider failure,
+        // never misdiagnosed as a cross-worktree reviewer mismatch.
+        fail_read_thread_ids: Arc<Mutex<std::collections::HashSet<String>>>,
         // (thread_id, model, effort) recorded at each start_turn, so a test can
         // assert the model/effort a reviewer turn actually ran with (reuse must keep
         // the reviewer's own model, not the parent's).
@@ -7300,6 +7304,7 @@ mod review_tests {
                 fail_archive: Arc::new(AtomicBool::new(false)),
                 fail_delete: Arc::new(AtomicBool::new(false)),
                 fail_delete_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -7438,6 +7443,12 @@ mod review_tests {
             &self,
             thread_id: &str,
         ) -> Result<crate::provider::ThreadSyncData, String> {
+            if self.fail_read_thread_ids.lock().await.contains(thread_id) {
+                return Err(format!(
+                    "{} provider probe failed for '{thread_id}': PROBE_UNAVAILABLE",
+                    self.name
+                ));
+            }
             let thread = self
                 .threads
                 .lock()
@@ -11344,6 +11355,66 @@ settings update: {error}"
         );
     }
 
+    // A provider probe failure is not evidence that the reviewer lives in another tree.
+    // After restart the provider is the only authority for the thread's cwd, so its error
+    // must fail the request directly rather than accepting a job that later reports
+    // "an unknown workspace" as a topology mismatch.
+    #[tokio::test]
+    async fn explicit_reuse_surfaces_provider_workspace_probe_failure() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap().to_string();
+        init_git_seed(&cwd);
+
+        let (app, providers) = build_review_app(&cwd, &["codex"]).await;
+        start_parent(&app, &cwd, "codex").await;
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // Simulate restart: force workspace discovery through provider read_thread.
+        {
+            let mut relay = app.relay.write().await;
+            relay.runtimes.remove(&reviewer);
+            relay.threads.retain(|thread| thread.id != reviewer);
+            relay.review_jobs.clear();
+            assert!(relay.thread_cwd(&reviewer).is_none());
+        }
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_read_thread_ids
+            .lock()
+            .await
+            .insert(reviewer.clone());
+        let turns_before = provider.turns.lock().await.len();
+
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer);
+        let error = app
+            .request_review(reuse)
+            .await
+            .expect_err("the provider probe failure must reject the request");
+        assert!(
+            error.contains("PROBE_UNAVAILABLE"),
+            "the provider's diagnostic must be preserved: {error}"
+        );
+        assert!(
+            !error.contains("unknown workspace") && !error.contains("start a clean reviewer"),
+            "a provider failure must not be rewritten as a topology mismatch: {error}"
+        );
+        assert_eq!(
+            provider.turns.lock().await.len(),
+            turns_before,
+            "a rejected reuse request must not drive any turn"
+        );
+    }
+
     // The ENOENT race is not only around `git`: the workspace can also vanish between our
     // liveness check and the PROVIDER call. Each turn boundary must degrade the same way it
     // would have if the check had seen the deletion.
@@ -11573,6 +11644,24 @@ settings update: {error}"
         assert_eq!(
             job.round, 1,
             "no fix rounds can run without a drivable author"
+        );
+        let read_only_logs = app
+            .relay
+            .read()
+            .await
+            .snapshot()
+            .logs
+            .into_iter()
+            .filter(|entry| {
+                entry.message.contains(&receipt.review_job_id)
+                    && entry.message.contains("runs read-only")
+                    && entry.message.contains("no recap, fix or post-back turns")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_only_logs.len(),
+            1,
+            "the job must emit exactly one read-only mode summary: {read_only_logs:?}"
         );
     }
 
