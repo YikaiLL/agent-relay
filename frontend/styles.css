@@ -4658,3 +4658,174 @@ body.is-resizing-panel {
    * at the bottom make sense. */
   .app-shell:not(.remote-app-shell) .sidebar-bottom-bar { display: none; }
 }
+
+/* ── Session tab strip ──────────────────────────────────────────────────────
+ * Chrome/terminal-shaped strip of a project's open sessions. Shared by the local
+ * and remote surfaces (both load this stylesheet), so the only surface-specific
+ * part is the mobile block at the bottom: there is no hover on a phone, so the
+ * per-tab controls can't hide behind it. */
+.session-tab-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px 6px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.session-tab-strip.is-empty {
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+}
+.session-tab-empty {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-none);
+}
+
+.session-tab {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 220px;
+  padding-left: 8px;
+  padding-right: 4px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  color: var(--text-secondary);
+}
+.session-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+/* The focused tab reads as continuous with the pane below, so it covers the
+ * strip's bottom border rather than sitting above it. */
+.session-tab.is-focused {
+  margin-bottom: -1px;
+  padding-bottom: 1px;
+  background: var(--bg-elevated);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+.session-tab.is-pinned {
+  max-width: 150px;
+}
+/* Visually separate the pinned zone from the rest of the strip. */
+.session-tab.is-pinned + .session-tab:not(.is-pinned) {
+  margin-left: 10px;
+}
+
+.session-tab-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 7px 2px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-none);
+}
+.session-tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Keeps titles aligned whether or not a session currently has an activity dot. */
+.session-tab-dot-placeholder {
+  flex: none;
+  width: 6px;
+  height: 6px;
+}
+
+.session-tab-pin,
+.session-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-tertiary);
+  opacity: 0;
+}
+.session-tab:hover .session-tab-pin,
+.session-tab:hover .session-tab-close,
+.session-tab.is-focused .session-tab-pin,
+.session-tab.is-focused .session-tab-close,
+.session-tab-main:focus-visible ~ .session-tab-pin,
+.session-tab-pin:focus-visible,
+.session-tab-close:focus-visible,
+/* A pinned tab always shows its pin, otherwise the state is invisible. */
+.session-tab-pin.is-pinned {
+  opacity: 1;
+}
+.session-tab-pin:hover,
+.session-tab-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.session-tab-pin.is-pinned {
+  color: var(--accent);
+}
+
+.session-tab.is-dragging {
+  opacity: 0.5;
+}
+.session-tab.is-drop-target {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.session-tab-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  align-self: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: var(--text-md);
+  line-height: var(--leading-none);
+}
+.session-tab-new:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+@media (max-width: 960px) {
+  /* No hover on a phone: close is always reachable, and the pin only shows on the
+   * focused tab (or when already pinned) so narrow tabs stay legible. */
+  .session-tab {
+    max-width: 168px;
+  }
+  .session-tab-close {
+    opacity: 1;
+  }
+  .session-tab-pin {
+    display: none;
+  }
+  .session-tab.is-focused .session-tab-pin,
+  .session-tab-pin.is-pinned {
+    display: inline-flex;
+    opacity: 1;
+  }
+}
