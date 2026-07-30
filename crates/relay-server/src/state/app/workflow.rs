@@ -30,7 +30,10 @@ use crate::state::{
     StopCondition, Workflow, WorkflowRun, WorkflowStep, WorkflowVerdict, MAX_REVIEWERS_PER_PARENT,
 };
 
-use super::review::{random_suffix, reviewer_thread_settings};
+use super::review::{
+    classify_workspace_result, random_suffix, reviewer_thread_settings, ReviewWorkspace,
+    ThreadDriveError,
+};
 use super::*;
 
 /// Hard cap on the review/revise loop so a single run can't loop unbounded.
@@ -314,6 +317,23 @@ starting a workflow"
             let parent_cwd = relay
                 .thread_cwd(&parent_thread_id)
                 .ok_or_else(|| "cannot resolve the thread to run a workflow on".to_string())?;
+            // The device must be allowed to act in the parent thread's workspace — the
+            // run launches file-mutating turns there.
+            let device_scope = relay.device_path_scope(device_id);
+            ensure_path_within_device_scope(&parent_cwd, &device_scope, &relay.allowed_roots)?;
+            // That directory may be GONE (an agent worktree removed once its work landed).
+            // A read-only review can be moved to a related workspace; Code Flow CANNOT: its
+            // author writes files, and a provider thread stays bound to the cwd it was
+            // created with (`send_message_to_thread` has no cwd to override). Substituting
+            // one here would authorize a run whose author then fails on its first tool call.
+            // So refuse up front, and say what to do instead.
+            if !dir_exists(&parent_cwd) {
+                return Err(format!(
+                    "the workspace this thread ran in ({parent_cwd}) no longer exists, and a \
+workflow writes files there — start a thread in the workspace you want to work in and run \
+the workflow from that thread"
+                ));
+            }
             // Liveness/approvals target the NAMED parent, not the active thread.
             if relay
                 .runtime_for_thread(&parent_thread_id)
@@ -350,10 +370,6 @@ finish before starting a workflow"
                         .to_string(),
                 );
             }
-            // The device must be allowed to act in the parent thread's workspace — the
-            // run launches file-mutating turns there.
-            let device_scope = relay.device_path_scope(device_id);
-            ensure_path_within_device_scope(&parent_cwd, &device_scope, &relay.allowed_roots)?;
             (parent_thread_id, parent_cwd)
         };
         // Authorized + KNOWN thread only: resolve the provider once. Because the thread
@@ -553,11 +569,19 @@ finish before starting a workflow"
 
         // 2. Spawn the read-only reviewer thread once; reused across rounds.
         self.set_run_step(&run_id, &review.id).await;
+        let Some(reviewer_workspace) = LiveWorkspace::from_path(&cwd) else {
+            self.fail_run(
+                &run_id,
+                format!("failed to start the reviewer thread: workspace {cwd} no longer exists"),
+            )
+            .await;
+            return;
+        };
         let (mut reviewer_thread_id, reviewer_model) = match self
             .start_workflow_step_thread(
                 &run_id,
                 &review.id,
-                &cwd,
+                &reviewer_workspace,
                 &review.agent,
                 review.model.as_deref(),
             )
@@ -595,10 +619,21 @@ finish before starting a workflow"
                 .map(|(_, text)| text)
                 .unwrap_or_default();
             let instructions = non_empty(Some(review.prompt.clone()));
+            // Name the tree the diff came from — same reason as a plain review: a reviewer
+            // that assumes the wrong working tree reasons about the wrong branch. A workflow
+            // never substitutes a workspace (it refuses instead), so the run's cwd IS the
+            // author's own directory.
+            let workspace = ReviewWorkspace {
+                cwd: cwd.clone(),
+                recorded_cwd: cwd.clone(),
+                fallback_from: None,
+                roots: list_worktrees(&cwd).await,
+            };
+            let workspace_line = self.describe_review_workspace(&workspace);
             let prompt = if round == 1 {
-                reviewer_prompt(&recap, &diff, instructions.as_deref())
+                reviewer_prompt(&recap, &diff, instructions.as_deref(), &workspace_line)
             } else {
-                re_review_prompt(&recap, &diff, instructions.as_deref())
+                re_review_prompt(&recap, &diff, instructions.as_deref(), &workspace_line)
             };
 
             self.set_run_step(&run_id, &review.id).await;
@@ -930,10 +965,10 @@ the drain window; it may still be running."
         &self,
         run_id: &str,
         step_id: &str,
-        cwd: &str,
+        workspace: &LiveWorkspace,
         provider: &str,
         model_override: Option<&str>,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String), ThreadDriveError> {
         let (provider_name, bridge) = {
             let (name, bridge) = self.resolve_provider(Some(provider))?;
             (name.to_string(), bridge.clone())
@@ -956,9 +991,12 @@ the drain window; it may still be running."
         let (approval_policy, sandbox, read_only_enforced) =
             reviewer_thread_settings(&provider_name, &defaults.approval_policy, &defaults.sandbox);
 
-        let start = bridge
-            .start_thread(cwd, &model, &approval_policy, &sandbox, None)
-            .await?;
+        let start = classify_workspace_result(
+            workspace,
+            bridge
+                .start_thread(workspace.as_str(), &model, &approval_policy, &sandbox, None)
+                .await,
+        )?;
         let mut thread = start.thread;
         thread.provider = provider_name.clone();
         thread.source = provider_name.clone();
@@ -967,7 +1005,7 @@ the drain window; it may still be running."
             let mut relay = self.relay.write().await;
             relay.register_background_thread(
                 thread,
-                cwd,
+                workspace.as_str(),
                 &model,
                 &approval_policy,
                 &sandbox,
@@ -992,7 +1030,10 @@ Bash can still write without approval (best-effort read-only)"
             };
             relay.push_log(
                 "info",
-                format!("Workflow: started a {provider_name} background reviewer thread in {cwd}: {note}."),
+                format!(
+                    "Workflow: started a {provider_name} background reviewer thread in {}: {note}.",
+                    workspace.as_str()
+                ),
             );
             relay.notify();
         }

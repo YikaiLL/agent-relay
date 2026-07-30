@@ -677,8 +677,8 @@ an automatic provider stop will be requested."
     }
 }
 
-async fn apply_unified_diff(
-    cwd: &str,
+async fn apply_unified_diff_in(
+    workspace: &LiveWorkspace,
     diff: &str,
     direction: FileChangeApplyDirection,
 ) -> Result<(), String> {
@@ -686,7 +686,7 @@ async fn apply_unified_diff(
     command
         .arg("apply")
         .arg("--whitespace=nowarn")
-        .current_dir(cwd)
+        .current_dir(workspace.as_str())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -725,23 +725,313 @@ async fn apply_unified_diff(
     })
 }
 
+async fn apply_unified_diff(
+    cwd: &str,
+    diff: &str,
+    direction: FileChangeApplyDirection,
+) -> Result<(), String> {
+    let workspace = LiveWorkspace::from_path(cwd)
+        .ok_or_else(|| format!("failed to start git apply: workspace {cwd} no longer exists"))?;
+    apply_unified_diff_in(&workspace, diff, direction).await
+}
+
 const WORKSPACE_DIFF_MAX_BYTES: usize = 4 * 1024 * 1024;
 const WORKSPACE_DIFF_UNTRACKED_MAX_BYTES: usize = 64 * 1024;
 
-/// Enumerate every working tree of the repo containing `cwd` (main + linked
-/// `git worktree`s). Best-effort: a non-repo / git failure yields an empty list,
-/// which degrades the panel to "no picker", never to an error.
+/// A directory that existed when it crossed into a filesystem/provider boundary.
+///
+/// The handle does not pretend a directory can never disappear: cleanup may still race
+/// the operation after construction. It does make every spawn site start from an explicit
+/// liveness check, and gives the error classifier the exact path whose disappearance it
+/// must distinguish from a real git/provider error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveWorkspace {
+    path: String,
+}
+
+impl LiveWorkspace {
+    pub(crate) fn from_path(path: &str) -> Option<Self> {
+        dir_exists(path).then(|| Self {
+            path: path.to_string(),
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        dir_exists(&self.path)
+    }
+}
+
+/// The result of resolving a recorded workspace.
+///
+/// `Gone` preserves the tombstone even when a related live tree is available for a
+/// read-only fallback. Callers must choose explicitly whether substitution is safe:
+/// diff/review readers may use it, while a provider thread that writes in its recorded
+/// cwd must refuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceResolution {
+    Live(LiveWorkspace),
+    Gone {
+        recorded: String,
+        substitute: Option<LiveWorkspace>,
+    },
+}
+
+impl WorkspaceResolution {
+    /// Select a live workspace for a read-only operation, retaining the tombstone that
+    /// must be surfaced to the user when this is a fallback.
+    pub(crate) fn into_readable(self) -> Option<(LiveWorkspace, Option<String>)> {
+        match self {
+            Self::Live(workspace) => Some((workspace, None)),
+            Self::Gone {
+                recorded,
+                substitute: Some(workspace),
+            } => Some((workspace, Some(recorded))),
+            Self::Gone {
+                substitute: None, ..
+            } => None,
+        }
+    }
+}
+
+/// Whether a path still names a directory. `Command::current_dir` on a missing directory
+/// fails at SPAWN time (ENOENT), never as a git error we could interpret, so this check
+/// is the only thing standing between a deleted workspace and a raw
+/// "No such file or directory (os error 2)" in the UI.
+pub(crate) fn dir_exists(path: &str) -> bool {
+    !path.is_empty() && std::path::Path::new(path).is_dir()
+}
+
+/// Collect a diff for `target`, tolerating that workspace being removed BETWEEN the resolve
+/// that chose it and the git spawn that reads it.
+///
+/// That window is real, not theoretical: the thing deleting these directories is a cleanup
+/// task racing the UI's refresh, and losing the race would resurface the exact
+/// "failed to run git rev-parse …: No such file or directory (os error 2)" this all exists
+/// to remove. On failure, if `target` is no longer a directory, re-resolve once and retry.
+///
+/// Returns the diff plus the workspace it could NOT use, if the retry substituted one.
+pub(crate) async fn collect_workspace_diff_resilient(
+    target: &str,
+    relay_cwd: &str,
+    device_scope: &[String],
+    allowed_roots: &[String],
+) -> Result<(WorkspaceDiffResponse, Option<String>), String> {
+    let first = LiveWorkspace::from_path(target);
+    let first_result = match first.as_ref() {
+        Some(workspace) => collect_workspace_diff_in(workspace).await,
+        None => Err(format!("workspace {target} no longer exists")),
+    };
+    match first_result {
+        Ok(diff) => Ok((diff, None)),
+        // Only a vanished workspace is retried; a genuine git error still surfaces.
+        Err(error) if !first.as_ref().is_some_and(LiveWorkspace::is_live) => {
+            let resolution =
+                resolve_workspace_cwd(target, relay_cwd, device_scope, allowed_roots).await;
+            match resolution.into_readable() {
+                Some((retry, fallback_from)) => {
+                    let diff = collect_workspace_diff_in(&retry).await?;
+                    Ok((diff, fallback_from))
+                }
+                None => {
+                    tracing::debug!(
+                        target,
+                        %error,
+                        "workspace vanished mid-collect and nothing related survives"
+                    );
+                    Ok((WorkspaceDiffResponse::unavailable(), None))
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The repository working tree that CONTAINED `path`: the nearest ancestor holding a
+/// `.git` entry (a directory in a main worktree, a file in a linked one).
+///
+/// Filesystem-only by necessity — `path` itself no longer exists, so git cannot be asked
+/// about it. This is what makes a removed agent worktree degrade to something useful:
+/// this project creates them at `<repo>/.claude/worktrees/<name>`, so the enclosing repo
+/// is exactly the tree whose `main` the work landed on.
+fn enclosing_repo_root(path: &str) -> Option<String> {
+    let mut current = std::path::Path::new(path).parent();
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return Some(dir.to_string_lossy().to_string());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// Resolve the workspace to actually run git in (and to point a reviewer at), given the
+/// cwd a thread recorded.
+///
+/// A thread carries the cwd it was born in forever, but that directory can stop existing:
+/// an agent `git worktree` is removed once its work lands, a checkout gets moved or
+/// deleted. Everything spawned there then fails with ENOENT — which is how the diff panel
+/// came to render "failed to run git rev-parse --is-inside-work-tree: No such file or
+/// directory (os error 2)" and how a whole review job died on the same string.
+///
+/// So this degrades rather than guesses. A substitute is only ever a workspace that is
+/// PROVABLY related to the one that vanished:
+/// - the repo whose directory tree contained it (`enclosing_repo_root`), or
+/// - a repo that still lists it as one of its worktrees — git keeps reporting a deleted
+///   worktree as `prunable`, so the repo itself vouches for the relation.
+///
+/// Deliberately NOT a candidate: the relay's current cwd on its own. That is merely
+/// wherever the most recent session was started, so accepting it would hand thread A the
+/// diff of whatever unrelated project happens to be active — the very leak the fail-closed
+/// rule in `workspace_diff` exists to prevent, and one device scope cannot catch on an
+/// unrestricted relay. `None` means nothing provably related is in reach; callers surface
+/// that as "unavailable" or a clear refusal, never as a raw git error.
+///
+/// Every substitute is re-checked against the caller's scope: falling back must not widen
+/// what a narrow-scoped device can reach.
+pub(crate) async fn resolve_workspace_cwd(
+    recorded: &str,
+    relay_cwd: &str,
+    device_scope: &[String],
+    allowed_roots: &[String],
+) -> WorkspaceResolution {
+    if let Some(workspace) = LiveWorkspace::from_path(recorded) {
+        return WorkspaceResolution::Live(workspace);
+    }
+    let candidates = [
+        enclosing_repo_root(recorded),
+        registering_repo_main_worktree(recorded, relay_cwd).await,
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        // The recorded cwd is gone by definition, so a candidate equal to it is no
+        // candidate at all.
+        if paths_equivalent_allowing_missing(&candidate, recorded) || !dir_exists(&candidate) {
+            continue;
+        }
+        if !path_within_device_scope(&candidate, device_scope, allowed_roots) {
+            continue;
+        }
+        let Some(substitute) = LiveWorkspace::from_path(&candidate) else {
+            continue;
+        };
+        return WorkspaceResolution::Gone {
+            recorded: recorded.to_string(),
+            substitute: Some(substitute),
+        };
+    }
+    WorkspaceResolution::Gone {
+        recorded: recorded.to_string(),
+        substitute: None,
+    }
+}
+
+/// The MAIN working tree of the repo reachable from `probe_cwd` — but only if that repo
+/// still lists `recorded` among its worktrees.
+///
+/// This is the identity check that makes a deleted SIBLING worktree (`../repo-feature`,
+/// nothing above it to identify the repo) recoverable without ever guessing: git lists a
+/// worktree whose directory was removed as `prunable`, so its presence there is the repo
+/// saying "that was mine". The answer is the repo's main tree — where the work merges to —
+/// not `probe_cwd`, which may itself be some other worktree.
+async fn registering_repo_main_worktree(recorded: &str, probe_cwd: &str) -> Option<String> {
+    let probe = LiveWorkspace::from_path(probe_cwd)?;
+    let records = list_worktree_records(&probe).await;
+    if !records
+        .iter()
+        .any(|record| paths_equivalent_allowing_missing(&record.path, recorded))
+    {
+        return None;
+    }
+    records
+        .iter()
+        .find(|record| record.is_main && !record.bare && !record.prunable)
+        .map(|record| record.path.clone())
+}
+
+/// Compare two paths where one may no longer exist, tolerating a symlinked prefix (macOS
+/// `/var` → `/private/var`). `paths_equivalent` canonicalizes, which needs both paths to
+/// exist — and the entire point here is a directory that is gone, whose registered path in
+/// git may be spelled through the canonical prefix while the thread recorded the symlinked
+/// one.
+fn paths_equivalent_allowing_missing(a: &str, b: &str) -> bool {
+    a == b || normalize_missing_path(a) == normalize_missing_path(b)
+}
+
+/// Canonicalize the deepest ANCESTOR of `path` that still exists and re-attach the rest,
+/// so a path with a vanished tail still normalizes its surviving prefix.
+fn normalize_missing_path(path: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(normalize_cwd(path));
+    let mut tail = Vec::new();
+    let mut current = path.as_path();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            let mut resolved = canonical;
+            for component in tail.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path,
+        }
+    }
+}
+
+/// Enumerate every working tree of the repo containing `workspace` (main + linked
+/// `git worktree`s) that can actually be diffed. Best-effort: a non-repo / git failure
+/// yields an empty list, which degrades the panel to "no picker", never to an error.
+pub(crate) async fn list_worktrees_in(workspace: &LiveWorkspace) -> Vec<WorkspaceRootView> {
+    diffable_roots(list_worktree_records(workspace).await)
+}
+
+/// Compatibility boundary for callers that only have a persisted/display cwd. The git
+/// spawn itself still accepts only `LiveWorkspace`; later orchestration code should carry
+/// the handle returned by `resolve_workspace_cwd` instead of re-entering through this.
 pub(crate) async fn list_worktrees(cwd: &str) -> Vec<WorkspaceRootView> {
+    let Some(workspace) = LiveWorkspace::from_path(cwd) else {
+        return Vec::new();
+    };
+    list_worktrees_in(&workspace).await
+}
+
+/// Keep only the records that HAVE a working tree to diff. Neither a bare repo nor a
+/// prunable entry does: prunable is the `rm -rf`-without-`git worktree remove` case, which
+/// git keeps listing until pruned, and offering it would be an option guaranteed to fail.
+fn diffable_roots(records: Vec<WorktreeRecord>) -> Vec<WorkspaceRootView> {
+    records
+        .into_iter()
+        .filter(|record| !record.bare && !record.prunable)
+        .map(|record| WorkspaceRootView {
+            path: record.path,
+            branch: record.branch,
+            is_main: record.is_main,
+        })
+        .collect()
+}
+
+/// Every worktree record git reports for the repo containing `workspace`, INCLUDING bare
+/// and prunable ones. Kept separate from `list_worktrees_in` because the prunable entries
+/// are exactly what proves a repo once owned a directory that has since been deleted (see
+/// `registering_repo_main_worktree`), while they must never be offered as diff targets.
+async fn list_worktree_records(workspace: &LiveWorkspace) -> Vec<WorktreeRecord> {
     // `-z` is what makes a path containing a newline (or trailing whitespace)
     // parseable at all — it is git's own documented answer for exactly that case.
     // `worktree list -z` landed in git 2.36, so fall back to the newline form for
     // older gits rather than silently losing the picker there.
-    if let Ok(output) = run_git_capture(cwd, &["worktree", "list", "--porcelain", "-z"]).await {
+    if let Ok(output) = run_git_capture(workspace, &["worktree", "list", "--porcelain", "-z"]).await
+    {
         if output.status.success() {
             return parse_worktree_porcelain_z(&String::from_utf8_lossy(&output.stdout));
         }
     }
-    match run_git_capture(cwd, &["worktree", "list", "--porcelain"]).await {
+    match run_git_capture(workspace, &["worktree", "list", "--porcelain"]).await {
         Ok(output) if output.status.success() => {
             parse_worktree_porcelain(&String::from_utf8_lossy(&output.stdout))
         }
@@ -749,21 +1039,31 @@ pub(crate) async fn list_worktrees(cwd: &str) -> Vec<WorkspaceRootView> {
     }
 }
 
+/// One `git worktree list --porcelain` record, before any filtering.
+struct WorktreeRecord {
+    path: String,
+    branch: Option<String>,
+    is_main: bool,
+    bare: bool,
+    /// git's own marker for "registered, but its directory is gone".
+    prunable: bool,
+}
+
 /// Parse the NUL-terminated (`-z`) form: every field ends with `\0`, and an empty
 /// field separates records. Preferred because it is unambiguous for any path.
-fn parse_worktree_porcelain_z(text: &str) -> Vec<WorkspaceRootView> {
+fn parse_worktree_porcelain_z(text: &str) -> Vec<WorktreeRecord> {
     parse_worktree_records(text.split('\0'))
 }
 
 /// Parse the newline form. Fallback only: a path containing a newline cannot be
 /// recovered from this encoding.
-fn parse_worktree_porcelain(text: &str) -> Vec<WorkspaceRootView> {
+fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeRecord> {
     parse_worktree_records(text.split('\n'))
 }
 
 /// Shared record assembly for both encodings. An empty field/line closes the current
 /// record; the first record is always the repository's main worktree.
-fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<WorkspaceRootView> {
+fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<WorktreeRecord> {
     let mut records: Vec<Vec<&str>> = Vec::new();
     let mut current: Vec<&str> = Vec::new();
     for field in fields {
@@ -804,19 +1104,17 @@ fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<Work
             }
             // `detached` needs no handling: branch simply stays None.
         }
-        // Neither a bare repo nor a prunable entry has a working tree to diff. Prunable
-        // is the `rm -rf`-without-`git worktree remove` case: git keeps listing it until
-        // pruned, and offering it would be an option guaranteed to fail. Note `is_main`
-        // keys off the RECORD index, so skipping a record cannot promote the next
-        // worktree to "main".
-        if bare || prunable {
-            continue;
-        }
+        // Records are kept VERBATIM here, bare and prunable included — filtering is the
+        // caller's decision (`list_worktrees` drops them; the deleted-workspace identity
+        // check needs precisely the prunable ones). `is_main` keys off the RECORD index,
+        // so a filtered-out record can never promote the next worktree to "main".
         if let Some(path) = path {
-            roots.push(WorkspaceRootView {
+            roots.push(WorktreeRecord {
                 path: path.to_string(),
                 branch,
                 is_main: index == 0,
+                bare,
+                prunable,
             });
         }
     }
@@ -826,6 +1124,71 @@ fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<Work
 /// How far back through a thread's transcript to look for evidence of where it has
 /// been writing. Bounded so a long thread cannot make the diff endpoint expensive.
 const SUGGESTED_ROOT_SCAN_LIMIT: usize = 200;
+
+/// One line telling a reviewer WHICH working tree it is being handed — path, branch, and
+/// whether that is the repo's main tree or a linked worktree — plus, when this is not the
+/// reviewed thread's own directory, why it isn't.
+///
+/// Without it a reviewer silently reasons about the wrong branch, and there are two
+/// routine ways the tree differs from the thread's cwd: the thread's agent worktree was
+/// removed once its work landed, or the thread moved between the repo and a worktree
+/// mid-session (so its edits are no longer where it started).
+pub(crate) struct WorkingTreeNotice<'a> {
+    /// The tree the diff was taken from.
+    pub(crate) cwd: &'a str,
+    /// In-scope working trees of that repo, for naming the branch and main/linked kind.
+    pub(crate) roots: &'a [WorkspaceRootView],
+    /// The reviewed thread's own recorded cwd.
+    pub(crate) reviewed_thread_cwd: Option<&'a str>,
+}
+
+pub(crate) fn describe_working_tree(notice: WorkingTreeNotice<'_>) -> String {
+    let WorkingTreeNotice {
+        cwd,
+        roots,
+        reviewed_thread_cwd: recorded_cwd,
+    } = notice;
+    let matched = roots.iter().find(|root| paths_equivalent(&root.path, cwd));
+    let mut line = match matched {
+        Some(root) => {
+            let kind = if root.is_main {
+                "the repository's main working tree"
+            } else {
+                "a linked git worktree"
+            };
+            match root.branch.as_deref() {
+                Some(branch) => {
+                    format!("Working tree under review: {cwd} (branch {branch}, {kind})")
+                }
+                None => format!("Working tree under review: {cwd} (detached HEAD, {kind})"),
+            }
+        }
+        None => format!("Working tree under review: {cwd}"),
+    };
+    match recorded_cwd {
+        Some(recorded)
+            if !recorded.is_empty() && !paths_equivalent_allowing_missing(recorded, cwd) =>
+        {
+            if dir_exists(recorded) {
+                line.push_str(&format!(
+                    ". The reviewed session's own directory is {recorded}; this tree is \
+where its recent edits actually landed."
+                ));
+            } else {
+                line.push_str(&format!(
+                    ". The workspace the reviewed session ran in ({recorded}) no longer \
+exists, so this is the workspace that owned it."
+                ));
+            }
+        }
+        _ => {}
+    }
+    // No "your own cwd differs" caveat here on purpose: a reviewer thread is always created
+    // in, or refused for, the tree under review (see `resolve_review_workspace` and the
+    // reuse gate), so a mismatch is prevented structurally rather than explained in prose the
+    // reviewer may ignore.
+    line
+}
 
 /// Which enumerated root a thread's recent writes actually landed in, given its tool
 /// calls most-recent-first. Returns `None` when there is no usable evidence.
@@ -848,6 +1211,47 @@ pub(crate) fn suggested_root_from_tools<'a>(
     tools: impl Iterator<Item = (&'a ToolCallView, &'a str)>,
     roots: &[WorkspaceRootView],
 ) -> Option<String> {
+    suggested_root_from_paths(&landed_write_paths(tools), roots)
+}
+
+/// The paths a thread's recent tool calls actually WROTE, most-recent-first.
+///
+/// Split out from `suggested_root_from_tools` so a caller that has to enumerate roots
+/// asynchronously (the review path: it needs git, and holding the relay lock across an
+/// await is not an option) can lift this evidence out under the lock without cloning
+/// whole tool views and their diff bodies.
+pub(crate) fn landed_write_paths<'a>(
+    tools: impl Iterator<Item = (&'a ToolCallView, &'a str)>,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    for (tool, status) in tools {
+        if !is_landed_file_change(tool, status) {
+            continue;
+        }
+        // Only the changes that actually carry content — an entry may mix a landed
+        // write with one that did not. `tool.path` is consulted solely as the
+        // single-file shorthand when the entry carries no per-change paths at all
+        // (see claude.rs's fallback), and only for an entry already judged landed.
+        paths.extend(
+            tool.file_changes
+                .iter()
+                .filter(|change| tool.file_changes_omitted || !change.diff.is_empty())
+                .map(|change| change.path.clone()),
+        );
+        if tool.file_changes.is_empty() {
+            if let Some(shorthand) = tool.path.as_deref() {
+                paths.push(shorthand.to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// Which enumerated root the given write paths (most-recent-first) landed in.
+pub(crate) fn suggested_root_from_paths(
+    paths: &[String],
+    roots: &[WorkspaceRootView],
+) -> Option<String> {
     if roots.is_empty() {
         return None;
     }
@@ -863,32 +1267,9 @@ pub(crate) fn suggested_root_from_tools<'a>(
         })
         .collect();
 
-    for (tool, status) in tools {
-        if !is_landed_file_change(tool, status) {
-            continue;
-        }
-        // Only the changes that actually carry content — an entry may mix a landed
-        // write with one that did not. `tool.path` is consulted solely as the
-        // single-file shorthand when the entry carries no per-change paths at all
-        // (see claude.rs's fallback), and only for an entry already judged landed.
-        let landed_changes = tool
-            .file_changes
-            .iter()
-            .filter(|change| tool.file_changes_omitted || !change.diff.is_empty())
-            .map(|change| change.path.as_str());
-        let shorthand = tool
-            .file_changes
-            .is_empty()
-            .then(|| tool.path.as_deref())
-            .flatten();
-        let candidates = landed_changes.chain(shorthand);
-        for candidate in candidates {
-            if let Some(matched) = match_longest_root(candidate, &normalized) {
-                return Some(matched);
-            }
-        }
-    }
-    None
+    paths
+        .iter()
+        .find_map(|candidate| match_longest_root(candidate, &normalized))
 }
 
 /// Whether this transcript entry represents a file write that actually reached disk.
@@ -947,9 +1328,12 @@ pub(crate) fn paths_equivalent(a: &str, b: &str) -> bool {
     }
 }
 
-async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, String> {
+async fn collect_workspace_diff_in(
+    workspace: &LiveWorkspace,
+) -> Result<WorkspaceDiffResponse, String> {
+    let cwd = workspace.as_str();
     let generated_at = unix_now();
-    let inside = run_git_capture(cwd, &["rev-parse", "--is-inside-work-tree"]).await?;
+    let inside = run_git_capture(workspace, &["rev-parse", "--is-inside-work-tree"]).await?;
     if !inside.status.success() {
         return Ok(WorkspaceDiffResponse {
             cwd: cwd.to_string(),
@@ -962,11 +1346,13 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
             suggested_root: None,
             suggested_root_known: true,
             unavailable: false,
+            // Attached by the caller, which owns the fallback decision.
+            fallback_from: None,
             generated_at,
         });
     }
 
-    let tracked = run_git_capture(cwd, &["diff", "--no-color", "HEAD"]).await?;
+    let tracked = run_git_capture(workspace, &["diff", "--no-color", "HEAD"]).await?;
     if !tracked.status.success() {
         let stderr = String::from_utf8_lossy(&tracked.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -979,8 +1365,11 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
         truncate_to_char_boundary(tracked.stdout, WORKSPACE_DIFF_MAX_BYTES);
     let mut file_changes = split_unified_diff_by_file(&tracked_diff);
 
-    let untracked_listing =
-        run_git_capture(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]).await?;
+    let untracked_listing = run_git_capture(
+        workspace,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
     let mut untracked_truncated = false;
     if untracked_listing.status.success() {
         for raw_path in untracked_listing.stdout.split(|byte| *byte == 0) {
@@ -991,7 +1380,7 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
                 Ok(value) => value.to_string(),
                 Err(_) => continue,
             };
-            match synthesize_untracked_diff(cwd, &path).await {
+            match synthesize_untracked_diff_in(workspace, &path).await {
                 Ok((diff, file_truncated)) => {
                     if file_truncated {
                         untracked_truncated = true;
@@ -1024,14 +1413,25 @@ async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, Stri
         roots: Vec::new(),
         suggested_root: None,
         unavailable: false,
+        // Attached by the caller, which owns the fallback decision.
+        fallback_from: None,
         generated_at,
     })
 }
 
-async fn run_git_capture(cwd: &str, args: &[&str]) -> Result<std::process::Output, String> {
+async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, String> {
+    let workspace =
+        LiveWorkspace::from_path(cwd).ok_or_else(|| format!("workspace {cwd} no longer exists"))?;
+    collect_workspace_diff_in(&workspace).await
+}
+
+async fn run_git_capture(
+    workspace: &LiveWorkspace,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     Command::new("git")
         .args(args)
-        .current_dir(cwd)
+        .current_dir(workspace.as_str())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -1051,10 +1451,13 @@ fn truncate_to_char_boundary(mut bytes: Vec<u8>, limit: usize) -> (String, bool)
     (String::from_utf8_lossy(&bytes).into_owned(), true)
 }
 
-async fn synthesize_untracked_diff(cwd: &str, rel_path: &str) -> Result<(String, bool), String> {
+async fn synthesize_untracked_diff_in(
+    workspace: &LiveWorkspace,
+    rel_path: &str,
+) -> Result<(String, bool), String> {
     use tokio::io::AsyncReadExt;
 
-    let abs = std::path::Path::new(cwd).join(rel_path);
+    let abs = std::path::Path::new(workspace.as_str()).join(rel_path);
     let metadata = tokio::fs::metadata(&abs)
         .await
         .map_err(|error| format!("stat failed for {rel_path}: {error}"))?;
@@ -1107,6 +1510,13 @@ async fn synthesize_untracked_diff(cwd: &str, rel_path: &str) -> Result<(String,
         }
     }
     Ok((diff, truncated))
+}
+
+#[cfg(test)]
+async fn synthesize_untracked_diff(cwd: &str, rel_path: &str) -> Result<(String, bool), String> {
+    let workspace =
+        LiveWorkspace::from_path(cwd).ok_or_else(|| format!("workspace {cwd} no longer exists"))?;
+    synthesize_untracked_diff_in(&workspace, rel_path).await
 }
 
 #[derive(Debug)]

@@ -414,8 +414,30 @@ export function WorkspaceChangesPanel({ store }) {
   );
 }
 
+// The server substitutes a workspace when the one a session ran in has stopped existing
+// (an agent worktree removed once its work landed). That beats the raw
+// `git rev-parse ... (os error 2)` it used to surface, but it must never be silent: an
+// unlabelled fallback reads as "this session's changes" while showing another tree's.
+function FallbackWorkspaceNote({ state }) {
+  const from = state.data?.fallback_from;
+  if (!from) return null;
+  const gone = basename(from);
+  const shown = basename(state.data?.cwd || "");
+  return h(
+    "p",
+    { className: "workspace-changes-fallback-note", title: `${from} → ${state.data?.cwd || ""}` },
+    shown
+      ? `Worktree ${gone} no longer exists — showing ${shown} instead.`
+      : `Worktree ${gone} no longer exists.`
+  );
+}
+
+function basename(path) {
+  return path.split("/").filter(Boolean).pop() || path;
+}
+
 function rootLabel(root) {
-  const name = root.path.split("/").filter(Boolean).pop() || root.path;
+  const name = basename(root.path);
   const branch = root.branch || "detached";
   return root.is_main ? `${branch} · ${name}` : `${branch} · ${name} (worktree)`;
 }
@@ -539,6 +561,9 @@ function WorkspaceChangesEntry({ store, state, stats, expanded }) {
           renderDiffContent(state, "rail")
         )
       : null,
+    // Shown whether or not the row is expanded: which tree these stats belong to is
+    // exactly the thing a collapsed row hides.
+    h(FallbackWorkspaceNote, { state }),
     !expanded && isError
       ? h(
           "p",
@@ -781,6 +806,7 @@ export function WorkspaceDiffSheetBody({ store }) {
             : null
         )
       : null,
+    h(FallbackWorkspaceNote, { state }),
     // Same compact row as the rail, so the panel reads identically on desktop
     // and phone. `.workspace-diff-sheet-body` is what scales it up to touch
     // targets — this surface is only ever reached from the mobile chip.

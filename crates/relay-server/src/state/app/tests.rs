@@ -82,6 +82,22 @@ statuses aren't misread as busy:\n  {line}",
     }
 }
 
+/// Shared provider-double contract: a thread keeps the cwd it was created with, and
+/// provider operations that drive it fail once that directory has been removed.
+fn require_live_test_cwd(
+    provider: &str,
+    thread_id: &str,
+    action: &str,
+    recorded: Option<String>,
+) -> Result<(), String> {
+    match recorded {
+        Some(cwd) if !std::path::Path::new(&cwd).is_dir() => Err(format!(
+            "{provider}: cannot {action} '{thread_id}': its workspace {cwd} no longer exists"
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod workspace_diff_tests {
     use super::super::{
@@ -143,7 +159,7 @@ worktree /repo/detached
 HEAD cccc3333
 detached
 ";
-        let roots = super::super::parse_worktree_porcelain(text);
+        let roots = super::super::diffable_roots(super::super::parse_worktree_porcelain(text));
         assert_eq!(roots.len(), 3, "got {roots:?}");
 
         assert_eq!(roots[0].path, "/repo/main");
@@ -174,7 +190,7 @@ worktree /repo/feature
 HEAD bbbb2222
 branch refs/heads/feature
 ";
-        let roots = super::super::parse_worktree_porcelain(text);
+        let roots = super::super::diffable_roots(super::super::parse_worktree_porcelain(text));
         assert_eq!(
             roots.len(),
             1,
@@ -193,7 +209,7 @@ branch refs/heads/feature
     fn porcelain_z_preserves_paths_with_newlines_and_trailing_space() {
         // NUL-terminated lines; an empty line (i.e. "\0\0") separates records.
         let text = "worktree /repo/we\nird\0HEAD aaaa\0branch refs/heads/main\0\0worktree /repo/trailing \0HEAD bbbb\0branch refs/heads/f\0\0";
-        let roots = super::super::parse_worktree_porcelain_z(text);
+        let roots = super::super::diffable_roots(super::super::parse_worktree_porcelain_z(text));
         assert_eq!(roots.len(), 2, "got {roots:?}");
         assert_eq!(
             roots[0].path, "/repo/we\nird",
@@ -227,7 +243,7 @@ worktree /repo/alive
 HEAD cccc
 branch refs/heads/alive
 ";
-        let roots = super::super::parse_worktree_porcelain(text);
+        let roots = super::super::diffable_roots(super::super::parse_worktree_porcelain(text));
         let paths: Vec<&str> = roots.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, vec!["/repo/main", "/repo/alive"], "got {roots:?}");
         assert!(roots[0].is_main);
@@ -239,8 +255,13 @@ branch refs/heads/alive
 
     #[test]
     fn porcelain_handles_empty_and_trailing_whitespace() {
-        assert!(super::super::parse_worktree_porcelain("").is_empty());
-        assert!(super::super::parse_worktree_porcelain("\n\n\n").is_empty());
+        assert!(
+            super::super::diffable_roots(super::super::parse_worktree_porcelain("")).is_empty()
+        );
+        assert!(
+            super::super::diffable_roots(super::super::parse_worktree_porcelain("\n\n\n"))
+                .is_empty()
+        );
     }
 
     // The Undo / Reapply control ends here: the stored diff is piped to `git apply`
@@ -439,6 +460,7 @@ branch refs/heads/alive
 #[cfg(test)]
 mod path_scope_tests {
     use super::super::*;
+    use super::require_live_test_cwd;
     use crate::codex::CodexBridge;
     use crate::fake_provider::FakeProviderBridge;
     use crate::protocol::{
@@ -660,6 +682,355 @@ mod path_scope_tests {
             .expect("linked root present");
         assert!(!linked_root.is_main);
         assert_eq!(linked_root.branch.as_deref(), Some("feature"));
+    }
+
+    // ---- L3: the thread's worktree stopped existing --------------------------------
+    //
+    // Build a repo whose linked worktree lives UNDER the main one, mirroring how this
+    // project makes agent worktrees (`<repo>/.claude/worktrees/<name>`). Returns
+    // (main_path, nested_worktree_path).
+    async fn init_repo_with_nested_worktree(root: &std::path::Path) -> (String, String) {
+        async fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let main = root.join("mainwt");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]).await;
+        git(&main, &["config", "user.email", "t@example.com"]).await;
+        git(&main, &["config", "user.name", "T"]).await;
+        std::fs::write(main.join("seed.txt"), "line1\n").unwrap();
+        git(&main, &["add", "seed.txt"]).await;
+        git(&main, &["commit", "-q", "-m", "seed"]).await;
+
+        let nested = main.join(".claude").join("worktrees").join("wt-gone");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "worktree-wt-gone",
+                nested.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        (
+            main.to_string_lossy().to_string(),
+            nested.to_string_lossy().to_string(),
+        )
+    }
+
+    // L3: a thread keeps the cwd it was born in forever, but an agent worktree gets
+    // REMOVED once its work has landed. Every git command we spawn in a directory that
+    // no longer exists fails at SPAWN time with ENOENT, and the panel rendered that
+    // verbatim: "Failed to load: failed to run git rev-parse --is-inside-work-tree: No
+    // such file or directory (os error 2)". A vanished workspace must degrade to the
+    // repo it lived in, not to an error.
+    #[tokio::test]
+    async fn workspace_diff_falls_back_when_the_threads_worktree_was_removed() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, nested_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = nested_cwd.clone();
+        }
+        // An uncommitted change in the MAIN tree, so a working fallback is
+        // distinguishable from "clean" and from "unavailable".
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\n",
+        )
+        .unwrap();
+
+        // The directory disappears WITHOUT `git worktree remove` — what a deleted
+        // `.claude/worktrees/<name>` leaves behind (git still lists it, as prunable).
+        std::fs::remove_dir_all(&nested_cwd).unwrap();
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .await
+            .expect("a removed worktree must not surface a raw git spawn error");
+
+        assert!(
+            !response.unavailable,
+            "a removed worktree must fall back to a real workspace, not blank out"
+        );
+        assert!(
+            same_path(&response.cwd, &main_cwd),
+            "expected the fallback to the repo the worktree lived in, got {}",
+            response.cwd
+        );
+        assert_eq!(
+            response
+                .fallback_from
+                .as_deref()
+                .map(|from| same_path(from, &nested_cwd)),
+            Some(true),
+            "the panel must be told WHICH workspace vanished, so it can say so: {:?}",
+            response.fallback_from
+        );
+        assert!(
+            response
+                .file_changes
+                .iter()
+                .any(|change| change.path.ends_with("seed.txt")),
+            "the fallback must actually diff the fallback workspace: {:?}",
+            response
+                .file_changes
+                .iter()
+                .map(|c| c.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The picker recovers too: enumerating from a directory that does not exist
+        // returned no roots at all, stranding the user with nothing to switch to.
+        assert!(
+            response
+                .roots
+                .iter()
+                .any(|root| same_path(&root.path, &main_cwd)),
+            "the fallback must re-enumerate selectable roots"
+        );
+    }
+
+    // TOCTOU: resolving a workspace and spawning git in it are two steps, and the cleanup
+    // that removes an agent worktree can land between them — which would resurface the exact
+    // raw ENOENT this whole fix exists to remove. Collecting must re-resolve and retry once.
+    // Driven at the seam (a target that is already gone by the time we collect) rather than
+    // with a real race, so it is deterministic.
+    #[tokio::test]
+    async fn a_workspace_deleted_between_resolve_and_git_is_retried() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, vanishing_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nEDITED-IN-MAIN\n",
+        )
+        .unwrap();
+        // Stands in for "it existed when we resolved it, and was deleted a moment later".
+        std::fs::remove_dir_all(&vanishing_cwd).unwrap();
+
+        let (response, fallback_from) =
+            super::super::collect_workspace_diff_resilient(&vanishing_cwd, &main_cwd, &[], &[])
+                .await
+                .expect("a workspace that vanished mid-flight must not surface a git spawn error");
+
+        assert!(
+            same_path(&response.cwd, &main_cwd),
+            "the retry must land on the surviving workspace; got {}",
+            response.cwd
+        );
+        assert!(
+            response.diff.contains("EDITED-IN-MAIN"),
+            "the retry must produce the fallback workspace's real diff"
+        );
+        assert_eq!(
+            fallback_from
+                .as_deref()
+                .map(|from| same_path(from, &vanishing_cwd)),
+            Some(true),
+            "the retry must still report WHICH workspace vanished"
+        );
+    }
+
+    // …and when nothing related survives, the retry must fail closed rather than error out
+    // or reach for an unrelated repo.
+    #[tokio::test]
+    async fn a_vanished_workspace_with_no_survivor_reports_unavailable() {
+        let tmp = TempDir::new().expect("tmp");
+        // A plain (non-repo) directory tree, so neither identity check can find an owner.
+        let orphan = tmp.path().join("no-repo-here").join("gone");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let orphan_cwd = orphan.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&orphan).unwrap();
+
+        let (response, fallback_from) =
+            super::super::collect_workspace_diff_resilient(&orphan_cwd, "", &[], &[])
+                .await
+                .expect("no error, just unavailable");
+        assert!(response.unavailable);
+        assert!(fallback_from.is_none());
+    }
+
+    // L3 fail-closed, the case device scope CANNOT catch: an unrestricted local operator.
+    // Substituting a workspace is only defensible when the substitute is provably related
+    // to the one that vanished. `relay.current_cwd` carries no such relation — it is just
+    // wherever the most recent session was started — so on an unrestricted relay a deleted
+    // sibling worktree would hand thread A the diff of whatever unrelated project happens
+    // to be active. That is the exact leak the fail-closed rule in `workspace_diff` exists
+    // to prevent.
+    #[tokio::test]
+    async fn workspace_diff_never_crosses_into_an_unrelated_repo() {
+        let tmp = TempDir::new().expect("tmp");
+        // Repo A owns the thread's worktree (a sibling checkout, so nothing above it can
+        // identify the repo once it is deleted).
+        let (_repo_a_main, gone_cwd) = init_repo_with_worktree(tmp.path()).await;
+        // Repo B is an entirely different project that merely happens to be the relay's
+        // current workspace.
+        let other = TempDir::new().expect("other repo");
+        let (repo_b_main, _repo_b_linked) = init_repo_with_worktree(other.path()).await;
+        std::fs::write(
+            std::path::Path::new(&repo_b_main).join("seed.txt"),
+            "line1\nSECRET-FROM-AN-UNRELATED-PROJECT\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&repo_b_main).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = gone_cwd.clone();
+        }
+        std::fs::remove_dir_all(&gone_cwd).unwrap();
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .await
+            .expect("a deleted workspace must not error");
+        assert!(
+            response.unavailable,
+            "with no workspace provably related to the deleted one, this must fail closed; \
+got cwd {}",
+            response.cwd
+        );
+        assert!(
+            !response.diff.contains("SECRET-FROM-AN-UNRELATED-PROJECT"),
+            "an unrelated project's diff must never be shown under this thread"
+        );
+        assert!(response.fallback_from.is_none());
+    }
+
+    // ...and when a substitute IS provably related, it must be the repo's MAIN tree, not
+    // whatever tree the relay happens to be sitting in. git still lists a deleted worktree
+    // (as prunable), which is what establishes that the repo owned it.
+    #[tokio::test]
+    async fn workspace_diff_falls_back_to_the_repo_that_registered_the_removed_worktree() {
+        async fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, gone_cwd) = init_repo_with_worktree(tmp.path()).await;
+        // A SECOND worktree of the same repo, which is where the relay happens to be.
+        let other_wt = tmp.path().join("otherwt");
+        git(
+            std::path::Path::new(&main_cwd),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                other_wt.to_str().unwrap(),
+            ],
+        )
+        .await;
+        let other_cwd = other_wt.to_string_lossy().to_string();
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nEDITED-IN-MAIN-TREE\n",
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&other_cwd).join("seed.txt"),
+            "line1\nEDITED-IN-THE-OTHER-WORKTREE\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&other_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = gone_cwd.clone();
+        }
+        std::fs::remove_dir_all(&gone_cwd).unwrap();
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .await
+            .expect("a deleted worktree must not error");
+        assert!(!response.unavailable);
+        assert!(
+            same_path(&response.cwd, &main_cwd),
+            "the substitute must be the repo's main tree, not the tree the relay sits in; \
+got {}",
+            response.cwd
+        );
+        assert!(
+            response.diff.contains("EDITED-IN-MAIN-TREE")
+                && !response.diff.contains("EDITED-IN-THE-OTHER-WORKTREE"),
+            "the main tree's diff is what must be shown"
+        );
+        assert_eq!(
+            response
+                .fallback_from
+                .as_deref()
+                .map(|from| same_path(from, &gone_cwd)),
+            Some(true)
+        );
+    }
+
+    // L3 fail-closed: falling back must never WIDEN what a narrow-scoped device sees. A
+    // device scoped to the (now deleted) worktree alone gets "unavailable" — never the
+    // enclosing repo's diff, which is outside its scope.
+    #[tokio::test]
+    async fn workspace_diff_fallback_never_escapes_the_device_scope() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, nested_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = nested_cwd.clone();
+        }
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nSECRET-OUTSIDE-THE-SCOPE\n",
+        )
+        .unwrap();
+        pair_device(&app, "device-narrow", vec![nested_cwd.clone()]).await;
+
+        std::fs::remove_dir_all(&nested_cwd).unwrap();
+
+        let response = app
+            .workspace_diff(
+                Some("device-narrow".to_string()),
+                Some("thread-a".to_string()),
+                None,
+                false,
+            )
+            .await
+            .expect("a removed worktree must not error, even for a scoped device");
+        assert!(
+            response.unavailable,
+            "no in-scope workspace is left, so this must fail closed"
+        );
+        assert!(
+            !response.diff.contains("SECRET-OUTSIDE-THE-SCOPE"),
+            "the fallback must not reach outside the device scope"
+        );
+        assert!(response.fallback_from.is_none());
     }
 
     // A real repo with SEVERAL linked worktrees, including a detached one. Every other
@@ -1089,6 +1460,54 @@ mod path_scope_tests {
             auto.cwd
         );
         assert!(auto.file_changes[0].diff.contains("EDITED-IN-WORKTREE"));
+    }
+
+    // The MIRROR of the case above, which nothing pinned: a thread that was born in a
+    // worktree and has moved back to the main tree (its worktree merged, the agent
+    // carried on in the repo). The panel has to follow in that direction too, or every
+    // post-merge session shows a stale worktree's diff.
+    #[tokio::test]
+    async fn auto_root_lands_back_on_the_main_tree_when_the_thread_moved_back() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nEDITED-IN-MAIN\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            // Born in the worktree...
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = linked_cwd.clone();
+            // ...but its landed writes are now in the main tree.
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let response = app
+            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(response.suggested_root.as_deref().unwrap_or(""), &main_cwd),
+            "the main tree must be suggested once the thread writes there; got {:?}",
+            response.suggested_root
+        );
+        assert!(
+            same_path(&response.cwd, &main_cwd),
+            "auto_root must follow the thread back to the main tree; got {}",
+            response.cwd
+        );
+        assert!(
+            response
+                .file_changes
+                .iter()
+                .any(|change| change.diff.contains("EDITED-IN-MAIN")),
+            "the diff must be the main tree's"
+        );
     }
 
     // No evidence, or evidence pointing at the session's own cwd, is nothing to suggest:
@@ -2369,7 +2788,14 @@ mod path_scope_tests {
             _approval_policy: &str,
             _sandbox: &str,
         ) -> Result<(), String> {
-            if self.threads.lock().await.contains_key(thread_id) {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            if recorded.is_some() {
+                require_live_test_cwd(self.name, thread_id, "resume", recorded)?;
                 self.resume_thread_ids
                     .lock()
                     .await
@@ -2445,6 +2871,13 @@ mod path_scope_tests {
             effort: &str,
             images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
             self.turn_thread_ids
                 .lock()
                 .await
@@ -4458,10 +4891,17 @@ mod path_scope_tests {
 
         async fn resume_thread(
             &self,
-            _thread_id: &str,
+            thread_id: &str,
             _approval_policy: &str,
             _sandbox: &str,
         ) -> Result<(), String> {
+            let recorded = self
+                .threads
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "resume", recorded)?;
             Ok(())
         }
 
@@ -4516,6 +4956,13 @@ mod path_scope_tests {
             _effort: &str,
             _images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
             Ok(Some(format!("{thread_id}-turn")))
         }
 
@@ -4705,7 +5152,14 @@ mod path_scope_tests {
             _approval_policy: &str,
             _sandbox: &str,
         ) -> Result<(), String> {
-            if self.threads.lock().await.contains_key(thread_id) {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.summary.cwd.clone());
+            if recorded.is_some() {
+                require_live_test_cwd("consumed-initial", thread_id, "resume", recorded)?;
                 Ok(())
             } else {
                 Err(format!(
@@ -4762,12 +5216,19 @@ mod path_scope_tests {
 
         async fn start_turn(
             &self,
-            _thread_id: &str,
+            thread_id: &str,
             _text: &str,
             _model: &str,
             _effort: &str,
             _images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.summary.cwd.clone());
+            require_live_test_cwd("consumed-initial", thread_id, "start a turn for", recorded)?;
             Err("consumed-initial provider does not support follow-up turns".to_string())
         }
 
@@ -6486,7 +6947,14 @@ mod path_scope_tests {
             })
         }
 
-        async fn resume_thread(&self, _t: &str, _a: &str, _s: &str) -> Result<(), String> {
+        async fn resume_thread(&self, thread_id: &str, _a: &str, _s: &str) -> Result<(), String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "resume", recorded)?;
             Ok(())
         }
 
@@ -6533,12 +7001,19 @@ mod path_scope_tests {
 
         async fn start_turn(
             &self,
-            _t: &str,
+            thread_id: &str,
             _text: &str,
             model: &str,
             _e: &str,
             _images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
+            let recorded = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone());
+            require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
             self.seen_models.lock().await.push(model.to_string());
             if let Some(err) = self.reject(model) {
                 return Err(err);
@@ -6674,6 +7149,7 @@ mod path_scope_tests {
 #[cfg(test)]
 mod review_tests {
     use super::super::*;
+    use super::require_live_test_cwd;
     use crate::protocol::{
         ModelOptionView, RequestReviewInput, SendMessageInput, StartSessionInput,
         StartWorkflowInput, StopTurnInput, TakeOverInput, ThreadSummaryView, TranscriptEntryKind,
@@ -6740,6 +7216,10 @@ mod review_tests {
         // other thread deletes fine. Lets a test fail ONLY a reviewer delete while
         // the parent delete still succeeds (the F1 un-hide-on-failure path).
         fail_delete_thread_ids: Arc<Mutex<std::collections::HashSet<String>>>,
+        // Thread ids whose provider-backed hydration probe should fail. Used to
+        // prove a transient `read_thread` error is surfaced as a provider failure,
+        // never misdiagnosed as a cross-worktree reviewer mismatch.
+        fail_read_thread_ids: Arc<Mutex<std::collections::HashSet<String>>>,
         // (thread_id, model, effort) recorded at each start_turn, so a test can
         // assert the model/effort a reviewer turn actually ran with (reuse must keep
         // the reviewer's own model, not the parent's).
@@ -6766,6 +7246,21 @@ mod review_tests {
         // code. Lets a test assert the NEXT round re-reviews the REFRESHED workspace
         // diff (the marker surfaces in the reviewer's re-review prompt).
         mutate_cwd_on_fix_turn: Arc<Mutex<Option<String>>>,
+        // When set, a parent FIX turn DELETES this directory — modeling an agent worktree
+        // that gets cleaned up while a multi-round review is still in flight.
+        delete_dir_on_fix_turn: Arc<Mutex<Option<String>>>,
+        // When set, a turn whose prompt contains the marker DELETES the given directory
+        // before the provider's own cwd check runs — modeling a workspace that vanishes
+        // between our liveness check and the provider call. One-shot, so the degrade/retry
+        // path must then succeed.
+        delete_dir_when_prompt_contains: Arc<Mutex<Option<(String, String)>>>,
+        // Extra text the reviewer appends to its reply, one entry per reviewer turn (FIFO).
+        // Lets a test give round 1 a uniquely identifiable finding.
+        reviewer_notes: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // When set (absolute file path, marker), a parent FIX turn edits THAT file and
+        // records the landed change in its transcript — modeling an author whose fix lands
+        // in a different working tree than the one round 1 reviewed.
+        landed_edit_on_fix_turn: Arc<Mutex<Option<(String, String)>>>,
         // Threads "evicted" by a simulated provider/app-server restart: a turn can't
         // start on one until it is re-loaded via `resume_thread`. Models Codex, where
         // approvalPolicy/sandbox attach on thread/resume, not turn/start.
@@ -6809,12 +7304,17 @@ mod review_tests {
                 fail_archive: Arc::new(AtomicBool::new(false)),
                 fail_delete: Arc::new(AtomicBool::new(false)),
                 fail_delete_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 raise_approval_on_fix_turn: Arc::new(AtomicBool::new(false)),
                 suppress_fix_reply: Arc::new(AtomicBool::new(false)),
                 mutate_cwd_on_fix_turn: Arc::new(Mutex::new(None)),
+                delete_dir_on_fix_turn: Arc::new(Mutex::new(None)),
+                landed_edit_on_fix_turn: Arc::new(Mutex::new(None)),
+                delete_dir_when_prompt_contains: Arc::new(Mutex::new(None)),
+                reviewer_notes: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 unloaded_threads: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 resumes: Arc::new(Mutex::new(Vec::new())),
                 complete_delay_ms: Arc::new(AtomicU64::new(15)),
@@ -6844,6 +7344,22 @@ mod review_tests {
                 provider: self.name.to_string(),
                 forked_from: None,
             }
+        }
+
+        /// A real provider keeps each thread bound to the cwd it was created with and
+        /// re-sends it on every turn (see `claude.rs`, which hands the worker the thread's
+        /// stored cwd), so a turn in a directory that has been deleted fails AT THE
+        /// PROVIDER. Modeling that is what keeps "the workspace was removed" tests honest:
+        /// a fake that ignores cwd reports success for turns a real agent could never run.
+        async fn require_live_cwd(&self, thread_id: &str, action: &str) -> Result<(), String> {
+            let recorded = self
+                .start_thread_cwds
+                .lock()
+                .await
+                .iter()
+                .find(|(id, _)| id == thread_id)
+                .map(|(_, cwd)| cwd.clone());
+            require_live_test_cwd(self.name, thread_id, action, recorded)
         }
     }
 
@@ -6911,6 +7427,7 @@ mod review_tests {
             if !self.threads.lock().await.contains_key(thread_id) {
                 return Err(format!("{} thread '{thread_id}' was not found", self.name));
             }
+            self.require_live_cwd(thread_id, "resume").await?;
             // Record the resume settings and re-load the thread into the (simulated)
             // app-server so a turn can start on it.
             self.resumes.lock().await.push((
@@ -6926,6 +7443,12 @@ mod review_tests {
             &self,
             thread_id: &str,
         ) -> Result<crate::provider::ThreadSyncData, String> {
+            if self.fail_read_thread_ids.lock().await.contains(thread_id) {
+                return Err(format!(
+                    "{} provider probe failed for '{thread_id}': PROBE_UNAVAILABLE",
+                    self.name
+                ));
+            }
             let thread = self
                 .threads
                 .lock()
@@ -6996,6 +7519,16 @@ mod review_tests {
                     self.name
                 ));
             }
+            {
+                let mut hook = self.delete_dir_when_prompt_contains.lock().await;
+                if let Some((marker, dir)) = hook.clone() {
+                    if text.contains(&marker) {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        *hook = None;
+                    }
+                }
+            }
+            self.require_live_cwd(thread_id, "start a turn for").await?;
             self.turns
                 .lock()
                 .await
@@ -7049,6 +7582,53 @@ mod review_tests {
             // marker to the tracked `seed.txt` in this thread's cwd, so the NEXT
             // round's freshly-collected workspace diff reflects the change.
             if is_fix_turn {
+                if let Some(doomed) = self.delete_dir_on_fix_turn.lock().await.take() {
+                    let _ = std::fs::remove_dir_all(&doomed);
+                }
+                if let Some((path, marker)) = self.landed_edit_on_fix_turn.lock().await.take() {
+                    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+                    contents.push_str(&marker);
+                    contents.push('\n');
+                    std::fs::write(&path, contents).expect("author fix should edit its file");
+                    // A real provider also reports the write, which is the evidence that
+                    // says WHERE the author is now working.
+                    let mut relay = self.state.write().await;
+                    let runtime = relay.ensure_runtime_for_thread(&thread_id);
+                    let item_id = format!("fix-edit-{}", runtime.transcript.len());
+                    runtime
+                        .transcript
+                        .push(crate::state::relay::TranscriptRecord {
+                            item_id,
+                            kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                            text: None,
+                            status: "completed".to_string(),
+                            turn_id: Some("turn-fix".to_string()),
+                            tool: Some(crate::protocol::ToolCallView {
+                                item_type: "fileChange".to_string(),
+                                name: "Edit".to_string(),
+                                title: "Edit".to_string(),
+                                detail: None,
+                                query: None,
+                                path: None,
+                                url: None,
+                                command: None,
+                                input_preview: None,
+                                result_preview: None,
+                                diff: None,
+                                file_changes: vec![crate::protocol::FileChangeDiffView {
+                                    path: path.clone(),
+                                    change_type: "update".to_string(),
+                                    diff: format!(
+                                        "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
+                                    ),
+                                }],
+                                apply_state: None,
+                                file_changes_omitted: false,
+                                can_apply: None,
+                            }),
+                        });
+                    relay.notify();
+                }
                 if let Some(marker) = self.mutate_cwd_on_fix_turn.lock().await.clone() {
                     let cwd = self
                         .start_thread_cwds
@@ -7077,7 +7657,13 @@ mod review_tests {
                     .await
                     .pop_front()
                     .unwrap_or_else(|| "NEEDS_CHANGES".to_string());
-                format!("{REVIEW_REPLY}\n\nVERDICT: {verdict}")
+                let note = self
+                    .reviewer_notes
+                    .lock()
+                    .await
+                    .pop_front()
+                    .unwrap_or_default();
+                format!("{REVIEW_REPLY}\n{note}\n\nVERDICT: {verdict}")
             } else {
                 REVIEW_REPLY.to_string()
             };
@@ -10223,6 +10809,975 @@ settings update: {error}"
         std::fs::write(std::path::Path::new(cwd).join("seed.txt"), "line1\nline2\n").unwrap();
         git(&["add", "seed.txt"]);
         git(&["commit", "-q", "-m", "seed"]);
+    }
+
+    /// `git worktree add` a fresh branch at `path`, from the repo at `repo`.
+    fn add_worktree(repo: &str, path: &str, branch: &str) {
+        let ok = std::process::Command::new("git")
+            .args(["worktree", "add", "-q", "-b", branch, path])
+            .current_dir(repo)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git worktree add {path} failed");
+    }
+
+    fn same_dir(a: &str, b: &str) -> bool {
+        a == b
+            || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+    }
+
+    // The reported failure: "Review failed — failed to collect the workspace diff: failed
+    // to run git rev-parse --is-inside-work-tree: No such file or directory (os error 2)".
+    // The parent thread was started inside an agent worktree that has since been removed
+    // (its work landed and the worktree was cleaned up), so every git command spawned in
+    // that cwd dies at spawn time. A review must degrade to the repo that worktree lived
+    // in — the reviewer can still review — instead of failing the job outright.
+    #[tokio::test]
+    async fn review_falls_back_when_the_parents_worktree_was_removed() {
+        let dir = TempDir::new().expect("tmpdir");
+        let main_dir = dir.path().join("mainwt");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let main_cwd = main_dir.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        // `<repo>/.claude/worktrees/<name>` — the layout this project actually creates.
+        let nested = main_dir.join(".claude").join("worktrees").join("wt-gone");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let nested_cwd = nested.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &nested_cwd, "worktree-wt-gone");
+
+        // The session lives in the worktree, so the relay's own cwd is that worktree too:
+        // the fallback cannot come from `current_cwd` here, it has to find the repo.
+        let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        start_parent(&app, &nested_cwd, "codex").await;
+
+        // The worktree disappears under the running session.
+        std::fs::remove_dir_all(&nested_cwd).unwrap();
+        // A pending change in the repo the review should now be reading.
+        std::fs::write(
+            main_dir.join("seed.txt"),
+            "line1\nline2\nFALLBACK_WORKSPACE_EDIT\n",
+        )
+        .unwrap();
+
+        let receipt = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("a review must start even when the thread's worktree is gone");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "the review must not die on a dangling worktree: {:?}",
+            job.error
+        );
+
+        let provider = providers.get("codex").unwrap();
+        let cwds = provider.start_thread_cwds.lock().await.clone();
+        let reviewer_thread = job.reviewer_thread_id.clone().expect("reviewer thread");
+        assert!(
+            cwds.iter()
+                .any(|(tid, cwd)| tid == &reviewer_thread && same_dir(cwd, &main_cwd)),
+            "the reviewer must be started in the fallback workspace ({main_cwd}): {cwds:?}"
+        );
+        let turns = provider.turns.lock().await.clone();
+        assert!(
+            turns
+                .iter()
+                .any(|(_, prompt)| prompt.contains("FALLBACK_WORKSPACE_EDIT")),
+            "the reviewer must receive the fallback workspace's real diff"
+        );
+    }
+
+    // The review mirror of `workspace_diff_never_crosses_into_an_unrelated_repo`: a review
+    // must never be silently retargeted at an unrelated project just because that project
+    // is the relay's current workspace. Reviewing the wrong repo is worse than refusing —
+    // the reviewer "approves" work it never saw.
+    #[tokio::test]
+    async fn review_refuses_when_only_an_unrelated_repo_remains() {
+        let dir = TempDir::new().expect("tmpdir");
+        // Repo A owns the parent thread's worktree; deleting it leaves nothing above it
+        // that can identify the repo.
+        let repo_a = dir.path().join("repo-a");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        let repo_a_cwd = repo_a.to_str().unwrap().to_string();
+        init_git_seed(&repo_a_cwd);
+        let gone = dir.path().join("repo-a-wt");
+        let gone_cwd = gone.to_str().unwrap().to_string();
+        add_worktree(&repo_a_cwd, &gone_cwd, "worktree-gone");
+
+        // Repo B — a different project — is where the relay is.
+        let repo_b = dir.path().join("repo-b");
+        std::fs::create_dir_all(&repo_b).unwrap();
+        let repo_b_cwd = repo_b.to_str().unwrap().to_string();
+        init_git_seed(&repo_b_cwd);
+        std::fs::write(
+            repo_b.join("seed.txt"),
+            "line1\nline2\nSECRET-FROM-AN-UNRELATED-PROJECT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&repo_a_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &gone_cwd, "codex").await;
+        std::fs::remove_dir_all(&gone_cwd).unwrap();
+        // Then a session is started in repo B, so the relay's current workspace is now
+        // that unrelated project — the reviewer's scenario: review thread A while a
+        // thread in another repo is the active one.
+        start_parent(&app, &repo_b_cwd, "codex").await;
+
+        let mut input = review_input("codex");
+        input.parent_thread_id = Some(parent.id.clone());
+        let error = app.request_review(input).await.expect_err(
+            "a review with no workspace provably related to the thread's must be refused",
+        );
+        assert!(
+            error.contains("no longer exists"),
+            "the refusal must say what is wrong: {error}"
+        );
+
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        assert!(
+            !turns
+                .iter()
+                .any(|(_, prompt)| prompt.contains("SECRET-FROM-AN-UNRELATED-PROJECT")),
+            "no reviewer turn may carry an unrelated project's diff: {turns:?}"
+        );
+    }
+
+    // Code Flow WRITES the tree, and a provider thread is bound to the cwd it was created
+    // with — `send_message_to_thread` cannot move it. So substituting a workspace here
+    // would authorize a run whose author still edits a directory that no longer exists.
+    // Refuse up front instead, with a message that says what to do.
+    #[tokio::test]
+    async fn workflow_refuses_when_the_threads_workspace_is_gone() {
+        let dir = TempDir::new().expect("tmpdir");
+        let main_dir = dir.path().join("mainwt");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let main_cwd = main_dir.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        let nested = main_dir.join(".claude").join("worktrees").join("wt-gone");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let nested_cwd = nested.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &nested_cwd, "worktree-wt-gone");
+
+        let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        start_parent(&app, &nested_cwd, "codex").await;
+        std::fs::remove_dir_all(&nested_cwd).unwrap();
+
+        let error = app
+            .start_workflow(
+                Some("device-1".to_string()),
+                workflow_code_flow("codex", 3),
+                "anchor-item".to_string(),
+                None,
+            )
+            .await
+            .expect_err("a writing workflow must not be relocated to another workspace");
+        assert!(
+            error.contains("no longer exists"),
+            "the refusal must name the problem: {error}"
+        );
+        assert!(
+            !app.relay.read().await.has_active_workflow(),
+            "a refused workflow must not record a run"
+        );
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        assert!(turns.is_empty(), "no author turn may have run: {turns:?}");
+    }
+
+    /// Record a LANDED file edit at `path` in `thread`'s transcript — the same evidence
+    /// the diff panel already uses to tell which working tree an agent is writing in.
+    async fn seed_landed_edit(app: &AppState, thread: &str, path: &str) {
+        let tool = crate::protocol::ToolCallView {
+            item_type: "fileChange".to_string(),
+            name: "Edit".to_string(),
+            title: "Edit".to_string(),
+            detail: None,
+            query: None,
+            path: None,
+            url: None,
+            command: None,
+            input_preview: None,
+            result_preview: None,
+            diff: None,
+            file_changes: vec![crate::protocol::FileChangeDiffView {
+                path: path.to_string(),
+                change_type: "update".to_string(),
+                // A landed write carries a diff body; an empty one means it never
+                // reached disk and must not count as evidence.
+                diff: format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"),
+            }],
+            apply_state: None,
+            file_changes_omitted: false,
+            can_apply: None,
+        };
+        let mut relay = app.relay.write().await;
+        let runtime = relay.ensure_runtime_for_thread(thread);
+        let item_id = format!("item-{}", runtime.transcript.len());
+        runtime
+            .transcript
+            .push(crate::state::relay::TranscriptRecord {
+                item_id,
+                kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                text: None,
+                status: "completed".to_string(),
+                turn_id: Some("turn-evidence".to_string()),
+                tool: Some(tool),
+            });
+    }
+
+    /// A repo plus a SIBLING linked worktree, both with a committed `seed.txt`. Sibling
+    /// (not nested) on purpose: the two trees' diffs then share no files at all, so
+    /// "which tree did the reviewer actually get" is unambiguous in these tests.
+    fn init_repo_with_sibling_worktree(root: &std::path::Path) -> (String, String) {
+        let main = root.join("mainwt");
+        std::fs::create_dir_all(&main).unwrap();
+        let main_cwd = main.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        let linked = root.join("linkedwt");
+        let linked_cwd = linked.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &linked_cwd, "feature-branch");
+        (main_cwd, linked_cwd)
+    }
+
+    // Switching, direction 1 — the thread STARTED in the main tree and has since been
+    // editing in a linked worktree. The review must follow the work: the diff, the
+    // reviewer's own cwd and the prompt all have to name the worktree, otherwise the
+    // reviewer reviews an empty main tree and "approves" work it never saw.
+    #[tokio::test]
+    async fn review_follows_the_worktree_the_thread_is_now_editing() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &main_cwd, "codex").await;
+        seed_landed_edit(&app, &parent.id, &format!("{linked_cwd}/seed.txt")).await;
+
+        let receipt = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "job err: {:?}", job.error);
+
+        let provider = providers.get("codex").unwrap();
+        let turns = provider.turns.lock().await.clone();
+        let reviewer_prompt = turns
+            .iter()
+            .map(|(_, prompt)| prompt.as_str())
+            .find(|prompt| prompt.contains("Workspace diff collected by the relay"))
+            .expect("a reviewer turn carrying the workspace diff")
+            .to_string();
+
+        assert!(
+            reviewer_prompt.contains("WORKTREE_EDIT"),
+            "the review must diff the worktree the thread is writing in"
+        );
+        assert!(
+            !reviewer_prompt.contains("MAIN_TREE_EDIT"),
+            "it must NOT hand over the main tree's unrelated changes"
+        );
+        // The prompt has to SAY which tree this is: a reviewer that thinks it is looking
+        // at `main` reasons about the wrong branch.
+        assert!(
+            reviewer_prompt.contains(&linked_cwd) || reviewer_prompt.contains("linkedwt"),
+            "the prompt must name the working tree under review: {reviewer_prompt}"
+        );
+        assert!(
+            reviewer_prompt.contains("feature-branch"),
+            "the prompt must name the branch under review: {reviewer_prompt}"
+        );
+
+        let cwds = provider.start_thread_cwds.lock().await.clone();
+        let reviewer_thread = job.reviewer_thread_id.clone().expect("reviewer thread");
+        assert!(
+            cwds.iter()
+                .any(|(tid, cwd)| tid == &reviewer_thread && same_dir(cwd, &linked_cwd)),
+            "the reviewer must be able to open the files it is reviewing: {cwds:?}"
+        );
+    }
+
+    // Multi-round: the reviewed worktree can vanish BETWEEN rounds (its work landed and it
+    // was cleaned up while the review was still negotiating). Round 2 must re-resolve the
+    // workspace instead of re-diffing a directory that is gone — pinning the tree at job
+    // creation would fail the whole review on the same ENOENT this all started with.
+    #[tokio::test]
+    async fn review_rounds_re_resolve_when_the_reviewed_worktree_disappears() {
+        let dir = TempDir::new().expect("tmpdir");
+        let main_dir = dir.path().join("mainwt");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let main_cwd = main_dir.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        let nested = main_dir.join(".claude").join("worktrees").join("wt-doomed");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let nested_cwd = nested.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &nested_cwd, "worktree-wt-doomed");
+        std::fs::write(
+            std::path::Path::new(&nested_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(main_dir.join("seed.txt"), "line1\nline2\nMAIN_TREE_EDIT\n").unwrap();
+
+        let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        start_parent(&app, &nested_cwd, "codex").await;
+        let provider = providers.get("codex").unwrap();
+        // Round 1 rejects → the parent gets a fix turn, during which the worktree is
+        // removed; round 2 must still be able to review, and then approves.
+        queue_verdicts(provider, &["NEEDS_CHANGES", "APPROVE"]).await;
+        *provider.delete_dir_on_fix_turn.lock().await = Some(nested_cwd.clone());
+
+        let mut input = review_input("codex");
+        input.max_rounds = Some(3);
+        let receipt = app
+            .request_review(input)
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "a worktree removed mid-review must not fail the job: {:?}",
+            job.error
+        );
+        assert_eq!(job.round, 2, "the loop must have run a second round");
+
+        let turns = provider.turns.lock().await.clone();
+        let review_prompts: Vec<&String> = turns
+            .iter()
+            .filter(|(_, prompt)| prompt.contains("Workspace diff collected by the relay"))
+            .map(|(_, prompt)| prompt)
+            .collect();
+        assert_eq!(review_prompts.len(), 2, "two review rounds");
+        assert!(
+            review_prompts[0].contains("WORKTREE_EDIT"),
+            "round 1 reviews the thread's own worktree"
+        );
+        assert!(
+            review_prompts[1].contains("MAIN_TREE_EDIT"),
+            "round 2 must fall back to the repo that owned the deleted worktree"
+        );
+        assert!(
+            review_prompts[1].contains("no longer exists"),
+            "round 2 must TELL the reviewer the tree changed under it: {}",
+            review_prompts[1]
+        );
+    }
+
+    // The other half of multi-round movement: the tree still exists, but the author's fix
+    // lands in a DIFFERENT working tree than round 1 reviewed. Round 2 must follow the work
+    // (re-derived evidence), not re-review the tree the author has left behind.
+    #[tokio::test]
+    async fn review_rounds_follow_the_authors_fix_into_another_tree() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        start_parent(&app, &main_cwd, "codex").await;
+        let provider = providers.get("codex").unwrap();
+        queue_verdicts(provider, &["NEEDS_CHANGES", "APPROVE"]).await;
+        // The fix turn edits — and reports editing — a file in the LINKED worktree.
+        *provider.landed_edit_on_fix_turn.lock().await = Some((
+            format!("{linked_cwd}/seed.txt"),
+            "FIX_LANDED_IN_THE_WORKTREE".to_string(),
+        ));
+
+        let mut input = review_input("codex");
+        input.max_rounds = Some(3);
+        let receipt = app
+            .request_review(input)
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "job err: {:?}", job.error);
+        assert_eq!(job.round, 2, "one rejected round, then approval");
+
+        let turns = provider.turns.lock().await.clone();
+        let review_prompts: Vec<&String> = turns
+            .iter()
+            .filter(|(_, prompt)| prompt.contains("Workspace diff collected by the relay"))
+            .map(|(_, prompt)| prompt)
+            .collect();
+        assert_eq!(review_prompts.len(), 2, "two review rounds");
+        assert!(
+            review_prompts[0].contains("MAIN_TREE_EDIT"),
+            "round 1 reviews the tree the author was in"
+        );
+        assert!(
+            review_prompts[1].contains("FIX_LANDED_IN_THE_WORKTREE"),
+            "round 2 must review the tree the author's fix actually landed in: {}",
+            review_prompts[1]
+        );
+        assert!(
+            review_prompts[1].contains(&linked_cwd) || review_prompts[1].contains("linkedwt"),
+            "…and name that tree for the reviewer: {}",
+            review_prompts[1]
+        );
+    }
+
+    // Swapping in a clean reviewer mid-loop must not lose the negotiation. The whole point of
+    // round 2 is "were my findings addressed?", and a fresh thread has none of round 1's
+    // review in its transcript — so the handoff has to carry those findings explicitly, or
+    // the new reviewer silently re-reviews from scratch.
+    #[tokio::test]
+    async fn a_replacement_reviewer_is_handed_the_previous_rounds_findings() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        start_parent(&app, &main_cwd, "codex").await;
+        let provider = providers.get("codex").unwrap();
+        queue_verdicts(provider, &["NEEDS_CHANGES", "APPROVE"]).await;
+        // Round 1's reviewer reports something uniquely identifiable...
+        provider
+            .reviewer_notes
+            .lock()
+            .await
+            .push_back("FINDING_ALPHA: unchecked unwrap in seed.rs".to_string());
+        // ...and the author's fix lands in the OTHER tree, forcing round 2 onto a clean
+        // reviewer (the round-1 reviewer lives in the main tree and cannot be moved).
+        *provider.landed_edit_on_fix_turn.lock().await = Some((
+            format!("{linked_cwd}/seed.txt"),
+            "FIX_LANDED_IN_THE_WORKTREE".to_string(),
+        ));
+
+        let mut input = review_input("codex");
+        input.max_rounds = Some(3);
+        let receipt = app
+            .request_review(input)
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "job err: {:?}", job.error);
+        assert_eq!(job.round, 2);
+
+        let turns = provider.turns.lock().await.clone();
+        let review_prompts: Vec<(&String, &String)> = turns
+            .iter()
+            .filter(|(_, prompt)| prompt.contains("Workspace diff collected by the relay"))
+            .map(|(tid, prompt)| (tid, prompt))
+            .collect();
+        assert_eq!(review_prompts.len(), 2, "two review rounds");
+        assert_ne!(
+            review_prompts[0].0, review_prompts[1].0,
+            "round 2 must run on a different (clean) reviewer thread"
+        );
+        assert!(
+            review_prompts[1].1.contains("FINDING_ALPHA"),
+            "the replacement reviewer must receive round 1's findings: {}",
+            review_prompts[1].1
+        );
+    }
+
+    // The strict semantics promised for an EXPLICIT cross-tree reuse must hold even when the
+    // reviewer's workspace is only knowable by asking the provider (after a restart its row
+    // is gone). Silently substituting a clean reviewer would contradict the receipt, which
+    // already told the caller which reviewer would be used.
+    #[tokio::test]
+    async fn explicit_cross_tree_reuse_is_refused_even_when_its_cwd_must_be_probed() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &main_cwd, "codex").await;
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // Simulate the restart: the reviewer's runtime and row are gone, so its workspace is
+        // unknown locally and can only come from the provider.
+        {
+            let mut relay = app.relay.write().await;
+            relay.runtimes.remove(&reviewer);
+            relay.threads.retain(|thread| thread.id != reviewer);
+            relay.review_jobs.clear();
+            assert!(relay.thread_cwd(&reviewer).is_none());
+        }
+        // The work has since moved to the other tree.
+        seed_landed_edit(&app, &parent.id, &format!("{linked_cwd}/seed.txt")).await;
+
+        let provider = providers.get("codex").unwrap();
+        let turns_before = provider.turns.lock().await.len();
+        let threads_before = provider.start_thread_cwds.lock().await.len();
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer.clone());
+        let error = app
+            .request_review(reuse)
+            .await
+            .expect_err("an explicit cross-tree reuse must be refused, not downgraded");
+        assert!(
+            error.contains(&main_cwd) && error.contains(&linked_cwd),
+            "the refusal must name both trees: {error}"
+        );
+        assert_eq!(
+            provider.turns.lock().await.len(),
+            turns_before,
+            "no recap or reviewer turn may run"
+        );
+        assert_eq!(
+            provider.start_thread_cwds.lock().await.len(),
+            threads_before,
+            "no replacement reviewer thread may be created"
+        );
+    }
+
+    // A provider probe failure is not evidence that the reviewer lives in another tree.
+    // After restart the provider is the only authority for the thread's cwd, so its error
+    // must fail the request directly rather than accepting a job that later reports
+    // "an unknown workspace" as a topology mismatch.
+    #[tokio::test]
+    async fn explicit_reuse_surfaces_provider_workspace_probe_failure() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap().to_string();
+        init_git_seed(&cwd);
+
+        let (app, providers) = build_review_app(&cwd, &["codex"]).await;
+        start_parent(&app, &cwd, "codex").await;
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // Simulate restart: force workspace discovery through provider read_thread.
+        {
+            let mut relay = app.relay.write().await;
+            relay.runtimes.remove(&reviewer);
+            relay.threads.retain(|thread| thread.id != reviewer);
+            relay.review_jobs.clear();
+            assert!(relay.thread_cwd(&reviewer).is_none());
+        }
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_read_thread_ids
+            .lock()
+            .await
+            .insert(reviewer.clone());
+        let turns_before = provider.turns.lock().await.len();
+
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer);
+        let error = app
+            .request_review(reuse)
+            .await
+            .expect_err("the provider probe failure must reject the request");
+        assert!(
+            error.contains("PROBE_UNAVAILABLE"),
+            "the provider's diagnostic must be preserved: {error}"
+        );
+        assert!(
+            !error.contains("unknown workspace") && !error.contains("start a clean reviewer"),
+            "a provider failure must not be rewritten as a topology mismatch: {error}"
+        );
+        assert_eq!(
+            provider.turns.lock().await.len(),
+            turns_before,
+            "a rejected reuse request must not drive any turn"
+        );
+    }
+
+    // The ENOENT race is not only around `git`: the workspace can also vanish between our
+    // liveness check and the PROVIDER call. Each turn boundary must degrade the same way it
+    // would have if the check had seen the deletion.
+    #[tokio::test]
+    async fn a_workspace_deleted_at_the_recap_turn_boundary_degrades_to_read_only() {
+        let dir = TempDir::new().expect("tmpdir");
+        let main_dir = dir.path().join("mainwt");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let main_cwd = main_dir.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        let nested = main_dir.join(".claude").join("worktrees").join("wt-racy");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let nested_cwd = nested.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &nested_cwd, "worktree-wt-racy");
+        std::fs::write(
+            main_dir.join("seed.txt"),
+            "line1\nline2\nFALLBACK_WORKSPACE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &nested_cwd, "codex").await;
+        // The workspace exists when the review starts and is deleted exactly when the recap
+        // turn reaches the provider.
+        *providers
+            .get("codex")
+            .unwrap()
+            .delete_dir_when_prompt_contains
+            .lock()
+            .await = Some(("recap the changes".to_string(), nested_cwd.clone()));
+
+        let receipt = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "losing the race at the recap boundary must degrade, not fail: {:?}",
+            job.error
+        );
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        assert!(
+            turns
+                .iter()
+                .any(|(_, prompt)| prompt.contains("FALLBACK_WORKSPACE_EDIT")),
+            "the reviewer must still review the surviving tree"
+        );
+        let _ = parent;
+    }
+
+    // Same race, at the LAST provider boundary: the review is finished and only its delivery
+    // turn is left. Losing the race there must not fail a completed review.
+    #[tokio::test]
+    async fn a_workspace_deleted_at_the_post_back_boundary_still_completes() {
+        let dir = TempDir::new().expect("tmpdir");
+        let main_dir = dir.path().join("mainwt");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let main_cwd = main_dir.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        let nested = main_dir.join(".claude").join("worktrees").join("wt-racy");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let nested_cwd = nested.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &nested_cwd, "worktree-wt-racy");
+
+        let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        start_parent(&app, &nested_cwd, "codex").await;
+        let mut input = review_input("codex");
+        // last_message: no recap turn, so the post-back is the only parent turn.
+        input.recap_source = Some("last_message".to_string());
+        *providers
+            .get("codex")
+            .unwrap()
+            .delete_dir_when_prompt_contains
+            .lock()
+            .await = Some((
+            "review result from reviewer thread".to_string(),
+            nested_cwd.clone(),
+        ));
+
+        let receipt = app
+            .request_review(input)
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "a finished review must not fail on delivery: {:?}",
+            job.error
+        );
+        let stored = {
+            let relay = app.relay.read().await;
+            relay
+                .review_job(&receipt.review_job_id)
+                .and_then(|job| job.review_text.clone())
+        };
+        assert!(
+            stored.is_some_and(|text| text.contains(REVIEW_REPLY)),
+            "the review text must survive an undeliverable post-back"
+        );
+    }
+
+    // …and at the reviewer's own boundary: its tree vanishes after the diff was collected but
+    // before its turn reaches the provider. The round must be re-resolved and retried in a
+    // surviving tree rather than failing.
+    #[tokio::test]
+    async fn a_reviewer_tree_deleted_at_the_turn_boundary_is_retried() {
+        let dir = TempDir::new().expect("tmpdir");
+        let main_dir = dir.path().join("mainwt");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let main_cwd = main_dir.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        let nested = main_dir.join(".claude").join("worktrees").join("wt-racy");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let nested_cwd = nested.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &nested_cwd, "worktree-wt-racy");
+        std::fs::write(
+            std::path::Path::new(&nested_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            main_dir.join("seed.txt"),
+            "line1\nline2\nFALLBACK_WORKSPACE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        start_parent(&app, &nested_cwd, "codex").await;
+        let mut input = review_input("codex");
+        input.recap_source = Some("last_message".to_string());
+        // The reviewer's tree disappears exactly as its review turn reaches the provider.
+        *providers
+            .get("codex")
+            .unwrap()
+            .delete_dir_when_prompt_contains
+            .lock()
+            .await = Some((
+            "Workspace diff collected by the relay".to_string(),
+            nested_cwd.clone(),
+        ));
+
+        let receipt = app
+            .request_review(input)
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "the round must be retried in a surviving tree: {:?}",
+            job.error
+        );
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        assert!(
+            turns
+                .iter()
+                .any(|(_, prompt)| prompt.contains("FALLBACK_WORKSPACE_EDIT")),
+            "the retry must review the surviving tree: {turns:?}"
+        );
+    }
+
+    // A thread whose workspace was deleted cannot be DRIVEN at all: its provider thread is
+    // bound to that cwd and re-sends it on every turn. So a review of one must run
+    // read-only — no recap turn, no author fix rounds, and no post-back turn — while still
+    // reviewing the code that thread left behind. Anything else either fails the review or
+    // (worse) reports success for turns a real provider refused.
+    #[tokio::test]
+    async fn review_of_a_deleted_workspace_drives_no_parent_turns() {
+        let dir = TempDir::new().expect("tmpdir");
+        let main_dir = dir.path().join("mainwt");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let main_cwd = main_dir.to_str().unwrap().to_string();
+        init_git_seed(&main_cwd);
+        let nested = main_dir.join(".claude").join("worktrees").join("wt-gone");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let nested_cwd = nested.to_str().unwrap().to_string();
+        add_worktree(&main_cwd, &nested_cwd, "worktree-wt-gone");
+
+        let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &nested_cwd, "codex").await;
+        std::fs::remove_dir_all(&nested_cwd).unwrap();
+        std::fs::write(
+            main_dir.join("seed.txt"),
+            "line1\nline2\nFALLBACK_WORKSPACE_EDIT\n",
+        )
+        .unwrap();
+
+        // Ask for the recap-turn flow AND multiple rounds explicitly: both of those drive
+        // the parent, and both must be skipped rather than attempted.
+        let mut input = review_input("codex");
+        input.max_rounds = Some(3);
+        let receipt = app
+            .request_review(input)
+            .await
+            .expect("a review must still start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "the review must complete read-only: {:?}",
+            job.error
+        );
+
+        let provider = providers.get("codex").unwrap();
+        let turns = provider.turns.lock().await.clone();
+        assert!(
+            !turns.iter().any(|(tid, _)| tid == &parent.id),
+            "no turn may be driven on a thread whose workspace is gone: {turns:?}"
+        );
+        // The reviewer still ran, against the fallback tree...
+        assert!(
+            turns
+                .iter()
+                .any(|(_, prompt)| prompt.contains("FALLBACK_WORKSPACE_EDIT")),
+            "the reviewer must still have reviewed the surviving tree"
+        );
+        // ...and its findings are not lost just because they can't be posted back.
+        let stored = {
+            let relay = app.relay.read().await;
+            relay
+                .review_job(&receipt.review_job_id)
+                .and_then(|job| job.review_text.clone())
+        };
+        assert!(
+            stored.is_some_and(|text| text.contains(REVIEW_REPLY)),
+            "the review text must be recorded on the job for the panel to show"
+        );
+        assert_eq!(
+            job.round, 1,
+            "no fix rounds can run without a drivable author"
+        );
+        let read_only_logs = app
+            .relay
+            .read()
+            .await
+            .snapshot()
+            .logs
+            .into_iter()
+            .filter(|entry| {
+                entry.message.contains(&receipt.review_job_id)
+                    && entry.message.contains("runs read-only")
+                    && entry.message.contains("no recap, fix or post-back turns")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_only_logs.len(),
+            1,
+            "the job must emit exactly one read-only mode summary: {read_only_logs:?}"
+        );
+    }
+
+    // A REUSED reviewer thread stays bound to the cwd it was created with — no provider API
+    // moves it — so reusing one across trees would review one tree while its file tools read
+    // another. An explicit cross-tree reuse request must be refused, not accepted with a
+    // caveat in the prompt.
+    #[tokio::test]
+    async fn reused_reviewer_is_refused_when_it_is_not_in_the_tree_under_review() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &main_cwd, "codex").await;
+
+        // Review 1 runs in the main tree and leaves a reviewer thread bound there.
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        assert_eq!(first_job.status, "complete", "{:?}", first_job.error);
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // Then the author's work moves into the linked worktree, so review 2 would target a
+        // tree the existing reviewer is not in.
+        seed_landed_edit(&app, &parent.id, &format!("{linked_cwd}/seed.txt")).await;
+        let turns_before = providers.get("codex").unwrap().turns.lock().await.len();
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer.clone());
+        let error = app
+            .request_review(reuse)
+            .await
+            .expect_err("reusing a reviewer from another tree must be refused");
+        assert!(
+            error.contains(&main_cwd) && error.contains(&linked_cwd),
+            "the refusal must name both trees so the user can act: {error}"
+        );
+        assert_eq!(
+            providers.get("codex").unwrap().turns.lock().await.len(),
+            turns_before,
+            "the refused review must not run any turn"
+        );
+    }
+
+    // Switching, direction 2 — the thread STARTED in a worktree (that still exists) and
+    // has since moved back to the main tree. Same requirement, mirrored: follow the work
+    // to `main`, and say `main` in the prompt.
+    #[tokio::test]
+    async fn review_follows_the_main_tree_when_the_thread_moved_back() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&linked_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &linked_cwd, "codex").await;
+        seed_landed_edit(&app, &parent.id, &format!("{main_cwd}/seed.txt")).await;
+
+        let receipt = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("review should start");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "job err: {:?}", job.error);
+
+        let provider = providers.get("codex").unwrap();
+        let turns = provider.turns.lock().await.clone();
+        let reviewer_prompt = turns
+            .iter()
+            .map(|(_, prompt)| prompt.as_str())
+            .find(|prompt| prompt.contains("Workspace diff collected by the relay"))
+            .expect("a reviewer turn carrying the workspace diff")
+            .to_string();
+
+        assert!(
+            reviewer_prompt.contains("MAIN_TREE_EDIT"),
+            "the review must diff the main tree the thread moved back to"
+        );
+        assert!(
+            !reviewer_prompt.contains("WORKTREE_EDIT"),
+            "it must NOT hand over the stale worktree's changes"
+        );
+        assert!(
+            reviewer_prompt.contains(&main_cwd) || reviewer_prompt.contains("mainwt"),
+            "the prompt must name the working tree under review: {reviewer_prompt}"
+        );
+        assert!(
+            reviewer_prompt.contains("main"),
+            "the prompt must name the branch under review: {reviewer_prompt}"
+        );
+
+        let cwds = provider.start_thread_cwds.lock().await.clone();
+        let reviewer_thread = job.reviewer_thread_id.clone().expect("reviewer thread");
+        assert!(
+            cwds.iter()
+                .any(|(tid, cwd)| tid == &reviewer_thread && same_dir(cwd, &main_cwd)),
+            "the reviewer must be able to open the files it is reviewing: {cwds:?}"
+        );
     }
 
     #[tokio::test]

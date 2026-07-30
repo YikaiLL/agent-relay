@@ -31,9 +31,9 @@ pub(crate) use self::relay::{
 #[cfg(test)]
 pub(crate) use self::relay::PushKind;
 pub(crate) use self::review::{
-    parent_fix_prompt, parent_recap_prompt, parse_verdict, post_back_message, re_review_prompt,
-    review_approved_message, review_escalated_message, reviewer_prompt, ReviewJob, ReviewJobStatus,
-    ReviewMode, ReviewRecapSource,
+    handoff_review_prompt, parent_fix_prompt, parent_recap_prompt, parse_verdict,
+    post_back_message, re_review_prompt, review_approved_message, review_escalated_message,
+    reviewer_prompt, ReviewJob, ReviewJobStatus, ReviewMode, ReviewRecapSource,
 };
 // `Verdict` is consumed only by tests today; the workflow runner that will use it in
 // a live path isn't wired up yet, so keep the re-export without an unused-import

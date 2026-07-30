@@ -186,7 +186,7 @@ impl AppState {
         root: Option<String>,
         auto_root: bool,
     ) -> Result<WorkspaceDiffResponse, String> {
-        let (cwd, device_scope, allowed_roots) = {
+        let (cwd, relay_cwd, device_scope, allowed_roots) = {
             let relay = self.relay.read().await;
             // Resolve which workspace to diff:
             // - absent selector       → the global/active cwd (legacy back-compat)
@@ -206,8 +206,29 @@ impl AppState {
                 .map(|id| relay.device_path_scope(id))
                 .unwrap_or_default();
             ensure_path_within_device_scope(&resolved, &device_scope, &relay.allowed_roots)?;
-            (resolved, device_scope, relay.allowed_roots.clone())
+            (
+                resolved,
+                relay.current_cwd.clone(),
+                device_scope,
+                relay.allowed_roots.clone(),
+            )
         };
+
+        // That workspace may no longer EXIST — a thread born in an agent worktree keeps its
+        // path after the worktree is removed. Spawning git there fails with ENOENT, which
+        // used to reach the panel verbatim ("failed to run git rev-parse
+        // --is-inside-work-tree: No such file or directory (os error 2)") and took the root
+        // picker with it, leaving no way back. Degrade to a workspace that is provably
+        // related, in scope — or fail closed — and report WHICH one vanished.
+        let (workspace, fallback_from) =
+            match super::resolve_workspace_cwd(&cwd, &relay_cwd, &device_scope, &allowed_roots)
+                .await
+                .into_readable()
+            {
+                Some(usable) => usable,
+                None => return Ok(WorkspaceDiffResponse::unavailable()),
+            };
+        let cwd = workspace.as_str().to_string();
 
         // Enumerate from the session's OWN cwd, which has just cleared the scope
         // check. This is the only source of selectable roots, so the picker can
@@ -294,10 +315,23 @@ impl AppState {
             }
         };
 
-        let mut response = collect_workspace_diff(&target).await?;
+        // Resilient because the resolve above and this collect are two steps: a cleanup task
+        // can remove the tree in between, and the panel must not go back to showing a raw
+        // git spawn error when it loses that race.
+        let (mut response, retry_fallback) = super::collect_workspace_diff_resilient(
+            &target,
+            &relay_cwd,
+            &device_scope,
+            &allowed_roots,
+        )
+        .await?;
+        if response.unavailable {
+            return Ok(response);
+        }
         response.roots = roots;
         response.suggested_root = suggested;
         response.suggested_root_known = suggested_root_known;
+        response.fallback_from = fallback_from.or(retry_fallback);
         Ok(response)
     }
 
