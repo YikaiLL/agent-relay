@@ -232,6 +232,13 @@ async function run() {
     // --- Mobile (narrow) viewport: rail hidden, header gear reaches Settings ---
     // Reload into a clean state so the stacked mobile layout puts the sticky header
     // near the top (the prior projects/drawer state would push it far down).
+    // View context now deliberately survives reload, so select Sessions explicitly
+    // instead of relying on reload to reset a preceding Projects-mode scenario.
+    await page.click("#threads-view-sessions");
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
+      { timeout: TIMEOUT_MS }
+    );
     await page.setViewportSize({ width: 390, height: 780 });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".local-frame", { timeout: TIMEOUT_MS });

@@ -64,3 +64,58 @@ test("projects mode groups by project once the payload is loaded", () => {
   const labels = model.groups.map((group) => group.label);
   assert.ok(labels.includes("VerifyProj"), `expected a VerifyProj group, got ${JSON.stringify(labels)}`);
 });
+
+// Parity with the local Projects sidebar, which lists one row per project and
+// deliberately does NOT surface the "Unassigned" bucket (see
+// shared/project-overview-react.js:54 and the local render path's comment at
+// local/render-session.js:1445). Remote still routed Projects mode through
+// buildNavigationThreadGroups(groupBy:"project"), whose shared grouping always
+// creates an Unassigned bucket (shared/thread-groups.js:124-126) — so the phone
+// flooded the Projects view with every unassigned session. Commit a49ce53 named
+// the remote surface as a follow-up and it was never done.
+//
+// The invariant asserted here is representation-independent: whether Projects
+// mode ends up emitting thread groups or project rows, an unassigned session must
+// never be surfaced, and a real project must still be represented.
+test("projects mode never surfaces the Unassigned bucket (parity with local)", () => {
+  const model = selectThreadsRenderModel({
+    ...base,
+    viewMode: "projects",
+    threads: [
+      { id: "t1", cwd: "/work/a", updated_at: 1 },
+      // Deliberately has no entry in threadProjectId — this is the session that
+      // must stay hidden in Projects mode.
+      { id: "t2", cwd: "/work/b", updated_at: 2 },
+    ],
+    projects: [{ id: "p1", name: "VerifyProj" }],
+    threadProjectId: { t1: "p1" },
+    projectsLoaded: true,
+  });
+
+  const groups = model.groups || [];
+  const labels = groups.map((group) => String(group.label ?? ""));
+  assert.ok(
+    !labels.some((label) => /unassigned/i.test(label)),
+    `no Unassigned group may be surfaced, got ${JSON.stringify(labels)}`
+  );
+
+  const surfacedThreadIds = groups.flatMap((group) =>
+    (group.threads || []).map((thread) => thread.id)
+  );
+  assert.ok(
+    !surfacedThreadIds.includes("t2"),
+    `the unassigned session t2 must not be surfaced, got ${JSON.stringify(surfacedThreadIds)}`
+  );
+
+  // Positive half: keep this test honest — an implementation that simply emits
+  // nothing in Projects mode must not pass. The assigned session must also still
+  // be reachable, so dropping the bucket can't turn Projects mode into a dead end.
+  assert.ok(
+    labels.includes("VerifyProj"),
+    `the real project must still be represented, got ${JSON.stringify(labels)}`
+  );
+  assert.ok(
+    surfacedThreadIds.includes("t1"),
+    "the assigned session must still be reachable in Projects mode"
+  );
+});

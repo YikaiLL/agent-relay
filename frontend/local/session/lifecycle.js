@@ -212,9 +212,9 @@ export function createLifecycleController(ctx) {
 
       const newThreadId = payload.data.active_thread_id || null;
       state.defaultsSeeded = false;
-      await runViewTransition(() => {
+      await runViewTransition(async () => {
         setSelectedCwd(payload.data.current_cwd || cwd);
-        setThreadRoute(newThreadId);
+        await setThreadRoute(newThreadId);
         seedDefaults(payload.data);
         applySessionSnapshot(payload.data);
       });
@@ -256,9 +256,9 @@ export function createLifecycleController(ctx) {
       }
 
       state.defaultsSeeded = false;
-      await runViewTransition(() => {
+      await runViewTransition(async () => {
         setSelectedCwd(payload.data.current_cwd || state.selectedCwd);
-        setThreadRoute(payload.data.active_thread_id || threadId);
+        await setThreadRoute(payload.data.active_thread_id || threadId);
         seedDefaults(payload.data);
         applySessionSnapshot(payload.data);
       });
@@ -309,9 +309,9 @@ export function createLifecycleController(ctx) {
       }
 
       state.defaultsSeeded = false;
-      await runViewTransition(() => {
+      await runViewTransition(async () => {
         setSelectedCwd(payload.data.current_cwd || cwd);
-        setThreadRoute(payload.data.active_thread_id || null);
+        await setThreadRoute(payload.data.active_thread_id || null);
         seedDefaults(payload.data);
         applySessionSnapshot(payload.data);
       });
@@ -418,13 +418,7 @@ export function createLifecycleController(ctx) {
       return;
     }
 
-    await runViewTransition(() => {
-      setThreadRoute(latestThread.id);
-      if (state.session) {
-        renderSession(state.session);
-      }
-      renderThreads();
-    });
+    await runViewTransition(() => setThreadRoute(latestThread.id));
   }
 
   async function sendMessage(textOverride, threadId, images = []) {
@@ -698,9 +692,13 @@ export function createLifecycleController(ctx) {
       // briefly re-enables the stick-to-bottom follow) instead of keeping the
       // user's freshly anchored message in place.
       retargetTranscriptScrollThread(state, threadPromotion.from, threadPromotion.to);
-      if (state.viewThreadId === threadPromotion.from) {
-        setThreadRoute(threadPromotion.to, { replace: true });
-      }
+      // Rekey every canonical workspace and the route in one queued command. The
+      // controller preserves tab identity/pin/order and uses history.replace when the
+      // promoted thread is currently visible.
+      void state.sessionViewController?.retargetThread(
+        threadPromotion.from,
+        threadPromotion.to
+      );
     }
 
     // Update per-thread attention + fire notifications here — the single
