@@ -22,8 +22,10 @@ import {
   focusedTab,
   layoutHasThread,
   layoutThreadIds,
+  moveTab,
   openThreadTab,
   retargetThread,
+  setTabPinned,
 } from "../shared/tab-layout.js";
 import { NO_PROJECT_KEY, SESSIONS_KEY } from "../shared/tab-workspace-store.js";
 
@@ -259,6 +261,44 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
         location: closesVisibleThread
           ? { context: state.location.context, threadId: focusedThreadId(closed) }
           : state.location,
+        workspaces: next.workspaces,
+      });
+    }
+
+    case "PIN_TAB": {
+      const tabId = stringId(action.tabId);
+      if (!tabId) {
+        return state;
+      }
+      const context = action.context
+        ? normalizeSessionViewContext(action.context)
+        : state.location.context;
+      const next = withWorkspace(
+        state,
+        context,
+        setTabPinned(workspaceFor(state, context), tabId, action.pinned)
+      );
+      return createSessionViewState({
+        location: state.location,
+        workspaces: next.workspaces,
+      });
+    }
+
+    case "MOVE_TAB": {
+      const tabId = stringId(action.tabId);
+      if (!tabId) {
+        return state;
+      }
+      const context = action.context
+        ? normalizeSessionViewContext(action.context)
+        : state.location.context;
+      const next = withWorkspace(
+        state,
+        context,
+        moveTab(workspaceFor(state, context), tabId, action.toIndex)
+      );
+      return createSessionViewState({
+        location: state.location,
         workspaces: next.workspaces,
       });
     }

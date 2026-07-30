@@ -165,6 +165,47 @@ test("promotion rekeys the same visible tab without losing pin or identity invar
   assert.equal(state.workspaces[SESSIONS_KEY].tabs[0].pinned, true);
 });
 
+test("valid move and background-context pin/move do not disturb the visible location", () => {
+  let state = createSessionViewState();
+  for (const threadId of ["a", "b", "c"]) {
+    state = transition(state, { type: "OPEN_THREAD", threadId });
+  }
+  state = transition(state, {
+    type: "SWITCH_CONTEXT",
+    context: project("project-1"),
+  });
+  state = transition(state, {
+    type: "OPEN_THREAD",
+    threadId: "project-visible",
+  });
+
+  state = transition(state, {
+    type: "MOVE_TAB",
+    tabId: tabIdForThread("c"),
+    toIndex: 0,
+    context: sessions(),
+  });
+  state = transition(state, {
+    type: "PIN_TAB",
+    tabId: tabIdForThread("a"),
+    pinned: true,
+    context: sessions(),
+  });
+  state = transition(state, {
+    type: "MOVE_TAB",
+    tabId: tabIdForThread("b"),
+    toIndex: 1,
+    context: sessions(),
+  });
+
+  assert.deepEqual(state.location, {
+    context: project("project-1"),
+    threadId: "project-visible",
+  });
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["a", "b", "c"]);
+  assert.equal(state.workspaces[SESSIONS_KEY].tabs[0].pinned, true);
+});
+
 test("versioned history restores the exact context while the URL owns the thread id", () => {
   let state = createSessionViewState();
   state = transition(state, { type: "OPEN_THREAD", threadId: "session-a" });
