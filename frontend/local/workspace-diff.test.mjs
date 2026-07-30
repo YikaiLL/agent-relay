@@ -987,3 +987,42 @@ test("every workspace-diff surface uses the same compact row markup", async () =
   );
   assert.match(sheet, /workspace-diff-sheet-body/, "the density hook is present");
 });
+
+// A thread born in a `git worktree` keeps that path forever, but agent worktrees get
+// removed once their work lands. The server now degrades to the enclosing repo instead
+// of erroring (it used to surface a raw `git rev-parse ... (os error 2)`), which makes
+// silence the new hazard: the panel would show ANOTHER tree's changes under this
+// session's name. Whenever the diff is a fallback, every surface must say so.
+test("a fallback workspace is labelled on every surface, not shown silently", async () => {
+  const { WorkspaceDiffSheetBody } = await import("./workspace-diff.js");
+  const state = {
+    status: "loaded",
+    expanded: true,
+    data: {
+      cwd: "/Users/x/repo",
+      fallback_from: "/Users/x/repo/.claude/worktrees/wt-gone",
+      file_changes: [],
+    },
+  };
+
+  for (const [name, Component] of [
+    ["desktop rail (local + remote)", WorkspaceChangesPanel],
+    ["phone sheet / remote modal", WorkspaceDiffSheetBody],
+  ]) {
+    const html = renderToStaticMarkup(
+      React.createElement(Component, { store: fakeStore(state) })
+    );
+    assert.match(html, /workspace-changes-fallback-note/, `${name} renders the notice`);
+    assert.match(html, /wt-gone/, `${name} names the workspace that vanished`);
+    assert.match(html, /no longer exists/, `${name} says what happened`);
+    assert.match(html, /repo/, `${name} names the workspace being shown instead`);
+  }
+
+  // The common case must stay quiet: no fallback, no notice.
+  const normal = renderToStaticMarkup(
+    React.createElement(WorkspaceChangesPanel, {
+      store: fakeStore({ status: "loaded", expanded: true, data: { cwd: "/Users/x/repo", file_changes: [] } }),
+    })
+  );
+  assert.doesNotMatch(normal, /workspace-changes-fallback-note/);
+});

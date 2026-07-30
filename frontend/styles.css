@@ -4395,6 +4395,13 @@ body.is-resizing-panel {
   font-size: var(--text-sm);
   color: var(--text-warning);
 }
+/* "the worktree this session ran in is gone, you're looking at the repo instead" —
+   informational, not a failure, so it reads quieter than the error line above. */
+.workspace-changes-fallback-note {
+  margin: 0 10px 8px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
 
 /* Right-panel tabs (Changes | Reviewer) ---------------------------------- */
 .right-panel-tabs {

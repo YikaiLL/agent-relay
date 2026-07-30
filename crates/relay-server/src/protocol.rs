@@ -1517,6 +1517,13 @@ pub struct WorkspaceDiffResponse {
     /// than falling back to another workspace's diff. Distinct from a clean tree.
     #[serde(default)]
     pub unavailable: bool,
+    /// The workspace this response was ASKED for but could not use, because that
+    /// directory no longer exists — a `git worktree` the thread was born in and that
+    /// has since been removed. `Some` means `cwd` is a fallback workspace, not the
+    /// thread's own, so the panel can say so instead of silently showing another
+    /// tree's changes. `None` = `cwd` is the thread's own workspace.
+    #[serde(default)]
+    pub fallback_from: Option<String>,
     pub generated_at: u64,
 }
 
@@ -1536,6 +1543,7 @@ impl WorkspaceDiffResponse {
             suggested_root: None,
             suggested_root_known: false,
             unavailable: true,
+            fallback_from: None,
             generated_at: 0,
         }
     }

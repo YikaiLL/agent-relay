@@ -298,12 +298,14 @@ pub(crate) fn reviewer_prompt(
     recap: &str,
     diff: &WorkspaceDiffResponse,
     instructions: Option<&str>,
+    workspace: &str,
 ) -> String {
     build_review_prompt(
         "You are reviewing another agent's work in this repository.",
         recap,
         diff,
         instructions,
+        workspace,
     )
 }
 
@@ -315,6 +317,7 @@ pub(crate) fn re_review_prompt(
     recap: &str,
     diff: &WorkspaceDiffResponse,
     instructions: Option<&str>,
+    workspace: &str,
 ) -> String {
     build_review_prompt(
         "You previously reviewed this repository. Here is an updated recap and a fresh \
@@ -323,7 +326,34 @@ review and whether earlier findings were addressed.",
         recap,
         diff,
         instructions,
+        workspace,
     )
+}
+
+/// Prompt for a reviewer that REPLACES an earlier one part-way through the loop, because the
+/// tree under review moved or the previous reviewer's workspace was removed (a provider thread
+/// cannot be relocated, so the replacement is a different thread).
+///
+/// `re_review_prompt` would be wrong here: it leans on the prior review sitting in the
+/// reviewer's OWN transcript, which a fresh thread does not have. Without handing the earlier
+/// findings over explicitly, round 2 silently restarts the negotiation instead of judging
+/// whether round 1's findings were addressed.
+pub(crate) fn handoff_review_prompt(
+    recap: &str,
+    diff: &WorkspaceDiffResponse,
+    instructions: Option<&str>,
+    workspace: &str,
+    previous_review: &str,
+) -> String {
+    let intro = format!(
+        "You are taking over a code review from another reviewer, which reviewed a different \
+working tree of this repository. Its findings are below, and the author has since worked on \
+them. Re-review the CURRENT state: for each earlier finding say whether it is addressed, and \
+add anything new you see.\n\n\
+Findings from the previous reviewer:\n{}",
+        previous_review.trim()
+    );
+    build_review_prompt(&intro, recap, diff, instructions, workspace)
 }
 
 /// Shared body for the reviewer / re-review prompts. Only the opening `intro`
@@ -333,6 +363,7 @@ fn build_review_prompt(
     recap: &str,
     diff: &WorkspaceDiffResponse,
     instructions: Option<&str>,
+    workspace: &str,
 ) -> String {
     let recap = if recap.trim().is_empty() {
         "(the parent agent did not provide a recap)"
@@ -355,8 +386,19 @@ working tree)"
         diff.diff.clone()
     };
 
+    // Name the tree before anything else: the reviewer opens files by path, and the tree
+    // it is handed is not always the reviewed session's own directory (a removed agent
+    // worktree, or a session that moved between the repo and a worktree).
+    let workspace = workspace.trim();
+    let workspace_line = if workspace.is_empty() {
+        String::new()
+    } else {
+        format!("{workspace}\n\n")
+    };
+
     let mut prompt = format!(
         "{intro}\n\n\
+{workspace_line}\
 Do not modify files. Inspect the working tree and report findings only.\n\
 Prioritize bugs, regressions, security risks, race conditions, data loss,\n\
 incorrect assumptions, and missing tests. Keep style nits out unless they hide a\n\
