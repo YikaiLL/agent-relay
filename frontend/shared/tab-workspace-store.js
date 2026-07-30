@@ -7,6 +7,7 @@ import {
   focusTab,
   moveTab,
   openThreadTab,
+  retargetThread,
   sameWorkspace,
   setTabPinned,
 } from "./tab-layout.js";
@@ -111,6 +112,34 @@ export function createTabWorkspaceStore({ persistence = null } = {}) {
     },
 
     /**
+     * Rekey a promoted session everywhere it is open (see retargetThread). Covers every
+     * workspace, loaded or not, for the same reason the removal sweep does: the tab may
+     * live in a project this page has not opened yet.
+     */
+    retargetThreadEverywhere(fromThreadId, toThreadId) {
+      if (!fromThreadId || !toThreadId || fromThreadId === toThreadId) {
+        return;
+      }
+      for (const key of get().allWorkspaceKeys()) {
+        get().update(key, (current) => retargetThread(current, fromThreadId, toThreadId));
+      }
+    },
+
+    /**
+     * Every workspace key this store could serve: the loaded ones plus whatever
+     * persistence knows about. `persistence.keys()` is optional.
+     */
+    allWorkspaceKeys() {
+      let persistedKeys = [];
+      try {
+        persistedKeys = persistence?.keys?.() || [];
+      } catch {
+        persistedKeys = [];
+      }
+      return [...new Set([...Object.keys(get().workspaces), ...persistedKeys])];
+    },
+
+    /**
      * Drop a session from every workspace that has it open. Call this when a session
      * is deleted: a tab pointing at a thread that no longer exists is dead — it can't
      * be focused into anything, and it keeps a stale title in the strip.
@@ -126,14 +155,7 @@ export function createTabWorkspaceStore({ persistence = null } = {}) {
         return;
       }
 
-      let persistedKeys = [];
-      try {
-        persistedKeys = persistence?.keys?.() || [];
-      } catch {
-        persistedKeys = [];
-      }
-
-      for (const key of new Set([...Object.keys(get().workspaces), ...persistedKeys])) {
+      for (const key of get().allWorkspaceKeys()) {
         // Hydrate before sweeping, so a cold workspace is inspected rather than
         // skipped. ensureWorkspace is idempotent and caches.
         const workspace = get().ensureWorkspace(key);

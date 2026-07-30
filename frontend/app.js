@@ -1230,6 +1230,10 @@ function ensureActiveProjectSelected() {
   const nextId = projects[0]?.id ?? null;
   if (nextId !== activeId) {
     state.threadListStore.getState().setActiveProject(nextId);
+    // Project payloads arrive asynchronously, so creating/deleting a project can
+    // change the selected project without changing the thread route. Keep the current
+    // history entry's view context current or a reload cannot restore that selection.
+    replaceCurrentThreadHistoryEntry();
   }
 }
 
@@ -1258,6 +1262,9 @@ function setThreadViewMode(mode) {
   // Runs BEFORE the renders below, and with the transition disabled, so those renders
   // can't skip a pending route update.
   syncRouteToCurrentWorkspace();
+  // Switching between two empty tab sets leaves the thread route unchanged, but the
+  // mode is still navigation state that a reload/back-forward entry must remember.
+  replaceCurrentThreadHistoryEntry();
   renderThreads();
   // Switch the main area too: entering Projects shows the card overview; leaving it
   // returns to console/conversation. renderSession derives the view from the mode.
@@ -2176,8 +2183,12 @@ async function boot() {
   await loadSession("initial boot");
   await loadThreads("initial boot");
   // A `?thread=` deep link (address bar, restored tab, reload) sets viewThreadId
-  // directly, without going through viewThread. Same reconciliation as back/forward:
-  // launching straight onto a deleted session must not create a dead tab.
+  // directly, without going through viewThread. Restore the entry's view context first
+  // — a reload on a project session kept its URL but loaded with the default Sessions
+  // context, so the session landed in the wrong tab set and the project was lost — then
+  // apply the same reconciliation back/forward does, so launching straight onto a
+  // deleted session doesn't create a dead tab.
+  restoreViewContext(window.history.state);
   adoptRoutedThread();
   // Nothing else renders between here and the first snapshot, so refresh the strip.
   renderSessionTabs();
@@ -3276,12 +3287,11 @@ function readThreadIdFromUrl() {
   return url.searchParams.get("thread") || null;
 }
 
-function setThreadRoute(threadId, options = {}) {
+function writeThreadHistoryEntry(threadId, { replace = false } = {}) {
   const nextThreadId = threadId || null;
-  const threadChanged = state.viewThreadId !== nextThreadId;
   const url = new URL(window.location.href);
-  if (threadId) {
-    url.searchParams.set("thread", threadId);
+  if (nextThreadId) {
+    url.searchParams.set("thread", nextThreadId);
   } else {
     url.searchParams.delete("thread");
   }
@@ -3298,11 +3308,21 @@ function setThreadRoute(threadId, options = {}) {
     viewMode: state.threadListStore.getState().viewMode,
     projectId: readActiveProjectId(state.threadListStore),
   };
-  if (options.replace) {
+  if (replace) {
     window.history.replaceState(entry, "", next);
   } else {
     window.history.pushState(entry, "", next);
   }
+}
+
+function replaceCurrentThreadHistoryEntry() {
+  writeThreadHistoryEntry(state.viewThreadId, { replace: true });
+}
+
+function setThreadRoute(threadId, options = {}) {
+  const nextThreadId = threadId || null;
+  const threadChanged = state.viewThreadId !== nextThreadId;
+  writeThreadHistoryEntry(nextThreadId, options);
   state.viewThreadId = nextThreadId;
   // The single choke point for "which session am I viewing", so it's also the right
   // place to guarantee that session has a tab — covering starting a session, a
@@ -3541,6 +3561,16 @@ function renderSessionTabs() {
  * strip previously each carried their own copy of this body.
  */
 function viewThreadById(threadId, { transition = true, replace = false } = {}) {
+  // A tab rendered before another window deleted its session is still clickable, and
+  // this path is not covered by the navigation-time sweep. Routing to a dead id would
+  // put the main area on a session that no longer exists, so drop the stale tab and
+  // settle instead.
+  if (isRemovedThreadId(threadId, state.removedThreadIds)) {
+    state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
+    syncRouteToCurrentWorkspace({ replace: true });
+    renderSessionTabs();
+    return;
+  }
   // Viewing a session is what puts it in the tab strip: the strip records "what I
   // have open", so it has to cover however the user got here (sidebar click, deep
   // link, tab click).
@@ -3633,7 +3663,11 @@ function adoptRoutedThread() {
  * it be overwritten would defeat the navigation.
  */
 function restoreViewContext(entry) {
-  if (!entry || typeof entry !== "object") {
+  // Require an explicit viewMode. Entries created before this shipped (or by an
+  // external link) are `{}` / null, and reading a missing field as "sessions" would
+  // silently switch modes instead of keeping the current context, which is what the
+  // absence of state is supposed to mean.
+  if (entry?.viewMode !== "projects" && entry?.viewMode !== "sessions") {
     return;
   }
 
@@ -3650,8 +3684,16 @@ function restoreViewContext(entry) {
       projectsToolbar.hidden = !isProjects;
     }
   }
-  if (readActiveProjectId(state.threadListStore) !== (entry.projectId || null)) {
-    state.threadListStore.getState().setActiveProject(entry.projectId || null);
+  // Only restore a project that still exists. The entry can outlive the project it
+  // names, and selecting a deleted id would implicitly create a workspace bucket for a
+  // project that is gone; fall back to no selection and let ensureActiveProjectSelected
+  // pick a live one.
+  const restoredProjectId = entry.projectId
+    && (state.projects || []).some((project) => project.id === entry.projectId)
+    ? entry.projectId
+    : null;
+  if (readActiveProjectId(state.threadListStore) !== restoredProjectId) {
+    state.threadListStore.getState().setActiveProject(restoredProjectId);
   }
 }
 

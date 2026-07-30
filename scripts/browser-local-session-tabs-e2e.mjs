@@ -48,6 +48,14 @@ function assertCoherent(state, label) {
     if (state.focusedTabThreadId !== state.routedThreadId) {
       throw new Error(`${label}: the highlight disagrees with the route — ${where}`);
     }
+    // A routed session settles into the conversation view in BOTH directions, including
+    // a read-only one: the view-only projection rewrites the rendered session's
+    // active_thread_id to the viewed thread (local/view-only-thread.js), so
+    // isViewingConversation ends up true. Reaching it is asynchronous — the projection
+    // has to load first — which is why this is polled rather than sampled.
+    if (state.mainView !== "conversation") {
+      throw new Error(`${label}: a routed session is not rendered as a conversation — ${where}`);
+    }
     return;
   }
 
@@ -157,6 +165,16 @@ async function run() {
     const page = await launched.context.newPage();
     attachPageDebugLogging(page, "local", { prefix: "local-session-tabs-e2e" });
     page.on("pageerror", (error) => pageErrors.push(error.stack || error.message));
+    // Project creation and delete both prompt; `promptValue` is what a prompt answers
+    // with, and confirms are accepted.
+    let promptValue = "";
+    page.on("dialog", async (dialog) => {
+      if (dialog.type() === "prompt") {
+        await dialog.accept(promptValue);
+        return;
+      }
+      await dialog.accept();
+    });
 
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#open-start-session-dialog", { timeout: TIMEOUT_MS });
@@ -409,6 +427,145 @@ async function run() {
     );
     await shoot(page, "08b-context-restored");
 
+    // --- A reload keeps the view context, not just the thread ---
+    // The URL only carries the thread, so a reload used to come back in the default
+    // Sessions context and drop the session into the wrong tab set.
+    await page.click("#threads-view-projects");
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
+      { timeout: TIMEOUT_MS }
+    );
+    // A real project, so the Projects context has something to restore. Creating one
+    // selects it, which is what makes the tab bucket project-specific.
+    promptValue = "Reload Project";
+    await page.click("#projects-create-button");
+    await page.waitForSelector(".project-sidebar-row.is-active", { timeout: TIMEOUT_MS });
+    const selectedProject = await page.evaluate(
+      () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+    );
+    assert.match(selectedProject, /Reload Project/, "the new project is selected");
+
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-tab-strip", {
+      state: "attached",
+      timeout: TIMEOUT_MS,
+    });
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
+      { timeout: TIMEOUT_MS }
+    );
+    assert.equal(
+      await sidebarViewMode(page),
+      "projects",
+      "a reload restores the Projects context rather than defaulting to Sessions"
+    );
+    // Reload closes the sidebar drawer in conversation-sized layouts. The selected
+    // project row still renders inside it, so this assertion is about state/identity,
+    // not whether the drawer currently lays the row out.
+    await page.waitForSelector(".project-sidebar-row.is-active", {
+      state: "attached",
+      timeout: TIMEOUT_MS,
+    });
+    assert.match(
+      await page.evaluate(
+        () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+      ),
+      /Reload Project/,
+      "the selected project survives the reload, so the tab bucket does too"
+    );
+    await waitForCoherent(page, "after reloading in Projects mode");
+    await shoot(page, "08c-projects-reload");
+
+    // --- Legacy and stale history context entries degrade safely ---
+    // Exercise these on a separate page so their synthetic same-document history
+    // entries cannot disturb the delete/back/forward sequence below.
+    const historyPage = await launched.context.newPage();
+    historyPage.on("pageerror", (error) =>
+      pageErrors.push(`[historyPage] ${error.stack || error.message}`)
+    );
+    await historyPage.goto(`http://127.0.0.1:${relayPort}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await historyPage.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
+    await historyPage.click("#threads-view-projects");
+    await historyPage.waitForFunction(
+      () =>
+        document.querySelector(".sidebar")?.dataset.threadView === "projects"
+        && Boolean(window.history.state?.projectId)
+        && Boolean(document.querySelector(".project-sidebar-row.is-active")),
+      { timeout: TIMEOUT_MS }
+    );
+    const validProjectEntry = await historyPage.evaluate(() => window.history.state);
+    const validProjectTitle = await historyPage.evaluate(
+      () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+    );
+
+    // Entries created before view-context history shipped carry `{}`. Landing on one
+    // must keep the context already on screen, not reinterpret the missing viewMode as
+    // Sessions and jump away.
+    await historyPage.evaluate((entry) => {
+      window.history.pushState({}, "", window.location.href);
+      window.history.pushState(entry, "", window.location.href);
+    }, validProjectEntry);
+    await historyPage.goBack();
+    await historyPage.waitForTimeout(300);
+    assert.equal(
+      await sidebarViewMode(historyPage),
+      "projects",
+      "a legacy empty history state keeps the current view mode"
+    );
+    assert.equal(
+      await historyPage.evaluate(
+        () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+      ),
+      validProjectTitle,
+      "a legacy empty history state keeps the current project"
+    );
+
+    // A history entry can outlive its project. It must not select that dead id or
+    // implicitly create a tab workspace bucket for it.
+    const deletedProjectId = "deleted-project-from-history";
+    await historyPage.evaluate(
+      ({ current, deletedId }) => {
+        window.history.pushState(
+          {
+            threadId: null,
+            viewMode: "projects",
+            projectId: deletedId,
+          },
+          "",
+          window.location.href
+        );
+        window.history.pushState(current, "", window.location.href);
+      },
+      { current: validProjectEntry, deletedId: deletedProjectId }
+    );
+    await historyPage.goBack();
+    await historyPage.waitForFunction(
+      () => !document.querySelector(".project-sidebar-row.is-active"),
+      { timeout: TIMEOUT_MS }
+    );
+    assert.equal(
+      await sidebarViewMode(historyPage),
+      "projects",
+      "a deleted project entry may keep Projects mode while dropping its invalid selection"
+    );
+    assert.equal(
+      await historyPage.evaluate(
+        (key) => window.localStorage.getItem(`sealwire:tab-workspace:${key}`),
+        deletedProjectId
+      ),
+      null,
+      "restoring a deleted project must not create a persisted tab workspace for it"
+    );
+    await historyPage.close();
+
+    await page.click("#threads-view-sessions");
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
+      { timeout: TIMEOUT_MS }
+    );
+
     // --- Deleting a session must not let history resurrect its tab ---
     // History entries outlive threads, so backing onto a deleted session's entry
     // used to re-create the very tab the delete had just swept.
@@ -423,7 +580,6 @@ async function run() {
       { timeout: TIMEOUT_MS }
     );
 
-    page.once("dialog", (dialog) => dialog.accept());
     await page.waitForSelector(`button.conversation-item[data-thread-id="${threadA}"]`, {
       timeout: TIMEOUT_MS,
     });
@@ -551,7 +707,6 @@ async function run() {
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
     await openThreadDrawer(page);
-    page.once("dialog", (dialog) => dialog.accept());
     await page.waitForSelector(`button.conversation-item[data-thread-id="${threadB}"]`, {
       timeout: TIMEOUT_MS,
     });
@@ -559,6 +714,29 @@ async function run() {
     await page.waitForSelector("#delete-thread-button", { timeout: TIMEOUT_MS });
     await page.click("#delete-thread-button");
     await page.waitForTimeout(1000);
+
+    // B still has the dead tab rendered. Clicking it is the most direct path and does
+    // NOT go through the navigation-time sweep, so the click handler has to notice the
+    // tombstone itself rather than routing to a session that no longer exists.
+    const deadTab = `.session-tab[data-thread-id="${threadB}"]`;
+    assert.ok(
+      await pageB.$(deadTab),
+      "the second window must still hold its in-memory tab so the dead-click path is exercised"
+    );
+    await pageB.click(`${deadTab} .session-tab-main`);
+    await pageB.waitForTimeout(1000);
+    const afterClickingDead = await coherence(pageB);
+    assert.ok(
+      !afterClickingDead.tabThreadIds.includes(threadB),
+      `clicking a tab deleted by another window must drop it, got `
+        + JSON.stringify(afterClickingDead.tabThreadIds)
+    );
+    assert.notEqual(
+      afterClickingDead.routedThreadId,
+      threadB,
+      "clicking a dead tab must not route to it"
+    );
+    await waitForCoherent(pageB, "second window after clicking a dead tab");
 
     // B navigates back onto the now-dead session; no reload, no storage event.
     await pageB.goBack({ waitUntil: "domcontentloaded" });

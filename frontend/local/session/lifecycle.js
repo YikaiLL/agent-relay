@@ -698,6 +698,13 @@ export function createLifecycleController(ctx) {
       // briefly re-enables the stick-to-bottom follow) instead of keeping the
       // user's freshly anchored message in place.
       retargetTranscriptScrollThread(state, threadPromotion.from, threadPromotion.to);
+      // Rekey the session's TAB the same way, and BEFORE the route moves: otherwise
+      // setThreadRoute opens a second tab for the real id while the pending one lingers
+      // as a permanently unloadable tab — persisted, on the ordinary Claude new-session
+      // path. Retargeting in place also keeps pin, strip order and focus.
+      state.tabWorkspaceStore
+        ?.getState()
+        .retargetThreadEverywhere(threadPromotion.from, threadPromotion.to);
       if (state.viewThreadId === threadPromotion.from) {
         setThreadRoute(threadPromotion.to, { replace: true });
       }
