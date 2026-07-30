@@ -66,6 +66,45 @@ function deleteGlyph() {
   );
 }
 
+// The one control that folds a group: "+" to unfold, "−" to fold. A chevron read
+// as decoration on a row that was already clickable; a +/− reads as the button it
+// is, which matters now that folding and selecting are deliberately separate
+// targets (see thread-list-collapse.dom.test.mjs).
+function DisclosureButton({ isCollapsed, label, onToggle }) {
+  return h(
+    "button",
+    {
+      type: "button",
+      className: "thread-group-disclosure",
+      "data-state": isCollapsed ? "collapsed" : "expanded",
+      "aria-expanded": isCollapsed ? "false" : "true",
+      "aria-label": `${isCollapsed ? "Expand" : "Collapse"} ${label}`,
+      title: isCollapsed ? "Expand" : "Collapse",
+      onClick: (event) => {
+        // Never let a fold bubble into the row's select handler.
+        event.stopPropagation();
+        onToggle();
+      },
+    },
+    h(
+      "svg",
+      {
+        "aria-hidden": "true",
+        width: "13",
+        height: "13",
+        viewBox: "0 0 16 16",
+        fill: "none",
+        stroke: "currentColor",
+        strokeWidth: "1.6",
+        strokeLinecap: "round",
+      },
+      h("path", { d: "M3.5 8h9" }),
+      // The vertical stroke is the only difference between "−" and "+".
+      isCollapsed ? h("path", { d: "M8 3.5v9" }) : null
+    )
+  );
+}
+
 export function ThreadGroupList({
   activeThreadId = null,
   collapsedGroupCwds = new Set(),
@@ -375,17 +414,14 @@ export function ThreadGroupHeader({
   const canToggle = Boolean(collapsible && onToggleGroup);
   if (projectId && (onRenameProject || onDeleteProject)) {
     const isActiveProject = Boolean(activeProjectId) && activeProjectId === projectId;
-    // Selecting the project and folding it away are BOTH row-level: the name is
-    // only a few characters wide, and a user aiming at "the project" hits the row.
-    // Hanging selection off the name alone meant the tab strip only followed a
-    // pixel-perfect click. The chevron opts out (see below) — it means fold, only.
+    // The whole row selects — the label is only a few characters wide, and a user
+    // aiming at "the project" hits the row. Selecting must NOT also fold: making
+    // an already-active project active again would hide the sessions you were
+    // reaching for. Folding lives on the disclosure button alone.
     const activateRow = () => {
       onSelectProject?.(projectId);
-      if (canToggle) {
-        onToggleGroup(normalizedCwd);
-      }
     };
-    const rowClickable = Boolean(onSelectProject) || canToggle;
+    const rowClickable = Boolean(onSelectProject);
     return h(
       "div",
       {
@@ -485,50 +521,55 @@ export function ThreadGroupHeader({
             deleteGlyph()
           )
       ),
-      // The header is a <div> (it hosts action <button>s), so it cannot itself be
-      // the ARIA disclosure control — the chevron carries the button semantics and
-      // aria-expanded. The row-level onClick above is the mouse convenience.
       canToggle
-        ? h(
-            "button",
-            {
-              type: "button",
-              className: "thread-group-chevron-button",
-              "aria-expanded": isCollapsed ? "false" : "true",
-              "aria-label": `${isCollapsed ? "Expand" : "Collapse"} project ${group.label}`,
-              onClick: (event) => {
-                event.stopPropagation();
-                onToggleGroup(normalizedCwd);
-              },
-            },
-            h("span", { "aria-hidden": "true", className: "thread-group-chevron" })
-          )
+        ? h(DisclosureButton, {
+            isCollapsed,
+            label: `project ${group.label}`,
+            onToggle: () => onToggleGroup(normalizedCwd),
+          })
         : null
     );
   }
 
   if (collapsible) {
+    // A <div>, not a <button>: it hosts the disclosure <button>, and nesting
+    // buttons is invalid. Same shape as a project header — the label is its own
+    // button so the selection stays keyboard-reachable.
+    //
+    // The Unknown-workspace key is a display sentinel rather than a directory. It
+    // would be sent to the relay verbatim as a path, so it never leaves the
+    // display layer: that group folds, but its label is inert.
+    const selectable = Boolean(onSelectWorkspace) && Boolean(group.cwd) && !isUnknownWorkspace(group.cwd);
+    const selectWorkspace = () => onSelectWorkspace(group.cwd);
     return h(
-      "button",
+      "div",
       {
-        "aria-expanded": isCollapsed ? "false" : "true",
-        className: "thread-group-header",
-        onClick: () => {
-          onToggleGroup?.(normalizedCwd);
-          // This header is also what points new sessions at a workspace, so
-          // collapsing must not swallow the selection. The Unknown-workspace key
-          // is a display sentinel rather than a directory — it would be sent to
-          // the relay as a path, so it never leaves the display layer.
-          if (onSelectWorkspace && group.cwd && !isUnknownWorkspace(group.cwd)) {
-            onSelectWorkspace(group.cwd);
-          }
-        },
+        className: "thread-group-header" + (selectable ? " is-clickable" : ""),
+        onClick: selectable ? selectWorkspace : undefined,
         title: headerTitle,
-        type: "button",
       },
       h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
-      h("span", { className: "thread-group-name" }, group.label),
-      h("span", { "aria-hidden": "true", className: "thread-group-chevron" })
+      selectable
+        ? h(
+            "button",
+            {
+              type: "button",
+              className: "thread-group-name thread-group-name-button",
+              "data-select-workspace": group.cwd,
+              onClick: (event) => {
+                // Don't also fire the row handler — one selection per click.
+                event.stopPropagation();
+                selectWorkspace();
+              },
+            },
+            group.label
+          )
+        : h("span", { className: "thread-group-name" }, group.label),
+      h(DisclosureButton, {
+        isCollapsed,
+        label: group.label,
+        onToggle: () => onToggleGroup?.(normalizedCwd),
+      })
     );
   }
 

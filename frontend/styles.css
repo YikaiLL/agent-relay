@@ -1057,51 +1057,41 @@ input:focus, textarea:focus, select:focus {
   text-overflow: ellipsis;
 }
 
-.thread-group-chevron {
-  margin-left: auto;
-  width: 8px;
-  height: 8px;
-  border-right: 1.5px solid var(--text-tertiary);
-  border-bottom: 1.5px solid var(--text-tertiary);
-  transform: rotate(45deg);
-  transition: transform 120ms ease;
-}
-
-.thread-group.is-collapsed .thread-group-chevron {
-  transform: rotate(-45deg);
-}
-
-/* The collapse control on a PROJECT header. That header is a <div> (it hosts the
-   rename/delete buttons), so the chevron carries the button semantics and
-   aria-expanded. Wraps the plain .thread-group-chevron span so the triangle keeps
-   its own border-drawn styling instead of fighting the base button rule. */
+/* Both header kinds are <div>s that select on click, so the cursor has to be set
+   explicitly — and only where a selection handler actually exists. */
+.thread-group-header.is-clickable,
 .thread-group-header-project.is-clickable {
   cursor: pointer;
 }
 
-/* justify-content is flex-END, not center: the button is widened to a usable tap
-   target, but the chevron inside has to sit flush with the row's right edge — the
-   same place the bare `margin-left: auto` chevron lands on a cwd header. Centring
-   it left ~6px of dead space and read as "not quite right-aligned". */
-.thread-group-chevron-button {
+/* The +/− fold control. `margin-left: auto` pins it to the row's right edge (on a
+   project header the badges/actions already sit right, so it lands after them).
+   Sized as a real tap target rather than a bare glyph — it is the ONLY way to
+   fold a group now that clicking the row means "select". */
+.thread-group-disclosure {
   flex: none;
   display: inline-flex;
   align-items: center;
-  justify-content: flex-end;
-  width: 20px;
-  height: 20px;
-  margin-left: 2px;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
   padding: 0;
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
+  color: var(--text-tertiary);
 }
 
-.thread-group-chevron-button:hover {
-  background: transparent;
+.thread-group-disclosure:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
 }
 
-.thread-group-chevron-button .thread-group-chevron {
-  margin-left: 0;
+/* On a project header the badges/actions consume the auto margin first, so keep
+   the disclosure hard against the right edge behind them. */
+.thread-group-header-project .thread-group-disclosure {
+  margin-left: 2px;
 }
 
 .thread-group-show-more {

@@ -3,19 +3,20 @@
 // is virtualized, and the virtualizer measures zero-height rows under jsdom, so
 // nothing would render.
 //
-// Two gaps are captured here:
+// THE CONTRACT — one control per intent, no click does two things:
 //
-//   1. cwd ("folder") headers — the collapsible branch only ever called
-//      onToggleGroup, so wiring collapse into a surface that also wants the
-//      header to set the active workspace (local Sessions mode) silently DROPPED
-//      the workspace selection. Collapse and select have to coexist on one click.
+//   * the +/− disclosure button  -> fold/unfold, and ONLY that
+//   * the label (and the rest of the row) -> select, and ONLY that
 //
-//   2. project headers — ThreadGroupHeader short-circuits to a static header as
-//      soon as the group carries a projectId AND a rename/delete handler, so the
-//      collapse machinery (collapsible/collapsedGroupCwds/onToggleGroup, all
-//      already passed by local's Projects mode) was unreachable: no chevron, and
-//      onToggleGroup was never called. Selecting the project is what re-points
-//      the right-hand tab strip, so toggling must NOT replace it — both fire.
+// This split is the whole point. Folding used to ride along with selection, which
+// meant clicking an already-selected project to make it active ALSO folded it —
+// hiding the very sessions you were reaching for. Selection is idempotent;
+// toggling is not, so they cannot share a click target.
+//
+// Both header kinds behave identically here. A cwd ("folder") header therefore
+// cannot be a <button> anymore — it has to host the disclosure <button>, and
+// nesting buttons is invalid — so it is a <div> with a <button> label, exactly
+// like a project header already was.
 //
 // Kept in its own file so the DOM globals below don't leak into the static suite.
 import test from "node:test";
@@ -68,232 +69,196 @@ function click(element) {
   });
 }
 
-// --- cwd / "folder" headers -------------------------------------------------
-
-test("a collapsible cwd header toggles collapse AND still selects the workspace", () => {
-  const toggled = [];
-  const selected = [];
-  const { host, cleanup } = mount({
+function cwdProps(extra = {}) {
+  return {
     collapsible: true,
     group: CWD_GROUP,
     isCollapsed: false,
     normalizedCwd: "/tmp/work",
-    onSelectWorkspace: (cwd) => selected.push(cwd),
-    onToggleGroup: (cwd) => toggled.push(cwd),
-  });
+    ...extra,
+  };
+}
 
-  click(host.querySelector(".thread-group-header"));
+function projectProps(extra = {}) {
+  return {
+    collapsible: true,
+    group: PROJECT_GROUP,
+    isCollapsed: false,
+    normalizedCwd: "proj-1",
+    onDeleteProject: () => {},
+    onRenameProject: () => {},
+    ...extra,
+  };
+}
 
-  // Collapse is the new behaviour...
-  assert.deepEqual(toggled, ["/tmp/work"]);
-  // ...but the header is also what points new sessions at this workspace. Losing
-  // that is the regression this test exists to prevent.
-  assert.deepEqual(selected, ["/tmp/work"]);
+// --- the disclosure control -------------------------------------------------
+
+test("the disclosure shows a plus when collapsed and a minus when expanded", () => {
+  const shut = mount(projectProps({ isCollapsed: true, onToggleGroup: () => {} }));
+  const collapsed = shut.host.querySelector(".thread-group-disclosure");
+  assert.equal(collapsed.getAttribute("aria-expanded"), "false");
+  assert.equal(collapsed.dataset.state, "collapsed");
+  // A plus is a minus plus one stroke — the vertical bar is what distinguishes them.
+  assert.equal(collapsed.querySelectorAll("svg path").length, 2, "collapsed must render '+'");
+  shut.cleanup();
+
+  const open = mount(projectProps({ onToggleGroup: () => {} }));
+  const expanded = open.host.querySelector(".thread-group-disclosure");
+  assert.equal(expanded.getAttribute("aria-expanded"), "true");
+  assert.equal(expanded.dataset.state, "expanded");
+  assert.equal(expanded.querySelectorAll("svg path").length, 1, "expanded must render '−'");
+  open.cleanup();
+});
+
+test("a cwd header gets the same disclosure control as a project header", () => {
+  const { host, cleanup } = mount(cwdProps({ isCollapsed: true, onToggleGroup: () => {} }));
+  const disclosure = host.querySelector(".thread-group-disclosure");
+  assert.ok(disclosure, "folder rows need the same +/− affordance as projects");
+  assert.equal(disclosure.getAttribute("aria-expanded"), "false");
+  assert.equal(disclosure.querySelectorAll("svg path").length, 2);
   cleanup();
 });
 
-test("a collapsible cwd header reports its state through aria-expanded", () => {
-  const open = mount({
-    collapsible: true,
-    group: CWD_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "/tmp/work",
-    onToggleGroup: () => {},
-  });
-  assert.equal(open.host.querySelector(".thread-group-header").getAttribute("aria-expanded"), "true");
-  open.cleanup();
+// Nested <button> is invalid HTML, so the header cannot stay a <button> once it
+// hosts the disclosure. Guard the structure, not just the behaviour.
+test("a collapsible header is not itself a button", () => {
+  const { host, cleanup } = mount(cwdProps({ onToggleGroup: () => {}, onSelectWorkspace: () => {} }));
+  assert.equal(host.querySelector(".thread-group-header").tagName, "DIV");
+  assert.equal(host.querySelectorAll("button button").length, 0);
+  cleanup();
+});
 
-  const shut = mount({
-    collapsible: true,
-    group: CWD_GROUP,
-    isCollapsed: true,
-    normalizedCwd: "/tmp/work",
-    onToggleGroup: () => {},
-  });
-  assert.equal(shut.host.querySelector(".thread-group-header").getAttribute("aria-expanded"), "false");
-  shut.cleanup();
+// --- toggle is ONLY the disclosure ------------------------------------------
+
+test("the cwd disclosure folds without selecting the workspace", () => {
+  const toggled = [];
+  const selected = [];
+  const { host, cleanup } = mount(
+    cwdProps({
+      onSelectWorkspace: (cwd) => selected.push(cwd),
+      onToggleGroup: (cwd) => toggled.push(cwd),
+    })
+  );
+
+  click(host.querySelector(".thread-group-disclosure"));
+
+  assert.deepEqual(toggled, ["/tmp/work"]);
+  assert.deepEqual(selected, [], "folding is not a selection");
+  cleanup();
+});
+
+test("the project disclosure folds without selecting the project", () => {
+  const toggled = [];
+  const picked = [];
+  const { host, cleanup } = mount(
+    projectProps({
+      onSelectProject: (id) => picked.push(id),
+      onToggleGroup: (key) => toggled.push(key),
+    })
+  );
+
+  click(host.querySelector(".thread-group-disclosure"));
+
+  assert.deepEqual(toggled, ["proj-1"]);
+  assert.deepEqual(picked, [], "folding must not yank the tab strip over");
+  cleanup();
+});
+
+// --- select is ONLY the label / row -----------------------------------------
+
+// The regression this whole split exists for: selecting an already-active
+// project must leave it open, or you hide the sessions you were reaching for.
+test("clicking a project label selects it and does NOT fold it", () => {
+  const toggled = [];
+  const picked = [];
+  const { host, cleanup } = mount(
+    projectProps({
+      onSelectProject: (id) => picked.push(id),
+      onToggleGroup: (key) => toggled.push(key),
+    })
+  );
+
+  click(host.querySelector(".thread-group-name-button"));
+
+  assert.deepEqual(picked, ["proj-1"]);
+  assert.deepEqual(toggled, [], "selecting must never fold");
+  cleanup();
+});
+
+test("clicking a project row's empty space selects it and does NOT fold it", () => {
+  const toggled = [];
+  const picked = [];
+  const { host, cleanup } = mount(
+    projectProps({
+      onSelectProject: (id) => picked.push(id),
+      onToggleGroup: (key) => toggled.push(key),
+    })
+  );
+
+  click(host.querySelector(".thread-group-header-project"));
+
+  assert.deepEqual(picked, ["proj-1"]);
+  assert.deepEqual(toggled, []);
+  cleanup();
+});
+
+test("clicking a cwd label selects the workspace and does NOT fold it", () => {
+  const toggled = [];
+  const selected = [];
+  const { host, cleanup } = mount(
+    cwdProps({
+      onSelectWorkspace: (cwd) => selected.push(cwd),
+      onToggleGroup: (cwd) => toggled.push(cwd),
+    })
+  );
+
+  click(host.querySelector(".thread-group-name-button"));
+
+  assert.deepEqual(selected, ["/tmp/work"]);
+  assert.deepEqual(toggled, []);
+  cleanup();
 });
 
 // The Unknown-workspace key is a display sentinel, never a real directory — it
-// must not reach onSelectWorkspace even now that collapse shares the click.
-test("the unknown-workspace header collapses without leaking the sentinel as a cwd", () => {
+// would be sent to the relay as a path. It must stay foldable but unselectable.
+test("the unknown-workspace header folds but never leaks the sentinel as a cwd", () => {
   const toggled = [];
   const selected = [];
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: { cwd: "__unknown_workspace__", label: "Unknown workspace" },
-    isCollapsed: false,
-    normalizedCwd: "__unknown_workspace__",
-    onSelectWorkspace: (cwd) => selected.push(cwd),
-    onToggleGroup: (cwd) => toggled.push(cwd),
-  });
+  const { host, cleanup } = mount(
+    cwdProps({
+      group: { cwd: "__unknown_workspace__", label: "Unknown workspace" },
+      normalizedCwd: "__unknown_workspace__",
+      onSelectWorkspace: (cwd) => selected.push(cwd),
+      onToggleGroup: (cwd) => toggled.push(cwd),
+    })
+  );
 
-  click(host.querySelector(".thread-group-header"));
+  click(host.querySelector(".thread-group-disclosure"));
+  const label = host.querySelector(".thread-group-name-button");
+  if (label) {
+    click(label);
+  }
 
   assert.deepEqual(toggled, ["__unknown_workspace__"]);
   assert.deepEqual(selected, [], "the sentinel must never be handed out as a workspace path");
   cleanup();
 });
 
-// --- project headers --------------------------------------------------------
+// --- project actions stay inert ---------------------------------------------
 
-test("a project header renders a collapse chevron", () => {
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onToggleGroup: () => {},
-  });
-
-  assert.ok(
-    host.querySelector(".thread-group-header-project .thread-group-chevron"),
-    "the project header must show the same collapse affordance as a cwd header"
-  );
-  cleanup();
-});
-
-test("clicking a project header toggles collapse", () => {
-  const toggled = [];
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onToggleGroup: (key) => toggled.push(key),
-  });
-
-  click(host.querySelector(".thread-group-header-project"));
-
-  assert.deepEqual(toggled, ["proj-1"]);
-  cleanup();
-});
-
-// The whole row is the click target a user aims at — the name is a few characters
-// wide, and everything either side of it is the same row. Selecting the project
-// (which re-points the right-hand tab strip) must therefore hang off the ROW, not
-// only off the name; otherwise the tab strip only follows a pixel-perfect click.
-test("clicking anywhere on a project row selects the project, not just toggles it", () => {
+test("project rename/delete buttons neither fold nor select", () => {
   const toggled = [];
   const picked = [];
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onSelectProject: (id) => picked.push(id),
-    onToggleGroup: (key) => toggled.push(key),
-  });
-
-  click(host.querySelector(".thread-group-header-project"));
-
-  assert.deepEqual(picked, ["proj-1"], "the row click must re-point the tab strip");
-  assert.deepEqual(toggled, ["proj-1"]);
-  cleanup();
-});
-
-// The chevron is the one control that means ONLY "fold this away" — it must not
-// also yank the tab strip over to this project.
-test("the project chevron toggles without selecting the project", () => {
-  const toggled = [];
-  const picked = [];
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onSelectProject: (id) => picked.push(id),
-    onToggleGroup: (key) => toggled.push(key),
-  });
-
-  click(host.querySelector(".thread-group-chevron-button"));
-
-  assert.deepEqual(toggled, ["proj-1"]);
-  assert.deepEqual(picked, []);
-  cleanup();
-});
-
-// The nested session rows ARE the count — restating it as "2 sessions" is noise
-// that also crowds the collapse chevron off the right edge.
-test("a project header shows no raw session-count badge", () => {
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onToggleGroup: () => {},
-  });
-
-  assert.doesNotMatch(host.innerHTML, /\bsessions?\b/i);
-  cleanup();
-});
-
-// Working / needs-input are not counts-for-counting's-sake — they are the reason
-// to look at a collapsed project at all, so they stay.
-test("a project header keeps its working / needs-input badges", () => {
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: { ...PROJECT_GROUP, summary: { working: 2, needsInput: 1, total: 5 } },
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onToggleGroup: () => {},
-  });
-
-  assert.match(host.innerHTML, /2 working/);
-  assert.match(host.innerHTML, /1 needs input/);
-  cleanup();
-});
-
-test("clicking the project NAME still selects the project and also toggles collapse", () => {
-  const toggled = [];
-  const picked = [];
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onSelectProject: (id) => picked.push(id),
-    onToggleGroup: (key) => toggled.push(key),
-  });
-
-  click(host.querySelector(".thread-group-name-button"));
-
-  // Selecting a project is what re-points the right-hand tab strip at that
-  // project's workspace. Collapse is additive — it must not displace it.
-  assert.deepEqual(picked, ["proj-1"]);
-  // Exactly once: the name button sits inside the header, so a bubbling click
-  // plus the button's own handler would double-toggle back to where it started.
-  assert.deepEqual(toggled, ["proj-1"]);
-  cleanup();
-});
-
-test("project rename/delete buttons do not toggle collapse", () => {
-  const toggled = [];
   const renamed = [];
   const deleted = [];
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: (id) => deleted.push(id),
-    onRenameProject: (id) => renamed.push(id),
-    onToggleGroup: (key) => toggled.push(key),
-  });
+  const { host, cleanup } = mount(
+    projectProps({
+      onDeleteProject: (id) => deleted.push(id),
+      onRenameProject: (id) => renamed.push(id),
+      onSelectProject: (id) => picked.push(id),
+      onToggleGroup: (key) => toggled.push(key),
+    })
+  );
 
   const actions = host.querySelectorAll(".thread-group-action");
   click(actions[0]);
@@ -302,60 +267,51 @@ test("project rename/delete buttons do not toggle collapse", () => {
   assert.deepEqual(renamed, ["proj-1"]);
   assert.deepEqual(deleted, ["proj-1"]);
   assert.deepEqual(toggled, [], "acting on a project must not fold its sessions away");
+  assert.deepEqual(picked, []);
   cleanup();
 });
 
-// Unlike a cwd header (itself a <button>), a project header is a <div> — it hosts
-// the rename/delete <button>s, which cannot legally nest inside a button. So the
-// chevron is the ARIA disclosure control and carries aria-expanded.
-test("a project header reports its state through aria-expanded on the chevron", () => {
-  const shut = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: true,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onToggleGroup: () => {},
-  });
-  assert.equal(
-    shut.host.querySelector(".thread-group-chevron-button").getAttribute("aria-expanded"),
-    "false"
+// --- badges -----------------------------------------------------------------
+
+// The nested session rows ARE the count — restating it as "2 sessions" is noise
+// that also crowds the disclosure off the right edge.
+test("a project header shows no raw session-count badge", () => {
+  const { host, cleanup } = mount(projectProps({ onToggleGroup: () => {} }));
+  assert.doesNotMatch(host.innerHTML, /\bsessions?\b/i);
+  cleanup();
+});
+
+// Working / needs-input are not counts-for-counting's-sake — they are the reason
+// to look at a folded project at all, so they stay.
+test("a project header keeps its working / needs-input badges", () => {
+  const { host, cleanup } = mount(
+    projectProps({
+      group: { ...PROJECT_GROUP, summary: { working: 2, needsInput: 1, total: 5 } },
+      onToggleGroup: () => {},
+    })
   );
-  shut.cleanup();
-});
 
-test("the project chevron toggles collapse exactly once (no double-fire from the row)", () => {
-  const toggled = [];
-  const { host, cleanup } = mount({
-    collapsible: true,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-    onToggleGroup: (key) => toggled.push(key),
-  });
-
-  click(host.querySelector(".thread-group-chevron-button"));
-
-  assert.deepEqual(toggled, ["proj-1"]);
+  assert.match(host.innerHTML, /2 working/);
+  assert.match(host.innerHTML, /1 needs input/);
   cleanup();
 });
 
-// Not every surface wires collapse (the header also renders in read-only spots).
-// Without onToggleGroup the header must stay inert rather than growing a chevron
-// that does nothing.
-test("a project header without a toggle handler shows no chevron", () => {
-  const { host, cleanup } = mount({
-    collapsible: false,
-    group: PROJECT_GROUP,
-    isCollapsed: false,
-    normalizedCwd: "proj-1",
-    onDeleteProject: () => {},
-    onRenameProject: () => {},
-  });
+// --- surfaces that never wired collapse -------------------------------------
 
-  assert.equal(host.querySelector(".thread-group-chevron"), null);
+test("a project header without a toggle handler shows no disclosure", () => {
+  const { host, cleanup } = mount(projectProps({ collapsible: false }));
+  assert.equal(host.querySelector(".thread-group-disclosure"), null);
+  cleanup();
+});
+
+test("a cwd header without a toggle handler still selects its workspace", () => {
+  const selected = [];
+  const { host, cleanup } = mount(
+    cwdProps({ collapsible: false, onSelectWorkspace: (cwd) => selected.push(cwd) })
+  );
+
+  assert.equal(host.querySelector(".thread-group-disclosure"), null);
+  click(host.querySelector(".thread-group-header"));
+  assert.deepEqual(selected, ["/tmp/work"]);
   cleanup();
 });
