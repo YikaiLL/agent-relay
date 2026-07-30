@@ -11,7 +11,7 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use relay_broker::auth::{BrokerAuthMode, BROKER_AUTH_MODE_ENV};
 use relay_broker::join_ticket::unix_now;
 use relay_broker::protocol::{PeerRole, PresenceKind, ServerMessage};
@@ -46,7 +46,11 @@ use self::session_claim::{issue_session_claim, verify_session_claim};
 #[cfg(test)]
 use relay_broker::protocol::BROKER_PROTOCOL_VERSION;
 
-const RECONNECT_DELAY_SECS: u64 = 2;
+const BROKER_RECONNECT_BASE_DELAY_SECS: u64 = 2;
+const BROKER_RECONNECT_MAX_DELAY_SECS: u64 = 60;
+const BROKER_RECONNECT_STABLE_SESSION_SECS: u64 = 60;
+const BROKER_PING_INTERVAL_SECS: u64 = 20;
+const BROKER_PONG_TIMEOUT_SECS: u64 = 10;
 const PUBLIC_RELAY_AUTH_REQUEST_RETRY_SECS: u64 = 5;
 const PUBLIC_RELAY_REGISTRATION_SCHEMA_VERSION: u32 = 1;
 const PUBLIC_RELAY_IDENTITY_SCHEMA_VERSION: u32 = 1;
@@ -175,6 +179,109 @@ fn snapshot_publish_decision(
 enum ServerMessageOutcome {
     Continue,
     RateLimited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryDelay {
+    delay: Duration,
+    cap: Duration,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RetryBackoff {
+    base_delay: Duration,
+    max_delay: Duration,
+    consecutive_failures: u32,
+}
+
+impl RetryBackoff {
+    fn new(base_delay: Duration, max_delay: Duration) -> Self {
+        assert!(
+            !base_delay.is_zero() && max_delay >= base_delay,
+            "retry backoff requires a non-zero base delay no larger than its maximum"
+        );
+        Self {
+            base_delay,
+            max_delay,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn reset_after_stable_session(&mut self, session_duration: Duration) {
+        if session_duration >= Duration::from_secs(BROKER_RECONNECT_STABLE_SESSION_SECS) {
+            self.reset();
+        }
+    }
+
+    fn next_delay<R>(&mut self, rng: &mut R) -> RetryDelay
+    where
+        R: Rng + ?Sized,
+    {
+        let exponent = self.consecutive_failures.min(31);
+        let cap = self
+            .base_delay
+            .saturating_mul(1_u32 << exponent)
+            .min(self.max_delay);
+        let cap_millis = cap.as_millis().min(u64::MAX as u128) as u64;
+        let floor_millis = (cap_millis / 2).max(1);
+        let delay = Duration::from_millis(rng.gen_range(floor_millis..=cap_millis));
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        RetryDelay {
+            delay,
+            cap,
+            consecutive_failures: self.consecutive_failures,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BrokerSessionError {
+    message: String,
+    connected_duration: Option<Duration>,
+}
+
+impl BrokerSessionError {
+    fn before_connected(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            connected_duration: None,
+        }
+    }
+
+    fn after_connected(message: impl Into<String>, connected_at: Instant) -> Self {
+        Self {
+            message: message.into(),
+            connected_duration: Some(connected_at.elapsed()),
+        }
+    }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn connected_duration(&self) -> Option<Duration> {
+        self.connected_duration
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BrokerLivenessConfig {
+    ping_interval: Duration,
+    pong_timeout: Duration,
+}
+
+impl Default for BrokerLivenessConfig {
+    fn default() -> Self {
+        Self {
+            ping_interval: Duration::from_secs(BROKER_PING_INTERVAL_SECS),
+            pong_timeout: Duration::from_secs(BROKER_PONG_TIMEOUT_SECS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,31 +670,61 @@ async fn run_broker_loop(
     mut change_rx: watch::Receiver<u64>,
     config: BrokerConfig,
 ) {
+    let mut reconnect_backoff = RetryBackoff::new(
+        Duration::from_secs(BROKER_RECONNECT_BASE_DELAY_SECS),
+        Duration::from_secs(BROKER_RECONNECT_MAX_DELAY_SECS),
+    );
     loop {
-        match run_broker_session(&state, &mut change_rx, &config).await {
-            Ok(()) => {
+        let connected_duration = match run_broker_session(&state, &mut change_rx, &config).await {
+            Ok(connected_duration) => {
                 debug!("broker session ended cleanly");
+                reconnect_backoff.reset_after_stable_session(connected_duration);
+                Some(connected_duration)
             }
             Err(error) => {
+                let connected_duration = error.connected_duration();
                 warn!(
                     broker_room_id = config.broker_room_id(),
                     peer_id = config.relay_peer_id(),
-                    %error,
+                    error = %error.message(),
                     "broker session ended"
                 );
                 state
-                    .push_runtime_log("warn", format!("Broker disconnected: {error}"))
+                    .push_runtime_log("warn", format!("Broker disconnected: {}", error.message()))
                     .await;
+                if let Some(connected_duration) = connected_duration {
+                    reconnect_backoff.reset_after_stable_session(connected_duration);
+                }
+                connected_duration
             }
-        }
+        };
 
         state.set_broker_connection(false).await;
-        tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+        let retry = {
+            let mut rng = rand::thread_rng();
+            reconnect_backoff.next_delay(&mut rng)
+        };
+        info!(
+            broker_room_id = config.broker_room_id(),
+            peer_id = config.relay_peer_id(),
+            reconnect_delay_ms = retry.delay.as_millis(),
+            reconnect_delay_cap_ms = retry.cap.as_millis(),
+            consecutive_failures = retry.consecutive_failures,
+            connected_duration_ms = connected_duration
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+            "scheduling broker reconnect"
+        );
+        tokio::time::sleep(retry.delay).await;
     }
 }
 
 async fn run_public_broker_enrollment_loop(state: AppState, pending: PendingPublicEnrollment) {
     let client = reqwest::Client::new();
+    let mut retry_backoff = RetryBackoff::new(
+        Duration::from_secs(PUBLIC_RELAY_AUTH_REQUEST_RETRY_SECS),
+        Duration::from_secs(BROKER_RECONNECT_MAX_DELAY_SECS),
+    );
     loop {
         match perform_public_relay_enrollment(&client, &pending).await {
             Ok(registration) => match BrokerConfig::from_env().await {
@@ -633,7 +770,18 @@ async fn run_public_broker_enrollment_loop(state: AppState, pending: PendingPubl
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(PUBLIC_RELAY_AUTH_REQUEST_RETRY_SECS)).await;
+        let retry = {
+            let mut rng = rand::thread_rng();
+            retry_backoff.next_delay(&mut rng)
+        };
+        info!(
+            control_url = %pending.control_url,
+            retry_delay_ms = retry.delay.as_millis(),
+            retry_delay_cap_ms = retry.cap.as_millis(),
+            consecutive_failures = retry.consecutive_failures,
+            "scheduling public broker enrollment retry"
+        );
+        tokio::time::sleep(retry.delay).await;
     }
 }
 
@@ -689,25 +837,41 @@ async fn run_broker_session(
     state: &AppState,
     change_rx: &mut watch::Receiver<u64>,
     config: &BrokerConfig,
-) -> Result<(), String> {
-    let connect_url = config.relay_connect_url().await?;
-    let (socket, _) = connect_async(connect_url.as_str())
+) -> Result<Duration, BrokerSessionError> {
+    run_broker_session_with_liveness(state, change_rx, config, BrokerLivenessConfig::default())
         .await
-        .map_err(|error| format!("failed to connect to broker: {error}"))?;
+}
+
+async fn run_broker_session_with_liveness(
+    state: &AppState,
+    change_rx: &mut watch::Receiver<u64>,
+    config: &BrokerConfig,
+    liveness: BrokerLivenessConfig,
+) -> Result<Duration, BrokerSessionError> {
+    let connect_url = config
+        .relay_connect_url()
+        .await
+        .map_err(BrokerSessionError::before_connected)?;
+    let (socket, _) = connect_async(connect_url.as_str()).await.map_err(|error| {
+        BrokerSessionError::before_connected(format!("failed to connect to broker: {error}"))
+    })?;
     let (mut sender, mut receiver) = socket.split();
 
     let welcome = receiver
         .next()
         .await
-        .ok_or_else(|| "broker closed before welcome".to_string())?
-        .map_err(|error| format!("broker welcome read failed: {error}"))?;
-    match decode_server_frame(welcome)? {
+        .ok_or_else(|| BrokerSessionError::before_connected("broker closed before welcome"))?
+        .map_err(|error| {
+            BrokerSessionError::before_connected(format!("broker welcome read failed: {error}"))
+        })?;
+    match decode_server_frame(welcome).map_err(BrokerSessionError::before_connected)? {
         Some(ServerMessage::Welcome {
             protocol_version,
             peers,
             ..
         }) => {
-            validate_broker_protocol_version(protocol_version)?;
+            validate_broker_protocol_version(protocol_version)
+                .map_err(BrokerSessionError::before_connected)?;
             let surface_peers = peers
                 .into_iter()
                 .filter(|peer| peer.role == PeerRole::Surface)
@@ -731,17 +895,24 @@ async fn run_broker_session(
                 }
             }
         }
-        Some(ServerMessage::Error { message, .. }) => return Err(message),
+        Some(ServerMessage::Error { message, .. }) => {
+            return Err(BrokerSessionError::before_connected(message))
+        }
         Some(other) => {
-            return Err(format!(
+            return Err(BrokerSessionError::before_connected(format!(
                 "expected broker welcome frame, got {}",
                 server_message_name(&other)
+            )))
+        }
+        None => {
+            return Err(BrokerSessionError::before_connected(
+                "broker did not send a welcome frame",
             ))
         }
-        None => return Err("broker did not send a welcome frame".to_string()),
     }
 
     state.set_broker_connection(true).await;
+    let connected_at = Instant::now();
     state
         .push_runtime_log(
             "info",
@@ -750,10 +921,20 @@ async fn run_broker_session(
         .await;
     publish_pending_broker_messages(&mut sender, state)
         .await
-        .map_err(|error| format!("initial broker direct publish failed: {error}"))?;
+        .map_err(|error| {
+            BrokerSessionError::after_connected(
+                format!("initial broker direct publish failed: {error}"),
+                connected_at,
+            )
+        })?;
     publish_snapshot(&mut sender, state)
         .await
-        .map_err(|error| format!("initial broker publish failed: {error}"))?;
+        .map_err(|error| {
+            BrokerSessionError::after_connected(
+                format!("initial broker publish failed: {error}"),
+                connected_at,
+            )
+        })?;
     let mut snapshot_publish_gate =
         SnapshotPublishGate::new(Duration::from_millis(SNAPSHOT_PUBLISH_MIN_INTERVAL_MILLIS));
     snapshot_publish_gate.mark_published(Instant::now());
@@ -765,14 +946,20 @@ async fn run_broker_session(
     let mut pending_transcript_delta_timer = Box::pin(sleep_until(
         Instant::now() + Duration::from_secs(24 * 60 * 60),
     ));
+    let mut heartbeat_seq = 0_u64;
+    let mut awaiting_pong: Option<Vec<u8>> = None;
+    let mut broker_ping_timer = Box::pin(sleep_until(Instant::now() + liveness.ping_interval));
+    let mut broker_pong_timer = Box::pin(sleep_until(
+        Instant::now() + Duration::from_secs(24 * 60 * 60),
+    ));
 
     loop {
         tokio::select! {
             changed = change_rx.changed() => {
-                changed.map_err(|_| "relay change channel closed".to_string())?;
+                changed.map_err(|_| BrokerSessionError::after_connected("relay change channel closed", connected_at))?;
                 let deltas = drain_pending_broker_messages_for_publish(&mut sender, state)
                     .await
-                    .map_err(|error| format!("broker direct publish failed: {error}"))?;
+                    .map_err(|error| BrokerSessionError::after_connected(format!("broker direct publish failed: {error}"), connected_at))?;
                 if !deltas.is_empty() {
                     let schedule_flush = pending_transcript_deltas.is_empty();
                     pending_transcript_deltas.extend(deltas);
@@ -791,7 +978,7 @@ async fn run_broker_session(
                     SnapshotPublishDecision::PublishSnapshot => {
                         publish_snapshot(&mut sender, state)
                             .await
-                            .map_err(|error| format!("broker publish failed: {error}"))?;
+                            .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::FlushTranscriptDeltasThenPublishSnapshot => {
                         flush_pending_transcript_deltas(
@@ -801,11 +988,14 @@ async fn run_broker_session(
                         )
                         .await
                         .map_err(|error| {
-                            format!("broker transcript delta publish before snapshot failed: {error}")
+                            BrokerSessionError::after_connected(
+                                format!("broker transcript delta publish before snapshot failed: {error}"),
+                                connected_at,
+                            )
                         })?;
                         publish_snapshot(&mut sender, state)
                             .await
-                            .map_err(|error| format!("broker publish failed: {error}"))?;
+                            .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::DelayUntil(deadline) => {
                         pending_snapshot_timer.as_mut().reset(deadline);
@@ -816,7 +1006,7 @@ async fn run_broker_session(
                 let deltas = std::mem::take(&mut pending_transcript_deltas);
                 pending_transcript_deltas = publish_transcript_delta_batch(&mut sender, state, deltas)
                     .await
-                    .map_err(|error| format!("broker transcript delta publish failed: {error}"))?;
+                    .map_err(|error| BrokerSessionError::after_connected(format!("broker transcript delta publish failed: {error}"), connected_at))?;
                 if !pending_transcript_deltas.is_empty() {
                     pending_transcript_delta_timer.as_mut().reset(
                         Instant::now()
@@ -833,7 +1023,7 @@ async fn run_broker_session(
                     SnapshotPublishDecision::PublishSnapshot => {
                         publish_snapshot(&mut sender, state)
                             .await
-                            .map_err(|error| format!("broker publish failed: {error}"))?;
+                            .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::FlushTranscriptDeltasThenPublishSnapshot => {
                         flush_pending_transcript_deltas(
@@ -843,26 +1033,68 @@ async fn run_broker_session(
                         )
                         .await
                         .map_err(|error| {
-                            format!("broker transcript delta publish before snapshot failed: {error}")
+                            BrokerSessionError::after_connected(
+                                format!("broker transcript delta publish before snapshot failed: {error}"),
+                                connected_at,
+                            )
                         })?;
                         publish_snapshot(&mut sender, state)
                             .await
-                            .map_err(|error| format!("broker publish failed: {error}"))?;
+                            .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::DelayUntil(deadline) => {
                         pending_snapshot_timer.as_mut().reset(deadline);
                     }
                 }
             }
+            () = &mut broker_ping_timer => {
+                if awaiting_pong.is_some() {
+                    return Err(BrokerSessionError::after_connected(
+                        "broker heartbeat timed out before the next ping",
+                        connected_at,
+                    ));
+                }
+                heartbeat_seq = heartbeat_seq.wrapping_add(1);
+                let payload = heartbeat_seq.to_be_bytes().to_vec();
+                sender
+                    .send(Message::Ping(payload.clone()))
+                    .await
+                    .map_err(|error| BrokerSessionError::after_connected(format!("broker heartbeat ping failed: {error}"), connected_at))?;
+                debug!(heartbeat_seq, "sent broker heartbeat ping");
+                awaiting_pong = Some(payload);
+                broker_pong_timer
+                    .as_mut()
+                    .reset(Instant::now() + liveness.pong_timeout);
+                broker_ping_timer
+                    .as_mut()
+                    .reset(Instant::now() + liveness.ping_interval);
+            }
+            () = &mut broker_pong_timer, if awaiting_pong.is_some() => {
+                return Err(BrokerSessionError::after_connected(format!(
+                    "broker heartbeat timed out after {}ms without pong",
+                    liveness.pong_timeout.as_millis()
+                ), connected_at));
+            }
             incoming = receiver.next() => {
                 let Some(frame) = incoming else {
-                    return Err("broker socket closed".to_string());
+                    return Err(BrokerSessionError::after_connected("broker socket closed", connected_at));
                 };
-                let frame = frame.map_err(|error| format!("broker receive failed: {error}"))?;
-                if let Some(message) = decode_server_frame(frame)? {
+                let frame = frame.map_err(|error| BrokerSessionError::after_connected(format!("broker receive failed: {error}"), connected_at))?;
+                if let Message::Pong(payload) = &frame {
+                    if awaiting_pong.as_deref() == Some(payload.as_slice()) {
+                        awaiting_pong = None;
+                        debug!(heartbeat_seq, "received broker heartbeat pong");
+                    }
+                    continue;
+                }
+                if let Some(message) = decode_server_frame(frame)
+                    .map_err(|error| BrokerSessionError::after_connected(error, connected_at))?
+                {
                     let message_name = server_message_name(&message);
                     let started_at = Instant::now();
-                    let outcome = handle_server_message(state, &mut sender, message).await?;
+                    let outcome = handle_server_message(state, &mut sender, message)
+                        .await
+                        .map_err(|error| BrokerSessionError::after_connected(error, connected_at))?;
                     let elapsed_ms = started_at.elapsed().as_millis();
                     if elapsed_ms >= BROKER_MESSAGE_HANDLER_SLOW_WARN_MILLIS {
                         warn!(

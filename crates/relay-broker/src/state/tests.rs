@@ -103,6 +103,68 @@ async fn duplicate_peer_ids_are_rejected_per_channel() {
 }
 
 #[tokio::test]
+async fn relay_reconnect_replaces_old_connection_without_old_leave_removing_new_peer() {
+    let state = BrokerState::default();
+    let mut surface = state
+        .join("room-a", "phone-1", PeerRole::Surface, None)
+        .await
+        .expect("surface should join");
+    let mut old_relay = state
+        .join("room-a", "relay-1", PeerRole::Relay, None)
+        .await
+        .expect("old relay should join");
+    let old_connection_id = old_relay.connection_id;
+    drain_presence(&mut surface.receiver).await;
+
+    let new_relay = state
+        .join("room-a", "relay-1", PeerRole::Relay, None)
+        .await
+        .expect("authenticated relay reconnect should replace its stale connection");
+    assert_ne!(new_relay.connection_id, old_connection_id);
+    assert_eq!(
+        new_relay.existing_peers,
+        vec![PeerSummary {
+            peer_id: "phone-1".to_string(),
+            role: PeerRole::Surface,
+            device_id: None,
+        }]
+    );
+    assert_eq!(
+        old_relay.receiver.recv().await,
+        None,
+        "replacing the peer should close the old connection's outbound channel"
+    );
+    let stale_publish = state
+        .publish_connection(
+            "room-a",
+            "relay-1",
+            old_connection_id,
+            json!({"kind":"stale_snapshot"}),
+        )
+        .await
+        .expect_err("replaced connection must not publish through the new peer identity");
+    assert!(stale_publish.contains("connection has been replaced"));
+
+    state
+        .leave_connection("room-a", "relay-1", old_connection_id)
+        .await;
+    drain_presence(&mut surface.receiver).await;
+    state
+        .publish_connection(
+            "room-a",
+            "relay-1",
+            new_relay.connection_id,
+            json!({"kind":"session_snapshot"}),
+        )
+        .await
+        .expect("old connection cleanup must not remove the replacement");
+    assert!(matches!(
+        surface.receiver.recv().await,
+        Some(ServerMessage::Message { from_peer_id, .. }) if from_peer_id == "relay-1"
+    ));
+}
+
+#[tokio::test]
 async fn targeted_messages_publish_only_to_listed_peers() {
     let state = BrokerState::default();
     let mut surface_a = state

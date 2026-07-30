@@ -17,6 +17,7 @@ pub struct BrokerState {
 #[derive(Default)]
 struct Inner {
     rooms: HashMap<String, RoomState>,
+    next_connection_id: u64,
 }
 
 struct RoomState {
@@ -24,6 +25,7 @@ struct RoomState {
 }
 
 struct PeerHandle {
+    connection_id: u64,
     role: PeerRole,
     device_id: Option<String>,
     tx: mpsc::UnboundedSender<ServerMessage>,
@@ -31,6 +33,7 @@ struct PeerHandle {
 
 #[derive(Debug)]
 pub struct JoinResult {
+    pub connection_id: u64,
     pub existing_peers: Vec<PeerSummary>,
     pub receiver: mpsc::UnboundedReceiver<ServerMessage>,
 }
@@ -73,20 +76,50 @@ impl BrokerState {
             device_id: device_id.clone(),
         };
         let mut inner = self.inner.lock().await;
+        inner.next_connection_id = inner.next_connection_id.wrapping_add(1).max(1);
+        let connection_id = inner.next_connection_id;
         let room = inner
             .rooms
             .entry(channel_id.to_string())
             .or_insert_with(RoomState::default);
 
-        if room.peers.contains_key(peer_id) {
-            return Err(format!(
-                "peer `{peer_id}` is already connected to channel `{channel_id}`"
+        let replacing_relay = match room.peers.get(peer_id) {
+            Some(existing) if existing.role == PeerRole::Relay && role == PeerRole::Relay => {
+                info!(
+                    channel_id,
+                    peer_id,
+                    old_connection_id = existing.connection_id,
+                    new_connection_id = connection_id,
+                    "broker relay peer connection replaced"
+                );
+                true
+            }
+            Some(_) => {
+                return Err(format!(
+                    "peer `{peer_id}` is already connected to channel `{channel_id}`"
+                ));
+            }
+            None => false,
+        };
+
+        if replacing_relay {
+            let existing = room
+                .peers
+                .get(peer_id)
+                .expect("replaced relay should still be present");
+            self.record_event(UsageEvent::new(
+                UsageEventKind::Disconnect,
+                channel_id,
+                peer_id,
+                existing.role,
+                existing.device_id.clone(),
             ));
         }
 
         let existing_peers = room
             .peers
             .iter()
+            .filter(|(existing_peer_id, _)| existing_peer_id.as_str() != peer_id)
             .map(|(peer_id, handle)| PeerSummary {
                 peer_id: peer_id.clone(),
                 role: handle.role,
@@ -94,7 +127,10 @@ impl BrokerState {
             })
             .collect::<Vec<_>>();
 
-        for handle in room.peers.values() {
+        for (existing_peer_id, handle) in &room.peers {
+            if existing_peer_id == peer_id {
+                continue;
+            }
             let _ = handle.tx.send(ServerMessage::Presence {
                 channel_id: channel_id.to_string(),
                 kind: PresenceKind::Joined,
@@ -105,6 +141,7 @@ impl BrokerState {
         room.peers.insert(
             peer_id.to_string(),
             PeerHandle {
+                connection_id,
                 role,
                 device_id,
                 tx,
@@ -120,16 +157,40 @@ impl BrokerState {
         ));
 
         Ok(JoinResult {
+            connection_id,
             existing_peers,
             receiver: rx,
         })
     }
 
     pub async fn leave(&self, channel_id: &str, peer_id: &str) {
+        self.leave_inner(channel_id, peer_id, None).await;
+    }
+
+    pub async fn leave_connection(&self, channel_id: &str, peer_id: &str, connection_id: u64) {
+        self.leave_inner(channel_id, peer_id, Some(connection_id))
+            .await;
+    }
+
+    async fn leave_inner(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        expected_connection_id: Option<u64>,
+    ) {
         let mut inner = self.inner.lock().await;
         let Some(room) = inner.rooms.get_mut(channel_id) else {
             return;
         };
+
+        if let Some(expected_connection_id) = expected_connection_id {
+            let Some(handle) = room.peers.get(peer_id) else {
+                return;
+            };
+            if handle.connection_id != expected_connection_id {
+                return;
+            }
+        }
 
         let Some(handle) = room.peers.remove(peer_id) else {
             return;
@@ -168,6 +229,28 @@ impl BrokerState {
         from_peer_id: &str,
         payload: serde_json::Value,
     ) -> Result<(), String> {
+        self.publish_inner(channel_id, from_peer_id, None, payload)
+            .await
+    }
+
+    pub async fn publish_connection(
+        &self,
+        channel_id: &str,
+        from_peer_id: &str,
+        connection_id: u64,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        self.publish_inner(channel_id, from_peer_id, Some(connection_id), payload)
+            .await
+    }
+
+    async fn publish_inner(
+        &self,
+        channel_id: &str,
+        from_peer_id: &str,
+        expected_connection_id: Option<u64>,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
         let inner = self.inner.lock().await;
         let Some(room) = inner.rooms.get(channel_id) else {
             return Err(format!("channel `{channel_id}` is not active"));
@@ -183,6 +266,13 @@ impl BrokerState {
             .peers
             .get(from_peer_id)
             .expect("sender should exist in room");
+        if expected_connection_id
+            .is_some_and(|connection_id| sender_handle.connection_id != connection_id)
+        {
+            return Err(format!(
+                "peer `{from_peer_id}` connection has been replaced in channel `{channel_id}`"
+            ));
+        }
         let sender_role = sender_handle.role;
         let sender_device_id = sender_handle.device_id.clone();
         let outbound_payload_kind = payload_kind(&payload).to_string();

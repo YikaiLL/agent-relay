@@ -761,6 +761,86 @@ async fn duplicate_peers_get_error_frame() {
 }
 
 #[tokio::test]
+async fn duplicate_relay_connection_replaces_stale_socket() {
+    let address = spawn_app().await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let surface_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::device_surface_join("room-a", "device-1", None),
+    );
+
+    let (mut stale_relay, _) = connect_async(&relay_url)
+        .await
+        .expect("stale relay should connect");
+    let _welcome = next_server_message(&mut stale_relay).await;
+
+    let (mut replacement_relay, _) = connect_async(&relay_url)
+        .await
+        .expect("replacement relay websocket should connect");
+    match next_server_message(&mut replacement_relay).await {
+        ServerMessage::Welcome { peer_id, peers, .. } => {
+            assert_eq!(peer_id, "relay-1");
+            assert!(peers.is_empty());
+        }
+        other => panic!("replacement relay should receive welcome, got: {other:?}"),
+    }
+
+    let stale_event = tokio::time::timeout(Duration::from_secs(1), stale_relay.next())
+        .await
+        .expect("stale relay socket should be closed after replacement");
+    match stale_event {
+        None => {}
+        Some(Ok(Message::Close(_))) => {}
+        Some(Err(_)) => {}
+        Some(other) => panic!("stale relay should close, got: {other:?}"),
+    }
+
+    let (mut surface, _) = connect_async(&surface_url)
+        .await
+        .expect("surface should connect after relay replacement");
+    match next_server_message(&mut surface).await {
+        ServerMessage::Welcome { peers, .. } => {
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].peer_id, "relay-1");
+            assert_eq!(peers[0].role, protocol::PeerRole::Relay);
+        }
+        other => panic!("surface should see replacement relay, got: {other:?}"),
+    }
+
+    let _presence = next_server_message(&mut replacement_relay).await;
+    replacement_relay
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage::Publish {
+                protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+                payload: json!({"kind":"session_snapshot"}),
+            })
+            .expect("client frame should serialize"),
+        ))
+        .await
+        .expect("replacement relay publish should send");
+    match next_server_message(&mut surface).await {
+        ServerMessage::Message {
+            from_peer_id,
+            payload,
+            ..
+        } => {
+            assert_eq!(from_peer_id, "relay-1");
+            assert_eq!(payload, json!({"kind":"session_snapshot"}));
+        }
+        other => panic!("surface should receive replacement relay publish, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn missing_join_ticket_gets_error_frame() {
     let address = spawn_app().await;
     let url = format!("ws://{address}/ws/room-a?role=surface");

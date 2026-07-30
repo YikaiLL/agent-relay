@@ -181,7 +181,8 @@ async function waitFor(predicate, timeoutMs = 1000) {
 function installBrowserStubs() {
   const storage = new Map();
   const elements = new Map();
-  const pendingTimers = [];
+  const pendingTimers = new Map();
+  let nextTimerId = 1;
   const localStorage = {
     getItem(key) {
       return storage.has(key) ? storage.get(key) : null;
@@ -215,12 +216,14 @@ function installBrowserStubs() {
     },
     crypto: webcrypto,
     indexedDB: createIndexedDbStub(),
-    setTimeout(callback) {
-      pendingTimers.push(callback);
-      return pendingTimers.length;
+    setTimeout(callback, delay = 0) {
+      const id = nextTimerId;
+      nextTimerId += 1;
+      pendingTimers.set(id, { callback, delay });
+      return id;
     },
     clearTimeout(id) {
-      pendingTimers[id - 1] = null;
+      pendingTimers.delete(id);
     },
   };
 
@@ -242,12 +245,14 @@ function installBrowserStubs() {
 
   return {
     localStorage,
+    scheduledTimerDelays() {
+      return Array.from(pendingTimers.values(), (timer) => timer.delay);
+    },
     runTimers() {
-      while (pendingTimers.length) {
-        const callback = pendingTimers.shift();
-        if (callback) {
-          callback();
-        }
+      while (pendingTimers.size) {
+        const [id, timer] = pendingTimers.entries().next().value;
+        pendingTimers.delete(id);
+        timer.callback();
       }
     },
   };
@@ -330,6 +335,66 @@ test("expired device broker access refreshes automatically during reconnect", as
   assert.equal(storedProfile.deviceRefreshMode, "cookie");
   FakeWebSocket.instances[1].emit("open");
   assert.equal(state.socketConnected, true);
+});
+
+test("broker socket reconnect backs off with jitter and resets after a stable connection", async () => {
+  const browser = installBrowserStubs();
+  FakeWebSocket.instances = [];
+  const originalDateNow = Date.now;
+  let nowMs = originalDateNow();
+  Date.now = () => nowMs;
+
+  try {
+    const { state, saveRemoteAuth } = await import("./state.js");
+    const { connectBroker } = await import("./broker-client.js");
+
+    seedRemoteAuth(state, saveRemoteAuth, {
+      relayId: "relay-1",
+      brokerUrl: "ws://broker.example.test",
+      brokerChannelId: "room-a",
+      relayPeerId: "relay-1",
+      deviceId: "device-1",
+      deviceLabel: "Primary Phone",
+      payloadSecret: "payload-secret-1",
+      deviceJoinTicket: "device-ws-token",
+      deviceJoinTicketExpiresAt: Math.floor(nowMs / 1000) + 300,
+      securityMode: "private",
+      sessionClaim: null,
+      sessionClaimExpiresAt: null,
+    });
+    seedPairingState(state);
+    seedSocketState(state);
+
+    await connectBroker("initial boot");
+    assert.equal(FakeWebSocket.instances.length, 1);
+    FakeWebSocket.instances[0].emit("open");
+    FakeWebSocket.instances[0].emit("close", { code: 1006, reason: "restart" });
+
+    let delays = browser.scheduledTimerDelays();
+    assert.equal(delays.length, 1);
+    assert.ok(delays[0] >= 750 && delays[0] <= 1500);
+
+    browser.runTimers();
+    assert.equal(FakeWebSocket.instances.length, 2);
+    FakeWebSocket.instances[1].emit("close", { code: 1006, reason: "outage" });
+
+    delays = browser.scheduledTimerDelays();
+    assert.equal(delays.length, 1);
+    assert.ok(delays[0] >= 1500 && delays[0] <= 3000);
+
+    browser.runTimers();
+    assert.equal(FakeWebSocket.instances.length, 3);
+    FakeWebSocket.instances[2].emit("open");
+    nowMs += 60_001;
+    FakeWebSocket.instances[2].emit("close", { code: 1006, reason: "stable restart" });
+
+    delays = browser.scheduledTimerDelays();
+    assert.equal(delays.length, 1);
+    assert.ok(delays[0] >= 750 && delays[0] <= 1500);
+  } finally {
+    Date.now = originalDateNow;
+    FakeWebSocket.instances = [];
+  }
 });
 
 test("device broker refresh updates the original relay when selection changes mid-refresh", async () => {

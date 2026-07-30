@@ -2008,6 +2008,7 @@ async fn handle_socket(
         }
     };
     let peer_id = peer_id.expect("broker should assign a peer id");
+    let connection_id = join.connection_id;
 
     let (mut sender, mut receiver) = socket.split();
     let welcome = ServerMessage::Welcome {
@@ -2018,7 +2019,10 @@ async fn handle_socket(
     };
 
     if send_message(&mut sender, &welcome).await.is_err() {
-        state.broker.leave(&channel_id, &peer_id).await;
+        state
+            .broker
+            .leave_connection(&channel_id, &peer_id, connection_id)
+            .await;
         return;
     }
 
@@ -2115,8 +2119,15 @@ async fn handle_socket(
                                     .await;
                                     continue;
                                 }
-                                if let Err(error) =
-                                    state.broker.publish(&channel_id, &peer_id, payload).await
+                                if let Err(error) = state
+                                    .broker
+                                    .publish_connection(
+                                        &channel_id,
+                                        &peer_id,
+                                        connection_id,
+                                        payload,
+                                    )
+                                    .await
                                 {
                                     warn!(
                                         channel_id,
@@ -2125,6 +2136,9 @@ async fn handle_socket(
                                         payload = %payload_summary,
                                         "failed to publish message"
                                     );
+                                    if error.contains("connection has been replaced") {
+                                        break;
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -2173,7 +2187,10 @@ async fn handle_socket(
             }
         }
     }
-    state.broker.leave(&channel_id, &peer_id).await;
+    state
+        .broker
+        .leave_connection(&channel_id, &peer_id, connection_id)
+        .await;
 }
 
 async fn send_message(

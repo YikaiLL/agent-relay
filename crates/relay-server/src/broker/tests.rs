@@ -1,13 +1,20 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use super::*;
 use crate::protocol::{
     SendMessageInput, ThreadTranscriptResponse, TranscriptEntryKind, TranscriptEntryView,
 };
-use crate::state::{PendingTranscriptDelta, TranscriptDeltaKind};
+use crate::state::{
+    AppState, PendingTranscriptDelta, RelayState, SecurityProfile, TranscriptDeltaKind,
+};
 use axum::{extract::Path, routing::post, Json, Router};
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
+use rand::{rngs::StdRng, SeedableRng};
 use relay_broker::public_control::{
     ClientGrantRequest, ClientGrantResponse, DeviceGrantBulkRevokeRequest,
     DeviceGrantBulkRevokeResponse, DeviceGrantRequest, DeviceGrantResponse,
@@ -16,8 +23,11 @@ use relay_broker::public_control::{
     RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
     RelayWsTokenResponse,
 };
-use tokio::net::TcpListener;
 use tokio::time::Instant;
+use tokio::{
+    net::TcpListener,
+    sync::{watch, RwLock},
+};
 
 use super::session_claim::{decode_and_verify_session_claim, unix_now};
 
@@ -167,6 +177,145 @@ async fn spawn_public_control_mock() -> String {
             .expect("mock control plane should serve");
     });
     format!("http://{address}")
+}
+
+fn broker_test_state() -> AppState {
+    let (change_tx, _) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        "/tmp/broker-test".to_string(),
+        change_tx.clone(),
+        SecurityProfile::private(),
+    )));
+    AppState::from_parts(relay, HashMap::new(), change_tx)
+}
+
+async fn spawn_heartbeat_test_broker(respond_to_ping: bool) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should resolve");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("broker should accept");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("websocket handshake should succeed");
+        let welcome = ServerMessage::Welcome {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            channel_id: "room-stalled".to_string(),
+            peer_id: "relay-stalled".to_string(),
+            peers: Vec::new(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&welcome).expect("welcome should serialize"),
+            ))
+            .await
+            .expect("welcome should send");
+
+        if !respond_to_ping {
+            // Model a connection that remains ESTABLISHED locally after the remote
+            // path has died: keep the socket open, but never read, write, close, or
+            // answer Ping.
+            std::future::pending::<()>().await;
+            drop(socket);
+            return;
+        }
+
+        while let Some(frame) = socket.next().await {
+            match frame.expect("heartbeat frame should read") {
+                Message::Ping(payload) => socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("heartbeat pong should send"),
+                Message::Close(_) => return,
+                _ => {}
+            }
+        }
+    });
+    format!("ws://{address}")
+}
+
+async fn heartbeat_test_config(broker_url: String) -> BrokerConfig {
+    BrokerConfig::from_parts(
+        Some(broker_url),
+        None,
+        None,
+        Some("room-stalled".to_string()),
+        Some("relay-stalled".to_string()),
+        Some("self_hosted".to_string()),
+        Some("test-broker-ticket-secret".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("config should parse")
+    .expect("config should be enabled")
+}
+
+#[tokio::test]
+async fn broker_session_times_out_when_peer_goes_silent() {
+    let config = heartbeat_test_config(spawn_heartbeat_test_broker(false).await).await;
+    let state = broker_test_state();
+    let mut change_rx = state.subscribe();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_broker_session_with_liveness(
+            &state,
+            &mut change_rx,
+            &config,
+            BrokerLivenessConfig {
+                ping_interval: Duration::from_millis(50),
+                pong_timeout: Duration::from_millis(25),
+            },
+        ),
+    )
+    .await
+    .expect("silent broker should hit the liveness deadline")
+    .expect_err("silent broker session should end");
+
+    assert!(
+        error.message().contains("heartbeat timed out"),
+        "silent broker should fail with a heartbeat timeout, got: {}",
+        error.message()
+    );
+    assert!(
+        error.connected_duration().is_some(),
+        "post-welcome heartbeat failures should carry connected duration"
+    );
+}
+
+#[tokio::test]
+async fn broker_session_stays_connected_when_peer_answers_pings() {
+    let config = heartbeat_test_config(spawn_heartbeat_test_broker(true).await).await;
+    let state = broker_test_state();
+    let mut change_rx = state.subscribe();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(250),
+        run_broker_session_with_liveness(
+            &state,
+            &mut change_rx,
+            &config,
+            BrokerLivenessConfig {
+                ping_interval: Duration::from_millis(50),
+                pong_timeout: Duration::from_millis(25),
+            },
+        ),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "responsive broker session should remain connected"
+    );
+    assert!(
+        state.snapshot().await.broker_connected,
+        "responsive broker should remain broker_connected"
+    );
 }
 
 #[tokio::test]
@@ -486,6 +635,43 @@ async fn broker_config_public_mode_returns_pending_enrollment_until_cached_regis
         .await
         .expect("cached relay should reuse the saved registration");
     assert_eq!(cached_pairing.token, "pairing-token-pair-cached");
+}
+
+#[test]
+fn reconnect_backoff_grows_to_cap_with_jitter() {
+    let mut backoff = RetryBackoff::new(Duration::from_secs(2), Duration::from_secs(60));
+    let mut rng = StdRng::seed_from_u64(7);
+
+    for (index, expected_cap_secs) in [2, 4, 8, 16, 32, 60, 60].into_iter().enumerate() {
+        let retry = backoff.next_delay(&mut rng);
+        assert_eq!(retry.cap, Duration::from_secs(expected_cap_secs));
+        assert_eq!(retry.consecutive_failures, index as u32 + 1);
+        assert!(
+            retry.delay >= retry.cap / 2 && retry.delay <= retry.cap,
+            "retry delay {:?} should stay inside the jitter window for cap {:?}",
+            retry.delay,
+            retry.cap
+        );
+    }
+}
+
+#[test]
+fn reconnect_backoff_resets_only_after_a_stable_session() {
+    let mut backoff = RetryBackoff::new(Duration::from_secs(2), Duration::from_secs(60));
+    let mut rng = StdRng::seed_from_u64(11);
+
+    assert_eq!(backoff.next_delay(&mut rng).cap, Duration::from_secs(2));
+    assert_eq!(backoff.next_delay(&mut rng).cap, Duration::from_secs(4));
+
+    backoff.reset_after_stable_session(Duration::from_secs(
+        BROKER_RECONNECT_STABLE_SESSION_SECS - 1,
+    ));
+    assert_eq!(backoff.next_delay(&mut rng).cap, Duration::from_secs(8));
+
+    backoff.reset_after_stable_session(Duration::from_secs(BROKER_RECONNECT_STABLE_SESSION_SECS));
+    let retry = backoff.next_delay(&mut rng);
+    assert_eq!(retry.cap, Duration::from_secs(2));
+    assert_eq!(retry.consecutive_failures, 1);
 }
 
 #[test]

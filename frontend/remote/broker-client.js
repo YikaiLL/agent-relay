@@ -22,12 +22,18 @@ import {
 const BROKER_PROTOCOL_VERSION = 1;
 const RELAY_PROTOCOL_VERSION = 1;
 const DEVICE_SESSION_ROOM_MAX_BYTES = 512;
+const SOCKET_RECONNECT_BASE_DELAY_MS = 1500;
+const SOCKET_RECONNECT_MAX_DELAY_MS = 60_000;
+const SOCKET_RECONNECT_STABLE_SESSION_MS = 60_000;
 
 let onBrokerReady = () => {};
 let onBrokerPayload = async () => {};
 let onBrokerDisconnect = () => {};
 let onRelayPresence = () => {};
 const inFlightDeviceRefreshes = new Map();
+let socketReconnectFailures = 0;
+let socketReconnectSelectionKey = null;
+let socketReconnectWindow = null;
 
 export function configureBrokerClient(handlers) {
   onBrokerReady = handlers.onBrokerReady || onBrokerReady;
@@ -53,6 +59,46 @@ export function cancelDeviceRefreshesForRelay(relayId = null) {
       inFlightDeviceRefreshes.delete(key);
     }
   }
+}
+
+function reconnectWindow() {
+  return typeof window !== "undefined" ? window : null;
+}
+
+function resetSocketReconnectBackoff(selectionKey = currentConnectionSelectionKey()) {
+  socketReconnectFailures = 0;
+  socketReconnectSelectionKey = selectionKey;
+  socketReconnectWindow = reconnectWindow();
+}
+
+function syncSocketReconnectBackoff(selectionKey = currentConnectionSelectionKey()) {
+  const currentWindow = reconnectWindow();
+  if (currentWindow !== socketReconnectWindow || selectionKey !== socketReconnectSelectionKey) {
+    socketReconnectFailures = 0;
+    socketReconnectSelectionKey = selectionKey;
+    socketReconnectWindow = currentWindow;
+  }
+}
+
+function noteClosedSocketDuration(openedAtMs, selectionKey) {
+  if (openedAtMs === null) {
+    return;
+  }
+  if (Date.now() - openedAtMs >= SOCKET_RECONNECT_STABLE_SESSION_MS) {
+    resetSocketReconnectBackoff(selectionKey);
+  }
+}
+
+function nextSocketReconnectDelayMs(selectionKey = currentConnectionSelectionKey()) {
+  syncSocketReconnectBackoff(selectionKey);
+  const exponent = Math.min(socketReconnectFailures, 31);
+  const cap = Math.min(
+    SOCKET_RECONNECT_BASE_DELAY_MS * (2 ** exponent),
+    SOCKET_RECONNECT_MAX_DELAY_MS
+  );
+  socketReconnectFailures += 1;
+  const floor = Math.max(1, Math.floor(cap / 2));
+  return Math.floor(floor + Math.random() * (cap - floor + 1));
 }
 
 class StaleDeviceRefreshError extends Error {
@@ -99,6 +145,10 @@ async function ensureDeviceRefreshStillOwnsProfile(relayId, expectedSignature, b
 
 export async function connectBroker(reason) {
   const selectionKey = currentConnectionSelectionKey();
+  syncSocketReconnectBackoff(selectionKey);
+  if (reason !== "reconnect") {
+    resetSocketReconnectBackoff(selectionKey);
+  }
   if (!state.pairingTicket && state.remoteAuth && !connectionTarget() && canRefreshDeviceJoinTicket()) {
     try {
       await refreshDeviceJoinTicket(reason);
@@ -153,6 +203,7 @@ export async function connectBroker(reason) {
 
   renderLog(`Connecting to broker (${reason}) via ${url.host}.`);
   const socket = new WebSocket(url.toString());
+  let socketOpenedAtMs = null;
   applyRemoteSurfacePatch(createBrokerConnectionPatch({
     relayConnected: false,
     relayConnectionMessage: null,
@@ -168,6 +219,7 @@ export async function connectBroker(reason) {
       return;
     }
 
+    socketOpenedAtMs = Date.now();
     applyRemoteSurfacePatch(createBrokerConnectionPatch({
       serverConnectionMessage: null,
       serverConnectionState: "connected",
@@ -189,6 +241,7 @@ export async function connectBroker(reason) {
       return;
     }
 
+    noteClosedSocketDuration(socketOpenedAtMs, selectionKey);
     applyRemoteSurfacePatch(createBrokerConnectionPatch({
       relayConnected: false,
       relayConnectionMessage: "Relay server disconnected. Waiting for it to reconnect.",
@@ -222,6 +275,8 @@ export async function connectBroker(reason) {
 export function closeBrokerSocket(resetConnectionState = true) {
   if (!state.socket) {
     if (resetConnectionState) {
+      cancelSocketReconnect();
+      resetSocketReconnectBackoff();
       applyRemoteSurfacePatch(createBrokerConnectionPatch({
         relayConnected: false,
         relayConnectionMessage: null,
@@ -236,6 +291,10 @@ export function closeBrokerSocket(resetConnectionState = true) {
   }
 
   const socket = state.socket;
+  if (resetConnectionState) {
+    cancelSocketReconnect();
+    resetSocketReconnectBackoff();
+  }
   applyRemoteSurfacePatch(createBrokerConnectionPatch({
     socket: null,
   }));
@@ -545,9 +604,10 @@ function scheduleSocketReconnect() {
   }
 
   cancelSocketReconnect();
+  const reconnectDelayMs = nextSocketReconnectDelayMs();
   const socketReconnectTimer = window.setTimeout(() => {
     void connectBroker("reconnect");
-  }, 1500);
+  }, reconnectDelayMs);
   applyRemoteSurfacePatch(createBrokerConnectionPatch({
     socketReconnectTimer,
   }));
