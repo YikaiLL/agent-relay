@@ -93,6 +93,12 @@ async function waitForCoherent(page, label, timeoutMs = TIMEOUT_MS) {
   return last;
 }
 
+function sidebarViewMode(page) {
+  return page.evaluate(
+    () => document.querySelector(".sidebar")?.dataset.threadView || null
+  );
+}
+
 function tabState(page) {
   return page.evaluate(() => {
     const tabs = [...document.querySelectorAll(".session-tab")];
@@ -359,6 +365,49 @@ async function run() {
       "switching back restores the Sessions tab set"
     );
     await shoot(page, "08-sessions-mode-restored");
+
+    // --- Back restores the context an entry was made in, with no side effect on the
+    // current tab set ---
+    // A tab set belongs to a project, so a session opened in Sessions mode must not be
+    // adopted into a project's strip just because you pressed back while that project
+    // was selected. The entry carries its own view mode, so back returns there.
+    assert.equal(await sidebarViewMode(page), "sessions", "starting in Sessions mode");
+    await page.click("#threads-view-projects");
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
+      { timeout: TIMEOUT_MS }
+    );
+    const projectsStrip = (await tabState(page)).threadIds;
+
+    await page.goBack({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
+      { timeout: TIMEOUT_MS }
+    );
+    const restored = await waitForCoherent(page, "after back from Projects into Sessions");
+    assert.deepEqual(
+      restored.tabThreadIds,
+      sessionsTabs,
+      "back lands in the Sessions tab set it came from"
+    );
+
+    // And the Projects strip is untouched — nothing was adopted into it.
+    await page.click("#threads-view-projects");
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
+      { timeout: TIMEOUT_MS }
+    );
+    assert.deepEqual(
+      (await tabState(page)).threadIds,
+      projectsStrip,
+      "the project's tab set gained nothing from the back navigation"
+    );
+    await page.click("#threads-view-sessions");
+    await page.waitForFunction(
+      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
+      { timeout: TIMEOUT_MS }
+    );
+    await shoot(page, "08b-context-restored");
 
     // --- Deleting a session must not let history resurrect its tab ---
     // History entries outlive threads, so backing onto a deleted session's entry

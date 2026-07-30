@@ -1624,14 +1624,20 @@ window.addEventListener("resize", () => {
   syncThreadHistoryScroll();
 });
 
-window.addEventListener("popstate", () => {
+window.addEventListener("popstate", (event) => {
+  // Restore the view context the entry was created in BEFORE adopting its thread, so
+  // the session lands back in the tab set it came from. A tab set belongs to a project;
+  // adopting the session into whatever project is selected now would show a tab for a
+  // session that isn't in that project. Entries created before this existed (or by an
+  // external link) carry no state — those keep the current context.
+  restoreViewContext(event.state);
   state.viewThreadId = readThreadIdFromUrl();
   // Back/forward writes viewThreadId directly rather than going through
-  // setThreadRoute (it must not push another history entry), so re-open the tab
-  // here. Navigating back to a session you had merely CLOSED re-opens it, which keeps
-  // the strip and the transcript agreeing.
-  // A history entry can name a session that was archived or deleted since; refusing to
-  // create its tab is not enough, the route must not be left pointing at it either.
+  // setThreadRoute (it must not push another history entry), so re-open the tab here.
+  // Navigating back to a session you had merely CLOSED re-opens it, which keeps the
+  // strip and the transcript agreeing. A history entry can also name a session that was
+  // archived or deleted since; refusing to create its tab is not enough, the route must
+  // not be left pointing at it either — adoptRoutedThread handles both.
   adoptRoutedThread();
   if (state.session) {
     renderSession(state.session);
@@ -3281,10 +3287,21 @@ function setThreadRoute(threadId, options = {}) {
   }
 
   const next = url.pathname + url.search + url.hash;
+  // Record the VIEW CONTEXT alongside the thread, not just the thread id. A tab set is
+  // scoped to a project, so a session only belongs in the strip of the context it was
+  // opened from. Without this, going back would adopt the old session into whichever
+  // project happened to be selected now — putting a tab for a session that isn't in
+  // that project into that project's strip. The URL is left alone; this rides in the
+  // history state object, which was previously unused.
+  const entry = {
+    threadId: nextThreadId,
+    viewMode: state.threadListStore.getState().viewMode,
+    projectId: readActiveProjectId(state.threadListStore),
+  };
   if (options.replace) {
-    window.history.replaceState({}, "", next);
+    window.history.replaceState(entry, "", next);
   } else {
-    window.history.pushState({}, "", next);
+    window.history.pushState(entry, "", next);
   }
   state.viewThreadId = nextThreadId;
   // The single choke point for "which session am I viewing", so it's also the right
@@ -3604,6 +3621,38 @@ function adoptRoutedThread() {
     return;
   }
   openSessionTab(state.viewThreadId);
+}
+
+/**
+ * Put the sidebar back into the view mode / project a history entry was created in,
+ * WITHOUT pushing another entry.
+ *
+ * Only the store and the mode-gated chrome are touched; the caller re-renders. This is
+ * deliberately not setThreadViewMode(), which also reconciles the route to the target
+ * workspace — during a back/forward the route is the thing we are restoring, so letting
+ * it be overwritten would defeat the navigation.
+ */
+function restoreViewContext(entry) {
+  if (!entry || typeof entry !== "object") {
+    return;
+  }
+
+  const store = state.threadListStore.getState();
+  const isProjects = entry.viewMode === "projects";
+  if (store.viewMode !== (isProjects ? "projects" : "sessions")) {
+    store.setViewMode(isProjects ? "projects" : "sessions");
+    threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
+    threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
+    if (sidebarElement) {
+      sidebarElement.dataset.threadView = isProjects ? "projects" : "sessions";
+    }
+    if (projectsToolbar) {
+      projectsToolbar.hidden = !isProjects;
+    }
+  }
+  if (readActiveProjectId(state.threadListStore) !== (entry.projectId || null)) {
+    state.threadListStore.getState().setActiveProject(entry.projectId || null);
+  }
 }
 
 /**
