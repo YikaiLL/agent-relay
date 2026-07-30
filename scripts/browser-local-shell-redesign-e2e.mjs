@@ -114,78 +114,91 @@ async function run() {
     await page.click("#threads-view-projects");
     await openThreadDrawer(page);
     await page.click("#projects-create-button");
-    await page.waitForSelector("#threads-list .project-sidebar-row", { state: "visible", timeout: TIMEOUT_MS });
+    // Projects mode now lists each project as a GROUP HEADER with its sessions nested
+    // underneath, so project actions moved from a "⋯ opens a menu" row onto inline
+    // buttons on the header. The three access paths this guards are unchanged:
+    // visible/tappable, mouse (right-click), and keyboard.
+    await page.waitForSelector("#threads-list .thread-group-header-project", {
+      state: "visible",
+      timeout: TIMEOUT_MS,
+    });
+    const projectName = () =>
+      page.evaluate(
+        () => document.querySelector("#threads-list .thread-group-name")?.textContent || ""
+      );
 
-    // (a) the visible actions button (keyboard/touch reachable) opens the menu
-    await page.locator("#threads-list .project-sidebar-more").first().click();
-    await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
-    // Rename via the menu -> prompt -> row text updates
+    // (a) the inline Rename button (keyboard/touch reachable) renames directly
     promptValue = "Beta Project";
-    await page.click("#rename-project-button");
+    await page.locator('#threads-list .thread-group-action[title="Rename project"]').first().click();
     await page.waitForFunction(
-      () => (document.querySelector("#threads-list .project-sidebar-name")?.textContent || "").includes("Beta"),
+      () => (document.querySelector("#threads-list .thread-group-name")?.textContent || "").includes("Beta"),
       { timeout: TIMEOUT_MS }
     );
 
-    // (b) right-click also opens the menu AND executes a rename (mouse path)
+    // (b) right-click on the project header still opens the actions menu (mouse path)
     promptValue = "Gamma Project";
-    await page.locator("#threads-list .project-sidebar-row").first().click({ button: "right" });
+    await page.locator("#threads-list .thread-group-header-project").first().click({ button: "right" });
     await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
     await page.click("#rename-project-button");
     await page.waitForFunction(
-      () => (document.querySelector("#threads-list .project-sidebar-name")?.textContent || "").includes("Gamma"),
+      () => (document.querySelector("#threads-list .thread-group-name")?.textContent || "").includes("Gamma"),
       { timeout: TIMEOUT_MS }
     );
+    assert.match(await projectName(), /Gamma/, "the header shows the renamed project");
 
-    // (c) keyboard path: focus the ⋯ button, Enter opens the menu, and the menu's
-    // Rename/Delete buttons are focusable (project management is not mouse-only).
-    await page.locator("#threads-list .project-sidebar-more").first().focus();
-    await page.keyboard.press("Enter");
-    await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
-    await page.locator("#rename-project-button").focus();
-    const renameFocusable = await page.evaluate(() => document.activeElement?.id === "rename-project-button");
-    assert.ok(renameFocusable, "Rename is keyboard-focusable in the project actions menu");
-    await page.keyboard.press("Escape");
-    await page.waitForFunction(() => document.querySelector("#project-context-menu")?.hidden, { timeout: TIMEOUT_MS });
+    // (c) keyboard path: the inline action buttons are focusable, so project
+    // management is not mouse-only.
+    const renameButton = page.locator('#threads-list .thread-group-action[title="Rename project"]').first();
+    await renameButton.focus();
+    const renameFocusable = await page.evaluate(
+      () => document.activeElement?.getAttribute("title") === "Rename project"
+    );
+    assert.ok(renameFocusable, "Rename is keyboard-focusable on the project header");
 
     // --- Deleting the selected project must not strand a stale selection ---
     // Add a sibling so there's something to fall back to after deletion.
     promptValue = "Second Project";
     await page.click("#projects-create-button");
     await page.waitForFunction(
-      () => [...document.querySelectorAll("#threads-list .project-sidebar-name")].some((n) => /Second/.test(n.textContent || "")),
+      () => [...document.querySelectorAll("#threads-list .thread-group-name")].some((n) => /Second/.test(n.textContent || "")),
       { timeout: TIMEOUT_MS }
     );
-    // Select "Gamma" so it's the active project entering the delete.
-    await page.locator("#threads-list .project-sidebar-row", { hasText: "Gamma" }).first().click();
+    // Select "Gamma" so it's the active project entering the delete. The name is the
+    // click target (the header also hosts action buttons), and the main-area card
+    // overview is retired — selection now shows only as the header's active state,
+    // which is what decides the tab set a new session joins.
+    await page
+      .locator("#threads-list .thread-group-header-project", { hasText: "Gamma" })
+      .first()
+      .locator(".thread-group-name-button")
+      .click();
     await page.waitForFunction(
-      () => {
-        const active = document.querySelector("#threads-list .project-sidebar-row.is-active .project-sidebar-name")?.textContent?.trim();
-        return active === "Gamma Project" && document.querySelector(".chat-shell")?.getAttribute("data-view") === "project-overview";
-      },
+      () =>
+        document
+          .querySelector("#threads-list .thread-group-header-project.is-active .thread-group-name")
+          ?.textContent?.trim() === "Gamma Project",
       { timeout: TIMEOUT_MS }
     );
     // Delete it -> the sibling "Second Project" must auto-select (not linger on the dead id).
-    await page.locator("#threads-list .project-sidebar-row", { hasText: "Gamma" }).first().click({ button: "right" });
+    await page.locator("#threads-list .thread-group-header-project", { hasText: "Gamma" }).first().click({ button: "right" });
     await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
     await page.click("#delete-project-button");
     await page.waitForFunction(
       () => {
-        const names = [...document.querySelectorAll("#threads-list .project-sidebar-name")].map((n) => n.textContent.trim());
-        const active = document.querySelector("#threads-list .project-sidebar-row.is-active .project-sidebar-name")?.textContent?.trim();
-        return !names.some((n) => /Gamma/.test(n)) && active === "Second Project" &&
-          document.querySelector(".chat-shell")?.getAttribute("data-view") === "project-overview";
+        const names = [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim());
+        const active = document.querySelector("#threads-list .thread-group-header-project.is-active .thread-group-name")?.textContent?.trim();
+        return !names.some((n) => /Gamma/.test(n)) && active === "Second Project";
       },
       { timeout: TIMEOUT_MS }
     );
-    // Delete the LAST remaining project -> the selection clears (view leaves the overview).
-    await page.locator("#threads-list .project-sidebar-row", { hasText: "Second" }).first().click({ button: "right" });
+    // Delete the LAST remaining project -> the selection clears.
+    await page.locator("#threads-list .thread-group-header-project", { hasText: "Second" }).first().click({ button: "right" });
     await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
     await page.click("#delete-project-button");
     await page.waitForFunction(
       () =>
-        document.querySelectorAll("#threads-list .project-sidebar-row").length === 0 &&
-        document.querySelector(".chat-shell")?.getAttribute("data-view") !== "project-overview",
+        document.querySelectorAll("#threads-list .thread-group-header-project").length === 0
+        && !document.querySelector("#threads-list .thread-group-header-project.is-active"),
       { timeout: TIMEOUT_MS }
     );
     // A newly-created project auto-selects again (the stale id no longer blocks it).
@@ -193,8 +206,8 @@ async function run() {
     await page.click("#projects-create-button");
     await page.waitForFunction(
       () => {
-        const active = document.querySelector("#threads-list .project-sidebar-row.is-active .project-sidebar-name")?.textContent?.trim();
-        return active === "Fresh Project" && document.querySelector(".chat-shell")?.getAttribute("data-view") === "project-overview";
+        const active = document.querySelector("#threads-list .thread-group-header-project.is-active .thread-group-name")?.textContent?.trim();
+        return active === "Fresh Project";
       },
       { timeout: TIMEOUT_MS }
     );

@@ -480,9 +480,9 @@ async function run() {
     // selects it, which is what makes the tab bucket project-specific.
     promptValue = "Reload Project";
     await page.click("#projects-create-button");
-    await page.waitForSelector(".project-sidebar-row.is-active", { timeout: TIMEOUT_MS });
+    await page.waitForSelector(".thread-group-header-project.is-active", { timeout: TIMEOUT_MS });
     const selectedProject = await page.evaluate(
-      () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+      () => document.querySelector(".thread-group-header-project.is-active")?.textContent || ""
     );
     assert.match(selectedProject, /Reload Project/, "the new project is selected");
 
@@ -503,13 +503,13 @@ async function run() {
     // Reload closes the sidebar drawer in conversation-sized layouts. The selected
     // project row still renders inside it, so this assertion is about state/identity,
     // not whether the drawer currently lays the row out.
-    await page.waitForSelector(".project-sidebar-row.is-active", {
+    await page.waitForSelector(".thread-group-header-project.is-active", {
       state: "attached",
       timeout: TIMEOUT_MS,
     });
     assert.match(
       await page.evaluate(
-        () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+        () => document.querySelector(".thread-group-header-project.is-active")?.textContent || ""
       ),
       /Reload Project/,
       "the selected project survives the reload, so the tab bucket does too"
@@ -533,12 +533,12 @@ async function run() {
       () =>
         document.querySelector(".sidebar")?.dataset.threadView === "projects"
         && Boolean(window.history.state?.context?.projectId)
-        && Boolean(document.querySelector(".project-sidebar-row.is-active")),
+        && Boolean(document.querySelector(".thread-group-header-project.is-active")),
       { timeout: TIMEOUT_MS }
     );
     const validProjectEntry = await historyPage.evaluate(() => window.history.state);
     const validProjectTitle = await historyPage.evaluate(
-      () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+      () => document.querySelector(".thread-group-header-project.is-active")?.textContent || ""
     );
 
     // Entries created before view-context history shipped carry `{}`. Landing on one
@@ -557,7 +557,7 @@ async function run() {
     );
     assert.equal(
       await historyPage.evaluate(
-        () => document.querySelector(".project-sidebar-row.is-active")?.textContent || ""
+        () => document.querySelector(".thread-group-header-project.is-active")?.textContent || ""
       ),
       validProjectTitle,
       "a legacy empty history state keeps the current project"
@@ -583,7 +583,7 @@ async function run() {
     );
     await historyPage.goBack();
     await historyPage.waitForFunction(
-      () => !document.querySelector(".project-sidebar-row.is-active"),
+      () => !document.querySelector(".thread-group-header-project.is-active"),
       { timeout: TIMEOUT_MS }
     );
     assert.equal(

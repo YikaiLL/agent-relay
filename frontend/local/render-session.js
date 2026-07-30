@@ -362,8 +362,15 @@ export function createSessionRenderer({
     // home. `mainView` drives the CSS show/hide of the three main-area layouts.
     const projectsViewMode = readThreadListViewMode(state.threadListStore) === "projects";
     const activeProjectId = readActiveProjectId(state.threadListStore);
-    const showProjectOverview =
-      !viewingConversation && projectsViewMode && Boolean(activeProjectId);
+    // The main-area card overview is RETIRED FROM VIEW, not deleted. Sessions now live
+    // nested under their project in the sidebar, so the cards would duplicate that list;
+    // the component, its model and its pin/order prefs all stay because those prefs back
+    // the sidebar rows and the card layout may return for another purpose. Flip this back
+    // to `!viewingConversation && projectsViewMode && Boolean(activeProjectId)` to
+    // resurrect it.
+    const showProjectOverview = false;
+    void activeProjectId;
+    void projectsViewMode;
     const mainView = viewingConversation
       ? "conversation"
       : showProjectOverview
@@ -376,7 +383,11 @@ export function createSessionRenderer({
       appShell.dataset.view = mainView;
     }
     if (sessionHistoryDrawer) {
-      sessionHistoryDrawer.open = viewingConversation || Boolean(threadListUi.drawerOpen);
+      // Projects mode keeps the drawer open: the project tree IS the navigation there,
+      // and the old rule (open only while viewing a conversation) left it collapsed —
+      // measurable but clipped — whenever no session was open, hiding the whole list.
+      sessionHistoryDrawer.open =
+        viewingConversation || projectsViewMode || Boolean(threadListUi.drawerOpen);
     }
 
     syncThreadHistoryScroll();
@@ -1448,9 +1459,16 @@ export function createSessionRenderer({
       return;
     }
 
-    // Projects mode: the sidebar lists projects (one row each) — the sessions
-    // themselves live in the main-area card overview, and the Unassigned bucket is
-    // intentionally not surfaced here. Selecting a row opens that project's overview.
+    // Projects mode: the sidebar lists each project with ITS SESSIONS NESTED under it,
+    // so a session can be right-clicked for the same actions Sessions mode offers
+    // (fork/archive/delete/assign) without a detour through the main area.
+    //
+    // The Unassigned bucket is still not surfaced: it is not a project, and surfacing it
+    // is what flooded this list before the card-overview redesign (a49ce53).
+    //
+    // The main-area card overview is retired from view but deliberately NOT deleted —
+    // its pin/order prefs are reused by these rows, and the card layout may come back
+    // for another purpose.
     if (viewMode === "projects") {
       const activeProjectId = readActiveProjectId(state.threadListStore);
       const activity = buildThreadActivityMap(state.session);
@@ -1481,22 +1499,85 @@ export function createSessionRenderer({
       threadsCount.textContent = `${projectCount} ${projectCount === 1 ? "project" : "projects"}`;
       threadsCount.title = rows.map((row) => row.name).join("\n");
       resumeLatestButton.disabled = state.threads.length === 0;
+      // One group per project, sessions nested. Built from the project list (not from
+      // thread grouping) so an empty project still shows — it is a place to drop
+      // sessions into, and hiding it would make it unreachable.
+      const projectGroups = (state.projects || []).map((project) => ({
+        key: project.id,
+        cwd: "",
+        projectId: project.id,
+        label: project.name || project.id,
+        latestUpdatedAt: 0,
+        threads: selectProjectAgents({
+          projectId: project.id,
+          threads: state.threads,
+          threadProjectId: state.threadProjectId || {},
+        }),
+        // Same activity roll-up the project rows used to show; the header renders it.
+        summary: rows.find((row) => row.id === project.id) || null,
+      }));
+
       renderReactContent(
         threadsList,
-        h(ProjectSidebarList, {
-          rows,
-          activeProjectId,
+        h(ThreadGroupList, {
+          activeThreadId: viewedThreadId,
+          contextMenuThreadId: openCtxThreadId,
+          collapsible: true,
+          collapsedGroupCwds: threadListUi.collapsedGroupCwds || new Set(),
+          expandedGroupCwds: threadListUi.expandedGroupCwds || new Set(),
           emptyMessage: "No projects yet. Create one to group your sessions.",
-          onSelect(projectId) {
-            if (typeof enterProjectOverview === "function") {
-              enterProjectOverview(projectId);
-            }
+          formatThreadMeta(thread) {
+            return formatRelativeTime(thread.updated_at);
           },
-          onContext(projectId, name, clientX, clientY) {
+          groups: projectGroups,
+          includePreview: true,
+          activeProjectId,
+          onContextProject(projectId, name, clientX, clientY) {
             if (typeof openProjectContextMenu === "function") {
               openProjectContextMenu(projectId, name, clientX, clientY);
             }
           },
+          onSelectProject(projectId) {
+            // Select the project WITHOUT opening a session: this is what decides which
+            // tab set a newly started session joins.
+            if (typeof enterProjectOverview === "function") {
+              enterProjectOverview(projectId);
+            }
+          },
+          onContextThread(threadId, clientX, clientY) {
+            openThreadContextMenu(threadId, clientX, clientY);
+          },
+          // Finally reachable on local: these group headers only render their
+          // rename/delete affordances for groups carrying a projectId, and until now
+          // local only ever passed cwd groups here.
+          onRenameProject,
+          onDeleteProject,
+          onResumeThread(threadId) {
+            threadAttention.clear(threadId);
+            void ensureNotificationPermission();
+            renderThreads();
+            if (typeof viewThread === "function") {
+              // Open INTO the owning project's context, so a session nested under P
+              // lands in P's tab set even when another project is selected.
+              const owningProjectId = (state.threadProjectId || {})[threadId] || null;
+              viewThread(threadId, {
+                context: owningProjectId
+                  ? { kind: "project", projectId: owningProjectId }
+                  : null,
+              });
+            }
+          },
+          onToggleGroup(cwd) {
+            state.threadListStore.getState().toggleCollapsedGroup(cwd);
+            renderThreads();
+          },
+          onToggleExpandedGroup(cwd) {
+            state.threadListStore.getState().toggleExpandedGroup(cwd);
+            renderThreads();
+          },
+          threadActivity: activity,
+          threadAttention: attention,
+          threadReviewing: reviewing,
         })
       );
       return;
