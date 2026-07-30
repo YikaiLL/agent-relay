@@ -220,13 +220,15 @@ impl AppState {
         // --is-inside-work-tree: No such file or directory (os error 2)") and took the root
         // picker with it, leaving no way back. Degrade to a workspace that is provably
         // related, in scope — or fail closed — and report WHICH one vanished.
-        let (cwd, fallback_from) =
+        let (workspace, fallback_from) =
             match super::resolve_workspace_cwd(&cwd, &relay_cwd, &device_scope, &allowed_roots)
                 .await
+                .into_readable()
             {
-                Some(usable) => (usable.cwd, usable.fallback_from),
+                Some(usable) => usable,
                 None => return Ok(WorkspaceDiffResponse::unavailable()),
             };
+        let cwd = workspace.as_str().to_string();
 
         // Enumerate from the session's OWN cwd, which has just cleared the scope
         // check. This is the only source of selectable roots, so the picker can

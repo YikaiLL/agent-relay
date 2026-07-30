@@ -1395,9 +1395,10 @@ turn started ({error}); finishing with round {round}'s findings."
             )
         };
 
-        let usable =
+        let (usable, _) =
             resolve_workspace_cwd(&recorded_cwd, &relay_cwd, &device_scope, &allowed_roots)
                 .await
+                .into_readable()
                 .ok_or_else(|| {
                     format!(
                     "the workspace this thread ran in ({recorded_cwd}) no longer exists, and no \
@@ -1406,12 +1407,13 @@ workspace related to it is available to review instead"
                 })?;
         // Roots come from git, so all of them still exist; filtered to the requesting
         // device's scope so a review can never be steered outside it.
-        let roots: Vec<_> = list_worktrees(&usable.cwd)
+        let roots: Vec<_> = list_worktrees_in(&usable)
             .await
             .into_iter()
             .filter(|root| path_within_device_scope(&root.path, &device_scope, &allowed_roots))
             .collect();
-        let cwd = suggested_root_from_paths(&write_evidence, &roots).unwrap_or(usable.cwd);
+        let cwd = suggested_root_from_paths(&write_evidence, &roots)
+            .unwrap_or_else(|| usable.as_str().to_string());
         Ok(ReviewWorkspace {
             cwd,
             recorded_cwd,
