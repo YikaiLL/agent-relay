@@ -30,7 +30,10 @@ use crate::state::{
     StopCondition, Workflow, WorkflowRun, WorkflowStep, WorkflowVerdict, MAX_REVIEWERS_PER_PARENT,
 };
 
-use super::review::{random_suffix, reviewer_thread_settings, ReviewWorkspace};
+use super::review::{
+    classify_workspace_result, random_suffix, reviewer_thread_settings, ReviewWorkspace,
+    ThreadDriveError,
+};
 use super::*;
 
 /// Hard cap on the review/revise loop so a single run can't loop unbounded.
@@ -566,11 +569,19 @@ finish before starting a workflow"
 
         // 2. Spawn the read-only reviewer thread once; reused across rounds.
         self.set_run_step(&run_id, &review.id).await;
+        let Some(reviewer_workspace) = LiveWorkspace::from_path(&cwd) else {
+            self.fail_run(
+                &run_id,
+                format!("failed to start the reviewer thread: workspace {cwd} no longer exists"),
+            )
+            .await;
+            return;
+        };
         let (mut reviewer_thread_id, reviewer_model) = match self
             .start_workflow_step_thread(
                 &run_id,
                 &review.id,
-                &cwd,
+                &reviewer_workspace,
                 &review.agent,
                 review.model.as_deref(),
             )
@@ -953,10 +964,10 @@ the drain window; it may still be running."
         &self,
         run_id: &str,
         step_id: &str,
-        cwd: &str,
+        workspace: &LiveWorkspace,
         provider: &str,
         model_override: Option<&str>,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String), ThreadDriveError> {
         let (provider_name, bridge) = {
             let (name, bridge) = self.resolve_provider(Some(provider))?;
             (name.to_string(), bridge.clone())
@@ -979,9 +990,12 @@ the drain window; it may still be running."
         let (approval_policy, sandbox, read_only_enforced) =
             reviewer_thread_settings(&provider_name, &defaults.approval_policy, &defaults.sandbox);
 
-        let start = bridge
-            .start_thread(cwd, &model, &approval_policy, &sandbox, None)
-            .await?;
+        let start = classify_workspace_result(
+            workspace,
+            bridge
+                .start_thread(workspace.as_str(), &model, &approval_policy, &sandbox, None)
+                .await,
+        )?;
         let mut thread = start.thread;
         thread.provider = provider_name.clone();
         thread.source = provider_name.clone();
@@ -990,7 +1004,7 @@ the drain window; it may still be running."
             let mut relay = self.relay.write().await;
             relay.register_background_thread(
                 thread,
-                cwd,
+                workspace.as_str(),
                 &model,
                 &approval_policy,
                 &sandbox,
@@ -1015,7 +1029,10 @@ Bash can still write without approval (best-effort read-only)"
             };
             relay.push_log(
                 "info",
-                format!("Workflow: started a {provider_name} background reviewer thread in {cwd}: {note}."),
+                format!(
+                    "Workflow: started a {provider_name} background reviewer thread in {}: {note}.",
+                    workspace.as_str()
+                ),
             );
             relay.notify();
         }
