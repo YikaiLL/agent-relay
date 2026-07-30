@@ -94,8 +94,32 @@ export function saveTabWorkspace(key, workspace) {
   }
 }
 
+/**
+ * Every workspace key present in storage. Lets a delete sweep reach workspaces this
+ * page load never opened, which would otherwise resurrect the deleted session.
+ */
+export function tabWorkspaceKeys() {
+  const store = storage();
+  if (!store) {
+    return [];
+  }
+  try {
+    const keys = [];
+    for (let index = 0; index < store.length; index += 1) {
+      const raw = store.key(index);
+      if (raw?.startsWith(KEY_PREFIX)) {
+        keys.push(raw.slice(KEY_PREFIX.length));
+      }
+    }
+    return keys;
+  } catch {
+    return [];
+  }
+}
+
 /** The adapter shape createTabWorkspaceStore expects. */
 export const browserTabWorkspacePersistence = {
   load: loadTabWorkspace,
   save: saveTabWorkspace,
+  keys: tabWorkspaceKeys,
 };

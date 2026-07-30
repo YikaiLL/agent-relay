@@ -12,8 +12,13 @@ import {
 } from "./tab-layout.js";
 
 // Tab workspaces are scoped per project: switching project switches the whole set
-// of open tabs. Sessions mode has no project, so it gets its own bucket rather
-// than being left without tabs.
+// of open tabs.
+//
+// The two modes that have no project still need distinct buckets, or they leak into
+// each other: Sessions mode is its own workspace, and Projects mode before a project
+// is selected is a third. A single shared fallback made Sessions mode and an
+// empty Projects mode share tabs.
+export const SESSIONS_KEY = "__sessions__";
 export const NO_PROJECT_KEY = "__no_project__";
 
 export function tabWorkspaceKey(projectId) {
@@ -110,15 +115,28 @@ export function createTabWorkspaceStore({ persistence = null } = {}) {
      * is deleted: a tab pointing at a thread that no longer exists is dead — it can't
      * be focused into anything, and it keeps a stale title in the strip.
      *
-     * Sweeps all loaded workspaces rather than one project, because a thread's
-     * project assignment can change while its tab is open.
+     * Covers every workspace, not just the current project (a thread's project
+     * assignment can change while its tab is open) and not just the loaded ones —
+     * a project whose tabs live only in storage would otherwise resurrect the
+     * deleted session the first time it was opened. `persistence.keys()` is
+     * optional; without it the sweep degrades to the in-memory workspaces.
      */
     closeThreadEverywhere(threadId) {
       if (!threadId) {
         return;
       }
-      for (const key of Object.keys(get().workspaces)) {
-        const workspace = get().workspaces[key];
+
+      let persistedKeys = [];
+      try {
+        persistedKeys = persistence?.keys?.() || [];
+      } catch {
+        persistedKeys = [];
+      }
+
+      for (const key of new Set([...Object.keys(get().workspaces), ...persistedKeys])) {
+        // Hydrate before sweeping, so a cold workspace is inspected rather than
+        // skipped. ensureWorkspace is idempotent and caches.
+        const workspace = get().ensureWorkspace(key);
         const owning = findTabByThread(workspace, threadId);
         if (owning) {
           get().update(key, (current) => closeTab(current, owning.id));

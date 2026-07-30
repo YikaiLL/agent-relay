@@ -11,7 +11,7 @@ import { loadTabWorkspace, saveTabWorkspace } from "./shared/tab-workspace-prefs
 
 function fakePersistence(seed = {}) {
   const saved = { ...seed };
-  const calls = { load: [], save: [] };
+  const calls = { load: [], save: [], keys: 0 };
   return {
     calls,
     saved,
@@ -22,6 +22,10 @@ function fakePersistence(seed = {}) {
     save(key, workspace) {
       calls.save.push(key);
       saved[key] = workspace;
+    },
+    keys() {
+      calls.keys += 1;
+      return Object.keys(saved);
     },
   };
 }
@@ -153,6 +157,35 @@ test("deleting a session closes its tab in every workspace", () => {
   assert.deepEqual(ids(store().ensureWorkspace("p1")), ["tab-t2"]);
   assert.deepEqual(ids(store().ensureWorkspace("p2")), []);
   assert.deepEqual(ids(persistence.saved.p1), ["tab-t2"], "the removal is persisted");
+});
+
+// Regression: the sweep used to walk only the in-memory `workspaces`, so a project
+// whose tabs live purely in storage (never visited this page load) kept the dead
+// tab — and resurrected it the first time you opened that project.
+test("deleting a session also sweeps workspaces that were never loaded", () => {
+  const persistence = fakePersistence({
+    p_cold: {
+      tabs: [
+        { id: "tab-t1", pinned: false, layout: createLeaf("t1") },
+        { id: "tab-t9", pinned: false, layout: createLeaf("t9") },
+      ],
+      focusedTabId: "tab-t1",
+    },
+  });
+  const store = createTabWorkspaceStore({ persistence }).getState;
+
+  // Only p_hot is loaded; p_cold exists solely in storage.
+  store().openThread("p_hot", "t1");
+  assert.deepEqual(Object.keys(store().workspaces), ["p_hot"]);
+
+  store().closeThreadEverywhere("t1");
+
+  assert.deepEqual(ids(store().ensureWorkspace("p_hot")), []);
+  assert.deepEqual(
+    ids(store().ensureWorkspace("p_cold")),
+    ["tab-t9"],
+    "the cold workspace must not bring the deleted session back"
+  );
 });
 
 test("closing an unknown or missing session is a no-op", () => {

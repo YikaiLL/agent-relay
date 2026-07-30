@@ -34,6 +34,18 @@ function tabState(page) {
   });
 }
 
+// The sessions list lives in a <details> drawer that is collapsed off the
+// conversation view; open it so its rows are laid out and clickable.
+async function openThreadDrawer(page) {
+  await page.evaluate(() => {
+    const drawer = document.querySelector(".sidebar-drawer");
+    if (drawer && !drawer.open) {
+      drawer.open = true;
+      drawer.dispatchEvent(new Event("toggle"));
+    }
+  });
+}
+
 async function shoot(page, name) {
   if (!SHOT_DIR) {
     return;
@@ -152,6 +164,7 @@ async function run() {
     );
     await shoot(page, "05-closed");
 
+
     // --- Tabs survive a reload (browser-local persistence) ---
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".session-tab", { timeout: TIMEOUT_MS });
@@ -160,6 +173,86 @@ async function run() {
       reloaded.threadIds.includes(threadB),
       `the pinned tab survives a reload, got ${JSON.stringify(reloaded.threadIds)}`
     );
+
+    // --- Closing the LAST tab must not resurrect it ---
+    // The strip used to adopt the relay's active thread whenever the route was
+    // empty, so emptying the strip immediately refilled it.
+    await page.click(`.session-tab[data-thread-id="${threadB}"] .session-tab-pin`);
+    await page.click(`.session-tab[data-thread-id="${threadB}"] .session-tab-close`);
+    await page.waitForFunction(() => document.querySelectorAll(".session-tab").length === 0, {
+      timeout: TIMEOUT_MS,
+    });
+    await page.waitForTimeout(600); // let a snapshot/render cycle go by
+    const emptied = await tabState(page);
+    assert.equal(emptied.count, 0, "closing the last tab leaves the strip empty");
+    assert.ok(emptied.stripPresent, "the strip itself stays mounted when empty");
+    await shoot(page, "06-emptied");
+
+    // --- Back/forward keeps the strip and the transcript in agreement ---
+    await page.goBack({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(600);
+    const backState = await tabState(page);
+    const routedBack = await page.evaluate(() =>
+      new URL(window.location.href).searchParams.get("thread")
+    );
+    if (routedBack) {
+      assert.ok(
+        backState.threadIds.includes(routedBack),
+        `history navigation to ${routedBack} must re-open its tab, got `
+          + JSON.stringify(backState.threadIds)
+      );
+    }
+
+    // --- Sessions mode and Projects mode keep separate tab sets ---
+    // Switching back to Sessions leaves `activeProjectId` set, so keying the tab
+    // bucket off that value alone made Sessions mode share the last project's tabs.
+    // Start this section from a clean slate: the earlier steps (notably the
+    // back/forward re-open) leave persisted tabs behind, and this assertion is about
+    // isolation between buckets, not about what those steps left.
+    await page.evaluate(() => {
+      for (const key of Object.keys(window.localStorage)) {
+        if (key.startsWith("sealwire:tab-workspace:")) {
+          window.localStorage.removeItem(key);
+        }
+      }
+    });
+    await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
+    await openThreadDrawer(page);
+
+    await page.click(`button.conversation-item[data-thread-id="${threadA}"]`);
+    await page.waitForFunction(
+      (id) => [...document.querySelectorAll(".session-tab")].some((tab) => tab.dataset.threadId === id),
+      threadA,
+      { timeout: TIMEOUT_MS }
+    );
+    const sessionsTabs = (await tabState(page)).threadIds;
+    assert.deepEqual(sessionsTabs, [threadA], "Sessions mode holds exactly the opened session");
+
+    await page.click("#threads-view-projects");
+    await page.waitForFunction(() => document.querySelectorAll(".session-tab").length === 0, {
+      timeout: TIMEOUT_MS,
+    });
+    assert.deepEqual(
+      (await tabState(page)).threadIds,
+      [],
+      "a fresh Projects workspace starts empty rather than inheriting Sessions"
+    );
+    await shoot(page, "07-projects-mode-empty");
+
+
+    await page.click("#threads-view-sessions");
+    await page.waitForFunction(
+      (id) => [...document.querySelectorAll(".session-tab")].some((tab) => tab.dataset.threadId === id),
+      threadA,
+      { timeout: TIMEOUT_MS }
+    );
+    assert.deepEqual(
+      (await tabState(page)).threadIds,
+      sessionsTabs,
+      "switching back restores the Sessions tab set"
+    );
+    await shoot(page, "08-sessions-mode-restored");
 
     assert.deepEqual(pageErrors, [], `no page errors: ${pageErrors.join("\n")}`);
     console.log("local session tabs e2e: OK");

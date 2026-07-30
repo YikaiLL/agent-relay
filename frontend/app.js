@@ -200,7 +200,11 @@ import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
 import { layoutThreadIds } from "./shared/tab-layout.js";
-import { createTabWorkspaceStore } from "./shared/tab-workspace-store.js";
+import {
+  NO_PROJECT_KEY,
+  SESSIONS_KEY,
+  createTabWorkspaceStore,
+} from "./shared/tab-workspace-store.js";
 import { browserTabWorkspacePersistence } from "./shared/tab-workspace-prefs.js";
 import {
   loadLastApprovalPolicy,
@@ -1603,6 +1607,12 @@ window.addEventListener("resize", () => {
 
 window.addEventListener("popstate", () => {
   state.viewThreadId = readThreadIdFromUrl();
+  // Back/forward writes viewThreadId directly rather than going through
+  // setThreadRoute (it must not push another history entry), so re-open the tab
+  // here. Navigating back to a session you had closed re-opens it, which keeps the
+  // strip and the transcript agreeing — the alternative, showing a session with no
+  // tab, contradicts the strip's whole premise.
+  openSessionTab(state.viewThreadId);
   if (state.session) {
     renderSession(state.session);
   }
@@ -3350,7 +3360,16 @@ let sessionTabsRootHandle = null;
 let sessionTabsRootElement = null;
 
 function currentTabProjectId() {
-  return readActiveProjectId(state.threadListStore);
+  // The bucket is a function of BOTH the view mode and the selected project.
+  // Reading `activeProjectId` alone was wrong twice over: switching back to Sessions
+  // leaves the last project set (so Sessions shared that project's tabs), and
+  // Projects mode before any project is selected has no id at all (so it shared
+  // Sessions'). Sessions therefore gets an explicit key of its own.
+  const viewMode = state.threadListStore.getState().viewMode;
+  if (viewMode !== "projects") {
+    return SESSIONS_KEY;
+  }
+  return readActiveProjectId(state.threadListStore) || NO_PROJECT_KEY;
 }
 
 function resolveTabThread(threadId) {
@@ -3380,17 +3399,14 @@ function renderSessionTabs() {
 
   const projectId = currentTabProjectId();
   const tabs = state.tabWorkspaceStore.getState();
-  // A freshly started session becomes the relay's active thread WITHOUT ever
-  // setting `viewThreadId`, so it would otherwise never appear in the strip. Give
-  // it a tab here — but only in that exact case (no thread explicitly viewed).
-  //
-  // Deliberately NOT "whatever is shown gets a tab": route updates run inside
-  // runViewTransition, which defers in browsers that support startViewTransition.
-  // Closing the focused tab would then still read the closed thread as "shown" and
-  // resurrect the tab the user just dismissed.
-  const workspace = !state.viewThreadId && state.session?.active_thread_id
-    ? tabs.openThread(projectId, state.session.active_thread_id)
-    : tabs.ensureWorkspace(projectId);
+  // Render-only: opening tabs is never a side effect of rendering. Starting a
+  // session already routes through setThreadRoute (local/session/lifecycle.js), so
+  // the strip needs no "adopt the active thread" fallback — and having one was
+  // actively wrong. It fired whenever the route was empty, which is exactly what
+  // closing the last tab and entering a project overview both do, so it resurrected
+  // the tab the user just closed and stamped the global active thread into every
+  // project workspace visited.
+  const workspace = tabs.ensureWorkspace(projectId);
   const items = buildSessionTabItems({
     workspace,
     layoutThreadIds,
@@ -3407,31 +3423,43 @@ function renderSessionTabs() {
       // never disagree with the transcript below it.
       focusedTabId: items.find((item) => item.threadId === state.viewThreadId)?.tabId
         || workspace.focusedTabId,
+      // NOTE on the missing trailing renderSessionTabs() in the navigating paths:
+      // viewThreadById defers its route update into runViewTransition. Re-rendering
+      // this React root synchronously afterwards makes the browser skip that pending
+      // transition, and its callback — which is what actually writes the route —
+      // never runs. The tab would move but the URL and viewThreadId would not, so
+      // the next close saw a stale "viewed" thread. viewThreadById already refreshes
+      // the strip through openSessionTab, so navigation owns the re-render.
       onFocus(tabId) {
         const item = items.find((entry) => entry.tabId === tabId);
         tabs.focusTabId(projectId, tabId);
         if (item?.threadId) {
           viewThreadById(item.threadId);
+        } else {
+          renderSessionTabs();
         }
-        renderSessionTabs();
       },
       onClose(tabId) {
         const item = items.find((entry) => entry.tabId === tabId);
         const next = tabs.closeTabId(projectId, tabId);
-        // Closing the tab you were viewing should land on the neighbour the model
-        // picked, not leave the transcript showing a closed session.
-        if (item?.threadId === state.viewThreadId) {
-          const nextThreadId = next.focusedTabId
-            ? layoutThreadIds(next.tabs.find((tab) => tab.id === next.focusedTabId)?.layout)[0]
-            : null;
-          if (nextThreadId) {
-            viewThreadById(nextThreadId);
-          } else {
-            clearThreadRoute();
-            if (state.session) {
-              renderSession(state.session);
-            }
-          }
+        // Closing a tab you weren't viewing changes nothing about the transcript.
+        if (item?.threadId !== state.viewThreadId) {
+          renderSessionTabs();
+          return;
+        }
+
+        // Closing the tab you WERE viewing has to move the transcript too, onto the
+        // neighbour the model picked (or the console home when nothing is left).
+        const nextThreadId = next.focusedTabId
+          ? layoutThreadIds(next.tabs.find((tab) => tab.id === next.focusedTabId)?.layout)[0]
+          : null;
+        if (nextThreadId) {
+          viewThreadById(nextThreadId);
+          return;
+        }
+        clearThreadRoute();
+        if (state.session) {
+          renderSession(state.session);
         }
         renderSessionTabs();
       },
