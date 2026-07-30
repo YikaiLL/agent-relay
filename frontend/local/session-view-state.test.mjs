@@ -233,6 +233,30 @@ test("versioned history restores the exact context while the URL owns the thread
   });
 });
 
+test("history preserves project context while project ids are not authoritative yet", () => {
+  let state = createSessionViewState();
+  state = transition(
+    state,
+    {
+      type: "RESTORE_HISTORY",
+      entry: {
+        version: 1,
+        context: project("project-loading"),
+      },
+      urlThreadId: "project-session",
+    },
+    {
+      projectIds: [],
+      projectIdsComplete: false,
+    }
+  );
+
+  assert.deepEqual(state.location, {
+    context: project("project-loading"),
+    threadId: "project-session",
+  });
+});
+
 test("legacy empty history keeps the current context", () => {
   let state = createSessionViewState({
     location: {

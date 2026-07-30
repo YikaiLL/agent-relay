@@ -1743,13 +1743,13 @@ export function createSessionRenderer({
   function runViewTransition(update) {
     const startViewTransition = document.startViewTransition?.bind(document);
     if (typeof startViewTransition !== "function") {
-      update();
-      return Promise.resolve();
+      return Promise.resolve().then(update);
     }
 
-    const transition = startViewTransition(() => {
-      update();
-    });
+    // Navigation commits can include an IndexedDB transaction. Returning the update
+    // promise keeps the browser transition open until canonical state, history and
+    // the first render have all crossed the same boundary.
+    const transition = startViewTransition(() => Promise.resolve().then(update));
 
     return transition.finished.catch(() => {});
   }

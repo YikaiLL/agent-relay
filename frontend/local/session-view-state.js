@@ -11,8 +11,8 @@
 // `state.viewThreadId` and `workspace.focusedTabId`.
 //
 // This module deliberately knows nothing about DOM, React, History, transcript loading,
-// or persistence. The future controller will turn browser/backend events into commands,
-// commit one transition, then perform those effects.
+// or persistence. session-view-controller turns browser/backend events into commands,
+// commits one transition, then performs those effects.
 
 import {
   closeTab,
@@ -156,14 +156,23 @@ function sweepUnavailableThreads(state, unavailableThreadIds) {
   return next;
 }
 
-function contextFromHistory(entry, currentContext, projectIds) {
+function contextFromHistory(
+  entry,
+  currentContext,
+  projectIds,
+  projectIdsComplete = true
+) {
   const knownProjects = stringSet(projectIds);
 
   // Versioned entries store context only. The URL remains the canonical/shareable
   // carrier for the thread id, so it cannot disagree with a duplicate history field.
   if (entry?.version === HISTORY_VERSION && entry.context) {
     const context = normalizeSessionViewContext(entry.context);
-    if (context.kind === "project" && !knownProjects.has(context.projectId)) {
+    if (
+      projectIdsComplete
+      && context.kind === "project"
+      && !knownProjects.has(context.projectId)
+    ) {
       return { kind: "projects-home" };
     }
     return context;
@@ -175,7 +184,7 @@ function contextFromHistory(entry, currentContext, projectIds) {
   }
   if (entry?.viewMode === "projects") {
     const projectId = stringId(entry.projectId);
-    return projectId && knownProjects.has(projectId)
+    return projectId && (!projectIdsComplete || knownProjects.has(projectId))
       ? { kind: "project", projectId }
       : { kind: "projects-home" };
   }
@@ -338,7 +347,8 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
       const context = contextFromHistory(
         action.entry,
         state.location.context,
-        facts.projectIds
+        facts.projectIds,
+        facts.projectIdsComplete !== false
       );
       const urlThreadId = stringId(action.urlThreadId);
       const unavailable = stringSet(facts.unavailableThreadIds);

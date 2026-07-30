@@ -56,6 +56,7 @@ function copyFacts(facts) {
         : [];
   return {
     projectIds: copyIds(facts?.projectIds),
+    projectIdsComplete: facts?.projectIdsComplete !== false,
     unavailableThreadIds: copyIds(facts?.unavailableThreadIds),
   };
 }
@@ -87,7 +88,10 @@ function normalizedWorkspaces(workspaces) {
 }
 
 function validHistoryWorkspaces(workspaces, action, facts) {
-  if (action?.type !== "RESTORE_HISTORY") {
+  if (
+    action?.type !== "RESTORE_HISTORY"
+    || facts?.projectIdsComplete === false
+  ) {
     return workspaces;
   }
   const validKeys = new Set([
@@ -295,8 +299,10 @@ export function createSessionViewController({
   async function commitNow(action, { history = null } = {}) {
     let change;
     try {
+      const projectIds = getProjectIds();
       change = await store.dispatch(action, {
-        projectIds: getProjectIds() || [],
+        projectIds: projectIds || [],
+        projectIdsComplete: projectIds != null,
         unavailableThreadIds: getUnavailableThreadIds() || [],
       });
     } catch (error) {

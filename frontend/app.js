@@ -199,15 +199,21 @@ import {
 import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
-import { focusedTab, layoutThreadIds, openThreadIds } from "./shared/tab-layout.js";
 import {
-  NO_PROJECT_KEY,
-  SESSIONS_KEY,
-  createTabWorkspaceStore,
-} from "./shared/tab-workspace-store.js";
-import { browserTabWorkspacePersistence } from "./shared/tab-workspace-prefs.js";
+  layoutThreadIds,
+} from "./shared/tab-layout.js";
 import {
-  isRemovedThreadId,
+  createBrowserSessionViewHistoryAdapter,
+  createSessionViewController,
+  createSessionViewStore,
+} from "./local/session-view-controller.js";
+import {
+  browserSessionViewPersistence,
+} from "./local/session-view-persistence.js";
+import {
+  sessionViewContextKey,
+} from "./local/session-view-state.js";
+import {
   loadRemovedThreadIds,
   rememberRemovedThreadId,
 } from "./shared/removed-threads.js";
@@ -270,7 +276,9 @@ const state = {
   defaultsSeeded: false,
   selectedCwd: "",
   session: null,
-  viewThreadId: readThreadIdFromUrl(),
+  // Compatibility read mirror for renderers. Replaced with a getter backed by the
+  // canonical session-view store immediately after state construction.
+  viewThreadId: null,
   // Read-only "view projection" pin for ANY non-active thread the user is looking
   // at (see local/view-only-thread.js). `{ threadId, entries, olderCursor,
   // generation, review, reviewSig, loading }` or null. Loaded by
@@ -332,18 +340,64 @@ const state = {
   // stale history entries survive a reload too.
   removedThreadIds: new Set(loadRemovedThreadIds()),
   threadListStore: createThreadListStore(),
-  // Per-project open-session tabs. Persistence is browser-local for now; the store
-  // takes it as an injected adapter so moving to server-persisted (cross-device)
-  // needs no change here or in the UI.
-  tabWorkspaceStore: createTabWorkspaceStore({
-    persistence: browserTabWorkspacePersistence,
-  }),
+  sessionViewStore: null,
+  sessionViewController: null,
   localUiStore: createLocalUiStore(),
   streamReconnectTimer: null,
   sessionPollTimer: null,
   threads: [],
   threadsPollTimer: null,
 };
+
+const sessionViewStore = createSessionViewStore({
+  initialLocation: {
+    context: { kind: "sessions" },
+    threadId: null,
+  },
+  persistence: browserSessionViewPersistence,
+  onError(error) {
+    logLine(`Session view persistence failed: ${error.message}`);
+  },
+});
+state.sessionViewStore = sessionViewStore;
+Object.defineProperty(state, "viewThreadId", {
+  configurable: false,
+  enumerable: true,
+  get() {
+    return sessionViewStore.getState().location.threadId;
+  },
+});
+
+const sessionViewController = createSessionViewController({
+  store: sessionViewStore,
+  historyAdapter: createBrowserSessionViewHistoryAdapter(window),
+  // Until the dedicated Projects payload has loaded, absence is not evidence of
+  // deletion. Returning null tells history restoration to preserve project context
+  // and cold buckets; the projects subscription reconciles again once authoritative.
+  getProjectIds() {
+    return state.projectsLoaded
+      ? (state.projects || []).map((project) => project.id)
+      : null;
+  },
+  getUnavailableThreadIds() {
+    return new Set([
+      ...loadRemovedThreadIds(),
+      ...state.removedThreadIds,
+    ]);
+  },
+  onCommit(change) {
+    syncThreadListViewFromContext(change.next.location.context);
+    if (change.locationChanged) {
+      clearComposerImageAttachments();
+    }
+  },
+  onError(error, details) {
+    logLine(
+      `Session view ${details?.phase || "transaction"} failed: ${error.message}`
+    );
+  },
+});
+state.sessionViewController = sessionViewController;
 
 const apiFetch = createApiFetch({
   getApiToken() {
@@ -378,12 +432,16 @@ const projectsStore = createProjectsStore({
 // captures the token at build time; runThreadProjectAction() refuses to act if it has
 // since advanced, so a button built from now-stale Project state can't mutate.
 let projectsStateSeq = 0;
+let reconciledProjectSignature = null;
 projectsStore.subscribe((projectsState) => {
   state.projects = projectsState.projects;
   state.threadProjectId = projectsState.threadProjectId;
   state.projectsLoading = projectsState.loading;
   state.projectsError = projectsState.error;
   state.projectsLoaded = projectsState.loaded;
+  if (!projectsState.loaded) {
+    reconciledProjectSignature = null;
+  }
   projectsStateSeq += 1;
   // Re-render on ANY change (loading/loaded/error transitions) while the Projects
   // view is showing, so its loading/error placeholder resolves to the grouping.
@@ -391,12 +449,46 @@ projectsStore.subscribe((projectsState) => {
   // only ever fires asynchronously (after a fetch settles), by which point they are
   // initialized.
   if (readThreadListViewMode(state.threadListStore) === "projects") {
-    // Once projects arrive, land on one so the main area shows a card overview
-    // instead of the console home.
-    ensureActiveProjectSelected();
+    if (
+      autoSelectFirstProjectWhenLoaded
+      && projectsState.loaded
+      && !projectsState.loading
+      && !projectsState.error
+    ) {
+      autoSelectFirstProjectWhenLoaded = false;
+      ensureActiveProjectSelected();
+    }
     renderThreads();
     if (state.session) {
       renderSession(state.session);
+    }
+  }
+  // Project ids become authoritative only after a successful payload. Re-run the
+  // current location as RESTORE_HISTORY once per project set so a deleted selected
+  // project falls to Projects home and its cold IndexedDB bucket is deleted. During
+  // initial loading/error we deliberately retain project context and persisted tabs.
+  if (
+    projectsState.loaded
+    && !projectsState.loading
+    && !projectsState.error
+  ) {
+    const signature = JSON.stringify(
+      projectsState.projects.map((project) => project.id)
+    );
+    if (signature !== reconciledProjectSignature) {
+      reconciledProjectSignature = signature;
+      void (async () => {
+        // A local create/select command may already be queued behind the Projects
+        // response that triggered this subscriber. Read location only AFTER earlier
+        // navigation commits, or an old Projects-home snapshot can replace the newly
+        // selected project's history entry.
+        await sessionViewController.whenIdle();
+        const location = sessionViewStore.getState().location;
+        await sessionViewController.restoreHistory(
+          { version: 1, context: location.context },
+          location.threadId
+        );
+      })();
     }
   }
   // Keep an OPEN context menu's Project section in sync regardless of view mode —
@@ -739,12 +831,10 @@ const renderer = createSessionRenderer({
   // area. Clears any open session so the overview (not a transcript) is what renders;
   // renderSession derives data-view="project-overview" from the selected project.
   enterProjectOverview(projectId) {
-    state.threadListStore.getState().setActiveProject(projectId);
-    clearThreadRoute();
-    if (state.session) {
-      renderer.renderSession(state.session);
-    }
-    renderer.renderThreads();
+    void sessionViewController.showOverview({
+      kind: "project",
+      projectId,
+    });
   },
   // "New agent" from a project overview: open the start-session dialog and remember
   // the project, so the session created by the next Start is auto-assigned to it.
@@ -1108,8 +1198,21 @@ const {
   renderThreads,
   runViewTransition,
   syncThreadHistoryScroll,
-  syncThreadSelection,
 } = renderer;
+
+// One post-commit projection path for every navigation source. The controller has
+// already committed canonical state, persistence and history before listeners run,
+// so renderers never observe a route that belongs to a different tab workspace.
+sessionViewController.subscribe((change) => {
+  renderSessionTabs();
+  renderThreads();
+  if (state.session) {
+    renderSession(state.session);
+  }
+  if (change.locationChanged) {
+    void loadViewOnlyTranscript(change.next.location.threadId);
+  }
+});
 
 const {
   cancelControllerHeartbeat,
@@ -1214,6 +1317,36 @@ for (const key of SETTINGS_TABS) {
 // Sessions/Projects sidebar grouping toggle (static-shell buttons wired by id).
 const threadsViewSessionsButton = document.getElementById("threads-view-sessions");
 const threadsViewProjectsButton = document.getElementById("threads-view-projects");
+let autoSelectFirstProjectWhenLoaded = false;
+
+function syncThreadViewChrome(isProjects) {
+  threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
+  threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
+  if (sidebarElement) {
+    sidebarElement.dataset.threadView = isProjects ? "projects" : "sessions";
+  }
+  if (projectsToolbar) {
+    projectsToolbar.hidden = !isProjects;
+  }
+}
+
+function syncThreadListViewFromContext(context) {
+  const store = state.threadListStore.getState();
+  const isProjects = context?.kind !== "sessions";
+  const viewMode = isProjects ? "projects" : "sessions";
+  if (store.viewMode !== viewMode) {
+    store.setViewMode(viewMode);
+  }
+  const projectId = context?.kind === "project" ? context.projectId : null;
+  if (readActiveProjectId(state.threadListStore) !== projectId) {
+    store.setActiveProject(projectId);
+  }
+  syncThreadViewChrome(isProjects);
+  if (isProjects) {
+    projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  }
+}
+
 // Land on a project (the first, by list order) when Projects mode is active but none
 // is validly selected — so the main area shows a card overview rather than the console
 // home. Also drops a STALE selection: if the active project was deleted (locally or by
@@ -1223,57 +1356,47 @@ const threadsViewProjectsButton = document.getElementById("threads-view-projects
 // project, or clear the selection when none remain.
 function ensureActiveProjectSelected() {
   const projects = state.projects || [];
-  const activeId = readActiveProjectId(state.threadListStore);
-  if (activeId && projects.some((project) => project.id === activeId)) {
+  const context = sessionViewStore.getState().location.context;
+  if (
+    context.kind === "project"
+    && projects.some((project) => project.id === context.projectId)
+  ) {
     return;
   }
-  const nextId = projects[0]?.id ?? null;
-  if (nextId !== activeId) {
-    state.threadListStore.getState().setActiveProject(nextId);
-    // Project payloads arrive asynchronously, so creating/deleting a project can
-    // change the selected project without changing the thread route. Keep the current
-    // history entry's view context current or a reload cannot restore that selection.
-    replaceCurrentThreadHistoryEntry();
-  }
+  const nextId = projects[0]?.id || null;
+  void sessionViewController.showOverview(
+    nextId
+      ? { kind: "project", projectId: nextId }
+      : { kind: "projects-home" },
+    { replace: true }
+  );
 }
 
-function setThreadViewMode(mode) {
+async function setThreadViewMode(mode) {
   const isProjects = mode === "projects";
-  state.threadListStore.getState().setViewMode(isProjects ? "projects" : "sessions");
-  threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
-  threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
-  // Mode-gate the sidebar's primary actions via CSS: the Projects toolbar shows in
-  // Projects mode, the New session / Continue latest launch panel in Sessions mode.
-  if (sidebarElement) {
-    sidebarElement.dataset.threadView = isProjects ? "projects" : "sessions";
+  if (!isProjects) {
+    await sessionViewController.switchContext({ kind: "sessions" });
+    return;
   }
-  if (projectsToolbar) {
-    projectsToolbar.hidden = !isProjects;
-  }
-  // Ensure the Projects payload is loaded when switching in (no-op if already current).
-  if (isProjects) {
-    projectsStore.syncToRevision(state.session?.projects_revision || 0);
-    ensureActiveProjectSelected();
-  }
-  // Each mode owns its own tab workspace, so switching mode switches which sessions
-  // are "open" — and the route has to follow. Without this the main area kept showing
-  // the previous mode's session while the strip already showed the target mode's tabs
-  // (or none), leaving the transcript and the strip describing different things.
-  // Runs BEFORE the renders below, and with the transition disabled, so those renders
-  // can't skip a pending route update.
-  syncRouteToCurrentWorkspace();
-  // Switching between two empty tab sets leaves the thread route unchanged, but the
-  // mode is still navigation state that a reload/back-forward entry must remember.
-  replaceCurrentThreadHistoryEntry();
-  renderThreads();
-  // Switch the main area too: entering Projects shows the card overview; leaving it
-  // returns to console/conversation. renderSession derives the view from the mode.
-  if (state.session) {
-    renderSession(state.session);
-  }
+  projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  const activeId = readActiveProjectId(state.threadListStore);
+  const projectId =
+    (activeId && state.projects.some((project) => project.id === activeId)
+      ? activeId
+      : state.projects[0]?.id) || null;
+  autoSelectFirstProjectWhenLoaded = !projectId && !state.projectsLoaded;
+  await sessionViewController.switchContext(
+    projectId
+      ? { kind: "project", projectId }
+      : { kind: "projects-home" }
+  );
 }
-threadsViewSessionsButton?.addEventListener("click", () => setThreadViewMode("sessions"));
-threadsViewProjectsButton?.addEventListener("click", () => setThreadViewMode("projects"));
+threadsViewSessionsButton?.addEventListener("click", () => {
+  void setThreadViewMode("sessions");
+});
+threadsViewProjectsButton?.addEventListener("click", () => {
+  void setThreadViewMode("projects");
+});
 
 // Prompt for a Project name (trimmed; null aborts). Native prompt mirrors the
 // window.confirm flow the archive/delete affordances already use.
@@ -1290,7 +1413,15 @@ async function createProjectFromToolbar() {
     return;
   }
   try {
-    await createProject(apiFetch, name);
+    const before = state.projects || [];
+    const receipt = await createProject(apiFetch, name);
+    const projectId = pickNewProjectId(before, receipt?.projects);
+    if (projectId) {
+      await sessionViewController.showOverview({
+        kind: "project",
+        projectId,
+      });
+    }
     logLine(`Created project "${name}".`);
   } catch (error) {
     logLine(`Failed to create project: ${error.message}`);
@@ -1331,7 +1462,19 @@ async function deleteProjectFromHeader(projectId, name) {
     return;
   }
   try {
-    await deleteProject(apiFetch, projectId);
+    const context = sessionViewStore.getState().location.context;
+    const wasSelected =
+      context.kind === "project" && context.projectId === projectId;
+    const receipt = await deleteProject(apiFetch, projectId);
+    if (wasSelected) {
+      const fallbackProjectId = receipt?.projects?.[0]?.id || null;
+      await sessionViewController.showOverview(
+        fallbackProjectId
+          ? { kind: "project", projectId: fallbackProjectId }
+          : { kind: "projects-home" },
+        { replace: true }
+      );
+    }
     logLine(`Deleted project "${name}".`);
   } catch (error) {
     logLine(`Failed to delete project: ${error.message}`);
@@ -1562,11 +1705,7 @@ allowedRootsForm?.addEventListener("submit", (event) => {
 // Exit the current session back to the list/overview. Bound to the in-conversation
 // header back arrow, the legacy sidebar back button, and the icon-rail home (folder).
 function goConsoleHome() {
-  clearThreadRoute();
-  if (state.session) {
-    renderSession(state.session);
-  }
-  renderThreads();
+  void clearThreadRoute();
 }
 
 goConsoleHomeButton?.addEventListener("click", goConsoleHome);
@@ -1632,29 +1771,15 @@ window.addEventListener("resize", () => {
 });
 
 window.addEventListener("popstate", (event) => {
-  // Restore the view context the entry was created in BEFORE adopting its thread, so
-  // the session lands back in the tab set it came from. A tab set belongs to a project;
-  // adopting the session into whatever project is selected now would show a tab for a
-  // session that isn't in that project. Entries created before this existed (or by an
-  // external link) carry no state — those keep the current context.
-  restoreViewContext(event.state);
-  state.viewThreadId = readThreadIdFromUrl();
-  // Back/forward writes viewThreadId directly rather than going through
-  // setThreadRoute (it must not push another history entry), so re-open the tab here.
-  // Navigating back to a session you had merely CLOSED re-opens it, which keeps the
-  // strip and the transcript agreeing. A history entry can also name a session that was
-  // archived or deleted since; refusing to create its tab is not enough, the route must
-  // not be left pointing at it either — adoptRoutedThread handles both.
-  adoptRoutedThread();
-  if (state.session) {
-    renderSession(state.session);
-  }
-  renderThreads();
+  void sessionViewController.restoreHistory(
+    event.state,
+    readThreadIdFromUrl()
+  );
 });
 
 directoryForm?.addEventListener("submit", (event) => {
   event.preventDefault();
-  clearThreadRoute();
+  void clearThreadRoute();
   setSelectedCwd(cwdInput.value.trim());
   void loadThreads("directory change");
 });
@@ -2066,20 +2191,14 @@ transcript.addEventListener("click", (event) => {
       // Was a line-for-line copy of controller.viewThread. Routed through the one
       // implementation so every way of opening a session shares its behaviour —
       // including landing in the tab strip.
-      viewThreadById(threadId);
+      void viewThreadById(threadId);
     }
     return;
   }
 
   const goHomeButton = event.target.closest("[data-go-console-home]");
   if (goHomeButton) {
-    void runViewTransition(() => {
-      clearThreadRoute();
-      if (state.session) {
-        renderSession(state.session);
-      }
-      syncThreadSelection();
-    });
+    void runViewTransition(() => clearThreadRoute());
     return;
   }
 
@@ -2182,16 +2301,10 @@ async function boot() {
 
   await loadSession("initial boot");
   await loadThreads("initial boot");
-  // A `?thread=` deep link (address bar, restored tab, reload) sets viewThreadId
-  // directly, without going through viewThread. Restore the entry's view context first
-  // — a reload on a project session kept its URL but loaded with the default Sessions
-  // context, so the session landed in the wrong tab set and the project was lost — then
-  // apply the same reconciliation back/forward does, so launching straight onto a
-  // deleted session doesn't create a dead tab.
-  restoreViewContext(window.history.state);
-  adoptRoutedThread();
-  // Nothing else renders between here and the first snapshot, so refresh the strip.
-  renderSessionTabs();
+  await sessionViewController.restoreHistory(
+    window.history.state,
+    readThreadIdFromUrl()
+  );
   connectSessionStream();
   scheduleThreadsPoll();
 }
@@ -2920,6 +3033,8 @@ async function archiveThreadFromContextMenu() {
   }
 
   const thread = resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
+  const wasViewed = state.viewThreadId === threadId;
+  const fallbackThreadId = wasViewed ? findAdjacentThreadId(threadId) : null;
   const title = thread?.name || thread?.preview || shortId(threadId);
   if (!window.confirm(`Archive "${title}" from local history?`)) {
     return;
@@ -2956,12 +3071,16 @@ async function archiveThreadFromContextMenu() {
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
     state.removedThreadIds.add(threadId);
     rememberRemovedThreadId(threadId);
-    state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
-    // Archiving the session you were VIEWING has to move the route as well, or the
-    // main area keeps rendering a session the strip no longer has a tab for. The
-    // permanent-delete path below does this via its own fallback logic.
-    if (threadId === state.viewThreadId) {
-      syncRouteToCurrentWorkspace();
+    const removal = await sessionViewController.removeThread(threadId);
+    if (
+      wasViewed
+      && !removal.next.location.threadId
+      && fallbackThreadId
+      && state.threads.some((entry) => entry.id === fallbackThreadId)
+    ) {
+      await sessionViewController.openThread(fallbackThreadId, {
+        replace: true,
+      });
     }
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
@@ -2982,8 +3101,8 @@ async function deleteThreadFromContextMenu() {
   }
 
   const thread = resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
-  const shouldPreserveConversation = state.viewThreadId === threadId;
-  const fallbackThreadId = shouldPreserveConversation ? findAdjacentThreadId(threadId) : null;
+  const wasViewed = state.viewThreadId === threadId;
+  const fallbackThreadId = wasViewed ? findAdjacentThreadId(threadId) : null;
   const title = thread?.name || thread?.preview || shortId(threadId);
   // Name the thread's own provider — the old ternary mislabeled every
   // non-Claude provider (incl. future ones) as "Codex".
@@ -3024,23 +3143,21 @@ async function deleteThreadFromContextMenu() {
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
     state.removedThreadIds.add(threadId);
     rememberRemovedThreadId(threadId);
-    state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
+    const removal = await sessionViewController.removeThread(threadId);
+    if (
+      wasViewed
+      && !removal.next.location.threadId
+      && fallbackThreadId
+      && state.threads.some((entry) => entry.id === fallbackThreadId)
+    ) {
+      await sessionViewController.openThread(fallbackThreadId, {
+        replace: true,
+      });
+    }
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
     await loadThreads("post-delete refresh");
-    if (shouldPreserveConversation) {
-      const canResumeFallback =
-        fallbackThreadId && state.threads.some((entry) => entry.id === fallbackThreadId);
-      if (canResumeFallback) {
-        setThreadRoute(fallbackThreadId, { replace: true });
-        await loadViewOnlyTranscript(fallbackThreadId);
-      } else {
-        clearThreadRoute({ replace: true });
-        await loadSession("post-delete refresh");
-      }
-    } else {
-      await loadSession("post-delete refresh");
-    }
+    await loadSession("post-delete refresh");
     logLine(payload.data?.message || `Deleted local session ${shortId(threadId)} permanently.`);
   } catch (error) {
     logLine(`Failed to permanently delete local session: ${error.message}`);
@@ -3052,12 +3169,11 @@ function findAdjacentThreadId(threadId) {
   if (index === -1) {
     return state.threads.find((entry) => entry.id !== threadId)?.id || null;
   }
-
   return (
-    state.threads[index + 1]?.id ||
-    state.threads[index - 1]?.id ||
-    state.threads.find((entry) => entry.id !== threadId)?.id ||
-    null
+    state.threads[index + 1]?.id
+    || state.threads[index - 1]?.id
+    || state.threads.find((entry) => entry.id !== threadId)?.id
+    || null
   );
 }
 
@@ -3287,55 +3403,21 @@ function readThreadIdFromUrl() {
   return url.searchParams.get("thread") || null;
 }
 
-function writeThreadHistoryEntry(threadId, { replace = false } = {}) {
-  const nextThreadId = threadId || null;
-  const url = new URL(window.location.href);
-  if (nextThreadId) {
-    url.searchParams.set("thread", nextThreadId);
-  } else {
-    url.searchParams.delete("thread");
-  }
-
-  const next = url.pathname + url.search + url.hash;
-  // Record the VIEW CONTEXT alongside the thread, not just the thread id. A tab set is
-  // scoped to a project, so a session only belongs in the strip of the context it was
-  // opened from. Without this, going back would adopt the old session into whichever
-  // project happened to be selected now — putting a tab for a session that isn't in
-  // that project into that project's strip. The URL is left alone; this rides in the
-  // history state object, which was previously unused.
-  const entry = {
-    threadId: nextThreadId,
-    viewMode: state.threadListStore.getState().viewMode,
-    projectId: readActiveProjectId(state.threadListStore),
-  };
-  if (replace) {
-    window.history.replaceState(entry, "", next);
-  } else {
-    window.history.pushState(entry, "", next);
-  }
-}
-
-function replaceCurrentThreadHistoryEntry() {
-  writeThreadHistoryEntry(state.viewThreadId, { replace: true });
-}
-
 function setThreadRoute(threadId, options = {}) {
-  const nextThreadId = threadId || null;
-  const threadChanged = state.viewThreadId !== nextThreadId;
-  writeThreadHistoryEntry(nextThreadId, options);
-  state.viewThreadId = nextThreadId;
-  // The single choke point for "which session am I viewing", so it's also the right
-  // place to guarantee that session has a tab — covering starting a session, a
-  // fallback route after a delete, and anything else that navigates without going
-  // through viewThread. Clearing the route (null) opens nothing.
-  openSessionTab(nextThreadId);
-  if (threadChanged) {
-    clearComposerImageAttachments();
+  const context = options.context || sessionViewStore.getState().location.context;
+  if (threadId) {
+    return sessionViewController.openThread(threadId, {
+      context,
+      replace: Boolean(options.replace),
+    });
   }
+  return sessionViewController.showOverview(context, {
+    replace: Boolean(options.replace),
+  });
 }
 
 function clearThreadRoute(options = {}) {
-  setThreadRoute(null, options);
+  return setThreadRoute(null, options);
 }
 
 function isViewingConversation(session) {
@@ -3429,19 +3511,6 @@ function renderClientLogLines(lines) {
 let sessionTabsRootHandle = null;
 let sessionTabsRootElement = null;
 
-function currentTabProjectId() {
-  // The bucket is a function of BOTH the view mode and the selected project.
-  // Reading `activeProjectId` alone was wrong twice over: switching back to Sessions
-  // leaves the last project set (so Sessions shared that project's tabs), and
-  // Projects mode before any project is selected has no id at all (so it shared
-  // Sessions'). Sessions therefore gets an explicit key of its own.
-  const viewMode = state.threadListStore.getState().viewMode;
-  if (viewMode !== "projects") {
-    return SESSIONS_KEY;
-  }
-  return readActiveProjectId(state.threadListStore) || NO_PROJECT_KEY;
-}
-
 function resolveTabThread(threadId) {
   const thread = (state.threads || []).find((entry) => entry.id === threadId);
   if (!thread) {
@@ -3467,16 +3536,13 @@ function renderSessionTabs() {
     sessionTabsRootElement = mount;
   }
 
-  const projectId = currentTabProjectId();
-  const tabs = state.tabWorkspaceStore.getState();
-  // Render-only: opening tabs is never a side effect of rendering. Starting a
-  // session already routes through setThreadRoute (local/session/lifecycle.js), so
-  // the strip needs no "adopt the active thread" fallback — and having one was
-  // actively wrong. It fired whenever the route was empty, which is exactly what
-  // closing the last tab and entering a project overview both do, so it resurrected
-  // the tab the user just closed and stamped the global active thread into every
-  // project workspace visited.
-  const workspace = tabs.ensureWorkspace(projectId);
+  const viewState = sessionViewStore.getState();
+  const context = viewState.location.context;
+  const workspace =
+    viewState.workspaces[sessionViewContextKey(context)] || {
+      tabs: [],
+      focusedTabId: null,
+    };
   const items = buildSessionTabItems({
     workspace,
     layoutThreadIds,
@@ -3498,53 +3564,20 @@ function renderSessionTabs() {
       // focus while the main area showed something else; falling back to
       // `active_thread_id` did the same on Home and in a project overview.
       focusedTabId: items.find((item) => item.threadId === state.viewThreadId)?.tabId || null,
-      // NOTE on the missing trailing renderSessionTabs() in the navigating paths:
-      // viewThreadById defers its route update into runViewTransition. Re-rendering
-      // this React root synchronously afterwards makes the browser skip that pending
-      // transition, and its callback — which is what actually writes the route —
-      // never runs. The tab would move but the URL and viewThreadId would not, so
-      // the next close saw a stale "viewed" thread. viewThreadById already refreshes
-      // the strip through openSessionTab, so navigation owns the re-render.
       onFocus(tabId) {
         const item = items.find((entry) => entry.tabId === tabId);
-        tabs.focusTabId(projectId, tabId);
         if (item?.threadId) {
-          viewThreadById(item.threadId);
-        } else {
-          renderSessionTabs();
+          void viewThreadById(item.threadId);
         }
       },
       onClose(tabId) {
-        const item = items.find((entry) => entry.tabId === tabId);
-        const next = tabs.closeTabId(projectId, tabId);
-        // Closing a tab you weren't viewing changes nothing about the transcript.
-        if (item?.threadId !== state.viewThreadId) {
-          renderSessionTabs();
-          return;
-        }
-
-        // Closing the tab you WERE viewing has to move the transcript too, onto the
-        // neighbour the model picked (or the console home when nothing is left).
-        const nextThreadId = next.focusedTabId
-          ? layoutThreadIds(next.tabs.find((tab) => tab.id === next.focusedTabId)?.layout)[0]
-          : null;
-        if (nextThreadId) {
-          viewThreadById(nextThreadId);
-          return;
-        }
-        clearThreadRoute();
-        if (state.session) {
-          renderSession(state.session);
-        }
-        renderSessionTabs();
+        void sessionViewController.closeTab(tabId, { context });
       },
       onTogglePin(tabId, pinned) {
-        tabs.setPinned(projectId, tabId, pinned);
-        renderSessionTabs();
+        void sessionViewController.pinTab(tabId, pinned, { context });
       },
       onMove(tabId, toIndex) {
-        tabs.moveTabId(projectId, tabId, toIndex);
-        renderSessionTabs();
+        void sessionViewController.moveTab(tabId, toIndex, { context });
       },
       emptyMessage: "No open sessions. Pick one from the sidebar.",
     })
@@ -3560,183 +3593,13 @@ function renderSessionTabs() {
  * Module-level so every entry point shares it — the sidebar row handler and the tab
  * strip previously each carried their own copy of this body.
  */
-function viewThreadById(threadId, { transition = true, replace = false } = {}) {
-  // A tab rendered before another window deleted its session is still clickable, and
-  // this path is not covered by the navigation-time sweep. Routing to a dead id would
-  // put the main area on a session that no longer exists, so drop the stale tab and
-  // settle instead.
-  if (isRemovedThreadId(threadId, state.removedThreadIds)) {
-    state.tabWorkspaceStore.getState().closeThreadEverywhere(threadId);
-    syncRouteToCurrentWorkspace({ replace: true });
-    renderSessionTabs();
-    return;
-  }
-  // Viewing a session is what puts it in the tab strip: the strip records "what I
-  // have open", so it has to cover however the user got here (sidebar click, deep
-  // link, tab click).
-  openSessionTab(threadId);
-  const update = () => {
-    setThreadRoute(threadId, { replace });
-    if (state.session) {
-      renderer.renderSession(state.session);
-    }
-    renderer.syncThreadSelection();
-  };
-  // `transition: false` for callers that must keep rendering afterwards. A pending
-  // view transition is skipped by any synchronous re-render, and its callback — the
-  // thing that writes the route — then never runs, silently desyncing the URL.
+async function viewThreadById(threadId, { transition = true, replace = false } = {}) {
+  const update = () => setThreadRoute(threadId, { replace });
   if (transition) {
-    void runViewTransition(update);
+    await runViewTransition(update);
   } else {
-    update();
+    await update();
   }
-  // Fetch the viewed thread's transcript so it renders read-only (instead of
-  // falling back to the console home). No-op / clears the projection when the
-  // thread is the active one.
-  void loadViewOnlyTranscript(threadId);
-}
-
-/**
- * The session the CURRENT workspace considers focused, or null when it has no tabs.
- * Used to keep the route and the main area in step with whichever workspace is in
- * scope — switching mode or removing a session must not leave the transcript showing
- * something the strip no longer holds.
- */
-function focusedThreadIdForCurrentWorkspace() {
-  const workspace = state.tabWorkspaceStore.getState().ensureWorkspace(currentTabProjectId());
-  const focused = focusedTab(workspace);
-  return focused ? layoutThreadIds(focused.layout)[0] || null : null;
-}
-
-/**
- * Point the route (and therefore the main area) at whatever the current workspace
- * has focused, clearing it when that workspace is empty. Renders are left to the
- * caller so a navigation's view transition isn't skipped by a trailing re-render.
- */
-function syncRouteToCurrentWorkspace({ replace = false } = {}) {
-  const nextThreadId = focusedThreadIdForCurrentWorkspace();
-  if (nextThreadId === (state.viewThreadId || null)) {
-    return;
-  }
-  if (nextThreadId) {
-    viewThreadById(nextThreadId, { transition: false, replace });
-  } else {
-    clearThreadRoute({ replace });
-  }
-}
-
-/**
- * Give the currently routed session a tab, unless that session has been archived or
- * deleted — in which case the route is settled onto whatever this workspace has
- * focused (or Home when it has nothing) instead.
- *
- * Shared by EVERY entry point that adopts a route it did not create: the initial load
- * (`?thread=` straight from the address bar, a restored tab, a reload) and
- * back/forward. Having only the popstate path do this left the launch path resurrecting
- * dead tabs, so the reconciliation lives in one place rather than being duplicated.
- */
-function adoptRoutedThread() {
-  // Another window may have removed a session that this one still has open. Refusing to
-  // re-create a dead tab is not enough on its own — the already-open copy has to go
-  // too, or this window keeps showing a tab for a session that no longer exists.
-  // Swept here (on navigation) rather than via a storage event: navigation is when a
-  // stale tab can actually be acted on, and it keeps the read-through model with no
-  // listener lifecycle to get wrong.
-  sweepRemovedTabs();
-  // Read-through, so a deletion made in another window of this profile counts; the
-  // in-session set is the fallback for when storage can't persist at all.
-  if (isRemovedThreadId(state.viewThreadId, state.removedThreadIds)) {
-    state.viewThreadId = null;
-    syncRouteToCurrentWorkspace({ replace: true });
-    return;
-  }
-  openSessionTab(state.viewThreadId);
-}
-
-/**
- * Put the sidebar back into the view mode / project a history entry was created in,
- * WITHOUT pushing another entry.
- *
- * Only the store and the mode-gated chrome are touched; the caller re-renders. This is
- * deliberately not setThreadViewMode(), which also reconciles the route to the target
- * workspace — during a back/forward the route is the thing we are restoring, so letting
- * it be overwritten would defeat the navigation.
- */
-function restoreViewContext(entry) {
-  // Require an explicit viewMode. Entries created before this shipped (or by an
-  // external link) are `{}` / null, and reading a missing field as "sessions" would
-  // silently switch modes instead of keeping the current context, which is what the
-  // absence of state is supposed to mean.
-  if (entry?.viewMode !== "projects" && entry?.viewMode !== "sessions") {
-    return;
-  }
-
-  const store = state.threadListStore.getState();
-  const isProjects = entry.viewMode === "projects";
-  if (store.viewMode !== (isProjects ? "projects" : "sessions")) {
-    store.setViewMode(isProjects ? "projects" : "sessions");
-    threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
-    threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
-    if (sidebarElement) {
-      sidebarElement.dataset.threadView = isProjects ? "projects" : "sessions";
-    }
-    if (projectsToolbar) {
-      projectsToolbar.hidden = !isProjects;
-    }
-  }
-  // Only restore a project that still exists. The entry can outlive the project it
-  // names, and selecting a deleted id would implicitly create a workspace bucket for a
-  // project that is gone; fall back to no selection and let ensureActiveProjectSelected
-  // pick a live one.
-  const restoredProjectId = entry.projectId
-    && (state.projects || []).some((project) => project.id === entry.projectId)
-    ? entry.projectId
-    : null;
-  if (readActiveProjectId(state.threadListStore) !== restoredProjectId) {
-    state.threadListStore.getState().setActiveProject(restoredProjectId);
-  }
-}
-
-/**
- * Close any open tab whose session has since been archived or deleted — including
- * removals performed by another window of this profile, which this window only learns
- * about by reading the shared tombstones.
- *
- * Only the loaded workspaces need sweeping: the removing window already rewrote the
- * persisted copies, so a workspace this window has not opened yet arrives clean.
- */
-function sweepRemovedTabs() {
-  const tabs = state.tabWorkspaceStore.getState();
-  const openIds = new Set(
-    Object.values(tabs.workspaces).flatMap((workspace) => openThreadIds(workspace))
-  );
-  if (!openIds.size) {
-    return;
-  }
-
-  const tombstoned = new Set([...loadRemovedThreadIds(), ...state.removedThreadIds]);
-  for (const threadId of openIds) {
-    if (tombstoned.has(threadId)) {
-      tabs.closeThreadEverywhere(threadId);
-    }
-  }
-}
-
-/**
- * Open (or focus) a tab for a session in the current project's workspace.
- *
- * Mutates the store ONLY — it deliberately does not render. React's root.render() is
- * asynchronous, so a render scheduled here lands after any `startViewTransition` the
- * caller goes on to start, which makes the browser skip that transition; its callback
- * is what writes the route, so the URL silently stopped following the tabs. Every
- * caller already re-renders through renderThreads/renderSession (or calls
- * renderSessionTabs itself), so the strip still refreshes.
- */
-function openSessionTab(threadId) {
-  if (!threadId) {
-    return;
-  }
-  state.tabWorkspaceStore.getState().openThread(currentTabProjectId(), threadId);
 }
 
 function escapeHtml(value) {

@@ -478,6 +478,41 @@ test("restoring a deleted project never hydrates that cold persisted tab set", a
   assert.deepEqual(persistence.deletes, ["deleted-project"]);
 });
 
+test("an unloaded project catalog preserves history context and persisted buckets", async () => {
+  const persistence = fakePersistence({
+    "project-loading": openThreadTab(
+      createTabWorkspace(),
+      "project-session"
+    ),
+  });
+  const store = createSessionViewStore({
+    initialLocation: { context: sessions(), threadId: null },
+    persistence,
+  });
+  const controller = createSessionViewController({
+    store,
+    getProjectIds: () => null,
+  });
+
+  const result = await controller.restoreHistory(
+    {
+      version: 1,
+      context: project("project-loading"),
+    },
+    "project-session"
+  );
+
+  assert.deepEqual(result.next.location, {
+    context: project("project-loading"),
+    threadId: "project-session",
+  });
+  assert.deepEqual(
+    threadIds(persistence.values.get("project-loading")),
+    ["project-session"]
+  );
+  assert.deepEqual(persistence.deletes, []);
+});
+
 test("pin and move persist tab state without creating browser history", async () => {
   const persistence = fakePersistence();
   const store = createSessionViewStore({

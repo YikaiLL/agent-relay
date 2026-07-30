@@ -122,6 +122,53 @@ function tabState(page) {
   });
 }
 
+async function clearTabPersistence(page) {
+  await page.evaluate(async () => {
+    for (const key of Object.keys(window.localStorage)) {
+      if (key.startsWith("sealwire:tab-workspace:")) {
+        window.localStorage.removeItem(key);
+      }
+    }
+    await new Promise((resolve, reject) => {
+      const request = window.indexedDB.deleteDatabase("sealwire-session-view");
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error || new Error("failed to clear tab database"));
+      request.onblocked = () => reject(new Error("tab database deletion was blocked"));
+    });
+  });
+}
+
+function persistedWorkspace(page, key) {
+  return page.evaluate(
+    (workspaceKey) =>
+      new Promise((resolve, reject) => {
+        const request = window.indexedDB.open("sealwire-session-view", 1);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains("tab-workspaces")) {
+            request.result.createObjectStore("tab-workspaces", { keyPath: "key" });
+          }
+        };
+        request.onsuccess = () => {
+          const database = request.result;
+          if (!database.objectStoreNames.contains("tab-workspaces")) {
+            database.close();
+            resolve(null);
+            return;
+          }
+          const transaction = database.transaction("tab-workspaces", "readonly");
+          const getRequest = transaction.objectStore("tab-workspaces").get(workspaceKey);
+          getRequest.onsuccess = () => resolve(getRequest.result?.workspace || null);
+          getRequest.onerror = () =>
+            reject(getRequest.error || new Error("failed to read tab workspace"));
+          transaction.oncomplete = () => database.close();
+        };
+        request.onerror = () =>
+          reject(request.error || new Error("failed to open tab database"));
+      }),
+    key
+  );
+}
+
 // The sessions list lives in a <details> drawer that is collapsed off the
 // conversation view; open it so its rows are laid out and clickable.
 async function openThreadDrawer(page) {
@@ -317,13 +364,7 @@ async function run() {
     // Start this section from a clean slate: the earlier steps (notably the
     // back/forward re-open) leave persisted tabs behind, and this assertion is about
     // isolation between buckets, not about what those steps left.
-    await page.evaluate(() => {
-      for (const key of Object.keys(window.localStorage)) {
-        if (key.startsWith("sealwire:tab-workspace:")) {
-          window.localStorage.removeItem(key);
-        }
-      }
-    });
+    await clearTabPersistence(page);
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
     await openThreadDrawer(page);
@@ -491,7 +532,7 @@ async function run() {
     await historyPage.waitForFunction(
       () =>
         document.querySelector(".sidebar")?.dataset.threadView === "projects"
-        && Boolean(window.history.state?.projectId)
+        && Boolean(window.history.state?.context?.projectId)
         && Boolean(document.querySelector(".project-sidebar-row.is-active")),
       { timeout: TIMEOUT_MS }
     );
@@ -551,10 +592,7 @@ async function run() {
       "a deleted project entry may keep Projects mode while dropping its invalid selection"
     );
     assert.equal(
-      await historyPage.evaluate(
-        (key) => window.localStorage.getItem(`sealwire:tab-workspace:${key}`),
-        deletedProjectId
-      ),
+      await persistedWorkspace(historyPage, deletedProjectId),
       null,
       "restoring a deleted project must not create a persisted tab workspace for it"
     );
