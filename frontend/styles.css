@@ -2236,8 +2236,15 @@ input:focus, textarea:focus, select:focus {
   flex: 0 0 auto;
   background: var(--text-3);
 }
+/* The remote sidebar puts the agent's MARK here instead of its name (the drawer is
+   narrow, and the row already spends width on a status dot and a status word). It
+   reuses .provider-mark rather than a parallel class, so the 14px slot, the muted
+   tone and the Claude colour override all stay defined in one place. Providers we
+   ship no icon for still render their name as text. */
 .provider-status-name {
   font-weight: var(--weight-medium);
+  display: inline-flex;
+  align-items: center;
 }
 .provider-status-state {
   margin-left: auto;

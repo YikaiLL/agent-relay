@@ -200,6 +200,7 @@ import {
 import { normalizeProjectName, projectsMenuReady } from "../shared/project-menu.js";
 import { buildThreadSheetSections, threadSheetHasActions } from "../shared/thread-actions-model.js";
 import { runThreadSheetAction } from "./thread-sheet-action.js";
+import { ProviderStatusSection } from "./provider-status-section.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
 import { renderLog } from "./session-surface.js";
 import { setRemoteTranscriptElement } from "./ui-refs.js";
@@ -1805,39 +1806,6 @@ function findThreadNameInGroups(groups, threadId) {
     }
   }
   return null;
-}
-
-function ProviderStatusSection({ model }) {
-  if (!model || model.length === 0) {
-    return null;
-  }
-  return h(
-    "section",
-    { className: "remote-access-shell provider-status-shell" },
-    h("p", { className: "sidebar-caption" }, "Providers"),
-    h(
-      "ul",
-      { className: "provider-status-list", id: "remote-provider-status-list" },
-      ...model.map((row) =>
-        h(
-          "li",
-          {
-            key: row.key,
-            className: "provider-status-row",
-            "data-provider": row.key,
-            "data-status": row.status,
-            title: row.reason || undefined,
-          },
-          h("span", {
-            className: `provider-status-dot ${row.dotClass}`,
-            "aria-hidden": "true",
-          }),
-          h("span", { className: "provider-status-name" }, row.label),
-          h("span", { className: "provider-status-state" }, row.statusLabel)
-        )
-      )
-    )
-  );
 }
 
 function RemoteSidebar({

@@ -128,11 +128,14 @@ async function main() {
       { timeout: LOCAL_TIMEOUT_MS }
     );
 
-    const providerBadgeText = await renderedThread
-      .locator(".conversation-provider-badge")
+    // The row identifies its agent with a MARK, not a text pill — 941b989 swapped the
+    // pill out and this assertion kept looking for it. It never failed loudly because
+    // this scenario only runs in the real-provider suite, which needs a Claude key.
+    const providerMarkProvider = await renderedThread
+      .locator(".provider-mark")
       .first()
-      .textContent();
-    assert.equal(providerBadgeText?.trim(), "Claude");
+      .getAttribute("data-provider");
+    assert.equal(providerMarkProvider, "claude_code");
 
     // Session details is a direct button in the chat header.
     await page.click("#open-session-details");

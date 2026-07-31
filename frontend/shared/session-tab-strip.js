@@ -1,7 +1,9 @@
 import React from "react";
 
 import { selectThreadDot } from "./thread-dot.js";
-import { providerIconSvg } from "./provider-icons.js";
+// The idle slot's content. A provider we ship no mark for leaves it empty rather
+// than borrowing another vendor's logo, which would mislabel the session.
+import { providerMark } from "./provider-mark.js";
 import {
   REORDER_HOLD_MS,
   createStripGesture,
@@ -82,19 +84,6 @@ function PinGlyph({ filled }) {
   );
 }
 
-// The idle slot's content. A provider we ship no mark for leaves it empty rather
-// than borrowing another vendor's logo, which would mislabel the session.
-function providerMark(provider) {
-  const icon = providerIconSvg(provider);
-  if (!icon) {
-    return null;
-  }
-  return h("span", {
-    className: "session-tab-provider",
-    "data-provider": provider,
-    dangerouslySetInnerHTML: { __html: icon },
-  });
-}
 
 function SessionTab({
   item,
@@ -154,7 +143,7 @@ function SessionTab({
         { className: "session-tab-lead", "aria-hidden": "true" },
         dot
           ? h("span", { className: dot.className })
-          : providerMark(item.provider)
+          : providerMark(item.provider, "session-tab-provider")
       ),
       h("span", { className: "session-tab-title" }, item.title),
       dot ? h("span", { className: "sr-only" }, dot.label) : null

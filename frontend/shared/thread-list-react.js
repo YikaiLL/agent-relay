@@ -15,25 +15,14 @@ import {
 import { canonicalizeWorkspace, isUnknownWorkspace } from "./thread-groups.js";
 import { createThreadListRows } from "./thread-list-state.js";
 import { providerLabel } from "./provider-labels.js";
-import { providerIconSvg } from "./provider-icons.js";
+// The row's agent mark. A provider we ship no mark for leaves the slot EMPTY
+// rather than borrowing another vendor's logo, which would mislabel the session
+// — same rule the transcript avatar and the session tab follow.
+import { providerMark } from "./provider-mark.js";
 import { selectThreadDot } from "./thread-dot.js";
 
 const h = React.createElement;
 
-// The row's agent mark. A provider we ship no mark for leaves the slot EMPTY
-// rather than borrowing another vendor's logo, which would mislabel the session
-// — same rule the transcript avatar and the session tab follow.
-function providerMark(provider) {
-  const icon = providerIconSvg(provider);
-  if (!icon) {
-    return null;
-  }
-  return h("span", {
-    className: "provider-mark",
-    "data-provider": provider,
-    dangerouslySetInnerHTML: { __html: icon },
-  });
-}
 const VISIBLE_THREAD_LIMIT = 10;
 const VIRTUAL_OVERSCAN = 8;
 const THREAD_LIST_SCROLL_ROOT_SELECTOR = "[data-thread-list-scroll-root]";

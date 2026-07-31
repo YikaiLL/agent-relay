@@ -50,6 +50,7 @@
       "public-transcript-delta",
       "public-thread-interleaving",
       "remote-mobile-header",
+      "remote-mobile-session-actions",
       "public-broker",
       "public-enrollment",
       "public-refresh",
@@ -64,6 +65,7 @@
       "public-transcript-delta",
       "public-thread-interleaving",
       "remote-mobile-header",
+      "remote-mobile-session-actions",
       "public-refresh",
       "public-thread-settings",
       "public-persistence",
@@ -161,6 +163,18 @@
         "mobile-header",
         "mobile-layout",
         "transcript-scroll"
+      ]
+    },
+    "remote-mobile-session-actions": {
+      "script": "browser-remote-mobile-session-actions-e2e.mjs",
+      "tier": "core",
+      "provider": "stub",
+      "transport": "static-remote",
+      "coverage": [
+        "mobile-session-actions",
+        "mobile-layout",
+        "provider-mark",
+        "projects"
       ]
     },
     "local-auth": {
