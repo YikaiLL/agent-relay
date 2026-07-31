@@ -2683,6 +2683,18 @@ got {}",
         // or one that answers before it's ready (`returns_empty`).
         list_models_should_fail: Arc<AtomicBool>,
         list_models_returns_empty: Arc<AtomicBool>,
+        // Off by default so every existing test keeps exercising the replay
+        // path. Flipped on to cover the native branch, whose "no fork prompt →
+        // stay idle" early return must not swallow pasted images.
+        native_fork: Arc<AtomicBool>,
+        // Models a provider (Claude, real Codex) that turns the initial prompt
+        // into the first turn at creation time. Default-off keeps existing
+        // tests on the "relay re-sends the prompt" branch; switching it on is
+        // what makes the images-withhold-the-prompt split observable.
+        consumes_initial_prompt: Arc<AtomicBool>,
+        // Fault injection for the first turn of a freshly-created thread, which
+        // is where an image-bearing fork sends its whole payload.
+        start_turn_should_fail: Arc<AtomicBool>,
     }
 
     impl RecordingProvider {
@@ -2707,6 +2719,9 @@ got {}",
                 list_models_calls: Arc::new(AtomicUsize::new(0)),
                 list_models_should_fail: Arc::new(AtomicBool::new(false)),
                 list_models_returns_empty: Arc::new(AtomicBool::new(false)),
+                native_fork: Arc::new(AtomicBool::new(false)),
+                consumes_initial_prompt: Arc::new(AtomicBool::new(false)),
+                start_turn_should_fail: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -2768,18 +2783,47 @@ got {}",
             _model: &str,
             _approval_policy: &str,
             _sandbox: &str,
-            _initial_prompt: Option<&str>,
+            initial_prompt: Option<&str>,
         ) -> Result<crate::provider::StartThreadResult, String> {
             let mut threads = self.threads.lock().await;
             let id = format!("{}-thread-{}", self.name, threads.len() + 1);
             let thread = self.thread_summary(&id, cwd);
             threads.insert(id, thread.clone());
+            let consumed_initial_prompt =
+                initial_prompt.is_some() && self.consumes_initial_prompt.load(Ordering::Relaxed);
             Ok(crate::provider::StartThreadResult {
+                thread,
+                consumed_initial_prompt,
+                initial_user_message: None,
+                started_turn_id: None,
+            })
+        }
+
+        async fn fork_thread(
+            &self,
+            request: crate::provider::ProviderForkRequest,
+        ) -> Result<Option<crate::provider::StartThreadResult>, String> {
+            if !self.native_fork.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let mut threads = self.threads.lock().await;
+            let id = format!("{}-fork-{}", self.name, threads.len() + 1);
+            let thread = self.thread_summary(&id, &request.cwd);
+            threads.insert(id, thread.clone());
+            Ok(Some(crate::provider::StartThreadResult {
                 thread,
                 consumed_initial_prompt: false,
                 initial_user_message: None,
                 started_turn_id: None,
-            })
+            }))
+        }
+
+        fn fork_capability(&self) -> crate::provider::ProviderForkCapability {
+            if self.native_fork.load(Ordering::Relaxed) {
+                crate::provider::ProviderForkCapability::NATIVE_AT_MESSAGE
+            } else {
+                crate::provider::ProviderForkCapability::REPLAY_ONLY
+            }
         }
 
         async fn resume_thread(
@@ -2878,6 +2922,9 @@ got {}",
                 .get(thread_id)
                 .map(|thread| thread.cwd.clone());
             require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
+            if self.start_turn_should_fail.load(Ordering::Relaxed) {
+                return Err("provider rejected the turn".to_string());
+            }
             self.turn_thread_ids
                 .lock()
                 .await
@@ -5709,6 +5756,289 @@ got {}",
         assert!(
             user_text.contains("continue on the fork"),
             "fork replay prompt should include the requested fork prompt: {user_text}"
+        );
+    }
+
+    // Pasting a screenshot into the fork dialog's "Fork Prompt" must reach the
+    // branch the same way the composer and New Session already do. The replay
+    // path builds its own handoff prompt, so the images have to ride that same
+    // first turn — dropping them means the user pastes and the fork never sees it.
+    #[tokio::test]
+    async fn fork_with_images_sends_them_in_the_forked_threads_first_turn() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, _claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let source = codex.thread_summary("codex-source", cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(source.id.clone(), source.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![source.clone()];
+        }
+
+        let image = ProviderImage {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+
+        app.fork_session_with_images(
+            ForkSessionInput {
+                source_thread_id: source.id.clone(),
+                up_to_item_id: None,
+                cwd: Some(cwd.to_string()),
+                initial_prompt: Some("continue with this screenshot".to_string()),
+                model: Some("codex-model".to_string()),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            },
+            vec![image.clone()],
+        )
+        .await
+        .expect("a local fork should forward its pasted images");
+
+        assert_eq!(
+            *codex.turn_images.lock().await,
+            vec![vec![image]],
+            "the forked thread's first turn must carry the pasted images"
+        );
+        let texts = codex.turn_texts.lock().await.clone();
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("continue with this screenshot")),
+            "the fork prompt must still reach the branch: {texts:?}"
+        );
+    }
+
+    // Against a provider that turns the initial prompt into the first turn at
+    // creation time (Claude, real Codex), a replay fork MUST withhold the
+    // prompt from `start_thread` when there are images — `start_thread` cannot
+    // carry image bytes, and the `consumed_initial_prompt` gate would then skip
+    // the follow-up send entirely, dropping BOTH the screenshot and the replay
+    // handoff context. The other replay test cannot see this: its provider
+    // never consumes the prompt, so it passes either way.
+    #[tokio::test]
+    async fn a_replay_fork_with_images_does_not_let_the_provider_swallow_the_prompt() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, _claude) = build_recording_provider_app(cwd).await;
+        codex.consumes_initial_prompt.store(true, Ordering::Relaxed);
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let source = codex.thread_summary("codex-source", cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(source.id.clone(), source.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![source.clone()];
+        }
+
+        let image = ProviderImage {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+
+        app.fork_session_with_images(
+            ForkSessionInput {
+                source_thread_id: source.id.clone(),
+                up_to_item_id: None,
+                cwd: Some(cwd.to_string()),
+                initial_prompt: Some("look at this".to_string()),
+                model: Some("codex-model".to_string()),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            },
+            vec![image.clone()],
+        )
+        .await
+        .expect("a replay fork with images should still send its first turn");
+
+        assert_eq!(
+            *codex.turn_images.lock().await,
+            vec![vec![image]],
+            "the images must reach the branch, not be stranded at thread creation"
+        );
+        let texts = codex.turn_texts.lock().await.clone();
+        assert!(
+            texts.iter().any(|text| text.contains("look at this")),
+            "the replay handoff prompt must ride the same turn: {texts:?}"
+        );
+    }
+
+    // Withholding the prompt from `start_thread` (required to carry images)
+    // puts Claude on its synthetic `claude-pending-*` deferred-start path, and
+    // the relay records fork lineage against that placeholder BEFORE the first
+    // turn is sent. `thread_forked_from` is persisted, so if that turn fails —
+    // a vision-less model rejecting the image, a worker crash — the placeholder
+    // never gets promoted and the lineage row survives every restart. A failed
+    // fork must not leave durable lineage behind.
+    #[tokio::test]
+    async fn a_failed_image_fork_leaves_no_persisted_lineage_behind() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, _claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let source = codex.thread_summary("codex-source", cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(source.id.clone(), source.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![source.clone()];
+        }
+
+        codex.start_turn_should_fail.store(true, Ordering::Relaxed);
+        let result = app
+            .fork_session_with_images(
+                ForkSessionInput {
+                    source_thread_id: source.id.clone(),
+                    up_to_item_id: None,
+                    cwd: Some(cwd.to_string()),
+                    initial_prompt: Some("look at this".to_string()),
+                    model: Some("codex-model".to_string()),
+                    approval_policy: None,
+                    sandbox: None,
+                    effort: None,
+                    device_id: Some("device-1".to_string()),
+                    provider: Some("codex".to_string()),
+                },
+                vec![ProviderImage {
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo=".to_string(),
+                }],
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a rejected first turn must surface as an error"
+        );
+
+        // Assert the PERSISTED projection, not just the in-memory map: this map
+        // is written to session.json, and checking memory alone would pass even
+        // if the removal never reached the snapshot that gets saved.
+        let relay = app.relay.read().await;
+        let persisted = crate::state::persistence::PersistedRelayState::from_relay(&relay);
+        assert!(
+            persisted.thread_forked_from.is_empty(),
+            "a fork whose first turn failed must not persist lineage: {:?}",
+            persisted.thread_forked_from
+        );
+    }
+
+    // A native fork deliberately stays idle when no fork prompt was typed, so
+    // the branch waits for the user instead of auto-running a canned
+    // instruction. Images are a prompt too: an image-only fork must still open
+    // a turn, otherwise the pasted screenshot is silently discarded.
+    #[tokio::test]
+    async fn image_only_fork_starts_a_turn_even_on_the_native_path() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, _claude) = build_recording_provider_app(cwd).await;
+        codex.native_fork.store(true, Ordering::Relaxed);
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let source = codex.thread_summary("codex-source", cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(source.id.clone(), source.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![source.clone()];
+        }
+
+        let image = ProviderImage {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+
+        app.fork_session_with_images(
+            ForkSessionInput {
+                source_thread_id: source.id.clone(),
+                up_to_item_id: None,
+                cwd: Some(cwd.to_string()),
+                initial_prompt: None,
+                model: Some("codex-model".to_string()),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            },
+            vec![image.clone()],
+        )
+        .await
+        .expect("an image-only fork should still start a turn");
+
+        assert_eq!(
+            *codex.turn_images.lock().await,
+            vec![vec![image]],
+            "an image-only fork must open a turn carrying the image"
+        );
+        assert_eq!(
+            *codex.turn_texts.lock().await,
+            vec![""],
+            "no fork prompt was typed, so no text should be invented"
+        );
+    }
+
+    // A fork with neither prompt nor images keeps the existing behaviour: the
+    // native branch stays idle and waits for the user.
+    #[tokio::test]
+    async fn a_native_fork_without_prompt_or_images_stays_idle() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, _claude) = build_recording_provider_app(cwd).await;
+        codex.native_fork.store(true, Ordering::Relaxed);
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let source = codex.thread_summary("codex-source", cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(source.id.clone(), source.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![source.clone()];
+        }
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id: source.id.clone(),
+            up_to_item_id: None,
+            cwd: Some(cwd.to_string()),
+            initial_prompt: None,
+            model: Some("codex-model".to_string()),
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: Some("codex".to_string()),
+        })
+        .await
+        .expect("fork without a prompt should succeed");
+
+        assert!(
+            codex.turn_images.lock().await.is_empty(),
+            "a native fork with nothing to send must not open a turn"
         );
     }
 

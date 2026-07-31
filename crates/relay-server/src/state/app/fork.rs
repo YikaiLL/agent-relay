@@ -17,6 +17,18 @@ const MAX_TOOL_FIELD_CHARS: usize = 700;
 
 impl AppState {
     pub async fn fork_session(&self, input: ForkSessionInput) -> Result<SessionSnapshot, String> {
+        self.fork_session_with_images(input, Vec::new()).await
+    }
+
+    /// Fork carrying images pasted into the local fork dialog. Only the local
+    /// HTTP surface can supply these — the shared `ForkSessionInput` that the
+    /// broker forwards has no image field, so a remote fork always lands here
+    /// with an empty vec.
+    pub async fn fork_session_with_images(
+        &self,
+        input: ForkSessionInput,
+        images: Vec<ProviderImage>,
+    ) -> Result<SessionSnapshot, String> {
         let device_id = require_device_id(input.device_id)?;
         let source_thread_id = non_empty(Some(input.source_thread_id))
             .ok_or_else(|| "source_thread_id is required".to_string())?;
@@ -175,6 +187,7 @@ impl AppState {
                         &device_id,
                         &source_thread_id,
                         user_prompt,
+                        images,
                     )
                     .await;
             }
@@ -205,6 +218,7 @@ impl AppState {
             &effort,
             &device_id,
             replay_prompt,
+            images,
         )
         .await
     }
@@ -222,6 +236,7 @@ impl AppState {
         device_id: &str,
         source_thread_id: &str,
         user_prompt: Option<String>,
+        images: Vec<ProviderImage>,
     ) -> Result<SessionSnapshot, String> {
         let forked_thread_id = start_result.thread.id.clone();
         let thread_data = target_bridge.read_thread(&forked_thread_id).await?;
@@ -253,18 +268,23 @@ impl AppState {
         // A native fork already carries the source context, so with no fork
         // prompt the branch stays idle and waits for the user rather than
         // auto-running a canned instruction under the inherited approval policy.
-        let Some(text) = user_prompt else {
+        // Pasted images ARE a prompt though: an image-only fork must still open
+        // a turn, or the screenshot the user attached is silently discarded.
+        if user_prompt.is_none() && images.is_empty() {
             let _ = self.list_threads(20, Some(device_id.to_string())).await;
             return Ok(self.snapshot().await);
-        };
+        }
 
-        self.send_message_inner(SendMessageInput {
-            text,
-            model: Some(model.to_string()),
-            effort: Some(effort.to_string()),
-            device_id: Some(device_id.to_string()),
-            thread_id: forked_thread_id,
-        })
+        self.send_message_inner_with_images(
+            SendMessageInput {
+                text: user_prompt.unwrap_or_default(),
+                model: Some(model.to_string()),
+                effort: Some(effort.to_string()),
+                device_id: Some(device_id.to_string()),
+                thread_id: forked_thread_id,
+            },
+            &images,
+        )
         .await
     }
 
@@ -281,15 +301,16 @@ impl AppState {
         effort: &str,
         device_id: &str,
         replay_prompt: String,
+        images: Vec<ProviderImage>,
     ) -> Result<SessionSnapshot, String> {
+        // Thread creation cannot carry images — `start_thread` only takes text.
+        // So when the fork has attachments, withhold the prompt here and send
+        // the whole first turn (replay context + images) through the turn path
+        // instead, the same split `start_session_with_images` uses. Letting the
+        // provider consume the prompt at creation would strand the images.
+        let initial_prompt = images.is_empty().then_some(replay_prompt.as_str());
         let start_result = target_bridge
-            .start_thread(
-                cwd,
-                model,
-                approval_policy,
-                sandbox,
-                Some(replay_prompt.as_str()),
-            )
+            .start_thread(cwd, model, approval_policy, sandbox, initial_prompt)
             .await?;
         let consumed_initial_prompt = start_result.consumed_initial_prompt;
         let started_thread_id = start_result.thread.id.clone();
@@ -348,15 +369,29 @@ impl AppState {
         }
 
         if !consumed_initial_prompt {
-            return self
-                .send_message_inner(SendMessageInput {
-                    text: replay_prompt,
-                    model: Some(model.to_string()),
-                    effort: Some(effort.to_string()),
-                    device_id: Some(device_id.to_string()),
-                    thread_id: started_thread_id,
-                })
+            let sent = self
+                .send_message_inner_with_images(
+                    SendMessageInput {
+                        text: replay_prompt,
+                        model: Some(model.to_string()),
+                        effort: Some(effort.to_string()),
+                        device_id: Some(device_id.to_string()),
+                        thread_id: started_thread_id.clone(),
+                    },
+                    &images,
+                )
                 .await;
+            if sent.is_err() {
+                // Lineage was recorded above so the branch is linked the moment
+                // it appears, but the fork never actually started. Keeping the
+                // row would persist a link to a thread that carries none of the
+                // source's context — and for Claude the id is a
+                // `claude-pending-*` placeholder that is now never promoted, so
+                // the entry could never be cleaned up later either.
+                let mut relay = self.relay.write().await;
+                relay.clear_thread_forked_from(&started_thread_id);
+            }
+            return sent;
         }
 
         let _ = self.list_threads(20, Some(device_id.to_string())).await;

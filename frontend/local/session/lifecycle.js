@@ -275,7 +275,7 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  async function forkSession(forkDraft) {
+  async function forkSession(forkDraft, images = []) {
     const sourceThreadId = forkDraft?.sourceThreadId || "";
     if (!sourceThreadId) {
       return { ok: false, error: "Choose a session to fork." };
@@ -297,9 +297,12 @@ export function createLifecycleController(ctx) {
         // Settings the user did not explicitly choose go out as null so the
         // relay resolves them from the SOURCE thread. Sending the live
         // session's values here would silently re-permission the fork.
+        // `images` rides OUTSIDE forkFieldsToPayload on purpose: that builder is
+        // shared with the remote client, whose fork payload must stay image-free.
         body: JSON.stringify({
           ...forkFieldsToPayload({ ...forkDraft, sourceThreadId, cwd }),
           device_id: state.deviceId,
+          ...(images.length ? { images } : {}),
         }),
       });
       const payload = await response.json();

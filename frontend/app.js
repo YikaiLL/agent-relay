@@ -176,6 +176,7 @@ import {
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
 import { ForkSessionDialog } from "./shared/fork-session-dialog.js";
+import { forkCompletionEffect } from "./local/fork-submit-ownership.js";
 import {
   applyForkProviderChange,
   defaultForkFields,
@@ -301,6 +302,11 @@ const state = {
   newSessionSubmitInFlight: false,
   newSessionImageAttachments: [],
   nextNewSessionImageAttachmentId: 1,
+  forkImageAttachments: [],
+  nextForkImageAttachmentId: 1,
+  // Bumped on every fork-dialog opening so an in-flight submit can tell whether
+  // the dialog it started from is still the one on screen.
+  forkDialogGeneration: 0,
   sessionStream: null,
   streamConnected: false,
   transcriptEntryDetailCache: new Map(),
@@ -2118,6 +2124,90 @@ function clearNewSessionImageAttachments() {
   renderNewSessionImageAttachments();
 }
 
+// The fork dialog is rendered by React on every field change, so its prompt
+// textarea and attachment mount do not exist at module load and are replaced
+// as the user edits. Both handlers are therefore delegated from `document`,
+// and the chips are re-applied after each React render (see
+// renderForkSessionDialog) — React owns `hidden` on that div and would reset
+// it to true on the next keystroke otherwise.
+const FORK_DIALOG_ID = "local-fork-session-dialog";
+const FORK_PROMPT_INPUT_ID = `${FORK_DIALOG_ID}-start-prompt`;
+const FORK_PROMPT_ATTACHMENTS_ID = "fork-prompt-attachments";
+
+function renderForkImageAttachments() {
+  const mount = document.getElementById(FORK_PROMPT_ATTACHMENTS_ID);
+  if (!mount) return;
+  mount.replaceChildren();
+  mount.hidden = state.forkImageAttachments.length === 0;
+
+  for (const attachment of state.forkImageAttachments) {
+    const chip = document.createElement("span");
+    chip.className = "composer-attachment";
+
+    const name = document.createElement("span");
+    name.className = "composer-attachment-name";
+    name.textContent = `${attachment.file.name || "Pasted image"} · ${formatAttachmentBytes(attachment.file.size)}`;
+    chip.append(name);
+
+    const remove = document.createElement("button");
+    remove.className = "composer-attachment-remove";
+    remove.dataset.removeForkImageAttachment = attachment.id;
+    remove.disabled = Boolean(state.forkDialog?.pending);
+    remove.type = "button";
+    remove.title = "Remove image";
+    remove.setAttribute("aria-label", `Remove ${attachment.file.name || "pasted image"}`);
+    remove.textContent = "×";
+    chip.append(remove);
+
+    mount.append(chip);
+  }
+}
+
+document.addEventListener("paste", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element) || target.id !== FORK_PROMPT_INPUT_ID) return;
+  // Frozen while a submit is in flight, like the composer. Accepting a paste
+  // here would attach an image to a request that has already been sent, and it
+  // would be dropped when the fork completes and closes the dialog.
+  if (state.forkDialog?.pending) return;
+  const files = pastedImageFiles(event.clipboardData);
+  if (files.length === 0) return;
+  event.preventDefault();
+
+  const { accepted, errors } = validateImageAttachments(
+    state.forkImageAttachments,
+    files
+  );
+  for (const file of accepted) {
+    state.forkImageAttachments.push({
+      file,
+      id: `fork-image-${state.nextForkImageAttachmentId++}`,
+    });
+  }
+  for (const error of errors) {
+    logLine(`Fork image rejected: ${error}`);
+  }
+  if (accepted.length > 0) {
+    logLine(
+      `Attached ${accepted.length} pasted image${accepted.length === 1 ? "" : "s"} to the fork.`
+    );
+    renderForkImageAttachments();
+  }
+});
+
+document.addEventListener("click", (event) => {
+  const button =
+    event.target instanceof Element
+      ? event.target.closest("[data-remove-fork-image-attachment]")
+      : null;
+  if (!button || state.forkDialog?.pending) return;
+  state.forkImageAttachments = state.forkImageAttachments.filter(
+    (attachment) => attachment.id !== button.dataset.removeForkImageAttachment
+  );
+  renderForkImageAttachments();
+  document.getElementById(FORK_PROMPT_INPUT_ID)?.focus();
+});
+
 // Treat each opening as a fresh attachment draft. In particular, reopening
 // after dismissing the dialog or after a failed start cannot silently carry a
 // screenshot into an unrelated workspace/session. An in-flight start already
@@ -2960,7 +3050,8 @@ function renderForkSessionDialog() {
   const settings = providerSettings(provider);
   const selectedModel = fields.model || defaultModelForProvider(provider);
   const dialog = React.createElement(ForkSessionDialog, {
-    id: "local-fork-session-dialog",
+    id: FORK_DIALOG_ID,
+    initialPromptAttachmentsId: FORK_PROMPT_ATTACHMENTS_ID,
     sourceThread: dialogState.sourceThread,
     fields,
     pending: dialogState.pending,
@@ -2979,7 +3070,13 @@ function renderForkSessionDialog() {
   });
 
   flushSync(() => forkSessionRoot.render(dialog));
-  const element = document.getElementById("local-fork-session-dialog");
+  // After React, never before: the mount only exists once React has rendered
+  // it, and it is a brand-new empty div on every open. Re-running here also
+  // re-syncs each chip's disabled state when `pending` flips on submit.
+  // (React itself leaves the chips alone — it never sets children on that div,
+  // and `hidden` is a constant prop, so it is not rewritten between renders.)
+  renderForkImageAttachments();
+  const element = document.getElementById(FORK_DIALOG_ID);
   if (element && !element.open) {
     element.showModal();
   }
@@ -3034,6 +3131,12 @@ function openForkDialogForThread(threadId, upToItemId = "") {
     },
   };
   closeThreadContextMenu();
+  // Treat each opening as a fresh attachment draft. Reopening after a dismiss
+  // or a failed fork must not silently carry a screenshot into a fork of a
+  // DIFFERENT source thread. An in-flight fork captured its own slice already,
+  // and the generation bump stops it from acting on this new dialog.
+  state.forkImageAttachments = [];
+  state.forkDialogGeneration += 1;
   renderForkSessionDialog();
   // The source thread's catalog is usually not the active session's, so fetch
   // it before the user can submit a model that belongs to another provider.
@@ -3088,13 +3191,60 @@ async function submitForkDialog(submittedFields = null) {
   if (!dialogState.sourceThread?.id || dialogState.pending) {
     return;
   }
+  // Capture the attachments synchronously, like the composer does: the dialog
+  // can be reopened (which resets the draft) while this request is in flight.
+  const imageAttachments = state.forkImageAttachments.slice();
+  // The dialog stays cancelable while pending, so this request may outlive the
+  // opening that started it. Every completion below is gated on this token.
+  const generation = state.forkDialogGeneration;
   state.forkDialog = { ...dialogState, pending: true };
   renderForkSessionDialog();
-  const result = await forkSession({
-    ...(submittedFields || dialogState.fields),
-    sourceThreadId: dialogState.sourceThread.id,
+  let images = [];
+  try {
+    images = await Promise.all(
+      imageAttachments.map(async (attachment) => ({
+        data_url: await imageFileToDataUrl(attachment.file),
+      }))
+    );
+  } catch (error) {
+    if (
+      forkCompletionEffect({
+        capturedGeneration: generation,
+        currentGeneration: state.forkDialogGeneration,
+        ok: false,
+      }) === "showError"
+    ) {
+      state.forkDialog = {
+        ...state.forkDialog,
+        pending: false,
+        error: `Image attachment failed: ${error.message}`,
+      };
+      renderForkSessionDialog();
+    }
+    return;
+  }
+  const result = await forkSession(
+    {
+      ...(submittedFields || dialogState.fields),
+      sourceThreadId: dialogState.sourceThread.id,
+    },
+    images
+  );
+  const effect = forkCompletionEffect({
+    capturedGeneration: generation,
+    currentGeneration: state.forkDialogGeneration,
+    ok: Boolean(result?.ok),
   });
-  if (result?.ok) {
+  if (effect === "discard") {
+    // The user cancelled and reopened while this was in flight. The fork itself
+    // still happened (or failed) on the relay and was logged there; touching the
+    // dialog now would close or corrupt an unrelated one.
+    return;
+  }
+  if (effect === "close") {
+    // This opening is still the current one, so its draft is exactly what was
+    // sent — clear it and close.
+    state.forkImageAttachments = [];
     closeForkDialog();
     return;
   }

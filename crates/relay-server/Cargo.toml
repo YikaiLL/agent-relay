@@ -36,3 +36,5 @@ fs4 = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3"
+# `oneshot` for router-level tests (already in the lock via axum/tower-http).
+tower = { version = "0.5", features = ["util"] }

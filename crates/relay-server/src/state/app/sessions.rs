@@ -431,7 +431,7 @@ impl AppState {
         self.send_message_inner_with_images(input, &[]).await
     }
 
-    async fn send_message_inner_with_images(
+    pub(super) async fn send_message_inner_with_images(
         &self,
         input: SendMessageInput,
         images: &[ProviderImage],

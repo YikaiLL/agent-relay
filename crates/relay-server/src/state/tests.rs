@@ -699,6 +699,98 @@ fn promote_background_thread_migrates_last_activity_keeping_most_recent() {
         .contains_key("claude-pending-2"));
 }
 
+// Removing the lineage row is only half the job: the persistence task saves
+// exclusively in response to watch-channel notifications, so a silent in-memory
+// removal never reaches disk. The fork's own activation already notified and
+// (after the debounce) wrote the STALE row — and a first turn can fail slowly,
+// e.g. a 30s Claude worker timeout, long after that save. Without a notify here
+// the orphan simply comes back on the next restart.
+#[test]
+fn clearing_fork_lineage_notifies_so_the_removal_reaches_disk() {
+    let (change_tx, mut change_rx) = watch::channel(0_u64);
+    let mut relay = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    relay.set_thread_forked_from("fork-1", "source-1");
+    relay.notify();
+    // Model the persistence task having already saved that stale row.
+    let _ = change_rx.borrow_and_update();
+    assert!(!change_rx.has_changed().expect("channel stays open"));
+
+    relay.clear_thread_forked_from("fork-1");
+
+    assert!(
+        change_rx.has_changed().expect("channel stays open"),
+        "removing lineage must wake the persistence task, or the stale row survives a restart"
+    );
+    assert!(relay.thread_forked_from("fork-1").is_none());
+}
+
+// The flip side: clearing a row that was never there must not bump the
+// revision. A spurious notification wakes every connected client and schedules
+// a pointless save on a path that runs for ordinary non-fork sessions too.
+#[test]
+fn clearing_absent_fork_lineage_does_not_notify() {
+    let (change_tx, mut change_rx) = watch::channel(0_u64);
+    let mut relay = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    relay.notify();
+    let _ = change_rx.borrow_and_update();
+
+    relay.clear_thread_forked_from("never-forked");
+
+    assert!(
+        !change_rx.has_changed().expect("channel stays open"),
+        "a no-op removal must not notify"
+    );
+}
+
+// A Claude replay fork that carries pasted images has to withhold the prompt
+// from `start_thread` (that call cannot take image bytes), which puts Claude on
+// its deferred-start path: the fork is recorded against a synthetic
+// `claude-pending-…` id and only becomes a real session on the first turn.
+// `thread_forked_from` must therefore ride promotion like every other
+// thread-keyed map, or the branch loses its lineage and the pending key is
+// orphaned in a PERSISTED map — leaking across restarts forever.
+#[test]
+fn promote_background_thread_migrates_fork_lineage() {
+    let mut relay = test_state();
+    relay.set_thread_forked_from("claude-pending-3", "source-thread");
+    relay.promote_background_thread("claude-pending-3", "real-3");
+
+    assert_eq!(
+        relay.thread_forked_from("real-3"),
+        Some("source-thread".to_string()),
+        "the promoted thread must keep the source it was forked from"
+    );
+    assert!(
+        !relay.thread_forked_from.contains_key("claude-pending-3"),
+        "the pending lineage entry must not orphan in a persisted map"
+    );
+}
+
+// Promotion must not clobber lineage the real id already has: the event stream
+// can create the real-id thread first, and its own lineage is the honest one.
+#[test]
+fn promotion_keeps_existing_fork_lineage_on_the_real_thread() {
+    let mut relay = test_state();
+    relay.set_thread_forked_from("claude-pending-4", "pending-source");
+    relay.set_thread_forked_from("real-4", "real-source");
+    relay.promote_background_thread("claude-pending-4", "real-4");
+
+    assert_eq!(
+        relay.thread_forked_from("real-4"),
+        Some("real-source".to_string()),
+        "an existing real-id lineage wins over the pending one"
+    );
+    assert!(!relay.thread_forked_from.contains_key("claude-pending-4"));
+}
+
 #[test]
 fn promotion_records_lineage_and_rides_the_snapshot() {
     // The pending->real id transition is, from a client's point of view,
