@@ -27,21 +27,22 @@ test("ships a mark for each provider the relay can actually run", () => {
   assert.deepEqual(providersWithIcons().sort(), ["claude_code", "codex"]);
 });
 
-test("claude_code resolves to the Anthropic starburst in its brand colour", () => {
-  const svg = providerIconSvg("claude_code");
-  assert.match(svg, /^<svg /);
-  // Brand salmon, baked in: it reads on both the light and the dark theme, so it
-  // does not need to follow currentColor the way the OpenAI mark does.
-  assert.match(svg, /#D97757/);
-});
-
-test("codex resolves to the OpenAI mark that follows currentColor", () => {
-  const svg = providerIconSvg("codex");
-  assert.match(svg, /^<svg /);
-  // The OpenAI mark is monochrome black by design and would vanish on the dark
-  // theme, so it MUST inherit colour rather than hard-code it.
-  assert.match(svg, /fill="currentColor"/);
-  assert.doesNotMatch(svg, /#[0-9a-f]{6}/i);
+// No mark carries a baked colour. Claude's brand orange used to be, on the
+// theory that it "reads on both themes" — measured, it lands at 2.78:1 on the
+// light surface, under the 3:1 WCAG AA floor for non-text UI, because a fixed
+// colour cannot track a surface that inverts. Both marks now inherit
+// currentColor and CSS picks the value per provider per theme.
+test("every mark follows currentColor, with no colour baked in", () => {
+  for (const provider of providersWithIcons()) {
+    const svg = providerIconSvg(provider);
+    assert.match(svg, /^<svg /, `${provider} should be an svg`);
+    assert.match(svg, /fill="currentColor"/, `${provider} must inherit its colour`);
+    assert.doesNotMatch(
+      svg,
+      /#[0-9a-f]{3,8}\b/i,
+      `${provider} must not hard-code a colour — it cannot follow the theme`
+    );
+  }
 });
 
 test("a provider we ship no mark for resolves to null, never to another vendor's logo", () => {
@@ -64,13 +65,17 @@ test("the vendored svgs carry no <title> and no <script>", () => {
 
 // --- the transcript avatar --------------------------------------------------
 
-test("an agent message shows its provider's mark", () => {
-  const claude = renderAgent({ provider: "claude_code" });
-  assert.match(claude, /class="message-avatar"/);
-  assert.match(claude, /#D97757/, "the Claude starburst should be inlined");
-
-  const codex = renderAgent({ provider: "codex" });
-  assert.match(codex, /fill="currentColor"/, "the OpenAI mark should be inlined");
+test("an agent message inlines exactly the mark we ship for its provider", () => {
+  // Compared against the module's own output rather than a copied fragment, so
+  // this keeps holding when the vendored asset is regenerated.
+  for (const provider of providersWithIcons()) {
+    const markup = renderAgent({ provider });
+    assert.match(markup, /class="message-avatar"/);
+    assert.ok(
+      markup.includes(providerIconSvg(provider)),
+      `${provider}'s avatar should inline the shipped mark verbatim`
+    );
+  }
 });
 
 test("the avatar tags the provider so CSS can theme the mark", () => {
@@ -84,8 +89,13 @@ test("an agent message with an unknown or missing provider keeps the sparkle", (
   for (const options of [{ provider: "fake" }, { provider: "" }, {}, null]) {
     const markup = renderAgent(options);
     assert.match(markup, /class="message-avatar"/, "the avatar slot must still render");
-    assert.doesNotMatch(markup, /#D97757/);
     assert.doesNotMatch(markup, /data-provider="(claude_code|codex)"/);
+    for (const provider of providersWithIcons()) {
+      assert.ok(
+        !markup.includes(providerIconSvg(provider)),
+        `an unknown provider must not borrow ${provider}'s mark`
+      );
+    }
   }
 });
 
@@ -100,5 +110,5 @@ test("a pending agent message shows the provider mark too", () => {
     })
   );
   assert.match(markup, /class="message-avatar"/);
-  assert.match(markup, /#D97757/);
+  assert.ok(markup.includes(providerIconSvg("claude_code")));
 });

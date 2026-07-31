@@ -21,8 +21,8 @@ const ROOT = process.cwd();
 
 // provider id (as the relay reports it) -> icon file in the package
 const SOURCES = [
-  { provider: "claude_code", file: "claude-color.svg", note: "Anthropic starburst, brand #D97757" },
-  { provider: "codex", file: "openai.svg", note: "OpenAI knot, currentColor so themes can flip it" },
+  { provider: "claude_code", file: "claude-color.svg", note: "Anthropic starburst" },
+  { provider: "codex", file: "openai.svg", note: "OpenAI knot" },
 ];
 
 function packageDir() {
@@ -48,8 +48,21 @@ function tidy(svg, file) {
       // package's own layout opinion and not ours.
       .replace(/\s(?:width|height)="1em"/g, "")
       .replace(/\sstyle="[^"]*"/g, "")
+      // Every mark inherits its colour. A baked fill cannot track a surface that
+      // inverts between themes: Claude's brand orange shipped hard-coded and
+      // measured 2.78:1 on the light surface, under the 3:1 WCAG AA floor for
+      // non-text UI. CSS now picks the value per provider per theme, so the brand
+      // colour is still what renders on the dark surface it was chosen for.
+      .replace(/fill="#[0-9a-f]{3,8}"/gi, 'fill="currentColor"')
       .replace(/\s{2,}/g, " ")
   );
+}
+
+function assertInheritsColour(svg, file) {
+  if (/#[0-9a-f]{3,8}\b/i.test(svg)) {
+    throw new Error(`${file}: a colour survived the currentColor rewrite`);
+  }
+  return svg;
 }
 
 const dir = packageDir();
@@ -57,7 +70,7 @@ const version = require("@lobehub/icons-static-svg/package.json").version;
 const entries = [];
 for (const { provider, file, note } of SOURCES) {
   const svg = await fs.readFile(path.join(dir, "icons", file), "utf8");
-  entries.push({ provider, file, note, svg: tidy(svg, file) });
+  entries.push({ provider, file, note, svg: assertInheritsColour(tidy(svg, file), file) });
 }
 
 const body = `// GENERATED FILE — do not edit by hand.
@@ -70,6 +83,9 @@ const body = `// GENERATED FILE — do not edit by hand.
 // Keyed by the provider id the relay reports. A provider with no mark (\`fake\`,
 // or anything new) resolves to null and the caller falls back to its own glyph —
 // never to another vendor's logo.
+//
+// Every mark inherits currentColor; none carries a baked colour. CSS picks the
+// value per provider per theme — see --provider-*-mark in styles.css.
 ${entries
   .map(
     ({ provider, file, note }) =>

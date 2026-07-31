@@ -162,6 +162,15 @@
   --provider-codex-bg: rgba(84, 133, 196, 0.20);
   --provider-codex-border: color-mix(in srgb, #5485c4 24%, var(--border-subtle));
   --provider-codex-fill: color-mix(in srgb, #5485c4 18%, transparent);
+
+  /* Agent MARKS (transcript avatar, session tab) — distinct from the chip
+     colours above. Both vendored svgs inherit currentColor, so these tokens are
+     the whole colour story. Claude's brand orange is the dark-theme value: it
+     was chosen for a dark surface and measures 5.6:1 there. The light theme
+     darkens it (see below) because a fixed colour cannot track an inverting
+     surface — unmodified it lands at 2.78:1, under the 3:1 WCAG AA floor for
+     non-text UI. */
+  --provider-claude-mark: #D97757;
 }
 
 :root[data-theme="light"] {
@@ -184,6 +193,11 @@
     --text-2: #315260;
     --text-3: #4f6f79;
     --text-faint: #738a94;
+
+    /* Claude's mark, darkened for the same reason the accent above is: the brand
+       orange was picked for a dark surface and only reaches 2.78:1 on this one.
+       70% of the brand hue keeps it recognisably Claude at 5.1:1. */
+    --provider-claude-mark: color-mix(in srgb, #D97757 70%, #000);
 
     /* Accent — teal darkened for AA contrast on white; on-accent flips to near-white */
     --accent: #006291;
@@ -4895,11 +4909,35 @@ body.is-resizing-panel {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* Keeps titles aligned whether or not a session currently has an activity dot. */
-.session-tab-dot-placeholder {
+/* The tab's leading slot. ONE width for both states — an activity dot while the
+   session is live, the provider's mark while it is idle — so titles never shift
+   as turns start and finish. 14px is set by the mark; the 6px dot centres in it. */
+.session-tab-lead {
   flex: none;
-  width: 6px;
-  height: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+}
+
+.session-tab-provider {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  /* Muted so the mark identifies the tab without competing with the activity
+     dots beside it. Both marks inherit this; Claude overrides it below to stay
+     recognisable. */
+  color: var(--text-tertiary);
+}
+
+.session-tab-provider[data-provider="claude_code"] {
+  color: var(--provider-claude-mark);
+}
+
+.session-tab-provider svg {
+  width: 14px;
+  height: 14px;
 }
 
 .session-tab-pin,

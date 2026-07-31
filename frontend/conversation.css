@@ -402,12 +402,18 @@
   height: 18px;
 }
 
-/* Provider marks. The Claude starburst carries its own brand fill (#D97757, which
-   reads on both themes), so it just needs the accent tint switched off. The
-   OpenAI knot is monochrome and inherits currentColor — near-black on light,
-   near-white on dark, or it disappears into the background. */
+/* Provider marks. Both vendored svgs inherit currentColor, so these rules are the
+   whole colour story. Codex follows the body text (near-black on light,
+   near-white on dark). Claude uses its own token, which is the brand orange on
+   dark and a darkened brand hue on light — a fixed colour cannot track a surface
+   that inverts, and unmodified it measured 2.78:1 here, under the 3:1 WCAG AA
+   floor for non-text UI. */
 .chat-message-assistant .message-avatar[data-provider] {
   color: var(--text-primary);
+}
+
+.chat-message-assistant .message-avatar[data-provider="claude_code"] {
+  color: var(--provider-claude-mark);
 }
 .chat-message-assistant .message-card {
   padding: 0;

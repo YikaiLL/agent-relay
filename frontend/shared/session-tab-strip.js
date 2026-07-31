@@ -1,6 +1,7 @@
 import React from "react";
 
 import { selectThreadDot } from "./thread-dot.js";
+import { providerIconSvg } from "./provider-icons.js";
 
 const { useState } = React;
 const h = React.createElement;
@@ -58,6 +59,20 @@ function PinGlyph({ filled }) {
   );
 }
 
+// The idle slot's content. A provider we ship no mark for leaves it empty rather
+// than borrowing another vendor's logo, which would mislabel the session.
+function providerMark(provider) {
+  const icon = providerIconSvg(provider);
+  if (!icon) {
+    return null;
+  }
+  return h("span", {
+    className: "session-tab-provider",
+    "data-provider": provider,
+    dangerouslySetInnerHTML: { __html: icon },
+  });
+}
+
 function SessionTab({
   item,
   focused,
@@ -105,9 +120,18 @@ function SessionTab({
         onClick: () => onFocus?.(item.tabId),
         title: item.tooltip || item.title,
       },
-      dot
-        ? h("span", { className: dot.className, "aria-hidden": "true" })
-        : h("span", { className: "session-tab-dot-placeholder", "aria-hidden": "true" }),
+      // One fixed-width slot for both states, so titles line up whether or not a
+      // session has a dot — a slot that resized per state would make every title
+      // jump as turns start and finish. Status outranks identity inside it: the
+      // dot is transient and demands attention, the provider is static and can
+      // wait for the session to settle.
+      h(
+        "span",
+        { className: "session-tab-lead", "aria-hidden": "true" },
+        dot
+          ? h("span", { className: dot.className })
+          : providerMark(item.provider)
+      ),
       h("span", { className: "session-tab-title" }, item.title),
       dot ? h("span", { className: "sr-only" }, dot.label) : null
     ),
@@ -259,7 +283,7 @@ export function SessionTabStrip({
  * signal maps the sidebar is fed. Kept next to the component so a caller doesn't
  * have to know how a layout tree maps onto a tab label.
  *
- * `resolveThread(threadId)` returns `{ title, tooltip }` for a session. A tab
+ * `resolveThread(threadId)` returns `{ title, tooltip, provider }` for a session. A tab
  * holding a split shows the first session's title with a pane count, which is
  * enough until panes get their own affordance.
  */
@@ -283,6 +307,9 @@ export function buildSessionTabItems({
       pinned: Boolean(tab.pinned),
       title: `${resolved.title || "Session"}${paneSuffix}`,
       tooltip: resolved.tooltip || null,
+      // Which agent owns the tab. Shown in the leading slot while the session is
+      // idle, i.e. whenever the activity dot is not using it.
+      provider: resolved.provider || "",
       activity: threadActivity?.get?.(primaryId) || null,
       attentionKind: threadAttention?.get?.(primaryId) || null,
       reviewing: Boolean(threadReviewing?.has?.(primaryId)),

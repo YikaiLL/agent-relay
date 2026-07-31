@@ -3524,6 +3524,9 @@ function resolveTabThread(threadId) {
   return {
     title: thread.name || thread.preview || shortId(thread.id),
     tooltip: thread.cwd || thread.name || thread.id,
+    // Drives the tab's idle mark. Read off the THREAD, not the live session: a
+    // strip can hold tabs from several providers at once.
+    provider: thread.provider || "",
   };
 }
 
