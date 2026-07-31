@@ -1303,14 +1303,42 @@ input:focus, textarea:focus, select:focus {
   background: var(--border-faint);
 }
 
-.context-menu-heading {
-  margin: 2px 0;
-  padding: 2px 10px;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-strong);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+/* "Projects  <current> ›" — the row that opens the second-level Project flyout. */
+.context-menu-submenu-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.context-menu-submenu-trigger[aria-expanded="true"] {
+  background: var(--surface-3);
+}
+
+.context-menu-submenu-value {
+  margin-left: auto;
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   color: var(--text-tertiary);
+}
+
+/* The session IS in a project — read it as a value, not as placeholder text. */
+.context-menu-submenu-value.is-assigned {
+  color: var(--accent);
+}
+
+.context-menu-submenu-chevron {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+}
+
+/* Second level: same panel chrome, stacked above the menu it flies out of. */
+.context-menu-submenu {
+  z-index: 61;
 }
 
 .context-menu-project-button.is-current {

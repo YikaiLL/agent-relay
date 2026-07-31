@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildProjectMenuItems,
+  currentProjectLabel,
   pickNewProjectId,
   normalizeProjectName,
   projectsMenuReady,
@@ -27,20 +28,43 @@ test("buildProjectMenuItems: unassigned thread → assign options + create, no u
   );
 });
 
-test("buildProjectMenuItems: assigned thread → leading unassign + current marked", () => {
+test("buildProjectMenuItems: assigned thread → current project leads, unassign trails the list", () => {
   const items = buildProjectMenuItems({
     projects: [
       { id: "a", name: "Alpha" },
       { id: "b", name: "Beta" },
+      { id: "c", name: "Gamma" },
     ],
     currentProjectId: "b",
   });
-  assert.equal(items[0].kind, "unassign", "unassign is offered first when assigned");
-  const beta = items.find((i) => i.projectId === "b");
-  const alpha = items.find((i) => i.projectId === "a");
-  assert.equal(beta.isCurrent, true, "the current project is marked");
-  assert.equal(alpha.isCurrent, false);
-  assert.equal(items[items.length - 1].kind, "create");
+  assert.deepEqual(
+    items.map((i) => [i.kind, i.label, i.isCurrent ?? null]),
+    [
+      // The thread's own project sits at the top, checked — the submenu opens with
+      // "where am I" already visible, and moving elsewhere is one click below.
+      ["assign", "Beta", true],
+      ["assign", "Alpha", false],
+      ["assign", "Gamma", false],
+      ["unassign", "Remove from project", null],
+      ["create", "New project…", null],
+    ]
+  );
+});
+
+test("currentProjectLabel: the submenu trigger's value text", () => {
+  const projects = [
+    { id: "a", name: "Alpha" },
+    { id: "b", name: "" },
+  ];
+  assert.equal(currentProjectLabel({ projects, currentProjectId: "a" }), "Alpha");
+  assert.equal(currentProjectLabel({ projects, currentProjectId: "b" }), "b", "falls back to the id when unnamed");
+  assert.equal(currentProjectLabel({ projects, currentProjectId: null }), null, "unassigned → no value");
+  assert.equal(
+    currentProjectLabel({ projects, currentProjectId: "gone" }),
+    null,
+    "membership pointing at a project we no longer hold → no value (never invent a name)"
+  );
+  assert.equal(currentProjectLabel(), null, "missing state → no value");
 });
 
 test("buildProjectMenuItems: tolerates missing/empty inputs", () => {

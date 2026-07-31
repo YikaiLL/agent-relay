@@ -20,6 +20,12 @@ import { dumpProcessLogs, stopManagedProcess, waitForHealth } from "./e2e/harnes
 
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
 
+// Progress breadcrumbs on stderr. This script has ~12 phases behind 45s waits (and one
+// reopen loop that can retry 40×), so a silent run is indistinguishable from a hang —
+// these say which phase owns the stall.
+const startedAt = Date.now();
+const step = (message) => console.error(`[step +${((Date.now() - startedAt) / 1000).toFixed(1)}s] ${message}`);
+
 async function api(relayPort, method, apiPath, body) {
   const response = await fetch(`http://127.0.0.1:${relayPort}${apiPath}`, {
     method,
@@ -61,8 +67,15 @@ const projectNames = (page) =>
     [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim())
   );
 
-// Right-click a thread row (Sessions mode) and read its Project-section buttons.
+// Right-click a thread row (Sessions mode), open its second-level "Projects ›" flyout,
+// and read that flyout's buttons. Projects live one level down now: the menu itself only
+// carries the trigger row.
 async function openThreadMenu(page, tid) {
+  // Dismiss whatever a previous step left open first: the menu paints AT the cursor, so
+  // a stale one sits on top of the very row this right-click has to hit. Two presses
+  // because Escape peels one level at a time (flyout, then menu).
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
   await page.waitForFunction(
     (t) => {
       const count = document.querySelector("#threads-count")?.textContent || "";
@@ -73,27 +86,101 @@ async function openThreadMenu(page, tid) {
     { timeout: TIMEOUT_MS }
   );
   await page.locator(`#threads-list [data-thread-id="${tid}"]`).click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+  await page.waitForSelector("#thread-context-menu:not([hidden]) #thread-project-submenu-trigger", { timeout: TIMEOUT_MS });
+  await openThreadProjectSubmenu(page);
   await page.waitForFunction(() => {
-    const menu = document.querySelector("#thread-context-menu");
-    return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0;
+    const submenu = document.querySelector("#thread-project-submenu");
+    return submenu && !submenu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0;
   }, null, { timeout: TIMEOUT_MS });
   return page.evaluate(() => [...document.querySelectorAll("#thread-project-actions button")].map((b) => b.textContent.trim()));
 }
 
-const clickThreadProjectButton = (page, predicate) =>
-  page.evaluate((arg) => {
-    const btn = [...document.querySelectorAll("#thread-project-actions button")].find((b) => {
+// Reveal the second level with a REAL pointer hover, which is how a mouse user gets
+// there — a synthetic .click() would skip hit-testing and pass even if the row were
+// covered. The pointer parks on a neighbouring row first for two reasons: hover() that
+// lands where the pointer already sits fires no mouseenter (silent flake), and crossing
+// off the trigger must dismiss the flyout, so reopening proves that rule too.
+async function openThreadProjectSubmenu(page) {
+  await page.locator("#fork-thread-button").hover({ timeout: TIMEOUT_MS });
+  await page.locator("#thread-project-submenu-trigger").hover({ timeout: TIMEOUT_MS });
+  await page.waitForSelector("#thread-project-submenu:not([hidden])", { timeout: TIMEOUT_MS });
+}
+
+// The trigger row's own value text — the session's project as shown WITHOUT opening the
+// flyout ("None" when unassigned).
+const threadProjectTriggerValue = (page) =>
+  page.evaluate(() => document.querySelector("#thread-project-current-label")?.textContent?.trim() || null);
+
+// Right-click a thread row and read the FIRST level only — no flyout. This is the
+// "projects moved one level down" contract: the menu itself carries a single trigger row
+// naming the session's project, and zero Project buttons.
+async function readThreadMenuFirstLevel(page, tid) {
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+  await page.locator(`#threads-list [data-thread-id="${tid}"]`).click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+  await page.waitForSelector("#thread-context-menu:not([hidden]) #thread-project-submenu-trigger", { timeout: TIMEOUT_MS });
+  return page.evaluate(() => ({
+    triggerValue: document.querySelector("#thread-project-current-label")?.textContent?.trim() || null,
+    submenuHidden: !!document.querySelector("#thread-project-submenu")?.hidden,
+    // Rendered, not merely present: the rows are BUILT when the menu opens (so a
+    // Projects refresh can withdraw them) but live inside the hidden flyout, so what
+    // matters is that none of them are on screen at the first level.
+    visibleProjectButtons: [...document.querySelectorAll("#thread-project-actions button")].filter(
+      (b) => b.getClientRects().length > 0
+    ).length,
+    menuButtonLabels: [...document.querySelectorAll("#thread-context-menu .context-menu-button")].map((b) =>
+      b.textContent.trim()
+    ),
+  }));
+}
+
+// Geometry of both panels once the flyout is open — it must sit fully on screen and
+// beside (never on top of) the menu it flew out of.
+const threadMenuGeometry = (page) =>
+  page.evaluate(() => {
+    const menu = document.querySelector("#thread-context-menu").getBoundingClientRect();
+    const submenu = document.querySelector("#thread-project-submenu").getBoundingClientRect();
+    return {
+      insideViewport:
+        submenu.left >= 0
+        && submenu.top >= 0
+        && submenu.right <= window.innerWidth
+        && submenu.bottom <= window.innerHeight,
+      horizontallyClear: submenu.left >= menu.right || submenu.right <= menu.left,
+      menu: { left: menu.left, right: menu.right, top: menu.top, bottom: menu.bottom },
+      submenu: { left: submenu.left, right: submenu.right, top: submenu.top, bottom: submenu.bottom },
+    };
+  });
+
+// Pick a row in the open flyout with a REAL pointer click. Deliberately not a synthetic
+// element.click(): the flyout lives OUTSIDE #thread-context-menu, so a genuine click is
+// the only thing that exercises the document-level dismiss handler — which would
+// otherwise tear the menu down before the action ran.
+async function clickThreadProjectButton(page, predicate) {
+  const index = await page.evaluate((arg) => {
+    const buttons = [...document.querySelectorAll("#thread-project-actions button")];
+    return buttons.findIndex((b) => {
       const text = b.textContent.trim();
       return arg.exact ? text.replace(/^✓\s*/, "") === arg.exact : text.includes(arg.includes);
     });
-    btn?.click();
   }, predicate);
+  assert.ok(
+    index >= 0,
+    `flyout row ${JSON.stringify(predicate)} not found: ${JSON.stringify(
+      await page.evaluate(() => [...document.querySelectorAll("#thread-project-actions button")].map((b) => b.textContent.trim()))
+    )}`
+  );
+  await page.locator("#thread-project-actions button").nth(index).click({ timeout: TIMEOUT_MS });
+}
 
 // Reopen a thread menu until its Project buttons satisfy `match(labels)`.
 async function waitForThreadMenuState(page, tid, match) {
   for (let i = 0; i < 40; i += 1) {
     const labels = await openThreadMenu(page, tid);
     if (match(labels)) return labels;
+    // Escape peels one level per press: flyout, then the menu itself. Both must go, or
+    // the still-open menu covers the thread row the next right-click needs to hit.
+    await page.keyboard.press("Escape");
     await page.keyboard.press("Escape");
     await delay(200);
   }
@@ -134,6 +221,7 @@ async function main() {
   let context;
   let page;
   try {
+    step("1-3. start a fake session, create + assign a project (API)");
     // 1. Start a fake session so a thread exists; 2-3. create + assign a Project.
     const started = await api(relayPort, "POST", "/api/session/start", {
       cwd: workspace,
@@ -161,6 +249,8 @@ async function main() {
     assert.ok(fetched.projects_revision > 0, `projects_revision > 0: ${fetched.projects_revision}`);
     assert.equal(fetched.thread_project_id[threadId], projectId, "GET /api/projects membership");
 
+    step("4. load the UI");
+
     // 4. Load the UI (Sessions mode by default).
     ({ browser, context } = await launchBrowser({ contextOptions: { viewport: { width: 1400, height: 1000 } } }));
     page = await context.newPage();
@@ -178,6 +268,8 @@ async function main() {
     }));
     assert.ok(sessionsView.hasToggle, "the Sessions/Projects toggle buttons exist");
     assert.match(sessionsView.countText, /folder/, `Sessions mode shows folder grouping: ${sessionsView.countText}`);
+
+    step("5. Projects mode rows");
 
     // 5. Switch to Projects: the sidebar lists each project as a group header,
     //    with its sessions nested underneath.
@@ -200,6 +292,8 @@ async function main() {
       };
     }, "VerifyProj");
 
+    step("6. back to Sessions");
+
     // 6. Switch back to Sessions.
     await page.evaluate(() => document.querySelector("#threads-view-sessions").click());
     await delay(300);
@@ -207,6 +301,8 @@ async function main() {
       sessionsButtonActive: document.querySelector("#threads-view-sessions")?.classList.contains("is-active") || false,
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
     }));
+
+    step("7. passive membership propagation");
 
     // 7. Passive propagation: an API unassign (no browser action) flows through the
     // snapshot's projects_revision -> refetch -> re-render, dropping the project's
@@ -242,6 +338,8 @@ async function main() {
     const afterUnassignBadge = await verifyBadge(page);
     await api(relayPort, "POST", "/api/projects", { action: "assign", thread_id: threadId, project_id: projectId });
 
+    step("8. fail closed on a failed fetch");
+
     // 8. Fail closed: a failed Projects fetch shows an explicit error placeholder and
     // NO project rows — never a false empty/"unassigned" grouping.
     const failPage = await context.newPage();
@@ -266,6 +364,8 @@ async function main() {
       projectRows: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
     }));
     await failPage.close();
+
+    step("9. fail closed on a held refresh");
 
     // 9. Fail closed on refresh: a newer-revision fetch held in flight shows the
     // loading placeholder with NO rows, then the rows return once it resolves.
@@ -306,6 +406,8 @@ async function main() {
     );
     await gatePage.close();
 
+    step("10. CRUD UI flows");
+
     // 10. CRUD UI: toolbar create + thread-menu assign/unassign/new + project-menu
     // rename/delete — the real user flows.
     const crudPage = await context.newPage();
@@ -316,6 +418,10 @@ async function main() {
     await crudPage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
 
     let menuItems = [];
+    let assignedMenuItems = [];
+    let triggerValueBeforeAssign = null;
+    let triggerValueAssigned = null;
+    let triggerValueUnassigned = null;
     let assignConfirmed = null;
     let currentMarked = false;
     let unassignConfirmed = "unset";
@@ -323,7 +429,11 @@ async function main() {
     let renameConfirmed = false;
     let deleteConfirmed = false;
     let projectMenuClosedOnBump = false;
+    let firstLevel = null;
+    let geometry = null;
+    let keyboardNav = null;
     try {
+      step("10. crud flow: create UiCrudProj from the toolbar");
       // Create "UiCrudProj" from the Projects toolbar.
       await crudPage.evaluate(() => document.querySelector("#threads-view-projects").click());
       await crudPage.waitForFunction(() => { const b = document.querySelector("#projects-toolbar"); return b && !b.hidden; }, null, { timeout: TIMEOUT_MS });
@@ -340,16 +450,54 @@ async function main() {
 
       // Assign / unassign / new+assign via the THREAD context menu (Sessions mode).
       await crudPage.evaluate(() => document.querySelector("#threads-view-sessions").click());
+      step("10a. first level only (no flyout)");
+      // Level one on its own: Projects are NOT here, just the trigger row naming one.
+      firstLevel = await readThreadMenuFirstLevel(crudPage, threadId);
+      triggerValueBeforeAssign = firstLevel.triggerValue;
+      step("10b. hover-open the flyout and assign UiCrudProj");
       menuItems = await openThreadMenu(crudPage, threadId);
+      geometry = await threadMenuGeometry(crudPage);
       await clickThreadProjectButton(crudPage, { exact: "UiCrudProj" });
       assignConfirmed = await waitForMembership(relayPort, threadId, uiProjId);
-      await waitForThreadMenuState(crudPage, threadId, (labels) => labels.some((t) => t.startsWith("✓ UiCrudProj")));
+      assignedMenuItems = await waitForThreadMenuState(crudPage, threadId, (labels) =>
+        labels.some((t) => t.startsWith("✓ UiCrudProj"))
+      );
+      // The trigger row names the session's project without opening the flyout.
+      triggerValueAssigned = await threadProjectTriggerValue(crudPage);
       currentMarked = true;
 
+      step("10c. keyboard: ArrowRight into the flyout, Escape peels one level at a time");
+      // Escape #1 closes only the flyout and returns focus to the trigger; ArrowRight
+      // re-enters it and lands on the first row; Escape #1 again, #2 closes the menu.
+      await openThreadMenu(crudPage, threadId);
+      await crudPage.keyboard.press("Escape");
+      const afterFirstEscape = await crudPage.evaluate(() => ({
+        submenuHidden: !!document.querySelector("#thread-project-submenu")?.hidden,
+        menuStillOpen: !document.querySelector("#thread-context-menu")?.hidden,
+        focusOnTrigger: document.activeElement?.id === "thread-project-submenu-trigger",
+      }));
+      await crudPage.keyboard.press("ArrowRight");
+      const afterArrowRight = await crudPage.evaluate(() => ({
+        submenuOpen: !document.querySelector("#thread-project-submenu")?.hidden,
+        focusInsideSubmenu: !!document.activeElement?.closest("#thread-project-submenu"),
+      }));
+      await crudPage.keyboard.press("Escape");
+      await crudPage.keyboard.press("Escape");
+      const afterSecondEscape = await crudPage.evaluate(() => ({
+        menuHidden: !!document.querySelector("#thread-context-menu")?.hidden,
+        submenuHidden: !!document.querySelector("#thread-project-submenu")?.hidden,
+      }));
+      keyboardNav = { afterFirstEscape, afterArrowRight, afterSecondEscape };
+
+      step("10d. remove from project");
       await openThreadMenu(crudPage, threadId);
       await clickThreadProjectButton(crudPage, { includes: "Remove from project" });
       unassignConfirmed = await waitForMembership(relayPort, threadId, null);
+      // Back to no project: nothing is checked, and the trigger row says so.
+      await waitForThreadMenuState(crudPage, threadId, (labels) => !labels.some((t) => t.startsWith("✓")));
+      triggerValueUnassigned = await threadProjectTriggerValue(crudPage);
 
+      step("10e. new project from the flyout");
       await openThreadMenu(crudPage, threadId);
       nextPrompt = "UiMenuProj";
       await clickThreadProjectButton(crudPage, { includes: "New project" });
@@ -401,6 +549,8 @@ async function main() {
       await crudPage.close();
     }
 
+    step("11. thread-menu fail-closed");
+
     // 11. Thread-menu fail-closed (Sessions mode, GET fails): NO actionable Project
     // buttons, only a non-interactive "unavailable" note.
     const menuFailPage = await context.newPage();
@@ -415,17 +565,23 @@ async function main() {
     const menuFailTarget = menuFailPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
     await menuFailTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
     await menuFailTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+    await menuFailPage.waitForSelector("#thread-context-menu:not([hidden]) #thread-project-submenu-trigger", { timeout: TIMEOUT_MS });
+    await openThreadProjectSubmenu(menuFailPage);
     await menuFailPage.waitForFunction(() => {
-      const menu = document.querySelector("#thread-context-menu");
+      const submenu = document.querySelector("#thread-project-submenu");
       const note = document.querySelector("#thread-project-actions .context-menu-note");
-      return menu && !menu.hidden && !!note;
+      return submenu && !submenu.hidden && !!note;
     }, null, { timeout: TIMEOUT_MS });
     const menuFailClosed = await menuFailPage.evaluate(() => ({
       buttonCount: document.querySelectorAll("#thread-project-actions button").length,
       note: document.querySelector("#thread-project-actions .context-menu-note")?.textContent?.trim() || null,
+      // Must NOT read "None" — that would assert non-membership we can't vouch for.
+      triggerValue: document.querySelector("#thread-project-current-label")?.textContent?.trim() || null,
       sessionsActive: document.querySelector("#threads-view-sessions")?.classList.contains("is-active") || false,
     }));
     await menuFailPage.close();
+
+    step("12. open thread-menu goes stale");
 
     // 12. Open thread-menu goes stale: a held newer-revision refresh withdraws buttons.
     const staleMenuPage = await context.newPage();
@@ -441,8 +597,10 @@ async function main() {
     const staleTarget = staleMenuPage.locator(`#threads-list [data-thread-id="${threadId}"]`);
     await staleTarget.waitFor({ state: "visible", timeout: TIMEOUT_MS });
     await staleTarget.click({ button: "right", position: { x: 24, y: 16 }, timeout: TIMEOUT_MS });
+    await staleMenuPage.waitForSelector("#thread-context-menu:not([hidden]) #thread-project-submenu-trigger", { timeout: TIMEOUT_MS });
+    await openThreadProjectSubmenu(staleMenuPage);
     await staleMenuPage.waitForFunction(
-      () => { const menu = document.querySelector("#thread-context-menu"); return menu && !menu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0; },
+      () => { const submenu = document.querySelector("#thread-project-submenu"); return submenu && !submenu.hidden && document.querySelectorAll("#thread-project-actions button").length > 0; },
       null,
       { timeout: TIMEOUT_MS }
     );
@@ -465,7 +623,8 @@ async function main() {
     console.log(JSON.stringify({
       sessionsView, projectsView, backToSessions,
       unassignPropagated, afterUnassignBadge, failClosed, gatePending,
-      crud: { menuItems, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign, renameConfirmed, deleteConfirmed, projectMenuClosedOnBump },
+      crud: { menuItems, assignedMenuItems, triggerValueBeforeAssign, triggerValueAssigned, triggerValueUnassigned, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign, renameConfirmed, deleteConfirmed, projectMenuClosedOnBump },
+      submenu: { firstLevel, geometry, keyboardNav },
       menuFailClosed, staleMenu,
     }, null, 2));
 
@@ -489,6 +648,58 @@ async function main() {
     assert.ok(menuItems.some((t) => t.replace(/^✓\s*/, "") === "UiCrudProj"), `thread menu lists the toolbar-created project: ${JSON.stringify(menuItems)}`);
     assert.ok(assignConfirmed, "assigning via the thread menu recorded membership server-side");
     assert.ok(currentMarked, "the assigned project is marked current (✓) on reopen");
+    // Second-level menu contract: the session's own project leads the flyout, and the
+    // first-level row names it without opening anything.
+    assert.match(
+      assignedMenuItems[0] || "",
+      /^✓ UiCrudProj$/,
+      `the session's own project leads the flyout: ${JSON.stringify(assignedMenuItems)}`
+    );
+    assert.equal(triggerValueAssigned, "UiCrudProj", `the trigger row names the session's project: ${triggerValueAssigned}`);
+    assert.notEqual(triggerValueBeforeAssign, "UiCrudProj", "the trigger row didn't already claim the target project");
+    assert.equal(triggerValueUnassigned, "None", `after Remove, the trigger row reads None: ${triggerValueUnassigned}`);
+
+    // Projects live one level DOWN: the menu itself shows only the trigger row.
+    assert.equal(firstLevel.submenuHidden, true, "the flyout starts closed on a fresh right-click");
+    assert.equal(
+      firstLevel.visibleProjectButtons,
+      0,
+      `no Project rows are on screen at the first level: ${firstLevel.visibleProjectButtons}`
+    );
+    assert.equal(
+      firstLevel.menuButtonLabels.filter((label) => label.startsWith("Projects")).length,
+      1,
+      `exactly one Projects row at the first level: ${JSON.stringify(firstLevel.menuButtonLabels)}`
+    );
+    // That single row carries the session's project name (label + value concatenated).
+    assert.match(
+      firstLevel.menuButtonLabels.find((label) => label.startsWith("Projects")) || "",
+      new RegExp(`^Projects${firstLevel.triggerValue}$`),
+      `the Projects row names the current project: ${JSON.stringify(firstLevel)}`
+    );
+    assert.ok(
+      firstLevel.triggerValue && firstLevel.triggerValue !== "None",
+      `the seeded session shows its project at the first level: ${firstLevel.triggerValue}`
+    );
+
+    assert.equal(geometry.insideViewport, true, `the flyout stays on screen: ${JSON.stringify(geometry)}`);
+    assert.equal(geometry.horizontallyClear, true, `the flyout sits beside the menu, not over it: ${JSON.stringify(geometry)}`);
+
+    assert.deepEqual(
+      keyboardNav.afterFirstEscape,
+      { submenuHidden: true, menuStillOpen: true, focusOnTrigger: true },
+      `Escape peels the flyout only, handing focus back to the trigger: ${JSON.stringify(keyboardNav.afterFirstEscape)}`
+    );
+    assert.deepEqual(
+      keyboardNav.afterArrowRight,
+      { submenuOpen: true, focusInsideSubmenu: true },
+      `ArrowRight enters the flyout and focuses a row: ${JSON.stringify(keyboardNav.afterArrowRight)}`
+    );
+    assert.deepEqual(
+      keyboardNav.afterSecondEscape,
+      { menuHidden: true, submenuHidden: true },
+      `a second Escape closes the menu itself: ${JSON.stringify(keyboardNav.afterSecondEscape)}`
+    );
     assert.equal(unassignConfirmed, null, "removing via the thread menu cleared membership server-side");
     assert.ok(menuCreateAssign, "'New project…' both creates the project and assigns the session");
     assert.ok(renameConfirmed, "renaming via the project context menu updates the name server-side");
@@ -498,6 +709,11 @@ async function main() {
     assert.equal(menuFailClosed.sessionsActive, true, "thread-menu fail-closed probe stays in Sessions mode");
     assert.equal(menuFailClosed.buttonCount, 0, `no Project mutation buttons while the fetch is failing: ${menuFailClosed.buttonCount}`);
     assert.match(menuFailClosed.note || "", /Projects unavailable|Loading projects/, `a fail-closed note replaces the controls: ${menuFailClosed.note}`);
+    assert.match(
+      menuFailClosed.triggerValue || "",
+      /Unavailable|Loading/,
+      `the trigger row shows a status word, never "None", while the payload is untrustworthy: ${menuFailClosed.triggerValue}`
+    );
 
     assert.equal(staleMenu.buttonCount, 0, `an open thread menu withdraws its buttons on a pending refresh: ${staleMenu.buttonCount}`);
     assert.match(staleMenu.note || "", /Loading projects/, `the open thread menu falls closed to a loading note: ${staleMenu.note}`);
