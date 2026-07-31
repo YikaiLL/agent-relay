@@ -13,6 +13,7 @@ import {
   observeElementRect,
 } from "@tanstack/virtual-core";
 import { CHECK_SVG, COPY_SVG, FORK_SVG, SPARKLES_SVG } from "../svg.js";
+import { providerIconSvg } from "./provider-icons.js";
 import { computeForkableItemIds, isForkableEntry } from "./transcript-fork.js";
 import {
   buildFileDisplayPathMap,
@@ -238,21 +239,32 @@ function UserEntryImpl({ entry, isLatestUser = false, isJustPrepended = false })
 // tail entry gets a new reference and re-renders.
 const UserEntry = React.memo(UserEntryImpl);
 
-// `isForkable` is threaded in as a plain boolean rather than reading it off
-// `options` inside the component: options gets a fresh identity on every
+// The agent's mark. A provider we ship no logo for (`fake`, or anything new)
+// falls back to the generic sparkle — NEVER to another vendor's logo, which
+// would mislabel who wrote the message. `data-provider` is what lets CSS theme
+// the mark: the OpenAI knot is monochrome black and has to flip to white on the
+// dark theme.
+function messageAvatar(provider) {
+  const icon = providerIconSvg(provider);
+  return h("span", {
+    className: "message-avatar",
+    "aria-hidden": "true",
+    ...(icon ? { "data-provider": provider } : null),
+    dangerouslySetInnerHTML: { __html: icon || SPARKLES_SVG },
+  });
+}
+
+// `isForkable` and `provider` are threaded in as plain scalars rather than read
+// off `options` inside the component: options gets a fresh identity on every
 // transcript change, which would defeat React.memo for every agent message in
 // a long thread.
-function AgentEntryImpl({ entry, isJustPrepended = false, isForkable = false }) {
+function AgentEntryImpl({ entry, isJustPrepended = false, isForkable = false, provider = "" }) {
   return h(
     "article",
     transcriptEntryDomAttrs(entry, "chat-message chat-message-assistant", null, {
       justPrepended: isJustPrepended,
     }),
-    h("span", {
-      className: "message-avatar",
-      "aria-hidden": "true",
-      dangerouslySetInnerHTML: { __html: SPARKLES_SVG },
-    }),
+    messageAvatar(provider),
     h(
       "div",
       { className: "message-card" },
@@ -1812,7 +1824,7 @@ function DiffGroupEntry({ group, options = null }) {
 // keep the entry's slot/identity/role styling but render a loading indicator
 // instead of the clipped 24-character shell text or an "(empty)" body; the
 // authoritative body replaces it in place after hydration.
-function OmittedEntryImpl({ entry, isJustPrepended = false }) {
+function OmittedEntryImpl({ entry, isJustPrepended = false, provider = "" }) {
   const kind = entry?.kind || "agent_text";
   const className =
     kind === "user_text"
@@ -1828,13 +1840,7 @@ function OmittedEntryImpl({ entry, isJustPrepended = false }) {
       { "data-transcript-pending": "true", "aria-busy": "true" },
       { justPrepended: isJustPrepended }
     ),
-    kind === "agent_text"
-      ? h("span", {
-          className: "message-avatar",
-          "aria-hidden": "true",
-          dangerouslySetInnerHTML: { __html: SPARKLES_SVG },
-        })
-      : null,
+    kind === "agent_text" ? messageAvatar(provider) : null,
     h(
       "div",
       { className: "message-card" },
@@ -1859,8 +1865,12 @@ export function TranscriptEntry({
   // An omitted-content entry must never render its clipped shell or an
   // "(empty)" body — show the unified loading placeholder until hydration
   // delivers the authoritative content, regardless of role.
+  // Plain scalar, pulled out of `options` here so the memoized entries below
+  // never take `options` as a prop (see AgentEntryImpl).
+  const provider = options?.provider || "";
+
   if (entry?.content_state === "omitted") {
-    return h(OmittedEntry, { entry, isJustPrepended });
+    return h(OmittedEntry, { entry, isJustPrepended, provider });
   }
 
   const kind = entry.kind || "reasoning";
@@ -1873,6 +1883,7 @@ export function TranscriptEntry({
       entry,
       isJustPrepended,
       isForkable: isForkableEntry(entry, options),
+      provider,
     });
   }
   if (kind === "command") {

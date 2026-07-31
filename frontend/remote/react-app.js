@@ -2616,6 +2616,8 @@ function RemoteTranscriptPanel({
         // The per-message fork button is the ONLY fork entry that works on
         // iOS: thread-row contextmenu never fires for touch long-press.
         canFork: canForkInSession(session),
+        // Stamps each agent message with the mark of whoever wrote it.
+        provider: session?.provider || "",
         onEnsureFileChangeDetail,
         pendingAskUserQuestions,
         onSubmitAskUserAnswers: (requestId, answers) => {

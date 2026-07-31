@@ -121,6 +121,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.2"
   },
   "devDependencies": {
+    "@lobehub/icons-static-svg": "^1.94.0",
     "@noble/hashes": "^2.0.1",
     "@tanstack/query-core": "^5.100.6",
     "@tanstack/virtual-core": "^3.14.0",

@@ -1362,6 +1362,10 @@ export function createSessionRenderer({
           // thread's history into a NEW session, it never writes to the thread
           // you are looking at.
           canFork: canForkInSession(session),
+          // Stamps each agent message with the mark of whoever wrote it. Read off
+          // the session being VIEWED (a read-only projection carries its own
+          // provider), so a saved codex thread never renders under Claude's logo.
+          provider: session?.provider || "",
           onEnsureFileChangeDetail: (itemId) => {
             void state.controller?.ensureFileChangeDetail?.(itemId);
           },

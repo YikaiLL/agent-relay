@@ -401,6 +401,14 @@
   width: 18px;
   height: 18px;
 }
+
+/* Provider marks. The Claude starburst carries its own brand fill (#D97757, which
+   reads on both themes), so it just needs the accent tint switched off. The
+   OpenAI knot is monochrome and inherits currentColor — near-black on light,
+   near-white on dark, or it disappears into the background. */
+.chat-message-assistant .message-avatar[data-provider] {
+  color: var(--text-primary);
+}
 .chat-message-assistant .message-card {
   padding: 0;
   border-radius: 0;
