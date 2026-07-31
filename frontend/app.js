@@ -164,6 +164,10 @@ import {
   projectMenuActionAllowed,
 } from "./local/project-menu.js";
 import { installThreadListWheelProxy } from "./shared/thread-list-scroll.js";
+import {
+  positionContextMenuElement,
+  updateContextMenuContent,
+} from "./shared/context-menu-position.js";
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
 import { ForkSessionDialog } from "./shared/fork-session-dialog.js";
@@ -492,9 +496,14 @@ projectsStore.subscribe((projectsState) => {
   // Keep an OPEN context menu's Project section in sync regardless of view mode —
   // a settled refresh/failure must repopulate (fresh membership) or fall closed
   // (loading/error note) rather than leave stale assign/unassign controls exposed.
-  const openContextThreadId = readThreadListContextMenu(state.threadListStore).threadId;
-  if (openContextThreadId && threadContextMenu && !threadContextMenu.hidden) {
-    populateThreadProjectActions(openContextThreadId);
+  // Re-place while repopulating: the swap changes the menu's height (a one-line
+  // note ⇄ a full project list), and a `top` computed for the old height can put
+  // the new content below the fold.
+  const openContext = readThreadListContextMenu(state.threadListStore);
+  if (openContext.threadId && threadContextMenu && !threadContextMenu.hidden) {
+    updateContextMenuContent(threadContextMenu, openContext, () =>
+      populateThreadProjectActions(openContext.threadId)
+    );
   }
   // Fail closed: a projects transition (remote rename/delete, add, or a refresh/error)
   // can invalidate the right-clicked project, so drop any open project menu rather than
@@ -1495,11 +1504,10 @@ function openProjectContextMenu(projectId, name, clientX, clientY) {
   // Don't stack the two menus.
   closeThreadContextMenu({ rerender: false });
   projectContextTarget = { id: projectId, name: name || projectId };
+  // Unhide first so the menu can be measured, then place it: near the bottom of
+  // the sidebar it flips up instead of running off the viewport.
   projectContextMenu.hidden = false;
-  const left = Math.max(12, Math.min(clientX, window.innerWidth - 220));
-  const top = Math.max(12, Math.min(clientY, window.innerHeight - 96));
-  projectContextMenu.style.left = `${left}px`;
-  projectContextMenu.style.top = `${top}px`;
+  positionContextMenuElement(projectContextMenu, clientX, clientY);
 }
 
 function closeProjectContextMenu() {
@@ -2971,14 +2979,16 @@ function openThreadContextMenu(threadId, clientX, clientY) {
     ? "Running session cannot be deleted"
     : "Delete permanently";
   // Per-session Project assignment — rebuilt from the current Projects payload each
-  // open so the marked "current" project and the list stay fresh.
-  populateThreadProjectActions(threadId);
-
-  threadContextMenu.hidden = false;
-  const left = Math.max(12, Math.min(clientX, window.innerWidth - 220));
-  const top = Math.max(12, Math.min(clientY, window.innerHeight - 64));
-  threadContextMenu.style.left = `${left}px`;
-  threadContextMenu.style.top = `${top}px`;
+  // open so the marked "current" project and the list stay fresh. Populate and place
+  // go through the same entry point the projects-store subscriber uses, so an open
+  // and a mid-open refresh can't drift apart: the menu is measured AFTER its
+  // variable-height content lands, and a row near the bottom of a long list opens
+  // the menu upward instead of off the bottom edge.
+  updateContextMenuContent(
+    threadContextMenu,
+    { clientX, clientY },
+    () => populateThreadProjectActions(threadId)
+  );
 
   // Re-render the thread list so the `is-context-target` highlight lands via
   // React (driven by the store's context-menu target we just set). Opening the
