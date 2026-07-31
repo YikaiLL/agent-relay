@@ -153,6 +153,9 @@ test("createThreadListRows keys on the neutral project group key", () => {
   assert.equal(groupRow.normalizedCwd, "proj_a");
 });
 
+// @deprecated along with findLatestThread itself — see thread-groups.js. Its only
+// caller went away with the "Continue latest" button, so this test is now the sole
+// thing keeping the function alive. Delete both together at the next cleanup pass.
 test("findLatestThread respects preferred workspace when available", () => {
   const threads = [
     { id: "thread-a", cwd: "/tmp/a", updated_at: 20 },

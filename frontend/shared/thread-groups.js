@@ -146,6 +146,19 @@ function sortThreadGroups(groups) {
     });
 }
 
+/**
+ * Pick the most recent thread, preferring one in `preferredCwd`.
+ *
+ * @deprecated No application code calls this. Its only caller was
+ * `resumeLatestSession()`, which backed the sidebar's "Continue latest" button;
+ * both were removed when that button was retired. What remains is this function
+ * and the four assertions covering it in thread-groups.test.mjs.
+ *
+ * Kept deliberately for now rather than deleted, so the removal is a decision
+ * someone makes on purpose. If nothing has adopted it by the next cleanup pass,
+ * delete it together with its tests — a tested function with no callers reads
+ * like a supported API and invites new callers to a dead path.
+ */
 export function findLatestThread(threads, preferredCwd) {
   if (!threads?.length) {
     return null;
