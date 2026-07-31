@@ -399,7 +399,7 @@ function ChatHeader() {
               title: "Session details",
             },
             h(InfoIcon)
-          )
+          ),
         ),
         h("p", { className: "chat-subtitle", id: "workspace-subtitle" })
       )
@@ -427,6 +427,23 @@ function ChatHeader() {
           "aria-label": "Settings",
         },
         iconNode(SETTINGS_SVG)
+      ),
+      // Shown only when the title is naming a PROJECT (see header-labels.js): starting
+      // an agent into a project is the action that belongs to one. render-session.js
+      // owns the hidden flag and the project id. Lives in the header actions — beside
+      // the panel toggle — rather than inline with the title, so it reads as an action
+      // and lines up with the other header controls.
+      h(
+        "button",
+        {
+          className: "header-new-agent-button",
+          hidden: true,
+          id: "header-new-agent",
+          type: "button",
+          title: "Start an agent in this project",
+        },
+        iconNode(PLUS_SVG),
+        h("span", null, "New agent")
       ),
       h(
         "button",

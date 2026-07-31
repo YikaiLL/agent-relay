@@ -31,6 +31,7 @@ import {
   transcript,
   workspaceTitle,
   workspaceSubtitle,
+  headerNewAgentButton,
   workspaceSuggestionsList,
 } from "./dom.js";
 import React from "react";
@@ -338,12 +339,19 @@ export function createSessionRenderer({
     const threadListUi = readThreadListUi(state.threadListStore);
     state.currentApprovalId = approval?.request_id || null;
 
-    // Title/subtitle rules live in one tested place (header-labels.js): title = the
-    // thread you're viewing (never the workspace basename), subtitle drops "live" and
-    // keeps only the read-only warning. See that module for the rationale.
+    const projectsViewMode = readThreadListViewMode(state.threadListStore) === "projects";
+    const activeProjectId = readActiveProjectId(state.threadListStore);
+
+    // Title/subtitle rules live in one tested place (header-labels.js): the title
+    // names the CONTAINER (project in Projects mode, folder in Sessions mode) so it
+    // stops duplicating the session tab strip underneath. See that module for the
+    // rationale, including why the old "title = thread" rule was dropped.
     const threadLabel = session.active_thread_id
       ? activeThread?.name || activeThread?.preview || shortId(session.active_thread_id)
       : "";
+    const activeProject = activeProjectId
+      ? (state.projects || []).find((project) => project.id === activeProjectId) || null
+      : null;
     const headerLabels = selectHeaderLabels({
       hasWorkspace: Boolean(workspace),
       activeThreadId: session.active_thread_id,
@@ -351,15 +359,25 @@ export function createSessionRenderer({
       viewOnly: session.view_only,
       reviewInProgress: Boolean(state.viewOnlyThread?.review),
       threadLabel,
+      sidebarMode: projectsViewMode ? "projects" : "sessions",
+      projectId: activeProjectId,
+      projectName: activeProject?.name || "",
+      workspaceName: workspace ? workspaceBasename(workspace) : "",
+      workspacePath: workspace,
     });
     workspaceTitle.textContent = headerLabels.title;
+    workspaceTitle.title = headerLabels.titleTooltip;
     workspaceSubtitle.textContent = headerLabels.subtitle;
+    if (headerNewAgentButton) {
+      // The id rides on the element so the click handler in app.js doesn't have to
+      // re-derive which project the header is naming.
+      headerNewAgentButton.hidden = !headerLabels.newAgentProjectId;
+      headerNewAgentButton.dataset.projectId = headerLabels.newAgentProjectId || "";
+    }
 
     // Three-way main view: a live/read-only conversation always wins; otherwise, in
     // Projects mode with a selected project, the card overview replaces the console
     // home. `mainView` drives the CSS show/hide of the three main-area layouts.
-    const projectsViewMode = readThreadListViewMode(state.threadListStore) === "projects";
-    const activeProjectId = readActiveProjectId(state.threadListStore);
     // The main-area card overview is RETIRED FROM VIEW, not deleted. Sessions now live
     // nested under their project in the sidebar, so the cards would duplicate that list;
     // the component, its model and its pin/order prefs all stay because those prefs back

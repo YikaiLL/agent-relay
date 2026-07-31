@@ -31,6 +31,7 @@ import {
   forkSessionDialogRoot,
   forkThreadButton,
   goConsoleHomeButton,
+  headerNewAgentButton,
   launchStartSessionDialog,
   launchSettingsModal,
   loadDirectoryButton,
@@ -833,12 +834,11 @@ const renderer = createSessionRenderer({
       projectId,
     });
   },
-  // "New agent" from a project overview: open the start-session dialog and remember
-  // the project, so the session created by the next Start is auto-assigned to it.
-  startProjectAgent(projectId) {
-    state.pendingProjectAssignment = projectId || null;
-    document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
-  },
+  // "New agent": open the start-session dialog and remember the project, so the
+  // session created by the next Start is auto-assigned to it. Hoisted to module
+  // scope (below) because the chat header's own New agent button needs the same
+  // flow, and it is wired imperatively rather than through the renderer.
+  startProjectAgent,
 });
 
 // Wrap renderer.renderSession so every full render also reconciles the
@@ -1706,6 +1706,23 @@ function goConsoleHome() {
 }
 
 goConsoleHomeButton?.addEventListener("click", goConsoleHome);
+
+// Remember which project the next Start belongs to, then open the launcher. Shared
+// by the project overview's "New agent" and the chat header's.
+function startProjectAgent(projectId) {
+  state.pendingProjectAssignment = projectId || null;
+  document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+}
+
+// "New agent" in the header — the header only shows it while it is naming a
+// project (header-labels.js), and render-session stamps that project's id onto the
+// element, so this reuses the project overview's flow verbatim.
+headerNewAgentButton?.addEventListener("click", () => {
+  const projectId = headerNewAgentButton.dataset.projectId || "";
+  if (projectId) {
+    startProjectAgent(projectId);
+  }
+});
 
 threadsRefreshButton.addEventListener("click", () => {
   void loadThreads("manual refresh");

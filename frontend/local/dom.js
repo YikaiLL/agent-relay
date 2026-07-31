@@ -71,6 +71,7 @@ export const forkSessionDialogRoot = document.querySelector("#fork-session-dialo
 export const pairedDevicesList = document.querySelector("#paired-devices-list");
 export const chatShell = document.querySelector(".chat-shell");
 export const workspaceTitle = document.querySelector("#workspace-title");
+export const headerNewAgentButton = document.querySelector("#header-new-agent");
 export const workspaceSubtitle = document.querySelector("#workspace-subtitle");
 export const workspaceSuggestionsList = document.querySelector("#workspace-suggestions");
 export const localModelBadge = document.querySelector("#local-model-badge");
