@@ -402,9 +402,21 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
       // Back/Forward retraces a browse, so it reuses the preview slot exactly as
       // the clicks it is replaying did — otherwise walking back through a browse
       // deposits one permanent tab per step, which is the accumulation the
-      // preview tab exists to stop. Boot passes no flag: a reloaded or shared
-      // `?thread=` is a session asked for by name, and it must not be the first
-      // thing the next peek throws away.
+      // preview tab exists to stop.
+      //
+      // Boot passes no flag, and that means "route to it, changing nothing about
+      // a tab that already exists". Concretely:
+      //
+      //   * a link to a session you are NOT holding open  -> a new, KEPT tab.
+      //     You named it on purpose, so it must not be the first thing the next
+      //     peek throws away.
+      //   * a refresh on a session you were only peeking at -> STILL a peek.
+      //     Reload is not a gesture. Preview-ness is persisted state and has to
+      //     round-trip faithfully, or refreshing the page would quietly pin
+      //     whatever you happened to be looking at.
+      //
+      // Both fall out of one rule — `openThreadTab` only ever flags a NEW tab —
+      // which is why this passes no flag rather than choosing between them here.
       const opened = openThreadTab(workspaceFor(state, context), urlThreadId, {
         preview: action.preview === true,
       });

@@ -2588,6 +2588,10 @@ async function boot() {
 
   await loadSession("initial boot");
   await loadThreads("initial boot");
+  // No `preview` intent, unlike the popstate handler above. Boot means "route to
+  // this, changing nothing about a tab that already exists": a link to a session
+  // you are not holding open opens a kept tab, while a refresh on one you were
+  // only peeking at stays a peek — reload is not a gesture.
   await sessionViewController.restoreHistory(
     window.history.state,
     readThreadIdFromUrl()

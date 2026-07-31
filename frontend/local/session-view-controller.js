@@ -434,9 +434,12 @@ export function createSessionViewController({
     },
     /**
      * `preview: true` marks this as Back/Forward — the browser replaying peeks the
-     * user already made, so a reopened session reuses the preview slot. Boot and
-     * a shared `?thread=` pass nothing: that session was named on purpose and is
-     * kept.
+     * user already made, so a reopened session reuses the preview slot.
+     *
+     * Boot passes nothing, which means "route to it and leave an existing tab
+     * alone": a link to a session you are not holding open becomes a kept tab,
+     * while a refresh on one you were peeking at stays a peek. See the
+     * RESTORE_HISTORY case in session-view-state.js.
      */
     restoreHistory(entry, urlThreadId, { preview = undefined } = {}) {
       return commit(

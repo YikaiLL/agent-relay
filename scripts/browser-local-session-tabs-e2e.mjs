@@ -392,6 +392,27 @@ async function run() {
     );
     await waitForCoherent(page, "after peeking at a session");
 
+    // A refresh is not a gesture: it must neither keep the peek nor lose it.
+    // Preview-ness is persisted state, so it has to survive the round trip
+    // through IndexedDB and come back still replaceable — a reload that quietly
+    // pinned whatever you were looking at would grow the pile one refresh at a
+    // time. (A link to a session you are NOT holding open still opens a kept tab;
+    // that is the "launching straight onto a session's URL" case further down.)
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-tab", { timeout: TIMEOUT_MS });
+    await page.waitForFunction(
+      (id) => {
+        const tabs = [...document.querySelectorAll(".session-tab")];
+        return tabs.length === 1
+          && tabs[0].dataset.threadId === id
+          && tabs[0].dataset.preview === "true";
+      },
+      threadA,
+      { timeout: TIMEOUT_MS }
+    );
+    await waitForCoherent(page, "after refreshing on a peeked session");
+    await openThreadDrawer(page);
+
     // The whole point: the second peek REPLACES the first instead of stacking.
     await page.click(`button.conversation-item[data-thread-id="${threadB}"]`);
     await page.waitForFunction(

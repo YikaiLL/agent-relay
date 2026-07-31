@@ -499,3 +499,60 @@ test("stepping back onto a kept session leaves it kept", () => {
   assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["a", "b"]);
   assert.deepEqual(previewIds(state, SESSIONS_KEY), ["b"], "the kept session was not demoted");
 });
+
+// Reload is not a gesture. A session you were only peeking at stays a peek
+// across a refresh: preview-ness is persisted state and must round-trip
+// faithfully, or refreshing the page would quietly pin whatever you happened to
+// be looking at. (The other half — a link to a session you are NOT already
+// holding open — is covered by "history restore opens a kept tab": there is no
+// existing tab there, so the new one is kept.)
+test("boot does not re-flag a session that is already open", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: true });
+
+  // Reloading on ?thread=a, with a's preview tab restored from storage.
+  state = transition(state, {
+    type: "RESTORE_HISTORY",
+    entry: { version: 1, context: sessions() },
+    urlThreadId: "a",
+  });
+  assert.deepEqual(
+    previewIds(state, SESSIONS_KEY),
+    ["a"],
+    "a refresh neither keeps nor discards; it restores what was there"
+  );
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["a"]);
+
+  // ...and it is still the slot the next peek takes.
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["b"]);
+
+  // The same restore onto a KEPT session leaves it kept, symmetrically.
+  state = transition(state, { type: "OPEN_THREAD", threadId: "c", preview: false });
+  state = transition(state, {
+    type: "RESTORE_HISTORY",
+    entry: { version: 1, context: sessions() },
+    urlThreadId: "c",
+  });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["b"], "the kept session stayed kept");
+});
+
+// Closing a tab discards it, and that includes discarding the fact that it was
+// kept — the tab and its state go together. So stepping Back onto a session you
+// had kept and then closed reopens it the way any other back step does: as a
+// peek. Keeping it again is one double click away.
+test("back onto a kept-then-closed session reopens it as a peek", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: false });
+  state = transition(state, { type: "CLOSE_TAB", tabId: tabIdForThread("a") });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+
+  state = transition(state, {
+    type: "RESTORE_HISTORY",
+    entry: { version: 1, context: sessions() },
+    urlThreadId: "a",
+    preview: true,
+  });
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["a"]);
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["a"]);
+});

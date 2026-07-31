@@ -754,3 +754,33 @@ test("back through a browse peeks; boot restores a kept tab", async () => {
   assert.deepEqual(tabs.map((tab) => tab.preview), [true, false]);
   assert.deepEqual(threadIds(store.getState().workspaces[SESSIONS_KEY]), ["a", "c"]);
 });
+
+// The boot path that actually runs in a browser: workspaces arrive by HYDRATION
+// inside the transaction, not from an in-memory store, so a persisted preview tab
+// has to survive the round trip through storage and normalization before the
+// restore even sees it. The empty-store version of this test could not have shown
+// that.
+test("booting on a persisted preview tab restores it as a peek, not a keep", async () => {
+  const persistence = fakePersistence({
+    [SESSIONS_KEY]: openThreadTab(createTabWorkspace(), "a", { preview: true }),
+  });
+  const store = createSessionViewStore({
+    initialLocation: { context: sessions(), threadId: null },
+    persistence,
+  });
+  const controller = createSessionViewController({ store });
+
+  // Reload on ?thread=a — no intent, exactly what app.js's boot call does.
+  await controller.restoreHistory({ version: 1, context: sessions() }, "a");
+  const restored = store.getState().workspaces[SESSIONS_KEY];
+  assert.deepEqual(threadIds(restored), ["a"]);
+  assert.equal(
+    restored.tabs[0].preview,
+    true,
+    "a refresh is not a gesture: it must neither keep nor discard the peek"
+  );
+
+  // And it is still the slot the next peek takes.
+  await controller.openThread("b", { preview: true });
+  assert.deepEqual(threadIds(store.getState().workspaces[SESSIONS_KEY]), ["b"]);
+});
