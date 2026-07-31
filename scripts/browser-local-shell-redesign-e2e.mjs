@@ -58,14 +58,17 @@ async function run() {
     await page.waitForSelector(".local-frame", { timeout: TIMEOUT_MS });
     await page.waitForTimeout(500);
 
-    // --- Icon rail: logo + gear only ---
+    // --- Icon rail: mounted, but only SHOWN while the sidebar is collapsed ---
     // The rail's Projects folder was retired: it duplicated the sidebar's own
     // Sessions/Projects toggle, and the one job only it did — bringing a collapsed
     // nav panel back — belongs to #toggle-left-panel (asserted below).
+    // Its remaining two occupants (seal logo, gear) now live in the sidebar while
+    // it is open, so an expanded rail would render both of them twice.
     const rail = await page.evaluate(() => {
       const r = document.querySelector(".icon-rail");
       return {
         present: !!r,
+        visible: r ? getComputedStyle(r).display !== "none" : false,
         hasLogo: !!r?.querySelector(".icon-rail-logo"),
         hasHome: !!r?.querySelector("#icon-rail-home"),
         hasGear: !!r?.querySelector("#icon-rail-settings"),
@@ -75,9 +78,20 @@ async function run() {
     assert.ok(rail.present && rail.hasLogo && rail.hasGear, `icon rail: ${JSON.stringify(rail)}`);
     assert.equal(rail.hasHome, false, `the rail's Projects folder is retired: ${JSON.stringify(rail)}`);
     assert.equal(rail.buttons, 1, "icon rail is the gear only (no home, no bell)");
+    assert.equal(rail.visible, false, `an expanded sidebar hides the rail: ${JSON.stringify(rail)}`);
 
-    // --- Settings modal + tabs (desktop entry: rail gear) ---
-    await page.click("#icon-rail-settings");
+    // The brand and Settings the rail used to carry are on the open sidebar.
+    const expandedChrome = await page.evaluate(() => ({
+      brandLogo: !!document.querySelector(".sidebar-brand .sidebar-brand-logo"),
+      footerGear: !!document.querySelector("#sidebar-host-status #sidebar-settings"),
+    }));
+    assert.ok(
+      expandedChrome.brandLogo && expandedChrome.footerGear,
+      `expanded sidebar owns brand + Settings: ${JSON.stringify(expandedChrome)}`
+    );
+
+    // --- Settings modal + tabs (desktop entry: sidebar footer gear) ---
+    await page.click("#sidebar-settings");
     await page.waitForFunction(() => document.querySelector("#settings-modal")?.open, { timeout: TIMEOUT_MS });
     for (const tab of ["providers", "devices", "log", "appearance"]) {
       await page.click(`#settings-tab-${tab}`);
@@ -116,6 +130,22 @@ async function run() {
     // before the collapse lands.
     await page.click("#sidebar-top-toggle");
     await page.waitForFunction(() => document.body.classList.contains("sidebar-collapsed"), { timeout: TIMEOUT_MS });
+
+    // Collapsed, the rail is the ONLY brand and the only Settings entry left: the
+    // sidebar that holds the replacements is `visibility: hidden` in this exact
+    // state, so if the rail stayed hidden here the window would have neither.
+    const collapsedRail = await page.evaluate(() => {
+      const r = document.querySelector(".icon-rail");
+      return {
+        visible: r ? getComputedStyle(r).display !== "none" : false,
+        gearHittable: !!r?.querySelector("#icon-rail-settings")?.offsetParent,
+      };
+    });
+    assert.ok(
+      collapsedRail.visible && collapsedRail.gearHittable,
+      `a collapsed sidebar restores the rail: ${JSON.stringify(collapsedRail)}`
+    );
+
     await page.click("#toggle-left-panel");
     await page.waitForFunction(() => !document.body.classList.contains("sidebar-collapsed"), { timeout: TIMEOUT_MS });
 

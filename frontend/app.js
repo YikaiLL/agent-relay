@@ -1299,8 +1299,15 @@ function openSettingsModal(tab = "providers") {
   settingsModal?.showModal();
 }
 
+// Three gears, one modal, each owning a state the others cannot reach:
+//   #sidebar-settings      — sidebar footer; the desktop entry while expanded
+//   #icon-rail-settings    — icon rail; only rendered while the sidebar is collapsed
+//   #open-settings-header  — chat header; ≤960px, where neither of the above shows
+// Every one of them is optional (`?.`) because no single view mounts all three.
+document
+  .getElementById("sidebar-settings")
+  ?.addEventListener("click", () => openSettingsModal());
 iconRailSettingsButton?.addEventListener("click", () => openSettingsModal());
-// Mobile-only header gear (the rail is hidden ≤960px) opens the same Settings modal.
 document
   .getElementById("open-settings-header")
   ?.addEventListener("click", () => openSettingsModal());

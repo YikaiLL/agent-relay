@@ -1,15 +1,28 @@
 import assert from "node:assert/strict";
 
 // Devices/pairing now lives in the consolidated Settings modal's "Devices" tab
-// (#settings-modal), opened from the icon-rail gear (desktop) or the header gear
-// (mobile, where the rail is hidden). This helper opens Settings and activates the
-// Devices tab so the pairing controls (#start-pairing-button, #pairing-link-input, …)
-// are visible — same contract the callers relied on with the old #security-modal.
+// (#settings-modal). There are three gears and no view mounts all of them:
+//
+//   #sidebar-settings     sidebar footer — desktop, sidebar expanded
+//   #icon-rail-settings   icon rail      — desktop, sidebar collapsed
+//   #open-settings-header chat header    — ≤960px, where neither of the above shows
+//
+// Probing in that order (rather than assuming one) is what keeps this helper
+// working across every caller's viewport and collapse state. This helper opens
+// Settings and activates the Devices tab so the pairing controls
+// (#start-pairing-button, #pairing-link-input, …) are visible — same contract the
+// callers relied on with the old #security-modal.
+const SETTINGS_ENTRIES = ["#sidebar-settings", "#icon-rail-settings", "#open-settings-header"];
+
 async function ensureSettingsEntryClicked(page) {
-  const railVisible = await page
-    .$("#icon-rail-settings")
-    .then((el) => (el ? el.isVisible() : false));
-  await page.click(railVisible ? "#icon-rail-settings" : "#open-settings-header");
+  for (const selector of SETTINGS_ENTRIES) {
+    const visible = await page.$(selector).then((el) => (el ? el.isVisible() : false));
+    if (visible) {
+      await page.click(selector);
+      return;
+    }
+  }
+  assert.fail(`no visible Settings entry among ${SETTINGS_ENTRIES.join(", ")}`);
 }
 
 export async function openSecurityModal(page) {

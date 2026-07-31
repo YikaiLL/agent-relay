@@ -63,9 +63,21 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
         },
         h(ToggleLeftPanelIcon)
       ),
+      // The seal sits in the lockup, not in the icon rail. The rail is only up
+      // while the sidebar is collapsed, so leaving the brand there would mean the
+      // app has no mark at all in its normal, expanded state. Matches how the
+      // remote shell has always built this row. `alt` is empty because the
+      // wordmark beside it already names the app.
       h(
         "div",
         { className: "sidebar-brand" },
+        h("img", {
+          className: "sidebar-brand-logo",
+          src: "/static/sealwire_logo.png",
+          alt: "",
+          width: 24,
+          height: 24,
+        }),
         h("span", { className: "sidebar-brand-name" }, "Sealwire")
       )
     ),
@@ -105,11 +117,27 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
     h(ThreadContextMenu),
     h(ProjectContextMenu),
     h("div", { id: "fork-session-dialog-root" }),
+    // Footer: what the relay is doing on the left, the way into Settings on the
+    // right. The gear is the DESKTOP entry now that the icon rail only exists
+    // while the sidebar is collapsed. It is not the only one — this whole bar is
+    // `display: none` on local mobile, which is what #open-settings-header in the
+    // chat header covers. Wired imperatively in app.js by id, like the rail gear.
     h(
       "div",
       { className: "sidebar-bottom-bar sidebar-host-status", id: "sidebar-host-status" },
       h("span", { className: "sidebar-host-dot", id: "sidebar-host-dot", "aria-hidden": "true" }),
-      h("span", { className: "sidebar-host-label", id: "sidebar-host-label" }, "Local relay · Live")
+      h("span", { className: "sidebar-host-label", id: "sidebar-host-label" }, "Local relay · Live"),
+      h(
+        "button",
+        {
+          className: "sidebar-settings-button",
+          id: "sidebar-settings",
+          type: "button",
+          title: "Settings",
+          "aria-label": "Settings",
+        },
+        iconNode(SETTINGS_SVG)
+      )
     ),
     h("div", {
       className: "sidebar-resize",
