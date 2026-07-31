@@ -994,8 +994,13 @@ input:focus, textarea:focus, select:focus {
   transition: opacity 120ms ease;
 }
 
+/* :focus-within is scoped to the actions themselves, NOT the whole header. The
+   header also hosts the label and the +/- disclosure; scoping it to the header
+   meant clicking "fold" latched the pencil and trash on until focus moved away —
+   folding a group should not arm its destructive actions. The actions stay
+   focusable at opacity: 0, so tabbing into them still lights them up. */
 .thread-group-header-project:hover .thread-group-actions,
-.thread-group-header-project:focus-within .thread-group-actions {
+.thread-group-actions:focus-within {
   opacity: 1;
 }
 
