@@ -4940,15 +4940,40 @@ body.is-resizing-panel {
  * part is the mobile block at the bottom: there is no hover on a phone, so the
  * per-tab controls can't hide behind it. */
 .session-tab-strip {
+  /* Tabs are a fixed size: past a handful of sessions the strip overflows and is
+   * panned, rather than shrinking every title into an ellipsis. */
+  --session-tab-width: 200px;
+  --session-tab-width-pinned: 148px;
   display: flex;
   align-items: stretch;
   gap: 2px;
   padding: 4px 6px 0;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: thin;
+  /* No scrollbar: the strip is one line tall, a gutter would eat a third of it,
+   * and drag/wheel are the affordance (see shared/tab-strip-gesture.js). */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  /* Don't hand a horizontal overscroll to the browser's back-navigation. */
+  overscroll-behavior-x: contain;
+  /* Touch panning stays native; the pointer gestures are for mouse and pen. */
+  touch-action: pan-x;
+  /* A drag across tabs must pan, never select their titles. */
+  user-select: none;
+  -webkit-user-select: none;
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border-subtle);
+}
+.session-tab-strip::-webkit-scrollbar {
+  display: none;
+}
+/* Grabbing wins over every child's cursor while a drag is in flight, so the strip
+ * doesn't read as "clickable tab" mid-gesture. */
+.session-tab-strip.is-panning,
+.session-tab-strip.is-panning *,
+.session-tab-strip.is-reordering,
+.session-tab-strip.is-reordering * {
+  cursor: grabbing;
 }
 .session-tab-strip.is-empty {
   align-items: center;
@@ -4966,9 +4991,11 @@ body.is-resizing-panel {
   display: flex;
   align-items: center;
   gap: 2px;
-  flex: 0 1 auto;
+  /* Fixed, not flexible: a tab keeps its width whatever else is open, so a title
+   * never changes length under you as sessions come and go. */
+  flex: 0 0 var(--session-tab-width);
+  width: var(--session-tab-width);
   min-width: 0;
-  max-width: 220px;
   padding-left: 8px;
   padding-right: 4px;
   border: 1px solid transparent;
@@ -4989,8 +5016,11 @@ body.is-resizing-panel {
   border-color: var(--border-subtle);
   color: var(--text-primary);
 }
+/* Pinned tabs are the long-lived ones and there are usually several, so they get
+ * a narrower fixed width — the same trade Chrome makes. */
 .session-tab.is-pinned {
-  max-width: 150px;
+  flex-basis: var(--session-tab-width-pinned);
+  width: var(--session-tab-width-pinned);
 }
 /* Visually separate the pinned zone from the rest of the strip. */
 .session-tab.is-pinned + .session-tab:not(.is-pinned) {
@@ -5090,6 +5120,8 @@ body.is-resizing-panel {
   color: var(--accent);
 }
 
+/* The held-then-dragged tab. It stays in place (the strip doesn't reflow until
+ * the drop) and reads as lifted off the strip. */
 .session-tab.is-dragging {
   opacity: 0.5;
 }
@@ -5103,10 +5135,15 @@ body.is-resizing-panel {
   justify-content: center;
   flex: none;
   align-self: center;
+  /* Sticky so the control survives a scrolled strip — it is the only way to open
+   * a session on the surfaces that pass onNewTab. Opaque, or tabs would pan
+   * underneath it. */
+  position: sticky;
+  right: 0;
   width: 26px;
   height: 26px;
   padding: 0;
-  background: transparent;
+  background: var(--bg-surface);
   border: none;
   border-radius: 6px;
   color: var(--text-secondary);
@@ -5121,8 +5158,9 @@ body.is-resizing-panel {
 @media (max-width: 960px) {
   /* No hover on a phone: close is always reachable, and the pin only shows on the
    * focused tab (or when already pinned) so narrow tabs stay legible. */
-  .session-tab {
-    max-width: 168px;
+  .session-tab-strip {
+    --session-tab-width: 168px;
+    --session-tab-width-pinned: 124px;
   }
   .session-tab-close {
     opacity: 1;

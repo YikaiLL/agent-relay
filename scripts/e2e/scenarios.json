@@ -18,6 +18,7 @@
       "local-projects-toggle",
       "local-shell-redesign",
       "local-session-tabs",
+      "local-session-tab-scroll",
       "local-rail-toggle-align",
       "local-permission-modes"
     ],
@@ -40,6 +41,7 @@
       "local-projects-toggle",
       "local-shell-redesign",
       "local-session-tabs",
+      "local-session-tab-scroll",
       "local-rail-toggle-align",
       "local-delete",
       "local-permission-modes"
@@ -278,6 +280,20 @@
         "tab-pin",
         "tab-close",
         "tab-persistence"
+      ]
+    },
+    "local-session-tab-scroll": {
+      "script": "browser-local-session-tab-scroll-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "session-tabs",
+        "tab-fixed-width",
+        "tab-strip-overflow",
+        "tab-strip-wheel-pan",
+        "tab-strip-drag-pan",
+        "tab-hold-reorder"
       ]
     },
     "local-rail-toggle-align": {
