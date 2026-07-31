@@ -432,9 +432,15 @@ export function createSessionViewController({
         toThreadId,
       });
     },
-    restoreHistory(entry, urlThreadId) {
+    /**
+     * `preview: true` marks this as Back/Forward — the browser replaying peeks the
+     * user already made, so a reopened session reuses the preview slot. Boot and
+     * a shared `?thread=` pass nothing: that session was named on purpose and is
+     * kept.
+     */
+    restoreHistory(entry, urlThreadId, { preview = undefined } = {}) {
       return commit(
-        { type: "RESTORE_HISTORY", entry, urlThreadId },
+        { type: "RESTORE_HISTORY", entry, urlThreadId, preview },
         { history: "replace" }
       );
     },

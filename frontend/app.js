@@ -1961,7 +1961,12 @@ window.addEventListener("resize", () => {
 window.addEventListener("popstate", (event) => {
   void sessionViewController.restoreHistory(
     event.state,
-    readThreadIdFromUrl()
+    readThreadIdFromUrl(),
+    // Back/Forward retraces a browse: every peek pushed an entry, so replaying
+    // one must reuse the preview slot rather than deposit a permanent tab per
+    // step. Boot (below) deliberately does NOT pass this — a reloaded or shared
+    // `?thread=` names a session on purpose.
+    { preview: true }
   );
 });
 
@@ -2466,7 +2471,14 @@ transcript.addEventListener("click", (event) => {
       // Was a line-for-line copy of controller.viewThread. Routed through the one
       // implementation so every way of opening a session shares its behaviour —
       // including landing in the tab strip.
-      void viewThreadById(threadId);
+      //
+      // These buttons ("Open live conversation" on Home, "Continue" on the
+      // standby empty state) each name ONE session and you pressed it on
+      // purpose, so this is a KEEP — the same class of gesture as a double
+      // click, not a browse. Without the explicit `false` a session that was
+      // already peeked would stay in the disposable slot and be thrown away by
+      // the next sidebar click.
+      void viewThreadById(threadId, { preview: false });
     }
     return;
   }
@@ -3912,7 +3924,13 @@ function renderSessionTabs() {
       onFocus(tabId) {
         const item = items.find((entry) => entry.tabId === tabId);
         if (item?.threadId) {
-          void viewThreadById(item.threadId);
+          // No view transition, for the same reason a sidebar peek skips it: a
+          // running transition swallows the SECOND click of a double click, so
+          // animating tab focus would quietly break double-click-to-keep on the
+          // strip. Switching tabs wants a cut anyway — browser tabs don't
+          // cross-fade either. No `preview` flag: focusing a tab must leave it
+          // exactly as kept or as disposable as it already was.
+          void viewThreadById(item.threadId, { transition: false });
         }
       },
       onClose(tabId) {

@@ -399,7 +399,15 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
         });
       }
 
-      const opened = openThreadTab(workspaceFor(state, context), urlThreadId);
+      // Back/Forward retraces a browse, so it reuses the preview slot exactly as
+      // the clicks it is replaying did — otherwise walking back through a browse
+      // deposits one permanent tab per step, which is the accumulation the
+      // preview tab exists to stop. Boot passes no flag: a reloaded or shared
+      // `?thread=` is a session asked for by name, and it must not be the first
+      // thing the next peek throws away.
+      const opened = openThreadTab(workspaceFor(state, context), urlThreadId, {
+        preview: action.preview === true,
+      });
       return createSessionViewState({
         location: { context, threadId: urlThreadId },
         workspaces: withWorkspace(state, context, opened).workspaces,

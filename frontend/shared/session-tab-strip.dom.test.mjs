@@ -717,7 +717,14 @@ test("a preview tab is marked, and only that tab", () => {
   view.cleanup();
 });
 
-test("double-clicking a tab keeps it, without a second focus round trip", () => {
+// The browser's REAL sequence is click, click, dblclick — a double click always
+// delivers its two clicks first. Emitting a single click here would be a friendly
+// fiction that hides what the strip's own callbacks actually see (two focuses),
+// and it is exactly the fiction that let the transition bug through: whether
+// those clicks arrive at all is decided outside jsdom, by whether focusing a tab
+// starts a view transition. The browser half of this contract lives in
+// scripts/browser-local-session-tabs-e2e.mjs; this half proves the wiring.
+test("double-clicking a tab keeps it, after the focuses its clicks already made", () => {
   const focused = [];
   const promoted = [];
   const view = mount({
@@ -729,12 +736,17 @@ test("double-clicking a tab keeps it, without a second focus round trip", () => 
 
   const main = tabEl(view.host, "tab-b").querySelector(".session-tab-main");
   click(main);
+  click(main);
   act(() => {
     main.dispatchEvent(new dom.window.MouseEvent("dblclick", { bubbles: true, cancelable: true }));
   });
 
   assert.deepEqual(promoted, ["tab-b"]);
-  assert.deepEqual(focused, ["tab-b"], "the keep gesture is not also a navigation");
+  assert.deepEqual(
+    focused,
+    ["tab-b", "tab-b"],
+    "both clicks focus; focusing the same tab twice is idempotent, so this is harmless"
+  );
 
   view.cleanup();
 });

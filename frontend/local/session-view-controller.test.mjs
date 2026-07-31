@@ -730,3 +730,27 @@ test("promotion targets the tab's own context, not whatever is selected now", as
 
   assert.equal(store.getState().workspaces.p1.tabs[0].preview, false);
 });
+
+test("back through a browse peeks; boot restores a kept tab", async () => {
+  const store = createSessionViewStore({
+    initialLocation: { context: sessions(), threadId: null },
+  });
+  const controller = createSessionViewController({ store });
+
+  await controller.openThread("a", { preview: true });
+  await controller.openThread("b", { preview: true });
+
+  // Back/Forward — the browser replaying peeks the user already made.
+  await controller.restoreHistory({ version: 1, context: sessions() }, "a", { preview: true });
+  assert.deepEqual(
+    threadIds(store.getState().workspaces[SESSIONS_KEY]),
+    ["a"],
+    "back reuses the preview slot instead of stacking"
+  );
+
+  // Boot / a shared link — a session named on purpose, so it is kept.
+  await controller.restoreHistory({ version: 1, context: sessions() }, "c");
+  const tabs = store.getState().workspaces[SESSIONS_KEY].tabs;
+  assert.deepEqual(tabs.map((tab) => tab.preview), [true, false]);
+  assert.deepEqual(threadIds(store.getState().workspaces[SESSIONS_KEY]), ["a", "c"]);
+});

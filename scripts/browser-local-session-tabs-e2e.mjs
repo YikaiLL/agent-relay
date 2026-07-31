@@ -404,6 +404,34 @@ async function run() {
     );
     await waitForCoherent(page, "after peeking at a second session");
 
+    // Back/Forward retraces a browse, so it must reuse the preview slot too.
+    // Every peek pushes a history entry; if replaying one deposited a permanent
+    // tab, walking back through a browse would rebuild the pile the preview tab
+    // exists to prevent.
+    await page.goBack({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      (id) => {
+        const tabs = [...document.querySelectorAll(".session-tab")];
+        return tabs.length === 1
+          && tabs[0].dataset.threadId === id
+          && tabs[0].dataset.preview === "true";
+      },
+      threadA,
+      { timeout: TIMEOUT_MS }
+    );
+    await waitForCoherent(page, "after stepping back through a browse");
+
+    await page.goForward({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(
+      (id) => {
+        const tabs = [...document.querySelectorAll(".session-tab")];
+        return tabs.length === 1 && tabs[0].dataset.threadId === id;
+      },
+      threadB,
+      { timeout: TIMEOUT_MS }
+    );
+    await waitForCoherent(page, "after stepping forward again");
+
     // A double click keeps it, so the next peek can no longer take its slot.
     //
     // This assertion is also the regression guard for a real trap: while a root
@@ -433,6 +461,30 @@ async function run() {
       "only the freshly peeked session stays replaceable"
     );
     await waitForCoherent(page, "after keeping one session and peeking another");
+
+    // The SAME keep gesture on the tab itself. This is the other end of the
+    // journey — you peeked from the sidebar, you stayed, now you keep it from the
+    // strip — and it walks into exactly the same trap: if focusing a tab starts a
+    // root view transition, the second click of this double click never reaches
+    // the page and the gesture silently degrades into a plain focus. Tab focus is
+    // therefore transition-free (app.js), and this is the guard.
+    await page.dblclick(`.session-tab[data-thread-id="${threadA}"] .session-tab-main`);
+    await page.waitForFunction(
+      () => document.querySelectorAll(".session-tab[data-preview]").length === 0,
+      { timeout: TIMEOUT_MS }
+    );
+    const keptFromStrip = await tabState(page);
+    assert.deepEqual(
+      keptFromStrip.previewThreadIds,
+      [],
+      "double-clicking the tab keeps it, same as double-clicking the row"
+    );
+    assert.deepEqual(
+      [...keptFromStrip.threadIds].sort(),
+      [threadA, threadB].sort(),
+      "keeping a tab neither opens nor closes anything"
+    );
+    await waitForCoherent(page, "after keeping a session from the tab strip");
     await shoot(page, "06b-preview-tabs");
 
     // --- Sessions mode and Projects mode keep separate tab sets ---
@@ -777,6 +829,47 @@ async function run() {
     assert.ok(atHome.tabThreadIds.length > 0, "the strip still lists the open sessions at Home");
     await waitForCoherent(page, "at Home with an open session");
     await shoot(page, "10-home-no-focus");
+
+    // --- Home's explicit "Open live conversation" KEEPS the session ---
+    // It names one session and you pressed it on purpose — that is a keep, the
+    // same class of gesture as a double click. Merely routing to it would leave a
+    // session you deliberately opened sitting in the disposable slot, for the
+    // next sidebar click to throw away.
+    const liveThreadId = await page.evaluate(
+      () => document.querySelector("[data-open-thread-id]")?.dataset.openThreadId || null
+    );
+    assert.ok(liveThreadId, "Home offers an explicit way into the live conversation");
+
+    // Peek it first, so "keeps it" is something this test can actually observe.
+    await openThreadDrawer(page);
+    await page.click(`button.conversation-item[data-thread-id="${liveThreadId}"]`);
+    await page.waitForFunction(
+      (id) =>
+        [...document.querySelectorAll(".session-tab[data-preview]")].some(
+          (tab) => tab.dataset.threadId === id
+        ),
+      liveThreadId,
+      { timeout: TIMEOUT_MS }
+    );
+    await page.click("#go-console-home");
+    await page.waitForFunction(
+      () => !new URL(window.location.href).searchParams.get("thread"),
+      { timeout: TIMEOUT_MS }
+    );
+    await page.click(`[data-open-thread-id="${liveThreadId}"]`);
+    await page.waitForFunction(
+      (id) => new URL(window.location.href).searchParams.get("thread") === id,
+      liveThreadId,
+      { timeout: TIMEOUT_MS }
+    );
+    await page.waitForTimeout(400);
+    const afterExplicitOpen = await tabState(page);
+    assert.ok(
+      !afterExplicitOpen.previewThreadIds.includes(liveThreadId),
+      "an explicit Open live conversation keeps the session rather than leaving it disposable, got "
+        + JSON.stringify(afterExplicitOpen.previewThreadIds)
+    );
+    await waitForCoherent(page, "after opening the live conversation from Home");
 
     // --- Launching straight onto a deleted session's URL ---
     // The initial load adopts `?thread=` from the address bar without going through

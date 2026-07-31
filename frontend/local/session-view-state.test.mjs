@@ -456,3 +456,46 @@ test("history restore opens a kept tab", () => {
   });
   assert.deepEqual(previewIds(state, SESSIONS_KEY), []);
 });
+
+// Retracing your steps is still browsing. Back/Forward walks the peeks you just
+// made, so restoring one must reuse the preview slot exactly as the original
+// click did — otherwise walking back through a browse deposits one permanent tab
+// per step, which is the accumulation the preview tab exists to stop.
+test("stepping back through a browse reuses the preview slot", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: true });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["b"]);
+
+  // Back onto "a": its tab was replaced by "b", so this reopens it.
+  state = transition(state, {
+    type: "RESTORE_HISTORY",
+    entry: { version: 1, context: sessions() },
+    urlThreadId: "a",
+    preview: true,
+  });
+  assert.deepEqual(
+    workspaceThreadIds(state, SESSIONS_KEY),
+    ["a"],
+    "back replaced the peek instead of stacking on it"
+  );
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["a"]);
+  assert.equal(state.location.threadId, "a");
+});
+
+// The other half of the contract: a session you kept must survive being stepped
+// over, and stepping back onto it must not make it disposable again.
+test("stepping back onto a kept session leaves it kept", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: false });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+  state = transition(state, {
+    type: "RESTORE_HISTORY",
+    entry: { version: 1, context: sessions() },
+    urlThreadId: "a",
+    preview: true,
+  });
+
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["a", "b"]);
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["b"], "the kept session was not demoted");
+});
