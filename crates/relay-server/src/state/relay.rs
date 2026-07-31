@@ -1124,6 +1124,17 @@ impl RelayState {
                 .or_insert(pending_project);
             self.bump_projects_revision();
         }
+        // Same orphan class for fork lineage. A replay fork carrying pasted
+        // images must withhold the prompt from `start_thread` (it cannot take
+        // image bytes), which puts Claude on its deferred-start path — so the
+        // fork is recorded against the pending id and would otherwise lose its
+        // source here, leaving a stale key in this PERSISTED map. Conflict
+        // keeps the real id's own lineage.
+        if let Some(pending_source) = self.thread_forked_from.remove(pending_id) {
+            self.thread_forked_from
+                .entry(real_id.to_string())
+                .or_insert(pending_source);
+        }
         // Drop the stale pending row; the real row is upserted by the caller.
         self.threads.retain(|thread| thread.id != pending_id);
         for approval in self.pending_approvals.values_mut() {
@@ -2745,6 +2756,20 @@ impl RelayState {
 
     pub fn thread_forked_from(&self, thread_id: &str) -> Option<String> {
         self.thread_forked_from.get(thread_id).cloned()
+    }
+
+    /// Drop a lineage row for a fork that never started. The map is persisted,
+    /// so a row pointing at a thread that was created but never given its first
+    /// turn would otherwise outlive every restart.
+    ///
+    /// Notifies on a real removal: the persistence task only saves in response
+    /// to a watch-channel change, so a silent in-memory removal would never
+    /// reach disk and the stale row would return on the next restart. A no-op
+    /// removal stays silent rather than waking every client for nothing.
+    pub fn clear_thread_forked_from(&mut self, thread_id: &str) {
+        if self.thread_forked_from.remove(thread_id).is_some() {
+            self.notify();
+        }
     }
 
     pub fn remember_thread_settings(

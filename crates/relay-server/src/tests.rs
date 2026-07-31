@@ -34,6 +34,69 @@ fn cookie_headers() -> HeaderMap {
     headers
 }
 
+// Every route that accepts pasted images must lift axum's 2 MB default body
+// limit, or a single retina screenshot 413s before the handler (and its
+// friendly size errors) is ever reached. `/api/session/fork` shipped without
+// the layer its start/message siblings carry, which capped forking at roughly
+// 1.5 MB of image bytes — far under the 8 MB/image the validator advertises.
+#[tokio::test]
+async fn image_accepting_routes_accept_a_body_over_the_default_limit() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    for route in [
+        "/api/session/fork",
+        "/api/session/start",
+        "/api/session/message",
+    ] {
+        let project = tempfile::TempDir::new().expect("project tempdir");
+        let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+        let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+            project.path().display().to_string(),
+            change_tx.clone(),
+            crate::state::SecurityProfile::private(),
+        )));
+        let context = AppContext {
+            app: crate::state::AppState::from_parts(
+                relay,
+                std::collections::HashMap::new(),
+                change_tx,
+            ),
+            auth: test_auth(),
+            launch_id: None,
+            security_headers: SecurityHeadersConfig::default(),
+        };
+        let router = build_router(context, WebAssets::Embedded);
+
+        // Comfortably over axum's 2 MB default, comfortably under our 24 MB cap.
+        let body = format!(
+            r#"{{"source_thread_id":"t","cwd":"/tmp","device_id":"d","padding":"{}"}}"#,
+            "a".repeat(3 * 1024 * 1024)
+        );
+        // Bearer auth (not cookie) so the request clears CSRF and actually
+        // reaches the body extractor, which is what the limit guards.
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(route)
+                    .header(header::HOST, "127.0.0.1:8787")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{route} must raise the default body limit so a pasted screenshot fits"
+        );
+    }
+}
+
 #[test]
 fn security_headers_are_applied() {
     let mut headers = HeaderMap::new();
@@ -432,6 +495,48 @@ fn local_start_session_accepts_images_without_changing_the_shared_start_input() 
     assert_eq!(input.session.cwd.as_deref(), Some("/tmp/project"));
     assert!(input.session.initial_prompt.is_none());
     assert_eq!(input.images.len(), 1);
+}
+
+// The local fork endpoint wraps the SHARED ForkSessionInput rather than adding
+// an image field to it, so the broker's remote fork payload stays image-free.
+// This pins both halves: the wrapper parses images, and the flattened fork
+// fields still land on the shared struct.
+#[test]
+fn local_fork_accepts_images_without_changing_the_shared_fork_input() {
+    let input: LocalForkSessionInput = serde_json::from_value(serde_json::json!({
+        "source_thread_id": "thread-1",
+        "up_to_item_id": "item-4",
+        "cwd": "/tmp/project",
+        "initial_prompt": "continue here",
+        "model": "gpt-test",
+        "approval_policy": null,
+        "sandbox": null,
+        "effort": null,
+        "device_id": "device-1",
+        "provider": "codex",
+        "images": [{ "data_url": "data:image/png;base64,iVBORw0KGgo=" }]
+    }))
+    .expect("the local fork request should accept image attachments");
+
+    assert_eq!(input.fork.source_thread_id, "thread-1");
+    assert_eq!(input.fork.up_to_item_id.as_deref(), Some("item-4"));
+    assert_eq!(input.fork.initial_prompt.as_deref(), Some("continue here"));
+    assert_eq!(input.images.len(), 1);
+
+    // A remote fork sends no `images` key at all; it must still deserialize.
+    let remote: LocalForkSessionInput = serde_json::from_value(serde_json::json!({
+        "source_thread_id": "thread-1",
+        "cwd": "/tmp/project",
+        "initial_prompt": null,
+        "model": null,
+        "approval_policy": null,
+        "sandbox": null,
+        "effort": null,
+        "device_id": "device-1",
+        "provider": "codex"
+    }))
+    .expect("a fork request without images must still parse");
+    assert!(remote.images.is_empty());
 }
 
 #[test]

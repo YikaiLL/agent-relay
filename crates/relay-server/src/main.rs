@@ -141,6 +141,17 @@ struct LocalStartSessionInput {
     images: Vec<LocalImageInput>,
 }
 
+// Images ride the LOCAL fork wrapper only. The shared `ForkSessionInput` that
+// the broker forwards for a remote fork stays image-free, so a paired phone
+// cannot push image bytes through this endpoint.
+#[derive(Debug, Deserialize)]
+struct LocalForkSessionInput {
+    #[serde(flatten)]
+    fork: ForkSessionInput,
+    #[serde(default)]
+    images: Vec<LocalImageInput>,
+}
+
 #[derive(Debug, Deserialize)]
 struct LocalImageInput {
     data_url: String,
@@ -295,7 +306,10 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             "/api/session/start",
             post(start_session).layer(DefaultBodyLimit::max(MAX_LOCAL_MESSAGE_BODY_BYTES)),
         )
-        .route("/api/session/fork", post(fork_session))
+        .route(
+            "/api/session/fork",
+            post(fork_session).layer(DefaultBodyLimit::max(MAX_LOCAL_MESSAGE_BODY_BYTES)),
+        )
         .route("/api/session/resume", post(resume_session))
         .route("/api/session/settings", post(update_session_settings))
         .route("/api/session/heartbeat", post(session_heartbeat))
@@ -781,12 +795,13 @@ async fn fork_session(
     State(context): State<AppContext>,
     headers: HeaderMap,
     uri: Uri,
-    Json(input): Json<ForkSessionInput>,
+    Json(input): Json<LocalForkSessionInput>,
 ) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
+    let images = parse_local_message_images(input.images).map_err(bad_request)?;
     context
         .app
-        .fork_session(input)
+        .fork_session_with_images(input.fork, images)
         .await
         .map(|snapshot| Json(ApiEnvelope::ok(compact_local_snapshot(snapshot))))
         .map_err(|error| classify_session_error(error))

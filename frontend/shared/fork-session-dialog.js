@@ -54,6 +54,9 @@ export function ForkSessionDialog({
   approvalOptions = [],
   effortOptions = [],
   onRequestClose = null,
+  // Opt-in mount for pasted-image chips. Local passes an id; remote leaves it
+  // null because a paired device cannot send image bytes at all.
+  initialPromptAttachmentsId = null,
 }) {
   const sourceTitle = forkSourceLabel(sourceThread);
   const cwdId = `${id}-cwd`;
@@ -140,7 +143,12 @@ export function ForkSessionDialog({
         idPrefix: id,
         labels: {
           initialPrompt: "Fork Prompt",
-          initialPromptPlaceholder: "Optional task for the forked agent.",
+          // Only advertise pasting where it works. The mount id is the same
+          // signal the accessory uses, so the hint cannot drift from the
+          // surface that actually accepts a paste (remote has neither).
+          initialPromptPlaceholder: initialPromptAttachmentsId
+            ? "Optional task for the forked agent. Paste an image to attach it."
+            : "Optional task for the forked agent.",
         },
         model: {
           approvalOptions: withInheritOption(approvalOptions, inheritable.has("approvalPolicy")),
@@ -151,6 +159,14 @@ export function ForkSessionDialog({
           providerOptions,
         },
         onFieldChange,
+        initialPromptAccessory: initialPromptAttachmentsId
+          ? h("div", {
+              "aria-live": "polite",
+              className: "composer-attachments start-session-attachments",
+              hidden: true,
+              id: initialPromptAttachmentsId,
+            })
+          : null,
       }),
       error
         ? h(

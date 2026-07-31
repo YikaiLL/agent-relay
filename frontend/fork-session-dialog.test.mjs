@@ -180,3 +180,28 @@ test("a short source title is shown in full", () => {
   const html = renderDialog({ sourceThread: { id: "t", name: "My session" } });
   assert.match(html, /Source: My session/);
 });
+
+// The composer and New Session both accept pasted screenshots; the fork dialog
+// was the one prompt input left without a mount for them, so Ctrl/Cmd+V in
+// "Fork Prompt" silently did nothing. The mount stays opt-in (local passes the
+// id, remote does not) because remote cannot send image bytes at all.
+test("local can opt into a fork-prompt image attachment mount without adding it remotely", () => {
+  const localHtml = renderDialog({
+    initialPromptAttachmentsId: "fork-prompt-attachments",
+  });
+  assert.match(localHtml, /id="fork-prompt-attachments"/);
+  assert.match(localHtml, /Paste an image to attach it\./);
+
+  const remoteHtml = renderDialog({ id: "remote-fork-session-dialog" });
+  assert.doesNotMatch(remoteHtml, /fork-prompt-attachments/);
+  // Remote cannot send image bytes, so it must not advertise pasting.
+  assert.doesNotMatch(remoteHtml, /Paste an image to attach it\./);
+});
+
+// The paste handler and the chips are wired by id, so the textarea the user
+// types into must keep the id app.js delegates on. A silent rename here would
+// disable pasting with every test still green.
+test("the fork prompt textarea keeps the id the local paste handler delegates on", () => {
+  const html = renderDialog({ id: "local-fork-session-dialog" });
+  assert.match(html, /id="local-fork-session-dialog-start-prompt"/);
+});
