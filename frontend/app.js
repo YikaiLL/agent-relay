@@ -69,6 +69,9 @@ import {
   stopButton,
   threadContextMenu,
   threadProjectActions,
+  threadProjectSubmenu,
+  threadProjectSubmenuTrigger,
+  threadProjectCurrentLabel,
   projectsToolbar,
   projectsCreateButton,
   threadsCount,
@@ -158,6 +161,7 @@ import {
 } from "./local/project-actions.js";
 import {
   buildProjectMenuItems,
+  currentProjectLabel,
   pickNewProjectId,
   normalizeProjectName,
   projectsMenuReady,
@@ -501,9 +505,7 @@ projectsStore.subscribe((projectsState) => {
   // the new content below the fold.
   const openContext = readThreadListContextMenu(state.threadListStore);
   if (openContext.threadId && threadContextMenu && !threadContextMenu.hidden) {
-    updateContextMenuContent(threadContextMenu, openContext, () =>
-      populateThreadProjectActions(openContext.threadId)
-    );
+    refreshThreadContextMenuContent(openContext, openContext.threadId);
   }
   // Fail closed: a projects transition (remote rename/delete, add, or a refresh/error)
   // can invalidate the right-clicked project, so drop any open project menu rather than
@@ -1592,8 +1594,10 @@ async function runThreadProjectAction(threadId, item, builtSeq) {
   }
 }
 
-// Rebuild the context menu's per-session Project section for `threadId` from the
-// current Projects payload. Called each time the menu opens (openThreadContextMenu).
+// Rebuild the context menu's per-session Project controls for `threadId` from the
+// current Projects payload: the trigger row's "current project" value plus the
+// submenu's buttons. Called each time the menu opens (openThreadContextMenu) and
+// whenever the Projects payload transitions while it is open.
 function populateThreadProjectActions(threadId) {
   if (!threadProjectActions) {
     return;
@@ -1603,13 +1607,27 @@ function populateThreadProjectActions(threadId) {
   // mutation controls as authoritative unless we hold a current payload. During a
   // pending/failed/first-load fetch, show a non-interactive note instead of buttons
   // (which would falsely imply "no projects / not a member" or expose stale controls).
-  if (
-    !projectsMenuReady({
-      projectsLoaded: state.projectsLoaded,
-      projectsError: state.projectsError,
-      projectsLoading: state.projectsLoading,
-    })
-  ) {
+  const ready = projectsMenuReady({
+    projectsLoaded: state.projectsLoaded,
+    projectsError: state.projectsError,
+    projectsLoading: state.projectsLoading,
+  });
+  const currentProjectId = state.threadProjectId?.[threadId] || null;
+  // The trigger row answers "which project is this session in?" without opening the
+  // submenu. Same fail-closed rule: while the payload is pending/failed we show a
+  // status word, never "None" — "None" would assert non-membership we can't vouch for.
+  if (threadProjectCurrentLabel) {
+    const assignedLabel = ready
+      ? currentProjectLabel({ projects: state.projects || [], currentProjectId })
+      : null;
+    threadProjectCurrentLabel.textContent = ready
+      ? assignedLabel || "None"
+      : state.projectsError
+        ? "Unavailable"
+        : "Loading…";
+    threadProjectCurrentLabel.classList.toggle("is-assigned", Boolean(assignedLabel));
+  }
+  if (!ready) {
     const note = document.createElement("p");
     note.className = "context-menu-note";
     note.textContent = state.projectsError ? "Projects unavailable" : "Loading projects…";
@@ -1617,9 +1635,16 @@ function populateThreadProjectActions(threadId) {
     return;
   }
   const builtSeq = projectsStateSeq; // freshness token for this build
-  const currentProjectId = state.threadProjectId?.[threadId] || null;
   const items = buildProjectMenuItems({ projects: state.projects || [], currentProjectId });
   for (const item of items) {
+    // "Remove from project" trails the Project list and reads as a different class of
+    // action than picking one — rule it off so it isn't mistaken for another Project.
+    if (item.kind === "unassign") {
+      const separator = document.createElement("div");
+      separator.className = "context-menu-separator";
+      separator.setAttribute("role", "separator");
+      threadProjectActions.appendChild(separator);
+    }
     const button = document.createElement("button");
     button.type = "button";
     button.className = "context-menu-button context-menu-project-button";
@@ -1637,6 +1662,111 @@ function populateThreadProjectActions(threadId) {
     threadProjectActions.appendChild(button);
   }
 }
+
+// Populate + place the thread menu, then re-place an open Projects flyout. The flyout is
+// anchored to the MENU's box, and the menu's own placement depends on the height of the
+// content this call just rebuilt (a one-line "Loading projects…" note ⇄ a full list can
+// flip it above the click) — so the flyout has to be re-placed after that lands, not
+// from inside the populate callback where the menu hasn't moved yet.
+function refreshThreadContextMenuContent(anchor, threadId) {
+  const placement = updateContextMenuContent(threadContextMenu, anchor, () =>
+    populateThreadProjectActions(threadId)
+  );
+  repositionThreadProjectSubmenu();
+  return placement;
+}
+
+// Show + position the "Projects ›" submenu against the trigger row. Positioned in JS
+// (rather than as a CSS-nested flyout) because the parent menu is itself fixed-
+// positioned at the cursor and scrolls its own overflow.
+function openThreadProjectSubmenu() {
+  if (
+    !threadProjectSubmenu
+    || !threadProjectSubmenuTrigger
+    || !threadContextMenu
+    || threadContextMenu.hidden
+  ) {
+    return;
+  }
+  threadProjectSubmenu.hidden = false;
+  threadProjectSubmenuTrigger.setAttribute("aria-expanded", "true");
+  placeThreadProjectSubmenu();
+}
+
+// Clamp the submenu next to the parent menu: to its right when there is room, flipped
+// to its left when there isn't, and never hanging past a viewport edge.
+function placeThreadProjectSubmenu() {
+  const menuRect = threadContextMenu.getBoundingClientRect();
+  const triggerRect = threadProjectSubmenuTrigger.getBoundingClientRect();
+  const { width, height } = threadProjectSubmenu.getBoundingClientRect();
+  const gap = 4;
+  const margin = 8;
+  let left = menuRect.right + gap;
+  if (left + width > window.innerWidth - margin) {
+    left = menuRect.left - width - gap;
+  }
+  left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+  // Align the panel's top with its trigger row, then lift it just enough to fit.
+  const top = Math.max(margin, Math.min(triggerRect.top - 4, window.innerHeight - height - margin));
+  threadProjectSubmenu.style.left = `${left}px`;
+  threadProjectSubmenu.style.top = `${top}px`;
+}
+
+// Re-place the submenu only if it is currently open (no-op otherwise).
+function repositionThreadProjectSubmenu() {
+  if (
+    !threadProjectSubmenu
+    || threadProjectSubmenu.hidden
+    || !threadProjectSubmenuTrigger
+    || !threadContextMenu
+  ) {
+    return;
+  }
+  placeThreadProjectSubmenu();
+}
+
+function closeThreadProjectSubmenu() {
+  if (threadProjectSubmenu) {
+    threadProjectSubmenu.hidden = true;
+  }
+  threadProjectSubmenuTrigger?.setAttribute("aria-expanded", "false");
+}
+
+// Open-only, not a toggle: on a mouse the pointer's `mouseenter` has already opened the
+// flyout by the time the click lands, so toggling would make a deliberate click on
+// "Projects" close what the user was reaching for. Dismissal is Escape / hovering
+// another row / picking a Project. Tap (no hover) still opens it.
+threadProjectSubmenuTrigger?.addEventListener("click", () => {
+  openThreadProjectSubmenu();
+});
+
+// Hover opens the flyout, and hovering any OTHER row of the parent menu dismisses it —
+// the usual nested-menu feel, so the panel never shadows the session actions.
+threadProjectSubmenuTrigger?.addEventListener("mouseenter", () => {
+  openThreadProjectSubmenu();
+});
+
+// ArrowRight enters the flyout from the keyboard (Enter/Space already toggle it), and
+// lands on its first row so the list is navigable without a mouse.
+threadProjectSubmenuTrigger?.addEventListener("keydown", (event) => {
+  if (event.key !== "ArrowRight") {
+    return;
+  }
+  event.preventDefault();
+  openThreadProjectSubmenu();
+  threadProjectSubmenu?.querySelector("button")?.focus();
+});
+
+threadContextMenu?.addEventListener("mouseover", (event) => {
+  if (!threadProjectSubmenu || threadProjectSubmenu.hidden) {
+    return;
+  }
+  const row = event.target.closest(".context-menu-button");
+  if (!row || row === threadProjectSubmenuTrigger) {
+    return;
+  }
+  closeThreadProjectSubmenu();
+});
 
 closeSettingsModalButton?.addEventListener("click", () => {
   settingsModal?.close();
@@ -1767,7 +1897,9 @@ document.addEventListener("click", (event) => {
     return;
   }
 
-  if (event.target.closest("#thread-context-menu")) {
+  // The Projects flyout is a sibling of the menu, not a descendant — without it in this
+  // test, clicking a Project would close the menu before its handler ran.
+  if (event.target.closest("#thread-context-menu") || event.target.closest("#thread-project-submenu")) {
     return;
   }
 
@@ -1776,6 +1908,13 @@ document.addEventListener("click", (event) => {
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    // Peel one level at a time: an open Projects flyout first (back to the session
+    // actions), and only then the menu itself.
+    if (threadProjectSubmenu && !threadProjectSubmenu.hidden) {
+      closeThreadProjectSubmenu();
+      threadProjectSubmenuTrigger?.focus();
+      return;
+    }
     closeThreadContextMenu();
     closeProjectContextMenu();
   }
@@ -2984,11 +3123,11 @@ function openThreadContextMenu(threadId, clientX, clientY) {
   // and a mid-open refresh can't drift apart: the menu is measured AFTER its
   // variable-height content lands, and a row near the bottom of a long list opens
   // the menu upward instead of off the bottom edge.
-  updateContextMenuContent(
-    threadContextMenu,
-    { clientX, clientY },
-    () => populateThreadProjectActions(threadId)
-  );
+  // Every open starts at the first level: the flyout is opt-in, not left open from a
+  // previous right-click (and closing it first keeps it from being placed against the
+  // menu's pre-move box).
+  closeThreadProjectSubmenu();
+  refreshThreadContextMenuContent({ clientX, clientY }, threadId);
 
   // Re-render the thread list so the `is-context-target` highlight lands via
   // React (driven by the store's context-menu target we just set). Opening the
@@ -3013,6 +3152,7 @@ function closeThreadContextMenu({ rerender = true } = {}) {
   if (threadContextMenu) {
     threadContextMenu.hidden = true;
   }
+  closeThreadProjectSubmenu(); // the flyout lives outside the menu element — hide it too
   if (forkThreadButton) {
     forkThreadButton.disabled = false;
     forkThreadButton.textContent = "Fork session";

@@ -256,21 +256,47 @@ function ThreadDrawer() {
 
 function ThreadContextMenu() {
   return h(
-    "div",
-    { className: "context-menu", hidden: true, id: "thread-context-menu" },
-    h("button", { className: "context-menu-button", id: "fork-thread-button", type: "button" }, "Fork session"),
-    h("button", { className: "context-menu-button", id: "archive-thread-button", type: "button" }, "Archive session"),
-    h("button", {
-      className: "context-menu-button context-menu-button-danger",
-      id: "delete-thread-button",
-      type: "button",
-    }, "Delete permanently"),
-    // Per-session Project assignment. Populated imperatively in app.js when the menu
-    // opens (one button per Project + unassign + "New project…"), from state.projects
-    // and the thread's current membership.
-    h("div", { className: "context-menu-separator", role: "separator" }),
-    h("p", { className: "context-menu-heading" }, "Project"),
-    h("div", { className: "context-menu-projects", id: "thread-project-actions" })
+    React.Fragment,
+    null,
+    h(
+      "div",
+      { className: "context-menu", hidden: true, id: "thread-context-menu" },
+      h("button", { className: "context-menu-button", id: "fork-thread-button", type: "button" }, "Fork session"),
+      h("button", { className: "context-menu-button", id: "archive-thread-button", type: "button" }, "Archive session"),
+      h("button", {
+        className: "context-menu-button context-menu-button-danger",
+        id: "delete-thread-button",
+        type: "button",
+      }, "Delete permanently"),
+      // Per-session Project assignment is one row here — "Projects  <current> ›" — that
+      // opens the submenu below. Flat-listing every Project at this level buried the
+      // session actions once a few Projects existed.
+      h("div", { className: "context-menu-separator", role: "separator" }),
+      h(
+        "button",
+        {
+          className: "context-menu-button context-menu-submenu-trigger",
+          id: "thread-project-submenu-trigger",
+          type: "button",
+          "aria-haspopup": "true",
+          "aria-expanded": "false",
+          "aria-controls": "thread-project-submenu",
+        },
+        h("span", { className: "context-menu-submenu-title" }, "Projects"),
+        h("span", { className: "context-menu-submenu-value", id: "thread-project-current-label" }, "None"),
+        iconNode(CHEVRON_RIGHT_SVG, "context-menu-submenu-chevron")
+      )
+    ),
+    // Second level, a SIBLING of the menu (not a child): the menu scrolls its own
+    // overflow, and nesting the submenu inside would let that clip it. Positioned
+    // imperatively against the trigger in app.js, and populated there when it opens
+    // (one button per Project + unassign + "New project…") from state.projects and the
+    // thread's current membership.
+    h(
+      "div",
+      { className: "context-menu context-menu-submenu", hidden: true, id: "thread-project-submenu", role: "menu" },
+      h("div", { className: "context-menu-projects", id: "thread-project-actions" })
+    )
   );
 }
 
