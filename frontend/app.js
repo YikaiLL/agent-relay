@@ -164,6 +164,7 @@ import {
   currentProjectLabel,
   pickNewProjectId,
   normalizeProjectName,
+  placeProjectSubmenu,
   projectsMenuReady,
   projectMenuActionAllowed,
 } from "./local/project-menu.js";
@@ -1648,6 +1649,9 @@ function populateThreadProjectActions(threadId) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "context-menu-button context-menu-project-button";
+    // The flyout is role="menu", so its rows have to be menuitems or the container's role
+    // is a lie to assistive tech.
+    button.setAttribute("role", "menuitem");
     if (item.isCurrent) {
       button.classList.add("is-current");
       button.setAttribute("aria-current", "true");
@@ -1679,7 +1683,7 @@ function refreshThreadContextMenuContent(anchor, threadId) {
 // Show + position the "Projects ›" submenu against the trigger row. Positioned in JS
 // (rather than as a CSS-nested flyout) because the parent menu is itself fixed-
 // positioned at the cursor and scrolls its own overflow.
-function openThreadProjectSubmenu() {
+function openThreadProjectSubmenu({ focusFirst = false } = {}) {
   if (
     !threadProjectSubmenu
     || !threadProjectSubmenuTrigger
@@ -1691,25 +1695,30 @@ function openThreadProjectSubmenu() {
   threadProjectSubmenu.hidden = false;
   threadProjectSubmenuTrigger.setAttribute("aria-expanded", "true");
   placeThreadProjectSubmenu();
+  if (focusFirst) {
+    threadProjectSubmenu.querySelector("button:not(:disabled)")?.focus();
+  }
 }
 
-// Clamp the submenu next to the parent menu: to its right when there is room, flipped
-// to its left when there isn't, and never hanging past a viewport edge.
+// Measure the panel, then hand the geometry to placeProjectSubmenu (pure: flip + clamp
+// are unit-tested there). Unhidden but held invisible for the measurement — a hidden
+// element measures zero, and revealing it at its previous coordinates first is a visible
+// jump on a re-place.
 function placeThreadProjectSubmenu() {
-  const menuRect = threadContextMenu.getBoundingClientRect();
-  const triggerRect = threadProjectSubmenuTrigger.getBoundingClientRect();
+  threadProjectSubmenu.style.visibility = "hidden";
+  threadProjectSubmenu.hidden = false;
   const { width, height } = threadProjectSubmenu.getBoundingClientRect();
-  const gap = 4;
-  const margin = 8;
-  let left = menuRect.right + gap;
-  if (left + width > window.innerWidth - margin) {
-    left = menuRect.left - width - gap;
-  }
-  left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
-  // Align the panel's top with its trigger row, then lift it just enough to fit.
-  const top = Math.max(margin, Math.min(triggerRect.top - 4, window.innerHeight - height - margin));
-  threadProjectSubmenu.style.left = `${left}px`;
-  threadProjectSubmenu.style.top = `${top}px`;
+  const { left, top } = placeProjectSubmenu({
+    menuRect: threadContextMenu.getBoundingClientRect(),
+    triggerRect: threadProjectSubmenuTrigger.getBoundingClientRect(),
+    submenuWidth: width,
+    submenuHeight: height,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  });
+  threadProjectSubmenu.style.left = `${Math.round(left)}px`;
+  threadProjectSubmenu.style.top = `${Math.round(top)}px`;
+  threadProjectSubmenu.style.visibility = "";
 }
 
 // Re-place the submenu only if it is currently open (no-op otherwise).
@@ -1725,11 +1734,15 @@ function repositionThreadProjectSubmenu() {
   placeThreadProjectSubmenu();
 }
 
-function closeThreadProjectSubmenu() {
+function closeThreadProjectSubmenu({ focusTrigger = false } = {}) {
   if (threadProjectSubmenu) {
     threadProjectSubmenu.hidden = true;
+    threadProjectSubmenu.style.visibility = ""; // never stay stuck invisible-but-shown
   }
   threadProjectSubmenuTrigger?.setAttribute("aria-expanded", "false");
+  if (focusTrigger) {
+    threadProjectSubmenuTrigger?.focus();
+  }
 }
 
 // Open-only, not a toggle: on a mouse the pointer's `mouseenter` has already opened the
@@ -1746,15 +1759,24 @@ threadProjectSubmenuTrigger?.addEventListener("mouseenter", () => {
   openThreadProjectSubmenu();
 });
 
-// ArrowRight enters the flyout from the keyboard (Enter/Space already toggle it), and
-// lands on its first row so the list is navigable without a mouse.
+// ArrowRight/ArrowDown enter the flyout from the keyboard (Enter/Space already open it),
+// landing on its first row so the list is navigable without a mouse.
 threadProjectSubmenuTrigger?.addEventListener("keydown", (event) => {
-  if (event.key !== "ArrowRight") {
+  if (event.key !== "ArrowRight" && event.key !== "ArrowDown") {
     return;
   }
   event.preventDefault();
-  openThreadProjectSubmenu();
-  threadProjectSubmenu?.querySelector("button")?.focus();
+  openThreadProjectSubmenu({ focusFirst: true });
+});
+
+// ArrowLeft walks back out to the trigger — the mirror of ArrowRight, so a keyboard user
+// can leave the flyout without dismissing the whole menu (which is what Escape does).
+threadProjectSubmenu?.addEventListener("keydown", (event) => {
+  if (event.key !== "ArrowLeft") {
+    return;
+  }
+  event.preventDefault();
+  closeThreadProjectSubmenu({ focusTrigger: true });
 });
 
 threadContextMenu?.addEventListener("mouseover", (event) => {
@@ -1911,8 +1933,7 @@ window.addEventListener("keydown", (event) => {
     // Peel one level at a time: an open Projects flyout first (back to the session
     // actions), and only then the menu itself.
     if (threadProjectSubmenu && !threadProjectSubmenu.hidden) {
-      closeThreadProjectSubmenu();
-      threadProjectSubmenuTrigger?.focus();
+      closeThreadProjectSubmenu({ focusTrigger: true });
       return;
     }
     closeThreadContextMenu();

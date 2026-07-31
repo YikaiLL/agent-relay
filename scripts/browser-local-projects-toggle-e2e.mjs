@@ -485,14 +485,26 @@ async function main() {
       const afterArrowRight = await crudPage.evaluate(() => ({
         submenuOpen: !document.querySelector("#thread-project-submenu")?.hidden,
         focusInsideSubmenu: !!document.activeElement?.closest("#thread-project-submenu"),
+        // role="menu" on the panel obliges its rows to be menuitems.
+        rowsAreMenuItems: [...document.querySelectorAll("#thread-project-actions button")].every(
+          (b) => b.getAttribute("role") === "menuitem"
+        ),
       }));
+      // ArrowLeft walks back out to the trigger without dismissing the whole menu.
+      await crudPage.keyboard.press("ArrowLeft");
+      const afterArrowLeft = await crudPage.evaluate(() => ({
+        submenuHidden: !!document.querySelector("#thread-project-submenu")?.hidden,
+        menuStillOpen: !document.querySelector("#thread-context-menu")?.hidden,
+        focusOnTrigger: document.activeElement?.id === "thread-project-submenu-trigger",
+      }));
+      await crudPage.keyboard.press("ArrowRight"); // back in, so Escape has a level to peel
       await crudPage.keyboard.press("Escape");
       await crudPage.keyboard.press("Escape");
       const afterSecondEscape = await crudPage.evaluate(() => ({
         menuHidden: !!document.querySelector("#thread-context-menu")?.hidden,
         submenuHidden: !!document.querySelector("#thread-project-submenu")?.hidden,
       }));
-      keyboardNav = { afterFirstEscape, afterArrowRight, afterSecondEscape };
+      keyboardNav = { afterFirstEscape, afterArrowRight, afterArrowLeft, afterSecondEscape };
 
       step("10d. remove from project");
       await openThreadMenu(crudPage, threadId);
@@ -700,8 +712,13 @@ async function main() {
     );
     assert.deepEqual(
       keyboardNav.afterArrowRight,
-      { submenuOpen: true, focusInsideSubmenu: true },
+      { submenuOpen: true, focusInsideSubmenu: true, rowsAreMenuItems: true },
       `ArrowRight enters the flyout and focuses a row: ${JSON.stringify(keyboardNav.afterArrowRight)}`
+    );
+    assert.deepEqual(
+      keyboardNav.afterArrowLeft,
+      { submenuHidden: true, menuStillOpen: true, focusOnTrigger: true },
+      `ArrowLeft leaves the flyout without closing the menu: ${JSON.stringify(keyboardNav.afterArrowLeft)}`
     );
     assert.deepEqual(
       keyboardNav.afterSecondEscape,

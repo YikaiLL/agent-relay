@@ -6,9 +6,67 @@ import {
   currentProjectLabel,
   pickNewProjectId,
   normalizeProjectName,
+  placeProjectSubmenu,
   projectsMenuReady,
   projectMenuActionAllowed,
 } from "./project-menu.js";
+
+// Geometry for the second-level flyout. Pure math on purpose: the browser e2e can only
+// ever exercise the open-right branch (the sidebar — and so the menu — is anchored to the
+// left edge), so flipping and edge clamping are only testable here.
+const MENU = { left: 100, right: 360, top: 300, bottom: 450 };
+const TRIGGER = { left: 104, right: 356, top: 410, bottom: 442 };
+const place = (overrides = {}) =>
+  placeProjectSubmenu({
+    menuRect: MENU,
+    triggerRect: TRIGGER,
+    submenuWidth: 260,
+    submenuHeight: 200,
+    viewportWidth: 1400,
+    viewportHeight: 900,
+    ...overrides,
+  });
+
+test("placeProjectSubmenu: opens beside the menu, first row aligned with its trigger", () => {
+  const { left, top, opensLeft } = place();
+  assert.equal(left, MENU.right + 4, "sits just outside the menu's right edge, clear of its padding");
+  assert.equal(top, TRIGGER.top - 4, "lifted by the panel's own padding so row 1 lines up with the trigger");
+  assert.equal(opensLeft, false);
+});
+
+test("placeProjectSubmenu: flips to the menu's left when the right side has no room", () => {
+  // A menu opened far right: nothing fits beyond it, but there is room before it.
+  const menuRect = { left: 400, right: 660, top: 300, bottom: 450 };
+  const { left, opensLeft } = place({ menuRect, viewportWidth: 700 }); // 660+4+260 > 692
+  assert.equal(left, 400 - 4 - 260, "mirrored to the far side of the menu");
+  assert.equal(opensLeft, true);
+});
+
+test("placeProjectSubmenu: when NEITHER side fits, clamp rather than hang off-screen", () => {
+  // Narrow viewport with the menu near the left: flipping would land at -164.
+  const { left, opensLeft } = place({ viewportWidth: 600 });
+  assert.equal(left, 8, "pinned to the left margin");
+  assert.equal(opensLeft, true, "still reports the flip it attempted");
+});
+
+test("placeProjectSubmenu: a long list near the bottom is lifted, not left hanging off", () => {
+  // Trigger sits low and the panel is tall: anchoring at the trigger would overflow.
+  const { top } = place({ submenuHeight: 400, viewportHeight: 700 });
+  assert.equal(top, 700 - 8 - 400, "bottom edge parked on the margin");
+  assert.ok(top < TRIGGER.top, "so it opens upward relative to its row");
+});
+
+test("placeProjectSubmenu: a panel taller/wider than the viewport pins to the top-left margin", () => {
+  // The min must win over the max, or clamping sends it off-screen negative.
+  const { left, top } = place({ submenuWidth: 2000, submenuHeight: 2000 });
+  assert.equal(top, 8, "top margin wins");
+  assert.equal(left, 8, "left margin wins");
+});
+
+test("placeProjectSubmenu: tolerates a missing/degenerate anchor instead of throwing", () => {
+  const { left, top } = placeProjectSubmenu();
+  assert.ok(Number.isFinite(left) && Number.isFinite(top), `finite fallback: ${left},${top}`);
+});
 
 test("buildProjectMenuItems: unassigned thread → assign options + create, no unassign", () => {
   const items = buildProjectMenuItems({

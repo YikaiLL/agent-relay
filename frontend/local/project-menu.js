@@ -88,6 +88,46 @@ export function projectsMenuReady({ projectsLoaded, projectsError, projectsLoadi
 }
 
 /**
+ * Viewport coordinates for the second-level Projects flyout (a `position: fixed` panel).
+ *
+ * Horizontally it hangs off the MENU's box, not the trigger's, so it clears the menu's
+ * own padding instead of overlapping it; it flips to the menu's far side when the right
+ * has no room. Vertically it anchors to the trigger row — lifted by the panel's padding
+ * so the first row lines up with that row — then clamps, which is what makes a long list
+ * on a low row open upward instead of off the bottom edge.
+ *
+ * Pure so the flip and both clamps are testable: the sidebar is left-anchored, so a
+ * browser test can only ever reach the open-right case.
+ *
+ * @returns {{ left: number, top: number, opensLeft: boolean }}
+ */
+export function placeProjectSubmenu({
+  menuRect,
+  triggerRect,
+  submenuWidth = 0,
+  submenuHeight = 0,
+  viewportWidth = 0,
+  viewportHeight = 0,
+  gap = 4,
+  margin = 8,
+  padding = 4,
+} = {}) {
+  const menu = menuRect || { left: 0, right: 0 };
+  const trigger = triggerRect || { top: 0 };
+  const openRight = menu.right + gap + submenuWidth <= viewportWidth - margin;
+  const desiredLeft = openRight ? menu.right + gap : menu.left - gap - submenuWidth;
+  // `margin` is the floor in both clamps: when the panel is bigger than the space it has
+  // to live in, pin it to the top/left margin rather than let the max drive it negative.
+  const maxLeft = Math.max(margin, viewportWidth - margin - submenuWidth);
+  const maxTop = Math.max(margin, viewportHeight - margin - submenuHeight);
+  return {
+    left: Math.min(Math.max(margin, desiredLeft), maxLeft),
+    top: Math.min(Math.max(margin, trigger.top - padding), maxTop),
+    opensLeft: !openRight,
+  };
+}
+
+/**
  * Whether a context-menu Project action may execute. The clicked button captured the
  * Projects-state sequence token when it was built; the action runs only if that token
  * still matches the current one (no transition since) AND the state is fresh. This is
