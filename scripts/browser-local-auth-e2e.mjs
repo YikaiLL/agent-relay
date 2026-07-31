@@ -122,6 +122,27 @@ async function main() {
       return transcript.includes("Session ready");
     }, null, { timeout: LOCAL_TIMEOUT_MS });
 
+    // Starting a session does NOT put you in the chat: local home deliberately parks
+    // the live session behind an explicit "Open live conversation" CTA. This test is
+    // about auth surviving a reload, so put the conversation on the ROUTE first —
+    // a reload from console home restores console home, where the composer is
+    // disabled and the assertions below can never come true. Leaving this to ambient
+    // timing is what made this scenario pass alone and fail inside the suite.
+    const routed = () => Boolean(new URL(window.location.href).searchParams.get("thread"));
+    // Settle first: right after "Session ready" lands in the transcript the home CTA
+    // may not be mounted yet, so probing for it immediately is itself a race.
+    await page.waitForFunction(
+      () =>
+        Boolean(new URL(window.location.href).searchParams.get("thread"))
+        || Boolean(document.querySelector("[data-open-thread-id]")),
+      null,
+      { timeout: LOCAL_TIMEOUT_MS }
+    );
+    if (!(await page.evaluate(routed))) {
+      await page.click("[data-open-thread-id]");
+    }
+    await page.waitForFunction(routed, null, { timeout: LOCAL_TIMEOUT_MS });
+
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => {
       const button = document.querySelector("#apply-token-button")?.textContent || "";

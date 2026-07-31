@@ -98,6 +98,9 @@ function measure() {
     blankBelowVisibleContent: Math.round(trect.bottom - lowestVisibleBottom),
     virtualized: Boolean(document.querySelector(".thread-content-virtualized")),
     viewLabel: document.querySelector("#workspace-subtitle")?.textContent || "",
+    // Which thread is on screen. The route is the authority — the header subtitle
+    // used to spell out "read-only · saved session" but no longer does.
+    viewedThreadId: new URL(window.location.href).searchParams.get("thread") || "",
     lastVisibleText: visible.length ? (visible[visible.length - 1].textContent || "").replace(/\s+/g, " ").trim().slice(0, 40) : null,
   };
 }
@@ -158,9 +161,16 @@ async function main() {
     }), THREAD_ID);
     console.log("DIAG after load:", JSON.stringify(diag));
     if (diag.view !== "conversation") {
-      await page.click("text=Continue latest", { timeout: 8000 }).catch(async () => {
-        await page.click("text=Fake E2E Session", { timeout: 8000 }).catch((e) => console.log("open err", e.message));
+      // Open by thread id, not by label. This used to click "Continue latest",
+      // a sidebar button that no longer exists, and fall back to
+      // `text=Fake E2E Session` — which matches the sidebar row, the tab AND the
+      // context menu, so it picked a hidden one and timed out on visibility.
+      // `data-open-thread-id` is unique (the DIAG above asserts openBtns === 1).
+      // The list lives in a <details> drawer, so make sure it is open first.
+      await page.evaluate(() => {
+        document.querySelector(".sidebar-drawer")?.setAttribute("open", "");
       });
+      await page.click(`[data-open-thread-id="${THREAD_ID}"]`, { timeout: 8000 });
     }
     await page.waitForFunction(() => document.querySelector(".chat-shell")?.dataset.view === "conversation", null, { timeout: 20000 });
     await page.waitForFunction(() => document.querySelectorAll(".chat-thread .chat-message").length > 0, null, { timeout: TIMEOUT_MS });
@@ -248,10 +258,26 @@ async function main() {
         && heldLaterStats.blankBelowVisibleContent <= 160,
       `the read-only working refresh collapsed loaded history back to a short tail (${JSON.stringify(heldLaterStats)})`
     );
-    assert.match(
-      heldLaterStats.viewLabel,
-      /read-only\s+·\s+saved session/i,
+    // Self-check: this regression is only meaningful while the SAVED thread is on
+    // screen and some OTHER thread is the live one — that pair is what "read-only
+    // projection" means. This used to be a regex on the header subtitle, which was
+    // a proxy for the same thing until that line was dropped from the header.
+    // Asserting the state directly is stricter than asserting its old label.
+    const liveThreadId = await page.evaluate(() =>
+      fetch("/api/session")
+        .then((r) => r.json())
+        .then((r) => r.data?.active_thread_id || "")
+        .catch(() => "")
+    );
+    assert.equal(
+      heldLaterStats.viewedThreadId,
+      THREAD_ID,
       "the regression must exercise the saved read-only projection"
+    );
+    assert.notEqual(
+      liveThreadId,
+      THREAD_ID,
+      "the saved thread must not also be the live one, or nothing read-only is being exercised"
     );
 
     await scenarioHarness.releaseBarrier(LIVE_BARRIER);

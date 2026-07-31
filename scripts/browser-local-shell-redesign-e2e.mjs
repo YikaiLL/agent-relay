@@ -58,19 +58,23 @@ async function run() {
     await page.waitForSelector(".local-frame", { timeout: TIMEOUT_MS });
     await page.waitForTimeout(500);
 
-    // --- Icon rail: logo + home(active) + gear, no bell ---
+    // --- Icon rail: logo + gear only ---
+    // The rail's Projects folder was retired: it duplicated the sidebar's own
+    // Sessions/Projects toggle, and the one job only it did — bringing a collapsed
+    // nav panel back — belongs to #toggle-left-panel (asserted below).
     const rail = await page.evaluate(() => {
       const r = document.querySelector(".icon-rail");
       return {
         present: !!r,
         hasLogo: !!r?.querySelector(".icon-rail-logo"),
-        homeActive: !!r?.querySelector("#icon-rail-home.is-active"),
+        hasHome: !!r?.querySelector("#icon-rail-home"),
         hasGear: !!r?.querySelector("#icon-rail-settings"),
         buttons: r ? r.querySelectorAll("button").length : 0,
       };
     });
-    assert.ok(rail.present && rail.hasLogo && rail.homeActive && rail.hasGear, `icon rail: ${JSON.stringify(rail)}`);
-    assert.equal(rail.buttons, 2, "icon rail has exactly home + gear (no bell)");
+    assert.ok(rail.present && rail.hasLogo && rail.hasGear, `icon rail: ${JSON.stringify(rail)}`);
+    assert.equal(rail.hasHome, false, `the rail's Projects folder is retired: ${JSON.stringify(rail)}`);
+    assert.equal(rail.buttons, 1, "icon rail is the gear only (no home, no bell)");
 
     // --- Settings modal + tabs (desktop entry: rail gear) ---
     await page.click("#icon-rail-settings");
@@ -104,10 +108,15 @@ async function run() {
     });
     assert.ok(/Live/.test(footer.text) && !footer.degraded, `footer live while stream connected: ${JSON.stringify(footer)}`);
 
-    // --- Folder re-expands a collapsed sidebar ---
+    // --- A collapsed sidebar can be brought back ---
+    // This used to go through the icon rail's folder. That button is gone, so the
+    // header's panel toggle is now the only way back — which makes this assertion
+    // more important, not less: it is the sole escape from a collapsed sidebar.
+    // It is rendered only while `body.sidebar-collapsed`, so it cannot be clicked
+    // before the collapse lands.
     await page.click("#sidebar-top-toggle");
     await page.waitForFunction(() => document.body.classList.contains("sidebar-collapsed"), { timeout: TIMEOUT_MS });
-    await page.click("#icon-rail-home");
+    await page.click("#toggle-left-panel");
     await page.waitForFunction(() => !document.body.classList.contains("sidebar-collapsed"), { timeout: TIMEOUT_MS });
 
     // --- Project actions: visible button opens the menu, Rename works ---

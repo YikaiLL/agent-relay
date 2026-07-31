@@ -187,18 +187,25 @@ async function main() {
       "VerifyProj",
       { timeout: TIMEOUT_MS }
     );
-    const projectsView = await page.evaluate((name) => {
+    const projectsView = await page.evaluate(({ name, threadId }) => {
       const row = [...document.querySelectorAll("#threads-list .thread-group-header-project")].find(
         (r) => r.querySelector(".thread-group-name")?.textContent?.trim() === name
       );
       return {
         countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
         projectRows: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+        // Projects mode builds its groups from the project list alone, so a
+        // session's row is present here IF AND ONLY IF it is assigned. That is a
+        // stronger signal than the old "N sessions" badge (now removed — the
+        // nested rows already say the count, and it crowded the fold control).
+        hasAssignedSession: Boolean(
+          document.querySelector(`#threads-list [data-thread-id="${threadId}"]`)
+        ),
         verifyBadge: row?.querySelector(".thread-group-badges")?.textContent?.trim() || "",
         hasActionsButton: !!row?.closest(".thread-group-header-project")?.querySelector(".thread-group-action"),
         projectsButtonActive: document.querySelector("#threads-view-projects")?.classList.contains("is-active") || false,
       };
-    }, "VerifyProj");
+    }, { name: "VerifyProj", threadId });
 
     // 6. Switch back to Sessions.
     await page.evaluate(() => document.querySelector("#threads-view-sessions").click());
@@ -227,14 +234,12 @@ async function main() {
     await api(relayPort, "POST", "/api/projects", { action: "unassign", thread_id: threadId });
     let unassignPropagated = false;
     try {
+      // Unassigning removes the session from every project group, so its row
+      // disappears from Projects mode entirely. (This used to watch the project
+      // badge fall to "0 sessions"; that badge no longer exists.)
       await page.waitForFunction(
-        (name) => {
-          const row = [...document.querySelectorAll("#threads-list .thread-group-header-project")].find(
-            (r) => r.querySelector(".thread-group-name")?.textContent?.trim() === name
-          );
-          return /0\s+session/.test(row?.querySelector(".thread-group-badges")?.textContent || "");
-        },
-        "VerifyProj",
+        (id) => !document.querySelector(`#threads-list [data-thread-id="${id}"]`),
+        threadId,
         { timeout: TIMEOUT_MS }
       );
       unassignPropagated = true;
@@ -472,7 +477,10 @@ async function main() {
     // --- Assertions ---
     assert.ok(projectsView.projectRows.includes("VerifyProj"), "VerifyProj row renders in Projects mode");
     assert.match(projectsView.countText, /1 project\b/, `count text = '1 project': ${projectsView.countText}`);
-    assert.match(projectsView.verifyBadge, /[1-9]/, `the assigned session is reflected in the project row badge: ${projectsView.verifyBadge}`);
+    assert.ok(
+      projectsView.hasAssignedSession,
+      `the assigned session shows under its project in Projects mode: ${JSON.stringify(projectsView.projectRows)}`
+    );
     assert.ok(projectsView.hasActionsButton, "each project header exposes visible action buttons (touch/keyboard reachable)");
     assert.ok(projectsView.projectsButtonActive, "Projects toggle button is active");
     assert.ok(backToSessions.sessionsButtonActive, "Sessions toggle re-activates");

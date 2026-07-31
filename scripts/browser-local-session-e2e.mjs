@@ -95,15 +95,23 @@ async function main() {
     }, null, { timeout: LOCAL_TIMEOUT_MS });
     await page.waitForFunction(
       () => {
-        const title = document.querySelector("#workspace-title")?.textContent || "";
         const subtitle = document.querySelector("#workspace-subtitle")?.textContent || "";
         const status = document.querySelector("#status-badge")?.textContent || "";
-        // New header rules: the workspace basename is no longer the title, and the
-        // "live" word is gone (it collided with the run-state badge). A running session
-        // now shows a non-empty status badge and identifies itself as EITHER the
-        // conversation title (the thread label, i.e. not "Relay console") OR the
-        // console-home "session · …" subtitle.
-        const identifiesSession = title !== "Relay console" || /session ·/i.test(subtitle);
+        const tabs = [...document.querySelectorAll(".session-tab-title")].map(
+          (node) => node.textContent || ""
+        );
+        // Header rules: the title names the CONTAINER — the workspace folder in
+        // Sessions mode, the project in Projects mode. It deliberately does NOT
+        // repeat the thread label, because the session tab strip directly beneath
+        // already carries it; that duplication is why the rule changed. "live" is
+        // still gone from the subtitle (it collided with the run-state badge).
+        //
+        // So a running session identifies itself through its TAB, or — on console
+        // home, where no tab is focused — through the "session · …" subtitle.
+        // (Checking `title !== "Relay console"` would now pass for any folder name
+        // and no longer proves a session is named anywhere.)
+        const identifiesSession =
+          tabs.some((tab) => tab.trim().length > 0) || /session ·/i.test(subtitle);
         return (
           status.trim().length > 0 &&
           !subtitle.toLowerCase().includes("live") &&

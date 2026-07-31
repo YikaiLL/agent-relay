@@ -688,7 +688,9 @@ async function run() {
     );
     await waitForCoherent(page, "viewing a session before going Home");
 
-    await page.click("#go-console-home-sidebar");
+    // The sidebar's "Back to console" button was retired (it was a legacy
+    // duplicate); the header's back arrow is the surviving way home.
+    await page.click("#go-console-home");
     await page.waitForFunction(
       () => !new URL(window.location.href).searchParams.get("thread"),
       { timeout: TIMEOUT_MS }

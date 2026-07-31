@@ -158,12 +158,16 @@ async function main() {
       document.querySelector(".sidebar-drawer")?.setAttribute("open", "");
     });
     await page.click(`[data-thread-id="${VIEWED_THREAD_ID}"]`);
+    // Readiness = the route switched to the viewed thread. This used to also wait
+    // for /read-only/ in #workspace-subtitle, but that string was cosmetic and has
+    // since been dropped from the header (only a review-locked session still gets a
+    // subtitle). Do NOT substitute "the composer is disabled" — an idle saved thread
+    // stays composable, since a targeted send is itself the claim.
+    //
+    // Nothing is lost by dropping it: the wait below gates on the codex catalog
+    // being rendered, which is the projection-specific signal this test is about.
     await page.waitForFunction(
-      (threadId) =>
-        new URL(window.location.href).searchParams.get("thread") === threadId
-        && /read-only/i.test(
-          document.querySelector("#workspace-subtitle")?.textContent || ""
-        ),
+      (threadId) => new URL(window.location.href).searchParams.get("thread") === threadId,
       VIEWED_THREAD_ID
     );
     await page.waitForFunction(
@@ -173,7 +177,7 @@ async function main() {
     );
 
     const result = await page.evaluate(() => ({
-      subtitle: document.querySelector("#workspace-subtitle")?.textContent || "",
+      composerDisabled: document.querySelector("#message-input")?.disabled === true,
       value: document.querySelector("#message-model")?.value || "",
       options: [...(document.querySelector("#message-model")?.options || [])]
         .map((option) => option.value),
