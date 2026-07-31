@@ -139,6 +139,7 @@ export function ThreadGroupList({
   onSelectProject = null,
   onResumeThread = null,
   onSelectWorkspace = null,
+  onThreadActions = null,
   onToggleExpandedGroup = null,
   onToggleGroup = null,
   previewFallback = "No preview yet.",
@@ -209,6 +210,7 @@ export function ThreadGroupList({
             onSelectProject,
             onResumeThread,
             onSelectWorkspace,
+            onThreadActions,
             onToggleExpandedGroup,
             onToggleGroup,
             previewFallback,
@@ -237,6 +239,7 @@ function ThreadListRow({
   onSelectProject,
   onResumeThread,
   onSelectWorkspace,
+  onThreadActions,
   onToggleExpandedGroup,
   onToggleGroup,
   previewFallback,
@@ -281,6 +284,7 @@ function ThreadListRow({
       includePreview,
       onContextThread,
       onResumeThread,
+      onThreadActions,
       previewFallback,
       thread: row.thread,
     });
@@ -630,6 +634,7 @@ export function ThreadGroupItem({
   includePreview,
   onContextThread,
   onResumeThread,
+  onThreadActions = null,
   previewFallback,
   thread,
 }) {
@@ -647,7 +652,7 @@ export function ThreadGroupItem({
   // it stable across renders.
   const isContextTarget = contextMenuThreadId === thread.id;
 
-  return h(
+  const rowButton = h(
     "button",
     {
       className: `conversation-item${active ? " is-active" : ""}${isContextTarget ? " is-context-target" : ""}`,
@@ -704,5 +709,54 @@ export function ThreadGroupItem({
       ? h("span", { className: "conversation-preview" }, thread.preview || previewFallback)
       : null,
     h("span", { className: "conversation-meta" }, formatThreadMeta(thread))
+  );
+
+  // Without an actions handler there is nothing to reveal — keep the bare row, so the
+  // surfaces that don't pass one (local, which has its own right-click menu) render
+  // byte-for-byte as before. Same optional-prop gate `onRenameProject` uses on the
+  // header.
+  if (!onThreadActions) return rowButton;
+
+  // The actions button is a SIBLING of the row button, never a child: the row itself is
+  // a <button>, and nesting one inside it is invalid HTML that browsers reparent. The
+  // wrapper is the shared positioned ancestor that lets it overlay the row's right edge
+  // (see .project-sidebar-row-wrap, the same pattern).
+  //
+  // This is also the only session-actions entry that works on a phone. Right-click is
+  // unreachable there — a touch long-press never dispatches `contextmenu` on iOS — so
+  // CSS keeps this button permanently visible under `@media (hover: none)`.
+  return h(
+    "div",
+    { className: "conversation-item-wrap" },
+    rowButton,
+    h(
+      "button",
+      {
+        type: "button",
+        className: "conversation-more",
+        "aria-label": `Actions for ${title}`,
+        title: "Session actions",
+        onClick: (event) => {
+          // The row underneath opens the session on click; without this the sheet and
+          // the session would both fire.
+          event.stopPropagation();
+          const rect = event.currentTarget.getBoundingClientRect();
+          onThreadActions(thread.id, rect.right, rect.bottom);
+        },
+      },
+      h(MoreGlyph)
+    )
+  );
+}
+
+// Local to this module rather than imported from project-overview-react.js: that file is
+// an unrelated component, and a three-dot glyph is not worth coupling them over.
+function MoreGlyph() {
+  return h(
+    "svg",
+    { "aria-hidden": "true", width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor" },
+    h("circle", { cx: "3", cy: "8", r: "1.3" }),
+    h("circle", { cx: "8", cy: "8", r: "1.3" }),
+    h("circle", { cx: "13", cy: "8", r: "1.3" })
   );
 }

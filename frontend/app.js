@@ -167,7 +167,7 @@ import {
   placeProjectSubmenu,
   projectsMenuReady,
   projectMenuActionAllowed,
-} from "./local/project-menu.js";
+} from "./shared/project-menu.js";
 import { installThreadListWheelProxy } from "./shared/thread-list-scroll.js";
 import {
   positionContextMenuElement,

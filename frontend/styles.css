@@ -1247,6 +1247,52 @@ input:focus, textarea:focus, select:focus {
   border-color: var(--border-faint);
 }
 
+/* Row + its actions button share a relative wrapper so the button can overlay the
+   row's right edge without nesting a <button> inside the row <button>. Mirrors
+   .project-sidebar-row-wrap. */
+.conversation-item-wrap {
+  position: relative;
+}
+.conversation-item-wrap .conversation-item {
+  padding-right: 34px;
+}
+.conversation-more {
+  position: absolute;
+  /* Centred rather than pinned to a fixed offset: the row is one line without a
+     preview and two with it, so only centring fits both. */
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-mute, var(--text-secondary));
+  opacity: 0;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+}
+.conversation-more:hover {
+  background: var(--surface-3);
+  color: var(--text-1);
+}
+.conversation-item-wrap:hover .conversation-more,
+.conversation-item-wrap:focus-within .conversation-more,
+.conversation-more:focus-visible {
+  opacity: 1;
+}
+/* Touch devices have no hover, and a long-press never dispatches `contextmenu` on
+   iOS — so on a phone this button is the ONLY way to reach session actions. It can
+   never be hover-gated there. */
+@media (hover: none) {
+  .conversation-more {
+    opacity: 1;
+  }
+}
+
 /* Resting rows sit at secondary/400, not primary/500. A list where every title
    is at full contrast has no hierarchy left to spend on the selected one — the
    eye gets no help finding its place, and the column reads heavier than it is.
@@ -3545,6 +3591,77 @@ input:focus, textarea:focus, select:focus {
 .close-modal-btn:hover { color: var(--text-primary); background: transparent; border: none; }
 .panel-modal-body {
   padding: 24px;
+}
+
+/* --- per-session actions sheet (remote) ------------------------------------
+   A centred dialog on a wide viewport, a bottom sheet on a phone: the targets
+   belong in thumb reach, and a tall list of projects needs the full width. */
+.thread-actions-sheet .panel-modal-body {
+  padding: 8px;
+  /* A long project list must scroll inside the sheet rather than push it past the
+     top of the viewport, where the header would become unreachable. */
+  max-height: min(60vh, 480px);
+  overflow-y: auto;
+}
+.thread-actions-group + .thread-actions-group {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+.thread-actions-group-label {
+  margin: 0;
+  padding: 6px 12px 4px;
+  font-size: var(--text-xs, 11px);
+  font-weight: var(--weight-strong);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-mute, var(--text-secondary));
+}
+.thread-actions-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  /* 44px is the touch-target floor; menu rows on a phone are mis-tapped below it. */
+  min-height: 44px;
+  padding: 10px 12px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--text-body);
+  text-align: left;
+}
+.thread-actions-item:hover {
+  background: var(--surface-2);
+}
+.thread-actions-item.is-current {
+  color: var(--text-primary);
+  font-weight: var(--weight-strong);
+}
+.thread-actions-item-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-actions-item-check {
+  flex: none;
+  color: var(--accent, var(--text-secondary));
+}
+/* Phone: dock to the bottom edge and go full width. */
+@media (max-width: 600px) {
+  .thread-actions-sheet {
+    width: 100%;
+    max-width: none;
+  }
+  .thread-actions-sheet[open] {
+    inset: auto auto 0 50%;
+    transform: translateX(-50%);
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    border-bottom: none;
+  }
 }
 
 .panel-modal-copy {

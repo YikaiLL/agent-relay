@@ -190,11 +190,16 @@ import {
   refreshRemoteProjects,
 } from "./projects-host.js";
 import {
+  assignRemoteThreadToProject,
   createRemoteProject,
+  fetchRemoteProjects,
   renameRemoteProject,
   deleteRemoteProject,
+  unassignRemoteThread,
 } from "./project-actions.js";
-import { normalizeProjectName, projectsMenuReady } from "../local/project-menu.js";
+import { normalizeProjectName, projectsMenuReady } from "../shared/project-menu.js";
+import { buildThreadSheetSections, threadSheetHasActions } from "../shared/thread-actions-model.js";
+import { runThreadSheetAction } from "./thread-sheet-action.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
 import { renderLog } from "./session-surface.js";
 import { setRemoteTranscriptElement } from "./ui-refs.js";
@@ -306,6 +311,9 @@ function RemoteApp() {
   // as it loads/errors.
   const remoteProjects = useRemoteProjects();
   const threadViewMode = useThreadListViewMode(threadListStore);
+  // Which session the actions sheet is open for (null = closed). Held by id, not by
+  // object, so the sheet keeps tracking the thread across list refreshes.
+  const [actionsSheetThreadId, setActionsSheetThreadId] = useState(null);
   const [progressVerb, setProgressVerb] = useState(null);
   const verbCyclerRef = useRef(null);
   if (!verbCyclerRef.current) verbCyclerRef.current = createVerbCycler();
@@ -1176,6 +1184,59 @@ function RemoteApp() {
     void ensureRemoteProviderModels(thread.provider);
   }
 
+  // --- per-session actions sheet ----------------------------------------------
+  //
+  // Remote's only reachable session-actions entry on a phone: `contextmenu` never
+  // fires for a touch long-press, so before this the row's right-click binding was
+  // dead on iOS and fork was reachable only from a transcript message.
+  const actionsSheetThread =
+    (currentState.threads || []).find((entry) => entry.id === actionsSheetThreadId) || null;
+  const actionsSheetSections = actionsSheetThread
+    ? buildThreadSheetSections({
+        // Same rule the relay enforces and local's menu mirrors — a background thread
+        // can be mid-turn too, so this is not just "is the active session running".
+        canFork: !threadIsBusyForFork(actionsSheetThread, session),
+        projects: remoteProjects.projects,
+        currentProjectId: remoteProjects.threadProjectId?.[actionsSheetThreadId] || null,
+        projectsLoaded: remoteProjects.loaded,
+        projectsError: remoteProjects.error,
+        projectsLoading: remoteProjects.loading,
+      })
+    : [];
+
+  const openActionsSheet = (threadId) => setActionsSheetThreadId(threadId);
+  const closeActionsSheet = () => setActionsSheetThreadId(null);
+  // An empty sheet must never slide up: it reads as a bug and, on a phone, also costs
+  // a tap to dismiss. Both gates matter — a thread can be mid-turn (no fork) while the
+  // projects payload is still loading (no project section).
+  const actionsSheetOpen =
+    Boolean(actionsSheetThreadId) && threadSheetHasActions(actionsSheetSections);
+
+  function handleThreadSheetAction(item) {
+    const threadId = actionsSheetThreadId;
+    // Close first: every branch either opens another dialog or awaits the network, and
+    // leaving the sheet up over the fork dialog would stack two modals.
+    closeActionsSheet();
+    // The projects known BEFORE the action — the create branch diffs against these to
+    // recover the new project's id.
+    const before = remoteProjects.projects;
+    return runThreadSheetAction({
+      item,
+      threadId,
+      projects: before,
+      deps: {
+        assign: assignRemoteThreadToProject,
+        unassign: unassignRemoteThread,
+        create: createRemoteProject,
+        fetchProjects: fetchRemoteProjects,
+        promptName: () => promptRemoteProjectName(),
+        openFork: (id) => handleOpenForkDialog(id),
+        refresh: refreshRemoteProjects,
+        log: renderLog,
+      },
+    });
+  }
+
   function handleForkFieldChange(field, value) {
     const dialog = remoteUiStore.getState().forkDialog;
     let next = { ...dialog.fields, [field]: value };
@@ -1499,7 +1560,11 @@ function RemoteApp() {
           void runThreadRefresh("manual refresh");
         },
         onResumeThread: handleResumeThread,
+        // Right-click keeps its long-standing shortcut straight to the fork dialog on
+        // the desktop-sized remote view; the sheet below is the entry that also works
+        // on touch, where `contextmenu` never fires.
         onContextThread: handleOpenForkDialog,
+        onThreadActions: openActionsSheet,
         threadViewMode,
         projectsReady: remoteProjectsReady,
         onSetThreadViewMode: setThreadViewMode,
@@ -1684,6 +1749,13 @@ function RemoteApp() {
           },
         })
       : null,
+    h(ThreadActionsSheet, {
+      open: actionsSheetOpen,
+      sections: actionsSheetSections,
+      threadTitle: actionsSheetThread?.name || "Session",
+      onClose: closeActionsSheet,
+      onSelect: (item) => void handleThreadSheetAction(item),
+    }),
     h(PairingModal, {
       deviceChromeModel,
       deviceLabel: remoteUi.deviceLabelDraft,
@@ -1779,6 +1851,7 @@ function RemoteSidebar({
   remoteUiState,
   onResumeThread,
   onContextThread,
+  onThreadActions,
   threadViewMode,
   projectsReady,
   onSetThreadViewMode,
@@ -2038,6 +2111,7 @@ function RemoteSidebar({
           }),
           includePreview: true,
           onContextThread,
+          onThreadActions,
           // Rename/delete on real project headers — only in Projects mode and only when
           // the payload is fresh (fail closed; the render model already returns no
           // groups otherwise, this is defence in depth).
@@ -2935,6 +3009,72 @@ function RemoteNotificationsSection({ pushModel }) {
     { className: "details-section" },
     h("h3", { className: "details-heading" }, "Notifications"),
     hint ? h("p", { className: "details-hint", id: "remote-push-status" }, hint) : null
+  );
+}
+
+// The per-session actions sheet — remote's answer to local's right-click menu.
+//
+// A bottom sheet rather than a cursor-anchored popover: there is no cursor on a phone,
+// the drawer is too narrow to hang a menu off a row, and a sheet puts the targets within
+// thumb reach. Built on ManagedDialog so it inherits Esc/backdrop dismissal and the
+// no-showModal fallback the other two remote modals already rely on.
+//
+// It renders descriptors and nothing else — which actions exist is decided by
+// buildThreadSheetSections, and every action's transport already exists. Archive and
+// delete are absent on purpose: the broker has no action for them (see the model).
+function ThreadActionsSheet({ onClose, onSelect, open, sections, threadTitle }) {
+  return h(
+    ManagedDialog,
+    {
+      className: "panel-modal thread-actions-sheet",
+      id: "remote-thread-actions-sheet",
+      open,
+      onRequestClose: onClose,
+    },
+    h(
+      "div",
+      { className: "modal-header" },
+      h("h2", null, threadTitle || "Session"),
+      h(
+        "button",
+        {
+          type: "button",
+          className: "header-button close-modal-btn",
+          id: "close-thread-actions-sheet",
+          onClick: onClose,
+          "aria-label": "Close",
+        },
+        "×"
+      )
+    ),
+    h(
+      "div",
+      { className: "panel-modal-body" },
+      ...sections.map((section) =>
+        h(
+          "div",
+          { className: "thread-actions-group", key: section.kind },
+          h("p", { className: "thread-actions-group-label" }, section.label),
+          ...section.items.map((item, index) =>
+            h(
+              "button",
+              {
+                type: "button",
+                // The thread's own project is marked rather than filtered out, so the
+                // list answers "where does this live" as well as "where can it go".
+                className: `thread-actions-item${item.isCurrent ? " is-current" : ""}`,
+                key: `${item.kind}:${item.projectId || index}`,
+                onClick: () => onSelect(item),
+              },
+              h("span", { className: "thread-actions-item-label" }, item.label),
+              item.isCurrent
+                ? h("span", { className: "thread-actions-item-check", "aria-label": "Current project" }, "✓")
+                : null
+            )
+          )
+        )
+      )
+    )
   );
 }
 
