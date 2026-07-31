@@ -166,6 +166,7 @@ import { SessionSettingsButton } from "../shared/session-settings-panel.js";
 import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
 import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap } from "../shared/thread-activity.js";
+import { attachProjectSummaries } from "../shared/project-overview-model.js";
 import { threadAttention } from "../shared/thread-attention.js";
 import {
   configureThreadNotifications,
@@ -1826,6 +1827,14 @@ function RemoteSidebar({
     },
   });
 
+  // Built once per render and shared by the group headers' roll-up and the per-row dots
+  // below — the same hoist local does (render-session.js). Beyond the wasted rebuild per
+  // project, `threadAttention.snapshotMap()` copies mutable state on every call, so
+  // recomputing per group could let a header's badge disagree with the row under it.
+  const threadActivityMap = buildThreadActivityMap(session);
+  const threadAttentionMap = threadAttention.snapshotMap();
+  const threadReviewingSet = buildReviewingThreadSet(session, remoteReviews);
+
   return h(
     "aside",
     {
@@ -2019,7 +2028,14 @@ function RemoteSidebar({
           formatThreadMeta(thread) {
             return formatRelativeTime(thread.updated_at);
           },
-          groups: threadsModel.groups || [],
+          // Same activity roll-up the local project headers show ("2 working" /
+          // "1 needs input"). Attached here rather than in the render model because this
+          // is where all three per-thread maps are in scope.
+          groups: attachProjectSummaries(threadsModel.groups, {
+            threadActivity: threadActivityMap,
+            threadAttention: threadAttentionMap,
+            threadReviewing: threadReviewingSet,
+          }),
           includePreview: true,
           onContextThread,
           // Rename/delete on real project headers — only in Projects mode and only when
@@ -2030,9 +2046,9 @@ function RemoteSidebar({
           onResumeThread,
           onToggleExpandedGroup,
           onToggleGroup,
-          threadActivity: buildThreadActivityMap(session),
-          threadAttention: threadAttention.snapshotMap(),
-          threadReviewing: buildReviewingThreadSet(session, remoteReviews),
+          threadActivity: threadActivityMap,
+          threadAttention: threadAttentionMap,
+          threadReviewing: threadReviewingSet,
         })
       )
     ),

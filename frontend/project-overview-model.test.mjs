@@ -6,6 +6,7 @@ import {
   projectCardStatus,
   sortProjectCards,
   summarizeProjectActivity,
+  attachProjectSummaries,
   reorderCardIds,
 } from "./shared/project-overview-model.js";
 import {
@@ -109,4 +110,55 @@ test("thread-list store tracks a display-only activeProjectId", () => {
   // Falsy / non-string clears it (never holds a sentinel).
   store.getState().setActiveProject("");
   assert.equal(readActiveProjectId(store), null);
+});
+
+// --- attachProjectSummaries ---------------------------------------------------
+//
+// Guards the wiring that gives remote's project headers the same activity roll-up
+// local shows. The DOM tests cover how a `summary` renders; these cover whether a
+// group gets one at all, which is the part remote actually changed.
+
+const summaryMaps = () => ({
+  threadActivity: new Map([["t1", { state: "working" }]]),
+  threadAttention: new Map([["t2", "needs_input"]]),
+  threadReviewing: new Set(),
+});
+
+test("attachProjectSummaries rolls up each project group's own threads", () => {
+  const [group] = attachProjectSummaries(
+    [{ key: "p1", projectId: "p1", threads: [{ id: "t1" }, { id: "t2" }, { id: "t3" }] }],
+    summaryMaps()
+  );
+  assert.equal(group.summary.working, 1);
+  assert.equal(group.summary.needsInput, 1);
+  assert.equal(group.summary.total, 3);
+});
+
+// A cwd group is not a project; the header never takes the project branch, so
+// handing it a summary would be dead data.
+test("attachProjectSummaries leaves non-project groups untouched", () => {
+  const cwdGroup = { key: "/work/a", cwd: "/work/a", threads: [{ id: "t1" }] };
+  const [out] = attachProjectSummaries([cwdGroup], summaryMaps());
+  assert.equal(out, cwdGroup, "returned by identity, not copied");
+  assert.equal(out.summary, undefined);
+});
+
+// The counts are the group's own, never the whole board's — this is what breaks if
+// someone rolls up `threads` from the wrong scope.
+test("attachProjectSummaries scopes counts per group", () => {
+  const [a, b] = attachProjectSummaries(
+    [
+      { key: "p1", projectId: "p1", threads: [{ id: "t1" }] },
+      { key: "p2", projectId: "p2", threads: [{ id: "t2" }] },
+    ],
+    summaryMaps()
+  );
+  assert.deepEqual([a.summary.working, a.summary.needsInput], [1, 0]);
+  assert.deepEqual([b.summary.working, b.summary.needsInput], [0, 1]);
+});
+
+test("attachProjectSummaries tolerates a missing group list and missing threads", () => {
+  assert.deepEqual(attachProjectSummaries(null, summaryMaps()), []);
+  const [group] = attachProjectSummaries([{ key: "p1", projectId: "p1" }], summaryMaps());
+  assert.equal(group.summary.total, 0);
 });

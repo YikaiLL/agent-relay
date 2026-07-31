@@ -99,3 +99,30 @@ export function summarizeProjectActivity({
   }
   return { working, needsInput, reviewing, total: agents.length };
 }
+
+// Attach the roll-up above to each project group as `summary`, the single contract
+// ThreadGroupList's project header reads. Only project groups get one — a cwd group
+// never takes the project branch, so a summary there would be dead data.
+//
+// Counts come from the group's own `threads`, not from the rows the header happens to
+// be showing: a group can be collapsed and the list truncates past a limit, and on a
+// phone both are the common case rather than the exception.
+//
+// Pass ONE snapshot of the three maps for the whole render — they are also fed to the
+// per-row dots, and `threadAttention.snapshotMap()` copies mutable state on each call,
+// so re-snapshotting per group could let a header disagree with the row beneath it.
+export function attachProjectSummaries(groups, { threadActivity, threadAttention, threadReviewing } = {}) {
+  return (groups || []).map((group) =>
+    group?.projectId
+      ? {
+          ...group,
+          summary: summarizeProjectActivity({
+            agents: group.threads || [],
+            threadActivity,
+            threadAttention,
+            threadReviewing,
+          }),
+        }
+      : group
+  );
+}
