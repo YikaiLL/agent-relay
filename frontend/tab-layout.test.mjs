@@ -13,7 +13,9 @@ import {
   moveTab,
   openThreadIds,
   openThreadTab,
+  promoteTab,
   retargetThread,
+  sameWorkspace,
   setTabPinned,
   tabIdForThread,
 } from "./shared/tab-layout.js";
@@ -240,4 +242,108 @@ test("a session inside a split counts as open", () => {
   assert.deepEqual(ids(reopened), ["tab-split"]);
   assert.equal(reopened.focusedTabId, "tab-split");
   assert.deepEqual(openThreadIds(workspace), ["t1", "t2"]);
+});
+
+// ── Preview tabs ────────────────────────────────────────────────────────────
+// Browsing the sidebar must not accumulate tabs: a preview open reuses the one
+// preview slot (VS Code's italic tab), and only a deliberate gesture keeps it.
+
+test("a preview open reuses the single preview slot instead of appending", () => {
+  let workspace = openThreadTab(createTabWorkspace(), "t1", { preview: true });
+  workspace = openThreadTab(workspace, "t2", { preview: true });
+
+  assert.deepEqual(ids(workspace), [tabIdForThread("t2")], "t1's preview tab was replaced");
+  assert.equal(workspace.focusedTabId, tabIdForThread("t2"));
+  assert.equal(workspace.tabs[0].preview, true);
+});
+
+test("a preview tab is replaced in place, keeping strip order", () => {
+  let workspace = openThreadTab(createTabWorkspace(), "kept", { preview: false });
+  workspace = openThreadTab(workspace, "peek", { preview: true });
+  workspace = openThreadTab(workspace, "tail", { preview: false });
+  assert.deepEqual(
+    ids(workspace),
+    [tabIdForThread("kept"), tabIdForThread("peek"), tabIdForThread("tail")]
+  );
+
+  const swapped = openThreadTab(workspace, "peek2", { preview: true });
+  assert.deepEqual(
+    ids(swapped),
+    [tabIdForThread("kept"), tabIdForThread("peek2"), tabIdForThread("tail")],
+    "the new preview takes the old preview's position, not the end of the strip"
+  );
+});
+
+test("a kept open never becomes a preview, and never demotes an open tab", () => {
+  const kept = openThreadTab(createTabWorkspace(), "t1");
+  assert.equal(kept.tabs[0].preview, false, "opening without a preview intent keeps the tab");
+
+  // Focusing an existing preview tab must not silently keep it: only an explicit
+  // promotion does that, or the preview slot could never be reused.
+  const preview = openThreadTab(createTabWorkspace(), "t1", { preview: true });
+  const refocused = openThreadTab(preview, "t1");
+  assert.equal(refocused.tabs[0].preview, true);
+});
+
+test("promoting a tab keeps it, and frees the preview slot for the next peek", () => {
+  let workspace = openThreadTab(createTabWorkspace(), "t1", { preview: true });
+  workspace = promoteTab(workspace, tabIdForThread("t1"));
+  assert.equal(workspace.tabs[0].preview, false);
+
+  workspace = openThreadTab(workspace, "t2", { preview: true });
+  assert.deepEqual(
+    ids(workspace),
+    [tabIdForThread("t1"), tabIdForThread("t2")],
+    "the promoted tab survives the next preview"
+  );
+});
+
+test("promoting an unknown or already-kept tab is a no-op", () => {
+  const workspace = openThreadTab(createTabWorkspace(), "t1");
+  assert.deepEqual(promoteTab(workspace, "tab-missing"), workspace);
+  assert.deepEqual(promoteTab(workspace, tabIdForThread("t1")), workspace);
+});
+
+// Pin and drag are both "I'm keeping this" gestures, same as in an editor.
+test("pinning a preview tab keeps it", () => {
+  const workspace = setTabPinned(
+    openThreadTab(createTabWorkspace(), "t1", { preview: true }),
+    tabIdForThread("t1"),
+    true
+  );
+  assert.equal(workspace.tabs[0].pinned, true);
+  assert.equal(workspace.tabs[0].preview, false, "a pinned tab is by definition kept");
+});
+
+test("dragging a preview tab into place keeps it", () => {
+  let workspace = openThreadTab(createTabWorkspace(), "t1");
+  workspace = openThreadTab(workspace, "t2");
+  workspace = openThreadTab(workspace, "peek", { preview: true });
+
+  const moved = moveTab(workspace, tabIdForThread("peek"), 0);
+  assert.deepEqual(
+    ids(moved),
+    [tabIdForThread("peek"), tabIdForThread("t1"), tabIdForThread("t2")]
+  );
+  assert.equal(moved.tabs[0].preview, false);
+});
+
+// Change detection drives both persistence and re-render; a promotion that
+// compared equal would never reach IndexedDB or repaint the italic title.
+test("preview state participates in workspace equality", () => {
+  const preview = openThreadTab(createTabWorkspace(), "t1", { preview: true });
+  const kept = promoteTab(preview, tabIdForThread("t1"));
+  assert.equal(sameWorkspace(preview, kept), false);
+  assert.equal(sameWorkspace(kept, promoteTab(kept, tabIdForThread("t1"))), true);
+});
+
+test("preview state survives normalization and a rekeyed session", () => {
+  const stored = createTabWorkspace(
+    openThreadTab(createTabWorkspace(), "claude-pending-1", { preview: true })
+  );
+  assert.equal(stored.tabs[0].preview, true, "a reloaded window keeps its preview tab");
+
+  const retargeted = retargetThread(stored, "claude-pending-1", "real-1");
+  assert.equal(retargeted.tabs[0].preview, true);
+  assert.deepEqual(openThreadIds(retargeted), ["real-1"]);
 });

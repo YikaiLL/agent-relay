@@ -68,6 +68,7 @@ function materializeActionContext(action, state) {
     "CLOSE_TAB",
     "PIN_TAB",
     "MOVE_TAB",
+    "PROMOTE_TAB",
   ]);
   if (!contextualTypes.has(action?.type) || action.context) {
     return { ...action };
@@ -264,7 +265,13 @@ export function createSessionViewStore({
 }
 
 function defaultHistoryMode(action, change) {
-  if (action?.type === "PIN_TAB" || action?.type === "MOVE_TAB") {
+  // Strip bookkeeping, not navigation: none of these move what's on screen, so
+  // none of them belong in the back stack.
+  if (
+    action?.type === "PIN_TAB"
+    || action?.type === "MOVE_TAB"
+    || action?.type === "PROMOTE_TAB"
+  ) {
     return "none";
   }
   if (action?.type === "RESTORE_HISTORY") {
@@ -367,11 +374,23 @@ export function createSessionViewController({
     },
     whenIdle,
     dispatch: commit,
-    openThread(threadId, { context = null, replace = false } = {}) {
+    /**
+     * `preview` is tri-state and forwarded verbatim: `true` peeks (reusing the
+     * one preview tab), `false` is the deliberate open that keeps the session,
+     * and omitting it routes without re-flagging an already-open tab. See the
+     * OPEN_THREAD case in session-view-state.js.
+     */
+    openThread(threadId, { context = null, replace = false, preview = undefined } = {}) {
       return commit(
-        { type: "OPEN_THREAD", threadId, context },
+        { type: "OPEN_THREAD", threadId, context, preview },
         { history: replace ? "replace" : null }
       );
+    },
+    promoteTab(tabId, { context = null } = {}) {
+      return commit({ type: "PROMOTE_TAB", tabId, context }, { history: "none" });
+    },
+    promoteThread(threadId, { context = null } = {}) {
+      return commit({ type: "PROMOTE_TAB", threadId, context }, { history: "none" });
     },
     switchContext(context, { replace = false } = {}) {
       return commit(

@@ -279,7 +279,8 @@
         "tab-focus-switch",
         "tab-pin",
         "tab-close",
-        "tab-persistence"
+        "tab-persistence",
+        "tab-preview"
       ]
     },
     "local-session-tab-scroll": {

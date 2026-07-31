@@ -357,3 +357,102 @@ test("the invariant diagnostic reports an unowned visible thread without repairi
     `visible thread missing-tab is not open in ${SESSIONS_KEY}`,
   ]);
 });
+
+// ── Preview opens ───────────────────────────────────────────────────────────
+// The sidebar's browse gesture must not accumulate tabs. `preview: true` peeks,
+// `preview: false` is the deliberate open that keeps the session, and an
+// unqualified OPEN_THREAD (boot, a new session, a fallback) keeps by default
+// without ever demoting or promoting a tab behind the user's back.
+
+const previewIds = (state, key) =>
+  (state.workspaces[key]?.tabs || []).filter((tab) => tab.preview).flatMap((tab) => layoutThreadIds(tab.layout));
+
+test("browsing sessions with preview opens reuses one tab", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: true });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "c", preview: true });
+
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["c"]);
+  assert.equal(state.location.threadId, "c", "the peeked session is still on screen");
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["c"]);
+});
+
+test("a deliberate open keeps the session and promotes its preview tab", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: true });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: false });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+
+  assert.deepEqual(
+    workspaceThreadIds(state, SESSIONS_KEY),
+    ["a", "b"],
+    "the promoted session survived the next peek"
+  );
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["b"]);
+});
+
+test("an unqualified open keeps a new tab but never re-flags an open one", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a" });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), [], "a plain open is a kept tab");
+
+  // Focusing a previewed session from the tab strip or the URL must leave it
+  // previewed, otherwise the slot is consumed by ordinary navigation.
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a" });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b" });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["b"]);
+});
+
+test("PROMOTE_TAB keeps a previewed session by thread or by tab id", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "OPEN_THREAD", threadId: "a", preview: true });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["a"]);
+  state = transition(state, { type: "PROMOTE_TAB", threadId: "a" });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), []);
+
+  state = transition(state, { type: "OPEN_THREAD", threadId: "b", preview: true });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), ["b"]);
+  state = transition(state, { type: "PROMOTE_TAB", tabId: tabIdForThread("b") });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), []);
+  assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["a", "b"]);
+
+  // Unknown targets must not throw or disturb the location.
+  const before = state;
+  state = transition(state, { type: "PROMOTE_TAB", threadId: "missing" });
+  assert.deepEqual(state.location, before.location);
+});
+
+test("each context owns its own preview slot", () => {
+  let state = createSessionViewState();
+  state = transition(state, {
+    type: "OPEN_THREAD",
+    threadId: "a",
+    preview: true,
+    context: project("p1"),
+  });
+  state = transition(state, {
+    type: "OPEN_THREAD",
+    threadId: "b",
+    preview: true,
+    context: project("p2"),
+  });
+
+  assert.deepEqual(workspaceThreadIds(state, "p1"), ["a"], "p1 keeps its own peek");
+  assert.deepEqual(workspaceThreadIds(state, "p2"), ["b"]);
+  assert.deepEqual(previewIds(state, "p1"), ["a"], "p2's peek must not consume p1's slot");
+  assert.deepEqual(previewIds(state, "p2"), ["b"]);
+});
+
+// Restoring a route is not a browse gesture: a shared/reloaded `?thread=` is a
+// session the user asked for by name.
+test("history restore opens a kept tab", () => {
+  let state = createSessionViewState();
+  state = transition(state, {
+    type: "RESTORE_HISTORY",
+    entry: { version: 1, context: sessions() },
+    urlThreadId: "a",
+  });
+  assert.deepEqual(previewIds(state, SESSIONS_KEY), []);
+});

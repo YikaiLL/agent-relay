@@ -1568,7 +1568,7 @@ export function createSessionRenderer({
           // local only ever passed cwd groups here.
           onRenameProject,
           onDeleteProject,
-          onResumeThread(threadId) {
+          onResumeThread(threadId, { preview = true } = {}) {
             threadAttention.clear(threadId);
             void ensureNotificationPermission();
             renderThreads();
@@ -1580,6 +1580,16 @@ export function createSessionRenderer({
                 context: owningProjectId
                   ? { kind: "project", projectId: owningProjectId }
                   : null,
+                // A click is a peek, a double click keeps it — see ThreadGroupItem.
+                preview,
+                // A peek commits WITHOUT the root view transition, and that is
+                // load-bearing twice over. While a view transition is running the
+                // page never receives the second click of a double click, so the
+                // keep gesture would silently degrade into another peek. And
+                // browsing wants an instant cut anyway: a 140ms cross-fade of the
+                // whole surface per row is exactly the mush you don't want while
+                // scanning a list. A deliberate open still animates.
+                transition: !preview,
               });
             }
           },
@@ -1628,14 +1638,18 @@ export function createSessionRenderer({
         // cwd groups carry no projectId, so ThreadGroupHeader shows nothing there).
         onRenameProject,
         onDeleteProject,
-        onResumeThread(threadId) {
+        onResumeThread(threadId, { preview = true } = {}) {
           // Opening a thread clears its attention dot immediately; the click also
           // doubles as the user gesture that unlocks notification permission.
           threadAttention.clear(threadId);
           void ensureNotificationPermission();
           renderThreads();
           if (typeof viewThread === "function") {
-            viewThread(threadId);
+            // A click is a peek, a double click keeps it — see ThreadGroupItem.
+            // A peek skips the view transition: it swallows the second click of
+            // the double click, and browsing wants a cut. See the Projects-mode
+            // handler above for the full reasoning.
+            viewThread(threadId, { preview, transition: !preview });
           }
         },
         onSelectWorkspace(cwd) {
@@ -1717,13 +1731,16 @@ export function createSessionRenderer({
         formatMeta(thread) {
           return formatRelativeTime(thread.updated_at);
         },
-        onOpenAgent(threadId) {
+        onOpenAgent(threadId, { preview = true } = {}) {
           // Opening clears the attention dot and doubles as the gesture that unlocks
-          // notification permission — mirrors the sidebar's onResumeThread.
+          // notification permission — mirrors the sidebar's onResumeThread, peek
+          // semantics and skipped transition included. A card and a row are two
+          // doors onto the same list; they must not disagree about what a click
+          // does to the tab strip.
           threadAttention.clear(threadId);
           void ensureNotificationPermission();
           if (typeof viewThread === "function") {
-            viewThread(threadId);
+            viewThread(threadId, { preview, transition: !preview });
           }
         },
         onTogglePin(threadId) {

@@ -80,3 +80,16 @@ test("an empty workspace produces no items", () => {
   assert.deepEqual(build(createTabWorkspace()), []);
   assert.deepEqual(buildSessionTabItems(), []);
 });
+
+// A preview tab has to be visibly different, or the one tab that quietly gets
+// replaced looks identical to the ones that don't.
+test("tab items carry the preview flag", () => {
+  const workspace = createTabWorkspace({
+    tabs: [
+      { id: "tab-a", layout: createLeaf("t1") },
+      { id: "tab-b", preview: true, layout: createLeaf("t2") },
+    ],
+  });
+
+  assert.deepEqual(build(workspace).map((item) => item.preview), [false, true]);
+});

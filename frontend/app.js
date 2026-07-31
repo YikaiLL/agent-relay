@@ -2234,6 +2234,13 @@ async function runComposerSubmit() {
   }
   // The thread the user is looking at (the read-only pin's thread, else active).
   const targetThreadId = pin?.threadId || state.session?.active_thread_id || null;
+  // Sending is the strongest "I'm working here" signal there is, so it keeps a
+  // session that was only peeked at — otherwise the next sidebar click could
+  // replace the preview tab out from under a live conversation. Fire and forget:
+  // a strip bookkeeping write must never delay the message.
+  if (targetThreadId) {
+    void sessionViewController.promoteThread(targetThreadId);
+  }
   state.composerSubmitInFlight = true;
   renderComposerImageAttachments();
   if (state.session) renderer.renderSession(state.session); // freeze the composer
@@ -3590,6 +3597,10 @@ function setThreadRoute(threadId, options = {}) {
     return sessionViewController.openThread(threadId, {
       context,
       replace: Boolean(options.replace),
+      // Tri-state, forwarded rather than defaulted: `true` peeks, `false` keeps,
+      // and undefined (every route that isn't a sidebar gesture) opens a kept tab
+      // without re-flagging one that is already open.
+      preview: options.preview,
     });
   }
   return sessionViewController.showOverview(context, {
@@ -3757,6 +3768,9 @@ function renderSessionTabs() {
       onClose(tabId) {
         void sessionViewController.closeTab(tabId, { context });
       },
+      onPromote(tabId) {
+        void sessionViewController.promoteTab(tabId, { context });
+      },
       onTogglePin(tabId, pinned) {
         void sessionViewController.pinTab(tabId, pinned, { context });
       },
@@ -3777,12 +3791,15 @@ function renderSessionTabs() {
  * Module-level so every entry point shares it — the sidebar row handler and the tab
  * strip previously each carried their own copy of this body.
  */
-async function viewThreadById(threadId, { transition = true, replace = false, context = null } = {}) {
+async function viewThreadById(
+  threadId,
+  { transition = true, replace = false, context = null, preview = undefined } = {}
+) {
   // `context` lets a caller open a session INTO a specific context in one command —
   // the Projects sidebar needs it, because clicking a session nested under project P
   // must land in P's tab set even when another project is currently selected. Doing it
   // as one dispatch keeps state and history ordered; selecting then opening would be two.
-  const update = () => setThreadRoute(threadId, { replace, context });
+  const update = () => setThreadRoute(threadId, { replace, context, preview });
   if (transition) {
     await runViewTransition(update);
   } else {

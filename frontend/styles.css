@@ -5054,6 +5054,14 @@ body.is-resizing-panel {
 .session-tab.is-pinned + .session-tab:not(.is-pinned) {
   margin-left: 10px;
 }
+/* The preview tab: the one the next sidebar click will replace. Italic, the same
+ * signal an editor uses for exactly this state — it reads as "provisional"
+ * without stealing a slot in the strip or shifting the title, which a badge or a
+ * dashed border would. Double-click the tab (or the sidebar row, or just send a
+ * message) to keep it. */
+.session-tab.is-preview .session-tab-title {
+  font-style: italic;
+}
 
 .session-tab-main {
   display: flex;

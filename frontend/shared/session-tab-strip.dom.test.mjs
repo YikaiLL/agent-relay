@@ -698,3 +698,67 @@ test("an empty strip shows the empty message and still offers the new-tab contro
     view.cleanup();
   }
 });
+
+// ── Preview tabs ────────────────────────────────────────────────────────────
+// The strip renders one tab that is quietly replaceable, so it must both LOOK
+// different and offer the same keep gesture the sidebar row does.
+
+const PREVIEW_ITEMS = [
+  { tabId: "tab-a", threadId: "t1", title: "Alpha", pinned: false },
+  { tabId: "tab-b", threadId: "t2", title: "Beta", pinned: false, preview: true },
+];
+
+test("a preview tab is marked, and only that tab", () => {
+  const view = mount({ items: PREVIEW_ITEMS, focusedTabId: "tab-b" });
+
+  assert.equal(tabEl(view.host, "tab-b").classList.contains("is-preview"), true);
+  assert.equal(tabEl(view.host, "tab-a").classList.contains("is-preview"), false);
+
+  view.cleanup();
+});
+
+test("double-clicking a tab keeps it, without a second focus round trip", () => {
+  const focused = [];
+  const promoted = [];
+  const view = mount({
+    items: PREVIEW_ITEMS,
+    focusedTabId: "tab-b",
+    onFocus: (tabId) => focused.push(tabId),
+    onPromote: (tabId) => promoted.push(tabId),
+  });
+
+  const main = tabEl(view.host, "tab-b").querySelector(".session-tab-main");
+  click(main);
+  act(() => {
+    main.dispatchEvent(new dom.window.MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+  });
+
+  assert.deepEqual(promoted, ["tab-b"]);
+  assert.deepEqual(focused, ["tab-b"], "the keep gesture is not also a navigation");
+
+  view.cleanup();
+});
+
+// The close and pin controls own their own clicks (see the tests above); a double
+// click on them must not leak a promotion for a tab that is being closed.
+test("double-clicking the close control never promotes", () => {
+  const promoted = [];
+  const closed = [];
+  const view = mount({
+    items: PREVIEW_ITEMS,
+    focusedTabId: "tab-b",
+    onClose: (tabId) => closed.push(tabId),
+    onPromote: (tabId) => promoted.push(tabId),
+  });
+
+  const closeButton = tabEl(view.host, "tab-b").querySelector(".session-tab-close");
+  act(() => {
+    closeButton.dispatchEvent(
+      new dom.window.MouseEvent("dblclick", { bubbles: true, cancelable: true })
+    );
+  });
+
+  assert.deepEqual(promoted, []);
+
+  view.cleanup();
+});

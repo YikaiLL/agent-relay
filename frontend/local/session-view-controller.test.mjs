@@ -668,3 +668,65 @@ test("the browser adapter owns URL serialization without duplicating the thread 
     next: "/local?keep=yes#composer",
   });
 });
+
+// ── Preview tabs ────────────────────────────────────────────────────────────
+
+test("previewing browses without pushing history, and promotion persists silently", async () => {
+  const persistence = fakePersistence();
+  const entries = [];
+  const store = createSessionViewStore({
+    initialLocation: { context: sessions(), threadId: null },
+    persistence,
+  });
+  const controller = createSessionViewController({
+    store,
+    historyAdapter: {
+      write(entry) {
+        entries.push(entry);
+      },
+    },
+  });
+
+  await controller.openThread("a", { preview: true });
+  await controller.openThread("b", { preview: true });
+  assert.deepEqual(
+    threadIds(store.getState().workspaces[SESSIONS_KEY]),
+    ["b"],
+    "browsing reuses the one preview tab"
+  );
+  // Peeking is still navigation: each peek is a place you can go back from.
+  assert.deepEqual(entries.map((entry) => entry.threadId), ["a", "b"]);
+
+  const promoted = await controller.promoteThread("b");
+  assert.equal(
+    promoted.next.workspaces[SESSIONS_KEY].tabs[0].preview,
+    false
+  );
+  assert.equal(entries.length, 2, "promotion is not a navigation — no history entry");
+  assert.deepEqual(
+    promoted.changedWorkspaceKeys,
+    [SESSIONS_KEY],
+    "promotion is a real change, so it reaches persistence"
+  );
+  assert.equal(
+    persistence.values.get(SESSIONS_KEY).tabs[0].preview,
+    false,
+    "the kept tab survives a reload"
+  );
+
+  await controller.openThread("c", { preview: true });
+  assert.deepEqual(threadIds(store.getState().workspaces[SESSIONS_KEY]), ["b", "c"]);
+});
+
+test("promotion targets the tab's own context, not whatever is selected now", async () => {
+  const store = createSessionViewStore({
+    initialLocation: { context: sessions(), threadId: null },
+  });
+  const controller = createSessionViewController({ store });
+
+  await controller.openThread("a", { context: project("p1"), preview: true });
+  await controller.switchContext(sessions());
+  await controller.promoteTab(tabIdForThread("a"), { context: project("p1") });
+
+  assert.equal(store.getState().workspaces.p1.tabs[0].preview, false);
+});

@@ -115,6 +115,11 @@ function tabState(page) {
       titles: tabs.map((tab) => tab.querySelector(".session-tab-title")?.textContent || ""),
       threadIds: tabs.map((tab) => tab.dataset.threadId || ""),
       pinned: tabs.map((tab) => tab.className.includes("is-pinned")),
+      // The tab the next sidebar click will replace. Italic in the strip; the
+      // data attribute exists so this can be asserted rather than eyeballed.
+      previewThreadIds: tabs
+        .filter((tab) => tab.dataset.preview === "true")
+        .map((tab) => tab.dataset.threadId || ""),
       focusedThreadId:
         document.querySelector(".session-tab.is-focused")?.dataset.threadId || null,
       stripPresent: Boolean(document.querySelector(".session-tab-strip")),
@@ -357,6 +362,78 @@ async function run() {
           + JSON.stringify(backState.threadIds)
       );
     }
+
+    // --- Browsing peeks; only a deliberate gesture keeps a tab ---
+    // A sidebar click used to append a tab per row it touched, so scrolling the
+    // list looking for a session left a dozen tabs behind. It now reuses ONE
+    // preview tab; a double click (or a pin, a drag, or sending a message) is
+    // what keeps a session. The session still opens on the FIRST click — peeking
+    // must stay as immediate as it always was.
+    await clearTabPersistence(page);
+    await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
+    await openThreadDrawer(page);
+    await page.waitForSelector(`button.conversation-item[data-thread-id="${threadA}"]`, {
+      timeout: TIMEOUT_MS,
+    });
+
+    await page.click(`button.conversation-item[data-thread-id="${threadA}"]`);
+    await page.waitForFunction(
+      (id) => [...document.querySelectorAll(".session-tab")].some((tab) => tab.dataset.threadId === id),
+      threadA,
+      { timeout: TIMEOUT_MS }
+    );
+    const peeked = await tabState(page);
+    assert.deepEqual(peeked.threadIds, [threadA], "a peek opens the session immediately");
+    assert.deepEqual(
+      peeked.previewThreadIds,
+      [threadA],
+      "a browsed session lands in the preview tab"
+    );
+    await waitForCoherent(page, "after peeking at a session");
+
+    // The whole point: the second peek REPLACES the first instead of stacking.
+    await page.click(`button.conversation-item[data-thread-id="${threadB}"]`);
+    await page.waitForFunction(
+      (id) => {
+        const tabs = [...document.querySelectorAll(".session-tab")];
+        return tabs.length === 1 && tabs[0].dataset.threadId === id;
+      },
+      threadB,
+      { timeout: TIMEOUT_MS }
+    );
+    await waitForCoherent(page, "after peeking at a second session");
+
+    // A double click keeps it, so the next peek can no longer take its slot.
+    //
+    // This assertion is also the regression guard for a real trap: while a root
+    // view transition is running, the page does not receive the SECOND click of a
+    // double click at all — the gesture silently degrades to a single click. A
+    // peek therefore commits without a transition (see render-session.js); if
+    // that ever goes back, this times out rather than failing somewhere subtle.
+    await page.dblclick(`button.conversation-item[data-thread-id="${threadB}"]`);
+    await page.waitForFunction(
+      () => document.querySelectorAll(".session-tab[data-preview]").length === 0,
+      { timeout: TIMEOUT_MS }
+    );
+    await page.click(`button.conversation-item[data-thread-id="${threadA}"]`);
+    await page.waitForFunction(
+      () => document.querySelectorAll(".session-tab").length === 2,
+      { timeout: TIMEOUT_MS }
+    );
+    const keptAndPeeked = await tabState(page);
+    assert.deepEqual(
+      [...keptAndPeeked.threadIds].sort(),
+      [threadA, threadB].sort(),
+      "the kept session survives the next peek"
+    );
+    assert.deepEqual(
+      keptAndPeeked.previewThreadIds,
+      [threadA],
+      "only the freshly peeked session stays replaceable"
+    );
+    await waitForCoherent(page, "after keeping one session and peeking another");
+    await shoot(page, "06b-preview-tabs");
 
     // --- Sessions mode and Projects mode keep separate tab sets ---
     // Switching back to Sessions leaves `activeProjectId` set, so keying the tab

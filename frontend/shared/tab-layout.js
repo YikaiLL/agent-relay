@@ -59,11 +59,26 @@ export function layoutHasThread(layout, threadId) {
 }
 
 function normalizeTab(tab) {
+  const pinned = Boolean(tab?.pinned);
   return {
     id: String(tab?.id || ""),
-    pinned: Boolean(tab?.pinned),
+    pinned,
+    // A PREVIEW tab is one the user is only looking at. Browsing the sidebar
+    // reuses this single slot instead of appending, so peeking at twenty
+    // sessions leaves one tab rather than twenty; a deliberate gesture
+    // (double-click, pin, drag, sending a message) promotes it. Same contract as
+    // an editor's italic tab.
+    //
+    // Pinned wins: a pinned tab is by definition kept, so the two can never both
+    // be set — including on a workspace rehydrated from storage.
+    preview: !pinned && Boolean(tab?.preview),
     layout: tab?.layout || createLeaf(""),
   };
+}
+
+/** The workspace's preview tab, if it currently has one. At most one exists. */
+export function previewTab(workspace) {
+  return (workspace?.tabs || []).find((tab) => tab.preview) || null;
 }
 
 // Pinned tabs always sort before unpinned ones (Chrome's pinned zone). Sorting is
@@ -105,8 +120,14 @@ export function tabIdForThread(threadId) {
  * Open `threadId`. A session is never opened twice: if some tab already shows it
  * (including inside a split), that tab is focused instead of a duplicate being
  * appended — the same rule a browser applies to "switch to tab".
+ *
+ * `preview: true` opens it as THE preview tab, replacing whatever was previewed
+ * before (in place, so the strip doesn't reshuffle while browsing). It only ever
+ * affects a NEW tab: focusing a session that is already open never changes
+ * whether its tab is kept, in either direction — promotion is `promoteTab`'s job
+ * alone, or the preview slot could never be reused.
  */
-export function openThreadTab(workspace, threadId, { tabId = null } = {}) {
+export function openThreadTab(workspace, threadId, { tabId = null, preview = false } = {}) {
   const base = createTabWorkspace(workspace);
   if (!threadId) {
     return base;
@@ -120,12 +141,40 @@ export function openThreadTab(workspace, threadId, { tabId = null } = {}) {
   const tab = normalizeTab({
     id: tabId || tabIdForThread(threadId),
     pinned: false,
+    preview,
     layout: createLeaf(threadId),
   });
+
+  const replacing = preview ? base.tabs.findIndex((entry) => entry.preview) : -1;
+  if (replacing !== -1) {
+    const tabs = [...base.tabs];
+    tabs.splice(replacing, 1, tab);
+    return { tabs: partitionPinned(tabs), focusedTabId: tab.id };
+  }
+
   // Appended after the pinned partition, never inside it.
   return {
     tabs: partitionPinned([...base.tabs, tab]),
     focusedTabId: tab.id,
+  };
+}
+
+/**
+ * Keep a preview tab: it stops being replaceable and survives the next peek.
+ *
+ * Deliberately separate from `openThreadTab` so that merely routing to a session
+ * — boot, popstate, a re-render's normalization pass — can never promote by
+ * accident. Only the gestures that mean "I'm working here" call this.
+ */
+export function promoteTab(workspace, tabId) {
+  const base = createTabWorkspace(workspace);
+  const target = findTab(base, tabId);
+  if (!target?.preview) {
+    return base;
+  }
+  return {
+    ...base,
+    tabs: base.tabs.map((tab) => (tab.id === tabId ? { ...tab, preview: false } : tab)),
   };
 }
 
@@ -167,8 +216,10 @@ export function setTabPinned(workspace, tabId, pinned) {
   if (!findTab(base, tabId)) {
     return base;
   }
+  // Through normalizeTab, so pinning also keeps a previewed tab — pinning is one
+  // of the "I'm keeping this" gestures.
   const tabs = base.tabs.map((tab) =>
-    tab.id === tabId ? { ...tab, pinned: Boolean(pinned) } : tab
+    tab.id === tabId ? normalizeTab({ ...tab, pinned: Boolean(pinned) }) : tab
   );
   return { ...base, tabs: partitionPinned(tabs) };
 }
@@ -188,7 +239,9 @@ export function moveTab(workspace, tabId, toIndex) {
     return base;
   }
 
-  const moving = base.tabs[from];
+  // Placing a tab by hand is an "I'm keeping this" gesture too: a preview tab
+  // that got dragged into position must not be replaced by the next peek.
+  const moving = normalizeTab({ ...base.tabs[from], preview: false });
   const pinnedCount = base.tabs.filter((tab) => tab.pinned).length;
   const lowerBound = moving.pinned ? 0 : pinnedCount;
   const upperBound = moving.pinned ? pinnedCount - 1 : base.tabs.length - 1;
@@ -307,6 +360,9 @@ export function sameWorkspace(left, right) {
     return (
       tab.id === other.id
       && Boolean(tab.pinned) === Boolean(other.pinned)
+      // Promotion changes nothing but this flag, and it still has to reach
+      // persistence and repaint the tab — so it belongs in the comparison.
+      && Boolean(tab.preview) === Boolean(other.preview)
       // Layout trees are a handful of nodes; a serialized compare keeps this honest
       // about nested splits without hand-rolling a tree walk.
       && JSON.stringify(tab.layout) === JSON.stringify(other.layout)

@@ -163,11 +163,20 @@ function ProjectCard({
         `${isDragging ? " is-dragging" : ""}${isDropTarget ? " is-drop-target" : ""}`,
       draggable: true,
       "data-thread-id": thread.id,
+      // A card PEEKS, exactly like a sidebar row: the session opens into the one
+      // reusable preview tab, so arranging an overview doesn't leave a tab behind
+      // per card you looked at. Cards and rows are two doors onto the same list
+      // and must not disagree about what opening means.
+      //
+      // No double-click-to-keep here, though the row has one: opening replaces
+      // the overview with the conversation, so the card is gone before a second
+      // click could reach it. Keeping belongs where the target survives — the tab
+      // strip (double-click the tab, or pin it), or simply sending a message.
       onClick: (event) => {
         if (event.target.closest(".project-card-pin") || event.target.closest(".project-card-drag")) {
           return;
         }
-        onOpen(thread.id);
+        onOpen(thread.id, { preview: true });
       },
       onDragStart: (event) => onDragStart(event, thread.id),
       onDragOver: (event) => onDragOver(event, thread.id),

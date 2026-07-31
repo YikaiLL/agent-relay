@@ -655,7 +655,18 @@ export function ThreadGroupItem({
       "data-thread-id": thread.id,
       "data-thread-provider": thread.provider || "",
       "data-thread-title": title,
-      onClick: () => onResumeThread?.(thread.id),
+      // One row, two intents. A single click PEEKS: the session opens instantly,
+      // as before, but into the reusable preview tab — so scrolling the sidebar
+      // hunting for a session no longer leaves a tab behind for every row touched
+      // on the way. A double click KEEPS it, the way an editor pins the tab you
+      // actually start working in.
+      //
+      // The two clicks of a double click fire first and peek; the dblclick then
+      // upgrades that same tab. Nothing is opened twice — `preview` only ever
+      // decides how a NEW tab is flagged, and the surface with no tab strip
+      // (remote) simply ignores the option.
+      onClick: () => onResumeThread?.(thread.id, { preview: true }),
+      onDoubleClick: () => onResumeThread?.(thread.id, { preview: false }),
       onContextMenu: onContextThread
         ? (event) => {
             event.preventDefault();

@@ -96,7 +96,16 @@ function providerMark(provider) {
   });
 }
 
-function SessionTab({ item, focused, isDragging, isDropTarget, onFocus, onClose, onTogglePin }) {
+function SessionTab({
+  item,
+  focused,
+  isDragging,
+  isDropTarget,
+  onFocus,
+  onClose,
+  onPromote,
+  onTogglePin,
+}) {
   // One source of truth for the activity dot, shared with the thread list and
   // project cards — a tab must never disagree with the sidebar about a session.
   const dot = selectThreadDot({
@@ -111,10 +120,13 @@ function SessionTab({ item, focused, isDragging, isDropTarget, onFocus, onClose,
       className:
         `session-tab${focused ? " is-focused" : ""}`
         + `${item.pinned ? " is-pinned" : ""}`
+        + `${item.preview ? " is-preview" : ""}`
         + `${isDragging ? " is-dragging" : ""}`
         + `${isDropTarget ? " is-drop-target" : ""}`,
       "data-tab-id": item.tabId,
       "data-thread-id": item.threadId,
+      // Read by the e2e suite, which has no way to ask about an italic title.
+      "data-preview": item.preview ? "true" : undefined,
     },
     h(
       "button",
@@ -124,6 +136,12 @@ function SessionTab({ item, focused, isDragging, isDropTarget, onFocus, onClose,
         "aria-selected": focused ? "true" : "false",
         className: "session-tab-main",
         onClick: () => onFocus?.(item.tabId),
+        // Same keep gesture as the sidebar row, on the other end of the journey:
+        // you peeked, you stayed, now double click to stop it being replaceable.
+        // Bound to the tab's own button so a double click on the close or pin
+        // control — which stop their own clicks — can never promote a tab that is
+        // on its way out.
+        onDoubleClick: () => onPromote?.(item.tabId),
         title: item.tooltip || item.title,
       },
       // One fixed-width slot for both states, so titles line up whether or not a
@@ -185,6 +203,7 @@ export function SessionTabStrip({
   focusedTabId = null,
   onFocus = null,
   onClose = null,
+  onPromote = null,
   onTogglePin = null,
   onMove = null,
   onNewTab = null,
@@ -592,6 +611,7 @@ export function SessionTabStrip({
         isDropTarget: dropTargetId === item.tabId && draggingId !== item.tabId,
         onFocus,
         onClose,
+        onPromote,
         onTogglePin,
       })
     ),
@@ -638,6 +658,9 @@ export function buildSessionTabItems({
       tabId: tab.id,
       threadId: primaryId,
       pinned: Boolean(tab.pinned),
+      // The tab the next peek will replace. Rendered as an italic title, the same
+      // signal an editor uses for exactly this state.
+      preview: Boolean(tab.preview),
       title: `${resolved.title || "Session"}${paneSuffix}`,
       tooltip: resolved.tooltip || null,
       // Which agent owns the tab. Shown in the leading slot while the session is

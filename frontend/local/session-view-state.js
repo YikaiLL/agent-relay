@@ -24,6 +24,7 @@ import {
   layoutThreadIds,
   moveTab,
   openThreadTab,
+  promoteTab,
   retargetThread,
   setTabPinned,
 } from "../shared/tab-layout.js";
@@ -220,10 +221,44 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
       const context = action.context
         ? normalizeSessionViewContext(action.context)
         : state.location.context;
-      const opened = openThreadTab(workspaceFor(state, context), threadId);
+      // Three intents, and the difference matters:
+      //   preview: true   browse — reuse the one preview slot
+      //   preview: false  deliberate open — keep it, promoting an existing peek
+      //   omitted         route to it (boot, popstate, a new session, a fallback
+      //                   after a close): a new tab is kept, an open one is left
+      //                   exactly as it is. Navigation must never silently
+      //                   consume or free the preview slot.
+      const opened = openThreadTab(workspaceFor(state, context), threadId, {
+        preview: action.preview === true,
+      });
+      const owning = action.preview === false ? findTabByThread(opened, threadId) : null;
       return createSessionViewState({
         location: { context, threadId },
-        workspaces: withWorkspace(state, context, opened).workspaces,
+        workspaces: withWorkspace(
+          state,
+          context,
+          owning ? promoteTab(opened, owning.id) : opened
+        ).workspaces,
+      });
+    }
+
+    case "PROMOTE_TAB": {
+      const context = action.context
+        ? normalizeSessionViewContext(action.context)
+        : state.location.context;
+      const current = workspaceFor(state, context);
+      // Addressable either way: the tab strip knows the tab, the composer and the
+      // sidebar know the session.
+      const tabId =
+        stringId(action.tabId)
+        || findTabByThread(current, stringId(action.threadId))?.id
+        || null;
+      if (!tabId) {
+        return state;
+      }
+      return createSessionViewState({
+        location: state.location,
+        workspaces: withWorkspace(state, context, promoteTab(current, tabId)).workspaces,
       });
     }
 
