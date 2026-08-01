@@ -198,7 +198,7 @@ import {
   unassignRemoteThread,
 } from "./project-actions.js";
 import { normalizeProjectName, projectsMenuReady } from "../shared/project-menu.js";
-import { buildThreadSheetSections, threadSheetHasActions } from "../shared/thread-actions-model.js";
+import { selectThreadSheet } from "../shared/thread-actions-model.js";
 import { runThreadSheetAction } from "./thread-sheet-action.js";
 import { ProviderStatusSection } from "./provider-status-section.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
@@ -1190,28 +1190,32 @@ function RemoteApp() {
   // Remote's only reachable session-actions entry on a phone: `contextmenu` never
   // fires for a touch long-press, so before this the row's right-click binding was
   // dead on iOS and fork was reachable only from a transcript message.
-  const actionsSheetThread =
-    (currentState.threads || []).find((entry) => entry.id === actionsSheetThreadId) || null;
-  const actionsSheetSections = actionsSheetThread
-    ? buildThreadSheetSections({
-        // Same rule the relay enforces and local's menu mirrors — a background thread
-        // can be mid-turn too, so this is not just "is the active session running".
-        canFork: !threadIsBusyForFork(actionsSheetThread, session),
-        projects: remoteProjects.projects,
-        currentProjectId: remoteProjects.threadProjectId?.[actionsSheetThreadId] || null,
-        projectsLoaded: remoteProjects.loaded,
-        projectsError: remoteProjects.error,
-        projectsLoading: remoteProjects.loading,
-      })
-    : [];
+  const selectSheetFor = (threadId) =>
+    selectThreadSheet({
+      threadId,
+      threads: currentState.threads,
+      session,
+      projects: remoteProjects.projects,
+      threadProjectId: remoteProjects.threadProjectId,
+      projectsLoaded: remoteProjects.loaded,
+      projectsError: remoteProjects.error,
+      projectsLoading: remoteProjects.loading,
+    });
+  const { thread: actionsSheetThread, sections: actionsSheetSections } =
+    selectSheetFor(actionsSheetThreadId);
 
-  const openActionsSheet = (threadId) => setActionsSheetThreadId(threadId);
+  const openActionsSheet = (threadId) => {
+    // Decide at TAP time. Deriving openness from the live sections instead would let a
+    // tap that found nothing re-open the sheet by itself moments later, when a slow
+    // projects payload landed — a sheet the user never asked for a second time.
+    if (!selectSheetFor(threadId).hasActions) {
+      renderLog("No actions available for that session yet.");
+      return;
+    }
+    setActionsSheetThreadId(threadId);
+  };
   const closeActionsSheet = () => setActionsSheetThreadId(null);
-  // An empty sheet must never slide up: it reads as a bug and, on a phone, also costs
-  // a tap to dismiss. Both gates matter — a thread can be mid-turn (no fork) while the
-  // projects payload is still loading (no project section).
-  const actionsSheetOpen =
-    Boolean(actionsSheetThreadId) && threadSheetHasActions(actionsSheetSections);
+  const actionsSheetOpen = Boolean(actionsSheetThreadId);
 
   function handleThreadSheetAction(item) {
     const threadId = actionsSheetThreadId;
@@ -2987,9 +2991,10 @@ function RemoteNotificationsSection({ pushModel }) {
 // thumb reach. Built on ManagedDialog so it inherits Esc/backdrop dismissal and the
 // no-showModal fallback the other two remote modals already rely on.
 //
-// It renders descriptors and nothing else — which actions exist is decided by
-// buildThreadSheetSections, and every action's transport already exists. Archive and
-// delete are absent on purpose: the broker has no action for them (see the model).
+// It renders descriptors and nothing else — what a session offers is decided by
+// selectThreadSheet. Two different rules apply there: an action with no remote
+// transport (archive, delete) is absent entirely, while one that merely cannot run
+// right now (fork on a running session) is present and disabled, saying why.
 function ThreadActionsSheet({ onClose, onSelect, open, sections, threadTitle }) {
   return h(
     ManagedDialog,
@@ -3018,6 +3023,12 @@ function ThreadActionsSheet({ onClose, onSelect, open, sections, threadTitle }) 
     h(
       "div",
       { className: "panel-modal-body" },
+      // Openness is decided at tap time against a session that HAD actions, but that
+      // session can disappear underneath an open sheet (archived elsewhere, list
+      // refreshed). Say so rather than leave a blank sheet on screen.
+      sections.length
+        ? null
+        : h("p", { className: "thread-actions-empty" }, "This session is no longer available."),
       ...sections.map((section) =>
         h(
           "div",
@@ -3032,7 +3043,11 @@ function ThreadActionsSheet({ onClose, onSelect, open, sections, threadTitle }) 
                 // list answers "where does this live" as well as "where can it go".
                 className: `thread-actions-item${item.isCurrent ? " is-current" : ""}`,
                 key: `${item.kind}:${item.projectId || index}`,
-                onClick: () => onSelect(item),
+                // Present but refused — the label says why (a running session cannot be
+                // forked; the projects payload is not trustworthy yet). Actions remote
+                // has no transport for are absent entirely rather than disabled here.
+                disabled: Boolean(item.disabled),
+                onClick: item.disabled ? undefined : () => onSelect(item),
               },
               h("span", { className: "thread-actions-item-label" }, item.label),
               item.isCurrent

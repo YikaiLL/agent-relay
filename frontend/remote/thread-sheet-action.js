@@ -16,7 +16,9 @@ import { pickNewProjectId } from "../shared/project-menu.js";
  *                             openFork, refresh, log }
  */
 export async function runThreadSheetAction({ item, threadId, projects = [], deps } = {}) {
-  if (!item || !threadId || !deps) return;
+  // A refused entry (running session, projects not loaded) is rendered disabled, but
+  // never trust the view for that — the descriptor is the authority.
+  if (!item || item.disabled || !threadId || !deps) return;
   const { assign, unassign, create, fetchProjects, promptName, openFork, refresh, log } = deps;
   try {
     if (item.kind === "fork") {

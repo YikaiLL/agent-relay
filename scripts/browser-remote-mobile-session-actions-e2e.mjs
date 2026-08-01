@@ -32,6 +32,9 @@ const WEB_ROOT = path.join(ROOT, "web");
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 30000);
 const RELAY_ID = "relay-e2e";
 const THREAD_ID = "thread-mobile-actions-e2e";
+// A SECOND, adjacent row. The enlarged touch target is taller than a row, so without
+// a neighbour there is nothing for it to bleed into and the overlap is invisible.
+const THREAD_ID_2 = "thread-mobile-actions-e2e-2";
 const MOBILE_VIEWPORT = { width: 390, height: 844 };
 
 async function main() {
@@ -59,7 +62,7 @@ async function main() {
 
   try {
     await page.addInitScript(
-      ({ relayId, threadId }) => {
+      ({ relayId, threadId, threadId2 }) => {
         const REMOTE_STATE_STORAGE_KEY = "agent-relay.remote-state";
         const REMOTE_STATE_SCHEMA_VERSION = 1;
         const REMOTE_SECRET_DB_NAME = "agent-relay-secrets";
@@ -90,6 +93,12 @@ async function main() {
           // wants to see the fork entry.
           status: "completed",
           model_provider: "openai",
+        };
+        const threadSummary2 = {
+          ...threadSummary,
+          id: threadId2,
+          name: "Beta session",
+          updated_at: 2,
         };
         const snapshot = {
           provider: "codex",
@@ -152,6 +161,7 @@ async function main() {
           })
         );
 
+        window.__projectActions = [];
         window.__agentRelaySecretReady = false;
         const openRequest = indexedDB.open(REMOTE_SECRET_DB_NAME, 1);
         openRequest.onupgradeneeded = () => {
@@ -216,8 +226,16 @@ async function main() {
                 action: "list_threads",
                 ok: true,
                 snapshot,
-                threads: { threads: [threadSummary] },
+                threads: { threads: [threadSummary, threadSummary2] },
               });
+              return;
+            }
+            if (request.type === "project_action") {
+              // Record what the sheet actually put on the wire, so the test can assert
+              // the action fired and carried the right thread/project — not merely
+              // that a button existed.
+              window.__projectActions.push(request.input || null);
+              this.#respond(actionId, { action: "project_action", ok: true, snapshot });
               return;
             }
             if (request.type === "fetch_projects") {
@@ -264,7 +282,7 @@ async function main() {
         }
         window.WebSocket = FakeWebSocket;
       },
-      { relayId: RELAY_ID, threadId: THREAD_ID }
+      { relayId: RELAY_ID, threadId: THREAD_ID, threadId2: THREAD_ID_2 }
     );
 
     await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
@@ -279,6 +297,27 @@ async function main() {
     const rowSelector = `.conversation-item-wrap:has([data-thread-id="${THREAD_ID}"])`;
     await page.waitForSelector(rowSelector, { state: "visible", timeout: TIMEOUT_MS });
 
+    // The drawer SLIDES in, and Playwright calls the row "visible" from the first frame
+    // — while it is still off-screen left (measured at x=-36 mid-animation). Every
+    // geometry assertion below would be measuring a position the user never sees, so
+    // wait for the transform to settle: on screen, and unchanged across two frames.
+    // A single frame's comparison is not enough — an eased transition barely moves near
+    // its end, so two samples can match while the drawer is still travelling. Require
+    // the same position several polls running.
+    await page.waitForFunction(
+      (selector) => {
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        const left = Math.round(el.getBoundingClientRect().left);
+        const state = window.__drawerSettle;
+        window.__drawerSettle =
+          state && state.left === left ? { left, count: state.count + 1 } : { left, count: 0 };
+        return left >= 0 && window.__drawerSettle.count >= 5;
+      },
+      rowSelector,
+      { timeout: TIMEOUT_MS }
+    );
+
     // --- 1. the "⋯" is reachable on touch ------------------------------------
     const moreButton = page.locator(`${rowSelector} .conversation-more`);
     await moreButton.waitFor({ state: "visible", timeout: TIMEOUT_MS });
@@ -288,6 +327,99 @@ async function main() {
       "1",
       "the actions button must not be hover-gated at mobile width — it is the only entry point there"
     );
+
+    // --- 1b. and its TOUCH TARGET meets the 44px floor -----------------------
+    //
+    // The glyph is 26px; the target is widened by an invisible overlay. Measuring the
+    // button's own box would miss that, so probe what actually receives a tap at the
+    // corners of the 44px square — the thing a finger cares about.
+    const hitArea = await page.evaluate((selector) => {
+      const more = document.querySelector(`${selector} .conversation-more`);
+      const r = more.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const reach = 44 / 2 - 1; // just inside the intended square
+      const probe = (dx, dy) => {
+        const el = document.elementFromPoint(cx + dx, cy + dy);
+        const hit = Boolean(el && (el === more || more.contains(el)));
+        // Name what intercepted the tap — a bare false gives nothing to debug from.
+        return hit || `blocked by ${el ? el.tagName + "." + (el.className || "?") : "nothing"}`;
+      };
+      return {
+        probes: {
+          centre: probe(0, 0),
+          left: probe(-reach, 0),
+          right: probe(reach, 0),
+          top: probe(0, -reach),
+          bottom: probe(0, reach),
+        },
+        glyphWidth: Math.round(r.width),
+        targetWidth: getComputedStyle(more, "::after").width,
+      };
+    }, rowSelector);
+    for (const [edge, hit] of Object.entries(hitArea.probes)) {
+      assert.equal(
+        hit,
+        true,
+        `a tap ${edge} of the glyph must still reach the actions button (44px floor), got ${JSON.stringify(hitArea)}`
+      );
+    }
+
+    // --- 1c. and it does not bleed into the NEIGHBOURING session -------------
+    //
+    // The enlarged target is centred on a 26px glyph, so if it is taller than the row
+    // it overhangs the rows above and below. Those are separately positioned, so the
+    // next row paints over the overhang: the effective target shrinks AND a tap near
+    // the edge can open the wrong session. Probe just inside the top and bottom of
+    // each row's target and assert the hit belongs to THAT row.
+    const neighbour = await page.evaluate(
+      ({ idA, idB }) => {
+        const wrapFor = (id) =>
+          document.querySelector(`.conversation-item-wrap:has([data-thread-id="${id}"])`);
+        const check = (id) => {
+          const wrap = wrapFor(id);
+          if (!wrap) return `no row for ${id}`;
+          const more = wrap.querySelector(".conversation-more");
+          const r = more.getBoundingClientRect();
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          const reach = 44 / 2 - 1;
+          const owner = (dy) => {
+            const el = document.elementFromPoint(cx, cy + dy);
+            const ownWrap = el && el.closest(".conversation-item-wrap");
+            if (!ownWrap) return "none";
+            return ownWrap === wrap ? "self" : "OTHER ROW";
+          };
+          return { top: owner(-reach), bottom: owner(reach) };
+        };
+        const wrapA = wrapFor(idA);
+        const wrapB = wrapFor(idB);
+        return {
+          a: check(idA),
+          b: check(idB),
+          rowHeight: wrapA ? Math.round(wrapA.getBoundingClientRect().height) : null,
+          adjacent:
+            wrapA && wrapB
+              ? Math.round(
+                  Math.abs(
+                    wrapB.getBoundingClientRect().top - wrapA.getBoundingClientRect().bottom
+                  )
+                )
+              : null,
+        };
+      },
+      { idA: THREAD_ID, idB: THREAD_ID_2 }
+    );
+    assert.ok(neighbour.rowHeight, `expected two rendered rows, got ${JSON.stringify(neighbour)}`);
+    for (const [row, edges] of [["first", neighbour.a], ["second", neighbour.b]]) {
+      for (const [edge, owner] of Object.entries(edges)) {
+        assert.equal(
+          owner,
+          "self",
+          `the ${edge} of the ${row} row's touch target must belong to its own session — a tap there must not open a neighbour. Got ${JSON.stringify(neighbour)}`
+        );
+      }
+    }
 
     // --- 2. it does not obscure the row --------------------------------------
     const geometry = await page.evaluate((selector) => {
@@ -381,9 +513,38 @@ async function main() {
       `the sheet must dock to the bottom edge on a phone, got ${JSON.stringify(sheet)}`
     );
 
+    // --- 6. an action actually reaches the wire ------------------------------
+    //
+    // Listing the right labels proves nothing about whether tapping one does anything.
+    // Move the session to the project it is NOT in, and assert the frame the relay
+    // would have received.
+    await page
+      .locator("#remote-thread-actions-sheet .thread-actions-item", { hasText: "Beta project" })
+      .tap();
+    await page.waitForFunction(() => window.__projectActions.length > 0, null, { timeout: TIMEOUT_MS });
+    const [assignFrame] = await page.evaluate(() => window.__projectActions);
+    assert.equal(assignFrame.action, "assign", `expected an assign, got ${JSON.stringify(assignFrame)}`);
+    assert.equal(assignFrame.thread_id, THREAD_ID);
+    assert.equal(assignFrame.project_id, "p2", "must carry the project that was tapped");
+
+    // Acting closes the sheet — leaving it up over the result would strand a modal.
+    await page.waitForSelector("#remote-thread-actions-sheet[open]", {
+      state: "hidden",
+      timeout: TIMEOUT_MS,
+    });
+
     console.log(
       JSON.stringify(
-        { threadId: THREAD_ID, items: sheet.items, providerPanel, viewport: MOBILE_VIEWPORT, ok: true },
+        {
+          threadId: THREAD_ID,
+          items: sheet.items,
+          providerPanel,
+          hitArea,
+          neighbour,
+          assignFrame,
+          viewport: MOBILE_VIEWPORT,
+          ok: true,
+        },
         null,
         2
       )

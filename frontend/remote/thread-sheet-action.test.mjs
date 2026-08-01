@@ -99,6 +99,16 @@ test("a transport failure is reported instead of swallowed", async () => {
   assert.match(h.calls[0][1], /Session action failed: relay offline/);
 });
 
+// The sheet renders these disabled, but the descriptor is the authority — a stale
+// render or a stray programmatic call must not fork a running session.
+test("a disabled descriptor never executes", async () => {
+  const h = harness();
+  await run({ kind: "fork", disabled: true }, h);
+  assert.deepEqual(h.calls, []);
+  await run({ kind: "projects-unavailable", disabled: true }, h);
+  assert.deepEqual(h.calls, []);
+});
+
 test("an unknown descriptor does nothing at all", async () => {
   const h = harness();
   await run({ kind: "nope" }, h);

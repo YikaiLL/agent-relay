@@ -1253,8 +1253,10 @@ input:focus, textarea:focus, select:focus {
 .conversation-item-wrap {
   position: relative;
 }
+/* Reserves the full 44px the actions button claims as a touch target (below), so the
+   enlarged hit area never lands on the session title. */
 .conversation-item-wrap .conversation-item {
-  padding-right: 34px;
+  padding-right: 44px;
 }
 .conversation-more {
   position: absolute;
@@ -1286,10 +1288,29 @@ input:focus, textarea:focus, select:focus {
 }
 /* Touch devices have no hover, and a long-press never dispatches `contextmenu` on
    iOS — so on a phone this button is the ONLY way to reach session actions. It can
-   never be hover-gated there. */
+   never be hover-gated there, and it has to meet the 44px touch floor. */
 @media (hover: none) {
   .conversation-more {
     opacity: 1;
+  }
+  /* The row is ~35px by default. Raising it to the touch floor is what lets the
+     enlarged target below sit ENTIRELY inside its own row: a 44px target centred on a
+     26px glyph in a 35px row overhangs ~4.5px top and bottom, and because rows are
+     separately positioned the neighbour paints over that overhang — so the target was
+     both smaller than it looked and able to open the WRONG session near the edge. */
+  .conversation-item-wrap .conversation-item {
+    min-height: 44px;
+  }
+  /* The glyph stays 26px; only the hit area grows, so a narrow drawer keeps its
+     density. Contained by the min-height above — never extend this past the row. */
+  .conversation-more::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 44px;
+    height: 44px;
   }
 }
 
@@ -3643,6 +3664,16 @@ input:focus, textarea:focus, select:focus {
 .thread-actions-item:hover {
   background: var(--surface-2);
 }
+/* Present but refused — a running session cannot be forked, a projects payload that is
+   still loading cannot be trusted. Local's menu disables the same entries rather than
+   hiding them, so the sheet does not change shape as a turn starts and ends. */
+.thread-actions-item:disabled {
+  color: var(--text-3);
+  cursor: default;
+}
+.thread-actions-item:disabled:hover {
+  background: transparent;
+}
 .thread-actions-item.is-current {
   color: var(--text-primary);
   font-weight: var(--weight-strong);
@@ -3656,6 +3687,12 @@ input:focus, textarea:focus, select:focus {
 .thread-actions-item-check {
   flex: none;
   color: var(--accent, var(--text-secondary));
+}
+.thread-actions-empty {
+  margin: 0;
+  padding: 14px 12px;
+  color: var(--text-3);
+  font-size: var(--text-body);
 }
 /* Phone: dock to the bottom edge and go full width. */
 @media (max-width: 600px) {

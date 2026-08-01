@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildThreadSheetSections, threadSheetHasActions } from "./thread-actions-model.js";
+import {
+  buildThreadSheetSections,
+  selectThreadSheet,
+  threadSheetHasActions,
+} from "./thread-actions-model.js";
 
 const READY = { projectsLoaded: true, projectsError: null, projectsLoading: false };
 const projects = [
@@ -10,42 +14,56 @@ const projects = [
 ];
 
 const kinds = (sections) => sections.map((section) => section.kind);
-const labels = (sections, kind) =>
-  (sections.find((section) => section.kind === kind)?.items || []).map((item) => item.label);
+const items = (sections, kind) => sections.find((section) => section.kind === kind)?.items || [];
+const labels = (sections, kind) => items(sections, kind).map((item) => item.label);
 
-test("a forkable session in a fresh projects payload offers both sections", () => {
-  const sections = buildThreadSheetSections({ canFork: true, projects, ...READY });
+test("an idle session in a fresh projects payload offers both sections", () => {
+  const sections = buildThreadSheetSections({ projects, ...READY });
   assert.deepEqual(kinds(sections), ["session", "projects"]);
   assert.deepEqual(labels(sections, "session"), ["Fork session"]);
 });
 
-// Nothing to fork from — offering the action would open a dialog that cannot submit.
-test("fork is withheld when the session cannot be forked", () => {
-  const sections = buildThreadSheetSections({ canFork: false, projects, ...READY });
-  assert.deepEqual(kinds(sections), ["projects"]);
+// A running session keeps the entry, DISABLED and saying why — the same thing local's
+// menu does. Hiding it would make the row's actions change shape as a turn starts and
+// ends, and leave the user wondering where fork went.
+test("a busy session still shows fork, disabled, with local's wording", () => {
+  const sections = buildThreadSheetSections({ forkBlocked: true, projects, ...READY });
+  const fork = items(sections, "session")[0];
+  assert.equal(fork.label, "Running session cannot be forked");
+  assert.equal(fork.disabled, true);
+  assert.equal(fork.kind, "fork");
 });
 
-// Fail closed, exactly as the sidebar does: a stale payload must not present
-// membership controls, because "current" could point at the wrong project.
-test("the projects section is withheld while the payload is not fresh", () => {
-  for (const stale of [
-    { projectsLoaded: false, projectsError: null, projectsLoading: false },
-    { projectsLoaded: true, projectsError: "boom", projectsLoading: false },
-    { projectsLoaded: true, projectsError: null, projectsLoading: true },
-  ]) {
-    const sections = buildThreadSheetSections({ canFork: true, projects, ...stale });
-    assert.deepEqual(kinds(sections), ["session"], JSON.stringify(stale));
-  }
+test("an idle session's fork entry is enabled", () => {
+  const fork = items(buildThreadSheetSections({ projects, ...READY }), "session")[0];
+  assert.equal(fork.disabled, false);
 });
+
+// Projects ARE supported on remote — they are just not loaded yet. Saying so beats an
+// empty gap where the section will later appear.
+// The full state matrix the real store can produce, because getting this wrong shows
+// the user "loading…" for something that already failed and will never arrive.
+// createProjectsStore leaves `loaded:false` when the FIRST fetch throws (it only
+// latches `loaded` on success), so a first-load failure is
+// {loaded:false, loading:false, error} — not the {loaded:true, error} of a later
+// refresh failure.
+for (const [name, state, expected] of [
+  ["never fetched", { projectsLoaded: false, projectsLoading: false, projectsError: null }, "Projects are loading…"],
+  ["first fetch in flight", { projectsLoaded: false, projectsLoading: true, projectsError: null }, "Projects are loading…"],
+  ["first fetch FAILED", { projectsLoaded: false, projectsLoading: false, projectsError: "boom" }, "Projects unavailable"],
+  ["retrying after a failure", { projectsLoaded: false, projectsLoading: true, projectsError: "boom" }, "Projects unavailable"],
+  ["refresh failed after a success", { projectsLoaded: true, projectsLoading: false, projectsError: "boom" }, "Projects unavailable"],
+  ["refreshing after a success", { projectsLoaded: true, projectsLoading: true, projectsError: null }, "Projects are loading…"],
+]) {
+  test(`projects state — ${name} — reads "${expected}"`, () => {
+    const sections = buildThreadSheetSections({ projects, ...state });
+    assert.deepEqual(labels(sections, "projects"), [expected]);
+    assert.equal(items(sections, "projects")[0].disabled, true);
+  });
+}
 
 test("an assigned session can be moved, removed, or filed under a new project", () => {
-  const sections = buildThreadSheetSections({
-    canFork: true,
-    projects,
-    currentProjectId: "p1",
-    ...READY,
-  });
-  // Current project first so membership is readable without scanning.
+  const sections = buildThreadSheetSections({ projects, currentProjectId: "p1", ...READY });
   assert.deepEqual(labels(sections, "projects"), [
     "Alpha",
     "Beta",
@@ -55,20 +73,114 @@ test("an assigned session can be moved, removed, or filed under a new project", 
 });
 
 test("an unassigned session is offered no 'remove from project'", () => {
-  const sections = buildThreadSheetSections({ canFork: true, projects, ...READY });
-  assert.deepEqual(labels(sections, "projects"), ["Alpha", "Beta", "New project…"]);
+  assert.deepEqual(labels(buildThreadSheetSections({ projects, ...READY }), "projects"), [
+    "Alpha",
+    "Beta",
+    "New project…",
+  ]);
 });
 
-// The empty case is the one that must never reach the screen.
-test("threadSheetHasActions is false when every section is empty", () => {
+// Archive and delete reach the relay over HTTP routes the broker has no action for.
+// Listing them would render buttons that cannot fire.
+test("no action is offered for a transport remote does not have", () => {
+  const text = JSON.stringify(buildThreadSheetSections({ projects, ...READY }));
+  assert.doesNotMatch(text, /archive/i);
+  assert.doesNotMatch(text, /delete/i);
+});
+
+// --- selectThreadSheet: resolving which session the sheet is for -----------------
+
+const session = { active_thread_id: "live-1", active_turn_id: null };
+const threads = [{ id: "t1", status: "completed" }];
+
+test("a session in the list resolves and gets a sheet", () => {
+  const view = selectThreadSheet({ threadId: "t1", threads, session, projects, ...READY });
+  assert.equal(view.thread.id, "t1");
+  assert.equal(view.hasActions, true);
+});
+
+// The render model INJECTS the active session as a row when history has not loaded or
+// pagination left it out (view-model.js). That row is real and tappable, so resolving
+// only from the fetched list left its "⋯" dead while its right-click still worked —
+// the fork path already resolved through this fallback.
+test("the injected active session resolves even when the thread list omits it", () => {
+  const view = selectThreadSheet({
+    threadId: "live-1",
+    threads: [],
+    session: { active_thread_id: "live-1", active_turn_id: null, current_status: "idle" },
+    projects,
+    ...READY,
+  });
+  assert.ok(view.thread, "the active session must resolve without a list entry");
+  assert.equal(view.thread.id, "live-1");
+  assert.equal(view.hasActions, true, "its sheet must open like any other row's");
+});
+
+test("a live session mid-turn resolves, and its fork entry is the disabled one", () => {
+  const view = selectThreadSheet({
+    threadId: "live-1",
+    threads: [],
+    session: { active_thread_id: "live-1", active_turn_id: "turn-9" },
+    projects,
+    ...READY,
+  });
+  assert.equal(items(view.sections, "session")[0].disabled, true);
+  assert.equal(view.hasActions, true, "a busy session still has a sheet worth opening");
+});
+
+// The invariant that removes the dead-tap and the belated-open at the root: as long as
+// the session resolves, there is always something to show.
+test("a resolved session always has actions, whatever the projects payload is doing", () => {
+  for (const projectsState of [
+    READY,
+    { projectsLoaded: false, projectsLoading: true, projectsError: null },
+    { projectsLoaded: true, projectsLoading: false, projectsError: "boom" },
+  ]) {
+    for (const busy of [{ active_turn_id: null }, { active_turn_id: "turn-9" }]) {
+      const view = selectThreadSheet({
+        threadId: "live-1",
+        threads: [],
+        session: { active_thread_id: "live-1", ...busy },
+        projects,
+        ...projectsState,
+      });
+      assert.equal(
+        view.hasActions,
+        true,
+        `expected actions for ${JSON.stringify({ projectsState, busy })}`
+      );
+    }
+  }
+});
+
+test("a thread that resolves to nothing yields no sheet", () => {
+  const view = selectThreadSheet({ threadId: "ghost", threads, session, projects, ...READY });
+  assert.equal(view.thread, null);
+  assert.deepEqual(view.sections, []);
+  assert.equal(view.hasActions, false);
+});
+
+test("no thread id yields no sheet", () => {
+  const view = selectThreadSheet({ threadId: "", threads, session, projects, ...READY });
+  assert.equal(view.hasActions, false);
+});
+
+test("membership is read for the resolved thread", () => {
+  const view = selectThreadSheet({
+    threadId: "t1",
+    threads,
+    session,
+    projects,
+    threadProjectId: { t1: "p2" },
+    ...READY,
+  });
+  const current = items(view.sections, "projects").filter((item) => item.isCurrent);
+  assert.deepEqual(current.map((item) => item.label), ["Beta"]);
+});
+
+test("threadSheetHasActions is false only when every section is empty", () => {
   assert.equal(threadSheetHasActions([]), false);
   assert.equal(threadSheetHasActions([{ kind: "projects", items: [] }]), false);
   assert.equal(threadSheetHasActions(null), false);
   assert.equal(threadSheetHasActions([{ kind: "session", items: [{ kind: "fork" }] }]), true);
-});
-
-test("a session with no fork and no fresh projects yields nothing to open", () => {
-  const sections = buildThreadSheetSections({ canFork: false, projects });
-  assert.deepEqual(sections, []);
-  assert.equal(threadSheetHasActions(sections), false);
 });
