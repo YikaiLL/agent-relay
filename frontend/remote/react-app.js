@@ -107,15 +107,9 @@ import {
   isOmittedFileChangeDetail,
   setLiveTranscriptEntryDetail,
 } from "./transcript/details.js";
-import {
-  captureTranscriptScrollSnapshot,
-  readTranscriptScrollPosition,
-  rememberTranscriptScrollPosition,
-  restoreTranscriptScrollPosition,
-  retargetRemoteTranscriptScroll,
-} from "./transcript-scroll.js";
 import { ensureProviderModels, fetchModelsWithRetry } from "./provider-model-fetch.js";
 import { useRemoteSessionRuntime } from "./use-remote-session-runtime.js";
+import { useRemoteTranscriptScrollBookkeeping } from "./use-transcript-scroll-bookkeeping.js";
 import {
   RemoteReviewerChip,
   RemoteWorkspaceChangesRail,
@@ -203,7 +197,6 @@ import { runThreadSheetAction } from "./thread-sheet-action.js";
 import { ProviderStatusSection } from "./provider-status-section.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
 import { renderLog } from "./session-surface.js";
-import { setRemoteTranscriptElement } from "./ui-refs.js";
 import { formatRelativeTime, formatTimestamp, shortId } from "./utils.js";
 
 const h = React.createElement;
@@ -2503,12 +2496,6 @@ function RemoteTranscriptPanel({
 }) {
   const relayNicknames = useRelayNicknames();
   const transcriptRef = useRef(null);
-  const previousRenderRef = useRef({
-    activeThreadId: null,
-    entries: [],
-  });
-  const anchoredUserIdsRef = useRef(new Map()); // threadId -> Set<userId>
-  const scrollPositionsRef = useRef(new Map()); // relayId:threadId -> restoration intent
 
   const approval = sessionView?.approval || null;
   const entries = session?.transcript || [];
@@ -2519,114 +2506,11 @@ function RemoteTranscriptPanel({
       && currentState.transcriptHydrationStatus === "loading"
   );
 
-  useLayoutEffect(() => {
-    const transcript = transcriptRef.current;
-    setRemoteTranscriptElement(transcript);
-    if (!transcript) {
-      previousRenderRef.current = {
-        activeThreadId: session?.active_thread_id || null,
-        entries,
-      };
-      return;
-    }
-
-    const previous = previousRenderRef.current;
-    const remoteThreadId = session?.active_thread_id || null;
-    const remoteScrollKey = remoteThreadId
-      ? `${currentState.activeRelayId || "-"}:${remoteThreadId}`
-      : null;
-
-    // Deferred-Claude promotion (send path sets the one-shot alias): same
-    // logical thread under a new public id — rekey the retained bookkeeping
-    // instead of treating it as a thread switch, so the first reply keeps the
-    // send-anchor instead of jump-bottom briefly re-enabling live follow.
-    const promotion = currentState.promotedThreadAlias || null;
-    if (
-      promotion
-      && previous?.activeThreadId === promotion.from
-      && remoteThreadId === promotion.to
-    ) {
-      retargetRemoteTranscriptScroll({
-        anchoredUserIds: anchoredUserIdsRef.current,
-        scrollPositions: scrollPositionsRef.current,
-        snapshot: previous,
-        fromScrollKey: `${currentState.activeRelayId || "-"}:${promotion.from}`,
-        toScrollKey: remoteScrollKey,
-        fromThreadId: promotion.from,
-        toThreadId: remoteThreadId,
-      });
-      // Consumed: the alias is one-shot. (An alias whose transition this pane
-      // never renders stays until the next promotion overwrites it — pending
-      // ids are unique, so it can never match anything else.)
-      currentState.promotedThreadAlias = null;
-    }
-
-    let restoredScrollPosition = null;
-    if (previous?.scrollKey && previous.scrollKey !== remoteScrollKey) {
-      // The prior layout-effect cleanup and scroll listener retained the old
-      // thread against its own DOM. Do not overwrite it here using the newly
-      // rendered thread's geometry; that can turn a history-reading offset into
-      // a false bottom-follow marker (or vice versa).
-      if (!scrollPositionsRef.current.has(previous.scrollKey)) {
-        const evictedScrollKey = rememberTranscriptScrollPosition(
-          scrollPositionsRef.current,
-          previous.scrollKey,
-          previous
-        );
-        if (evictedScrollKey) {
-          anchoredUserIdsRef.current.delete(evictedScrollKey);
-        }
-      }
-      restoredScrollPosition = readTranscriptScrollPosition(
-        scrollPositionsRef.current,
-        remoteScrollKey
-      );
-    }
-    const anchorsForThread =
-      anchoredUserIdsRef.current.get(remoteScrollKey) || new Set();
-    const action = restoreTranscriptScrollPosition({
-      alreadyAnchoredUserIds: anchorsForThread,
-      nextEntries: entries,
-      nextThreadId: remoteThreadId,
-      previousSnapshot: previous,
-      restoredScrollPosition,
-      scrollElement: transcript,
-    });
-    // Record the latest user entry handled by this action. New-message actions
-    // use this to avoid re-jumping mid-stream; thread-transition actions use it
-    // to establish the loaded transcript as a baseline so the next snapshot
-    // cannot mistake retained history for a newly-sent message.
-    if (action?.userEntryId) {
-      anchorsForThread.add(action.userEntryId);
-      anchoredUserIdsRef.current.set(remoteScrollKey, anchorsForThread);
-    }
-
-    const rememberCurrentPosition = () => {
-      const evictedScrollKey = rememberTranscriptScrollPosition(
-        scrollPositionsRef.current,
-        remoteScrollKey,
-        transcript
-      );
-      if (evictedScrollKey) {
-        anchoredUserIdsRef.current.delete(evictedScrollKey);
-      }
-    };
-    rememberCurrentPosition();
-    transcript.addEventListener("scroll", rememberCurrentPosition, { passive: true });
-
-    previousRenderRef.current = {
-      ...captureTranscriptScrollSnapshot({
-        entries,
-        scrollElement: transcript,
-        threadId: remoteThreadId,
-      }),
-      scrollKey: remoteScrollKey,
-    };
-    return () => {
-      rememberCurrentPosition();
-      transcript.removeEventListener("scroll", rememberCurrentPosition);
-      setRemoteTranscriptElement(null);
-    };
+  useRemoteTranscriptScrollBookkeeping({
+    currentState,
+    entries,
+    threadId: session?.active_thread_id || null,
+    transcriptRef,
   });
 
   let body = null;
