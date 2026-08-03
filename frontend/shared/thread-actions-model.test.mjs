@@ -20,7 +20,53 @@ const labels = (sections, kind) => items(sections, kind).map((item) => item.labe
 test("an idle session in a fresh projects payload offers both sections", () => {
   const sections = buildThreadSheetSections({ projects, ...READY });
   assert.deepEqual(kinds(sections), ["session", "projects"]);
-  assert.deepEqual(labels(sections, "session"), ["Fork session"]);
+  assert.deepEqual(labels(sections, "session"), ["Fork session", "Rename session\u2026"]);
+});
+
+// Rename passes the transport rule that excludes archive/delete: it HAS a broker action
+// (`rename_thread`). It is also never disabled — a rename is relay-side metadata that
+// takes no session claim, so unlike fork it stays usable while the session is mid-turn.
+test("rename is offered, and stays enabled on a running session", () => {
+  for (const forkBlocked of [false, true]) {
+    const rename = items(buildThreadSheetSections({ forkBlocked, projects, ...READY }), "session")
+      .find((item) => item.kind === "rename");
+    assert.ok(rename, `rename must be offered (forkBlocked=${forkBlocked})`);
+    assert.notEqual(rename.disabled, true, "renaming never waits for a turn to finish");
+  }
+});
+
+// "Use the agent's name" removes an override. Offering it on a session that never had
+// one is a control that provably does nothing — and `name` cannot be used to decide,
+// because the agent titles nearly every session.
+test("the reset entry appears only for a session that actually carries an override", () => {
+  const withOverride = labels(buildThreadSheetSections({ renamed: true, projects, ...READY }), "session");
+  assert.deepEqual(withOverride, ["Fork session", "Rename session\u2026", "Use the agent's name"]);
+
+  const withoutOverride = labels(buildThreadSheetSections({ projects, ...READY }), "session");
+  assert.ok(!withoutOverride.includes("Use the agent's name"));
+});
+
+test("the reset entry is driven by the relay's flag, not the displayed title", () => {
+  const agentTitled = selectThreadSheet({
+    threadId: "t1",
+    threads: [{ id: "t1", status: "completed", name: "Fix the auth bug" }],
+    session,
+    projects,
+    ...READY,
+  });
+  assert.ok(
+    !labels(agentTitled.sections, "session").includes("Use the agent's name"),
+    "an agent-supplied name is not an override"
+  );
+
+  const userTitled = selectThreadSheet({
+    threadId: "t1",
+    threads: [{ id: "t1", status: "completed", name: "Auth work", renamed: true }],
+    session,
+    projects,
+    ...READY,
+  });
+  assert.ok(labels(userTitled.sections, "session").includes("Use the agent's name"));
 });
 
 // A running session keeps the entry, DISABLED and saying why — the same thing local's

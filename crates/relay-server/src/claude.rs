@@ -348,6 +348,7 @@ impl ProviderBridge for ClaudeCodeBridge {
                 model_provider: "anthropic".to_string(),
                 provider: "claude_code".to_string(),
                 forked_from: None,
+                renamed: false,
             };
             return Ok(StartThreadResult {
                 thread,
@@ -444,6 +445,7 @@ impl ProviderBridge for ClaudeCodeBridge {
             model_provider: "anthropic".to_string(),
             provider: self.provider_name().to_string(),
             forked_from: None,
+            renamed: false,
         };
 
         Ok(Some(StartThreadResult {
@@ -501,6 +503,7 @@ impl ProviderBridge for ClaudeCodeBridge {
                     model_provider: "anthropic".to_string(),
                     provider: "claude_code".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 status: "idle".to_string(),
                 active_flags: Vec::new(),
@@ -1081,6 +1084,7 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                 model_provider: "anthropic".to_string(),
                 provider: "claude_code".to_string(),
                 forked_from: None,
+                renamed: false,
             });
             relay.notify();
         }
@@ -1986,6 +1990,7 @@ mod tests {
             model_provider: "anthropic".to_string(),
             provider: "claude_code".to_string(),
             forked_from: None,
+            renamed: false,
         }
     }
 
@@ -3257,6 +3262,7 @@ mod tests {
                     model_provider: "codex".to_string(),
                     provider: "codex".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 "/tmp/codex",
                 "gpt-5.5",

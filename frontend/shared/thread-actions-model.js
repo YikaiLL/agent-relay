@@ -29,6 +29,7 @@ import { resolveForkSourceThread, threadIsBusyForFork } from "./fork-fields.js";
  */
 export function buildThreadSheetSections({
   forkBlocked = false,
+  renamed = false,
   projects = [],
   currentProjectId = null,
   projectsLoaded = false,
@@ -47,9 +48,26 @@ export function buildThreadSheetSections({
           label: forkBlocked ? "Running session cannot be forked" : "Fork session",
           disabled: forkBlocked,
         },
+        {
+          // Rename passes the transport rule above: it has a real broker action
+          // (`rename_thread`), unlike archive/delete. It is never disabled — a rename
+          // is relay-side metadata that takes no session claim, so it works while the
+          // session is mid-turn.
+          kind: "rename",
+          label: "Rename session…",
+        },
       ],
     },
   ];
+
+  // Only offered once there is an override to remove. Listing it on a session that
+  // still shows the agent's own title would be a control that provably does nothing.
+  if (renamed) {
+    sections[0].items.push({
+      kind: "rename-reset",
+      label: "Use the agent's name",
+    });
+  }
 
   if (projectsMenuReady({ projectsLoaded, projectsError, projectsLoading })) {
     sections.push({
@@ -108,6 +126,9 @@ export function selectThreadSheet({
     // The rule the relay enforces and local's menu mirrors — a BACKGROUND thread can be
     // mid-turn too, so this is not just "is the active session running".
     forkBlocked: threadIsBusyForFork(thread, session),
+    // The relay's own flag, not `name`: the latter is the merged title, so it is set on
+    // every session the agent has titled and would advertise a reset on all of them.
+    renamed: Boolean(thread.renamed),
     projects,
     currentProjectId: threadProjectId?.[threadId] || null,
     projectsLoaded,

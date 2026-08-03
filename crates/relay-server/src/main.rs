@@ -42,13 +42,14 @@ use protocol::{
     DevicesResponse, ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView,
     PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
     ProjectActionInput, ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput,
-    ReadThreadTranscriptInput, RequestReviewInput, RequestReviewReceipt, ResumeSessionInput,
-    ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput,
-    SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StartWorkflowInput,
-    StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
-    ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-    ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
-    WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse,
+    ReadThreadTranscriptInput, RenameThreadInput, RequestReviewInput, RequestReviewReceipt,
+    ResumeSessionInput, ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse,
+    RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, SessionSnapshotCompactProfile,
+    StartSessionInput, StartWorkflowInput, StartWorkflowReceipt, StopTurnInput,
+    SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
+    ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadTranscriptResponse, ThreadsQuery,
+    ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput, WorkflowActionReceipt,
+    WorkflowsResponse, WorkspaceDiffResponse,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -309,6 +310,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/allowed-roots", post(update_allowed_roots))
         .route("/api/projects", get(fetch_projects).post(project_action))
         .route("/api/devices", get(list_devices))
+        .route("/api/threads/:thread_id/rename", post(rename_thread))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
             "/api/threads/:thread_id/delete",
@@ -734,6 +736,40 @@ async fn fetch_projects(
 ) -> Result<Json<ApiEnvelope<ProjectsResponse>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
     Ok(Json(ApiEnvelope::ok(context.app.fetch_projects().await)))
+}
+
+async fn rename_thread(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+    // A REQUIRED body, deliberately unlike the neighbouring archive/delete handlers.
+    //
+    // They take `Option<Json<_>>`, whose rejection type in axum 0.7 is `Infallible` and
+    // whose body is `T::from_request(..).await.ok()` — it swallows EVERY rejection: a
+    // missing or wrong `Content-Type`, malformed JSON, a wrong value type, an oversized
+    // body. For archive, all of those collapse to a benign default ("keep reviewer
+    // threads"). Here they would collapse to `RenameThreadInput::default()`, i.e.
+    // `name: None`, which this endpoint reads as a RESET — so a client that merely
+    // forgot its content-type header would get `200 OK` and have the user's title
+    // silently deleted.
+    //
+    // Rather than try to tell "no body" apart from "unparseable body" (the wrong
+    // content-type case is genuinely ambiguous), the bodyless convenience is dropped:
+    // a reset is the explicit `{"name": null}`, which is what both surfaces already
+    // send. Anything unparseable now gets axum's own 400/415 instead of destroying data.
+    Json(input): Json<RenameThreadInput>,
+) -> Result<Json<ApiEnvelope<ThreadRenameReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .rename_thread(&thread_id, input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        // Every failure here is a rejected REQUEST (name too long, reviewer thread,
+        // limit reached) — the rename never touches a provider, so there is no upstream
+        // to blame with a 502.
+        .map_err(bad_request)
 }
 
 async fn archive_thread(

@@ -29,3 +29,20 @@ export const assignRemoteThreadToProject = (threadId, projectId) =>
 
 export const unassignRemoteThread = (threadId) =>
   dispatchRemoteProjectAction({ action: "unassign", thread_id: threadId });
+
+/**
+ * Set (`name`) or clear (`null`) a session's user-chosen title.
+ *
+ * Its own broker action rather than a `project_action` variant: renaming a session is a
+ * different noun from renaming the project it sits in. Like `project_action` it takes no
+ * session claim — a rename never runs a turn, so it must not fight the active controller
+ * for the relay-wide lease and must work while that session is mid-turn.
+ *
+ * The broker drops the receipt (ack-only), so the caller repaints optimistically and
+ * lets the bumped `threads_revision` reconcile everyone, including this device.
+ */
+export const renameRemoteThread = (threadId, name) =>
+  dispatchOrRecover("rename_thread", {
+    thread_id: threadId,
+    input: { name: name ?? null },
+  });

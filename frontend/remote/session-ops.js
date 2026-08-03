@@ -30,6 +30,7 @@ import { providerLabel } from "../shared/provider-labels.js";
 import {
   createThreadListQueryOptions,
   createThreadTranscriptPageQueryOptions,
+  fetchThreadListFresh,
 } from "../shared/thread-queries.js";
 import {
   syncLiveTranscriptEntryDetailsFromSnapshot,
@@ -1113,25 +1114,49 @@ export async function fetchRemoteProviderModels(provider) {
   return result.models || [];
 }
 
+// Generation counter for the remote list. Bypassing de-duplication means two list
+// requests can be in flight at once with no ordering guarantee, so the OLDER one must not
+// land on top of the newer one's data — after a rename, the stale answer is precisely the
+// one that predates it.
+let remoteThreadsGeneration = 0;
+
 export async function refreshRemoteThreads(reason, options = {}) {
-  const { silent = false } = options;
+  // `fresh` bypasses the query cache's in-flight de-duplication — see
+  // `fetchThreadListFresh`. Used when the refresh answers a KNOWN mutation (a rename,
+  // here or on another device) rather than a poll.
+  const { silent = false, fresh = false } = options;
+  const generation = ++remoteThreadsGeneration;
 
   if (!silent) {
     renderLog(`Fetching remote session list (${reason}).`);
   }
 
   try {
-    const threads = await remoteQueryClient.fetchQuery(
-      createThreadListQueryOptions({
-        fetchThreads: fetchRemoteThreads,
-        limit: 80,
-        scope: remoteQueryScope(),
-        surface: "remote",
-      })
-    );
+    const queryOptions = {
+      fetchThreads: fetchRemoteThreads,
+      limit: 80,
+      scope: remoteQueryScope(),
+      surface: "remote",
+    };
+    const threads = fresh
+      ? await fetchThreadListFresh({ ...queryOptions, queryClient: remoteQueryClient })
+      : await remoteQueryClient.fetchQuery(createThreadListQueryOptions(queryOptions));
+    // Superseded by a newer refresh while this one was in flight — its result is the
+    // older view of the list, so applying it would undo the newer one.
+    if (generation !== remoteThreadsGeneration) {
+      return threads;
+    }
     applyRemoteSurfacePatch(createRemoteThreadsPatch(threads));
     return threads;
   } catch (error) {
+    // A superseded refresh did not fail — it was overtaken, and a fresh fetch CANCELS the
+    // request it replaced (evicting the query destroys its retryer). Reporting that as
+    // "Remote session refresh failed" would put an error banner on the screen every time
+    // a rename overtook the 12s poll, for a refresh whose result was going to be thrown
+    // away regardless. Swallow it; the newer request owns the repaint.
+    if (generation !== remoteThreadsGeneration) {
+      return [];
+    }
     if (!silent) {
       renderLog(`Remote session refresh failed: ${error.message}`);
     }

@@ -12,17 +12,60 @@ import { pickNewProjectId } from "../shared/project-menu.js";
  * @param {object} item      descriptor from buildThreadSheetSections
  * @param {string} threadId  the session the sheet was opened for
  * @param {Array}  projects  the projects known BEFORE the action (for the create diff)
+ * @param {string} currentName the session's CURRENT user-chosen title (its override),
+ *                             or null — seeds the rename prompt's "reset" semantics
  * @param {object} deps      { assign, unassign, create, fetchProjects, promptName,
- *                             openFork, refresh, log }
+ *                             openFork, refresh, log, rename, promptRename, refreshThreads }
  */
-export async function runThreadSheetAction({ item, threadId, projects = [], deps } = {}) {
+export async function runThreadSheetAction({
+  item,
+  threadId,
+  projects = [],
+  currentName = null,
+  deps,
+} = {}) {
   // A refused entry (running session, projects not loaded) is rendered disabled, but
   // never trust the view for that — the descriptor is the authority.
   if (!item || item.disabled || !threadId || !deps) return;
-  const { assign, unassign, create, fetchProjects, promptName, openFork, refresh, log } = deps;
+  const {
+    assign,
+    unassign,
+    create,
+    fetchProjects,
+    promptName,
+    openFork,
+    refresh,
+    log,
+    rename,
+    promptRename,
+    refreshThreads,
+  } = deps;
   try {
     if (item.kind === "fork") {
       openFork(threadId);
+      return;
+    }
+    if (item.kind === "rename" || item.kind === "rename-reset") {
+      // A reset skips the prompt entirely — the menu entry already said what it does.
+      const next = item.kind === "rename-reset" ? null : promptRename?.(currentName);
+      // `undefined` is a cancelled prompt; `null` is a deliberate reset. Only the
+      // former means "do nothing".
+      if (next === undefined) return;
+      await rename(threadId, next);
+      log(next ? `Renamed session to "${next}".` : "Session name reset.");
+      // Titles live on the thread list, not the projects payload, so `refresh()` (which
+      // refetches projects) would not repaint the row that just changed. This surface
+      // also drops broker write receipts, so the list has to be re-asked for.
+      //
+      // Caught separately: the rename has already SUCCEEDED by this point, and letting a
+      // failed repaint fall into the outer handler would report "Session action failed"
+      // for a rename the relay accepted and persisted. The list self-heals on the next
+      // poll either way.
+      try {
+        await refreshThreads?.();
+      } catch (error) {
+        log(`Renamed, but the session list did not refresh: ${error.message}`);
+      }
       return;
     }
     if (item.kind === "assign") {

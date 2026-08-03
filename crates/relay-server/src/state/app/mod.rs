@@ -22,12 +22,13 @@ use crate::{
         FileChangeDiffView, ForkSessionInput, HeartbeatInput, ModelOptionView, PairingDecision,
         PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
         ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
-        ReadThreadEntryDetailInput, ReadThreadTranscriptInput, ResumeSessionInput,
-        RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, StartSessionInput, StopTurnInput,
-        SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
-        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadStateView,
-        ThreadTranscriptResponse, ThreadsResponse, ToolCallView, UpdateSessionSettingsInput,
-        WorkspaceDiffResponse, WorkspaceRootView,
+        ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
+        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+        StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
+        ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
+        ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView, ThreadTranscriptResponse,
+        ThreadsResponse, ToolCallView, UpdateSessionSettingsInput, WorkspaceDiffResponse,
+        WorkspaceRootView,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -116,6 +117,11 @@ pub struct AppState {
     /// A set is required because unrelated parent threads may be reviewed concurrently.
     cancel_requested_jobs: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
+
+/// A real provider/thread id is short; cap the key length so a paired device can't
+/// bloat a persisted per-thread map (project membership, custom name) with giant ids,
+/// even while staying under the entry-count cap.
+const MAX_THREAD_ID_BYTES: usize = 256;
 
 mod approvals;
 mod broker;

@@ -1,5 +1,21 @@
 use super::*;
 
+/// Hard bounds on user-chosen session titles, for the same reason `project_action` has
+/// them: a paired device drives this path, and the map is persisted.
+///
+/// The character cap is deliberately the SMALLEST wire budget any surface applies to a
+/// name (remote lists compact to 96 chars; local web to 120). A user-set title is
+/// therefore never truncated on its way to a client — which matters because the rename
+/// dialogs seed themselves from the title they were shown. Allow 200 here and a phone
+/// receives `Refactor the auth…`, the user presses OK, and the ellipsised prefix becomes
+/// the session's real stored name, silently destroying the tail. Capping at what every
+/// surface can carry whole makes that round trip lossless by construction, instead of by
+/// a string heuristic that cannot tell a relay-added ellipsis from one the user typed.
+///
+/// A tab is ~200px wide, so 96 characters is already far more than any surface renders.
+pub(super) const MAX_THREAD_NAME_CHARS: usize = 96;
+const MAX_CUSTOM_THREAD_NAMES: usize = 10_000;
+
 impl AppState {
     pub async fn list_threads(
         &self,
@@ -96,6 +112,11 @@ impl AppState {
         for thread in &mut threads {
             thread.updated_at = relay.thread_last_activity_or(&thread.id, thread.updated_at);
             thread.forked_from = relay.thread_forked_from(&thread.id);
+            // Overlay the user's chosen title over the provider's auto-derived one. This
+            // is the list every surface renders tabs and sidebar rows from, and it is
+            // rebuilt from the providers on each call — so the override has to be
+            // re-applied here or a rename would last only until the next refresh.
+            relay.apply_custom_thread_name(thread);
         }
         sort_threads_by_recency(&mut threads);
         threads.truncate(limit);
@@ -163,6 +184,140 @@ impl AppState {
             } else {
                 "Relay workspace restrictions were already up to date.".to_string()
             },
+        })
+    }
+
+    /// Set or clear a session's user-chosen title.
+    ///
+    /// Pure relay-owned metadata — deliberately NOT routed to a provider. Neither
+    /// bridge exposes a "set title" call we could trust to stick (Claude re-derives its
+    /// summary as the conversation grows; Codex titles server-side), which is exactly
+    /// why the title drifts today. Keeping the override on our side is what makes a
+    /// rename permanent.
+    ///
+    /// Consequences of being metadata, all intentional and mirroring `project_action`:
+    ///   * no session slot / control claim is taken — renaming a tab must not fight the
+    ///     agent for the relay-wide lease, and must work while a turn is running;
+    ///   * an id that is not currently loaded into the thread list is still renamable;
+    ///   * a reviewer thread is not, because it is hidden from navigation entirely.
+    pub async fn rename_thread(
+        &self,
+        thread_id: &str,
+        input: RenameThreadInput,
+    ) -> Result<ThreadRenameReceipt, String> {
+        if thread_id.len() > MAX_THREAD_ID_BYTES {
+            return Err(format!(
+                "thread id must be at most {MAX_THREAD_ID_BYTES} bytes"
+            ));
+        }
+        let actor = input.device_id.as_deref().unwrap_or("local operator");
+        // Absent, null, empty and whitespace-only all mean the same thing: drop the
+        // override and go back to the provider's own title.
+        let name = match input.name.map(|name| name.trim().to_string()) {
+            Some(name) if !name.is_empty() => {
+                if name.chars().count() > MAX_THREAD_NAME_CHARS {
+                    return Err(format!(
+                        "session name must be at most {MAX_THREAD_NAME_CHARS} characters"
+                    ));
+                }
+                Some(name)
+            }
+            _ => None,
+        };
+
+        let mut relay = self.relay.write().await;
+        // A client can legitimately still be holding a `claude-pending-…` id: promotion
+        // to the real SDK id happens on the first send, and clients only learn about it
+        // from the next snapshot. Keying the write off the id as sent would land it on a
+        // dead key — invisible to every reader, and orphaned forever in a PERSISTED map,
+        // since no cleanup path ever sees a pending id again. Resolve first, then act.
+        let thread_id = &relay.resolve_promoted_thread_id(thread_id);
+        if relay.reviewer_thread_ids().contains(thread_id) {
+            return Err(format!(
+                "`{thread_id}` is a reviewer thread and cannot be renamed"
+            ));
+        }
+        // A permanently deleted session must not be renamable. Deletion clears the
+        // override (`mark_thread_deleted`), but the tombstone outlives the row, so a
+        // stale client acting on a thread it still lists would RE-CREATE the entry —
+        // one nothing will ever clean up again, occupying a slot under the persisted
+        // cap and waiting to be inherited by a reused id after a restart.
+        if relay.thread_is_locally_deleted(thread_id) {
+            return Err(format!("session `{thread_id}` was deleted"));
+        }
+        // The thread must be one the relay can actually PLACE. An id it cannot resolve to
+        // a workspace is an id it cannot prove is in scope — and because this map is
+        // persisted, accepting arbitrary ids would let a caller mint durable rows for
+        // sessions that do not exist: orphans no cleanup path can ever reach, each
+        // occupying a slot under `MAX_CUSTOM_THREAD_NAMES`.
+        //
+        // It also closes the archived-session hole. Archive drops the runtime and the
+        // cached row (`remove_thread`), so after it there is no cwd to resolve and a
+        // stale client can no longer resurrect the override that archive just cleared.
+        let Some(cwd) = relay.thread_cwd(thread_id) else {
+            return Err(format!(
+                "session `{thread_id}` is not available on this relay"
+            ));
+        };
+        // Scope the write exactly as `list_threads` scopes the READ — same predicate,
+        // same arguments — so a caller can only rename what it can see. A title is
+        // per-SESSION metadata and sessions are scope-filtered; a device that cannot see
+        // a session must not be able to relabel it for everyone else.
+        //
+        // The scope is passed THROUGH rather than short-circuited on when empty. An empty
+        // device scope does not mean "anywhere": `path_within_device_scope` reads it as
+        // "the relay's own `allowed_roots`", which is the boundary an unscoped paired
+        // device still has to respect. The local operator (`device_id: None`) takes the
+        // same path with an empty scope, so it too is held to `allowed_roots` — again
+        // matching what its own session list already shows it.
+        //
+        // This is deliberately STRICTER than `project_action`'s membership writes, which
+        // accept any thread id. Project membership is a global grouping; a session's
+        // title is the session's own.
+        let scope = input
+            .device_id
+            .as_deref()
+            .map(|device_id| relay.device_path_scope(device_id))
+            .unwrap_or_default();
+        let allowed_roots = relay.allowed_roots.clone();
+        if !path_within_device_scope(&cwd, &scope, &allowed_roots) {
+            return Err(format!(
+                "session `{thread_id}` is outside this device's allowed paths"
+            ));
+        }
+        // Bound the persisted map: refuse a NEW override once it is full. Clearing, and
+        // re-renaming an already-renamed session, both stay possible — neither grows it.
+        if name.is_some()
+            && relay.thread_custom_name(thread_id).is_none()
+            && relay.custom_thread_name_count() >= MAX_CUSTOM_THREAD_NAMES
+        {
+            return Err(format!(
+                "renamed-session limit reached ({MAX_CUSTOM_THREAD_NAMES})"
+            ));
+        }
+
+        let changed = relay.set_thread_custom_name(thread_id, name.clone());
+        let message = match &name {
+            Some(name) => format!("Renamed session to \"{name}\"."),
+            None => "Session name reset to the agent's own title.".to_string(),
+        };
+        if changed {
+            relay.push_log(
+                "info",
+                match &name {
+                    Some(name) => format!("Renamed session {thread_id} to \"{name}\" [{actor}]"),
+                    None => format!("Reset session {thread_id} to its agent title [{actor}]"),
+                },
+            );
+            // Wakes the SSE/snapshot path (carrying the bumped `threads_revision`) AND
+            // schedules the debounced state save, so the rename reaches other devices
+            // and survives a restart. A no-op rename skips both on purpose.
+            relay.notify();
+        }
+        Ok(ThreadRenameReceipt {
+            thread_id: thread_id.to_string(),
+            name,
+            message,
         })
     }
 

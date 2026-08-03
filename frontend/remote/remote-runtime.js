@@ -162,8 +162,8 @@ export function createRemoteAppHandlers() {
     onRefreshRelayDirectory() {
       return refreshRelayDirectoryFromUi();
     },
-    onRefreshThreads({ reason = "manual refresh", silent = false } = {}) {
-      return refreshRemoteThreads(reason, { silent });
+    onRefreshThreads({ reason = "manual refresh", silent = false, fresh = false } = {}) {
+      return refreshRemoteThreads(reason, { silent, fresh });
     },
     onFetchProviders() {
       return fetchRemoteProviders();

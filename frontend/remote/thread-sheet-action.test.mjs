@@ -17,6 +17,9 @@ function harness(overrides = {}) {
     openFork: record("openFork"),
     refresh: record("refresh"),
     log: record("log"),
+    rename: async (...a) => calls.push(["rename", ...a]),
+    promptRename: () => "Auth work",
+    refreshThreads: async () => calls.push(["refreshThreads"]),
     ...overrides,
   };
   return { calls, deps, names: () => calls.map((c) => c[0]) };
@@ -119,4 +122,54 @@ test("a missing thread id is refused", async () => {
   const h = harness();
   await runThreadSheetAction({ item: { kind: "unassign" }, threadId: "", deps: h.deps });
   assert.deepEqual(h.calls, []);
+});
+
+// --- rename ---------------------------------------------------------------------
+
+test("rename prompts, writes, and refreshes the THREAD list", async () => {
+  const h = harness();
+  await run({ kind: "rename" }, h, { currentName: null });
+  assert.deepEqual(h.names(), ["rename", "log", "refreshThreads"]);
+  assert.deepEqual(h.calls[0], ["rename", "t1", "Auth work"]);
+  // Titles ride the thread list, not the projects payload — refreshing projects would
+  // leave the row that just changed showing its old name.
+  assert.ok(!h.names().includes("refresh"));
+});
+
+// A cancelled prompt and an emptied one are DIFFERENT intents: cancel means "never
+// mind", empty means "go back to the agent's own title". Collapsing them would make a
+// reset unreachable, or an accidental Escape wipe the name.
+test("a cancelled prompt writes nothing; an emptied one resets", async () => {
+  const cancelled = harness({ promptRename: () => undefined });
+  await run({ kind: "rename" }, cancelled, { currentName: "Auth work" });
+  assert.deepEqual(cancelled.calls, []);
+
+  const cleared = harness({ promptRename: () => null });
+  await run({ kind: "rename" }, cleared, { currentName: "Auth work" });
+  assert.deepEqual(cleared.calls[0], ["rename", "t1", null]);
+});
+
+// The reset entry says what it does; asking again would be a pointless confirmation.
+test("the reset entry clears without prompting", async () => {
+  let prompted = false;
+  const h = harness({
+    promptRename: () => {
+      prompted = true;
+      return "ignored";
+    },
+  });
+  await run({ kind: "rename-reset" }, h, { currentName: "Auth work" });
+  assert.equal(prompted, false, "resetting must not open a prompt");
+  assert.deepEqual(h.calls[0], ["rename", "t1", null]);
+});
+
+test("a failed rename is reported, not thrown", async () => {
+  const h = harness({
+    rename: async () => {
+      throw new Error("relay offline");
+    },
+  });
+  await run({ kind: "rename" }, h, { currentName: null });
+  const logged = h.calls.find((call) => call[0] === "log");
+  assert.match(logged[1], /relay offline/);
 });

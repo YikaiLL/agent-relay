@@ -95,6 +95,13 @@ pub(super) struct PersistedRelayState {
     /// `#[serde(default)]` keeps old state files loadable (empty map).
     #[serde(default)]
     pub(super) thread_project_id: std::collections::HashMap<String, String>,
+    /// Session (thread) -> user-chosen title. Absent = show the provider's own
+    /// auto-derived name. Persisted because a rename that did not survive a relay
+    /// restart would be worse than no rename at all — the title would silently snap
+    /// back to whatever the agent last called the thread.
+    /// `#[serde(default)]` keeps pre-rename state files loadable (empty map).
+    #[serde(default)]
+    pub(super) thread_custom_name: std::collections::HashMap<String, String>,
     /// Persisted Projects cache key. Restored nonzero so a fresh client (which starts
     /// at 0) sees a mismatch and fetches the persisted projects across a restart —
     /// otherwise revision 0 would match and leave existing projects invisible until
@@ -159,6 +166,20 @@ impl PersistedRelayState {
             push_subscriptions: relay.push_subscriptions.clone(),
             projects: relay.projects.clone(),
             thread_project_id: relay.thread_project_id.clone(),
+            // Drop overrides keyed by a synthetic Claude pending id, for the same reason
+            // `active_thread_id` and `reviewer_threads` above drop theirs: that session
+            // exists only in this process's memory and has no real SDK session yet, so
+            // after a restart the key names nothing. Promotion normally re-keys the entry
+            // (see `promote_background_thread`), but a session renamed and never sent to
+            // would otherwise leave a row that no cleanup path can ever reach — it holds
+            // a slot under the persisted cap forever, and a reused id would inherit a
+            // stranger's title.
+            thread_custom_name: relay
+                .thread_custom_name
+                .iter()
+                .filter(|(thread_id, _)| !thread_id.starts_with("claude-pending-"))
+                .map(|(thread_id, name)| (thread_id.clone(), name.clone()))
+                .collect(),
             projects_revision: relay.projects_revision,
         }
     }

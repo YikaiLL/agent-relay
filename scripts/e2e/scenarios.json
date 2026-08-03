@@ -18,6 +18,7 @@
       "local-projects-toggle",
       "local-shell-redesign",
       "local-session-tabs",
+      "local-session-rename",
       "local-session-tab-scroll",
       "local-rail-toggle-align",
       "local-permission-modes"
@@ -41,6 +42,7 @@
       "local-projects-toggle",
       "local-shell-redesign",
       "local-session-tabs",
+      "local-session-rename",
       "local-session-tab-scroll",
       "local-rail-toggle-align",
       "local-delete",
@@ -51,6 +53,7 @@
       "public-thread-interleaving",
       "remote-mobile-header",
       "remote-mobile-session-actions",
+      "public-session-rename",
       "public-broker",
       "public-enrollment",
       "public-refresh",
@@ -66,6 +69,7 @@
       "public-thread-interleaving",
       "remote-mobile-header",
       "remote-mobile-session-actions",
+      "public-session-rename",
       "public-refresh",
       "public-thread-settings",
       "public-persistence",
@@ -297,6 +301,19 @@
         "tab-preview"
       ]
     },
+    "local-session-rename": {
+      "script": "browser-local-session-rename-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "session-tabs",
+        "tab-inline-rename",
+        "session-rename-overrides-provider",
+        "session-rename-persistence",
+        "session-rename-reset"
+      ]
+    },
     "local-session-tab-scroll": {
       "script": "browser-local-session-tab-scroll-e2e.mjs",
       "tier": "core",
@@ -368,6 +385,18 @@
       "transport": "public-broker",
       "coverage": [
         "refresh"
+      ]
+    },
+    "public-session-rename": {
+      "script": "browser-public-session-rename-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "public-broker",
+      "coverage": [
+        "session-rename-over-broker",
+        "session-rename-cross-device",
+        "session-rename-reset",
+        "mobile-session-actions"
       ]
     },
     "public-thread-settings": {

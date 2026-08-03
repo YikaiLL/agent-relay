@@ -6,10 +6,6 @@ use super::*;
 const MAX_PROJECTS: usize = 256;
 const MAX_PROJECT_NAME_CHARS: usize = 200;
 const MAX_PROJECT_MEMBERSHIPS: usize = 10_000;
-/// A real provider/thread id is short; cap the key length so a paired device can't
-/// bloat the persisted membership map (and the dedicated payload) with giant ids,
-/// even while staying under the entry-count cap.
-const MAX_THREAD_ID_BYTES: usize = 256;
 
 impl AppState {
     /// Manual Projects write path: create / rename / delete a Project, or assign /

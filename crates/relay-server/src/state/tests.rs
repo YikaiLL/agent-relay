@@ -87,6 +87,7 @@ fn test_persisted_state() -> PersistedRelayState {
         push_subscriptions: std::collections::HashMap::new(),
         projects: Default::default(),
         thread_project_id: Default::default(),
+        thread_custom_name: Default::default(),
         projects_revision: 0,
     }
 }
@@ -178,6 +179,7 @@ fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
         model_provider: "openai".to_string(),
         provider: "codex".to_string(),
         forked_from: None,
+        renamed: false,
     }
 }
 
@@ -306,6 +308,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             workflows_revision: 0,
             push_vapid_public_key: None,
             projects_revision: 0,
+            threads_revision: 0,
         }),
         receipt: Some(ApprovalReceipt {
             request_id: "req-1".to_string(),
@@ -4338,6 +4341,7 @@ mod paged_history_merge_tests {
                 model_provider: "anthropic".to_string(),
                 provider: "claude_code".to_string(),
                 forked_from: None,
+                renamed: false,
             },
             "/repo",
             "sonnet",
@@ -4416,6 +4420,7 @@ mod paged_history_merge_tests {
                 model_provider: "anthropic".to_string(),
                 provider: "claude_code".to_string(),
                 forked_from: None,
+                renamed: false,
             },
             "/repo",
             "sonnet",

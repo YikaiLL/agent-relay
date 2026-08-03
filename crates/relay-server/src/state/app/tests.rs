@@ -459,6 +459,7 @@ branch refs/heads/alive
 
 #[cfg(test)]
 mod path_scope_tests {
+    use super::super::threads::MAX_THREAD_NAME_CHARS;
     use super::super::*;
     use super::require_live_test_cwd;
     use crate::codex::CodexBridge;
@@ -1655,6 +1656,7 @@ got {}",
                 model_provider: "anthropic".to_string(),
                 provider: "claude_code".to_string(),
                 forked_from: None,
+                renamed: false,
             }];
         }
 
@@ -1948,6 +1950,555 @@ got {}",
             .expect("delete");
         assert!(receipt.projects.is_empty());
         assert!(receipt.thread_project_id.get("t1").is_none());
+    }
+
+    /// Give a thread id a workspace, so the relay can PLACE it.
+    ///
+    /// Rename refuses an id it cannot resolve to a cwd — an unplaceable id is one it
+    /// cannot prove is in scope, and the override map is persisted. Tests therefore have
+    /// to seed a session rather than invent a bare id, which is also what production
+    /// looks like: everything renamable came from `list_threads` or a live runtime.
+    async fn seed_thread_cwd(app: &AppState, thread_id: &str, cwd: &str) {
+        let mut relay = app.relay.write().await;
+        relay.ensure_runtime_for_thread(thread_id).current_cwd = cwd.to_string();
+    }
+
+    /// A reset request. `RenameThreadInput` deliberately has no `Default`: an omitted
+    /// `name` must be a deserialization error, not a silent title deletion (see the
+    /// struct's doc). Tests therefore spell a reset out, exactly as a client must.
+    fn reset_rename() -> RenameThreadInput {
+        RenameThreadInput {
+            name: None,
+            device_id: None,
+        }
+    }
+
+    /// THE invariant behind the rename feature. Providers auto-title a thread and keep
+    /// re-deriving that title as the conversation grows — that drift is the user-visible
+    /// bug being fixed. `list_threads` rebuilds the list from the providers on EVERY
+    /// call, so if the override were merely seeded into a cached row it would be gone by
+    /// the next refresh. The custom name must win over a NON-EMPTY provider name, every
+    /// time, for as long as the override exists.
+    #[tokio::test]
+    async fn rename_thread_beats_the_provider_title_on_every_refresh() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+        })
+        .await
+        .expect("start_session");
+
+        // Baseline: the provider supplies its own (non-empty) title.
+        let listed = app.list_threads(50, None).await.expect("list");
+        let thread_id = listed.threads[0].id.clone();
+        let provider_name = listed.threads[0].name.clone();
+        assert_eq!(
+            provider_name,
+            Some("Fake E2E Session".to_string()),
+            "precondition: the provider must be supplying a name to override"
+        );
+
+        let receipt = app
+            .rename_thread(
+                &thread_id,
+                RenameThreadInput {
+                    name: Some("  Auth work  ".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .expect("rename");
+        assert_eq!(
+            receipt.name,
+            Some("Auth work".to_string()),
+            "the name must be trimmed before it is stored"
+        );
+
+        // Three refreshes: each one re-asks the provider, which keeps answering with its
+        // own title. The override must survive all of them.
+        for round in 0..3 {
+            let listed = app.list_threads(50, None).await.expect("list");
+            let renamed = listed
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .expect("renamed thread still listed");
+            assert_eq!(
+                renamed.name,
+                Some("Auth work".to_string()),
+                "round {round}: the provider's title clobbered the user's rename"
+            );
+        }
+
+        // And a live provider EVENT (the other funnel — a finishing turn re-upserts the
+        // summary with a freshly derived title) must not clobber it either.
+        {
+            let mut relay = app.relay.write().await;
+            relay.upsert_thread(ThreadSummaryView {
+                id: thread_id.clone(),
+                name: Some("Provider Retitled Me".to_string()),
+                preview: "later message".to_string(),
+                cwd: cwd.clone(),
+                updated_at: 999,
+                source: "fake".to_string(),
+                status: "idle".to_string(),
+                model_provider: "fake".to_string(),
+                provider: "fake".to_string(),
+                forked_from: None,
+                renamed: false,
+            });
+            let cached = relay
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .expect("cached row");
+            assert_eq!(
+                cached.name,
+                Some("Auth work".to_string()),
+                "a live provider event must not overwrite the user's rename"
+            );
+        }
+
+        // `custom_name` must report the OVERRIDE, not the merged title, so a client can
+        // tell "the user chose this" from "the agent guessed this".
+        let listed = app.list_threads(50, None).await.expect("list");
+        let renamed = listed
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .expect("listed");
+        assert!(
+            renamed.renamed,
+            "the row must report that the title is the user's"
+        );
+
+        // Reset: clearing the override hands the title back to the provider. Without an
+        // expressible reset, a renamed session could never show its auto title again.
+        let receipt = app
+            .rename_thread(&thread_id, reset_rename())
+            .await
+            .expect("reset");
+        assert_eq!(receipt.name, None);
+        let listed = app.list_threads(50, None).await.expect("list");
+        let reset = listed
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .expect("thread still listed");
+        assert_eq!(
+            reset.name, provider_name,
+            "resetting must restore the provider's own title"
+        );
+        assert_eq!(
+            reset.renamed, false,
+            "a stale `renamed` would keep offering 'use the agent's name' forever"
+        );
+    }
+
+    /// A rename is invisible in the snapshot itself (names ride the thread list), so
+    /// `threads_revision` is the ONLY thing that tells a passive client its list went
+    /// stale. It must bump on a real change and stay put on a no-op, or every repaint
+    /// would trigger a refetch storm.
+    #[tokio::test]
+    async fn rename_thread_bumps_threads_revision_only_when_something_changed() {
+        let (app, _p, _o) = build_app("/tmp/rename-revision").await;
+        seed_thread_cwd(&app, "t1", "/tmp/rename-revision").await;
+        assert_eq!(app.snapshot().await.threads_revision, 0);
+
+        app.rename_thread(
+            "t1",
+            RenameThreadInput {
+                name: Some("Deploy".to_string()),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("rename");
+        let after_rename = app.snapshot().await.threads_revision;
+        assert!(after_rename > 0, "a rename must invalidate cached lists");
+
+        // Same name again (a stale UI re-submitting): nothing changed, so nothing to
+        // tell other clients about.
+        app.rename_thread(
+            "t1",
+            RenameThreadInput {
+                name: Some("Deploy".to_string()),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("no-op rename");
+        assert_eq!(
+            app.snapshot().await.threads_revision,
+            after_rename,
+            "a no-op rename must not invalidate every client's thread list"
+        );
+
+        // Clearing an override IS a change.
+        app.rename_thread("t1", reset_rename())
+            .await
+            .expect("reset");
+        assert!(app.snapshot().await.threads_revision > after_rename);
+
+        // Clearing again is not.
+        let after_reset = app.snapshot().await.threads_revision;
+        app.rename_thread("t1", reset_rename())
+            .await
+            .expect("no-op reset");
+        assert_eq!(app.snapshot().await.threads_revision, after_reset);
+    }
+
+    /// The bounds exist because a PAIRED DEVICE drives this path and the map is
+    /// persisted — same reasoning as `project_action`'s caps.
+    #[tokio::test]
+    async fn rename_thread_enforces_its_bounds() {
+        let (app, _p, _o) = build_app("/tmp/rename-bounds").await;
+        seed_thread_cwd(&app, "t1", "/tmp/rename-bounds").await;
+
+        // Derived from the constant, never hardcoded: the cap is deliberately pinned to
+        // the smallest wire budget, so a change to it must not silently invalidate this.
+        let too_long = "x".repeat(MAX_THREAD_NAME_CHARS + 1);
+        let error = app
+            .rename_thread(
+                "t1",
+                RenameThreadInput {
+                    name: Some(too_long),
+                    device_id: None,
+                },
+            )
+            .await
+            .expect_err("overlong name should be rejected");
+        assert!(error.contains("at most"), "unexpected error: {error}");
+
+        // Exactly at the cap is fine — and, because the cap IS the smallest wire budget,
+        // it also survives compaction untouched, which is what makes the rename dialogs'
+        // seed-from-the-displayed-title round trip lossless.
+        app.rename_thread(
+            "t1",
+            RenameThreadInput {
+                name: Some("y".repeat(MAX_THREAD_NAME_CHARS)),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("a name at the cap should be accepted");
+
+        let error = app
+            .rename_thread(
+                &"z".repeat(300),
+                RenameThreadInput {
+                    name: Some("Short".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .expect_err("overlong thread id should be rejected");
+        assert!(error.contains("thread id"), "unexpected error: {error}");
+
+        // Whitespace-only is a RESET, not a stored blank title — an empty tab label
+        // would be worse than the provider's own.
+        let receipt = app
+            .rename_thread(
+                "t1",
+                RenameThreadInput {
+                    name: Some("   ".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .expect("blank name");
+        assert_eq!(receipt.name, None);
+        assert!(app.relay.read().await.thread_custom_name("t1").is_none());
+    }
+
+    /// A rename can race the pending→real promotion, and must not be lost to it.
+    ///
+    /// A Claude session is renamable the moment its tab appears, while it still lives
+    /// under a synthetic `claude-pending-…` id. Promotion happens on the first send, and
+    /// clients only learn about it from the NEXT snapshot — so a rename sent in that
+    /// window arrives naming an id the relay has already retired. Writing it verbatim
+    /// would return 200 while storing the title under a dead key: invisible to every
+    /// reader, and orphaned forever in a persisted map (no cleanup path ever sees a
+    /// pending id again).
+    #[tokio::test]
+    async fn rename_thread_follows_a_session_that_was_promoted_mid_flight() {
+        let (app, _p, _o) = build_app("/tmp/rename-promotion").await;
+        seed_thread_cwd(&app, "real-7", "/tmp/rename-promotion").await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.promote_background_thread("claude-pending-7", "real-7");
+        }
+
+        // The client is still holding the pending id it was shown.
+        let receipt = app
+            .rename_thread(
+                "claude-pending-7",
+                RenameThreadInput {
+                    name: Some("Auth work".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .expect("rename");
+
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay.thread_custom_name("real-7"),
+            Some("Auth work".to_string()),
+            "the rename must follow the promotion to the real session id"
+        );
+        assert!(
+            relay.thread_custom_name("claude-pending-7").is_none(),
+            "a write under the retired id would orphan in a persisted map"
+        );
+        assert_eq!(
+            receipt.thread_id, "real-7",
+            "the receipt tells the client which session it actually renamed"
+        );
+    }
+
+    /// A title is per-SESSION metadata, and sessions are scope-filtered — so a paired
+    /// device that cannot SEE a session must not be able to relabel it for everyone
+    /// else. Every other per-thread operation (list, transcript, resume, send, review,
+    /// workflow) already enforces this; rename inherits the same boundary.
+    #[tokio::test]
+    async fn rename_thread_refuses_a_session_outside_the_device_scope() {
+        let scoped_dir = TempDir::new().expect("scoped");
+        let other_dir = TempDir::new().expect("other");
+        let scoped = scoped_dir.path().to_string_lossy().to_string();
+        let other = other_dir.path().to_string_lossy().to_string();
+
+        let (app, _p, _o) = build_app(&scoped).await;
+        pair_device(&app, "narrow-device", vec![scoped.clone()]).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("in-scope").current_cwd = scoped.clone();
+            relay.ensure_runtime_for_thread("out-of-scope").current_cwd = other.clone();
+        }
+
+        let error = app
+            .rename_thread(
+                "out-of-scope",
+                RenameThreadInput {
+                    name: Some("Sneaky".to_string()),
+                    device_id: Some("narrow-device".to_string()),
+                },
+            )
+            .await
+            .expect_err("an out-of-scope rename should be refused");
+        assert!(error.contains("allowed paths"), "unexpected: {error}");
+        assert!(app
+            .relay
+            .read()
+            .await
+            .thread_custom_name("out-of-scope")
+            .is_none());
+
+        // An id the relay cannot PLACE is one it cannot prove is in scope, so a
+        // restricted device is refused there too rather than fail-open.
+        assert!(app
+            .rename_thread(
+                "never-heard-of-it",
+                RenameThreadInput {
+                    name: Some("Sneaky".to_string()),
+                    device_id: Some("narrow-device".to_string()),
+                },
+            )
+            .await
+            .is_err());
+
+        // Its own session is renamable.
+        app.rename_thread(
+            "in-scope",
+            RenameThreadInput {
+                name: Some("Mine".to_string()),
+                device_id: Some("narrow-device".to_string()),
+            },
+        )
+        .await
+        .expect("an in-scope rename should be allowed");
+
+        // An UNSCOPED device is still bound — by the relay's own `allowed_roots`. An
+        // empty `path_scope` means "the relay's roots", not "anywhere", which is exactly
+        // what `path_within_device_scope` encodes; short-circuiting the check when the
+        // scope happens to be empty would hand every ordinarily-paired phone the ability
+        // to relabel sessions its own list refuses to show it.
+        pair_device(&app, "wide-device", Vec::new()).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_allowed_roots(vec![scoped.clone()]);
+        }
+        let error = app
+            .rename_thread(
+                "out-of-scope",
+                RenameThreadInput {
+                    name: Some("Sneaky".to_string()),
+                    device_id: Some("wide-device".to_string()),
+                },
+            )
+            .await
+            .expect_err("an unscoped device must still respect the relay's roots");
+        assert!(error.contains("allowed paths"), "unexpected: {error}");
+        assert!(app
+            .relay
+            .read()
+            .await
+            .thread_custom_name("out-of-scope")
+            .is_none());
+
+        // ...and so is the local operator, for the same reason: its own session list is
+        // filtered by `allowed_roots` too, so rename must not reach further than the list.
+        assert!(app
+            .rename_thread(
+                "out-of-scope",
+                RenameThreadInput {
+                    name: Some("Operator".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .is_err());
+    }
+
+    /// Archive clears the override; a stale client must not be able to put it back.
+    ///
+    /// Archive leaves no deletion tombstone, so the guard here is placement: it drops the
+    /// runtime and the cached row, and rename refuses an id it cannot resolve to a
+    /// workspace. Without that, the archive cleanup would be undone by any client still
+    /// listing the session — recreating exactly the permanent orphan it removed.
+    #[tokio::test]
+    async fn rename_thread_cannot_resurrect_an_archived_session() {
+        let (app, _p, _o) = build_app("/tmp/rename-archived").await;
+        seed_thread_cwd(&app, "t1", "/tmp/rename-archived").await;
+        app.rename_thread(
+            "t1",
+            RenameThreadInput {
+                name: Some("Auth work".to_string()),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("rename");
+
+        {
+            // What archive does to relay state (`AppState::archive_thread` calls this
+            // after the provider accepts).
+            let mut relay = app.relay.write().await;
+            relay.remove_thread("t1");
+            assert!(
+                relay.thread_custom_name("t1").is_none(),
+                "archive clears it"
+            );
+        }
+
+        assert!(
+            app.rename_thread(
+                "t1",
+                RenameThreadInput {
+                    name: Some("Resurrected".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .is_err(),
+            "an archived session is no longer placeable, so it is no longer renamable"
+        );
+        assert!(app.relay.read().await.thread_custom_name("t1").is_none());
+    }
+
+    /// Deletion clears the override, but the TOMBSTONE outlives the row — so a stale
+    /// client acting on a session it still lists would re-create an entry that no
+    /// cleanup path can ever reach again, holding a slot under the persisted cap and
+    /// waiting to be inherited by a reused id after a restart.
+    #[tokio::test]
+    async fn rename_thread_refuses_a_permanently_deleted_session() {
+        let (app, _p, _o) = build_app("/tmp/rename-deleted").await;
+        seed_thread_cwd(&app, "t1", "/tmp/rename-deleted").await;
+        app.rename_thread(
+            "t1",
+            RenameThreadInput {
+                name: Some("Auth work".to_string()),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("rename");
+        {
+            let mut relay = app.relay.write().await;
+            relay.mark_thread_deleted("t1");
+            assert!(relay.thread_custom_name("t1").is_none(), "delete clears it");
+        }
+
+        let error = app
+            .rename_thread(
+                "t1",
+                RenameThreadInput {
+                    name: Some("Resurrected".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .expect_err("a deleted session should not be renamable");
+        assert!(error.contains("deleted"), "unexpected: {error}");
+        assert!(
+            app.relay.read().await.thread_custom_name("t1").is_none(),
+            "a rename after deletion would orphan a persisted entry forever"
+        );
+    }
+
+    /// Reviewer threads are hidden from navigation entirely (they have no tab and no
+    /// sidebar row), so a rename targeting one is a bug or an attack, not a UI action.
+    /// Mirrors `assign_thread_to_project`'s refusal.
+    #[tokio::test]
+    async fn rename_thread_refuses_reviewer_threads() {
+        let (app, _p, _o) = build_app("/tmp/rename-reviewer").await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.register_background_thread(
+                ThreadSummaryView {
+                    id: "reviewer-1".to_string(),
+                    name: None,
+                    preview: String::new(),
+                    cwd: "/tmp/rename-reviewer".to_string(),
+                    updated_at: 1,
+                    source: "fake".to_string(),
+                    status: "idle".to_string(),
+                    model_provider: "fake".to_string(),
+                    provider: "fake".to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+                "/tmp/rename-reviewer",
+                "fake-model",
+                "on-request",
+                "workspace-write",
+                "medium",
+            );
+            relay.register_reviewer_thread("reviewer-1".to_string(), "parent-1".to_string());
+        }
+
+        let error = app
+            .rename_thread(
+                "reviewer-1",
+                RenameThreadInput {
+                    name: Some("Sneaky".to_string()),
+                    device_id: None,
+                },
+            )
+            .await
+            .expect_err("reviewer rename should be refused");
+        assert!(error.contains("reviewer thread"), "unexpected: {error}");
     }
 
     // B4a (revised): projects are NOT embedded in the snapshot (unbounded → would
@@ -2247,6 +2798,7 @@ got {}",
                     model_provider: "fake".to_string(),
                     provider: "fake".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 &cwd,
                 DEFAULT_MODEL,
@@ -2572,6 +3124,7 @@ got {}",
                     model_provider: "fake".to_string(),
                     provider: "fake".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 &cwd,
                 DEFAULT_MODEL,
@@ -2737,6 +3290,7 @@ got {}",
                 model_provider: self.name.to_string(),
                 provider: self.name.to_string(),
                 forked_from: None,
+                renamed: false,
             }
         }
     }
@@ -3342,6 +3896,7 @@ got {}",
                 model_provider: "codex".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             }];
         }
 
@@ -4784,6 +5339,7 @@ got {}",
                     model_provider: "fake".to_string(),
                     provider: "fake".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 "/tmp/project",
                 DEFAULT_MODEL,
@@ -4870,6 +5426,7 @@ got {}",
                 model_provider: self.name.to_string(),
                 provider: self.name.to_string(),
                 forked_from: None,
+                renamed: false,
             }
         }
     }
@@ -5086,6 +5643,7 @@ got {}",
                 model_provider: "consumed-initial".to_string(),
                 provider: "consumed-initial".to_string(),
                 forked_from: None,
+                renamed: false,
             }
         }
     }
@@ -7267,6 +7825,7 @@ got {}",
                 model_provider: self.name.to_string(),
                 provider: self.name.to_string(),
                 forked_from: None,
+                renamed: false,
             };
             self.threads.lock().await.insert(id, thread.clone());
             Ok(crate::provider::StartThreadResult {
@@ -7673,6 +8232,7 @@ mod review_tests {
                 model_provider: self.name.to_string(),
                 provider: self.name.to_string(),
                 forked_from: None,
+                renamed: false,
             }
         }
 
@@ -8254,6 +8814,7 @@ mod review_tests {
             model_provider: provider.to_string(),
             provider: provider.to_string(),
             forked_from: None,
+            renamed: false,
         }
     }
 
@@ -8507,6 +9068,7 @@ mod review_tests {
                 model_provider: "vscode".to_string(),
                 provider: String::new(),
                 forked_from: None,
+                renamed: false,
             };
             relay.register_background_thread(thread, cwd, "model", "never", "read-only", "low");
             relay.register_reviewer_thread(reviewer_id.to_string(), "parent-1".to_string());
@@ -8550,6 +9112,7 @@ mod review_tests {
                 model_provider: "vscode".to_string(),
                 provider: String::new(),
                 forked_from: None,
+                renamed: false,
             };
             relay.register_background_thread(thread, cwd, "model", "never", "read-only", "low");
             relay.register_reviewer_thread(reviewer_id.to_string(), "parent-1".to_string());
@@ -8670,6 +9233,7 @@ mod review_tests {
                 model_provider: "codex".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             };
             for (parent, reviewer, cwd, job_id) in [
                 ("parent-in", "rev-in", in_cwd, "job-in"),
@@ -8780,6 +9344,7 @@ mod review_tests {
                 model_provider: "codex".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             };
             for (parent, reviewer, cwd, job_id) in [
                 ("parent-in", "rev-in", in_cwd, "job-in"),
@@ -8876,6 +9441,7 @@ mod review_tests {
                 model_provider: "codex".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             };
             relay.register_background_thread(thread, cwd, "model", "never", "read-only", "low");
             // Drop the routing-cache row while the live runtime survives (and the
@@ -8916,6 +9482,7 @@ mod review_tests {
                 model_provider: "codex".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             };
             relay.register_background_thread(
                 thread.clone(),
@@ -10117,6 +10684,7 @@ mod review_tests {
                     model_provider: "codex".to_string(),
                     provider: "codex".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 &workspace,
                 "gpt-5.5",
@@ -12734,6 +13302,7 @@ settings update: {error}"
                     model_provider: "anthropic".to_string(),
                     provider: "claude_code".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 cwd,
                 "claude-model",
@@ -14287,6 +14856,7 @@ turn) must allow a review: {error:?}"
                     model_provider: "anthropic".to_string(),
                     provider: "claude_code".to_string(),
                     forked_from: None,
+                    renamed: false,
                 },
                 cwd,
                 "claude-model",
@@ -14756,6 +15326,7 @@ turn) must allow a review: {error:?}"
                 model_provider: "codex".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             });
             relay.bg_set_active_turn("bg-thread", Some("bg-turn".to_string()), unix_now());
         }
@@ -14802,6 +15373,7 @@ turn) must allow a review: {error:?}"
                 model_provider: "codex".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             });
             relay.bg_set_active_turn("bg-thread", Some("bg-turn".to_string()), unix_now());
         }

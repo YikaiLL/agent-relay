@@ -1,7 +1,12 @@
-// Local-surface Projects transport: the write path (POST /api/projects with a
-// `{ action, ... }` body) and the dedicated read path (GET /api/projects). Both go
-// through `apiFetch`. The remote surface uses `dispatchOrRecover("project_action")` /
-// `FetchProjects` instead (added with the remote Projects UI).
+// Local-surface transport for the relay-owned session METADATA the user edits directly:
+// Projects (the write path is POST /api/projects with a `{ action, ... }` body, the read
+// path GET /api/projects) and a session's own user-chosen title
+// (POST /api/threads/:id/rename). Both go through `apiFetch`.
+//
+// They live together because they share a shape, not a noun: each is a persisted,
+// relay-owned overlay on top of what the providers report, mutated by an explicit user
+// action rather than by an agent. The remote surface mirrors each of them with a broker
+// action (`project_action` / `rename_thread`) in `remote/project-actions.js`.
 
 async function unwrap(response) {
   const payload = await response.json().catch(() => null);
@@ -39,6 +44,23 @@ export const assignThreadToProject = (apiFetch, threadId, projectId) =>
 
 export const unassignThread = (apiFetch, threadId) =>
   postProjectAction(apiFetch, { action: "unassign", thread_id: threadId });
+
+/**
+ * Set (`name`) or clear (`null`) a session's user-chosen title.
+ *
+ * A separate route from the Projects ones because it is a different noun — this renames
+ * the SESSION, not the group it belongs to. Resolves to the ThreadRenameReceipt, whose
+ * `name` is the post-rename truth (trimmed, or `null` when reset), so the caller repaints
+ * from the server's answer rather than its own optimistic guess.
+ */
+export async function renameThread(apiFetch, threadId, name) {
+  const response = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/rename`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name ?? null }),
+  });
+  return unwrap(response);
+}
 
 /** GET the dedicated Projects payload ({ projects_revision, projects, thread_project_id }). */
 export async function fetchProjectsPayload(apiFetch) {

@@ -10,12 +10,12 @@ use crate::{
         ApplyFileChangeInput, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
         AskUserQuestionDetailResponse, DevicesResponse, ForkSessionInput, HeartbeatInput,
         ModelOptionView, ProjectActionInput, ProjectsResponse, ReadThreadEntriesInput,
-        ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RequestReviewInput,
-        ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot, StartSessionInput,
-        StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
-        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse, ThreadsQuery,
-        ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput, WorkflowsResponse,
-        WorkspaceDiffResponse,
+        ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
+        RequestReviewInput, ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot,
+        StartSessionInput, StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput,
+        TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse,
+        ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
+        WorkflowsResponse, WorkspaceDiffResponse,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
@@ -101,6 +101,14 @@ pub(super) enum RemoteActionRequest {
     /// session-scoped, so it does not require a session claim.
     ProjectAction {
         input: ProjectActionInput,
+    },
+    /// Set or clear a session's user-chosen title. Relay-owned metadata, like
+    /// `ProjectAction` — it never reaches a provider and never runs a turn, so it does
+    /// NOT require a session claim: renaming a tab must not fight the active controller
+    /// for the relay-wide lease, and must work while that session is mid-turn.
+    RenameThread {
+        thread_id: String,
+        input: RenameThreadInput,
     },
     FetchWorkspaceDiff {
         #[serde(default)]
@@ -199,6 +207,7 @@ impl RemoteActionRequest {
             Self::DecideApproval { .. } => RemoteActionKind::DecideApproval,
             Self::ApplyFileChange { .. } => RemoteActionKind::ApplyFileChange,
             Self::ProjectAction { .. } => RemoteActionKind::ProjectAction,
+            Self::RenameThread { .. } => RemoteActionKind::RenameThread,
             Self::FetchWorkspaceDiff { .. } => RemoteActionKind::FetchWorkspaceDiff,
             Self::FetchReviews { .. } => RemoteActionKind::FetchReviews,
             Self::FetchWorkflows { .. } => RemoteActionKind::FetchWorkflows,
@@ -290,6 +299,13 @@ impl RemoteActionRequest {
             Self::ProjectAction { mut input } => {
                 input.device_id = Some(device_id);
                 Self::ProjectAction { input }
+            }
+            Self::RenameThread {
+                thread_id,
+                mut input,
+            } => {
+                input.device_id = Some(device_id);
+                Self::RenameThread { thread_id, input }
             }
             Self::FetchWorkspaceDiff {
                 thread_id,
@@ -385,6 +401,7 @@ pub(super) enum RemoteActionKind {
     DecideApproval,
     ApplyFileChange,
     ProjectAction,
+    RenameThread,
     FetchWorkspaceDiff,
     FetchReviews,
     FetchWorkflows,
@@ -423,6 +440,7 @@ impl RemoteActionKind {
             Self::DecideApproval => "decide_approval",
             Self::ApplyFileChange => "apply_file_change",
             Self::ProjectAction => "project_action",
+            Self::RenameThread => "rename_thread",
             Self::FetchWorkspaceDiff => "fetch_workspace_diff",
             Self::FetchReviews => "fetch_reviews",
             Self::FetchWorkflows => "fetch_workflows",
@@ -1232,6 +1250,13 @@ async fn execute_remote_action(
             .map(|_| RemoteActionOutcome::default()),
         RemoteActionRequest::ProjectAction { input } => state
             .project_action(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        // The receipt is dropped (this is an ack-only action, like ProjectAction). The
+        // phone repaints from its own optimistic update, and every OTHER client learns
+        // about the rename from the bumped `threads_revision` on the next snapshot.
+        RemoteActionRequest::RenameThread { thread_id, input } => state
+            .rename_thread(&thread_id, input)
             .await
             .map(|_| RemoteActionOutcome::default()),
         RemoteActionRequest::FetchWorkspaceDiff {
@@ -2488,6 +2513,7 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         RemoteActionKind::SendMessage
         | RemoteActionKind::ApplyFileChange
         | RemoteActionKind::ProjectAction
+        | RemoteActionKind::RenameThread
         | RemoteActionKind::RequestReview
         | RemoteActionKind::StartWorkflow
         | RemoteActionKind::ResolveReview

@@ -201,6 +201,20 @@ pub struct SessionSnapshot {
     /// so the empty (no-Projects) wire shape stays byte-identical.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub projects_revision: u64,
+    /// Cache key for the thread LIST, bumped when a session's identity changes in a way
+    /// no other signal reports — today that is exactly one thing: a user rename.
+    ///
+    /// The snapshot never carries thread names (they ride `GET /api/threads` /
+    /// `list_threads`), and the thread list is otherwise only polled — 12s on local. A
+    /// rename is a direct manipulation whose whole promise is "it shows up on my other
+    /// devices", so waiting out a poll would read as broken. Clients refetch the list
+    /// when this changes, exactly like `projects_revision`.
+    ///
+    /// NOT bumped for ordinary churn (new messages, status changes): those already have
+    /// their own signals, and bumping here would turn every turn into a list refetch.
+    /// Skipped when 0 so the pre-rename wire shape stays byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub threads_revision: u64,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -1066,6 +1080,9 @@ impl ThreadSummaryView {
         if let Some(name) = &mut self.name {
             truncate_with_ellipsis(name, budget.max_name_chars);
         }
+        // `renamed` needs no budget of its own — it is a bool, and the string it
+        // describes IS `name`, already truncated above. That is the point of storing a
+        // flag instead of a second copy of the title.
         truncate_with_ellipsis(&mut self.preview, budget.max_preview_chars);
         self
     }
@@ -1859,6 +1876,21 @@ pub struct ThreadSummaryView {
     /// Providers do not track fork relationships, so this is relay-owned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// Whether `name` above is the USER's title rather than the agent's.
+    ///
+    /// A flag and not the string itself, deliberately. `name` already carries the merged
+    /// title, and the override always wins, so a `custom_name: String` field would repeat
+    /// `name` byte for byte on every renamed row — up to `MAX_THREAD_NAME_CHARS` of pure
+    /// duplication inside a byte-budgeted remote frame whose over-budget response is to
+    /// DROP SESSIONS from the sidebar (80 → 40 → 20 → 10). `renamed ? name : null`
+    /// reconstructs the override exactly, for ~15 bytes on the rare row that needs it.
+    ///
+    /// Two affordances are wrong without the distinction: offering "use the agent's name"
+    /// on a session that never had an override (a control that does nothing), and
+    /// skipping a rename as a no-op when the user deliberately types the agent's current
+    /// title to PIN it against future drift.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub renamed: bool,
 }
 
 /// A checkout of a project on a specific relay *host*. `host_id` is the host axis
@@ -1962,6 +1994,83 @@ pub struct ThreadArchiveReceipt {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadDeleteReceipt {
     pub thread_id: String,
+    pub message: String,
+}
+
+/// Body of the session rename endpoint.
+///
+/// `name` is REQUIRED but nullable, and the distinction is the whole point:
+///   * `{"name": "Deploy work"}` → set that user-chosen title;
+///   * `{"name": ""}` / whitespace → clear the override, back to the provider's own name;
+///   * `{"name": null}` → clear it, explicitly;
+///   * `{}` → a 422, NOT a reset.
+///
+/// The struct deliberately does NOT carry `#[serde(default)]`, so an omitted `name` is a
+/// deserialization error. Defaulting it would mean any body that merely FAILED to carry
+/// the field — a client bug, a partial write, a schema drift — silently deletes the
+/// user's title while answering 200. Destroying data must require asking for it.
+///
+/// Clearing must stay expressible, though: the provider keeps auto-deriving a title
+/// underneath, and "reset to auto" is the only way back to it once a session has been
+/// renamed. Hence required-but-nullable rather than simply required.
+// `Serialize` is derived because the broker's `RemoteActionRequest` round-trips its own
+// payload (replay cache / re-encryption), exactly like `ProjectActionInput`. It emits
+// `name` unconditionally (as `null` for a reset), so a round trip satisfies the stricter
+// `Deserialize` below.
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameThreadInput {
+    pub name: Option<String>,
+    /// Actor for the log line. Stamped SERVER-side on the broker path (a paired device
+    /// cannot claim to be another device); client-supplied only on the local surface.
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+// Hand-written so `name` is REQUIRED. A derived impl would not do it: serde treats an
+// `Option<T>` field as optional whether or not the container carries `#[serde(default)]`,
+// so `{}` would quietly deserialize to `name: None` — which this endpoint reads as
+// "delete the user's title". `JSON.stringify({ name: undefined })` produces exactly that
+// body, so it is an easy accident, not a contrived one.
+//
+// The `Option<Option<_>>` is the standard distinction: the outer layer says whether the
+// KEY was present, the inner one carries `null` vs a string.
+impl<'de> Deserialize<'de> for RenameThreadInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+            T: Deserialize<'de>,
+        {
+            Option::deserialize(deserializer).map(Some)
+        }
+
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default, deserialize_with = "present")]
+            name: Option<Option<String>>,
+            #[serde(default)]
+            device_id: Option<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(RenameThreadInput {
+            name: wire
+                .name
+                .ok_or_else(|| serde::de::Error::missing_field("name"))?,
+            device_id: wire.device_id,
+        })
+    }
+}
+
+/// Post-rename state, echoed so the calling client repaints without a refetch.
+/// `name: None` means the session is back on its provider-derived title.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadRenameReceipt {
+    pub thread_id: String,
+    pub name: Option<String>,
     pub message: String,
 }
 

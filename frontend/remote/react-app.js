@@ -188,9 +188,15 @@ import {
   createRemoteProject,
   fetchRemoteProjects,
   renameRemoteProject,
+  renameRemoteThread,
   deleteRemoteProject,
   unassignRemoteThread,
 } from "./project-actions.js";
+import {
+  normalizeThreadName,
+  threadCustomName,
+  threadNameDraft,
+} from "../shared/thread-rename.js";
 import { normalizeProjectName, projectsMenuReady } from "../shared/project-menu.js";
 import { selectThreadSheet } from "../shared/thread-actions-model.js";
 import { runThreadSheetAction } from "./thread-sheet-action.js";
@@ -860,6 +866,28 @@ function RemoteApp() {
     notifyRemoteProjects(session);
   }, [session]);
 
+  // Session titles ride the separately-fetched thread list, not the snapshot, so a
+  // rename made anywhere else (desktop tab strip, another phone) is invisible here
+  // until the list is re-asked for. `threads_revision` is that signal — the remote
+  // analog of the same hook in app.js.
+  //
+  // The first observation only SEEDS the baseline: the initial list fetch already
+  // carries the current titles, so refetching there would be pure duplication. Silent,
+  // because nobody asked for a refresh — the list must not flash a spinner.
+  const lastThreadsRevisionRef = useRef(null);
+  const threadsRevision = session?.threads_revision || 0;
+  useEffect(() => {
+    const seeding = lastThreadsRevisionRef.current === null;
+    if (lastThreadsRevisionRef.current === threadsRevision) {
+      return;
+    }
+    lastThreadsRevisionRef.current = threadsRevision;
+    if (seeding) {
+      return;
+    }
+    void runThreadRefresh("session renamed", { silent: true, fresh: true }).catch(() => {});
+  }, [threadsRevision]);
+
   // Reviewer-tab actions, bound to the broker-backed remote handlers. `handlers`
   // is rebuilt every render, so we keep the latest in a ref and expose a STABLE
   // action object via useMemo([]). Stability matters: `fetchReviewerTranscript`
@@ -1097,14 +1125,14 @@ function RemoteApp() {
     };
   }, []);
 
-  async function runThreadRefresh(reason, { silent = false } = {}) {
+  async function runThreadRefresh(reason, { silent = false, fresh = false } = {}) {
     let completed = false;
     if (!silent) {
       threadListStore.getState().startRefresh();
     }
 
     try {
-      await handlers.onRefreshThreads({ reason, silent });
+      await handlers.onRefreshThreads({ reason, silent, fresh });
       completed = true;
     } catch (error) {
       if (!silent) {
@@ -1212,6 +1240,9 @@ function RemoteApp() {
 
   function handleThreadSheetAction(item) {
     const threadId = actionsSheetThreadId;
+    // Read the session BEFORE closing the sheet — `actionsSheetThread` is derived from
+    // the open sheet's id and is null by the time the rename branch needs its name.
+    const sheetThread = actionsSheetThread;
     // Close first: every branch either opens another dialog or awaits the network, and
     // leaving the sheet up over the fork dialog would stack two modals.
     closeActionsSheet();
@@ -1222,6 +1253,7 @@ function RemoteApp() {
       item,
       threadId,
       projects: before,
+      currentName: threadCustomName(sheetThread),
       deps: {
         assign: assignRemoteThreadToProject,
         unassign: unassignRemoteThread,
@@ -1231,6 +1263,20 @@ function RemoteApp() {
         openFork: (id) => handleOpenForkDialog(id),
         refresh: refreshRemoteProjects,
         log: renderLog,
+        rename: renameRemoteThread,
+        // Seeded from the DISPLAYED title, so a never-renamed session opens with the
+        // agent's name to edit rather than an empty box. Returns `undefined` when
+        // cancelled and `null` when the user cleared it (a reset) — the two are
+        // different intents and the action branch relies on telling them apart.
+        promptRename: () => {
+          const answer = window.prompt(
+            "Rename this session.\n\nLeave it blank to go back to the name the agent picked.",
+            threadNameDraft(sheetThread, shortId(threadId))
+          );
+          return answer === null ? undefined : normalizeThreadName(answer);
+        },
+        refreshThreads: () =>
+          runThreadRefresh("session renamed", { silent: true, fresh: true }),
       },
     });
   }

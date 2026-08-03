@@ -153,6 +153,7 @@ fn make_snapshot() -> SessionSnapshot {
         workflows_revision: 0,
         push_vapid_public_key: None,
         projects_revision: 0,
+        threads_revision: 0,
     }
 }
 
@@ -1601,6 +1602,7 @@ fn threads_response_compact_for_broker_limits_serialized_size() {
                 model_provider: "openai".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             })
             .collect(),
     };
@@ -1613,6 +1615,52 @@ fn threads_response_compact_for_broker_limits_serialized_size() {
         .iter()
         .all(|thread| thread.preview.chars().count() <= MAX_BROKER_THREAD_PREVIEW_CHARS));
     assert!(serde_json::to_vec(&compacted).unwrap().len() <= THREADS_RESPONSE_TARGET_BYTES);
+}
+
+/// Every session renamed must not cost the sidebar half its rows.
+///
+/// The rename feature first carried the override as its OWN `custom_name: String` field,
+/// which duplicated `name` byte for byte on every renamed row. With 80 otherwise-small
+/// rows and ordinary-length titles that was enough to cross `THREADS_RESPONSE_TARGET_BYTES`,
+/// and the reduction loop's answer to an over-budget frame is to drop threads (80 → 40 →
+/// 20 → 10) — so the phone would silently lose half its sessions as a side effect of
+/// people naming their tabs. It is a `bool` now; this pins that.
+///
+/// The existing compaction tests all set `renamed: false`, so none of them exercise this.
+#[test]
+fn threads_response_stays_in_budget_when_every_session_is_renamed() {
+    let response = ThreadsResponse {
+        threads: (0..MAX_BROKER_THREADS)
+            .map(|index| ThreadSummaryView {
+                id: format!("thread-{index}"),
+                // A plausible user-chosen title at the length people actually type, not a
+                // pathological one — the point is that ordinary use stays in budget.
+                name: Some(format!("Refactor the auth token flow {index}")),
+                preview: format!("short preview {index}"),
+                cwd: format!("/tmp/project-{index}"),
+                updated_at: index as u64,
+                source: "cli".to_string(),
+                status: "idle".to_string(),
+                model_provider: "anthropic".to_string(),
+                provider: "claude_code".to_string(),
+                forked_from: None,
+                renamed: true,
+            })
+            .collect(),
+    };
+
+    let compacted = response.compact_for(ThreadsResponseCompactProfile::RemoteSurface);
+
+    assert_eq!(
+        compacted.threads.len(),
+        MAX_BROKER_THREADS,
+        "renaming sessions must not make the compactor start dropping them"
+    );
+    assert!(serde_json::to_vec(&compacted).unwrap().len() <= THREADS_RESPONSE_TARGET_BYTES);
+    assert!(
+        compacted.threads.iter().all(|thread| thread.renamed),
+        "the flag must survive compaction, or the reset affordance disappears on remote"
+    );
 }
 
 #[test]
@@ -1630,6 +1678,7 @@ fn threads_response_compact_for_local_web_is_less_aggressive() {
                 model_provider: "openai".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             })
             .collect(),
     };
@@ -1661,6 +1710,7 @@ fn threads_response_compact_for_ios_surface_currently_reuses_remote_budget() {
                 model_provider: "openai".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             })
             .collect(),
     };

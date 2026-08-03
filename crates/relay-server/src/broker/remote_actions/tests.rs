@@ -72,6 +72,7 @@ fn make_snapshot() -> SessionSnapshot {
         workflows_revision: 0,
         push_vapid_public_key: None,
         projects_revision: 0,
+        threads_revision: 0,
     }
 }
 
@@ -89,6 +90,7 @@ fn make_threads() -> ThreadsResponse {
                 model_provider: "openai".to_string(),
                 provider: "codex".to_string(),
                 forked_from: None,
+                renamed: false,
             })
             .collect(),
     }
@@ -1072,4 +1074,55 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
         carried["thread_project_id"]["thread-1"], "proj-1",
         "the device needs membership to group sessions by project"
     );
+}
+
+/// Locks the `rename_thread` wire contract against the exact payload the phone sends
+/// (`remote/project-actions.js`: `{ thread_id, input: { name } }`). A drift here fails
+/// only at runtime, on a device, with a confusing broker error.
+#[test]
+fn rename_thread_round_trips_the_payload_the_remote_surface_sends() {
+    let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "rename_thread",
+        "thread_id": "thread-1",
+        "input": { "name": "Auth work" }
+    }))
+    .expect("rename_thread should parse");
+    assert_eq!(request.kind(), RemoteActionKind::RenameThread);
+    assert_eq!(RemoteActionKind::RenameThread.as_str(), "rename_thread");
+
+    // bind_device must stamp the actor WITHOUT dropping the selector — the same
+    // rebuild-loses-the-field bug fetch_workspace_diff guards against.
+    match request.bind_device("device-9".to_string()) {
+        RemoteActionRequest::RenameThread { thread_id, input } => {
+            assert_eq!(thread_id, "thread-1");
+            assert_eq!(input.name.as_deref(), Some("Auth work"));
+            assert_eq!(
+                input.device_id.as_deref(),
+                Some("device-9"),
+                "the server stamps the actor; a device cannot claim to be another"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // A reset is `{"name": null}` — it must parse, not be mistaken for a malformed body.
+    let reset: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "rename_thread",
+        "thread_id": "thread-1",
+        "input": { "name": null }
+    }))
+    .expect("a reset should parse");
+    match reset {
+        RemoteActionRequest::RenameThread { input, .. } => assert!(input.name.is_none()),
+        other => panic!("unexpected request: {other:?}"),
+    }
+
+    assert!(matches!(
+        remote_action_result_kind(RemoteActionKind::RenameThread),
+        RemoteActionResultKind::RemoteActionAck
+    ));
+    // Renaming a tab must not fight the active controller for the relay-wide lease,
+    // and must work while that session is mid-turn.
+    assert!(!requires_session_claim(RemoteActionKind::RenameThread));
+    assert!(!issues_session_claim(RemoteActionKind::RenameThread));
 }

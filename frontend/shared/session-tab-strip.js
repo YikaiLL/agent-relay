@@ -85,15 +85,95 @@ function PinGlyph({ filled }) {
 }
 
 
+// The inline title editor. A tab is a small, dense target, so renaming happens in
+// place rather than in a dialog: you see the result in the strip as you type it, next
+// to the other tabs it has to be distinguishable from.
+//
+// Committing on BLUR (not cancelling) is deliberate — the box is tiny and easy to click
+// away from, and silently discarding a typed name would be the worse surprise. Escape
+// is the explicit "forget it".
+function TabTitleEditor({ defaultValue, onCommit, onCancel }) {
+  const inputRef = useRef(null);
+  // Guards the commit against running twice: Enter commits and then blurs, and the
+  // blur handler would otherwise submit the same name again.
+  const settledRef = useRef(false);
+
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) {
+      return;
+    }
+    input.focus();
+    // Select rather than place a caret: the common case is replacing the agent's
+    // title wholesale, and a selection makes "type over it" the default while still
+    // allowing an edit (arrow key first).
+    input.select();
+  }, []);
+
+  const settle = (commit) => {
+    if (settledRef.current) {
+      return;
+    }
+    settledRef.current = true;
+    if (commit) {
+      onCommit?.(inputRef.current?.value ?? "");
+    } else {
+      onCancel?.();
+    }
+  };
+
+  return h("input", {
+    ref: inputRef,
+    type: "text",
+    className: "session-tab-title-input",
+    defaultValue,
+    "aria-label": "Session name",
+    // The strip turns a press into a pan/reorder gesture. Inside the editor a press
+    // is a caret placement, and a drag is a text selection.
+    onPointerDown: (event) => event.stopPropagation(),
+    onClick: (event) => event.stopPropagation(),
+    // A double click inside the editor selects a word; it must not also promote the
+    // tab out of preview state.
+    onDoubleClick: (event) => event.stopPropagation(),
+    // The tab container preventDefault()s `contextmenu` to open this editor. Inside the
+    // editor a right-click means cut/copy/paste, so the event must not reach it —
+    // otherwise the one control where a text menu is genuinely useful is the one place
+    // it is suppressed.
+    onContextMenu: (event) => event.stopPropagation(),
+    onBlur: () => settle(true),
+    onKeyDown: (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        settle(true);
+        // Return focus to the strip rather than leaving it on a removed node.
+        event.currentTarget.blur();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        settle(false);
+        event.currentTarget.blur();
+      } else if (event.key === "Tab") {
+        // Let focus move on, but commit first — a tabbed-away edit is a finished one.
+        settle(true);
+      }
+      // Arrow keys, Home/End etc. must edit text, not pan the strip.
+      event.stopPropagation();
+    },
+  });
+}
+
 function SessionTab({
   item,
   focused,
   isDragging,
   isDropTarget,
+  editing,
   onFocus,
   onClose,
   onPromote,
   onTogglePin,
+  onBeginRename,
+  onCommitRename,
+  onCancelRename,
 }) {
   // One source of truth for the activity dot, shared with the thread list and
   // project cards — a tab must never disagree with the sidebar about a session.
@@ -102,6 +182,7 @@ function SessionTab({
     attentionKind: item.attentionKind || null,
     reviewing: Boolean(item.reviewing),
   });
+  const renamable = Boolean(onBeginRename) && Boolean(item.threadId);
 
   return h(
     "div",
@@ -116,38 +197,87 @@ function SessionTab({
       "data-thread-id": item.threadId,
       // Read by the e2e suite, which has no way to ask about an italic title.
       "data-preview": item.preview ? "true" : undefined,
+      "data-editing": editing ? "true" : undefined,
+      // Right-click is the rename gesture. It goes straight into the editor rather
+      // than opening a one-item menu: the tab IS the target and the label IS the
+      // thing being changed, so a menu would only add a click. Double-click is not
+      // available — it already promotes a preview tab (see onDoubleClick below).
+      onContextMenu: renamable
+        ? (event) => {
+            event.preventDefault();
+            // The sidebar row's own context menu lives on an ancestor; without this
+            // a right-click on a tab would also open that session menu behind the
+            // editor.
+            event.stopPropagation();
+            onBeginRename(item.tabId);
+          }
+        : undefined,
     },
-    h(
-      "button",
-      {
-        type: "button",
-        role: "tab",
-        "aria-selected": focused ? "true" : "false",
-        className: "session-tab-main",
-        onClick: () => onFocus?.(item.tabId),
-        // Same keep gesture as the sidebar row, on the other end of the journey:
-        // you peeked, you stayed, now double click to stop it being replaceable.
-        // Bound to the tab's own button so a double click on the close or pin
-        // control — which stop their own clicks — can never promote a tab that is
-        // on its way out.
-        onDoubleClick: () => onPromote?.(item.tabId),
-        title: item.tooltip || item.title,
-      },
-      // One fixed-width slot for both states, so titles line up whether or not a
-      // session has a dot — a slot that resized per state would make every title
-      // jump as turns start and finish. Status outranks identity inside it: the
-      // dot is transient and demands attention, the provider is static and can
-      // wait for the session to settle.
-      h(
-        "span",
-        { className: "session-tab-lead", "aria-hidden": "true" },
-        dot
-          ? h("span", { className: dot.className })
-          : providerMark(item.provider, "session-tab-provider")
-      ),
-      h("span", { className: "session-tab-title" }, item.title),
-      dot ? h("span", { className: "sr-only" }, dot.label) : null
-    ),
+    // One fixed-width slot for both states, so titles line up whether or not a
+    // session has a dot — a slot that resized per state would make every title
+    // jump as turns start and finish. Status outranks identity inside it: the
+    // dot is transient and demands attention, the provider is static and can
+    // wait for the session to settle.
+    //
+    // While editing, the lead moves OUT of the button and the button is replaced by
+    // the input. An <input> nested in a <button> is invalid HTML, and the button
+    // would swallow the clicks that place a caret — so the two are siblings, never
+    // parent and child.
+    editing
+      ? h(
+          "span",
+          { className: "session-tab-main is-editing" },
+          h(
+            "span",
+            { className: "session-tab-lead", "aria-hidden": "true" },
+            dot
+              ? h("span", { className: dot.className })
+              : providerMark(item.provider, "session-tab-provider")
+          ),
+          h(TabTitleEditor, {
+            // Seeded from the DISPLAYED title so a never-renamed session opens with
+            // the agent's name to edit, not an empty box.
+            defaultValue: item.renameDraft ?? item.title,
+            onCommit: (value) => onCommitRename?.(item.tabId, value),
+            onCancel: () => onCancelRename?.(item.tabId),
+          })
+        )
+      : h(
+          "button",
+          {
+            type: "button",
+            role: "tab",
+            "aria-selected": focused ? "true" : "false",
+            className: "session-tab-main",
+            onClick: () => onFocus?.(item.tabId),
+            // F2 is the platform-neutral rename key (Explorer, VS Code, most IDEs).
+            // Keyboard users cannot reach a right-click.
+            onKeyDown: renamable
+              ? (event) => {
+                  if (event.key === "F2") {
+                    event.preventDefault();
+                    onBeginRename(item.tabId);
+                  }
+                }
+              : undefined,
+            // Same keep gesture as the sidebar row, on the other end of the journey:
+            // you peeked, you stayed, now double click to stop it being replaceable.
+            // Bound to the tab's own button so a double click on the close or pin
+            // control — which stop their own clicks — can never promote a tab that is
+            // on its way out.
+            onDoubleClick: () => onPromote?.(item.tabId),
+            title: item.tooltip || item.title,
+          },
+          h(
+            "span",
+            { className: "session-tab-lead", "aria-hidden": "true" },
+            dot
+              ? h("span", { className: dot.className })
+              : providerMark(item.provider, "session-tab-provider")
+          ),
+          h("span", { className: "session-tab-title" }, item.title),
+          dot ? h("span", { className: "sr-only" }, dot.label) : null
+        ),
     h(
       "button",
       {
@@ -181,7 +311,10 @@ function SessionTab({
 }
 
 // Controls own their clicks; a press on one must never start a pan or a lift.
-const CONTROL_SELECTOR = ".session-tab-pin, .session-tab-close, .session-tab-new";
+// The title editor is in here for the same reason plus one more: dragging inside it
+// selects text, and a strip pan would steal that.
+const CONTROL_SELECTOR =
+  ".session-tab-pin, .session-tab-close, .session-tab-new, .session-tab-title-input";
 
 function tabIdAt(node) {
   return node?.closest?.("[data-tab-id]")?.getAttribute("data-tab-id") || null;
@@ -196,12 +329,20 @@ export function SessionTabStrip({
   onTogglePin = null,
   onMove = null,
   onNewTab = null,
+  // `onRename(threadId, name)` — `name` is the raw box contents; the caller normalizes
+  // (blank means "reset to the agent's own title"). Absent → tabs are not renamable and
+  // no rename affordance is advertised at all.
+  onRename = null,
   emptyMessage = "No open sessions.",
   reorderHoldMs = REORDER_HOLD_MS,
 }) {
   const [draggingId, setDraggingId] = useState(null);
   const [dropTargetId, setDropTargetId] = useState(null);
   const [panning, setPanning] = useState(false);
+  // Which tab is being renamed, if any. Local to the strip on purpose: an in-progress
+  // edit is transient UI, not navigation state — it must not survive a reload or land
+  // in the canonical session-view store.
+  const [editingTabId, setEditingTabId] = useState(null);
 
   const stripRef = useRef(null);
   const gestureRef = useRef(null);
@@ -558,6 +699,26 @@ export function SessionTabStrip({
     event.preventDefault();
   };
 
+  const beginRename = (tabId) => {
+    // Renaming a tab is not the same as viewing it — the strip deliberately does NOT
+    // focus the session here. Right-clicking a background tab to correct its label
+    // should not yank the main area away from what you were reading.
+    setEditingTabId(tabId);
+  };
+
+  const cancelRename = () => setEditingTabId(null);
+
+  const commitRename = (tabId, value) => {
+    setEditingTabId(null);
+    const item = items.find((entry) => entry.tabId === tabId);
+    if (!item?.threadId) {
+      return;
+    }
+    // The caller decides whether this is a real change and what "blank" means; the
+    // strip's job ends at reporting the intent.
+    onRename?.(item.threadId, value);
+  };
+
   if (!items.length) {
     return h(
       "div",
@@ -598,10 +759,16 @@ export function SessionTabStrip({
         focused: item.tabId === focusedTabId,
         isDragging: draggingId === item.tabId,
         isDropTarget: dropTargetId === item.tabId && draggingId !== item.tabId,
+        // A tab that is being dragged is not being renamed: a lift cancels the edit
+        // (its commit already ran on blur), so the two states can never overlap.
+        editing: Boolean(onRename) && editingTabId === item.tabId && !draggingId,
         onFocus,
         onClose,
         onPromote,
         onTogglePin,
+        onBeginRename: onRename ? beginRename : null,
+        onCommitRename: commitRename,
+        onCancelRename: cancelRename,
       })
     ),
     onNewTab
@@ -651,6 +818,11 @@ export function buildSessionTabItems({
       // signal an editor uses for exactly this state.
       preview: Boolean(tab.preview),
       title: `${resolved.title || "Session"}${paneSuffix}`,
+      // What the rename editor opens with — the session's OWN title, without the
+      // `(2)` pane count the displayed title carries. Seeding from `title` would
+      // pre-fill "Auth work (2)", and committing that stores the suffix literally,
+      // rendering as "Auth work (2) (2)" from then on.
+      renameDraft: resolved.title || "",
       tooltip: resolved.tooltip || null,
       // Which agent owns the tab. Shown in the leading slot while the session is
       // idle, i.e. whenever the activity dot is not using it.

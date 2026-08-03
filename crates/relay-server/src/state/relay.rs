@@ -274,6 +274,23 @@ pub struct RelayState {
     pub(super) projects: HashMap<String, crate::protocol::ProjectView>,
     /// Session (thread) -> project id membership. Absent = "Unassigned".
     pub(super) thread_project_id: HashMap<String, String>,
+    /// User-chosen session titles, keyed by thread id. Relay-owned and PERSISTED,
+    /// because the provider's own title is not ours to write and not stable: Claude
+    /// and Codex both re-derive a thread's name from its contents as the conversation
+    /// grows, so a title the user picked would be silently overwritten mid-session.
+    ///
+    /// This map is an OVERRIDE, not a seed — once present it wins over the provider's
+    /// name forever (see `apply_custom_thread_name`), and clearing the entry is the
+    /// only way back to the auto-derived title. That is the entire point of the
+    /// feature: a renamed tab must stop drifting.
+    ///
+    /// Absent = "use whatever the provider called it".
+    pub(super) thread_custom_name: HashMap<String, String>,
+    /// Monotonic cache key for the thread LIST channel; bumped only when a rename
+    /// changes a session's title. Rides the snapshot (tiny); the list itself is fetched
+    /// separately. In-memory only — a restart resets it to 0, so clients simply refetch
+    /// once on the mismatch (harmless), same as `projects_revision`.
+    pub(super) threads_revision: u64,
     /// Monotonic cache key for the dedicated Projects channel; bumped on every project
     /// mutation. Rides the snapshot (tiny); the full projects/membership payload is
     /// fetched on demand. In-memory only — a restart resets it to 0, so clients simply
@@ -390,6 +407,8 @@ impl RelayState {
             thread_last_activity_at: HashMap::new(),
             projects: HashMap::new(),
             thread_project_id: HashMap::new(),
+            thread_custom_name: HashMap::new(),
+            threads_revision: 0,
             projects_revision: 0,
             allowed_roots: Vec::new(),
             available_models: Vec::new(),
@@ -766,6 +785,125 @@ impl RelayState {
         self.projects_revision = self.projects_revision.wrapping_add(1);
     }
 
+    /// Set (`Some`) or clear (`None`) a session's user-chosen title. Returns whether
+    /// anything actually changed, so the caller can skip the revision bump / notify on
+    /// a no-op rename (re-submitting the same name from a stale UI).
+    ///
+    /// The caller is responsible for trimming/validating the name — `AppState::rename_thread`
+    /// owns the bounds, exactly as `project_action` owns `validate_project_name`.
+    pub(super) fn set_thread_custom_name(&mut self, thread_id: &str, name: Option<String>) -> bool {
+        let changed = match name {
+            Some(name) => self
+                .thread_custom_name
+                .insert(thread_id.to_string(), name.clone())
+                .is_none_or(|previous| previous != name),
+            None => self.thread_custom_name.remove(thread_id).is_some(),
+        };
+        if changed {
+            // The routing/display cache holds already-rendered rows. Re-overlay this
+            // thread's now so the very next `relay.threads` read agrees with the map,
+            // instead of waiting for the next provider list to refresh it.
+            self.refresh_custom_thread_name(thread_id);
+            // Tell every OTHER client the list it is holding is stale. Their next
+            // snapshot carries the new revision and they refetch — this is what makes a
+            // rename on the phone land on the desktop tab strip in ~a second instead of
+            // whenever the 12s thread poll next fires.
+            self.threads_revision = self.threads_revision.wrapping_add(1);
+        }
+        changed
+    }
+
+    /// Whether this thread was PERMANENTLY deleted while the relay was up.
+    ///
+    /// Deletion tombstones outlive the thread row, so a stale client can still name a
+    /// thread that is gone. Metadata writes must consult this or they resurrect a
+    /// persisted entry for a session nothing will ever clean up again.
+    pub(crate) fn thread_is_locally_deleted(&self, thread_id: &str) -> bool {
+        self.locally_deleted_thread_ids.contains(thread_id)
+    }
+
+    /// A session's user-chosen title, if it has one.
+    pub(crate) fn thread_custom_name(&self, thread_id: &str) -> Option<String> {
+        self.thread_custom_name.get(thread_id).cloned()
+    }
+
+    /// Resolve a thread id a CLIENT supplied to the id the relay actually keys state by.
+    ///
+    /// A Claude session lives under a synthetic `claude-pending-…` id until its first
+    /// send promotes it to a real SDK id. Clients learn about that promotion from the
+    /// snapshot, so between the promotion and the client processing it, a client can
+    /// legitimately act on the pending id. A write that keyed off it verbatim would land
+    /// on a dead key: invisible to every reader, and — for a PERSISTED map — orphaned
+    /// forever, because the pending id is never seen by any cleanup path.
+    ///
+    /// `thread_promoted_from` is real_id -> pending_id, so this scans it. The map is
+    /// small (one entry per promoted Claude session this process has seen) and this runs
+    /// only on an explicit user action, never in a hot path.
+    pub(crate) fn resolve_promoted_thread_id(&self, thread_id: &str) -> String {
+        if !thread_id.starts_with("claude-pending-") {
+            return thread_id.to_string();
+        }
+        self.thread_promoted_from
+            .iter()
+            .find(|(_, pending_id)| pending_id.as_str() == thread_id)
+            .map(|(real_id, _)| real_id.clone())
+            .unwrap_or_else(|| thread_id.to_string())
+    }
+
+    /// How many sessions currently carry a user-chosen title (the persisted map's size,
+    /// for the caller's entry-count bound).
+    pub(crate) fn custom_thread_name_count(&self) -> usize {
+        self.thread_custom_name.len()
+    }
+
+    /// Overlay the user's chosen title onto a provider-supplied summary. THE override
+    /// point: the custom name always wins, because the provider re-derives its own
+    /// title as the conversation grows and would otherwise clobber the user's choice
+    /// on the next list refresh.
+    pub(crate) fn apply_custom_thread_name(&self, thread: &mut ThreadSummaryView) {
+        // Always stamp `renamed`, including the false case: these rows are rebuilt from
+        // the providers, so leaving a stale `true` would tell the client a session is
+        // still renamed after it was reset.
+        match self.thread_custom_name.get(&thread.id) {
+            Some(name) => {
+                thread.name = Some(name.clone());
+                thread.renamed = true;
+            }
+            None => thread.renamed = false,
+        }
+    }
+
+    /// Re-apply the override across the cached rows (`threads` + per-thread runtime
+    /// summaries) for ONE thread, right after its override changed. Those rows were
+    /// built from an older provider list, so without this they keep the previous title
+    /// until the next list refresh or provider event.
+    ///
+    /// Clearing is the asymmetric case and the reason this takes the id. The overlay is
+    /// destructive — installing an override overwrites the provider's own title in the
+    /// cached row, and the relay keeps no shadow copy of it — so on a RESET there is
+    /// nothing to restore and leaving `name` alone would keep showing the title the
+    /// user just removed. `None` is the honest answer ("we no longer know what the
+    /// agent calls it"): the authoritative `list_threads` rebuilds from the provider
+    /// and re-overlays anyway, and `upsert_thread`'s merge refills the cache from the
+    /// next provider event.
+    fn refresh_custom_thread_name(&mut self, thread_id: &str) {
+        let name = self.thread_custom_name.get(thread_id).cloned();
+        let overlay = |thread: &mut ThreadSummaryView| {
+            thread.renamed = name.is_some();
+            thread.name = name.clone();
+        };
+        for thread in self.threads.iter_mut().filter(|row| row.id == thread_id) {
+            overlay(thread);
+        }
+        if let Some(summary) = self
+            .runtimes
+            .get_mut(thread_id)
+            .and_then(|runtime| runtime.summary.as_mut())
+        {
+            overlay(summary);
+        }
+    }
+
     /// The full, uncompacted Projects payload for the dedicated fetch channel.
     pub(crate) fn projects_response(&self) -> crate::protocol::ProjectsResponse {
         crate::protocol::ProjectsResponse {
@@ -1123,6 +1261,17 @@ impl RelayState {
                 .entry(real_id.to_string())
                 .or_insert(pending_project);
             self.bump_projects_revision();
+        }
+        // Same orphan class for a user-chosen title. A Claude session can be renamed
+        // BEFORE its first message — it is visible in the tab strip from the moment it
+        // is created — and that rename is recorded against the synthetic
+        // `claude-pending-…` id. Without this move the title silently reverts to the
+        // provider's auto-derived name on the first send, and the entry orphans in a
+        // persisted map. Conflict keeps the real id's own name.
+        if let Some(pending_name) = self.thread_custom_name.remove(pending_id) {
+            self.thread_custom_name
+                .entry(real_id.to_string())
+                .or_insert(pending_name);
         }
         // Same orphan class for fork lineage. A replay fork carrying pasted
         // images must withhold the prompt from `start_thread` (it cannot take
@@ -2227,6 +2376,7 @@ impl RelayState {
             workflows_revision: self.workflows_revision(),
             push_vapid_public_key: self.push_vapid_public_key.clone(),
             projects_revision: self.projects_revision,
+            threads_revision: self.threads_revision,
         }
     }
 
@@ -2518,6 +2668,7 @@ impl RelayState {
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
+        self.thread_custom_name = persisted.thread_custom_name.clone();
         self.projects_revision = persisted.projects_revision;
         // Normalize: a state file written before `projects_revision` existed restores
         // it as 0 while carrying projects; a fresh client (also 0) would then never
@@ -2569,6 +2720,11 @@ impl RelayState {
         if self.locally_deleted_thread_ids.contains(&thread.id) {
             return;
         }
+        // A user-renamed session keeps its title through every provider event. This is
+        // the live-event funnel (a turn finishing re-derives Claude's summary), so
+        // without the override here a rename would visibly revert mid-conversation
+        // even though the persisted map still held it.
+        self.apply_custom_thread_name(&mut thread);
         if let Some(existing) = self
             .threads
             .iter()
@@ -2847,6 +3003,12 @@ impl RelayState {
         self.threads.retain(|thread| thread.id != thread_id);
         self.thread_settings.remove(thread_id);
         self.thread_last_activity_at.remove(thread_id);
+        // The user's title goes with the session, on ARCHIVE as well as delete — this is
+        // the shared path. The relay has no un-archive, so an override left behind here
+        // could never be reached again: it would hold a slot under the persisted cap
+        // forever and wait to be inherited by a reused id. It joins the two persisted
+        // per-thread maps this function already clears, rather than being a special case.
+        self.thread_custom_name.remove(thread_id);
         self.runtimes.remove(thread_id);
         self.drop_pending_requests_for_thread(thread_id);
         self.threads.len() != before_len
@@ -2864,6 +3026,8 @@ impl RelayState {
         if self.thread_project_id.remove(thread_id).is_some() {
             self.bump_projects_revision();
         }
+        // The user's title is cleared by `remove_thread` below, which archive shares —
+        // unlike project membership above, it needs no permanent-delete-only placement.
         self.remove_thread(thread_id);
     }
 
@@ -3257,6 +3421,7 @@ impl RelayState {
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
+        self.thread_custom_name = persisted.thread_custom_name.clone();
         self.projects_revision = persisted.projects_revision;
         // Normalize: a state file written before `projects_revision` existed restores
         // it as 0 while carrying projects; a fresh client (also 0) would then never
@@ -3731,6 +3896,7 @@ mod tests {
             model_provider: "fake".to_string(),
             provider: "fake".to_string(),
             forked_from: None,
+            renamed: false,
         }
     }
 
@@ -4036,6 +4202,138 @@ mod tests {
             "an existing real-id assignment wins over the pending one"
         );
         assert!(relay.thread_project_id.get("claude-pending-2").is_none());
+    }
+
+    /// A rename that did not survive a relay restart would be worse than no rename:
+    /// the tab would silently snap back to whatever the agent last called the thread,
+    /// which is the exact complaint the feature exists to fix. Also pins backward
+    /// compatibility — a state file written before this map existed must still load.
+    #[test]
+    fn custom_thread_names_round_trip_through_persistence() {
+        let mut source = test_relay();
+        source.set_thread_custom_name("t1", Some("Auth work".to_string()));
+
+        let persisted = PersistedRelayState::from_relay(&source);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        assert_eq!(
+            restored.thread_custom_name("t1"),
+            Some("Auth work".to_string()),
+            "a rename must survive a relay restart"
+        );
+
+        // A pre-feature state file (field absent) loads with no overrides rather than
+        // failing to parse — every other per-thread map takes the same `serde(default)`.
+        let mut value = serde_json::to_value(&persisted).expect("serialize");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("thread_custom_name")
+            .expect("field should have been serialized");
+        let legacy: PersistedRelayState =
+            serde_json::from_value(value).expect("pre-rename state file must still load");
+        assert!(legacy.thread_custom_name.is_empty());
+    }
+
+    /// A Claude session is renamable the moment it appears — it has a tab before it has
+    /// a real SDK id. That rename is recorded against the synthetic `claude-pending-…`
+    /// id, so the promotion on first send must carry it over, or the title reverts
+    /// exactly when the user starts working and orphans a key in a PERSISTED map.
+    #[test]
+    fn promotion_carries_the_custom_name_to_the_real_thread_id() {
+        let mut relay = test_relay();
+        relay.set_thread_custom_name("claude-pending-1", Some("Auth work".to_string()));
+        relay.promote_background_thread("claude-pending-1", "real-1");
+        assert_eq!(
+            relay.thread_custom_name("real-1"),
+            Some("Auth work".to_string()),
+            "a rename made before the first message must survive promotion"
+        );
+        assert!(
+            relay.thread_custom_name("claude-pending-1").is_none(),
+            "the pending key would otherwise orphan in a persisted map"
+        );
+
+        // Conflict: a name the real id ALREADY has wins, mirroring project membership.
+        let mut relay = test_relay();
+        relay.set_thread_custom_name("claude-pending-2", Some("Pending name".to_string()));
+        relay.set_thread_custom_name("real-2", Some("Real name".to_string()));
+        relay.promote_background_thread("claude-pending-2", "real-2");
+        assert_eq!(
+            relay.thread_custom_name("real-2"),
+            Some("Real name".to_string())
+        );
+    }
+
+    /// The cached rows are what `relay.threads` readers see between provider refreshes,
+    /// so they have to track a rename immediately — and, on a RESET, must not keep
+    /// showing the title the user just removed. The overlay is destructive (no shadow
+    /// copy of the provider's title survives it), so clearing leaves `None` rather than
+    /// a stale name; the provider refills it on the next list/event.
+    #[test]
+    fn renaming_updates_the_cached_row_and_clearing_does_not_leave_it_stale() {
+        let mut relay = test_relay();
+        relay.upsert_thread(ThreadSummaryView {
+            id: "t1".to_string(),
+            name: Some("Agent Title".to_string()),
+            preview: "hello".to_string(),
+            cwd: "/tmp/project".to_string(),
+            updated_at: 1,
+            source: "fake".to_string(),
+            status: "idle".to_string(),
+            model_provider: "fake".to_string(),
+            provider: "fake".to_string(),
+            forked_from: None,
+            renamed: false,
+        });
+
+        relay.set_thread_custom_name("t1", Some("Auth work".to_string()));
+        let cached = relay
+            .threads
+            .iter()
+            .find(|thread| thread.id == "t1")
+            .expect("cached row");
+        assert_eq!(cached.name, Some("Auth work".to_string()));
+        assert!(cached.renamed);
+
+        relay.set_thread_custom_name("t1", None);
+        let cached = relay
+            .threads
+            .iter()
+            .find(|thread| thread.id == "t1")
+            .expect("cached row");
+        assert_eq!(
+            cached.renamed, false,
+            "a stale `renamed` would keep advertising the session as renamed"
+        );
+        assert_eq!(
+            cached.name, None,
+            "the removed title must not linger; the provider refills this"
+        );
+    }
+
+    /// Removing a session — archived OR permanently deleted — must drop its override.
+    ///
+    /// The relay has no un-archive path, so a title left behind by archive could never be
+    /// reached again: it would occupy a slot under the persisted cap forever and wait to
+    /// be inherited by a reused id. Clearing on both is also what the other persisted
+    /// per-thread maps in `remove_thread` (`thread_settings`, `thread_last_activity_at`)
+    /// already do, so the title is not a special case.
+    #[test]
+    fn removing_a_session_clears_its_custom_name_on_archive_and_on_delete() {
+        let mut relay = test_relay();
+        relay.set_thread_custom_name("t1", Some("Auth work".to_string()));
+        relay.set_thread_custom_name("t2", Some("Archived work".to_string()));
+
+        relay.mark_thread_deleted("t1");
+        assert!(relay.thread_custom_name("t1").is_none());
+
+        // `remove_thread` is the shared archive path.
+        relay.remove_thread("t2");
+        assert!(
+            relay.thread_custom_name("t2").is_none(),
+            "an archived session's title has no way back, so it must not linger"
+        );
     }
 
     #[test]

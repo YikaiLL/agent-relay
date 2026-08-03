@@ -5243,6 +5243,40 @@ body.is-resizing-panel {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The inline rename editor. It replaces the tab's own button (an <input> cannot live
+ * inside one), so it has to reproduce that button's box exactly — any difference in
+ * padding or font makes the tab twitch as the editor opens and closes, which reads as
+ * a glitch rather than a mode change. Only the treatment differs: a filled, outlined
+ * field, so it is unmistakably editable in a strip full of static labels. */
+.session-tab-title-input {
+  flex: 1;
+  min-width: 0;
+  padding: 1px 4px;
+  margin: -1px 0;
+  background: var(--bg-input, var(--bg-elevated));
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-none);
+  /* The accent border already carries the focus signal; the UA ring on top of it
+   * only thickens the tab. */
+  outline: none;
+}
+/* An editing tab keeps the pane-continuous treatment even when it is not the focused
+ * one — you are working on it, so it should not look dormant while you type. */
+.session-tab[data-editing="true"] {
+  background: var(--bg-elevated);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+/* A tab being renamed is never simultaneously "provisional": the italic would fight
+ * the input's own styling and make the typed text look disabled. */
+.session-tab.is-preview[data-editing="true"] .session-tab-title-input {
+  font-style: normal;
+}
 /* The tab's leading slot. ONE width for both states — an activity dot while the
    session is live, the provider's mark while it is idle — so titles never shift
    as turns start and finish. 14px is set by the mark; the 6px dot centres in it. */

@@ -54,6 +54,7 @@ impl ThreadRuntime {
                 model_provider: String::new(),
                 provider: String::new(),
                 forked_from: None,
+                renamed: false,
             }),
             active_turn_id: None,
             turn_revision: 0,
@@ -495,6 +496,7 @@ mod tests {
             model_provider: "fake".to_string(),
             provider: "fake".to_string(),
             forked_from: None,
+            renamed: false,
         }
     }
 

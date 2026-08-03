@@ -774,3 +774,255 @@ test("double-clicking the close control never promotes", () => {
 
   view.cleanup();
 });
+
+// --- inline rename --------------------------------------------------------------
+//
+// Renaming a tab is the one action whose target IS the label, so it happens in place.
+// The gestures it has to coexist with are already spoken for: double-click promotes a
+// preview tab, press-and-hold reorders, drag pans. Right-click was the only one free.
+
+function contextMenu(element) {
+  const event = new dom.window.MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+  act(() => {
+    element.dispatchEvent(event);
+  });
+  return event;
+}
+
+function keyDown(element, key) {
+  const event = new dom.window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+  act(() => {
+    element.dispatchEvent(event);
+  });
+  return event;
+}
+
+// React delegates `onBlur` from the bubbling `focusout`, not the non-bubbling `blur`.
+// A browser fires both; a test that dispatches only `blur` silently exercises nothing.
+function blur(element) {
+  act(() => {
+    element.dispatchEvent(new dom.window.FocusEvent("focusout", { bubbles: true }));
+  });
+}
+
+function editorIn(host, tabId) {
+  return tabEl(host, tabId)?.querySelector(".session-tab-title-input") || null;
+}
+
+function type(input, value) {
+  act(() => {
+    input.value = value;
+  });
+}
+
+test("right-click opens the editor on that tab, seeded with its current title", () => {
+  const view = mount({ items: ITEMS, focusedTabId: "tab-a", onRename: () => {} });
+  try {
+    const event = contextMenu(tabEl(view.host, "tab-b"));
+    // The browser's own menu must not also open over the editor.
+    assert.equal(event.defaultPrevented, true);
+
+    const input = editorIn(view.host, "tab-b");
+    assert.ok(input, "the right-clicked tab must enter edit mode");
+    assert.equal(input.value, "Beta", "the box starts from what the tab shows");
+    assert.equal(editorIn(view.host, "tab-a"), null, "only one tab edits at a time");
+    // The static label is replaced, not duplicated — two titles would double-render.
+    assert.equal(tabEl(view.host, "tab-b").querySelector(".session-tab-title"), null);
+  } finally {
+    view.cleanup();
+  }
+});
+
+// The editor replaces the tab's <button>. An <input> nested inside one is invalid HTML
+// and the button would swallow the clicks that place a caret, so this is a structural
+// requirement, not a style choice.
+test("the editor is never rendered inside the tab's button", () => {
+  const view = mount({ items: ITEMS, onRename: () => {} });
+  try {
+    contextMenu(tabEl(view.host, "tab-a"));
+    const input = editorIn(view.host, "tab-a");
+    assert.ok(input);
+    assert.equal(input.closest("button"), null);
+  } finally {
+    view.cleanup();
+  }
+});
+
+test("Enter commits the typed name against the tab's THREAD id", () => {
+  const renames = [];
+  const view = mount({ items: ITEMS, onRename: (threadId, name) => renames.push([threadId, name]) });
+  try {
+    contextMenu(tabEl(view.host, "tab-c"));
+    const input = editorIn(view.host, "tab-c");
+    type(input, "  Auth work  ");
+    keyDown(input, "Enter");
+
+    // Raw text, untrimmed: normalization is the caller's rule (shared/thread-rename.js),
+    // so the strip cannot disagree with the relay about it.
+    assert.deepEqual(renames, [["t3", "  Auth work  "]]);
+    assert.equal(editorIn(view.host, "tab-c"), null, "committing closes the editor");
+  } finally {
+    view.cleanup();
+  }
+});
+
+// Blank is how you ask for the agent's own title back. The strip must pass it through
+// rather than treating an emptied box as "nothing to do".
+test("an emptied box still commits, so a reset can be expressed", () => {
+  const renames = [];
+  const view = mount({ items: ITEMS, onRename: (threadId, name) => renames.push([threadId, name]) });
+  try {
+    contextMenu(tabEl(view.host, "tab-a"));
+    const input = editorIn(view.host, "tab-a");
+    type(input, "");
+    keyDown(input, "Enter");
+    assert.deepEqual(renames, [["t1", ""]]);
+  } finally {
+    view.cleanup();
+  }
+});
+
+test("Escape abandons the edit without reporting anything", () => {
+  const renames = [];
+  const view = mount({ items: ITEMS, onRename: (threadId, name) => renames.push([threadId, name]) });
+  try {
+    contextMenu(tabEl(view.host, "tab-a"));
+    const input = editorIn(view.host, "tab-a");
+    type(input, "Discarded");
+    keyDown(input, "Escape");
+
+    assert.deepEqual(renames, []);
+    assert.equal(editorIn(view.host, "tab-a"), null);
+    assert.equal(
+      tabEl(view.host, "tab-a").querySelector(".session-tab-title").textContent,
+      "Alpha"
+    );
+  } finally {
+    view.cleanup();
+  }
+});
+
+// The box is small and easy to click away from; discarding a typed name there would be
+// the worse surprise. Escape stays the explicit "forget it".
+test("clicking away commits rather than discarding, and commits only once", () => {
+  const renames = [];
+  const view = mount({ items: ITEMS, onRename: (threadId, name) => renames.push([threadId, name]) });
+  try {
+    contextMenu(tabEl(view.host, "tab-a"));
+    const input = editorIn(view.host, "tab-a");
+    type(input, "Blurred");
+    blur(input);
+    assert.deepEqual(renames, [["t1", "Blurred"]]);
+  } finally {
+    view.cleanup();
+  }
+});
+
+// Enter commits and then blurs. Without a settled-guard the blur would submit the same
+// name a second time — one keystroke, two writes.
+test("Enter then blur reports exactly one rename", () => {
+  const renames = [];
+  const view = mount({ items: ITEMS, onRename: (threadId, name) => renames.push([threadId, name]) });
+  try {
+    contextMenu(tabEl(view.host, "tab-a"));
+    const input = editorIn(view.host, "tab-a");
+    type(input, "Once");
+    keyDown(input, "Enter");
+    blur(input);
+    assert.deepEqual(renames, [["t1", "Once"]]);
+  } finally {
+    view.cleanup();
+  }
+});
+
+// Renaming a background tab is a label correction, not a navigation request: it must not
+// yank the main area away from whatever the user was reading.
+test("opening the editor neither focuses nor promotes the tab", () => {
+  const focused = [];
+  const promoted = [];
+  const view = mount({
+    items: ITEMS,
+    focusedTabId: "tab-a",
+    onFocus: (tabId) => focused.push(tabId),
+    onPromote: (tabId) => promoted.push(tabId),
+    onRename: () => {},
+  });
+  try {
+    contextMenu(tabEl(view.host, "tab-c"));
+    assert.deepEqual(focused, []);
+    assert.deepEqual(promoted, []);
+  } finally {
+    view.cleanup();
+  }
+});
+
+// Without a handler there is no transport, so advertising the gesture would be a lie —
+// and swallowing `contextmenu` would suppress the browser's own menu for nothing.
+test("with no onRename, right-click is left entirely alone", () => {
+  const view = mount({ items: ITEMS });
+  try {
+    const event = contextMenu(tabEl(view.host, "tab-a"));
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(editorIn(view.host, "tab-a"), null);
+  } finally {
+    view.cleanup();
+  }
+});
+
+// F2 is the platform rename key; a keyboard user cannot reach a right-click at all.
+test("F2 on a focused tab opens the editor", () => {
+  const view = mount({ items: ITEMS, focusedTabId: "tab-b", onRename: () => {} });
+  try {
+    const button = tabEl(view.host, "tab-b").querySelector(".session-tab-main");
+    keyDown(button, "F2");
+    assert.ok(editorIn(view.host, "tab-b"), "F2 must open the editor");
+  } finally {
+    view.cleanup();
+  }
+});
+
+// Text editing keys must EDIT TEXT. The app binds global shortcuts at the document
+// level, so an arrow or Home pressed while renaming a tab would otherwise both move the
+// caret and fire whatever that key means to the rest of the UI.
+//
+// The listener goes on `document`, not on the strip: React 18 delegates from the ROOT
+// CONTAINER, so a listener on a descendant of it runs before React's handler and could
+// never be stopped by one. Everything above the container is what stopPropagation can
+// actually protect — which is exactly where the global shortcuts live.
+test("keystrokes inside the editor do not escape to document-level shortcuts", () => {
+  const view = mount({ items: ITEMS, onRename: () => {} });
+  const seen = [];
+  const spy = (event) => seen.push(event.key);
+  dom.window.document.addEventListener("keydown", spy);
+  try {
+    contextMenu(tabEl(view.host, "tab-a"));
+    const input = editorIn(view.host, "tab-a");
+    keyDown(input, "ArrowLeft");
+    keyDown(input, "Home");
+    assert.deepEqual(seen, [], "a rename in progress must own its keyboard");
+  } finally {
+    dom.window.document.removeEventListener("keydown", spy);
+    view.cleanup();
+  }
+});
+
+// A press inside the box places a caret; a drag selects text. Neither may be stolen by
+// the strip's pan/hold gesture, and neither may leave a gesture armed behind the editor.
+test("a press inside the editor arms no strip gesture", async () => {
+  const before = windowListenerCount();
+  const view = mount({ items: ITEMS, onRename: () => {} });
+  try {
+    contextMenu(tabEl(view.host, "tab-a"));
+    const input = editorIn(view.host, "tab-a");
+    pointer(input, "pointerdown", centreOf("tab-a"));
+    await waitForHold();
+    assert.equal(
+      windowListenerCount(),
+      before,
+      "the editor must not install the strip's drag listeners"
+    );
+    assert.ok(!tabEl(view.host, "tab-a").className.includes("is-dragging"));
+  } finally {
+    view.cleanup();
+  }
+});

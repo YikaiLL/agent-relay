@@ -705,3 +705,180 @@ fn workspace_diff_query_parses_the_url_the_client_actually_builds() {
     let query: Query<crate::WorkspaceDiffQuery> = Query::try_from_uri(&uri).expect("root url");
     assert_eq!(query.0.root.as_deref(), Some("/repo/linked"));
 }
+
+/// A rename body that cannot be parsed must be REFUSED, never read as a reset.
+///
+/// The neighbouring archive/delete handlers take `Option<Json<_>>`, whose rejection type
+/// is `Infallible` — it turns a missing content-type, malformed JSON, or a wrong value
+/// type into `None`. That is harmless for archive (it defaults to "keep reviewers") and
+/// destructive for rename, where the default means "clear the user's title". This pins
+/// the rename endpoint to a REQUIRED body so the same shape cannot be copied back in.
+#[tokio::test]
+async fn rename_thread_refuses_an_unparseable_body_instead_of_clearing_the_name() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    // Each case would deserialize to `RenameThreadInput::default()` (a RESET) under
+    // `Option<Json<_>>`, and so would silently delete an existing title.
+    let cases: Vec<(&str, Option<&str>, &str)> = vec![
+        (
+            "body with no content-type",
+            None,
+            r#"{"name":"Deploy work"}"#,
+        ),
+        (
+            "body with the wrong content-type",
+            Some("text/plain"),
+            r#"{"name":"Deploy work"}"#,
+        ),
+        (
+            "malformed json",
+            Some("application/json"),
+            r#"{"name":"Deploy work"#,
+        ),
+        (
+            "wrong value type",
+            Some("application/json"),
+            r#"{"name":123}"#,
+        ),
+    ];
+
+    for (label, content_type, body) in cases {
+        let project = tempfile::TempDir::new().expect("project tempdir");
+        let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+        let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+            project.path().display().to_string(),
+            change_tx.clone(),
+            crate::state::SecurityProfile::private(),
+        )));
+        let context = AppContext {
+            app: crate::state::AppState::from_parts(
+                relay,
+                std::collections::HashMap::new(),
+                change_tx,
+            ),
+            auth: test_auth(),
+            launch_id: None,
+            security_headers: SecurityHeadersConfig::default(),
+        };
+        let router = build_router(context, WebAssets::Embedded);
+
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/threads/t1/rename")
+            .header(header::HOST, "127.0.0.1:8787")
+            .header(header::AUTHORIZATION, "Bearer secret");
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        let response = router
+            .oneshot(
+                request
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert!(
+            response.status().is_client_error(),
+            "{label}: an unparseable rename body must be refused, got {}",
+            response.status()
+        );
+    }
+}
+
+/// An omitted `name` is a 4xx, NOT a reset.
+///
+/// `{}` is a well-formed JSON body, so requiring a body does not catch it; only making
+/// `name` a REQUIRED (but nullable) field does. Without that, any client bug, partial
+/// write or schema drift that drops the field silently deletes the user's title while
+/// answering 200 — the same data-loss class as the swallowed-rejection bug above,
+/// reached through a different door.
+#[tokio::test]
+async fn rename_thread_refuses_a_body_that_omits_the_name_field() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let project = tempfile::TempDir::new().expect("project tempdir");
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        project.path().display().to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    let context = AppContext {
+        app: crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx),
+        auth: test_auth(),
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+    };
+    let router = build_router(context, WebAssets::Embedded);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/threads/t1/rename")
+                .header(header::HOST, "127.0.0.1:8787")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(
+        response.status().is_client_error(),
+        "an omitted name must be refused, not read as a reset (got {})",
+        response.status()
+    );
+}
+
+/// The counterpart: an explicit `{"name": null}` IS the reset, and must still be
+/// accepted — dropping the bodyless convenience must not drop the reset itself.
+#[tokio::test]
+async fn rename_thread_accepts_an_explicit_null_name_as_a_reset() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let project = tempfile::TempDir::new().expect("project tempdir");
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        project.path().display().to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    // Rename refuses an id the relay cannot place in a workspace, so the session has to
+    // exist for this to reach the reset path at all.
+    relay
+        .write()
+        .await
+        .ensure_runtime_for_thread("t1")
+        .current_cwd = project.path().display().to_string();
+    let context = AppContext {
+        app: crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx),
+        auth: test_auth(),
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+    };
+    let router = build_router(context, WebAssets::Embedded);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/threads/t1/rename")
+                .header(header::HOST, "127.0.0.1:8787")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"name":null}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+}

@@ -1857,6 +1857,7 @@ async fn handle_notification_drops_unthreaded_codex_events_when_active_thread_is
             model_provider: "anthropic".to_string(),
             provider: "claude_code".to_string(),
             forked_from: None,
+            renamed: false,
         });
     }
 
@@ -1907,6 +1908,7 @@ async fn handle_notification_tracks_background_thread_status_activity() {
             model_provider: "codex".to_string(),
             provider: "codex".to_string(),
             forked_from: None,
+            renamed: false,
         });
     }
 
@@ -1957,6 +1959,7 @@ async fn handle_server_request_for_background_thread_does_not_touch_active_progr
             model_provider: "codex".to_string(),
             provider: "codex".to_string(),
             forked_from: None,
+            renamed: false,
         });
     }
 
@@ -2371,6 +2374,7 @@ fn test_thread_summary(id: &str) -> ThreadSummaryView {
         model_provider: "openai".to_string(),
         provider: "codex".to_string(),
         forked_from: None,
+        renamed: false,
     }
 }
 

@@ -8,6 +8,7 @@ import {
   appShell,
   applyTokenButton,
   archiveThreadButton,
+  renameThreadButton,
   approvalPolicyInput,
   auditSummary,
   auditTimeline,
@@ -155,10 +156,18 @@ import {
   fetchProjectsPayload,
   createProject,
   renameProject,
+  renameThread,
   deleteProject,
   assignThreadToProject,
   unassignThread,
 } from "./local/project-actions.js";
+import {
+  applyRenameToRow,
+  normalizeThreadName,
+  threadCustomName,
+  threadNameChanged,
+  threadNameDraft,
+} from "./shared/thread-rename.js";
 import {
   buildProjectMenuItems,
   currentProjectLabel,
@@ -634,6 +643,7 @@ window.addEventListener("agent-relay:session-updated", () => {
   // Fetch the dedicated Projects payload when the snapshot's revision changes (a
   // no-op otherwise; unconditional on the first observation).
   projectsStore.syncToRevision(state.session?.projects_revision || 0);
+  refreshThreadsIfRenamedElsewhere();
   void devicesCache.sync(
     state.session?.devices_revision,
     () => getDevices(apiFetch),
@@ -642,6 +652,30 @@ window.addEventListener("agent-relay:session-updated", () => {
     }
   );
 });
+// Session titles do NOT ride the snapshot — they live on the separately-fetched thread
+// list, which is otherwise only polled every 12s. `threads_revision` bumps when someone
+// renames a session (here, on the phone, or in another window), and is the only signal
+// that the list we are holding has gone stale. Without this, a rename made on the phone
+// would take up to 12 seconds to appear on the desktop tab strip.
+//
+// `null` means "not observed yet": the first snapshot only SEEDS the baseline, because
+// boot has already fetched the list and a refetch there would be pure duplication.
+let lastThreadsRevision = null;
+function refreshThreadsIfRenamedElsewhere() {
+  const revision = state.session?.threads_revision || 0;
+  if (lastThreadsRevision === revision) {
+    return;
+  }
+  const seeding = lastThreadsRevision === null;
+  lastThreadsRevision = revision;
+  if (seeding) {
+    return;
+  }
+  // `fresh`: a deduped response could predate the rename that triggered this, and the
+  // revision is already consumed, so a stale title would stick until the next poll.
+  void loadThreads("session renamed", { fresh: true });
+}
+
 function refreshWorkspaceDiffIfChanged() {
   const session = state.session;
   if (!session) return;
@@ -1903,6 +1937,10 @@ threadsRefreshButton.addEventListener("click", () => {
 
 archiveThreadButton?.addEventListener("click", () => {
   void archiveThreadFromContextMenu();
+});
+
+renameThreadButton?.addEventListener("click", () => {
+  void renameThreadFromContextMenu();
 });
 
 forkThreadButton?.addEventListener("click", () => {
@@ -3378,6 +3416,85 @@ async function reviewerThreadsForDestructiveAction() {
   }
 }
 
+/**
+ * Set or clear a session's user-chosen title. The single write path for every rename
+ * entry point (tab strip inline editor, sidebar context menu).
+ *
+ * Optimistic: the local rows are patched before the request settles so the tab does not
+ * flicker back to the agent's title for a round trip. The server's receipt is then
+ * applied verbatim (it is the trimmed truth, and `null` when the rename was a reset),
+ * and a failure re-renders from `state.threads` — which the catch leaves untouched by
+ * reloading the list rather than trying to invert the patch.
+ */
+async function renameThreadById(threadId, rawName) {
+  if (!threadId) {
+    return;
+  }
+  const thread = state.threads.find((entry) => entry.id === threadId);
+  const next = normalizeThreadName(rawName);
+  // Compare against the OVERRIDE, never the displayed title. Typing the agent's current
+  // title on a session that has no override is a REAL action — it pins that title
+  // against the agent's next re-derivation, which is the whole point of the feature.
+  // Comparing against `name` would silently swallow exactly that request.
+  if (!threadNameChanged(rawName, threadCustomName(thread))) {
+    return;
+  }
+
+  // Re-looked-up every call, never captured: the `threads_revision` bump this rename
+  // causes makes us refetch too, so the row object can be replaced between the
+  // optimistic write and the receipt.
+  const applyName = (value) => {
+    applyRenameToRow(
+      state.threads.find((entry) => entry.id === threadId),
+      value
+    );
+    state.threadGroups = buildNavigationThreadGroups(state.threads);
+    renderThreads();
+    renderSessionTabs();
+  };
+
+  applyName(next);
+  try {
+    const receipt = await renameThread(apiFetch, threadId, next);
+    // Trust the server: it trims, caps, and answers `null` for a reset.
+    applyName(receipt?.name ?? null);
+    logLine(
+      receipt?.message
+        || (next ? `Renamed session to "${next}".` : "Session name reset.")
+    );
+  } catch (error) {
+    logLine(`Failed to rename session: ${error.message}`);
+    // Re-read rather than un-patching: the optimistic write is not the only thing that
+    // may have moved, and the list is cheap.
+    await loadThreads("post-rename recovery");
+  }
+}
+
+/**
+ * Rename from the sidebar's right-click menu. A prompt rather than an inline editor:
+ * the menu has already taken over the pointer, and this mirrors how renaming a Project
+ * works from its own menu.
+ */
+async function renameThreadFromContextMenu() {
+  const threadId = readThreadListContextMenu(state.threadListStore).threadId;
+  closeThreadContextMenu();
+  if (!threadId) {
+    return;
+  }
+  const thread =
+    resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
+  const current = threadNameDraft(thread, shortId(threadId));
+  const answer = window.prompt(
+    "Rename this session.\n\nLeave it blank to go back to the name the agent picked.",
+    current
+  );
+  // Cancel (null) is not the same as an emptied box (""): only the latter is a reset.
+  if (answer === null) {
+    return;
+  }
+  await renameThreadById(threadId, answer);
+}
+
 async function archiveThreadFromContextMenu() {
   const threadId = readThreadListContextMenu(state.threadListStore).threadId;
   closeThreadContextMenu();
@@ -3948,6 +4065,9 @@ function renderSessionTabs() {
       },
       onMove(tabId, toIndex) {
         void sessionViewController.moveTab(tabId, toIndex, { context });
+      },
+      onRename(threadId, name) {
+        void renameThreadById(threadId, name);
       },
       emptyMessage: "No open sessions. Pick one from the sidebar.",
     })

@@ -804,6 +804,7 @@ fn parse_thread_summary(thread: &Value) -> Result<ThreadSummaryView, String> {
             .unwrap_or_else(|| "unknown".to_string()),
         provider: String::new(),
         forked_from: None,
+        renamed: false,
     })
 }
 

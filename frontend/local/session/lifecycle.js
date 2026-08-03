@@ -26,7 +26,10 @@ import { resolveOutgoingEffort } from "../../shared/reasoning-efforts.js";
 import { providerLabel } from "../../shared/provider-labels.js";
 import { forkFieldsToPayload } from "../../shared/fork-fields.js";
 import { buildNavigationThreadGroups } from "../../shared/thread-groups.js";
-import { createThreadListQueryOptions } from "../../shared/thread-queries.js";
+import {
+  createThreadListQueryOptions,
+  fetchThreadListFresh,
+} from "../../shared/thread-queries.js";
 import { readThreadListUi } from "../../shared/thread-list-store.js";
 import { shouldRenderThreadListLoadingPlaceholder } from "../../shared/thread-list-state.js";
 import { syncLiveTranscriptEntryDetailsFromSnapshot } from "../transcript/details.js";
@@ -100,7 +103,18 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  async function loadThreads(reason) {
+  // Generation counter for `loadThreads`. Bypassing de-duplication means two list
+  // requests can now be in flight at once, and nothing guarantees they finish in the
+  // order they started — so the OLDER one must not be allowed to land on top of the
+  // newer one's data. Compared after each await; a superseded load returns silently.
+  let threadsLoadGeneration = 0;
+
+  // `fresh` bypasses the query cache's in-flight de-duplication. Pass it when the
+  // refresh is triggered by a KNOWN mutation (the `threads_revision` bump after a
+  // rename): a deduped response issued before that mutation would render pre-rename
+  // state, and the revision is already consumed so nothing would retry.
+  async function loadThreads(reason, { fresh = false } = {}) {
+    const generation = ++threadsLoadGeneration;
     state.threadListStore.getState().startRefresh();
     if (
       shouldRenderThreadListLoadingPlaceholder(
@@ -114,16 +128,24 @@ export function createLifecycleController(ctx) {
     logLine(`Fetching session list across saved workspaces (${reason})`);
 
     try {
-      const threads = queryClient
-        ? await queryClient.fetchQuery(
-            createThreadListQueryOptions({
-              fetchThreads: fetchThreadList,
-              limit: 120,
-              scope: "local",
-              surface: "local",
-            })
-          )
-        : await fetchThreadList({ limit: 120 });
+      const queryOptions = {
+        fetchThreads: fetchThreadList,
+        limit: 120,
+        scope: "local",
+        surface: "local",
+      };
+      const threads = fresh
+        ? await fetchThreadListFresh({ ...queryOptions, queryClient })
+        : queryClient
+          ? await queryClient.fetchQuery(createThreadListQueryOptions(queryOptions))
+          : await fetchThreadList({ limit: 120 });
+
+      // A newer load started while this one was in flight, so this result is already
+      // out of date — most sharply after a rename, where the stale answer is the one
+      // that predates it. Drop it rather than repaint with it.
+      if (generation !== threadsLoadGeneration) {
+        return;
+      }
 
       state.threadGroups = buildNavigationThreadGroups(threads);
       state.threads = state.threadGroups.flatMap((group) => group.threads);
@@ -137,6 +159,13 @@ export function createLifecycleController(ctx) {
         renderSession(state.session);
       }
     } catch (error) {
+      // Same generation check as the success path, and for a sharper reason: this branch
+      // ERASES the list. A superseded request that fails late — including one cancelled
+      // by the fresh fetch that superseded it — would otherwise blank the very list the
+      // newer request had just repainted, turning a stale-read bug into an empty sidebar.
+      if (generation !== threadsLoadGeneration) {
+        return;
+      }
       state.threadListStore.getState().failRefresh(error.message);
       if (state.authRequired && !state.authenticated) {
         state.threadGroups = [];
