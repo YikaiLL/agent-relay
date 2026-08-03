@@ -881,6 +881,24 @@ fn relay_env(
         "PATH",
         expanded_path(bundled_node.as_ref().and_then(|node| node.parent())),
     );
+    // TODO(shared-state): the CLI relay now keeps its state in ONE shared place
+    // per machine (`~/.agent-relay/`, see `relay-server`'s `state_paths` module)
+    // instead of one set per launch directory. The desktop app is still on its
+    // own `desktop-*` set under the picked workspace, so running the app and
+    // `npx sealwire` gives you two separate worlds (different threads, projects,
+    // paired devices, push key).
+    //
+    // Unifying them is NOT just dropping the `desktop-` prefixes. One relay per
+    // state file is enforced by a real lock (`instance_lock`), and this launcher
+    // reacts to a busy port by picking a free one and spawning a SECOND relay
+    // (`pick_port`, below). Point both at one state file and that second relay
+    // gets refused by the lock and exits — surfacing only as a stderr line in
+    // the log panel, i.e. "the app just doesn't start" with no explanation.
+    //
+    // So the prerequisite is making this launcher ATTACH to an already-running
+    // relay (drive the existing port as a client) instead of spawning its own,
+    // and only then sharing the state path. Until that exists, keep the
+    // deliberate split below.
     upsert_env(
         &mut envs,
         "RELAY_STATE_PATH",

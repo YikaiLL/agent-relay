@@ -152,7 +152,17 @@ console.log(`sealwire: serving local relay at http://${env.BIND_HOST}:${env.PORT
 if (brokerConfig) {
   console.log(`sealwire: using public broker ${brokerConfig.controlUrl}`);
 }
-console.log(`sealwire: workspace/state directory is ${userCwd}`);
+// The launch directory is the default workspace for new sessions, but it is NOT
+// where relay state lives: state is shared per machine (`~/.agent-relay/`, or
+// RELAY_STATE_PATH) so `cd` never forks your sessions, projects, paired devices
+// or push key. Print both so neither is a surprise.
+console.log(`sealwire: workspace directory is ${userCwd}`);
+console.log(
+  `sealwire: relay state is ${
+    process.env.RELAY_STATE_PATH ||
+    path.join(os.homedir(), ".agent-relay", "session.json")
+  } (shared across launch directories; set RELAY_STATE_PATH to isolate)`
+);
 
 const command = relayServerBinary || "cargo";
 const commandArgs = relayServerBinary

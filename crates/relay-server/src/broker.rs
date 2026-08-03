@@ -5,6 +5,7 @@ mod protocol;
 mod remote_actions;
 mod session_claim;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -58,8 +59,6 @@ const SNAPSHOT_PUBLISH_MIN_INTERVAL_MILLIS: u64 = 500;
 const BROKER_RATE_LIMIT_SNAPSHOT_COOLDOWN_SECS: u64 = 5;
 const TRANSCRIPT_DELTA_PUBLISH_WINDOW_MILLIS: u64 = 100;
 const BROKER_MESSAGE_HANDLER_SLOW_WARN_MILLIS: u128 = 1_000;
-const DEFAULT_PUBLIC_RELAY_REGISTRATION_FILE: &str = ".agent-relay/public-broker-registration.json";
-const DEFAULT_PUBLIC_RELAY_IDENTITY_FILE: &str = ".agent-relay/public-broker-identity.json";
 pub(crate) const RELAY_BROKER_IDENTITY_PATH_ENV: &str = "RELAY_BROKER_IDENTITY_PATH";
 const MAX_BROKER_TEXT_FRAME_BYTES: usize = 65_536;
 const RELAY_PROTOCOL_VERSION: u64 = 1;
@@ -1765,18 +1764,26 @@ async fn publish_targeted_messages(
     Ok(())
 }
 
+/// The broker registration and identity live next to the session file, not in
+/// the launch directory: they are *this relay's* identity to the broker, so a
+/// per-directory copy would re-enroll as a brand new relay and orphan the
+/// devices already paired with the old one. See [`crate::state_paths`].
 fn resolve_public_relay_registration_path(cwd: &Path, configured: Option<String>) -> PathBuf {
-    configured
-        .and_then(trimmed_string)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.join(DEFAULT_PUBLIC_RELAY_REGISTRATION_FILE))
+    crate::state_paths::sibling_state_file(
+        cwd,
+        RELAY_BROKER_REGISTRATION_PATH_ENV,
+        configured.and_then(trimmed_string).map(OsString::from),
+        crate::state_paths::PUBLIC_BROKER_REGISTRATION_FILE,
+    )
 }
 
 fn resolve_public_relay_identity_path(cwd: &Path, configured: Option<String>) -> PathBuf {
-    configured
-        .and_then(trimmed_string)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.join(DEFAULT_PUBLIC_RELAY_IDENTITY_FILE))
+    crate::state_paths::sibling_state_file(
+        cwd,
+        RELAY_BROKER_IDENTITY_PATH_ENV,
+        configured.and_then(trimmed_string).map(OsString::from),
+        crate::state_paths::PUBLIC_BROKER_IDENTITY_FILE,
+    )
 }
 
 async fn load_public_relay_registration(

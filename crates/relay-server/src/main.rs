@@ -11,6 +11,7 @@ mod protocol;
 mod protocol_tests;
 mod provider;
 mod state;
+mod state_paths;
 
 use std::{convert::Infallible, time::Duration};
 use std::{
@@ -197,6 +198,13 @@ async fn main() {
     // instance_lock's module docs (real OS file lock; refuse, don't attach).
     // Escape hatch (RELAY_DISABLE_INSTANCE_LOCK) for anything that genuinely
     // needs multiple instances on one state path (e.g. some test harnesses).
+    //
+    // Relay state is shared per machine (`~/.agent-relay/`), not per launch
+    // directory — see `state_paths`. An absent shared session file just starts a
+    // fresh one: there is deliberately no migration from a pre-existing
+    // `<cwd>/.agent-relay/`, which would mean owning atomicity, cross-process
+    // serialization, partial-copy recovery and identity-cloning-a-live-relay —
+    // a lot of machinery guarding a one-time event.
     let state_path = state::resolved_state_path();
     // Resolve (canonicalize) RELAY_STATE_PATH and pin the env var to the
     // result BEFORE AppState::new() (and therefore PersistenceStore) reads it
@@ -219,10 +227,15 @@ async fn main() {
                 let location = owner
                     .map(|owner| format!(" (pid {}, port {})", owner.pid, owner.port))
                     .unwrap_or_default();
+                // Relay state is shared per machine now, so "already running"
+                // is no longer scoped to the directory you launched from —
+                // say so, and point at the way to get a second relay anyway.
                 eprintln!(
-                    "relay-server: another relay is already running for this workspace{location}. \
-                     Refusing to start a second instance for the same RELAY_STATE_PATH ({}) — stop \
-                     it first, or use the one that's already running.",
+                    "relay-server: another relay is already running{location} against the state \
+                     file this one would use ({}). Relay state is shared across launch \
+                     directories, so this is expected when one is already up — use it, stop it \
+                     first, or give this one its own RELAY_STATE_PATH to run an isolated second \
+                     relay.",
                     state_path.display()
                 );
                 std::process::exit(1);

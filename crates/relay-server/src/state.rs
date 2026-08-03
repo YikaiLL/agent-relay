@@ -61,11 +61,10 @@ pub const CONTROLLER_LEASE_SECS: u64 = 15;
 pub const STALE_TURN_PROGRESS_TIMEOUT_SECS: u64 = 600;
 const MAX_LOG_LINES: usize = 200;
 const PERSISTED_STATE_VERSION: u32 = 2;
-const DEFAULT_STATE_FILE: &str = ".agent-relay/session.json";
 
 /// The absolute-ish path this process would persist its session state to,
 /// resolved the exact same way `AppState::new` resolves it (`RELAY_STATE_PATH`
-/// env override, else `<cwd>/.agent-relay/session.json`). Exposed so `main`
+/// env override, else the shared `~/.agent-relay/session.json`). Exposed so `main`
 /// can compute a settings fingerprint and check for an already-running
 /// instance *before* paying for `AppState::new()`'s full async init.
 pub(crate) fn resolved_state_path() -> PathBuf {

@@ -67,30 +67,21 @@ code, prompts, and approvals live in plaintext.
 
 ## Quick start
 
-The fastest path is the published npm package. On macOS it ships a prebuilt
-`relay-server` binary with the web UI embedded, so you don't need the Rust
-toolchain:
-
 ```bash
 npx sealwire
 ```
 
 That starts a **localhost-only** relay at <http://localhost:8787> and opens the
-web UI in your default browser as soon as the relay is ready. To pair a phone
-or remote browser through the hosted public broker, point it at the broker:
+web UI as soon as it is ready. The commands you'll actually use:
 
 ```bash
-npx sealwire --broker wss://agent-relay.up.railway.app
+sealwire cloud       # attach to the hosted public broker so a phone can pair
+sealwire local       # stay offline: never attach to a broker
+sealwire --port 8788 --host 127.0.0.1   # bind address / port
+sealwire --no-open   # don't open a browser
 ```
 
-For a guaranteed no-broker run — even if a broker origin is configured in your
-environment — use the `local` command:
-
-```bash
-npx sealwire local
-```
-
-You still need agent auth for whichever provider you use:
+You need agent auth for whichever provider you use:
 
 - **Codex** — the [`codex`](https://github.com/openai/codex) CLI installed and
   logged in
@@ -99,79 +90,23 @@ You still need agent auth for whichever provider you use:
   inside the package, so the `claude` command does **not** need to be on your
   PATH
 
-sealwire treats whatever directory you launched it from as your workspace root,
-and stores its state in `.agent-relay/` there. See [`npx sealwire`](#npx-sealwire)
-below for the full flag list.
+sealwire treats the directory you launched it from as the default workspace for
+new sessions; its own state (sessions, projects, paired devices) lives in
+`~/.agent-relay/` — one set per machine, so `cd`-ing elsewhere doesn't fork
+your history.
 
 > **Linux / Windows:** prebuilt binaries are temporarily disabled while those
 > platforms are untested. `npx sealwire` still works there, but it falls back to
-> building `relay-server` from source, which needs the Rust toolchain — the same
-> as the [from-source](#run-from-source) path below.
+> building `relay-server` from source, which needs the Rust toolchain.
 
-### Run from source
+A macOS **desktop app** (Tauri) is also in preview: it supervises the same
+`relay-server` as a sidecar and keeps the local and remote surfaces as separate
+native windows, with a control window for workspace selection, broker mode, and
+relay logs.
 
-Running from source is the path for contributors, or for any platform without a
-prebuilt binary. You will need:
-
-- **Rust toolchain** (`cargo`) — to build `relay-server`
-- **Node.js 18+** and `npm` — to build the web UI and run the Claude Code
-  worker
-- **Agent auth** for whichever provider you use:
-  - Codex: the [`codex`](https://github.com/openai/codex) CLI installed and
-    logged in
-  - Claude Code: an `ANTHROPIC_API_KEY`, or an existing
-    [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) login
-    (no separate `claude` CLI required)
-
-Then:
-
-```bash
-git clone https://github.com/sealwire/sealwire.git
-cd sealwire
-
-npm install                            # vite + frontend tooling
-(cd claude-worker && npm install)      # only needed for Claude Code sessions
-
-# Config for attaching to the hosted public broker. This file is gitignored.
-cat > .env.cloud.local <<'EOF'
-RELAY_BROKER_URL=wss://agent-relay.up.railway.app
-RELAY_BROKER_AUTH_MODE=public
-EOF
-
-npm run dev:restart:cloud
-```
-
-`npm run dev:restart:cloud` sources `.env.cloud.local` (falling back to the
-legacy `.env.public.local`), rebuilds the web UI, and starts `relay-server`.
-Re-run it anytime to pick up code or config changes — it kills the previous
-process first.
-
-Open <http://localhost:8787> and pair a phone or remote browser from the
-Settings panel. If you only want a localhost-only setup with no remote pairing,
-use `npm run dev:restart:local` (no broker config needed) instead.
-
-More detail on each piece — security model, what is and is not built, the full
-list of env vars, and the self-hosted broker option — is in the rest of this
-README and in [`DEPLOYMENT.md`](DEPLOYMENT.md).
-
-### Desktop app preview
-
-The macOS desktop shell is a Tauri app that supervises the existing
-`relay-server` binary as a sidecar. It keeps the local and remote web surfaces
-as separate native webview windows and adds a small control window for workspace
-selection, broker mode, restart/stop, and relay logs.
-
-```bash
-npm run desktop:dev
-npm run desktop:check
-npm run desktop:build
-```
-
-The desktop scripts build the Vite web assets, compile `relay-server`, download
-and verify a fixed Node.js LTS runtime, stage `claude-worker` with production
-dependencies, and copy the sidecars into `src-tauri/binaries/` with Tauri's
-target-triple sidecar names. Generated sidecars, runtime caches, staged
-resources, and bundles are ignored by git.
+Running from source, the full flag list, env vars, and the self-hosted broker
+option live in [`DEPLOYMENT.md`](DEPLOYMENT.md); tests and CI in
+[`TESTING.md`](TESTING.md).
 
 ## Current status
 
@@ -359,150 +294,6 @@ Longer-term, the plan is to grow from local-first control into:
 - stronger audit and policy controls
 - native mobile only where the web hits real limits
 - cloud execution targets and team workflows later
-
-## Run
-
-The quickest path is `npx sealwire` (prebuilt macOS binary, no Rust needed) —
-see [Quick start](#quick-start). Running from source instead requires:
-
-- Rust toolchain (`cargo`)
-- Node.js 18+ and `npm`
-
-Either way, you need agent auth for whichever provider you use:
-
-- Codex: the `codex` CLI, installed and logged in
-- Claude Code: an `ANTHROPIC_API_KEY`, or an existing Claude Code login (no
-  separate `claude` CLI required)
-
-The end-to-end build and run steps live in [Quick start](#quick-start) above.
-
-Testing and CI coverage live in [`TESTING.md`](TESTING.md).
-Deployment guidance, including the self-hosted broker option, lives in
-[`DEPLOYMENT.md`](DEPLOYMENT.md).
-
-### `npx sealwire`
-
-`sealwire` is published on npm, so on macOS you can skip the Rust toolchain
-entirely:
-
-```bash
-npx sealwire
-```
-
-The `npm Release` GitHub Actions workflow builds a prebuilt `relay-server`
-binary (with the web UI embedded), stages it under `bin/<platform>-<arch>/`,
-and publishes when `NPM_TOKEN` is configured. **Only macOS binaries
-(`darwin-arm64`, `darwin-x64`) ship today** — the Linux and Windows targets are
-temporarily commented out in the workflow while they're untested. On those
-platforms `npx sealwire` still runs, but it falls back to building
-`relay-server` from source via Cargo.
-
-By default `npx sealwire` starts a **localhost-only** relay; it does not attach
-to a broker unless you tell it to. Commands and flags:
-
-```bash
-# pair remote devices through the hosted public broker
-sealwire cloud                          # attach to the hosted broker (default
-                                        # wss://agent-relay.up.railway.app)
-sealwire --broker wss://agent-relay.up.railway.app  # or point at your own
-
-sealwire local                          # no broker (alias for --no-broker)
-sealwire --no-broker                    # same: run without a broker
-sealwire --host 127.0.0.1 --port 8787   # bind address / port
-sealwire --no-open                      # do not open the browser automatically
-```
-
-You can also set `AGENT_RELAY_PUBLIC_BROKER_URL` instead of passing `--broker`.
-By default the launcher waits for the newly started relay to identify itself
-through its health check, then opens its local web UI in your default browser.
-It skips browser opening in CI; pass `--no-open` to disable it explicitly in
-any environment.
-
-The `local` command (and `--no-broker`) is an explicit "stay offline" request:
-it ignores any configured broker origin **and** strips every `RELAY_BROKER_*`
-variable from the environment — case-insensitively, so a stray `relay_broker_url`
-on Windows can't sneak back in — before starting the relay. It does not change
-the bind host; pass `--host` if you need to control network exposure.
-
-### Minimal env vars (public broker)
-
-To attach to the hosted public broker, only two variables are required:
-
-```ini
-# .env.cloud.local — gitignored; read by `npm run dev:restart:cloud`
-RELAY_BROKER_URL=wss://agent-relay.up.railway.app
-RELAY_BROKER_AUTH_MODE=public
-```
-
-`scripts/restart-dev-cloud.sh` (run via `npm run dev:restart:cloud`) sources
-this file before launching `relay-server`. The `relay-server` binary itself
-reads from the process environment and does not auto-load `.env` files, so if
-you launch it without the script you will need to `export` the vars or feed
-them in some other way (e.g. `direnv`, `dotenv-cli`).
-
-Everything else has a sensible default:
-
-- `RELAY_BROKER_CONTROL_URL` is derived from `RELAY_BROKER_URL`
-  (`wss://` becomes `https://`)
-- `RELAY_BROKER_PUBLIC_URL` falls back to `RELAY_BROKER_URL`; only set it
-  separately when the relay reaches the broker through a different hostname
-  than remote devices do (e.g. a Docker network)
-- `RELAY_BROKER_PEER_ID` defaults to `local-relay`
-- `RELAY_BROKER_REGISTRATION_PATH` and `RELAY_BROKER_IDENTITY_PATH` default to
-  `.agent-relay/public-broker-registration.json` and
-  `.agent-relay/public-broker-identity.json` under the working directory
-- `RELAY_SECURITY_MODE` already defaults to `private`
-- `BIND_HOST` and `PORT` already default to `127.0.0.1` and `8787`
-
-`RELAY_BROKER_AUTH_MODE` (how the relay authenticates to the broker) and
-`RELAY_SECURITY_MODE` (whether the broker can see session content) are
-independent: `auth_mode=public` + `security=private` is the recommended
-combination — use the hosted broker for transport, keep payloads end-to-end
-encrypted so the broker stays blind to content.
-
-By default, **don't** set `RELAY_STATE_PATH` here: leaving it unset means a
-public-broker relay and a localhost-only relay started from the same
-workspace share the same `.agent-relay/session.json` — so reviewer threads,
-projects, and paired devices survive switching between the two, instead of
-silently forking into two separate histories. (Only one relay can run against
-a given state file at a time: if you try to start a second one for the same
-workspace, it refuses with a message pointing at the one already running,
-rather than corrupting the shared file. Stop the first, or just use it.)
-
-Only set your own `RELAY_STATE_PATH` if you deliberately want an isolated,
-throwaway environment (e.g. a scratch/test workspace whose state you don't
-want mixed with your regular one):
-
-```ini
-RELAY_STATE_PATH=.agent-relay/public-session.json
-```
-
-Notes:
-
-- the server binds to `127.0.0.1` by default
-- `web/` is generated and gitignored, so build the frontend before running the Rust web servers
-- set `BIND_HOST=0.0.0.0` only when you intentionally want network reachability
-- set `RELAY_API_TOKEN` to protect `/api` routes
-- when `BIND_HOST` is non-loopback, `RELAY_API_TOKEN` is now required by default
-- `RELAY_ALLOW_INSECURE_NO_AUTH=1` only exists as an explicit insecure development escape hatch for non-loopback binds
-- the local web UI now exchanges `RELAY_API_TOKEN` for an `HttpOnly` same-site session cookie, so normal browser use no longer needs to keep sending the raw token on every request
-- direct `Authorization: Bearer ...` API access still works for scripts and manual clients
-- relay HTTP responses now send CSP, `Permissions-Policy`, `Referrer-Policy: no-referrer`, and `X-Content-Type-Options: nosniff`
-- relay CSP keeps `connect-src` wide by default for local/LAN development; set `RELAY_CSP_CONNECT_SRC` only when you want to tighten production origins
-- set `RELAY_ENABLE_HSTS=1` only when the relay is actually behind HTTPS and forwards `X-Forwarded-Proto: https`
-- set `RELAY_HSTS_VALUE` if you need a narrower HSTS policy than the default `max-age=31536000; includeSubDomains`
-- set `RELAY_SECURITY_MODE=private` or `RELAY_SECURITY_MODE=managed` to switch visibility mode
-- use `npm run dev` when iterating on the web UI, then `npm run build` to refresh the
-  Rust-served assets under `web/`
-- use `npm run dev:full` to build the Rust-served frontend once, keep `web/`
-  rebuilding on change, and launch relay-server on `8787` plus relay-broker on
-  `8788`; when a private LAN IP is available, pairing links default to that LAN address
-- use `npm run dev:full:local` if you want localhost-only pairing links and a
-  localhost-only broker
-- override `RELAY_DEV_SERVER_PORT` or `RELAY_DEV_BROKER_PORT` if those defaults
-  are already in use
-- if you want to override the detected LAN address, set
-  `RELAY_BROKER_PUBLIC_URL=ws://<your-lan-ip>:8788`
 
 ## License
 

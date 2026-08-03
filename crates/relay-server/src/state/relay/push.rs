@@ -49,10 +49,12 @@ const PUSH_MESSAGE_TTL_SECS: u64 = 6 * 60 * 60;
 /// RFC 8188 record size. Our payloads are tiny; any value above the record fits.
 const PUSH_RECORD_SIZE: u32 = 4096;
 
+/// Env override for the VAPID key location. Prefer an absolute path: a relative
+/// one re-anchors the key to the launch directory (see `state_paths`).
+const VAPID_KEY_PATH_ENV: &str = "RELAY_VAPID_KEY_PATH";
+
 /// Default VAPID `sub` contact. Overridable via `RELAY_VAPID_SUBJECT`.
 const DEFAULT_VAPID_SUBJECT: &str = "mailto:sealwire@localhost";
-/// Default on-disk location of the persisted VAPID private scalar.
-pub(crate) const DEFAULT_VAPID_KEY_FILE: &str = ".agent-relay/vapid.key";
 
 // ---------------------------------------------------------------------------
 // Stored subscription + wire input
@@ -362,11 +364,17 @@ fn vapid_public_b64url(signing_key: &SigningKey) -> String {
     URL_SAFE_NO_PAD.encode(point.as_bytes())
 }
 
-/// Resolve the VAPID key path (env `RELAY_VAPID_KEY_PATH`, else `<cwd>/.agent-relay/vapid.key`).
+/// Resolve the VAPID key path (env `RELAY_VAPID_KEY_PATH`, else next to the
+/// session file — `~/.agent-relay/vapid.key` by default). It must follow the
+/// session file rather than the launch directory: a regenerated key silently
+/// invalidates every push subscription a paired phone already holds.
 pub(crate) fn vapid_key_path(cwd: &Path) -> PathBuf {
-    std::env::var_os("RELAY_VAPID_KEY_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.join(DEFAULT_VAPID_KEY_FILE))
+    crate::state_paths::sibling_state_file(
+        cwd,
+        VAPID_KEY_PATH_ENV,
+        std::env::var_os(VAPID_KEY_PATH_ENV),
+        crate::state_paths::VAPID_KEY_FILE,
+    )
 }
 
 /// Load the VAPID private scalar from `path`, generating + persisting one on
@@ -765,6 +773,84 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    // The VAPID key IS the push identity: regenerating it silently invalidates
+    // every subscription a phone already holds. So it must not depend on the
+    // directory the relay was launched from, and it must travel with the
+    // session file when that is redirected — otherwise an isolated scratch
+    // relay would steal/rotate the real relay's push identity.
+    #[test]
+    fn vapid_key_is_shared_across_launch_directories() {
+        let _lock = crate::state_paths::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+        let _state = crate::state_paths::EnvVarGuard::set("RELAY_STATE_PATH", None);
+        let _key = crate::state_paths::EnvVarGuard::set("RELAY_VAPID_KEY_PATH", None);
+
+        assert_eq!(
+            vapid_key_path(Path::new("/tmp/workspace-a")),
+            vapid_key_path(Path::new("/tmp/workspace-b")),
+            "the VAPID key must not fork per launch directory — that silently kills every \
+             existing push subscription"
+        );
+        assert_eq!(
+            vapid_key_path(Path::new("/tmp/workspace-a")),
+            home.path().join(".agent-relay").join("vapid.key"),
+        );
+    }
+
+    // First run on a fresh machine: `~/.agent-relay/` does not exist yet, and
+    // nothing creates it before the key is minted (persistence only does its
+    // create_dir_all on the first debounced save, later). If the key fails to
+    // persist, the next start silently mints a DIFFERENT one — so every push
+    // subscription registered in the first session dies on the first restart.
+    #[test]
+    fn vapid_key_persists_on_a_machine_with_no_state_directory_yet() {
+        let _lock = crate::state_paths::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+        let _state = crate::state_paths::EnvVarGuard::set("RELAY_STATE_PATH", None);
+        let _key = crate::state_paths::EnvVarGuard::set("RELAY_VAPID_KEY_PATH", None);
+
+        let path = vapid_key_path(Path::new("/tmp/workspace-a"));
+        assert!(
+            !path.parent().unwrap().exists(),
+            "precondition: fresh machine"
+        );
+
+        let first = load_or_generate_vapid(&path).unwrap();
+        let second = load_or_generate_vapid(&path).unwrap();
+
+        assert!(
+            path.exists(),
+            "the VAPID key must be persisted, not just minted"
+        );
+        assert_eq!(
+            first.public_b64url(),
+            second.public_b64url(),
+            "a restart must reuse the first key — a rotated key silently kills every push \
+             subscription registered before it"
+        );
+    }
+
+    #[test]
+    fn vapid_key_follows_an_explicit_state_path() {
+        let _lock = crate::state_paths::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+        let _state = crate::state_paths::EnvVarGuard::set(
+            "RELAY_STATE_PATH",
+            Some(&scratch.path().join("scratch-session.json")),
+        );
+        let _key = crate::state_paths::EnvVarGuard::set("RELAY_VAPID_KEY_PATH", None);
+
+        assert_eq!(
+            vapid_key_path(Path::new("/tmp/workspace-a")),
+            scratch.path().join("vapid.key"),
+            "a redirected session file must take its sibling identity files with it"
+        );
     }
 
     #[test]

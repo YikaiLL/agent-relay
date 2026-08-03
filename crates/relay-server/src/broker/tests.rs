@@ -1346,3 +1346,81 @@ async fn save_public_relay_registration_refuses_a_preplanted_temp_symlink() {
         "save must not have completed the rename onto the real registration path"
     );
 }
+
+// The broker registration (relay_id + refresh token) and the identity seed are
+// this relay's identity to the public broker. Deriving them from the launch
+// directory meant `cd ~/elsewhere && sealwire cloud` re-enrolled as a brand new
+// relay, orphaning the devices already paired with the old one.
+#[test]
+fn broker_identity_files_are_shared_across_launch_directories() {
+    let _lock = crate::state_paths::env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+    let _state = crate::state_paths::EnvVarGuard::set("RELAY_STATE_PATH", None);
+
+    let a = std::path::Path::new("/tmp/workspace-a");
+    let b = std::path::Path::new("/tmp/workspace-b");
+
+    assert_eq!(
+        resolve_public_relay_registration_path(a, None),
+        resolve_public_relay_registration_path(b, None),
+        "broker registration must not fork per launch directory"
+    );
+    assert_eq!(
+        resolve_public_relay_identity_path(a, None),
+        resolve_public_relay_identity_path(b, None),
+        "the relay signing seed must not fork per launch directory"
+    );
+    assert_eq!(
+        resolve_public_relay_registration_path(a, None),
+        home.path()
+            .join(".agent-relay")
+            .join("public-broker-registration.json"),
+    );
+    assert_eq!(
+        resolve_public_relay_identity_path(a, None),
+        home.path()
+            .join(".agent-relay")
+            .join("public-broker-identity.json"),
+    );
+}
+
+#[test]
+fn broker_identity_files_follow_an_explicit_state_path() {
+    let _lock = crate::state_paths::env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+    let _state = crate::state_paths::EnvVarGuard::set(
+        "RELAY_STATE_PATH",
+        Some(&scratch.path().join("scratch-session.json")),
+    );
+
+    let a = std::path::Path::new("/tmp/workspace-a");
+    assert_eq!(
+        resolve_public_relay_registration_path(a, None),
+        scratch.path().join("public-broker-registration.json"),
+    );
+    assert_eq!(
+        resolve_public_relay_identity_path(a, None),
+        scratch.path().join("public-broker-identity.json"),
+    );
+}
+
+// An explicit per-file override still wins — the escape hatch for a split
+// setup that deliberately keeps one file elsewhere.
+#[test]
+fn an_explicit_broker_path_override_still_wins() {
+    let _lock = crate::state_paths::env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+    let _state = crate::state_paths::EnvVarGuard::set("RELAY_STATE_PATH", None);
+
+    assert_eq!(
+        resolve_public_relay_registration_path(
+            std::path::Path::new("/tmp/workspace-a"),
+            Some("/tmp/explicit-registration.json".to_string()),
+        ),
+        std::path::Path::new("/tmp/explicit-registration.json"),
+    );
+}

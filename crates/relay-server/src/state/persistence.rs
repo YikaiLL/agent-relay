@@ -10,7 +10,7 @@ use tracing::warn;
 
 use super::{
     DeviceRecord, PairedDevice, RelayState, ReviewJob, ReviewerThread, ThreadSessionSettings,
-    WorkflowRun, DEFAULT_STATE_FILE, PERSISTED_STATE_VERSION,
+    WorkflowRun, PERSISTED_STATE_VERSION,
 };
 
 const PERSISTENCE_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -189,11 +189,13 @@ pub(super) struct PersistenceStore {
 }
 
 impl PersistenceStore {
+    /// `RELAY_STATE_PATH` if set, else the shared `~/.agent-relay/session.json`
+    /// — deliberately NOT `<cwd>/…`, so the directory you launch from stops
+    /// being the identity of your relay. See [`crate::state_paths`].
     pub(super) fn resolve(cwd: &Path) -> Self {
-        let path = std::env::var_os("RELAY_STATE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| cwd.join(DEFAULT_STATE_FILE));
-        Self { path }
+        Self {
+            path: crate::state_paths::session_file_path(cwd),
+        }
     }
 
     #[cfg(test)]
@@ -367,6 +369,53 @@ mod tests {
         assert!(
             !state_path.with_extension("tmp").exists(),
             "the temp file must be renamed away, not left behind"
+        );
+    }
+
+    // The launch directory must not be the identity of your relay. Resolving
+    // `<cwd>/.agent-relay/session.json` meant `cd ~/elsewhere && sealwire`
+    // silently opened a blank world (no threads, no projects, no paired
+    // devices) instead of the state the user has been building all along.
+    #[test]
+    fn resolves_one_shared_state_file_regardless_of_launch_directory() {
+        let _lock = crate::state_paths::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+        let _override = crate::state_paths::EnvVarGuard::set("RELAY_STATE_PATH", None);
+
+        let from_repo = PersistenceStore::resolve(Path::new("/tmp/workspace-a"))
+            .path()
+            .to_path_buf();
+        let from_elsewhere = PersistenceStore::resolve(Path::new("/tmp/workspace-b"))
+            .path()
+            .to_path_buf();
+
+        assert_eq!(
+            from_repo, from_elsewhere,
+            "two launch directories must resolve to the SAME session file, otherwise every \
+             directory gets its own forked history"
+        );
+        assert_eq!(
+            from_repo,
+            home.path().join(".agent-relay").join("session.json"),
+            "the shared default belongs under the user's home directory"
+        );
+    }
+
+    // The shared default is a default, not a cage: an explicit path is how a
+    // scratch/test relay stays isolated from the real one.
+    #[test]
+    fn an_explicit_state_path_still_wins_over_the_shared_default() {
+        let _lock = crate::state_paths::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let explicit = scratch.path().join("scratch-session.json");
+        let _home = crate::state_paths::EnvVarGuard::set("HOME", Some(home.path()));
+        let _override = crate::state_paths::EnvVarGuard::set("RELAY_STATE_PATH", Some(&explicit));
+
+        assert_eq!(
+            PersistenceStore::resolve(Path::new("/tmp/workspace-a")).path(),
+            explicit,
         );
     }
 
