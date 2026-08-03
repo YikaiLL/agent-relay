@@ -28,6 +28,10 @@ export const state = {
   claimRefreshTimer: null,
   clientAuth: loadedStore.clientAuth,
   clientLogs: ["Booting broker remote surface..."],
+  // thread id -> why that thread's last send/settings change was refused.
+  // Keyed by thread so a request settling after the user navigated can only
+  // affect the thread it targeted (see shared/composer-errors.js).
+  composerErrors: {},
   currentApprovalId: null,
   deviceIdentityPromise: null,
   deviceKeypair: null,

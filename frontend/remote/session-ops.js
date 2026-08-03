@@ -9,6 +9,7 @@ import {
   renderSession,
 } from "./session-surface.js";
 import {
+  patchRemoteState,
   state,
 } from "./state.js";
 import {
@@ -25,6 +26,7 @@ import {
   createTranscriptPageFetcher,
 } from "./transcript/api.js";
 import { transcriptPageCache } from "./transcript/page-cache-instance.js";
+import { withThreadError } from "../shared/composer-errors.js";
 import { createCachingTranscriptPageFetcher } from "../shared/caching-transcript-fetcher.js";
 import { providerLabel } from "../shared/provider-labels.js";
 import {
@@ -1414,6 +1416,9 @@ export async function sendMessage(messageDraft, effort, model = "") {
     renderLog("No session is selected.");
     return false;
   }
+  // A new attempt supersedes the last failure ON THIS THREAD only. Patched
+  // (not assigned) so the composer re-renders on both the clear and the set.
+  setComposerError(threadId, "");
 
   // Clamp the effort to the target model's supported set so a stale/foreign
   // value (e.g. a Claude-only "max" left on a codex thread) is never forwarded
@@ -1462,8 +1467,25 @@ export async function sendMessage(messageDraft, effort, model = "") {
     return true;
   } catch (error) {
     renderLog(`Remote send failed: ${error.message}`);
+    // Filed against the thread this send targeted (captured above), not the
+    // live one: the user can switch sessions while the request is in flight,
+    // and the reader only renders it while that thread is on screen.
+    setComposerError(threadId, error.message);
     return false;
   }
+}
+
+/**
+ * Publish (or clear, with an empty message) one thread's composer failure. The
+ * relay's own message is kept verbatim — it names the thread and the reason,
+ * which is the entire value of showing it at all. Keyed by thread so a request
+ * settling late can only ever affect the thread it was aimed at; see
+ * shared/composer-errors.js.
+ */
+function setComposerError(threadId, message) {
+  patchRemoteState({
+    composerErrors: withThreadError(state.composerErrors, threadId, message),
+  });
 }
 
 export async function stopActiveTurn() {

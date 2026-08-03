@@ -623,13 +623,23 @@ impl CodexBridge {
             // rather than relay-side bookkeeping — it also covers the case where
             // the relay HAS a hydrated runtime but codex still has no handle.
             Err(error) if is_thread_not_loaded_error(&error) => {
-                // Resume binds the approval policy + sandbox. With no remembered
-                // settings we'd have to invent them, and guessing wrong here
-                // silently widens what the turn may do — so fail closed and
-                // report the original error instead.
-                let Some((approval_policy, sandbox)) = policy.as_ref() else {
-                    return Err(error);
-                };
+                // Resume binds the approval policy + sandbox, so a thread the
+                // relay has no settings for forces a choice. Refusing to resume
+                // it (the old behavior) made every such thread PERMANENTLY
+                // unsendable — and those are ordinary threads: anything created
+                // by the Codex VSCode extension / CLI, or predating this relay
+                // process. The user's read is "codex just won't take a message".
+                //
+                // So heal, but never upward: fall back to the strictest policy
+                // the protocol has rather than to anything inherited or
+                // configured. Guessing PERMISSIVELY is what had to stay
+                // impossible — a read-only sandbox with escalation on anything
+                // outside codex's trusted-command set can only narrow what the
+                // turn may do, and the user can widen it deliberately from the
+                // composer's settings.
+                let (approval_policy, sandbox) =
+                    policy.unwrap_or((STRICTEST_APPROVAL_POLICY, STRICTEST_SANDBOX));
+                let invented = policy.is_none();
                 if let Err(resume_error) = self
                     .resume_thread(thread_id, approval_policy, sandbox)
                     .await
@@ -644,6 +654,46 @@ impl CodexBridge {
                     relay.notify();
                     return Err(error);
                 }
+                if invented {
+                    // Record what codex was actually told. Without this the UI
+                    // keeps showing the permissive values the runtime was
+                    // hydrated with while the thread runs locked down, so the
+                    // approval prompts that follow have no visible cause — and
+                    // the next turn would re-invent the policy all over again.
+                    let mut relay = self.state.write().await;
+                    relay.remember_thread_settings(
+                        thread_id,
+                        approval_policy,
+                        sandbox,
+                        effort,
+                        model,
+                    );
+                    relay.push_log(
+                        "warn",
+                        format!(
+                            "Thread {thread_id} had no saved permissions, so it was resumed \
+read-only with approvals required. Change File access if this turn needs to write."
+                        ),
+                    );
+                    relay.notify();
+                }
+                // The retry must re-assert the policy the resume just bound:
+                // `params` was built before the fallback existed, so a thread
+                // with no remembered settings would otherwise send a turn with
+                // no override at all and drift back to codex's own config
+                // default — the exact silent widening this path exists to avoid.
+                let params = if invented {
+                    let policy = Some((approval_policy, sandbox));
+                    if images.is_empty() {
+                        codex_turn_start_params(thread_id, text, model, effort, policy)
+                    } else {
+                        codex_turn_start_params_with_images(
+                            thread_id, text, model, effort, images, policy,
+                        )
+                    }
+                } else {
+                    params
+                };
                 self.send_request("turn/start", params).await?
             }
             Err(error) => return Err(error),
@@ -678,6 +728,21 @@ impl CodexBridge {
         .await
     }
 }
+
+/// The policy the bridge binds when it has to resume a thread it knows nothing
+/// about (see the heal in `start_turn_with_images`). Deliberately the most
+/// restrictive pair codex accepts, so recovering a thread can never hand it
+/// access the user did not choose. In codex's own words: `untrusted` = "Only
+/// run 'trusted' commands (e.g. ls, cat, sed) without asking for user approval.
+/// Will escalate to the user if the model proposes a command that is not in the
+/// 'trusted' set", and `read-only` = "Codex can read files in the current
+/// workspace. Approval is required to edit files or access the internet."
+///
+/// Both are codex vocabulary (`AskForApproval` / `SandboxMode`); anything
+/// outside those enums is rejected by the app-server before it even looks the
+/// thread up, so this fallback must never drift to a relay-level word.
+const STRICTEST_APPROVAL_POLICY: &str = "untrusted";
+const STRICTEST_SANDBOX: &str = "read-only";
 
 /// Does this `turn/start` failure mean "codex has no live handle for this
 /// thread" (as opposed to a genuine turn error)? Codex serves `thread/read` off

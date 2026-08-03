@@ -1,5 +1,6 @@
 import {
   approvalPolicyInput,
+  composerError,
   cwdInput,
   messageEffort,
   messageInput,
@@ -12,6 +13,11 @@ import {
   startPromptInput,
   threadsList,
 } from "../dom.js";
+import {
+  clearComposerError,
+  recordComposerError,
+  syncComposerError,
+} from "../composer-error.js";
 import {
   requestReview as requestReviewApi,
   startWorkflow as startWorkflowApi,
@@ -63,6 +69,10 @@ export function createLifecycleController(ctx) {
     liveElement,
     isViewingConversation,
   } = ctx;
+  // What the user is looking at right now: the routed/pinned thread, else the
+  // active one. Same expression as app.js and render-session.js, so a failure's
+  // visibility follows one notion of "current thread" across the surface.
+  const viewedThreadId = () => state.viewThreadId || state.session?.active_thread_id || null;
   const cancelControllerHeartbeat = (...args) => ctx.cancelControllerHeartbeat(...args);
   const cancelControllerLeaseRefresh = (...args) => ctx.cancelControllerLeaseRefresh(...args);
   const resetTranscriptHydrationState = (...args) => ctx.resetTranscriptHydrationState(...args);
@@ -425,8 +435,17 @@ export function createLifecycleController(ctx) {
       if (body.effort) parts.push(`effort=${body.effort}`);
       if (body.model) parts.push(`model=${body.model}`);
       logLine(`Updated session settings: ${parts.join(", ")}`);
+      // Only this thread's failure is resolved by this success — another
+      // thread's real failure must survive a late reply landing here.
+      clearComposerError(body.thread_id);
+      syncComposerError(composerError, viewedThreadId());
     } catch (error) {
       logLine(`Settings update failed: ${error.message}`);
+      // Same reason as the send path: the picker silently reverting is not an
+      // explanation. "…while a turn is in progress" tells the user to wait;
+      // a refused policy tells them the thread can't take it.
+      recordComposerError({ threadId: body.thread_id, message: error.message });
+      syncComposerError(composerError, viewedThreadId());
     }
   }
 
@@ -445,6 +464,10 @@ export function createLifecycleController(ctx) {
       return false;
     }
 
+    // A new attempt supersedes the last failure ON THIS THREAD only; a send
+    // aimed elsewhere says nothing about the thread the user is looking at.
+    clearComposerError(threadId);
+    syncComposerError(composerError, viewedThreadId());
     sendButton.disabled = true;
     logLine(`Sending prompt to ${providerLabel(state.session?.provider) || "agent"}`);
 
@@ -487,6 +510,12 @@ export function createLifecycleController(ctx) {
       return true;
     } catch (error) {
       logLine(`Prompt failed: ${error.message}`);
+      // The relay's message is the whole diagnosis (which thread, why). Show it
+      // verbatim: the draft is still in the box, so the user can act on it.
+      // Filed against THIS send's thread, not the live one — the user may have
+      // navigated away while the request was in flight.
+      recordComposerError({ threadId, message: error.message });
+      syncComposerError(composerError, viewedThreadId());
       return false;
     } finally {
       sendButton.disabled = false;

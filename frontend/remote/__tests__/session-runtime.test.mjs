@@ -53,6 +53,7 @@ test("deriveSessionRuntime returns runtime state from the session view", () => {
     currentApprovalId: "approval-1",
     currentEffortValue: "medium",
     currentModelValue: "gpt-5.5",
+    errorMessage: "",
     effortOptions: [
       { label: "minimal", value: "minimal" },
       { label: "medium", value: "medium" },
@@ -225,4 +226,38 @@ test("deriveSessionRuntime shows stop for a view-only stale working status", () 
   });
 
   assert.equal(runtime.stopVisible, true);
+});
+
+test("deriveSessionRuntime passes a send failure through to the composer", () => {
+  // The phone has the same gap the local surface had: a refused send went to
+  // renderLog (a debug panel most people never open) and the composer just sat
+  // there. The reason has to reach the component that owns the Send button.
+  const runtime = deriveSessionRuntime({
+    composerErrors: { "thread-1": "thread not found: thread-1" },
+    session: { active_thread_id: "thread-1", available_models: [], model: "gpt-5.5" },
+    sessionView: { composerDisabled: false, currentApprovalId: null, messagePlaceholder: "" },
+  });
+
+  assert.equal(runtime.errorMessage, "thread not found: thread-1");
+});
+
+test("deriveSessionRuntime hides a failure belonging to another thread", () => {
+  // The send that failed was aimed at thread-1; by the time it came back the
+  // user is on thread-2. Rendering it here blames the wrong session.
+  const runtime = deriveSessionRuntime({
+    composerErrors: { "thread-1": "thread not found: thread-1" },
+    session: { active_thread_id: "thread-2", available_models: [], model: "gpt-5.5" },
+    sessionView: { composerDisabled: false, currentApprovalId: null, messagePlaceholder: "" },
+  });
+
+  assert.equal(runtime.errorMessage, "");
+});
+
+test("deriveSessionRuntime reports no composer error by default", () => {
+  const runtime = deriveSessionRuntime({
+    session: { active_thread_id: "thread-1", available_models: [], model: "gpt-5.5" },
+    sessionView: { composerDisabled: false, currentApprovalId: null, messagePlaceholder: "" },
+  });
+
+  assert.equal(runtime.errorMessage, "");
 });

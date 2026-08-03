@@ -1,3 +1,4 @@
+import { threadError } from "../shared/composer-errors.js";
 import {
   buildReasoningEffortOptions,
   resolveReasoningEffortValue,
@@ -14,6 +15,13 @@ export function selectRemoteControlSession({ session, realSession }) {
 export function deriveSessionRuntime({
   composerDraft = "",
   composerEffort = "medium",
+  // Why each thread's last send/settings change was refused, straight from the
+  // relay, keyed by thread id. It rides the composer because that is where the
+  // user acted; the client log is a debug panel, not a way to tell someone
+  // their message did not go. Keyed by thread because sends survive navigation
+  // in both directions: a late rejection must not blame the session now on
+  // screen, and a late success elsewhere must not silence this one.
+  composerErrors = null,
   composerModel = "",
   sendPending = false,
   session,
@@ -35,6 +43,7 @@ export function deriveSessionRuntime({
     currentApprovalId: sessionView.currentApprovalId,
     currentEffortValue,
     currentModelValue,
+    errorMessage: threadError(composerErrors, session?.active_thread_id),
     effortOptions: buildReasoningEffortOptions(
       session?.available_models || [],
       currentModelValue,

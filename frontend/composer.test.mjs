@@ -51,3 +51,44 @@ test("ConversationComposer can render a local-only attachment area above the inp
 
   assert.ok(markup.indexOf('id="composer-attachments"') < markup.indexOf('id="message-input"'));
 });
+
+// A send the relay refuses has to be visible where the user pressed Send.
+// Both surfaces need it, and they drive the composer differently: the local
+// shell renders it ONCE and then mutates the DOM by id, while remote re-renders
+// with props. So the region is addressable (`errorId`) *and* prop-driven
+// (`errorMessage`).
+test("ConversationComposer renders an addressable, live error region above the input", () => {
+  const markup = renderToStaticMarkup(
+    h(ConversationComposer, {
+      errorId: "composer-error",
+      messageId: "message-input",
+      sendButtonId: "send-button",
+    })
+  );
+
+  assert.match(markup, /id="composer-error"/);
+  assert.match(markup, /role="alert"/, "the region must announce itself to screen readers");
+  assert.match(markup, /id="composer-error"[^>]*hidden/, "it starts empty and hidden");
+  assert.ok(
+    markup.indexOf('id="composer-error"') < markup.indexOf('id="message-input"'),
+    "the error belongs above the input, next to the button the user just pressed"
+  );
+});
+
+test("ConversationComposer shows a send failure passed as a prop", () => {
+  const markup = renderToStaticMarkup(
+    h(ConversationComposer, {
+      errorMessage: "that thread is busy with a turn; wait for it to finish",
+      messageId: "remote-message-input",
+      sendButtonId: "remote-send-button",
+    })
+  );
+
+  assert.match(markup, /role="alert"/);
+  assert.match(markup, /that thread is busy with a turn; wait for it to finish/);
+  assert.doesNotMatch(
+    markup,
+    /class="composer-error"[^>]*hidden/,
+    "a composer with a message must not render it hidden"
+  );
+});

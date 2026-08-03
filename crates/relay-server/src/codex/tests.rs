@@ -3535,28 +3535,133 @@ async fn start_turn_does_not_resume_a_thread_the_app_server_already_has() {
 }
 
 #[tokio::test]
-async fn start_turn_does_not_resume_a_thread_whose_settings_are_unknown() {
-    // Resume binds the approval policy + sandbox. With no remembered settings
-    // the bridge would have to invent them, and inventing them wrong silently
-    // widens what the turn is allowed to do (e.g. handing a read-only thread a
-    // writable sandbox). Fail closed: surface codex's error, resume nothing.
+async fn start_turn_heals_a_thread_with_no_remembered_settings_under_the_strictest_policy() {
+    // A Codex thread the relay never drove — created by the VSCode extension or
+    // the CLI, or left over from a previous relay process — has no remembered
+    // settings. Refusing to resume it left it PERMANENTLY unsendable:
+    // `turn/start` -> `thread not found` -> HTTP 400, on a thread whose
+    // transcript renders fine and whose session nobody is using. Claude has no
+    // such dead end (its worker resumes the SDK session from disk on every
+    // send), so this was a Codex-only "why can't I just talk to it".
+    //
+    // Heal it — but never by guessing a policy that could WIDEN what the turn
+    // may do (the hazard that made this fail closed in the first place). Resume
+    // under the strictest policy the protocol has: a read-only sandbox, and
+    // escalation for anything outside codex's trusted-command set. Recovery can
+    // then only narrow, never grant.
     let (bridge, state) = spawn_fake_codex_bridge().await;
 
-    let error = bridge
+    let turn_id = bridge
         .start_turn("thread-unknown", "hello", "gpt-5.6-sol", "low")
         .await
-        .expect_err("a thread with no remembered settings must not be silently resumed");
-
+        .expect("a thread with no remembered settings must still be sendable");
     assert!(
-        error.contains("thread not found"),
-        "the original app-server error must survive, got: {error}"
+        turn_id.is_some(),
+        "a healed turn/start must still return the turn id"
     );
-    assert!(
-        !codex_recv_methods(&state)
-            .await
+
+    let methods = codex_recv_methods(&state).await;
+    assert_eq!(
+        methods
             .iter()
-            .any(|method| method == "thread/resume"),
-        "no policy may be guessed for a thread the relay has no settings for"
+            .filter(|method| *method == "turn/start" || *method == "thread/resume")
+            .collect::<Vec<_>>(),
+        vec!["turn/start", "thread/resume", "turn/start"],
+        "the bridge must resume once, after codex reports the thread is not loaded"
+    );
+
+    let resume = codex_recv_payloads(&state)
+        .await
+        .into_iter()
+        .find(|payload| payload.get("method").and_then(Value::as_str) == Some("thread/resume"))
+        .expect("the heal must send thread/resume");
+    assert_eq!(
+        (
+            &resume["params"]["approvalPolicy"],
+            &resume["params"]["sandbox"]
+        ),
+        (&json!("untrusted"), &json!("read-only")),
+        "an invented policy must be the strictest one, so healing cannot grant \
+         write access nobody asked for: {resume}"
+    );
+
+    // The retried turn must re-assert the same policy. `turn/start` params are
+    // built before the fallback is chosen, so a retry that reused them would
+    // send no override and let codex fall back to its own config default —
+    // silently widening the very turn this path locked down.
+    let retry = codex_recv_payloads(&state)
+        .await
+        .into_iter()
+        .filter(|payload| payload.get("method").and_then(Value::as_str) == Some("turn/start"))
+        .next_back()
+        .expect("the heal must retry turn/start");
+    assert_eq!(
+        (
+            &retry["params"]["approvalPolicy"],
+            &retry["params"]["sandboxPolicy"]
+        ),
+        (
+            &json!("untrusted"),
+            &json!({ "type": "readOnly", "networkAccess": false })
+        ),
+        "the healed turn must carry the policy the resume bound: {retry}"
+    );
+
+    // The relay must also RECORD what it bound. Otherwise the UI keeps showing
+    // the permissive defaults the runtime was hydrated with while codex is
+    // actually running the thread read-only — and the user gets approval
+    // prompts with no way to see why.
+    let settings = state
+        .read()
+        .await
+        .remembered_thread_settings("thread-unknown")
+        .expect("the healed policy must be remembered");
+    assert_eq!(
+        (settings.approval_policy.as_str(), settings.sandbox.as_str()),
+        ("untrusted", "read-only"),
+        "the healed thread's settings must describe what codex was actually told"
+    );
+}
+
+#[tokio::test]
+async fn a_healed_turn_with_images_still_carries_the_invented_policy() {
+    // The retry rebuilds its params, and the images path is a separate branch
+    // from the text one. A miss there sends an image turn with no override at
+    // all, which drifts back to codex's config default — the silent widening
+    // the strict fallback exists to prevent, on the one path nobody looks at.
+    let (bridge, state) = spawn_fake_codex_bridge().await;
+
+    let images = vec![ProviderImage {
+        media_type: "image/png".to_string(),
+        data: "aGk=".to_string(),
+    }];
+    let turn_id = bridge
+        .start_turn_with_images("thread-cold-image", "look", "gpt-5.6-sol", "low", &images)
+        .await
+        .expect("an image send to a thread with unknown settings must still heal");
+    assert!(turn_id.is_some());
+
+    let retry = codex_recv_payloads(&state)
+        .await
+        .into_iter()
+        .filter(|payload| payload.get("method").and_then(Value::as_str) == Some("turn/start"))
+        .next_back()
+        .expect("the heal must retry turn/start");
+    assert_eq!(
+        (
+            &retry["params"]["approvalPolicy"],
+            &retry["params"]["sandboxPolicy"]
+        ),
+        (
+            &json!("untrusted"),
+            &json!({ "type": "readOnly", "networkAccess": false })
+        ),
+        "the healed image turn must carry the policy the resume bound: {retry}"
+    );
+    assert_eq!(
+        retry["params"]["input"][0]["type"],
+        json!("image"),
+        "and must still carry the attachment it was sent with: {retry}"
     );
 }
 

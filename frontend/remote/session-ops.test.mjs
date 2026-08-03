@@ -2374,6 +2374,62 @@ test("sendMessage clears pending state when the relay does not reply", async () 
   assert.equal(await pending, false);
 });
 
+test("a failed remote send records the reason for the composer, not just the log", async () => {
+  activeBrowser || installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { sendMessage } = await import("./session-ops.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: "claim-token-1",
+    sessionClaimExpiresAt: Math.floor(Date.now() / 1000) + 300,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  state.composerErrors = {};
+  state.session = { active_thread_id: "thread-1", available_models: [], model: "gpt-5.5" };
+  state.socket = {
+    readyState: 1,
+    send() {
+      throw new Error("socket write failed");
+    },
+  };
+
+  assert.equal(await sendMessage("hello remote", "medium"), false);
+  // Keyed by the thread it was sent to: the phone switches sessions freely,
+  // and a failure that outlives the switch must not surface on the session the
+  // user is now looking at (it would even name the wrong thread).
+  assert.match(
+    String(state.composerErrors?.["thread-1"]),
+    /socket write failed/,
+    "the phone must be able to show WHY the send failed"
+  );
+
+  // A later attempt on a DIFFERENT thread must not silence it: same inverse
+  // race the local surface had, where one thread's clear wiped another's.
+  state.session = { active_thread_id: "thread-2", available_models: [], model: "gpt-5.5" };
+  await sendMessage("hello again", "medium");
+
+  assert.match(
+    String(state.composerErrors?.["thread-1"]),
+    /socket write failed/,
+    "thread-1's failure survives an attempt aimed at thread-2"
+  );
+  assert.match(String(state.composerErrors?.["thread-2"]), /socket write failed/);
+});
+
 test("applyTranscriptDelta updates existing transcript entries using text and status fields", async () => {
   activeBrowser || installBrowserStubs();
 

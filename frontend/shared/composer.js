@@ -51,6 +51,8 @@ export function ConversationComposer({
   currentDraft,
   currentModelValue,
   enterSubmits,
+  errorId = null,
+  errorMessage = "",
   messageId = "remote-message-input",
   messagePlaceholder = "",
   modelId = "remote-message-model",
@@ -108,9 +110,31 @@ export function ConversationComposer({
     modelSelectProps.onChange = (event) => onModelChange(event.target.value);
   }
 
+  // Why a send failed belongs HERE, not only in the client log: the log is a
+  // collapsible panel, so a relay refusal ("thread not found: …", "that thread
+  // is busy with a turn", a path-scope rejection) read as "Send does nothing".
+  // Two ways in, because the surfaces drive this component differently: remote
+  // re-renders with `errorMessage`, while the local shell renders once and
+  // fills the node by id — so with `errorId` the region is always in the DOM,
+  // empty and hidden until something goes wrong.
+  const errorRegion =
+    errorId || errorMessage
+      ? h(
+          "p",
+          {
+            className: "composer-error",
+            id: errorId || undefined,
+            role: "alert",
+            hidden: !errorMessage,
+          },
+          errorMessage || null
+        )
+      : null;
+
   return h(
     "div",
     { className: "composer-inner" },
+    errorRegion,
     attachmentArea,
     h("textarea", textareaProps),
     h(

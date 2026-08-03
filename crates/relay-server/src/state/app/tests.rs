@@ -3876,7 +3876,18 @@ got {}",
     }
 
     #[tokio::test]
-    async fn send_to_cold_codex_thread_with_unknown_settings_fails_closed_after_hydration() {
+    async fn send_to_cold_codex_thread_with_unknown_settings_heals_without_inheriting_defaults() {
+        // End-to-end twin of the bridge-level heal (codex/tests.rs): a cold
+        // Codex thread the relay has no settings for — an imported/VSCode thread,
+        // or anything predating this process — must still ACCEPT a message. It
+        // used to fail closed, which read as "codex just won't take a message"
+        // on a session nobody was using.
+        //
+        // The safety half is what this file is here to prove: the permissive
+        // relay defaults set below (bypass / danger-full-access) must NOT be
+        // what the healed thread inherits. Healing binds the strictest policy
+        // instead, and the snapshot says so, so the UI cannot claim write
+        // access the thread does not have.
         let app = build_fake_codex_app("/tmp/project").await;
         pair_device(&app, "device-1", Vec::new()).await;
         let thread_id = "thread-imported";
@@ -3900,7 +3911,7 @@ got {}",
             }];
         }
 
-        let error = app
+        let snapshot = app
             .send_message(SendMessageInput {
                 text: "resume unsafely?".to_string(),
                 model: None,
@@ -3909,25 +3920,27 @@ got {}",
                 thread_id: thread_id.to_string(),
             })
             .await
-            .expect_err("unknown Codex settings must fail closed after cold hydration");
+            .expect("a cold Codex thread with unknown settings must still accept a message");
 
-        assert!(
-            error.contains("thread not found"),
-            "the original Codex not-loaded error must survive, got: {error}"
+        assert_eq!(
+            (snapshot.approval_policy.as_str(), snapshot.sandbox.as_str()),
+            ("untrusted", "read-only"),
+            "the snapshot must report the policy Codex was actually given, not the \
+             permissive relay defaults"
         );
         {
             let relay = app.relay.read().await;
-            assert!(
-                relay.runtime_for_thread(thread_id).is_some(),
-                "send preflight should have hydrated a runtime for the readable thread"
-            );
-            assert!(
-                relay.remembered_thread_settings(thread_id).is_none(),
-                "cold hydration must not turn permissive relay defaults into remembered settings"
-            );
-            assert!(
-                relay.thread_settings(thread_id).is_some(),
-                "the runtime can still expose display settings without authorizing Codex resume"
+            let remembered = relay
+                .remembered_thread_settings(thread_id)
+                .expect("the healed policy must be remembered, not re-invented every turn");
+            assert_eq!(
+                (
+                    remembered.approval_policy.as_str(),
+                    remembered.sandbox.as_str()
+                ),
+                ("untrusted", "read-only"),
+                "cold hydration must never turn permissive relay defaults into the \
+                 thread's remembered settings"
             );
         }
 
@@ -3935,14 +3948,10 @@ got {}",
         assert_eq!(
             methods
                 .iter()
-                .filter(|method| *method == "turn/start")
-                .count(),
-            1,
-            "the bridge may probe turn/start once, but must not retry after guessing policy"
-        );
-        assert!(
-            !methods.iter().any(|method| method == "thread/resume"),
-            "send must not resume a cold Codex thread when approval/sandbox settings are unknown"
+                .filter(|method| *method == "turn/start" || *method == "thread/resume")
+                .collect::<Vec<_>>(),
+            vec!["turn/start", "thread/resume", "turn/start"],
+            "the send must probe, resume once, then retry"
         );
     }
 

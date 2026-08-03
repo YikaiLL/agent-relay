@@ -3,6 +3,7 @@ import {
   auditSummary,
   auditTimeline,
   chatShell,
+  composerError,
   controlBanner,
   goConsoleHomeButton,
   sidebarHostStatus,
@@ -42,6 +43,7 @@ import {
   canonicalizeWorkspace,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
+import { syncComposerError } from "./composer-error.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
 import { canForkInSession } from "../shared/fork-fields.js";
@@ -514,6 +516,9 @@ export function createSessionRenderer({
       viewOnly: session.view_only,
       submitInFlight,
     });
+    // A failure belongs to the thread it happened to. Re-deciding it here means
+    // navigation alone hides it — no clearing hook to forget on a new route.
+    syncComposerError(composerError, state.viewThreadId || session?.active_thread_id || null);
     sendButton.disabled = buttons.sendDisabled;
     sendButton.hidden = buttons.sendHidden;
     if (stopButton) {

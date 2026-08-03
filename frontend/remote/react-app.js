@@ -502,6 +502,7 @@ function RemoteApp() {
     ? deriveSessionRuntime({
         composerDraft: remoteUi.composerDraft,
         composerEffort: remoteUi.composerEffort,
+        composerErrors: currentState.composerErrors,
         composerModel: remoteUi.composerModel,
         sendPending: remoteUi.sendPending,
         session,

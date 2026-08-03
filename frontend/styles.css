@@ -3318,6 +3318,19 @@ input:focus, textarea:focus, select:focus {
   gap: 6px;
 }
 
+/* Why the last send was refused, shown where the user pressed Send. Hidden
+   (via the `hidden` attribute) until there is something to say. */
+.composer-error {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--err-bg);
+  color: var(--err-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
 .composer-attachments[hidden] {
   display: none;
 }
