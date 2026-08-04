@@ -55,6 +55,26 @@ export function normalizeSessionViewContext(context) {
   return { kind: "sessions" };
 }
 
+/**
+ * The context a session row belongs to, decided by MEMBERSHIP alone.
+ *
+ * Total by design: it returns `{kind:"sessions"}` rather than null for a session
+ * in no project, and that distinction is the whole reason it exists.
+ * `setThreadRoute` reads a null context as "keep the current one", so expressing
+ * "this session belongs to no project" as null silently filed unassigned sessions
+ * into whichever project happened to be selected — giving them a tab in that
+ * project's workspace and leaving the switcher still naming it.
+ *
+ * That could not happen under the old Projects mode, which listed only the
+ * selected project's sessions. Pinning keeps the whole list on screen, so an
+ * unassigned row now sits one click away from a pinned project at all times.
+ */
+export function selectOwningContext({ threadId = null, threadProjectId = null } = {}) {
+  const id = stringId(threadId);
+  const projectId = id ? stringId(threadProjectId?.[id]) : "";
+  return projectId ? { kind: "project", projectId } : { kind: "sessions" };
+}
+
 export function sessionViewContextKey(context) {
   const normalized = normalizeSessionViewContext(context);
   if (normalized.kind === "sessions") {

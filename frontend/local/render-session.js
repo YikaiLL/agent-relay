@@ -44,6 +44,7 @@ import {
   selectPinnedProjectId,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
+import { selectOwningContext } from "./session-view-state.js";
 import { syncComposerError } from "./composer-error.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
@@ -1612,17 +1613,23 @@ export function createSessionRenderer({
           void ensureNotificationPermission();
           renderThreads();
           if (typeof viewThread === "function") {
-            // Open INTO the owning project's context, so a session lands in ITS tab
-            // set rather than the selected project's. A pinned list shows sessions
-            // from other projects too (they stay in their cwd groups), so the owner
-            // and the selection routinely differ — taking the selection here would
-            // quietly file the session under the wrong project's tabs.
-            const owningProjectId = (state.threadProjectId || {})[threadId] || null;
+            // Open INTO the owning context, so a session lands in ITS tab set
+            // rather than the selected project's. A pinned list keeps every
+            // session on screen — other projects' rows AND unassigned ones — so
+            // the owner and the selection routinely differ.
+            //
+            // Always stated, never null: `setThreadRoute` reads a null context as
+            // "keep the current one", which is how unassigned sessions were being
+            // filed into the selected project. See `selectOwningContext`.
+            //
             // A click is a peek, a double click keeps it — see ThreadGroupItem.
             // A peek skips the view transition: it swallows the second click of
             // the double click, and browsing wants a cut.
             viewThread(threadId, {
-              context: owningProjectId ? { kind: "project", projectId: owningProjectId } : null,
+              context: selectOwningContext({
+                threadId,
+                threadProjectId: state.threadProjectId,
+              }),
               preview,
               transition: !preview,
             });

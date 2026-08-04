@@ -6,6 +6,7 @@ import { NO_PROJECT_KEY, SESSIONS_KEY } from "../shared/tab-workspace-store.js";
 import {
   createSessionViewState,
   reduceSessionView,
+  selectOwningContext,
   sessionViewContextKey,
   sessionViewHistoryEntry,
   sessionViewInvariantErrors,
@@ -555,4 +556,52 @@ test("back onto a kept-then-closed session reopens it as a peek", () => {
   });
   assert.deepEqual(workspaceThreadIds(state, SESSIONS_KEY), ["a"]);
   assert.deepEqual(previewIds(state, SESSIONS_KEY), ["a"]);
+});
+
+// --- The owning context of a session row -------------------------------------
+//
+// Regression guard for a state bug the Project switcher introduced. Under the old
+// Projects mode the sidebar showed ONLY the selected project's sessions, so "open
+// this row" and "open it in the selected project" were the same thing. Pinning
+// changed that: the list keeps every session, so a row for an UNASSIGNED session
+// sits on screen right next to a pinned project's group.
+//
+// Opening one has to land in the Sessions context. Expressing that as `null` does
+// not work — `setThreadRoute` reads a null context as "use the current one", so
+// the unassigned session was being filed into the selected project's tab
+// workspace, and the switcher went on claiming that project. The context must be
+// stated, never defaulted.
+test("selectOwningContext puts an unassigned session in the sessions context", () => {
+  assert.deepEqual(
+    selectOwningContext({ threadId: "t1", threadProjectId: {} }),
+    { kind: "sessions" }
+  );
+});
+
+test("selectOwningContext follows membership into the owning project", () => {
+  assert.deepEqual(
+    selectOwningContext({ threadId: "t1", threadProjectId: { t1: "proj_a" } }),
+    { kind: "project", projectId: "proj_a" }
+  );
+});
+
+test("selectOwningContext ignores which project is currently selected", () => {
+  // The whole point: the answer depends on the ROW, never on the selection.
+  assert.deepEqual(
+    selectOwningContext({ threadId: "t_unassigned", threadProjectId: { t_other: "proj_a" } }),
+    { kind: "sessions" }
+  );
+});
+
+test("selectOwningContext never returns null, so no caller can fall back to current", () => {
+  for (const args of [
+    { threadId: "t1", threadProjectId: null },
+    { threadId: "t1" },
+    { threadId: null, threadProjectId: { t1: "proj_a" } },
+    {},
+    undefined,
+  ]) {
+    const context = selectOwningContext(args);
+    assert.ok(context && typeof context.kind === "string", `null-ish context for ${JSON.stringify(args)}`);
+  }
 });

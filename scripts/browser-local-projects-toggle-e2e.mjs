@@ -361,17 +361,47 @@ async function main() {
       // waiting for a session to be lost — the exact thing the design forbids.
       //
       // So: out of the pinned group, still in the list.
+      //
+      // Read via `data-thread-cwd`, which carries the row's GROUP cwd. The pinned
+      // project group has an empty cwd (it is not a directory), so a non-empty
+      // value is proof the row landed in a real folder group.
+      //
+      // NOT via `.closest(".thread-group")`: the list is virtualized FLAT, so a
+      // header and its rows are siblings, and `.thread-group` is the header's own
+      // class. closest() therefore returns null from any session row, and the
+      // earlier form of this check — `!closest(...)?.querySelector(...)` — was
+      // `!undefined`, i.e. true for every row that existed. It passed whether or
+      // not the row had moved.
       await page.waitForFunction(
         (id) => {
           const row = document.querySelector(`#threads-list [data-thread-id="${id}"]`);
+          // Still present: losing the row is the failure this exists to catch.
           if (!row) return false;
-          return !row.closest(".thread-group")?.querySelector(".thread-group-header-project");
+          return (row.getAttribute("data-thread-cwd") || "") !== "";
         },
         threadId,
         { timeout: TIMEOUT_MS }
       );
       unassignPropagated = true;
     } catch {}
+
+    // 7b. An UNASSIGNED row must open into the Sessions context, not the project
+    // that happens to be selected. Pinning is what made this reachable: the list
+    // keeps every session, so an unassigned row now sits one click from a pinned
+    // project at all times. Expressing "no project" as a null context let
+    // `setThreadRoute` fall back to the current one, which filed the session into
+    // that project's tab workspace and left the switcher still naming it.
+    //
+    // The switcher label is the observable: it reports the live context.
+    let unassignedOpenedInSessions = null;
+    if (unassignPropagated) {
+      await page.click(`#threads-list [data-thread-id="${threadId}"]`, { timeout: TIMEOUT_MS });
+      await delay(600);
+      unassignedOpenedInSessions = await page.evaluate(
+        () => document.querySelector(".project-switcher-trigger")?.textContent?.trim() || ""
+      );
+    }
+
     const afterUnassignBadge = await verifyBadge(page);
     await api(relayPort, "POST", "/api/projects", { action: "assign", thread_id: threadId, project_id: projectId });
 
@@ -683,7 +713,7 @@ async function main() {
 
     console.log(JSON.stringify({
       sessionsView, projectsView, backToSessions,
-      unassignPropagated, afterUnassignBadge, failedFetch, gatePending,
+      unassignPropagated, unassignedOpenedInSessions, afterUnassignBadge, failedFetch, gatePending,
       crud: { menuItems, assignedMenuItems, triggerValueBeforeAssign, triggerValueAssigned, triggerValueUnassigned, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign, renameConfirmed, deleteConfirmed, projectMenuClosedOnBump },
       submenu: { firstLevel, geometry, keyboardNav },
       menuFailClosed, staleMenu,
@@ -710,6 +740,11 @@ async function main() {
     assert.ok(
       unassignPropagated,
       `an API unassign moves the row OUT of the pinned group while keeping it in the list: ${afterUnassignBadge}`
+    );
+    assert.equal(
+      unassignedOpenedInSessions,
+      "All sessions",
+      `opening an unassigned row must leave the selected project, not adopt it into P's tab set: ${unassignedOpenedInSessions}`
     );
 
     // Fail OPEN, and the assertion that matters is the negative one: no session is
