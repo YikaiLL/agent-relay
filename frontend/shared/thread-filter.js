@@ -14,7 +14,7 @@ import { THREAD_STATES, THREAD_STATE_LABELS, selectThreadState } from "./thread-
 export const EMPTY_THREAD_FILTER = Object.freeze({
   on: false,
   states: THREAD_STATES,
-  retained: Object.freeze({}),
+  retained: new Map(),
 });
 
 export function isThreadFilterActive(filter) {
@@ -73,14 +73,19 @@ export function summarizeThreadStates(groups, stateOf) {
  * New matches join live — that half must stay immediate, or the bell would show a
  * snapshot of the past rather than what is going on.
  *
+ * A `Map`, not a plain object. Thread ids are arbitrary strings on the wire —
+ * `ThreadSummaryView.id` is a bare `String` and no parser constrains it — so an id of
+ * `"toString"` or `"constructor"` would read as already-present on an object literal and
+ * be admitted past the selection, while `"__proto__"` could never be stored at all.
+ *
  * Returns the next map; callers keep it on the filter and pass it back in.
  */
 export function nextRetainedStates(previous, groups, filter, stateOf) {
   if (!isThreadFilterActive(filter)) {
-    return {};
+    return new Map();
   }
   const states = selectedStates(filter);
-  const next = { ...(previous || {}) };
+  const next = new Map(previous || []);
   for (const thread of flattenThreads(groups)) {
     const id = thread?.id;
     const state = id ? stateOf(thread) : null;
@@ -92,8 +97,8 @@ export function nextRetainedStates(previous, groups, filter, stateOf) {
     // stale one and, the moment it goes stateless, snaps back to a bucket it left long
     // ago. Narrowed to "Needs input", answering a thread and letting it finish would
     // file it back under "Needs input" with no dot at all.
-    if (id in next || states.includes(state)) {
-      next[id] = state;
+    if (next.has(id) || states.includes(state)) {
+      next.set(id, state);
     }
   }
   return next;
@@ -105,13 +110,13 @@ export function nextRetainedStates(previous, groups, filter, stateOf) {
  * Groups come back in the ladder's order — not by recency — because that order IS the
  * urgency order, and a bell whose first bucket moved around would stop being scannable.
  */
-export function buildThreadStateGroups(groups, { stateOf, states, retained = {} } = {}) {
+export function buildThreadStateGroups(groups, { stateOf, states, retained = new Map() } = {}) {
   const wanted = (states || THREAD_STATES).filter((state) => THREAD_STATES.includes(state));
   const buckets = new Map();
 
   for (const thread of flattenThreads(groups)) {
     const live = stateOf(thread);
-    const remembered = (retained || {})[thread?.id] || null;
+    const remembered = (retained?.get?.(thread?.id)) || null;
     // A live state always wins, so a retained row moves to where it actually is rather
     // than being frozen where it entered. A retained row with no live state left keeps
     // its last bucket — that is what stops it vanishing when it goes idle.
@@ -168,7 +173,7 @@ export function selectThreadFilterView({ groups = [], filter = null, stateOf = (
   const filtered = buildThreadStateGroups(groups, {
     stateOf,
     states,
-    retained: filter.retained || {},
+    retained: filter.retained || new Map(),
   });
   const shown = filtered.reduce((total, group) => total + group.threads.length, 0);
   const everyState = states.length === THREAD_STATES.length;

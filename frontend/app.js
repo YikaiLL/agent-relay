@@ -355,7 +355,7 @@ const state = {
   // last seen in): while the filter is on, a thread that has matched stays listed even
   // after its state moves on, so a row cannot vanish from under the pointer because the
   // agent answered. See shared/thread-filter.js.
-  threadFilter: { on: false, states: [...THREAD_STATES], retained: {} },
+  threadFilter: { on: false, states: [...THREAD_STATES], retained: new Map() },
   projects: [],
   threadProjectId: {},
   projectsLoading: false,
@@ -1611,7 +1611,7 @@ function syncActivityFilterChrome() {
 // deliberate change of selection would instead make the new selection show rows the
 // user just excluded.
 function setActivityFilter(next) {
-  state.threadFilter = { ...state.threadFilter, ...next, retained: {} };
+  state.threadFilter = { ...state.threadFilter, ...next, retained: new Map() };
   syncActivityFilterChrome();
   renderThreads();
 }
