@@ -78,6 +78,9 @@ export const state = {
   // authoritative one every id lookup and the 12s poll read; a narrowed copy in there
   // would make every non-matching session look deleted. See shared/thread-search.js.
   threadSearch: { query: "", groups: [], loading: false, error: null, unavailableProviders: [] },
+  // Bumped by every path that abandons a search. The search field's text lives in React;
+  // this is how a teardown reaches it.
+  threadSearchCancelToken: 0,
 };
 
 syncCurrentRemoteAuth();

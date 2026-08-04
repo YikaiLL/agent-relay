@@ -1254,6 +1254,51 @@ export async function fetchRemoteThreads(options = {}) {
 }
 
 let remoteThreadSearchGeneration = 0;
+let remoteThreadSearchTimer = null;
+let remoteThreadSearchCancelToken = 0;
+
+/**
+ * Debounce a query. The timer lives HERE, not in the component, so that every path that
+ * tears the surface down cancels it along with the request — a timer owned by React is
+ * invisible to `createResetRemoteSurfaceStatePatch` and can fire against whatever
+ * connection replaced the one it was typed into.
+ */
+export function queueRemoteThreadSearch(rawQuery, delayMs = 180) {
+  window.clearTimeout(remoteThreadSearchTimer);
+  remoteThreadSearchTimer = null;
+  if (!normalizeThreadSearchQuery(rawQuery)) {
+    // Clearing is not a fetch — apply it at once so the list snaps back rather than
+    // sitting on stale matches for another debounce window.
+    void searchRemoteThreads("");
+    return;
+  }
+  remoteThreadSearchTimer = window.setTimeout(() => {
+    remoteThreadSearchTimer = null;
+    void searchRemoteThreads(rawQuery);
+  }, delayMs);
+}
+
+/**
+ * Abandon everything a search owns: the pending keystroke timer, any answer still in
+ * flight, and the results on screen.
+ *
+ * Bumping the generation is what makes an in-flight answer land nowhere. Relay identity
+ * alone is not enough — re-pairing tears the surface down while KEEPING the current
+ * relay id, so a rejected request would otherwise pass the identity check and write its
+ * error back over state that was just cleared.
+ */
+export function cancelRemoteThreadSearch() {
+  window.clearTimeout(remoteThreadSearchTimer);
+  remoteThreadSearchTimer = null;
+  remoteThreadSearchGeneration += 1;
+  remoteThreadSearchCancelToken += 1;
+  applyRemoteSurfacePatch({
+    threadSearch: { ...EMPTY_THREAD_SEARCH },
+    // Lets the component drop the text still in its field. The draft is React's, and a
+    // reset has no other way to reach it.
+    threadSearchCancelToken: remoteThreadSearchCancelToken,
+  });
+}
 
 /**
  * Run a title search, or clear one when `rawQuery` is blank.
@@ -1266,14 +1311,6 @@ let remoteThreadSearchGeneration = 0;
  * Results land in `state.threadSearch` and NOWHERE else: `state.threads` stays the
  * authoritative list that the poll, the render model and every id lookup read.
  */
-export function cancelRemoteThreadSearch() {
-  // Bumping the generation is what makes an in-flight answer land nowhere. Without it a
-  // request issued against relay A resolves after the switch and writes A's results —
-  // or A's error — into the state now showing relay B.
-  remoteThreadSearchGeneration += 1;
-  applyRemoteSurfacePatch(createRemoteThreadSearchPatch({ ...EMPTY_THREAD_SEARCH }));
-}
-
 export async function searchRemoteThreads(rawQuery) {
   const query = normalizeThreadSearchQuery(rawQuery);
   const generation = ++remoteThreadSearchGeneration;

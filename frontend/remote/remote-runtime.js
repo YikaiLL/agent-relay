@@ -5,7 +5,7 @@ import { applyPairingQuery, beginPairing, forgetCurrentDevice, handleEncryptedPa
 import { mountIosInstallHint } from "./ios-install.js";
 import { registerRemotePwa } from "./pwa.js";
 import { renderLog } from "./session-surface.js";
-import { applyFileChange, applySessionSnapshot, applyTranscriptDelta, applyTranscriptEvent, cancelRemoteThreadsPoll, clearSessionRuntime, deleteRemoteReview, fetchAskUserQuestionDetail, fetchRemoteProviderModels, fetchRemoteProviders, fetchRemoteThreadTranscript, fetchTranscriptEntryDetail, forkRemoteSession, refreshRemoteThreads, requestRemoteReview, resolveRemoteReview, resolveRemoteWorkflow, resumeRemoteSession, sendMessage, startRemoteSession, startRemoteWorkflow, stopActiveTurn, submitAskUserAnswer, submitDecision, syncRemoteSnapshot, takeOverControl, updateRemoteSessionSettings, viewRemoteThread } from "./session-ops.js";
+import { applyFileChange, applySessionSnapshot, applyTranscriptDelta, applyTranscriptEvent, cancelRemoteThreadSearch, cancelRemoteThreadsPoll, clearSessionRuntime, deleteRemoteReview, fetchAskUserQuestionDetail, fetchRemoteProviderModels, fetchRemoteProviders, fetchRemoteThreadTranscript, fetchTranscriptEntryDetail, forkRemoteSession, refreshRemoteThreads, requestRemoteReview, resolveRemoteReview, resolveRemoteWorkflow, resumeRemoteSession, sendMessage, startRemoteSession, startRemoteWorkflow, stopActiveTurn, submitAskUserAnswer, submitDecision, syncRemoteSnapshot, takeOverControl, updateRemoteSessionSettings, viewRemoteThread } from "./session-ops.js";
 import { clearActiveRelaySelection, ensureDeviceIdentity, hydrateStoredRemoteSecrets, selectRelayProfile, state } from "./state.js";
 import { applyRemoteSurfacePatch, createResetRemoteSurfaceStatePatch } from "./surface-state.js";
 
@@ -124,6 +124,7 @@ export async function switchRemoteRelay(relayId) {
 
   cancelRemoteThreadsPoll();
   applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+    cancelThreadSearch: cancelRemoteThreadSearch,
     clearClaimLifecycle,
     clearSessionRuntime,
     rejectPendingActions,
@@ -140,6 +141,7 @@ export function returnToRelayHome() {
 
   cancelRemoteThreadsPoll();
   applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+    cancelThreadSearch: cancelRemoteThreadSearch,
     clearClaimLifecycle,
     clearSessionRuntime,
     rejectPendingActions,

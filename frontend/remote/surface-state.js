@@ -33,6 +33,7 @@ export function createSessionRuntimeStatePatch(sessionRuntime) {
 }
 
 export function createResetRemoteSurfaceStatePatch({
+  cancelThreadSearch,
   clearClaimLifecycle,
   clearSessionRuntime,
   rejectPendingActions,
@@ -41,6 +42,14 @@ export function createResetRemoteSurfaceStatePatch({
   clearClaimLifecycle();
   clearSessionRuntime();
   rejectPendingActions(reason);
+  // Belongs in the transaction rather than in a relay-id watcher: re-pairing resets the
+  // surface while KEEPING the current relay id, so an id-keyed effect never fires and
+  // the rejected request writes its error back over the state just cleared.
+  //
+  // Required, not optional, and deliberately so: the failure this guards against is a
+  // reset path that FORGETS to abandon the search. Making it optional would turn that
+  // into a silent leak — the exact shape of the bug — instead of an immediate throw.
+  cancelThreadSearch();
   // A different relay may advertise an equal projects_revision — forget fetched
   // Projects so the next syncToRevision refetches unconditionally.
   resetRemoteProjectsStore();

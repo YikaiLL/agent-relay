@@ -97,7 +97,7 @@ import {
   fetchRemoteWorkflows,
   maybeLoadOlderTranscriptHistory,
   sendHeartbeat,
-  cancelRemoteThreadSearch,
+  queueRemoteThreadSearch,
   searchRemoteThreads,
 } from "./session-ops.js";
 import {
@@ -593,22 +593,13 @@ function RemoteApp() {
   // ends up searching for its last letter. `page.fill()` sets the value in one shot and
   // hides this completely; only real key-by-key input shows it.
   const [searchDraft, setSearchDraft] = useState("");
-  const searchDebounce = useRef(null);
-  const runSearch = (value) => {
-    window.clearTimeout(searchDebounce.current);
-    searchDebounce.current = null;
-    void searchRemoteThreads(value);
-  };
+  // The DEBOUNCE is not held here. A timer owned by the component is invisible to the
+  // surface reset, so a keystroke typed just before a re-pair would fire against
+  // whatever connection replaced the one it was typed into. `session-ops` owns it, next
+  // to the request it triggers, and cancels both together.
   const onSearchInput = (value) => {
     setSearchDraft(value);
-    window.clearTimeout(searchDebounce.current);
-    // Clearing is applied at once — the list snaps back rather than sitting on stale
-    // matches for another debounce window.
-    if (!value.trim()) {
-      runSearch("");
-      return;
-    }
-    searchDebounce.current = window.setTimeout(() => runSearch(value), 180);
+    queueRemoteThreadSearch(value);
   };
   const onSetSearchOpen = (open) => {
     setSearchOpen(open);
@@ -616,9 +607,18 @@ function RemoteApp() {
     // looks like it lost sessions, with the reason off screen.
     if (!open) {
       setSearchDraft("");
-      runSearch("");
+      queueRemoteThreadSearch("");
     }
   };
+
+  // Every teardown path — relay switch, re-pair, forget device — cancels the search
+  // through the reset transaction and bumps this token. The draft is the one piece of
+  // the search that lives in React, so this is how a reset reaches it.
+  const searchCancelToken = currentState.threadSearchCancelToken || 0;
+  useEffect(() => {
+    setSearchDraft("");
+    setSearchOpen(false);
+  }, [searchCancelToken]);
 
   // Retention is keyed by thread id alone, and thread ids are only unique WITHIN a
   // relay. Switching relays would otherwise let one relay's remembered states decide
@@ -628,13 +628,6 @@ function RemoteApp() {
   const activeRelayId = currentState.remoteAuth?.relayId || null;
   useEffect(() => {
     remoteUiStore.getState().setThreadFilterRetained(new Map());
-    // The draft and a pending debounce belong to the relay that was on screen. Left
-    // alone, a timer armed before the switch fires against the NEW relay with the old
-    // relay's query.
-    window.clearTimeout(searchDebounce.current);
-    searchDebounce.current = null;
-    setSearchDraft("");
-    cancelRemoteThreadSearch();
   }, [activeRelayId, remoteUiStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.

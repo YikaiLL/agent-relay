@@ -58,6 +58,11 @@ function installBrowserStubs() {
   };
   globalThis.window = {
     localStorage,
+    // Real windows have timers. `session-ops` schedules the thread poll and the search
+    // debounce through `window`, and a surface reset clears them — so a stub without
+    // these turns any teardown into a TypeError rather than exercising it.
+    setTimeout: (...args) => setTimeout(...args),
+    clearTimeout: (...args) => clearTimeout(...args),
     location: { href: "https://remote.example.test/" },
     history: {
       replaceState() {},

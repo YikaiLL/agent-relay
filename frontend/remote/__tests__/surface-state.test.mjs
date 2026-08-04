@@ -63,6 +63,9 @@ test("createResetRemoteSurfaceStatePatch returns reset state and runs lifecycle 
   const calls = [];
 
   const patch = createResetRemoteSurfaceStatePatch({
+    cancelThreadSearch() {
+      calls.push("search");
+    },
     clearClaimLifecycle() {
       calls.push("claim");
     },
@@ -75,8 +78,28 @@ test("createResetRemoteSurfaceStatePatch returns reset state and runs lifecycle 
     reason: "unit-test reset",
   });
 
-  assert.deepEqual(calls, ["claim", "runtime", "reject:unit-test reset"]);
+  assert.deepEqual(calls, ["claim", "runtime", "reject:unit-test reset", "search"]);
   assertClearedSessionPatch(patch);
+});
+
+// Tearing the surface down must ABANDON an open search, not merely blank its results:
+// a request already in flight has to be invalidated and a pending keystroke timer
+// cleared, or a re-pair lets the old relay's answer land in the new one's state.
+//
+// The dependency is required rather than optional on purpose — a reset path that
+// forgets it should throw here, loudly, instead of leaking quietly.
+test("every surface reset abandons an open search", () => {
+  assert.throws(
+    () =>
+      createResetRemoteSurfaceStatePatch({
+        clearClaimLifecycle() {},
+        clearSessionRuntime() {},
+        rejectPendingActions() {},
+        reason: "a reset that forgot the search",
+      }),
+    /cancelThreadSearch is not a function/,
+    "omitting the search teardown must fail loudly, not silently"
+  );
 });
 
 test("createRemoteThreadsPatch returns the canonical thread list patch", () => {

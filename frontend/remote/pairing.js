@@ -40,7 +40,7 @@ import {
   createRemoteThreadsPatch,
   createResetRemoteSurfaceStatePatch,
 } from "./surface-state.js";
-import { clearSessionRuntime } from "./session-ops.js";
+import { cancelRemoteThreadSearch, clearSessionRuntime } from "./session-ops.js";
 import { shortId } from "./utils.js";
 
 export function applyPairingQuery() {
@@ -88,6 +88,7 @@ export async function beginPairing(rawValue, { auto = false, deviceLabel = null 
       pairingError: null,
     }));
     applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+      cancelThreadSearch: cancelRemoteThreadSearch,
       clearClaimLifecycle,
       clearSessionRuntime,
       rejectPendingActions,
@@ -262,6 +263,7 @@ export function forgetCurrentDevice() {
   }));
   forgetCurrentRemoteProfile();
   applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+    cancelThreadSearch: cancelRemoteThreadSearch,
     clearClaimLifecycle,
     clearSessionRuntime,
     rejectPendingActions,
