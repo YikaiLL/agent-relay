@@ -112,6 +112,16 @@ fn validate_project_name(name: String) -> Result<String, String> {
 }
 
 /// Random, stable-shaped project id. Every Project is user-created with a fresh id.
+///
+/// **The `proj_` prefix is load-bearing, not decoration.** The sidebar's Project
+/// switcher renders one project group alongside cwd groups in a single list, and
+/// those group keys are the React keys and the virtualizer's `getItemKey`. A
+/// project id that could equal a canonical cwd (an absolute path) would collide
+/// and corrupt the list rather than merely mislabel a header. Keeping ids
+/// server-generated and prefixed is what makes the two key spaces disjoint by
+/// construction. If caller-chosen ids are ever accepted, namespace the pinned
+/// group's key first — see `buildCwdGroupsWithPinnedProject` in
+/// `frontend/shared/thread-groups.js` and the collision test beside it.
 fn new_project_id() -> String {
     format!("proj_{:016x}", rand::random::<u64>())
 }

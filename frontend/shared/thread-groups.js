@@ -55,11 +55,80 @@ export function buildNavigationThreadGroups(threads, options = {}) {
 // Every group carries a neutral `key` (canonical cwd in cwd mode, project id or the
 // "__unassigned__" sentinel in project mode) so downstream collapse/row state can be
 // keyed uniformly regardless of grouping mode.
+//
+// `options.pinnedProjectId` (cwd mode only) is the Project switcher: it LIFTS that
+// project's sessions out of their cwd groups into one group at the top, and leaves
+// every other session exactly where it was. It is not a filter — the list stays
+// full in every mode, so selecting the wrong project can never hide a session.
+//
+// Pinning is the ONE mode that mixes the two key spaces — a project id alongside
+// cwd keys — and `key` is both the React key and the virtualizer's `getItemKey`,
+// so a collision would corrupt the list rather than merely mislabel it. They are
+// disjoint by construction, not by convention: project ids are server-generated
+// (`proj_<16 hex>`, state/app/projects.rs) while cwd keys are absolute paths or
+// the `__unknown_workspace__` sentinel. `group keys stay unique when a project is
+// pinned` in thread-groups-pinned-project.test.mjs holds that assumption down —
+// if ids ever become caller-chosen, that test is what will fail first.
 export function buildThreadGroups(threads, options = {}) {
   if (options.groupBy === "project") {
     return buildProjectGroups(threads, options);
   }
-  return buildCwdGroups(threads, options);
+
+  const pinnedProject = resolvePinnedProject(options);
+  if (!pinnedProject) {
+    return buildCwdGroups(threads, options);
+  }
+
+  return buildCwdGroupsWithPinnedProject(threads, options, pinnedProject);
+}
+
+// A selected project can be deleted from another device while it is still
+// selected. That must fail OPEN — drop back to plain cwd grouping — because the
+// sessions themselves are all still there; failing closed would blank a list that
+// has nothing wrong with it.
+function resolvePinnedProject(options) {
+  if (!options.pinnedProjectId) {
+    return null;
+  }
+
+  return (
+    (options.projects || []).find((project) => project.id === options.pinnedProjectId) || null
+  );
+}
+
+function buildCwdGroupsWithPinnedProject(threads, options, project) {
+  const threadProjectId = options.threadProjectId || {};
+  const members = [];
+  const rest = [];
+
+  for (const thread of threads || []) {
+    // Membership is read live, so a session removed from the project falls back
+    // into its own cwd group on the very next render — no separate teardown.
+    if (threadProjectId[thread.id] === project.id) {
+      members.push(thread);
+    } else {
+      rest.push(thread);
+    }
+  }
+
+  // The pinned group is prepended rather than sorted in: it leads regardless of
+  // recency, because its position is what tells you which project is selected.
+  // An empty project still renders — a switcher whose selection shows nothing at
+  // all reads as broken rather than as empty.
+  const pinnedGroup = {
+    key: project.id,
+    cwd: "",
+    projectId: project.id,
+    pinned: true,
+    label: project.name || project.id,
+    latestUpdatedAt: members.reduce(
+      (latest, thread) => Math.max(latest, Number(thread.updated_at) || 0),
+      0,
+    ),
+    threads: [...members].sort((left, right) => (right.updated_at || 0) - (left.updated_at || 0)),
+  };
+
+  return [pinnedGroup, ...buildCwdGroups(rest, options)];
 }
 
 function buildCwdGroups(threads, options) {
@@ -190,5 +259,10 @@ export function summarizeThreadGroups(groups, options = {}) {
     return `${projectCount} ${projectCount === 1 ? "project" : "projects"} · ${sessions}`;
   }
 
-  return `${safeGroups.length} ${safeGroups.length === 1 ? "folder" : "folders"} · ${sessions}`;
+  // A pinned project group is not a folder. Counting it as one would make this
+  // line disagree with the list right above it — and the session total already
+  // covers its rows, so nothing goes uncounted by leaving it out here. The
+  // project's own name is on the switcher, so it needs no second mention.
+  const folderCount = safeGroups.filter((group) => !group.projectId).length;
+  return `${folderCount} ${folderCount === 1 ? "folder" : "folders"} · ${sessions}`;
 }
