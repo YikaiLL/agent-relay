@@ -17,6 +17,7 @@
       "local-thread-settings",
       "local-thread-groups",
       "local-projects-toggle",
+      "local-search-filter",
       "local-shell-redesign",
       "local-session-tabs",
       "local-session-rename",
@@ -42,6 +43,7 @@
       "local-thread-settings",
       "local-thread-groups",
       "local-projects-toggle",
+      "local-search-filter",
       "local-shell-redesign",
       "local-session-tabs",
       "local-session-rename",
@@ -273,6 +275,16 @@
       "transport": "local",
       "coverage": [
         "thread-groups"
+      ]
+    },
+    "local-search-filter": {
+      "script": "browser-local-search-filter-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "session-search",
+        "activity-filter"
       ]
     },
     "local-projects-toggle": {
