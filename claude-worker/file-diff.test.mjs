@@ -575,12 +575,12 @@ test("the input-reconstruction fallback also renders a relative header", async (
 });
 
 // A one-line edit to a long-but-small file (package-lock.json: ~6000 lines, 210KB) was
-// rendered as the whole file being deleted. Two guards compounded: the LCS cost cap
-// (lines * lines over MAX_LCS_CELLS) swapped the minimal diff for a whole-file
+// rendered as the whole file being deleted. Two guards compounded: a cost cap on the
+// old hand-rolled LCS (lines * lines) swapped the minimal diff for a whole-file
 // replacement — every old line `-` then every new line `+` — and the MAX_DIFF_LINES
-// truncation then cut the patch off before the first `+`, leaving -1395/+0. The cost cap
-// must be measured on the lines that actually differ, so an edit surrounded by thousands
-// of identical lines still diffs minimally.
+// truncation then cut the patch off before the first `+`, leaving -1395/+0. A file being
+// long is not the same as an edit being large: what a cap may key on is how much
+// actually DIFFERS, never the file's size.
 test("a one-line edit to a several-thousand-line file stays a one-line diff", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "lcs-big-"));
   const abs = path.join(root, "package-lock.json");
@@ -644,3 +644,80 @@ async function diffThroughTracker(before, after) {
   const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
   return out.tool.file_changes[0].diff;
 }
+
+// A file whose last line has no terminating newline needs the `\ No newline at end of
+// file` marker on each side that lacks it. Without it the hunk claims a trailing newline
+// that isn't in the file, and `git apply` refuses the whole patch ("patch does not
+// apply") — so Undo/Reapply silently does nothing for every such file.
+test("an edit to a file with no trailing newline produces an appliable patch", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "no-eol-"));
+  const abs = path.join(root, "f.txt");
+  const before = "a\nb";
+  const after = "a\nc";
+  await fs.writeFile(abs, before);
+
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Edit",
+    args: { file_path: "f.txt", old_string: "b", new_string: "c" },
+  });
+  await fs.writeFile(abs, after);
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+  const diff = out.tool.file_changes[0].diff;
+
+  await fs.writeFile(abs, before);
+  await gitApply(root, diff);
+  assert.equal(await fs.readFile(abs, "utf8"), after, "apply must not invent a trailing newline");
+
+  await gitApply(root, diff, ["--reverse"]);
+  assert.equal(await fs.readFile(abs, "utf8"), before, "reverse must restore the exact bytes");
+});
+
+// Adding or removing only the terminating newline is a real change to the file. Splitting
+// lines on "\n" and dropping a trailing empty element makes both sides compare equal, so
+// the edit rendered as no change at all.
+test("adding a trailing newline is a visible, appliable change", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "eol-add-"));
+  const abs = path.join(root, "f.txt");
+  const before = "a\nb";
+  const after = "a\nb\n";
+  await fs.writeFile(abs, before);
+
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Write",
+    args: { file_path: "f.txt", content: after },
+  });
+  await fs.writeFile(abs, after);
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+  const diff = out.tool.file_changes[0].diff;
+
+  assert.ok(diff, "a trailing-newline change must not render as no change");
+  await fs.writeFile(abs, before);
+  await gitApply(root, diff);
+  assert.equal(await fs.readFile(abs, "utf8"), after);
+});
+
+// Myers is O(N*D) in the edit distance, so two large files that differ almost everywhere
+// cost O(N^2). Unbounded, 20k lines of pure churn took ~58 SECONDS — the worker runs one
+// NDJSON loop, so that is a minute-long freeze of the whole session, not a slow render.
+// The diff must stay bounded no matter how different the two sides are.
+test("a fully-different large file diffs in bounded time", async () => {
+  const before = `${Array.from({ length: 20000 }, (_, i) => `old-${i}`).join("\n")}\n`;
+  const after = `${Array.from({ length: 20000 }, (_, i) => `new-${i}`).join("\n")}\n`;
+
+  const started = process.hrtime.bigint();
+  const diff = await diffThroughTracker(before, after);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.ok(
+    elapsedMs < 5000,
+    `worst-case diff must stay bounded; took ${Math.round(elapsedMs)}ms`
+  );
+  assert.ok(bodyLines(diff, "-").length > 0, "a rewrite removes lines");
+  assert.ok(bodyLines(diff, "+").length > 0, "a rewrite adds lines");
+});

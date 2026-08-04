@@ -1,14 +1,30 @@
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
+
+const requireFromHere = createRequire(import.meta.url);
+let diffLib = null;
+
+// jsdiff is loaded on first use, not at import time, mirroring how the worker defers the
+// Anthropic SDK: the process must boot — and answer `shutdown` — without resolving any
+// third-party module. `scripts/sealwire-package.test.mjs` proves that by running the
+// packed worker with no node_modules at all, so a static import here would break startup
+// in the tarball layout rather than at the first file edit.
+function diffModule() {
+  if (!diffLib) diffLib = requireFromHere("diff");
+  return diffLib;
+}
 
 const MAX_SNAPSHOT_BYTES = 512 * 1024;
 const MAX_DIFF_LINES = 1400;
 // Lines of unchanged context emitted around each change in a unified hunk.
 const DIFF_CONTEXT_LINES = 3;
-// Upper bound on the LCS DP table (rows * cols). Above this we fall back to a
-// whole-file replacement diff to avoid pathological O(n*m) cost/memory on huge
-// files (still bounded downstream by MAX_DIFF_LINES).
-const MAX_LCS_CELLS = 4_000_000;
+// Cap on the edit distance the diff will explore. Myers is O(N*D), so two large files
+// that differ almost everywhere degrade to O(N^2): unbounded, 20k lines of pure churn
+// took ~58 SECONDS, and the worker runs one NDJSON loop — that is a minute-long freeze
+// of the session, not a slow render. Bounding D to the number of lines the patch could
+// ever DISPLAY means we never compute detail the truncation would throw away anyway.
+const MAX_EDIT_DISTANCE = MAX_DIFF_LINES;
 const FILE_EDIT_TOOLS = new Set(["edit", "multiedit", "write", "notebookedit"]);
 
 // `root` (the session cwd) is what lets the patch header be repo-relative, which is
@@ -288,10 +304,24 @@ function applyStringEdit(content, oldString, newString, replaceAll) {
   return content.slice(0, at) + newString + content.slice(at + oldString.length);
 }
 
+// Renders a git-style unified diff. The hunk bodies come from jsdiff (Myers), which owns
+// every detail of the unified format we used to hand-roll and get subtly wrong: minimal
+// hunks, context coalescing, the `@@ -0,0` convention for a created file, and the
+// `\ No newline at end of file` marker. The file header stays ours because it is
+// git-specific (`diff --git a/x b/x`, mode lines) and because the relay's appliability
+// check and the repo-relative header rule are pinned to this exact shape.
 function renderFileDiff(filePath, oldContent, newContent, { oldExists = true, newExists = true } = {}) {
   if (oldExists && newExists && oldContent === newContent) return "";
-  const oldLines = splitLines(oldContent);
-  const newLines = splitLines(newContent);
+
+  const { structuredPatch } = diffModule();
+  const patch = structuredPatch(filePath, filePath, oldContent, newContent, undefined, undefined, {
+    context: DIFF_CONTEXT_LINES,
+    maxEditLength: MAX_EDIT_DISTANCE,
+  });
+  // A patch with no hunks means no line-level change at all. `undefined` is different:
+  // jsdiff hit the edit-distance cap and gave up, so we degrade rather than render
+  // nothing.
+  if (patch && !patch.hunks.length) return "";
 
   const header = [`diff --git a/${filePath} b/${filePath}`];
   if (!oldExists) header.push("new file mode 100644");
@@ -299,180 +329,36 @@ function renderFileDiff(filePath, oldContent, newContent, { oldExists = true, ne
   header.push(oldExists ? `--- a/${filePath}` : "--- /dev/null");
   header.push(newExists ? `+++ b/${filePath}` : "+++ /dev/null");
 
-  // `null` ops means even the differing middle is too large to diff minimally, so the
-  // patch degrades to a whole-file replacement.
-  const ops = computeLineOps(oldLines, newLines);
-  const body = ops
-    ? buildUnifiedHunks(ops)
-    : replacementBody(oldLines, newLines, oldExists, newExists);
-
-  // No line-level changes (e.g. only a trailing-newline difference) → no diff.
+  const body = patch
+    ? hunkLines(patch)
+    : replacementBody(oldContent, newContent, oldExists, newExists);
   if (!body.length) return "";
 
-  const lines = [...header, ...body];
-  if (lines.length > MAX_DIFF_LINES) {
-    return [
-      ...lines.slice(0, MAX_DIFF_LINES - 1),
-      `# Diff truncated by agent-relay: ${lines.length - MAX_DIFF_LINES + 1} lines omitted`,
-    ].join("\n") + "\n";
-  }
-  return lines.join("\n") + "\n";
+  return `${truncateDiff([...header, ...body]).join("\n")}\n`;
 }
 
-// Classic LCS line diff: returns an ordered list of {type, line} ops where type
-// is "equal" | "del" | "add". Compares lines with strict equality.
-//
-// The O(n*m) DP runs only over the lines that actually differ — a shared prefix and
-// suffix are peeled off first and re-emitted as `equal` ops. Skipping that peel is what
-// made a one-character edit to package-lock.json (5993 lines) price itself out of the
-// cost cap at 5993^2 ≈ 36M cells and degrade to a whole-file replacement, which the
-// line-budget truncation then cut off before the first `+`, rendering the edit as the
-// whole file being deleted.
-//
-// Returns null when even the differing middle is over MAX_LCS_CELLS, so the caller can
-// fall back instead of paying pathological time and memory (the DP allocates n*m
-// Int32s).
-function computeLineOps(oldLines, newLines) {
-  const shortest = Math.min(oldLines.length, newLines.length);
-  let head = 0;
-  while (head < shortest && oldLines[head] === newLines[head]) head += 1;
-  let tail = 0;
-  while (
-    tail < shortest - head &&
-    oldLines[oldLines.length - 1 - tail] === newLines[newLines.length - 1 - tail]
-  ) {
-    tail += 1;
-  }
-
-  const oldMid = oldLines.slice(head, oldLines.length - tail);
-  const newMid = newLines.slice(head, newLines.length - tail);
-  if (oldMid.length * newMid.length > MAX_LCS_CELLS) return null;
-
-  const ops = [];
-  for (let k = 0; k < head; k += 1) ops.push({ type: "equal", line: oldLines[k] });
-  for (const op of diffMiddle(oldMid, newMid)) ops.push(op);
-  for (let k = oldLines.length - tail; k < oldLines.length; k += 1) {
-    ops.push({ type: "equal", line: oldLines[k] });
-  }
-  return ops;
+// formatPatch emits its own `Index:`/`---`/`+++` preamble; keep only the hunks so the
+// git header built above is the one that ships. Slicing to the first `@@` leaves every
+// detail of hunk rendering to jsdiff.
+function hunkLines(patch) {
+  const { formatPatch } = diffModule();
+  const formatted = formatPatch(patch).split("\n");
+  const firstHunk = formatted.findIndex((line) => line.startsWith("@@"));
+  return firstHunk < 0 ? [] : formatted.slice(firstHunk).filter((line) => line !== "");
 }
 
-// Whole-file replacement, used only when the differing middle is still too large to diff
-// minimally. Removals and additions each get their own half of the line budget: emitting
-// every removal first lets the MAX_DIFF_LINES truncation cut the patch off before the
-// first `+`, which renders a rewrite as a whole-file deletion (-N/+0) — visually
-// identical to the file having been erased.
-function replacementBody(oldLines, newLines, oldExists, newExists) {
-  // Leaves room for the file header (up to 4 lines), the hunk header and both omission
-  // notes, so the outer truncation never has to cut this body.
-  const perSide = Math.floor((MAX_DIFF_LINES - 8) / 2);
+// Used only when jsdiff bails at MAX_EDIT_DISTANCE: every old line removed, every new
+// line added. Reaching here means the edit distance already exceeds the number of lines
+// the patch can display, so this body is always truncated and never appliable — it exists
+// to show the shape of the change, not to be applied.
+function replacementBody(oldContent, newContent, oldExists, newExists) {
+  const oldLines = splitLines(oldContent);
+  const newLines = splitLines(newContent);
   return [
     `@@ -${rangeHeader(oldLines.length, oldExists)} +${rangeHeader(newLines.length, newExists)} @@`,
-    ...budgetedSide(oldLines, "-", perSide),
-    ...budgetedSide(newLines, "+", perSide),
+    ...oldLines.map((line) => `-${line}`),
+    ...newLines.map((line) => `+${line}`),
   ];
-}
-
-function budgetedSide(lines, sign, limit) {
-  const shown = lines.slice(0, limit).map((line) => `${sign}${line}`);
-  if (lines.length > shown.length) {
-    const kind = sign === "-" ? "removed" : "added";
-    shown.push(`# ${lines.length - shown.length} ${kind} lines omitted by agent-relay`);
-  }
-  return shown;
-}
-
-function diffMiddle(oldLines, newLines) {
-  const n = oldLines.length;
-  const m = newLines.length;
-  // dp[i][j] = length of the LCS of oldLines[i..] and newLines[j..].
-  const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
-  for (let i = n - 1; i >= 0; i -= 1) {
-    for (let j = m - 1; j >= 0; j -= 1) {
-      dp[i][j] = oldLines[i] === newLines[j]
-        ? dp[i + 1][j + 1] + 1
-        : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
-  }
-
-  const ops = [];
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m) {
-    if (oldLines[i] === newLines[j]) {
-      ops.push({ type: "equal", line: oldLines[i] });
-      i += 1;
-      j += 1;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      ops.push({ type: "del", line: oldLines[i] });
-      i += 1;
-    } else {
-      ops.push({ type: "add", line: newLines[j] });
-      j += 1;
-    }
-  }
-  while (i < n) {
-    ops.push({ type: "del", line: oldLines[i] });
-    i += 1;
-  }
-  while (j < m) {
-    ops.push({ type: "add", line: newLines[j] });
-    j += 1;
-  }
-  return ops;
-}
-
-// Turn an ordered op list into unified-diff hunk lines with DIFF_CONTEXT_LINES
-// of context around each change region. Adjacent change regions whose context
-// windows touch are coalesced into a single hunk.
-function buildUnifiedHunks(ops) {
-  const changeIndexes = [];
-  for (let k = 0; k < ops.length; k += 1) {
-    if (ops[k].type !== "equal") changeIndexes.push(k);
-  }
-  if (!changeIndexes.length) return [];
-
-  const context = DIFF_CONTEXT_LINES;
-  const lastIndex = ops.length - 1;
-  const hunks = [];
-  let start = Math.max(0, changeIndexes[0] - context);
-  let end = Math.min(lastIndex, changeIndexes[0] + context);
-  for (let x = 1; x < changeIndexes.length; x += 1) {
-    const idx = changeIndexes[x];
-    if (idx - context <= end + 1) {
-      end = Math.min(lastIndex, idx + context);
-    } else {
-      hunks.push([start, end]);
-      start = Math.max(0, idx - context);
-      end = Math.min(lastIndex, idx + context);
-    }
-  }
-  hunks.push([start, end]);
-
-  // Prefix sums of consumed old/new lines so hunk headers get 1-based starts.
-  const oldPrefix = new Array(ops.length + 1).fill(0);
-  const newPrefix = new Array(ops.length + 1).fill(0);
-  for (let k = 0; k < ops.length; k += 1) {
-    const { type } = ops[k];
-    oldPrefix[k + 1] = oldPrefix[k] + (type === "equal" || type === "del" ? 1 : 0);
-    newPrefix[k + 1] = newPrefix[k] + (type === "equal" || type === "add" ? 1 : 0);
-  }
-
-  const lines = [];
-  for (const [s, e] of hunks) {
-    const oldCount = oldPrefix[e + 1] - oldPrefix[s];
-    const newCount = newPrefix[e + 1] - newPrefix[s];
-    const oldStart = oldCount > 0 ? oldPrefix[s] + 1 : oldPrefix[s];
-    const newStart = newCount > 0 ? newPrefix[s] + 1 : newPrefix[s];
-    lines.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
-    for (let k = s; k <= e; k += 1) {
-      const op = ops[k];
-      if (op.type === "equal") lines.push(` ${op.line}`);
-      else if (op.type === "del") lines.push(`-${op.line}`);
-      else lines.push(`+${op.line}`);
-    }
-  }
-  return lines;
 }
 
 function splitLines(content) {
@@ -484,6 +370,23 @@ function splitLines(content) {
 function rangeHeader(lineCount, exists) {
   if (!exists || lineCount === 0) return "0,0";
   return lineCount === 1 ? "1" : `1,${lineCount}`;
+}
+
+// Bounds a patch to MAX_DIFF_LINES by keeping its head AND its tail, not just its head.
+// A whole-file rewrite is a single hunk of every removal followed by every addition, so
+// head-only truncation drops all the `+` lines and the change renders as -N/+0 — which
+// the UI cannot tell apart from the file having been deleted. Keeping both ends means
+// both signs survive whatever shape the patch has.
+function truncateDiff(lines) {
+  if (lines.length <= MAX_DIFF_LINES) return lines;
+  const kept = MAX_DIFF_LINES - 1;
+  const head = Math.ceil(kept / 2);
+  const tail = kept - head;
+  return [
+    ...lines.slice(0, head),
+    `# Diff truncated by agent-relay: ${lines.length - kept} lines omitted`,
+    ...lines.slice(lines.length - tail),
+  ];
 }
 
 function summarizeFileChange(toolName, filePath) {
