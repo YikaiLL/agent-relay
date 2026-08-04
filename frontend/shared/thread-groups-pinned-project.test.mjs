@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 
 import {
   buildThreadGroups,
+  selectPinnedProjectId,
   summarizeThreadGroups,
   UNKNOWN_WORKSPACE_CWD,
 } from "./thread-groups.js";
@@ -239,6 +240,28 @@ test("a lone folder beside a pinned project stays singular", () => {
   );
 
   assert.equal(summarizeThreadGroups(groups), "1 folder · 3 sessions");
+});
+
+// `selectPinnedProjectId` is the "when to pin" policy. It is extracted from the
+// renderer precisely because the tempting answer is wrong: the bell LOOKS like it
+// narrows rows within groups (in which case a pin would compose with it) but it
+// re-buckets the list by state, which destroys group structure outright.
+test("the pin stands down while the bell is filtering", () => {
+  assert.equal(selectPinnedProjectId({ activeProjectId: "proj_pay", filtering: true }), null);
+});
+
+test("the pin stands down while a search is open", () => {
+  assert.equal(selectPinnedProjectId({ activeProjectId: "proj_pay", searching: true }), null);
+});
+
+test("the pin applies at rest", () => {
+  assert.equal(selectPinnedProjectId({ activeProjectId: "proj_pay" }), "proj_pay");
+});
+
+test("no selection means no pin, and no arguments does not throw", () => {
+  assert.equal(selectPinnedProjectId({ activeProjectId: null }), null);
+  assert.equal(selectPinnedProjectId({}), null);
+  assert.equal(selectPinnedProjectId(), null);
 });
 
 test("group keys stay unique when a project is pinned", () => {

@@ -219,6 +219,7 @@ import {
 import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
+import { ProjectSwitcher } from "./shared/project-switcher.js";
 import {
   layoutThreadIds,
 } from "./shared/tab-layout.js";
@@ -504,6 +505,9 @@ projectsStore.subscribe((projectsState) => {
     reconciledProjectSignature = null;
   }
   projectsStateSeq += 1;
+  // The switcher lists projects in EVERY mode — that is how you reach one from "All
+  // sessions" — so it refreshes unconditionally, outside the projects-mode gate below.
+  renderProjectSwitcher();
   // Re-render on ANY change (loading/loaded/error transitions) while the Projects
   // view is showing, so its loading/error placeholder resolves to the grouping.
   // `renderThreads`/`renderSession` are module consts defined below; this callback
@@ -1300,6 +1304,7 @@ const {
 // already committed canonical state, persistence and history before listeners run,
 // so renderers never observe a route that belongs to a different tab workspace.
 sessionViewController.subscribe((change) => {
+  renderProjectSwitcher();
   renderSessionTabs();
   renderThreads();
   if (state.session) {
@@ -1445,9 +1450,10 @@ function syncThreadListViewFromContext(context) {
     store.setActiveProject(projectId);
   }
   syncThreadViewChrome(isProjects);
-  if (isProjects) {
-    projectsStore.syncToRevision(state.session?.projects_revision || 0);
-  }
+  // Unconditional: the switcher offers the project list from every context, so
+  // gating the fetch on Projects mode would leave it empty exactly where it is the
+  // only way IN to a project.
+  projectsStore.syncToRevision(state.session?.projects_revision || 0);
 }
 
 // Land on a project (the first, by list order) when Projects mode is active but none
@@ -4185,6 +4191,44 @@ function renderClientLogLines(lines) {
 // client — a tab is a per-client view, not a claim on the relay.
 let sessionTabsRootHandle = null;
 let sessionTabsRootElement = null;
+let projectSwitcherRootHandle = null;
+let projectSwitcherRootElement = null;
+
+// The Project switcher above the tab strip. Its own sub-root for the same reason
+// the strip has one: the shell renders once, so anything data-driven needs its own.
+function renderProjectSwitcher() {
+  const mount = document.getElementById("project-switcher-mount");
+  if (!mount) {
+    return;
+  }
+
+  if (projectSwitcherRootElement !== mount) {
+    projectSwitcherRootHandle?.unmount();
+    projectSwitcherRootHandle = createRoot(mount);
+    projectSwitcherRootElement = mount;
+  }
+
+  const context = sessionViewStore.getState().location.context;
+  projectSwitcherRootHandle.render(
+    React.createElement(ProjectSwitcher, {
+      activeProjectId: context?.kind === "project" ? context.projectId : null,
+      projects: state.projects || [],
+      onCreateProject() {
+        void createProjectFromToolbar();
+      },
+      onSelectProject(projectId) {
+        // Straight through the session-view controller, which is what makes the
+        // switcher swap TAB SETS as well as the pinned group: each context owns its
+        // own workspace of tabs and its own remembered focus. `switchContext`
+        // restores where you were in that project; picking "All sessions" returns to
+        // the sessions context, not to a project-less limbo.
+        void sessionViewController.switchContext(
+          projectId ? { kind: "project", projectId } : { kind: "sessions" }
+        );
+      },
+    })
+  );
+}
 
 function resolveTabThread(threadId) {
   const thread = findVisible(threadId);

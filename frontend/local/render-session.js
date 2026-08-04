@@ -41,6 +41,7 @@ import { createRoot } from "react-dom/client";
 import {
   buildNavigationThreadGroups,
   canonicalizeWorkspace,
+  selectPinnedProjectId,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
 import { syncComposerError } from "./composer-error.js";
@@ -67,6 +68,7 @@ import {
 } from "../shared/thread-list-store.js";
 import { ProjectOverview, ProjectSidebarList } from "../shared/project-overview-react.js";
 import {
+  attachProjectSummaries,
   selectProjectAgents,
   sortProjectCards,
   summarizeProjectActivity,
@@ -1472,180 +1474,51 @@ export function createSessionRenderer({
       openCtxThreadId = readThreadListContextMenu(state.threadListStore).threadId;
     }
 
-    // Group by Project when the sidebar is in Projects mode; otherwise by cwd/folder.
-    // `state.threadGroups` stays the cwd grouping (the source of `state.threads`);
-    // project groups are derived on the fly from the flat list + the fetched Projects.
+    // Selecting a project PINS it: its sessions lift out of their cwd groups into one
+    // group at the top, and everything else stays where it was. The list is therefore
+    // always the full list — picking a project can never hide a session. That replaced
+    // the old two-axis "Projects mode", which swapped cwd grouping out entirely.
     const viewMode = readThreadListViewMode(state.threadListStore);
-    // A search cuts ACROSS the grouping mode. Leaving Projects mode in charge while a
-    // query is active would silently drop every result whose session has no project —
-    // the user would type a title they can see and be told it does not exist.
+    // A search cuts ACROSS the pin: it swaps the row SOURCE for a server-side slice
+    // that can contain sessions absent from `state.threads` entirely, so there is
+    // nothing coherent to lift out of.
     const searching = isThreadSearchActive(state.threadSearch);
-    // Both the search and the bell cut ACROSS the grouping mode. Leaving Projects mode
-    // in charge while either is on renders the project tree untouched while the control
-    // sits there looking active — a filter that visibly does nothing.
+    // The bell cuts across it too, and more bluntly: `buildThreadStateGroups` REPLACES
+    // the group structure with state buckets rather than narrowing within it, so a
+    // pinned group cannot survive it. Standing the pin down beats rendering a control
+    // that visibly does nothing.
     const filtering = isThreadFilterActive(state.threadFilter);
-    const projectsMode = viewMode === "projects" && !searching && !filtering;
-    const groupBy = projectsMode ? "project" : "cwd";
+    const pinnedProjectId = selectPinnedProjectId({
+      activeProjectId:
+        viewMode === "projects" ? readActiveProjectId(state.threadListStore) : null,
+      searching,
+      filtering,
+    });
 
-    // Fail closed: only render Project grouping when we hold a payload we can vouch
-    // for as CURRENT. Bail to a placeholder not just on error or before the first
-    // successful load (!projectsLoaded), but ALSO while a newer revision's fetch is
-    // in flight (projectsLoading) — otherwise a pending refresh would present the
-    // prior membership as if it were current, and a failing retry would oscillate
-    // stale grouping back in. A successful fetch is the only state that renders groups.
-    if (
-      projectsMode &&
-      (state.projectsError || !state.projectsLoaded || state.projectsLoading)
-    ) {
-      renderWorkspaceSuggestions(state.session);
-      renderThreadListMessage(
-        state.projectsError ? "Projects unavailable" : "Loading projects…",
-        state.projectsError
-          ? `Failed to load projects: ${state.projectsError}`
-          : "Loading projects…"
-      );
-      return;
-    }
-
-    // Projects mode: the sidebar lists each project with ITS SESSIONS NESTED under it,
-    // so a session can be right-clicked for the same actions Sessions mode offers
-    // (fork/archive/delete/assign) without a detour through the main area.
+    // Regrouped at RENDER time, not at load time: the pin follows the selection, which
+    // changes far more often than the thread list does. `state.threadGroups` stays the
+    // UNPINNED cwd grouping — it is a display projection of `state.threads` and never
+    // the source of it, so the authoritative list is untouched by any of this.
     //
-    // The Unassigned bucket is still not surfaced: it is not a project, and surfacing it
-    // is what flooded this list before the card-overview redesign (a49ce53).
-    //
-    // The main-area card overview is retired from view but deliberately NOT deleted —
-    // its pin/order prefs are reused by these rows, and the card layout may come back
-    // for another purpose.
-    if (projectsMode) {
-      const activeProjectId = readActiveProjectId(state.threadListStore);
-      const activity = buildThreadActivityMap(state.session);
-      const attention = threadAttention.snapshotMap();
-      const reviewing = buildReviewingThreadSet(state.session, reviewsCache.current());
-      const rows = (state.projects || []).map((project) => {
-        const agents = selectProjectAgents({
-          projectId: project.id,
-          threads: state.threads,
+    // Note this no longer fails closed while the Projects payload is missing or in
+    // flight. It used to, because a stale membership map would have mis-grouped the
+    // WHOLE list. A pin is additive: an unresolved project id degrades to plain cwd
+    // grouping (see `resolvePinnedProject`), which shows every session correctly — just
+    // not yet lifted. Blanking a complete list to a "Loading projects…" placeholder is
+    // the worse answer once the failure mode is "not yet sorted" rather than "wrong".
+    const threadGroups = pinnedProjectId
+      ? buildNavigationThreadGroups(state.threads || [], {
+          pinnedProjectId,
+          projects: state.projects || [],
           threadProjectId: state.threadProjectId || {},
-        });
-        const summary = summarizeProjectActivity({
-          agents,
-          threadActivity: activity,
-          threadAttention: attention,
-          threadReviewing: reviewing,
-        });
-        return {
-          id: project.id,
-          name: project.name || project.id,
-          working: summary.working,
-          needsInput: summary.needsInput,
-          total: summary.total,
-        };
-      });
-      renderWorkspaceSuggestions(state.session);
-      const projectCount = rows.length;
-      threadsCount.textContent = `${projectCount} ${projectCount === 1 ? "project" : "projects"}`;
-      threadsCount.title = rows.map((row) => row.name).join("\n");
-      // One group per project, sessions nested. Built from the project list (not from
-      // thread grouping) so an empty project still shows — it is a place to drop
-      // sessions into, and hiding it would make it unreachable.
-      const projectGroups = (state.projects || []).map((project) => ({
-        key: project.id,
-        cwd: "",
-        projectId: project.id,
-        label: project.name || project.id,
-        latestUpdatedAt: 0,
-        threads: selectProjectAgents({
-          projectId: project.id,
-          threads: state.threads,
-          threadProjectId: state.threadProjectId || {},
-        }),
-        // Same activity roll-up the project rows used to show; the header renders it.
-        summary: rows.find((row) => row.id === project.id) || null,
-      }));
-
-      renderReactContent(
-        threadsList,
-        h(ThreadGroupList, {
-          activeThreadId: viewedThreadId,
-          contextMenuThreadId: openCtxThreadId,
-          collapsible: true,
-          collapsedGroupCwds: threadListUi.collapsedGroupCwds || new Set(),
-          expandedGroupCwds: threadListUi.expandedGroupCwds || new Set(),
-          emptyMessage: "No projects yet. Create one to group your sessions.",
-          formatThreadMeta(thread) {
-            return formatRelativeTime(thread.updated_at);
-          },
-          groups: projectGroups,
-          includePreview: true,
-          activeProjectId,
-          onContextProject(projectId, name, clientX, clientY) {
-            if (typeof openProjectContextMenu === "function") {
-              openProjectContextMenu(projectId, name, clientX, clientY);
-            }
-          },
-          onSelectProject(projectId) {
-            // Select the project WITHOUT opening a session: this is what decides which
-            // tab set a newly started session joins.
-            if (typeof enterProjectOverview === "function") {
-              enterProjectOverview(projectId);
-            }
-          },
-          onContextThread(threadId, clientX, clientY) {
-            openThreadContextMenu(threadId, clientX, clientY);
-          },
-          // Finally reachable on local: these group headers only render their
-          // rename/delete affordances for groups carrying a projectId, and until now
-          // local only ever passed cwd groups here.
-          onRenameProject,
-          onDeleteProject,
-          onResumeThread(threadId, { preview = true } = {}) {
-            threadAttention.clear(threadId);
-            void ensureNotificationPermission();
-            renderThreads();
-            if (typeof viewThread === "function") {
-              // Open INTO the owning project's context, so a session nested under P
-              // lands in P's tab set even when another project is selected.
-              const owningProjectId = (state.threadProjectId || {})[threadId] || null;
-              viewThread(threadId, {
-                context: owningProjectId
-                  ? { kind: "project", projectId: owningProjectId }
-                  : null,
-                // A click is a peek, a double click keeps it — see ThreadGroupItem.
-                preview,
-                // A peek commits WITHOUT the root view transition, and that is
-                // load-bearing twice over. While a view transition is running the
-                // page never receives the second click of a double click, so the
-                // keep gesture would silently degrade into another peek. And
-                // browsing wants an instant cut anyway: a 140ms cross-fade of the
-                // whole surface per row is exactly the mush you don't want while
-                // scanning a list. A deliberate open still animates.
-                transition: !preview,
-              });
-            }
-          },
-          onToggleGroup(cwd) {
-            state.threadListStore.getState().toggleCollapsedGroup(cwd);
-            renderThreads();
-          },
-          onToggleExpandedGroup(cwd) {
-            state.threadListStore.getState().toggleExpandedGroup(cwd);
-            renderThreads();
-          },
-          threadActivity: activity,
-          threadAttention: attention,
-          threadReviewing: reviewing,
         })
-      );
-      return;
-    }
+      : state.threadGroups || [];
 
     // Searching swaps the SOURCE of the rows, not the row renderer: a result behaves
     // exactly like the same session listed at rest (same dots, same click/right-click).
     const listView = selectThreadListView({
-      threadGroups: state.threadGroups || [],
+      threadGroups,
       search: state.threadSearch,
-      groupBy,
     });
 
     // Hoisted: the bell needs the same three signals the row dots do, and computing
@@ -1677,7 +1550,17 @@ export function createSessionRenderer({
       stateOf,
     });
     syncActivityFilterCounts(filterView.counts);
-    const groups = filterView.groups;
+    // The pinned group's header carries the same activity roll-up ("2 working" /
+    // "1 needs input") the project headers showed before, so lifting a project to the
+    // top does not cost it the badges it had. This is a no-op without a pin — only
+    // groups carrying a projectId take a summary — so it needs no condition of its own.
+    // The three maps are passed as the ONE snapshot this render already took, which is
+    // what keeps a header from disagreeing with the rows beneath it.
+    const groups = attachProjectSummaries(filterView.groups, {
+      threadActivity: threadActivityMap,
+      threadAttention: threadAttentionMap,
+      threadReviewing: threadReviewingSet,
+    });
 
     // Both controls can have something to say about this list; composeListChrome keeps
     // the count describing what is actually rendered while the search's warning survives.
@@ -1710,10 +1593,18 @@ export function createSessionRenderer({
         onContextThread(threadId, clientX, clientY) {
           openThreadContextMenu(threadId, clientX, clientY);
         },
-        // Real project-group headers get rename/delete affordances (project mode only —
-        // cwd groups carry no projectId, so ThreadGroupHeader shows nothing there).
+        // Rename/delete render only for a group carrying a projectId, which since the
+        // switcher means exactly one group: the pinned one. That is now the surviving
+        // home for both actions — they used to be reachable only inside the retired
+        // Projects mode, so deleting that mode without this would have stranded them.
+        activeProjectId: pinnedProjectId,
         onRenameProject,
         onDeleteProject,
+        onContextProject(projectId, name, clientX, clientY) {
+          if (typeof openProjectContextMenu === "function") {
+            openProjectContextMenu(projectId, name, clientX, clientY);
+          }
+        },
         onResumeThread(threadId, { preview = true } = {}) {
           // Opening a thread clears its attention dot immediately; the click also
           // doubles as the user gesture that unlocks notification permission.
@@ -1721,11 +1612,20 @@ export function createSessionRenderer({
           void ensureNotificationPermission();
           renderThreads();
           if (typeof viewThread === "function") {
+            // Open INTO the owning project's context, so a session lands in ITS tab
+            // set rather than the selected project's. A pinned list shows sessions
+            // from other projects too (they stay in their cwd groups), so the owner
+            // and the selection routinely differ — taking the selection here would
+            // quietly file the session under the wrong project's tabs.
+            const owningProjectId = (state.threadProjectId || {})[threadId] || null;
             // A click is a peek, a double click keeps it — see ThreadGroupItem.
             // A peek skips the view transition: it swallows the second click of
-            // the double click, and browsing wants a cut. See the Projects-mode
-            // handler above for the full reasoning.
-            viewThread(threadId, { preview, transition: !preview });
+            // the double click, and browsing wants a cut.
+            viewThread(threadId, {
+              context: owningProjectId ? { kind: "project", projectId: owningProjectId } : null,
+              preview,
+              transition: !preview,
+            });
           }
         },
         onSelectWorkspace(cwd) {

@@ -82,6 +82,32 @@ export function buildThreadGroups(threads, options = {}) {
   return buildCwdGroupsWithPinnedProject(threads, options, pinnedProject);
 }
 
+/**
+ * When the Project switcher's selection is allowed to pin, and when it stands down.
+ *
+ * A policy rather than an inline condition, because "the pin composes with the
+ * bell" is exactly the plausible-but-wrong assumption this guards: the bell does
+ * NOT narrow rows within groups, it re-buckets the list by state
+ * (`buildThreadStateGroups` replaces the group structure outright), so a pinned
+ * group cannot survive it. A search is a different failure: it swaps the row
+ * SOURCE for a server-side slice that can contain sessions absent from the
+ * authoritative list, so there is nothing coherent to lift out of.
+ *
+ * In both cases the honest answer is to stand the pin down rather than render a
+ * selection that visibly does nothing.
+ */
+export function selectPinnedProjectId({
+  activeProjectId = null,
+  filtering = false,
+  searching = false,
+} = {}) {
+  if (!activeProjectId || searching || filtering) {
+    return null;
+  }
+
+  return activeProjectId;
+}
+
 // A selected project can be deleted from another device while it is still
 // selected. That must fail OPEN — drop back to plain cwd grouping — because the
 // sessions themselves are all still there; failing closed would blank a list that

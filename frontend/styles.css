@@ -5611,3 +5611,114 @@ body.is-resizing-panel {
   flex: none;
   margin-left: auto;
 }
+
+/* ===== Project switcher — picks which project is pinned to the top of the list ===== */
+/* Sits directly above the tab strip because the two are one hierarchy: this picks
+ * the container, the strip shows that container's open sessions. Styled to read as
+ * a breadcrumb rather than a segmented control — it is a place you ARE, not a mode
+ * you toggle, and the list below it stays complete in every selection. */
+.project-switcher {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 4px 6px 0;
+  background: var(--bg-surface);
+}
+
+.project-switcher-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  border: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-strong);
+  color: var(--text-primary);
+  background: transparent;
+  cursor: pointer;
+}
+
+.project-switcher-trigger:hover,
+.project-switcher-trigger[aria-expanded="true"] {
+  background: var(--surface-2, var(--bg-surface));
+}
+
+.project-switcher-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A caret drawn in CSS rather than an icon import: one glyph, and it has to flip. */
+.project-switcher-caret {
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--text-secondary);
+}
+
+.project-switcher-trigger[aria-expanded="true"] .project-switcher-caret {
+  transform: rotate(180deg);
+}
+
+/* Absolute, not fixed: it is anchored to the trigger and scrolls with it. (The
+ * sidebar's .context-menu is fixed and needs bounding-box measurement; this does
+ * not, which is the difference worth remembering when testing them.) */
+.project-switcher-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 2px);
+  left: 6px;
+  min-width: 200px;
+  max-width: 320px;
+  max-height: 60vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  /* Same tokens as .context-menu — this is a menu, and the two should not be
+   * distinguishable by chrome just because one is React and one is imperative. */
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  box-shadow: var(--shadow-popover);
+}
+
+.project-switcher-option {
+  border: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  color: var(--text-primary);
+  background: transparent;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-switcher-option:hover {
+  background: var(--surface-2, var(--bg-surface));
+}
+
+.project-switcher-option.is-active {
+  font-weight: var(--weight-strong);
+  background: var(--surface-2, var(--bg-surface));
+}
+
+/* Creating is a different KIND of act from navigating, so it is separated rather
+ * than sitting as one more name in the list. */
+.project-switcher-create {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  border-radius: 0 0 6px 6px;
+}

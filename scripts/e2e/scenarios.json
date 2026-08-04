@@ -305,7 +305,7 @@
       "transport": "local",
       "coverage": [
         "projects-toggle",
-        "projects-fail-closed"
+        "projects-pin-degrades-open"
       ]
     },
     "local-shell-redesign": {

@@ -28,6 +28,32 @@ async function openThreadDrawer(page) {
   });
 }
 
+// Pick a project in the switcher above the tab strip. Exactly one project is
+// pinned at a time, so its header — and the rename/delete affordances on it —
+// exist only while it is the selection; this is the way to any other project.
+async function selectProjectInSwitcher(page, name) {
+  await page.waitForSelector(".project-switcher-trigger", { state: "attached", timeout: TIMEOUT_MS });
+  // Read-then-act: blind-toggling would CLOSE an already-open menu and hang the
+  // option wait below for the full timeout.
+  const alreadyOpen = await page.evaluate(
+    () => document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded") === "true"
+  );
+  if (!alreadyOpen) {
+    await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  }
+  await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+  await page
+    .locator(".project-switcher-option", { hasText: new RegExp(`^${name}$`) })
+    .first()
+    .click({ timeout: TIMEOUT_MS });
+  await page.waitForFunction(
+    (n) => [...document.querySelectorAll("#threads-list .thread-group-header-project .thread-group-name")]
+      .some((r) => r.textContent.trim() === n),
+    name,
+    { timeout: TIMEOUT_MS }
+  );
+}
+
 async function run() {
   const relayPort = await getFreePort();
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "shell-redesign-e2e-"));
@@ -202,15 +228,12 @@ async function run() {
       () => [...document.querySelectorAll("#threads-list .thread-group-name")].some((n) => /Second/.test(n.textContent || "")),
       { timeout: TIMEOUT_MS }
     );
-    // Select "Gamma" so it's the active project entering the delete. The name is the
-    // click target (the header also hosts action buttons), and the main-area card
-    // overview is retired — selection now shows only as the header's active state,
-    // which is what decides the tab set a new session joins.
-    await page
-      .locator("#threads-list .thread-group-header-project", { hasText: "Gamma" })
-      .first()
-      .locator(".thread-group-name-button")
-      .click();
+    // Select "Gamma" so it's the active project entering the delete. Creating
+    // "Second Project" just auto-selected IT, and only the selected project is
+    // pinned as a header — so getting back to Gamma goes through the switcher.
+    // That is the point of the control: it is the only way to reach a project that
+    // is not the current one.
+    await selectProjectInSwitcher(page, "Gamma Project");
     await page.waitForFunction(
       () =>
         document

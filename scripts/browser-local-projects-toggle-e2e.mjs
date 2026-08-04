@@ -1,9 +1,10 @@
-// Drives the local web UI to verify the Sessions/Projects experience against the
-// current flat-list Projects sidebar: the Sessions/Projects toggle, project rows +
-// counts, passive propagation of API membership changes, the fail-closed
-// placeholders (Projects unavailable / Loading projects), the thread context-menu
-// project actions (assign / unassign / new+assign) and their fail-closed/stale
-// guards, and project Rename/Delete via the project context menu (right-click / ⋯).
+// Drives the local web UI to verify the Projects experience: selecting a project
+// PINS it as a group on top of cwd grouping (it does not swap the grouping axis),
+// passive propagation of API membership changes, degrading OPEN when the Projects
+// payload is unavailable or in flight (the list stays complete — it just isn't
+// pinned yet), the thread context-menu project actions (assign / unassign /
+// new+assign) and their fail-closed/stale guards, and project Rename/Delete via the
+// project context menu, which now lives on the pinned group's own header.
 // Run: AGENT_PROVIDERS=fake node scripts/browser-local-projects-toggle-e2e.mjs
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -187,13 +188,36 @@ async function waitForThreadMenuState(page, tid, match) {
   throw new Error("thread context menu never reached the expected Project state");
 }
 
-// Right-click a project row (Projects mode) to open the project context menu.
-async function openProjectMenu(page, name) {
+// Pick a project in the switcher above the tab strip. This is the ONLY way to
+// reach a given project's header now: exactly one project is pinned at a time, so
+// its rename/delete affordances exist only while it is the selection. Returns once
+// the pinned group has actually rendered under that name.
+async function selectProjectInSwitcher(page, name) {
+  await page.waitForSelector(".project-switcher-trigger", { state: "attached", timeout: TIMEOUT_MS });
+  // Read-then-act, never blind-toggle: if the menu is already open, clicking the
+  // trigger would close it and the option wait below would hang for the full 45s.
+  const alreadyOpen = await page.evaluate(
+    () => document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded") === "true"
+  );
+  if (!alreadyOpen) {
+    await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  }
+  await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+  await page
+    .locator(".project-switcher-option", { hasText: new RegExp(`^${name}$`) })
+    .first()
+    .click({ timeout: TIMEOUT_MS });
   await page.waitForFunction(
-    (n) => [...document.querySelectorAll("#threads-list .thread-group-name")].some((r) => r.textContent.trim() === n),
+    (n) => [...document.querySelectorAll("#threads-list .thread-group-header-project .thread-group-name")]
+      .some((r) => r.textContent.trim() === n),
     name,
     { timeout: TIMEOUT_MS }
   );
+}
+
+// Right-click the pinned project's header to open the project context menu.
+async function openProjectMenu(page, name) {
+  await selectProjectInSwitcher(page, name);
   const row = page
     .locator("#threads-list .thread-group-header-project", { hasText: name })
     .first();
@@ -330,11 +354,19 @@ async function main() {
     await api(relayPort, "POST", "/api/projects", { action: "unassign", thread_id: threadId });
     let unassignPropagated = false;
     try {
-      // Unassigning removes the session from every project group, so its row
-      // disappears from Projects mode entirely. (This used to watch the project
-      // badge fall to "0 sessions"; that badge no longer exists.)
+      // Unassigning MOVES the row, it does not remove it. This assertion used to
+      // wait for the row to disappear, which was correct when a project group was
+      // the whole list; under pinning a session that leaves a project falls back
+      // into its own cwd group and stays on screen. Waiting for "gone" would now be
+      // waiting for a session to be lost — the exact thing the design forbids.
+      //
+      // So: out of the pinned group, still in the list.
       await page.waitForFunction(
-        (id) => !document.querySelector(`#threads-list [data-thread-id="${id}"]`),
+        (id) => {
+          const row = document.querySelector(`#threads-list [data-thread-id="${id}"]`);
+          if (!row) return false;
+          return !row.closest(".thread-group")?.querySelector(".thread-group-header-project");
+        },
         threadId,
         { timeout: TIMEOUT_MS }
       );
@@ -343,10 +375,17 @@ async function main() {
     const afterUnassignBadge = await verifyBadge(page);
     await api(relayPort, "POST", "/api/projects", { action: "assign", thread_id: threadId, project_id: projectId });
 
-    step("8. fail closed on a failed fetch");
+    step("8. fail OPEN on a failed fetch");
 
-    // 8. Fail closed: a failed Projects fetch shows an explicit error placeholder and
-    // NO project rows — never a false empty/"unassigned" grouping.
+    // 8. Fail OPEN. This used to fail CLOSED — an error placeholder and no rows —
+    // and that was right while selecting a project SWAPPED the grouping axis: an
+    // unusable membership map would have mis-grouped the entire list.
+    //
+    // Pinning changed the calculus. A project is now lifted ON TOP of cwd grouping,
+    // so an unresolved project id degrades to plain cwd grouping, which shows every
+    // session correctly — just not yet lifted. The failure mode went from "the list
+    // is wrong" to "the list is not yet sorted", and blanking a complete list for
+    // the latter is the worse answer. What must NOT happen is a session vanishing.
     const failPage = await context.newPage();
     await failPage.route("**/api/projects*", (route) => {
       if (route.request().method() === "GET") {
@@ -358,22 +397,28 @@ async function main() {
     await openDrawer(failPage);
     await failPage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
     await failPage.evaluate(() => document.querySelector("#threads-view-projects").click());
-    await failPage.waitForFunction(
-      () => (document.querySelector("#threads-count")?.textContent || "").includes("Projects unavailable"),
-      null,
-      { timeout: TIMEOUT_MS }
-    );
-    const failClosed = await failPage.evaluate(() => ({
+    // Give the (failing) fetch time to settle so this observes the resolved state
+    // rather than the moment before it: with no placeholder to wait FOR, a bare
+    // assertion here would pass trivially against the pre-click list.
+    await delay(800);
+    const failedFetch = await failPage.evaluate((id) => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
       bodyText: document.querySelector("#threads-list")?.textContent?.trim() || "",
-      projectRows: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
-    }));
+      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+      // The one thing that must survive: the session is still reachable.
+      hasSessionRow: Boolean(document.querySelector(`#threads-list [data-thread-id="${id}"]`)),
+      // No project group can be pinned when membership could not be fetched.
+      projectHeaders: document.querySelectorAll("#threads-list .thread-group-header-project").length,
+    }), threadId);
     await failPage.close();
 
-    step("9. fail closed on a held refresh");
+    step("9. stay usable through a held refresh");
 
-    // 9. Fail closed on refresh: a newer-revision fetch held in flight shows the
-    // loading placeholder with NO rows, then the rows return once it resolves.
+    // 9. A newer-revision fetch held in flight must NOT blank the list. Same reason
+    // as step 8: the rows are all present and correct, only the pinning may be a
+    // revision behind. The pinned group survives the refresh rather than the list
+    // flashing empty and back — a sidebar that strobes on every project mutation is
+    // worse than one that is briefly a revision stale.
     const gatePage = await context.newPage();
     let holdRefresh = false;
     let releaseRefresh;
@@ -393,15 +438,14 @@ async function main() {
     );
     holdRefresh = true;
     await api(relayPort, "POST", "/api/projects", { action: "create", name: "GateProj2" });
-    await gatePage.waitForFunction(
-      () => (document.querySelector("#threads-count")?.textContent || "").includes("Loading projects"),
-      null,
-      { timeout: TIMEOUT_MS }
-    );
-    const gatePending = await gatePage.evaluate(() => ({
+    // Long enough for a blanking regression to be observable: the old code swapped
+    // to a placeholder as soon as `projectsLoading` flipped, which is immediate.
+    await delay(800);
+    const gatePending = await gatePage.evaluate((id) => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
-      projectRows: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
-    }));
+      groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
+      hasSessionRow: Boolean(document.querySelector(`#threads-list [data-thread-id="${id}"]`)),
+    }), threadId);
     releaseRefresh();
     holdRefresh = false;
     await gatePage.waitForFunction(
@@ -639,31 +683,71 @@ async function main() {
 
     console.log(JSON.stringify({
       sessionsView, projectsView, backToSessions,
-      unassignPropagated, afterUnassignBadge, failClosed, gatePending,
+      unassignPropagated, afterUnassignBadge, failedFetch, gatePending,
       crud: { menuItems, assignedMenuItems, triggerValueBeforeAssign, triggerValueAssigned, triggerValueUnassigned, assignConfirmed, currentMarked, unassignConfirmed, menuCreateAssign, renameConfirmed, deleteConfirmed, projectMenuClosedOnBump },
       submenu: { firstLevel, geometry, keyboardNav },
       menuFailClosed, staleMenu,
     }, null, 2));
 
     // --- Assertions ---
-    assert.ok(projectsView.projectRows.includes("VerifyProj"), "VerifyProj row renders in Projects mode");
-    assert.match(projectsView.countText, /1 project\b/, `count text = '1 project': ${projectsView.countText}`);
+    assert.ok(projectsView.projectRows.includes("VerifyProj"), "the selected project is pinned as a group");
+    // The count describes FOLDERS and sessions, not projects: a pinned project is
+    // lifted on top of cwd grouping rather than replacing it, and the pinned group
+    // is deliberately not counted as a folder (it is not one).
+    assert.match(
+      projectsView.countText,
+      /folder/,
+      `a pinned project still counts folders, not projects: ${projectsView.countText}`
+    );
     assert.ok(
       projectsView.hasAssignedSession,
-      `the assigned session shows under its project in Projects mode: ${JSON.stringify(projectsView.projectRows)}`
+      `the assigned session shows under its pinned project: ${JSON.stringify(projectsView.projectRows)}`
     );
     assert.ok(projectsView.hasActionsButton, "each project header exposes visible action buttons (touch/keyboard reachable)");
     assert.ok(projectsView.projectsButtonActive, "Projects toggle button is active");
     assert.ok(backToSessions.sessionsButtonActive, "Sessions toggle re-activates");
     assert.match(backToSessions.countText, /folder/, `back to Sessions shows folder grouping: ${backToSessions.countText}`);
-    assert.ok(unassignPropagated, `an API unassign propagates to the live project row count: ${afterUnassignBadge}`);
+    assert.ok(
+      unassignPropagated,
+      `an API unassign moves the row OUT of the pinned group while keeping it in the list: ${afterUnassignBadge}`
+    );
 
-    assert.equal(failClosed.countText, "Projects unavailable", `fail-closed count: ${failClosed.countText}`);
-    assert.deepEqual(failClosed.projectRows, [], `no rows rendered on fetch failure: ${JSON.stringify(failClosed.projectRows)}`);
-    assert.match(failClosed.bodyText, /Failed to load projects/, `error message shown: ${failClosed.bodyText}`);
+    // Fail OPEN, and the assertion that matters is the negative one: no session is
+    // lost. A placeholder here would now be a regression, not a safeguard.
+    assert.ok(
+      failedFetch.hasSessionRow,
+      `a failed Projects fetch must not cost the list a session: ${failedFetch.bodyText}`
+    );
+    assert.ok(
+      failedFetch.groupLabels.length > 0,
+      `a failed Projects fetch still renders cwd groups: ${JSON.stringify(failedFetch.groupLabels)}`
+    );
+    assert.equal(
+      failedFetch.projectHeaders,
+      0,
+      "nothing can be pinned when membership could not be fetched"
+    );
+    assert.doesNotMatch(
+      failedFetch.countText,
+      /unavailable|Loading/i,
+      `no placeholder replaces a list that is entirely intact: ${failedFetch.countText}`
+    );
 
-    assert.match(gatePending.countText, /Loading projects/, `pending refresh shows a loading placeholder: ${gatePending.countText}`);
-    assert.deepEqual(gatePending.projectRows, [], `no stale rows while a newer revision is pending: ${JSON.stringify(gatePending.projectRows)}`);
+    // A refresh in flight must not strobe the list. Being one revision stale about
+    // WHICH project is pinned is invisible; blanking every row is not.
+    assert.ok(
+      gatePending.hasSessionRow,
+      "a pending Projects refresh keeps every session on screen"
+    );
+    assert.ok(
+      gatePending.groupLabels.includes("VerifyProj"),
+      `the pinned group survives a refresh in flight: ${JSON.stringify(gatePending.groupLabels)}`
+    );
+    assert.doesNotMatch(
+      gatePending.countText,
+      /unavailable|Loading/i,
+      `no placeholder while a refresh is in flight: ${gatePending.countText}`
+    );
 
     assert.ok(menuItems.some((t) => t.replace(/^✓\s*/, "") === "UiCrudProj"), `thread menu lists the toolbar-created project: ${JSON.stringify(menuItems)}`);
     assert.ok(assignConfirmed, "assigning via the thread menu recorded membership server-side");
