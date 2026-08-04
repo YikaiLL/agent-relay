@@ -1153,9 +1153,14 @@ async fn execute_remote_action(
             ..RemoteActionOutcome::default()
         }),
         RemoteActionRequest::ListThreads { query } => state
-            .list_threads(
+            // `q` rides the same struct the HTTP route uses, so a paired device gets
+            // the identical search: matched after the rename overlay, before the
+            // truncate, over a deeper provider scan. Dropping it here would have left
+            // the phone silently filtering only the page it already had.
+            .list_threads_matching(
                 query.limit.unwrap_or(80).clamp(1, 200),
                 query.device_id.clone(),
+                query.q.as_deref(),
             )
             .await
             .map(|threads| RemoteActionOutcome {

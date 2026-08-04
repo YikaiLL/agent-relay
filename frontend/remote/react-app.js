@@ -97,6 +97,7 @@ import {
   fetchRemoteWorkflows,
   maybeLoadOlderTranscriptHistory,
   sendHeartbeat,
+  searchRemoteThreads,
 } from "./session-ops.js";
 import {
   buildExpandedTranscriptDetailEntries,
@@ -126,13 +127,18 @@ import {
   isReviewInProgressForThread,
   selectReviewLaunchModel,
 } from "../shared/review-state.js";
-import { BELL_SVG } from "../svg.js";
+import { BELL_SVG, SEARCH_SVG, X_SVG } from "../svg.js";
 import { THREAD_STATES, THREAD_STATE_LABELS, selectThreadState } from "../shared/thread-dot.js";
 import {
   composeListChrome,
   nextRetainedStates,
   selectThreadFilterView,
 } from "../shared/thread-filter.js";
+import {
+  findVisibleThread,
+  isThreadSearchActive,
+  selectThreadListView,
+} from "../shared/thread-search.js";
 import {
   canStartWorkflow,
   isWorkflowBlocked,
@@ -546,7 +552,10 @@ function RemoteApp() {
     // WORKING but belongs to no project would be missing from a control whose entire
     // job is "show me what is going on" — and would hand it nothing at all while the
     // Projects payload is loading or failed.
-    viewMode: remoteUi.threadFilter?.on ? "sessions" : threadViewMode,
+    viewMode:
+      remoteUi.threadFilter?.on || isThreadSearchActive(currentState.threadSearch)
+        ? "sessions"
+        : threadViewMode,
     projects: remoteProjects.projects,
     threadProjectId: remoteProjects.threadProjectId,
     projectsError: remoteProjects.error,
@@ -566,6 +575,42 @@ function RemoteApp() {
   const setThreadFilter = (next) => remoteUiStore.getState().setThreadFilter(next);
   const setThreadFilterRetained = (retained) =>
     remoteUiStore.getState().setThreadFilterRetained(retained);
+
+  // Every thread the user can currently SEE: the authoritative list plus anything a
+  // search surfaced from beyond it. LOOKUPS only — iteration stays on
+  // `currentState.threads`, or search results would leak into the resting view.
+  const findVisible = (threadId) =>
+    findVisibleThread(
+      { threads: currentState.threads, search: currentState.threadSearch },
+      threadId
+    );
+
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchQuery = currentState.threadSearch?.query || "";
+  const searchDebounce = useRef(null);
+  const runSearch = (value) => {
+    window.clearTimeout(searchDebounce.current);
+    searchDebounce.current = null;
+    void searchRemoteThreads(value);
+  };
+  const onSearchInput = (value) => {
+    window.clearTimeout(searchDebounce.current);
+    // Clearing is applied at once — the list snaps back rather than sitting on stale
+    // matches for another debounce window.
+    if (!value.trim()) {
+      runSearch("");
+      return;
+    }
+    searchDebounce.current = window.setTimeout(() => runSearch(value), 180);
+  };
+  const onSetSearchOpen = (open) => {
+    setSearchOpen(open);
+    // Closing must also clear: a hidden field still narrowing the list is a sidebar that
+    // looks like it lost sessions, with the reason off screen.
+    if (!open) {
+      runSearch("");
+    }
+  };
 
   // Retention is keyed by thread id alone, and thread ids are only unique WITHIN a
   // relay. Switching relays would otherwise let one relay's remembered states decide
@@ -1193,9 +1238,13 @@ function RemoteApp() {
     // See resolveForkSourceThread: the thread list may not be loaded (or may
     // not contain an older thread) when the transcript already shows its fork
     // buttons. Bailing here used to fail silently on this surface.
+    const visible = findVisible(threadId);
     const thread = resolveForkSourceThread({
       threadId,
-      threads: currentState.threads,
+      // The search slice too: a result from beyond the authoritative page is exactly
+      // the kind of older thread this resolver's fallbacks exist for, and forking it is
+      // one of the reasons to have gone looking.
+      threads: visible ? [visible, ...(currentState.threads || [])] : currentState.threads,
       session,
     });
     if (!thread) return;
@@ -1238,10 +1287,13 @@ function RemoteApp() {
   // Remote's only reachable session-actions entry on a phone: `contextmenu` never
   // fires for a touch long-press, so before this the row's right-click binding was
   // dead on iOS and fork was reachable only from a transcript message.
-  const selectSheetFor = (threadId) =>
-    selectThreadSheet({
+  const selectSheetFor = (threadId) => {
+    // A row reached through search is routinely absent from the authoritative list; with
+    // a bare lookup its "⋯" would report no actions and do nothing.
+    const visible = findVisible(threadId);
+    return selectThreadSheet({
       threadId,
-      threads: currentState.threads,
+      threads: visible ? [visible, ...(currentState.threads || [])] : currentState.threads,
       session,
       projects: remoteProjects.projects,
       threadProjectId: remoteProjects.threadProjectId,
@@ -1249,6 +1301,7 @@ function RemoteApp() {
       projectsError: remoteProjects.error,
       projectsLoading: remoteProjects.loading,
     });
+  };
   const { thread: actionsSheetThread, sections: actionsSheetSections } =
     selectSheetFor(actionsSheetThreadId);
 
@@ -1639,6 +1692,11 @@ function RemoteApp() {
         threadFilter: remoteUi.threadFilter,
         onSetThreadFilter: setThreadFilter,
         onSetThreadFilterRetained: setThreadFilterRetained,
+        threadSearch: currentState.threadSearch,
+        searchOpen,
+        searchQuery,
+        onSetSearchOpen,
+        onSearchInput,
         threadViewMode,
         projectsReady: remoteProjectsReady,
         onSetThreadViewMode: setThreadViewMode,
@@ -1944,6 +2002,11 @@ function RemoteSidebar({
   threadFilter,
   onSetThreadFilter,
   onSetThreadFilterRetained,
+  threadSearch,
+  searchOpen,
+  searchQuery,
+  onSetSearchOpen,
+  onSearchInput,
   threadViewMode,
   projectsReady,
   onSetThreadViewMode,
@@ -2010,6 +2073,15 @@ function RemoteSidebar({
       attentionKind: threadAttentionMap.get(thread.id) || null,
       reviewing: threadReviewingSet.has?.(thread.id),
     });
+  // Search swaps the SOURCE of the rows; the bell narrows whatever that source is. Same
+  // composition as local, which is what lets the two controls coexist instead of
+  // competing for the list.
+  const listView = selectThreadListView({
+    threadGroups: threadsModel.groups,
+    search: threadSearch,
+    groupBy: "cwd",
+  });
+
   // Retention is a monotonic accumulator. Local writes it during render because its
   // state is a plain mutable object; here it lives in a store, so writing it inline
   // would be a set() during render — React's cardinal sin. An effect keeps it out of the
@@ -2017,7 +2089,7 @@ function RemoteSidebar({
   // pass settles immediately instead of looping.
   const retainedNext = nextRetainedStates(
     threadFilter.retained,
-    threadsModel.groups,
+    listView.groups,
     threadFilter,
     stateOf
   );
@@ -2032,15 +2104,11 @@ function RemoteSidebar({
   });
 
   const filterView = selectThreadFilterView({
-    groups: threadsModel.groups,
+    groups: listView.groups,
     filter: { ...threadFilter, retained: retainedNext },
     stateOf,
   });
-  const listChrome = composeListChrome(
-    // Remote has no search yet, so there is never an abnormal status to defer to.
-    { status: "ok", countLabel: threadsModel.countLabel, emptyMessage: threadsModel.emptyMessage },
-    filterView
-  );
+  const listChrome = composeListChrome(listView, filterView);
 
   return h(
     "aside",
@@ -2081,6 +2149,24 @@ function RemoteSidebar({
           "button",
           {
             className:
+              "header-button sidebar-search-toggle" + (searchOpen ? " is-active" : ""),
+            id: "remote-sidebar-search-toggle",
+            type: "button",
+            title: "Search sessions",
+            "aria-label": "Search sessions",
+            "aria-expanded": String(searchOpen),
+            onClick: () => onSetSearchOpen(!searchOpen),
+          },
+          h("span", {
+            className: "inline-icon",
+            "aria-hidden": "true",
+            dangerouslySetInnerHTML: { __html: SEARCH_SVG },
+          })
+        ),
+        h(
+          "button",
+          {
+            className:
               "header-button sidebar-bell-toggle" + (threadFilter.on ? " is-active" : ""),
             id: "remote-sidebar-bell-toggle",
             type: "button",
@@ -2098,6 +2184,50 @@ function RemoteSidebar({
         )
       )
     ),
+    searchOpen
+      ? h(
+          "div",
+          { className: "sidebar-search", id: "remote-sidebar-search" },
+          h("span", {
+            className: "inline-icon sidebar-search-glyph",
+            "aria-hidden": "true",
+            dangerouslySetInnerHTML: { __html: SEARCH_SVG },
+          }),
+          h("input", {
+            autoComplete: "off",
+            className: "sidebar-search-input",
+            id: "remote-sidebar-search-input",
+            placeholder: "Search session titles",
+            spellCheck: false,
+            type: "search",
+            value: searchQuery,
+            "aria-label": "Search session titles",
+            onChange: (event) => onSearchInput(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                onSetSearchOpen(false);
+              }
+            },
+          }),
+          h(
+            "button",
+            {
+              className: "sidebar-search-clear",
+              id: "remote-sidebar-search-clear",
+              type: "button",
+              title: "Clear search",
+              "aria-label": "Clear search",
+              onClick: () => onSearchInput(""),
+            },
+            h("span", {
+              className: "inline-icon",
+              "aria-hidden": "true",
+              dangerouslySetInnerHTML: { __html: X_SVG },
+            })
+          )
+        )
+      : null,
     h(RemoteActivityFilter, {
       counts: filterView.counts,
       filter: threadFilter,

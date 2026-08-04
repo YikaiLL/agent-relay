@@ -177,6 +177,7 @@ async function main() {
         );
 
         window.__projectActions = [];
+        window.__listThreadQueries = [];
         window.__agentRelaySecretReady = false;
         const openRequest = indexedDB.open(REMOTE_SECRET_DB_NAME, 1);
         openRequest.onupgradeneeded = () => {
@@ -264,11 +265,20 @@ async function main() {
               return;
             }
             if (request.type === "list_threads") {
+              const q = request.query?.q;
+              window.__listThreadQueries.push(q ?? null);
+              const all = [threadSummary, threadSummary2, threadSummary3];
+              // Answer a search the way the relay does — matching server-side over the
+              // whole set — so the test proves `q` reached the wire and the client
+              // rendered the RESPONSE, rather than filtering rows it already had.
+              const matched = q
+                ? all.filter((t) => (t.name || "").toLowerCase().includes(q.toLowerCase()))
+                : all;
               this.#respond(actionId, {
                 action: "list_threads",
                 ok: true,
                 snapshot,
-                threads: { threads: [threadSummary, threadSummary2, threadSummary3] },
+                threads: { threads: matched },
               });
               return;
             }
@@ -384,6 +394,10 @@ async function main() {
     const groupLabels = () =>
       page.$$eval("#remote-threads-list .thread-group-name", (els) =>
         els.map((n) => n.textContent.trim())
+      );
+    const countLine = () =>
+      page.evaluate(() =>
+        document.querySelector("#remote-threads-count")?.textContent?.trim() || ""
       );
     const bellOn = () =>
       page.evaluate(() =>
@@ -604,7 +618,75 @@ async function main() {
     await page.tap("#remote-threads-view-sessions");
     await page.waitForTimeout(400);
 
-    // 6. With the bell off, the resting grouping is back.
+    // 6. Search. The relay-side filter is what makes this worth having on a phone: the
+    // list is truncated before it ever reaches the device, so a client-side filter could
+    // only ever search the page already on screen.
+    await setBell(false);
+    await page.tap("#remote-sidebar-search-toggle");
+    await page.waitForSelector("#remote-sidebar-search-input", {
+      state: "visible",
+      timeout: TIMEOUT_MS,
+    });
+    await page.fill("#remote-sidebar-search-input", "Quiet");
+    await page.waitForFunction(
+      (id) => {
+        const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
+        return rows.length === 1 && rows[0].dataset.threadId === id;
+      },
+      THREAD_ID_3,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(`search left ${JSON.stringify(await rowIds())}`);
+    });
+
+    // It must be a RELAY query, not a local filter over the loaded rows.
+    const sentQueries = await page.evaluate(() => window.__listThreadQueries);
+    assert.ok(
+      sentQueries.includes("Quiet"),
+      `the query must reach the wire, saw ${JSON.stringify(sentQueries)}`
+    );
+    assert.match(await countLine(), /result/, `count line: ${await countLine()}`);
+
+    // A search result must stay actionable — its "⋯" resolves through the same union
+    // local needed, or the sheet reports no actions and does nothing.
+    // The "⋯" is a SIBLING of the row button inside `.conversation-item-wrap`, not a
+    // child of it — nesting buttons would be invalid HTML.
+    await page.tap(
+      `.conversation-item-wrap:has([data-thread-id="${THREAD_ID_3}"]) .conversation-more`
+    );
+    await page.waitForSelector(".remote-sheet, [role=dialog]", { timeout: TIMEOUT_MS }).catch(() => {});
+    const sheetVisible = await page.evaluate(() =>
+      Boolean([...document.querySelectorAll("button")].some((b) => /Fork session/.test(b.textContent)))
+    );
+    assert.equal(sheetVisible, true, "a searched row's actions sheet must open");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+
+    // Search and the bell compose: the bell narrows whatever the search produced.
+    await setBell(true);
+    await page.waitForFunction(
+      () => document.querySelectorAll("#remote-threads-list .conversation-item").length === 0,
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(
+        `the idle search hit should be filtered out by the bell, got ${JSON.stringify(await rowIds())}`
+      );
+    });
+    await setBell(false);
+
+    // Closing the field clears the search rather than leaving the list narrowed with the
+    // reason off screen.
+    await page.tap("#remote-sidebar-search-toggle");
+    await page.waitForFunction((n) =>
+      document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
+      3,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(`closing search left ${JSON.stringify(await rowIds())}`);
+    });
+
+    // 7. With the bell off, the resting grouping is back.
     await setBell(false);
     await page.waitForFunction((n) =>
       document.querySelectorAll("#remote-threads-list .conversation-item").length === n,

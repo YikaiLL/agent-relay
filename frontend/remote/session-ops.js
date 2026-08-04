@@ -41,6 +41,7 @@ import { remoteQueryClient } from "./query-client.js";
 import { remoteUiRefs } from "./ui-refs.js";
 import {
   applyRemoteSurfacePatch,
+  createRemoteThreadSearchPatch,
   createRemoteThreadsPatch,
 } from "./surface-state.js";
 import { isReviewInProgressForThread } from "../shared/review-state.js";
@@ -49,6 +50,11 @@ import {
   shouldRebindPinnedViewOnPromotion,
 } from "../shared/thread-promotion.js";
 import { resolveOutgoingEffort } from "../shared/reasoning-efforts.js";
+import { buildNavigationThreadGroups } from "../shared/thread-groups.js";
+import {
+  EMPTY_THREAD_SEARCH,
+  normalizeThreadSearchQuery,
+} from "../shared/thread-search.js";
 import { threadAttention } from "../shared/thread-attention.js";
 import { forkFieldsToPayload } from "../shared/fork-fields.js";
 import { isDocumentForeground, notifyThreadEvents } from "../shared/thread-notify.js";
@@ -1219,15 +1225,97 @@ function runRemoteThreadsPoll() {
   void refreshRemoteThreads("poll", { silent: true }).catch(() => {});
 }
 
-export async function fetchRemoteThreads({ limit = 80 } = {}) {
+/**
+ * The raw page, including which providers could not be listed.
+ *
+ * A failed provider is dropped from the merge and the action still succeeds, so "zero
+ * threads" and "half the providers were unreachable" arrive identically unless the
+ * caller reads this. It only matters for search — where an empty answer reads as "that
+ * session does not exist" — but it rides both paths so there is one shape.
+ */
+export async function fetchRemoteThreadPage({ limit = 80, q = "" } = {}) {
   if (!state.remoteAuth) {
-    return [];
+    return { threads: [], unavailableProviders: [] };
   }
 
-  const result = await dispatchOrRecover("list_threads", {
-    query: { limit },
-  });
-  return result.threads?.threads || [];
+  const query = { limit };
+  if (q) {
+    query.q = q;
+  }
+  const result = await dispatchOrRecover("list_threads", { query });
+  return {
+    threads: result.threads?.threads || [],
+    unavailableProviders: result.threads?.unavailable_providers || [],
+  };
+}
+
+export async function fetchRemoteThreads(options = {}) {
+  return (await fetchRemoteThreadPage(options)).threads;
+}
+
+let remoteThreadSearchGeneration = 0;
+
+/**
+ * Run a title search, or clear one when `rawQuery` is blank.
+ *
+ * Deliberately NOT through the query cache. `threadListQueryKey` keys on `{limit}` only
+ * and `createThreadListQueryOptions` hardcodes `queryFn: () => fetchThreads({limit})`,
+ * so a cached search would share a key with the 12s poll — each would serve the other's
+ * answer. Local sidesteps it the same way.
+ *
+ * Results land in `state.threadSearch` and NOWHERE else: `state.threads` stays the
+ * authoritative list that the poll, the render model and every id lookup read.
+ */
+export async function searchRemoteThreads(rawQuery) {
+  const query = normalizeThreadSearchQuery(rawQuery);
+  const generation = ++remoteThreadSearchGeneration;
+
+  if (!query) {
+    // Clearing is not a fetch — snap back rather than flashing stale matches.
+    applyRemoteSurfacePatch(createRemoteThreadSearchPatch({ ...EMPTY_THREAD_SEARCH }));
+    return;
+  }
+
+  applyRemoteSurfacePatch(
+    createRemoteThreadSearchPatch({
+      ...state.threadSearch,
+      query,
+      loading: true,
+      error: null,
+    })
+  );
+
+  try {
+    // 80, not local's 120: the remote surface's response budget caps the list at 80
+    // (THREADS_RESPONSE_REMOTE_SURFACE_BUDGET) and reduces further under byte pressure,
+    // so asking for more would be silently trimmed and the count line would lie.
+    const { threads, unavailableProviders } = await fetchRemoteThreadPage({ limit: 80, q: query });
+    if (generation !== remoteThreadSearchGeneration) {
+      return;
+    }
+    applyRemoteSurfacePatch(
+      createRemoteThreadSearchPatch({
+        query,
+        groups: buildNavigationThreadGroups(threads),
+        loading: false,
+        error: null,
+        unavailableProviders,
+      })
+    );
+  } catch (error) {
+    if (generation !== remoteThreadSearchGeneration) {
+      return;
+    }
+    applyRemoteSurfacePatch(
+      createRemoteThreadSearchPatch({
+        query,
+        groups: [],
+        loading: false,
+        error: error.message || "Search failed",
+        unavailableProviders: [],
+      })
+    );
+  }
 }
 
 export async function resumeRemoteSession(threadId, _sessionDraftOverride = null) {

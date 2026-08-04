@@ -6,6 +6,7 @@ import {
   createClearedTranscriptHydrationPatch as createSharedClearedTranscriptHydrationPatch,
 } from "../shared/transcript-hydration-store.js";
 import { resetRemoteProjectsStore } from "./projects-host.js";
+import { EMPTY_THREAD_SEARCH } from "../shared/thread-search.js";
 
 export function applyRemoteSurfacePatch(patch) {
   return patchRemoteState(patch);
@@ -17,6 +18,9 @@ export function createClearedRemoteSurfaceSessionStatePatch() {
     realSession: null,
     session: null,
     threads: [],
+    // Results belong to the relay that answered them, and thread ids are only unique
+    // within a relay — the same reason fetched Projects are forgotten below.
+    threadSearch: { ...EMPTY_THREAD_SEARCH },
     ...createClearedTranscriptEntryDetailsPatch(),
   };
 }
@@ -46,6 +50,12 @@ export function createResetRemoteSurfaceStatePatch({
 export function createRemoteThreadsPatch(threads) {
   return {
     threads,
+  };
+}
+
+export function createRemoteThreadSearchPatch(threadSearch) {
+  return {
+    threadSearch,
   };
 }
 

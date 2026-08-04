@@ -74,6 +74,10 @@ export const state = {
   transcriptHydrationTailReady: false,
   transcriptHydrationLastFetchAt: 0,
   threads: [],
+  // Title-search results, held SEPARATELY from `threads`. That list is the
+  // authoritative one every id lookup and the 12s poll read; a narrowed copy in there
+  // would make every non-matching session look deleted. See shared/thread-search.js.
+  threadSearch: { query: "", groups: [], loading: false, error: null, unavailableProviders: [] },
 };
 
 syncCurrentRemoteAuth();

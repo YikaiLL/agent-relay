@@ -1127,3 +1127,109 @@ fn rename_thread_round_trips_the_payload_the_remote_surface_sends() {
     assert!(!requires_session_claim(RemoteActionKind::RenameThread));
     assert!(!issues_session_claim(RemoteActionKind::RenameThread));
 }
+
+/// The broker's `list_threads` action must carry `q` into the search, not drop it.
+///
+/// This is one line in `execute_remote_action`, and it is the whole feature on a phone:
+/// with `q` dropped the relay answers with the ordinary page, so the device shows every
+/// session and the search box looks broken. The browser e2e cannot see it — that harness
+/// stubs the relay, so it IS the server there.
+#[tokio::test]
+async fn list_threads_action_carries_the_search_query() {
+    use crate::fake_provider::FakeProviderBridge;
+    use crate::protocol::StartSessionInput;
+    use crate::provider::ProviderBridge;
+    use crate::state::{PairedDevice, RelayState, SecurityProfile};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    let dir = tempfile::TempDir::new().expect("tmpdir");
+    let cwd = dir.path().to_string_lossy().to_string();
+    let (change_tx, _rx) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        cwd.clone(),
+        change_tx.clone(),
+        SecurityProfile::private(),
+    )));
+    let bridge = FakeProviderBridge::spawn(relay.clone())
+        .await
+        .expect("fake provider should spawn");
+    let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+    providers.insert("fake".to_string(), Arc::new(bridge));
+    // start_session refuses an unidentified caller; pair one the way the relay would.
+    // Before `from_parts`, which takes the Arc — `AppState.relay` is private.
+    {
+        let mut guard = relay.write().await;
+        guard.paired_devices.insert(
+            "phone-1".to_string(),
+            PairedDevice {
+                device_id: "phone-1".to_string(),
+                label: "phone-1".to_string(),
+                payload_secret: "secret".to_string(),
+                device_verify_key: "verify".to_string(),
+                created_at: 1,
+                last_seen_at: Some(1),
+                last_peer_id: None,
+                broker_join_ticket_expires_at: None,
+                path_scope: Vec::new(),
+            },
+        );
+    }
+    let state = AppState::from_parts(relay, providers, change_tx);
+
+    state
+        .start_session(StartSessionInput {
+            device_id: Some("phone-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+        })
+        .await
+        .expect("start_session");
+
+    let listed = state.list_threads(50, None).await.expect("list");
+    let title = listed.threads[0]
+        .name
+        .clone()
+        .expect("the fake provider titles its sessions");
+
+    let run = |q: Option<&str>| {
+        let state = state.clone();
+        let q = q.map(str::to_string);
+        async move {
+            let outcome = execute_remote_action(
+                &state,
+                RemoteActionRequest::ListThreads {
+                    query: ThreadsQuery {
+                        limit: Some(50),
+                        device_id: None,
+                        q,
+                    },
+                },
+            )
+            .await
+            .expect("action should succeed");
+            outcome.threads.expect("the action returns a thread list")
+        }
+    };
+
+    assert_eq!(
+        run(Some(&title)).await.threads.len(),
+        1,
+        "a query matching the session's title must come back with it"
+    );
+    assert!(
+        run(Some("zzz-no-such-session")).await.threads.is_empty(),
+        "a non-matching query must narrow the answer — if it does not, `q` was dropped"
+    );
+    assert_eq!(
+        run(None).await.threads.len(),
+        1,
+        "no query still returns the ordinary page"
+    );
+}
