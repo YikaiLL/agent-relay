@@ -126,6 +126,13 @@ import {
   isReviewInProgressForThread,
   selectReviewLaunchModel,
 } from "../shared/review-state.js";
+import { BELL_SVG } from "../svg.js";
+import { THREAD_STATES, THREAD_STATE_LABELS, selectThreadState } from "../shared/thread-dot.js";
+import {
+  composeListChrome,
+  nextRetainedStates,
+  selectThreadFilterView,
+} from "../shared/thread-filter.js";
 import {
   canStartWorkflow,
   isWorkflowBlocked,
@@ -550,6 +557,9 @@ function RemoteApp() {
   const promptRemoteProjectName = (current = "") =>
     normalizeProjectName(window.prompt("Project name", current));
   const setThreadViewMode = (mode) => threadListStore.getState().setViewMode(mode);
+  const setThreadFilter = (next) => remoteUiStore.getState().setThreadFilter(next);
+  const setThreadFilterRetained = (retained) =>
+    remoteUiStore.getState().setThreadFilterRetained(retained);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
   const createRemoteProjectFromToolbar = async () => {
@@ -1610,6 +1620,9 @@ function RemoteApp() {
         // on touch, where `contextmenu` never fires.
         onContextThread: handleOpenForkDialog,
         onThreadActions: openActionsSheet,
+        threadFilter: remoteUi.threadFilter,
+        onSetThreadFilter: setThreadFilter,
+        onSetThreadFilterRetained: setThreadFilterRetained,
         threadViewMode,
         projectsReady: remoteProjectsReady,
         onSetThreadViewMode: setThreadViewMode,
@@ -1852,6 +1865,54 @@ function findThreadNameInGroups(groups, threadId) {
   return null;
 }
 
+// The bell's state pills. Mirrors local's `ActivityFilter`, but rendered from props
+// rather than toggled through `hidden`: remote is fully React and holds no `dom.js`
+// handles, so it can be conditional.
+function RemoteActivityFilter({ counts = null, filter, onSetThreadFilter }) {
+  if (!filter?.on) {
+    return null;
+  }
+  const selected = filter.states || THREAD_STATES;
+  return h(
+    "div",
+    {
+      className: "sidebar-activity-filter",
+      id: "remote-activity-filter",
+      role: "group",
+      "aria-label": "Filter sessions by activity",
+    },
+    ...THREAD_STATES.map((state) => {
+      const isSelected = selected.includes(state);
+      return h(
+        "button",
+        {
+          key: state,
+          className: "activity-filter-pill" + (isSelected ? " is-selected" : ""),
+          "data-state": state,
+          id: `remote-activity-filter-${state}`,
+          type: "button",
+          "aria-pressed": String(isSelected),
+          onClick: () => {
+            const next = isSelected
+              ? selected.filter((entry) => entry !== state)
+              : THREAD_STATES.filter((entry) => selected.includes(entry) || entry === state);
+            // Deselecting the last pill would show nothing with no way back except the
+            // bell itself; empty already means "all" to the filter.
+            onSetThreadFilter({ states: next.length ? next : [...THREAD_STATES] });
+          },
+        },
+        h("span", { className: `activity-filter-dot is-${state}`, "aria-hidden": "true" }),
+        h("span", { className: "activity-filter-label" }, THREAD_STATE_LABELS[state]),
+        h(
+          "span",
+          { className: "activity-filter-count", "data-count-for": state },
+          String(counts?.[state] ?? 0)
+        )
+      );
+    })
+  );
+}
+
 function RemoteSidebar({
   currentState,
   hasRelay,
@@ -1864,6 +1925,9 @@ function RemoteSidebar({
   onResumeThread,
   onContextThread,
   onThreadActions,
+  threadFilter,
+  onSetThreadFilter,
+  onSetThreadFilterRetained,
   threadViewMode,
   projectsReady,
   onSetThreadViewMode,
@@ -1920,6 +1984,44 @@ function RemoteSidebar({
   const threadAttentionMap = threadAttention.snapshotMap();
   const threadReviewingSet = buildReviewingThreadSet(session, remoteReviews);
 
+  // The bell re-buckets the SAME rows by state. It belongs here for the same reason the
+  // roll-up does: this is where all three per-thread maps are in scope. Doing it in the
+  // render model would mean recomputing them there, and two copies of `snapshotMap()`
+  // can disagree.
+  const stateOf = (thread) =>
+    selectThreadState({
+      activity: threadActivityMap.get(thread.id) || null,
+      attentionKind: threadAttentionMap.get(thread.id) || null,
+      reviewing: threadReviewingSet.has?.(thread.id),
+    });
+  // Retention is a monotonic accumulator. Local writes it during render because its
+  // state is a plain mutable object; here it lives in a store, so writing it inline
+  // would be a set() during render — React's cardinal sin. An effect keeps it out of the
+  // render pass, and because the map only ever grows toward a fixed point, the extra
+  // pass settles immediately instead of looping.
+  const retainedNext = nextRetainedStates(
+    threadFilter.retained,
+    threadsModel.groups,
+    threadFilter,
+    stateOf
+  );
+  useEffect(() => {
+    if (retainedNext !== threadFilter.retained && retainedNext.size !== threadFilter.retained.size) {
+      onSetThreadFilterRetained(retainedNext);
+    }
+  });
+
+  const filterView = selectThreadFilterView({
+    groups: threadsModel.groups,
+    filter: { ...threadFilter, retained: retainedNext },
+    stateOf,
+  });
+  const listChrome = composeListChrome(
+    // Remote has no search yet, so there is never an abnormal status to defer to.
+    { status: "ok", countLabel: threadsModel.countLabel, emptyMessage: threadsModel.emptyMessage },
+    filterView
+  );
+
   return h(
     "aside",
     {
@@ -1951,8 +2053,36 @@ function RemoteSidebar({
           height: 24,
         }),
         h("span", { className: "sidebar-brand-name" }, "Sealwire")
+      ),
+      h(
+        "div",
+        { className: "sidebar-top-actions" },
+        h(
+          "button",
+          {
+            className:
+              "header-button sidebar-bell-toggle" + (threadFilter.on ? " is-active" : ""),
+            id: "remote-sidebar-bell-toggle",
+            type: "button",
+            title: "Filter by activity",
+            "aria-label": "Filter by activity",
+            "aria-expanded": String(threadFilter.on),
+            onClick: () =>
+              onSetThreadFilter({ on: !threadFilter.on, states: [...THREAD_STATES] }),
+          },
+          h("span", {
+            className: "inline-icon",
+            "aria-hidden": "true",
+            dangerouslySetInnerHTML: { __html: BELL_SVG },
+          })
+        )
       )
     ),
+    h(RemoteActivityFilter, {
+      counts: filterView.counts,
+      filter: threadFilter,
+      onSetThreadFilter,
+    }),
     h(
       "div",
       { className: "sidebar-row" },
@@ -2050,7 +2180,7 @@ function RemoteSidebar({
       h(
         "div",
         { className: "sidebar-row" },
-        h("p", { className: "sidebar-caption", id: "remote-threads-count" }, threadsModel.countLabel),
+        h("p", { className: "sidebar-caption", id: "remote-threads-count" }, listChrome.countLabel),
         h(RefreshButton, {
           id: "remote-threads-refresh-button",
           label: "Refresh sessions",
@@ -2108,7 +2238,7 @@ function RemoteSidebar({
           // Both group kinds fold away — a project header carries its collapse
           // chevron alongside the rename/delete actions.
           collapsible: true,
-          emptyMessage: threadsModel.emptyMessage,
+          emptyMessage: listChrome.emptyMessage,
           expandedGroupCwds: threadListUi?.expandedGroupCwds || new Set(),
           formatThreadMeta(thread) {
             return formatRelativeTime(thread.updated_at);
@@ -2116,7 +2246,9 @@ function RemoteSidebar({
           // Same activity roll-up the local project headers show ("2 working" /
           // "1 needs input"). Attached here rather than in the render model because this
           // is where all three per-thread maps are in scope.
-          groups: attachProjectSummaries(threadsModel.groups, {
+          // `attachProjectSummaries` only decorates groups carrying a projectId, so the
+          // bell's state buckets pass through it untouched.
+          groups: attachProjectSummaries(filterView.groups, {
             threadActivity: threadActivityMap,
             threadAttention: threadAttentionMap,
             threadReviewing: threadReviewingSet,

@@ -5,6 +5,7 @@ import {
   loadLastEffort,
 } from "../shared/last-used-settings.js";
 import { loadDeviceLabel } from "./state.js";
+import { THREAD_STATES } from "../shared/thread-dot.js";
 import { notificationPermission } from "../shared/thread-notify.js";
 import { pushSupported } from "./push-subscribe.js";
 
@@ -52,10 +53,27 @@ export function createRemoteUiStore(initialState = {}) {
     pushPermission: notificationPermission(),
     pushSubscribed: false,
     sendPending: false,
+    // The bell. Same shape and rules as local's `state.threadFilter` — see
+    // shared/thread-filter.js — but held here because remote has no imperative `state`
+    // object. `retained` is a Map on purpose: thread ids are arbitrary strings.
+    threadFilter: { on: false, states: [...THREAD_STATES], retained: new Map() },
     sessionDraft: createDefaultSessionDraft(),
     sessionPanelOpen: false,
     sessionStartPending: false,
     ...initialState,
+    // Turning the bell on, or changing which states it covers, RESETS retention:
+    // carrying it across a deliberate change of selection would show rows the user just
+    // excluded.
+    setThreadFilter(next) {
+      set((state) => ({
+        threadFilter: { ...state.threadFilter, ...next, retained: new Map() },
+      }));
+    },
+    // The retention map is a monotonic accumulator recomputed each render, not a user
+    // action — kept off `setThreadFilter` so it cannot reset what it is accumulating.
+    setThreadFilterRetained(retained) {
+      set((state) => ({ threadFilter: { ...state.threadFilter, retained } }));
+    },
     clearComposerDraft() {
       set({
         composerDraft: "",

@@ -57,6 +57,7 @@
       "public-thread-interleaving",
       "remote-mobile-header",
       "remote-mobile-session-actions",
+      "remote-mobile-bell",
       "public-session-rename",
       "public-broker",
       "public-enrollment",
@@ -73,6 +74,7 @@
       "public-thread-interleaving",
       "remote-mobile-header",
       "remote-mobile-session-actions",
+      "remote-mobile-bell",
       "public-session-rename",
       "public-refresh",
       "public-thread-settings",
@@ -171,6 +173,15 @@
         "mobile-header",
         "mobile-layout",
         "transcript-scroll"
+      ]
+    },
+    "remote-mobile-bell": {
+      "script": "browser-remote-mobile-bell-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "static-remote",
+      "coverage": [
+        "activity-filter-mobile"
       ]
     },
     "remote-mobile-session-actions": {
