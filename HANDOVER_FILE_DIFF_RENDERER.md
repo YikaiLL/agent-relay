@@ -3,8 +3,9 @@
 Trigger: a one-character edit to `package-lock.json` rendered in the transcript as
 `−1395` with no additions — visually identical to the file having been deleted.
 
-Three commits landed on `main`. One defect is reproduced but **not fixed**; that is the
-work this handover exists for.
+Three commits landed on `main`. A fourth defect — one edited file drawing two cards — was
+reproduced later and is now fixed too; see [Duplicate file-change
+cards](#duplicate-file-change-cards-fixed).
 
 ---
 
@@ -76,84 +77,84 @@ disagreeing, which is the thing the jsdiff swap just removed.
 
 ---
 
-## Open — duplicate file-change cards
+## Duplicate file-change cards (fixed)
 
 **Symptom.** One edited file draws **two** stacked cards, both labelled with the same
-basename; one shows no +/− counts, the other shows the real ones. The group chip above
-them says "1 file change". The affected entry carries an Undo button.
+basename; one shows no +/− counts and reads "Diff unavailable for this file", the other
+shows the real diff. The group chip above them says "1 file change".
 
-**Reproduced.** `scripts/diag-file-diff-cards.mjs` (committed, diagnostic — not a test)
-drives the real local UI with the fake provider and a seeded transcript. Ladder:
+**Why one file has two spellings at all.** The worker deliberately puts both in one object
+(`claude-worker/file-diff.mjs`, `buildFileChange`): `path` stays ABSOLUTE (it is how the
+relay tells which worktree a thread has been writing in) while `patchHeaderPath` writes the
+patch header REPO-RELATIVE (what `git apply` requires). Anything that derives a path from
+the diff body and compares it to `path` as a raw string sees two files.
 
-| seed shape | rendered |
-|---|---|
-| one `fileChange`, `tool.path` and `file_changes[].path` both absolute | **1 card** ✅ |
-| the same, plus a `turnDiff` in the same turn | **1 card** ✅ (the turnDiff filter works) |
-| a `turnDiff` whose `file_changes` holds **both** the relative and the absolute spelling | **2 cards** ← the bug |
+**The producer — not where the first hunt looked.** No Rust `Vec<FileChangeDiffView>` ever
+holds both spellings; that is why instrumenting the runtime and the snapshot round trip
+found nothing. The mix is assembled at the very end, on a clone, at detail-serialization
+time:
 
-The third row matches the screenshot item for item:
+1. The snapshot strips diff bodies (`strip_file_change_diffs_for_transport`) and sets
+   `file_changes_omitted`, so expanding a file section auto-fetches the entry detail.
+2. `ThreadEntryDetailResponse::from_entry` runs `externalize_nested_file_change_diffs`
+   (`protocol.rs`), which **moves** the bodies onto `tool.diff` and **clears** the
+   per-change ones. The response therefore carries an absolute path with no diff beside a
+   patch whose header is relative.
+3. `getFileChanges` (`frontend/shared/file-change-diff.js`) merged `tool.file_changes` with
+   `parseFileChangesFromDiff(tool.diff)` keyed on `entry.path === normalized.path` → two
+   rows: the empty absolute one, then the real relative one.
 
-```
-groupChip: "··· 1 file change"      <- counted per distinct path, so it says 1
-sections:  ["package-lock.json",     <- empty diff, no counts
-            "package-lock.json"]     <- real diff, counts
-entry:     turn-diff:<turn>          <- a turnDiff, which is why Undo is present
-```
+A second, independent instance of the same mix: `read_thread_entries` returns entries with
+neither stripping nor externalizing, so a `fileChange` there carries `tool.diff` *and*
+`file_changes[0]` — also two rows, both with counts.
 
-**Root cause (rendering layer, confirmed).** `merge_file_change_view`
-(`crates/relay-server/src/file_changes.rs`) dedupes by **exact path-string equality**. The
-worker deliberately reports `path` as ABSOLUTE (it is how the relay tells which worktree a
-thread has been writing in) while `patchHeaderPath` writes the patch header
-REPO-RELATIVE (what `git apply` requires). When both sources feed one list, the same file
-arrives as two entries and `FileChangeDiff` draws a card per entry. The count is
-path-deduped, hence "1 file change" over 2 cards.
+**Intermittency.** `claude.rs read_thread` only passes `cwd` into the worker command when
+it has one; without it `patchHeaderPath` leaves the header ABSOLUTE and the two spellings
+match. Same thread, different reload, different card count.
 
-This surfaces when the group has no `fileChange` members and falls back to rendering the
-`turnDiff` (`frontend/shared/transcript-react.js`, the `fileChangeMembers.length ? … : …`
-line) — i.e. after the per-edit entries have been compacted away.
+**Fix — at the layer that mixes them, keyed on the root.** `fileChangePathKey(path, root)`
+canonicalizes a path against the session root; `mergeFileChangeLists` and `getFileChanges`
+take `options.currentCwd` (already threaded to the renderer as `transcriptOptions.currentCwd`
+and re-exposed on the tool as `display_options`), and the diff-group counters key their
+distinct-file set the same way, so one file spelled two ways is no longer counted — or
+summed — twice. The first-seen spelling keeps the display slot, which is the absolute one
+the entry actually carries.
 
-**What is NOT yet proven.** Which code path actually produces the mixed-spelling list on a
-**Claude** thread. The only transcript-side site that mixes keys is
-`build_turn_diff_entry_with_fallback` (`codex.rs`), whose `split_unified_diff_by_file`
-branch needs a non-empty `diff` — and both `claude.rs` call sites pass `None` or an
-`existing_diff` that reads back as `None`. So either there is a write to `turnDiff.diff`
-I did not find, or the affected thread carries data from an older build. The user confirms
-the thread was Claude, so something does produce it.
+**Do NOT loosen this to a suffix match.** With only the two strings, `x.js` and
+`/repo/deep/x.js` are indistinguishable from a genuine pair of same-named files in
+different directories. The root is what removes the guess; with no root the merge falls
+back to exact equality (today's behaviour), never a guess. A test pins that case.
 
-Ruled out along the way:
+**The key has to be equivalent to the producer, not merely "relative-ish".** The header is
+written by `path.relative` (`patchHeaderPath`), so the key resolves `.`/`..`, collapses
+duplicate separators, treats a root of `/` as a root, and compares Windows paths
+case-insensitively (`path.win32.relative` does; `path.posix.relative` does not). The first
+cut prefix-sliced the root off the string and left five ways for one file to key twice —
+each of which brought the empty card straight back. `frontend/shared/file-change-diff.test.mjs`
+checks the key against node's `path` rather than against hand-written strings, so the next
+edit to it has to stay equivalent to the thing that writes the header.
 
-- **Live path** — `tool_call_requested` sends `item_id: tool:${id}` and the result path
-  builds the same `tool:{id}`, so the upsert replaces rather than duplicating.
-- **Hydration path** — `toolEntryById` in `sdk-mapping.mjs` dedupes by the same key.
-- **`merge_tool_call_view`** — replaces `file_changes` wholesale, never concatenates.
-- **`~/.agent-relay/session.json`** — no tool anywhere carries a repeated basename
-  (transcripts are not stored there, so this only rules out half).
+**Deliberately NOT done: canonicalizing in Rust.** `merge_file_change_view`
+(`file_changes.rs`) still compares raw strings. It cannot produce this bug: Claude sets
+`tool.path` and `file_changes[].path` from the same string, both Claude turnDiff call sites
+pass a `diff` that reads back as `None` (the snapshot strips it), and Codex reports
+`changes[].path` repo-relative — the same namespace as its headers. Adding a root-keyed
+merge there would be a fix without a trigger, which is exactly what the previous round
+wrote and then reverted. Leave it until something proves it mixes.
 
-### Suggested next steps
+**Regression coverage.**
 
-1. **Defensive fix, independent of finding the producer.** Canonicalize the spelling
-   before merging, using the session root (`RelayState::current_cwd` / `thread_cwd`, and
-   `cwd_for_thread` on the two replay call sites — all already available). A first cut
-   plus three tests was written and then reverted for lack of a proven trigger; the
-   shape was:
-
-   ```rust
-   pub(crate) fn relativize_file_change_paths(
-       changes: &mut [FileChangeDiffView],
-       root: Option<&str>,
-   )
-   ```
-
-   **Do not loosen the match to a suffix test instead.** With only the two strings,
-   `x.js` and `/repo/sub/x.js` are indistinguishable from a genuine pair of same-named
-   files in different directories. The root is what removes the guess — one of the
-   reverted tests pinned exactly that case.
-
-2. **Keep hunting the producer.** Instrument `upsert_transcript_item` / the snapshot
-   round-trip for any write that leaves a Claude `turnDiff` with a non-empty `diff`.
-
-3. **Promote the diagnostic to a regression e2e** once the fix lands — it already
-   reproduces on demand; it needs assertions instead of `console.log`.
+- `frontend/shared/file-change-diff.test.mjs` — the key's equivalence to `path.relative`,
+  case by case, plus the merge outcome for each and the two must-not-merge guards
+  (same basename in different directories, POSIX case sensitivity).
+- `frontend/transcript-react.test.mjs` — one section for absolute-path + relative-header
+  (live shape), one for the externalized detail shape, one chip test (the doubled +/−
+  counts), and the same-basename guard that must stay two sections.
+- `scripts/browser-local-file-diff-cards-e2e.mjs` (`npm run test:browser:local-file-diff-cards`)
+  — the promoted diagnostic, now asserting. It drives the real relay + UI through
+  snapshot-strip → expand → detail fetch → render, which is the only place the two
+  spellings meet. Verified red before the fix (`2 !== 1`, page text identical to the
+  original screenshot) and green after.
 
 ---
 
@@ -166,7 +167,11 @@ Ruled out along the way:
 - **The recurring-bug taxonomy** (see the project memory note): family A is the
   algorithm/format layer, now closed by delegating to jsdiff. Family B is the
   capture/lifecycle layer — the re-read-disk root cause, provisional cards, patches lost
-  on reload. The duplicate-card bug above is family B. A diff library does not touch it.
+  on reload. The duplicate-card bug above is family B, and its lesson is the family's:
+  the defect was not in either representation but in the **seam** where two of them are
+  re-joined (here, an entry serializer that splits a change from its own body). When a
+  file-diff symptom appears at render time, look at the last hop before render, not at
+  the store.
 - **Untouched, not mine:** `scripts/browser-remote-mobile-session-actions-e2e.mjs` is
   modified in the working tree. It is a deliberately-red test awaiting its production CSS
   (project actions are hover-gated at `opacity: 0` and 24×24, with no

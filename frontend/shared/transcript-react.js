@@ -19,6 +19,7 @@ import {
   buildFileDisplayPathMap,
   diffStats,
   fileBasename,
+  fileChangePathKey,
   getFileChanges,
   parseUnifiedDiffRows,
 } from "./file-change-diff.js";
@@ -1605,12 +1606,15 @@ function groupExpandKey(group) {
   return firstId ? `group:${firstId}` : "";
 }
 
-function aggregateGroupDiffStats(group) {
+function aggregateGroupDiffStats(group, options = null) {
   let added = 0;
   let removed = 0;
   for (const entry of group?.entries || []) {
     const tool = entry?.tool || {};
-    const fileChanges = getFileChanges(tool);
+    // Counting walks the raw snapshot tools, which never carry `display_options`, so the
+    // session root has to be handed in — otherwise one file spelled two ways counts twice
+    // and its lines are summed twice with it.
+    const fileChanges = getFileChanges(tool, options);
     for (const change of fileChanges) {
       const stats = diffStats(change.diff);
       added += stats.added;
@@ -1627,7 +1631,7 @@ function aggregateGroupDiffStats(group) {
 // were omitted in a snapshot (in which case the fileChanges may still carry the
 // real diffs). Entries without a turn_id are counted directly. Also returns the
 // number of distinct changed files for the chip label.
-function aggregateDiffGroupStats(group) {
+function aggregateDiffGroupStats(group, options = null) {
   const entries = group?.entries || [];
   const turnsWithSummary = new Set();
   for (const entry of entries) {
@@ -1651,12 +1655,14 @@ function aggregateDiffGroupStats(group) {
     if (!isTurnDiff && entry?.turn_id && turnsWithSummary.has(entry.turn_id)) {
       continue;
     }
-    for (const change of getFileChanges(tool)) {
+    for (const change of getFileChanges(tool, options)) {
       const stats = diffStats(change.diff);
       added += stats.added;
       removed += stats.removed;
       if (change.path) {
-        files.add(change.path);
+        // Key by the same canonical form the merge uses, or the absolute spelling on one
+        // entry and the relative spelling on the next count as two changed files.
+        files.add(fileChangePathKey(change.path, options?.currentCwd || ""));
       }
     }
   }
@@ -1667,7 +1673,7 @@ function ToolGroupEntry({ group, options = null }) {
   const expandKey = groupExpandKey(group);
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
   const count = group?.entries?.length || 0;
-  const { added, removed } = aggregateGroupDiffStats(group);
+  const { added, removed } = aggregateGroupDiffStats(group, options);
   const label = `··· ${count} tool ${count === 1 ? "call" : "calls"}`;
 
   return h(
@@ -1759,7 +1765,7 @@ function turnDiffUndoAction(itemId, applyState) {
 function DiffGroupEntry({ group, options = null }) {
   const expandKey = groupExpandKey(group);
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
-  const { added, removed, fileCount } = aggregateDiffGroupStats(group);
+  const { added, removed, fileCount } = aggregateDiffGroupStats(group, options);
   // Prefer the distinct changed-file count. When no paths resolve (degenerate),
   // fall back to the number of edit cards — NOT entries.length, which would also
   // count the turnDiff summary (edits + 1) in a consolidated group.

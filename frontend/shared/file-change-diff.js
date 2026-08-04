@@ -161,8 +161,96 @@ export function mergeFileChangeDiff(existingDiff, incomingDiff) {
   return `${existing}\n${incoming}`;
 }
 
-export function mergeFileChangeLists(existingChanges, incomingChanges) {
+const WINDOWS_ROOT_PATTERN = /^[A-Za-z]:\//;
+const WINDOWS_DRIVE_PATTERN = /^[A-Za-z]:$/;
+
+// Split a path into resolved segments, the way `path.normalize` does: `.` dropped, `..`
+// popped, duplicate separators collapsed. An absolute path cannot climb above its own
+// root, so `..` there is discarded rather than kept.
+function splitResolvedSegments(value) {
+  const normalized = normalizePath(value);
+  const absolute = isAbsolutePath(normalized);
+  const windows = WINDOWS_ROOT_PATTERN.test(normalized);
+  const segments = [];
+  for (const raw of normalized.split("/")) {
+    if (!raw || raw === ".") {
+      continue;
+    }
+    if (raw === "..") {
+      const last = segments[segments.length - 1];
+      if (segments.length && last !== ".." && !WINDOWS_DRIVE_PATTERN.test(last)) {
+        segments.pop();
+      } else if (!absolute) {
+        segments.push("..");
+      }
+      continue;
+    }
+    segments.push(raw);
+  }
+  return { absolute, segments, windows };
+}
+
+function joinResolvedSegments({ absolute, segments, windows }) {
+  const joined = segments.join("/");
+  if (!absolute || windows) {
+    return joined;
+  }
+  return `/${joined}`;
+}
+
+// The tail of `target` below `base`, or null when `target` does not live under it. Windows
+// compares case-insensitively because `path.win32.relative` does; POSIX does not, because
+// `path.posix.relative` does not.
+function segmentsBelow(base, target) {
+  if (!base.absolute || !target.absolute || base.windows !== target.windows) {
+    return null;
+  }
+  if (target.segments.length <= base.segments.length) {
+    return null;
+  }
+  const fold = base.windows;
+  for (let index = 0; index < base.segments.length; index += 1) {
+    const from = base.segments[index];
+    const to = target.segments[index];
+    if (fold ? from.toLowerCase() !== to.toLowerCase() : from !== to) {
+      return null;
+    }
+  }
+  return target.segments.slice(base.segments.length).join("/");
+}
+
+// One file reaches the renderer spelled two ways: a change's `path` is ABSOLUTE (the
+// worker reports it that way so the relay can tell which worktree a thread wrote in)
+// while the patch header inside its diff is repo-RELATIVE (what `git apply` requires).
+// Keying on the raw strings made those two spellings two files, so a single edit drew two
+// stacked cards.
+//
+// The key must be EQUIVALENT to the producer, which is `path.relative` (see
+// `patchHeaderPath` in claude-worker/file-diff.mjs) — not merely prefix-slicing the root
+// off. Anywhere the arithmetic diverges the same file keys twice and the empty card comes
+// back: a root of `/`, a `.`/`..` segment, a doubled separator, a Windows path whose drive
+// or directory differs only in case. `frontend/shared/file-change-diff.test.mjs` pins the
+// key against node's `path` for exactly those.
+//
+// What it deliberately will NOT do is guess: with no root, or for a path that does not
+// live under it, the key stays the whole path and nothing merges. Matching on a path
+// SUFFIX instead would fold a root-level `x.js` into `deep/x.js`, which are two files.
+export function fileChangePathKey(path, root = "") {
+  const target = splitResolvedSegments(path);
+  if (!target.segments.length) {
+    return normalizePath(path);
+  }
+  const base = root ? splitResolvedSegments(root) : null;
+  const key = (base && segmentsBelow(base, target)) ?? joinResolvedSegments(target);
+  // A Windows path names the same file whatever the case, so the two spellings have to
+  // agree on it — including when one side arrives already relative.
+  return target.windows || base?.windows ? key.toLowerCase() : key;
+}
+
+export function mergeFileChangeLists(existingChanges, incomingChanges, options = null) {
+  const root = options?.currentCwd || "";
   const merged = [];
+  const indexByKey = new Map();
 
   function mergeOne(change) {
     const normalized = sanitizeFileChange(change);
@@ -170,12 +258,18 @@ export function mergeFileChangeLists(existingChanges, incomingChanges) {
       return;
     }
 
-    const existing = merged.find((entry) => entry.path === normalized.path);
-    if (!existing) {
+    // The first spelling wins the display slot: explicit changes are merged before
+    // diff-derived ones, so the card keeps the absolute path the entry actually carries
+    // (which the display map then shortens against the same root).
+    const key = fileChangePathKey(normalized.path, root);
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex === undefined) {
+      indexByKey.set(key, merged.length);
       merged.push({ ...normalized });
       return;
     }
 
+    const existing = merged[existingIndex];
     existing.diff = mergeFileChangeDiff(existing.diff, normalized.diff);
     if (existing.change_type === "update" && normalized.change_type !== "update") {
       existing.change_type = normalized.change_type;
@@ -288,13 +382,17 @@ export function parseFilePathsFromInputPreview(inputPreview) {
   return inputMatch[1].split("\n").map((path) => path.trim()).filter(Boolean);
 }
 
-export function getFileChanges(tool) {
+// `options.currentCwd` is the session root used to reconcile the two path spellings (see
+// fileChangePathKey). Callers that render through the transcript already carry it on the
+// tool as `display_options`; the explicit argument is for the ones that don't.
+export function getFileChanges(tool, options = null) {
+  const currentCwd = options?.currentCwd || tool?.display_options?.currentCwd || "";
   const explicitChanges = Array.isArray(tool?.file_changes)
     ? tool.file_changes.map(sanitizeFileChange).filter(Boolean)
     : [];
   const diffChanges = parseFileChangesFromDiff(tool?.diff);
   if (explicitChanges.length) {
-    const mergedChanges = mergeFileChangeLists(explicitChanges, diffChanges);
+    const mergedChanges = mergeFileChangeLists(explicitChanges, diffChanges, { currentCwd });
     if (!diffChanges.length && mergedChanges.length === 1 && !mergedChanges[0].diff && tool?.diff) {
       mergedChanges[0].diff = String(tool.diff);
     }

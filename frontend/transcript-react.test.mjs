@@ -969,6 +969,109 @@ test("renderEntryMarkup preserves absolute path outside current cwd", () => {
   assert.match(markup, /\/tmp\/outside-project\/file\.txt/);
 });
 
+// The worker reports `path` ABSOLUTE (it is how the relay tells which worktree a thread
+// wrote in) while the patch header is repo-RELATIVE (what `git apply` requires). Both
+// spellings of the same file reached the renderer, which matched them by exact string
+// and drew a card each: one edited file, two stacked sections.
+test("renderEntryMarkup draws one section when the worker path is absolute and the patch header is relative", () => {
+  const diff = [
+    "diff --git a/package-lock.json b/package-lock.json",
+    "--- a/package-lock.json",
+    "+++ b/package-lock.json",
+    "@@ -1,3 +1,3 @@",
+    " {",
+    '-  "lockfileVersion": 3,',
+    '+  "lockfileVersion": 4,',
+    " }",
+  ].join("\n");
+  const markup = renderEntryMarkup({
+    item_id: "fc-abs-header",
+    kind: "tool_call",
+    status: "completed",
+    tool: {
+      name: "Edit",
+      title: "Claude edited package-lock.json.",
+      item_type: "fileChange",
+      path: "/Users/luchi/git/agent-relay/package-lock.json",
+      diff,
+      file_changes: [
+        {
+          path: "/Users/luchi/git/agent-relay/package-lock.json",
+          change_type: "modify",
+          diff,
+        },
+      ],
+    },
+  }, {
+    currentCwd: "/Users/luchi/git/agent-relay",
+    expandedKeys: new Set(["entry:fc-abs-header"]),
+  });
+
+  assert.equal(markup.match(/class="diff-file-section"/g)?.length, 1);
+  assert.match(markup, /\+1/);
+  assert.match(markup, /-1/);
+});
+
+// The shape the detail fetch delivers: `externalize_nested_file_change_diffs` moves the
+// per-change bodies into `tool.diff` and clears them, leaving a path-only change spelled
+// absolute beside a patch spelled relative. Rendered as two sections, the counts landed on
+// one and the other read as an empty change.
+test("renderEntryMarkup folds an externalized patch onto its path-only file change", () => {
+  const markup = renderEntryMarkup({
+    item_id: "turn-diff:externalized",
+    kind: "tool_call",
+    status: "completed",
+    tool: {
+      name: "File summary",
+      title: "Claude changed package-lock.json in this turn.",
+      item_type: "turnDiff",
+      diff: "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1 +1 @@\n-old\n+new",
+      file_changes: [
+        {
+          path: "/Users/luchi/git/agent-relay/package-lock.json",
+          change_type: "modify",
+          diff: "",
+        },
+      ],
+    },
+  }, {
+    currentCwd: "/Users/luchi/git/agent-relay",
+    expandedKeys: new Set(["entry:turn-diff:externalized"]),
+  });
+
+  assert.equal(markup.match(/class="diff-file-section"/g)?.length, 1);
+  assert.match(markup, /\+1/);
+});
+
+// The guard on the fix above: `x.js` and `/repo/deep/x.js` are only the same file if the
+// root says so. Two genuinely different files that share a basename must stay two sections
+// — matching on a path suffix would silently merge them and lose one.
+test("renderEntryMarkup keeps same-named files in different directories apart", () => {
+  const markup = renderEntryMarkup({
+    item_id: "turn-diff:same-basename",
+    kind: "tool_call",
+    status: "completed",
+    tool: {
+      name: "File summary",
+      title: "Claude changed 2 files in this turn.",
+      item_type: "turnDiff",
+      diff: "diff --git a/x.js b/x.js\n--- a/x.js\n+++ b/x.js\n@@ -1 +1 @@\n-old\n+new",
+      file_changes: [
+        {
+          path: "/Users/luchi/git/agent-relay/deep/x.js",
+          change_type: "modify",
+          diff: "",
+        },
+      ],
+    },
+  }, {
+    currentCwd: "/Users/luchi/git/agent-relay",
+    expandedKeys: new Set(["entry:turn-diff:same-basename"]),
+  });
+
+  assert.equal(markup.match(/class="diff-file-section"/g)?.length, 2);
+});
+
 test("renderEntryMarkup shows expanded command detail and loading note when requested", () => {
   const expandedMarkup = renderEntryMarkup({
     item_id: "cmd-3",
@@ -1625,6 +1728,36 @@ test("TranscriptContent renders a collapsed diff-group chip with once-per-turn s
   assert.match(markup, /diff-group-chip-del">−1</);
   // Members (diff panels) do not render while the group is collapsed.
   assert.doesNotMatch(markup, /file-diff-panel/);
+});
+
+// Same defect as the duplicated sections, seen from the chip: counting the absolute path
+// and the relative patch header as two files also summed the one patch's lines twice.
+test("diff-group chip counts one file once when the path is absolute and the header relative", () => {
+  const diff = "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-foo\n+bar";
+  const fileChange = makeTool("fc-abs", {
+    tool: {
+      item_type: "fileChange",
+      name: "Edit",
+      diff,
+      file_changes: [{ path: "/repo/a.js", change_type: "update", diff }],
+    },
+    turn_id: "t9",
+  });
+  const turnDiff = makeTool("td-abs", {
+    tool: {
+      item_type: "turnDiff",
+      name: "File summary",
+      diff,
+      file_changes: [{ path: "/repo/a.js", change_type: "update", diff }],
+    },
+    turn_id: "t9",
+  });
+  const markup = renderTranscriptContentMarkup([fileChange, turnDiff], null, {
+    currentCwd: "/repo",
+  });
+  assert.match(markup, /··· 1 file change</);
+  assert.match(markup, /diff-group-chip-add">\+1</);
+  assert.match(markup, /diff-group-chip-del">−1</);
 });
 
 test("a turn editing several files collapses to ONE chip even with text between edits", () => {
