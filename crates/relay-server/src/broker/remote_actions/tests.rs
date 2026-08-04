@@ -1026,7 +1026,6 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
         projects: vec![crate::protocol::ProjectView {
             id: "proj-1".to_string(),
             name: "Sealwire".to_string(),
-            workspace_bindings: Vec::new(),
             instructions: None,
         }],
         thread_project_id,

@@ -722,17 +722,6 @@ impl RelayState {
         self.projects.get(project_id)
     }
 
-    /// The bound checkout cwd for a project on a given host, if recorded. Used as a
-    /// gap-filler when a session has no usable cwd of its own (see workspace_diff).
-    pub(crate) fn project_binding_cwd(&self, project_id: &str, host_id: &str) -> Option<String> {
-        self.projects
-            .get(project_id)?
-            .workspace_bindings
-            .iter()
-            .find(|binding| binding.host_id == host_id)
-            .map(|binding| binding.cwd.clone())
-    }
-
     /// All projects as a stable (name, then id) sorted list for clients.
     pub(crate) fn projects_view(&self) -> Vec<crate::protocol::ProjectView> {
         let mut projects: Vec<_> = self.projects.values().cloned().collect();
@@ -749,7 +738,6 @@ impl RelayState {
         let project = crate::protocol::ProjectView {
             id: id.clone(),
             name,
-            workspace_bindings: Vec::new(),
             instructions: None,
         };
         self.projects.insert(id, project.clone());
@@ -4177,7 +4165,7 @@ mod tests {
 
     #[test]
     fn projects_persist_round_trip_and_pre_projects_files_still_load() {
-        use crate::protocol::{ProjectView, WorkspaceBinding};
+        use crate::protocol::ProjectView;
 
         let mut relay = test_relay();
         relay.projects.insert(
@@ -4185,10 +4173,6 @@ mod tests {
             ProjectView {
                 id: "proj_a".to_string(),
                 name: "Sealwire".to_string(),
-                workspace_bindings: vec![WorkspaceBinding {
-                    host_id: "LOCAL".to_string(),
-                    cwd: "/srv/sealwire".to_string(),
-                }],
                 instructions: None,
             },
         );
@@ -4207,10 +4191,6 @@ mod tests {
             .project_for_thread("thread-1")
             .expect("thread-1 maps to its project");
         assert_eq!(project.name, "Sealwire");
-        assert_eq!(
-            restored.project_binding_cwd("proj_a", "LOCAL").as_deref(),
-            Some("/srv/sealwire"),
-        );
         assert!(restored.project_for_thread("unknown-thread").is_none());
 
         // Back-compat: a state file written before Projects (no keys) still loads,
@@ -4225,6 +4205,44 @@ mod tests {
         assert!(legacy.thread_project_id.is_empty());
     }
 
+    /// `ProjectView::workspace_bindings` was removed (a project is not bound to a
+    /// cwd). State files written before that removal still carry the key, so this
+    /// pins the one real risk of the deletion: they must load, not fail.
+    #[test]
+    fn state_files_carrying_the_removed_workspace_bindings_key_still_load() {
+        let mut relay = test_relay();
+        relay.projects.insert(
+            "proj_a".to_string(),
+            crate::protocol::ProjectView {
+                id: "proj_a".to_string(),
+                name: "Sealwire".to_string(),
+                instructions: None,
+            },
+        );
+        let persisted = PersistedRelayState::from_relay(&relay);
+
+        // Re-insert the legacy key exactly as an older build wrote it.
+        let mut value = serde_json::to_value(&persisted).expect("serialize");
+        value
+            .pointer_mut("/projects/proj_a")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the persisted project is an object")
+            .insert(
+                "workspace_bindings".to_string(),
+                serde_json::json!([{ "host_id": "LOCAL", "cwd": "/srv/sealwire" }]),
+            );
+
+        let legacy: PersistedRelayState = serde_json::from_value(value)
+            .expect("state files with the removed workspace_bindings key must still load");
+        assert_eq!(
+            legacy
+                .projects
+                .get("proj_a")
+                .map(|project| project.name.as_str()),
+            Some("Sealwire"),
+        );
+    }
+
     #[test]
     fn persisted_projects_restore_a_nonzero_revision_for_fresh_clients() {
         use crate::protocol::ProjectView;
@@ -4234,7 +4252,6 @@ mod tests {
             ProjectView {
                 id: "proj_a".to_string(),
                 name: "P".to_string(),
-                workspace_bindings: Vec::new(),
                 instructions: None,
             },
         );
@@ -4453,7 +4470,6 @@ mod tests {
             ProjectView {
                 id: "proj_a".to_string(),
                 name: "P".to_string(),
-                workspace_bindings: Vec::new(),
                 instructions: None,
             },
         );
