@@ -573,3 +573,74 @@ test("the input-reconstruction fallback also renders a relative header", async (
     `the fallback must not emit an absolute header; got:\n${change.diff.split("\n")[0]}`
   );
 });
+
+// A one-line edit to a long-but-small file (package-lock.json: ~6000 lines, 210KB) was
+// rendered as the whole file being deleted. Two guards compounded: the LCS cost cap
+// (lines * lines over MAX_LCS_CELLS) swapped the minimal diff for a whole-file
+// replacement — every old line `-` then every new line `+` — and the MAX_DIFF_LINES
+// truncation then cut the patch off before the first `+`, leaving -1395/+0. The cost cap
+// must be measured on the lines that actually differ, so an edit surrounded by thousands
+// of identical lines still diffs minimally.
+test("a one-line edit to a several-thousand-line file stays a one-line diff", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "lcs-big-"));
+  const abs = path.join(root, "package-lock.json");
+  const lines = Array.from({ length: 6000 }, (_, i) => `  "line-${i}": ${i},`);
+  const before = `${lines.join("\n")}\n`;
+  const after = `${before.replace('  "line-3000": 3000,', '  "line-3000": 3001,')}`;
+  await fs.writeFile(abs, before);
+
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Edit",
+    args: { file_path: abs, old_string: '"line-3000": 3000', new_string: '"line-3000": 3001' },
+  });
+  await fs.writeFile(abs, after);
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+
+  const diff = out.tool.file_changes[0].diff;
+  const removed = diff.split("\n").filter((l) => l.startsWith("-") && !l.startsWith("---"));
+  const added = diff.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++"));
+  assert.doesNotMatch(diff, /Diff truncated/, "a one-line edit must not overflow the line budget");
+  assert.deepEqual(removed, ['-  "line-3000": 3000,'], `expected one removed line, got ${removed.length}`);
+  assert.deepEqual(added, ['+  "line-3000": 3001,'], `expected one added line, got ${added.length}`);
+});
+
+// Even a genuine whole-file rewrite that overflows the line budget must not render as a
+// pure deletion. Truncating an all-removals-then-all-additions patch yields -N/+0, which
+// is indistinguishable in the UI from the file having been deleted.
+test("a truncated whole-file rewrite still shows additions, not a bare deletion", async () => {
+  const before = `${Array.from({ length: 6000 }, (_, i) => `old-${i}`).join("\n")}\n`;
+  const after = `${Array.from({ length: 6000 }, (_, i) => `new-${i}`).join("\n")}\n`;
+  const diff = await diffThroughTracker(before, after);
+
+  assert.ok(bodyLines(diff, "-").length > 0, "a rewrite removes lines");
+  assert.ok(
+    bodyLines(diff, "+").length > 0,
+    "a truncated rewrite must still show added lines, or it reads as a whole-file deletion"
+  );
+});
+
+function bodyLines(diff, sign) {
+  const marker = sign.repeat(3);
+  return diff.split("\n").filter((l) => l.startsWith(sign) && !l.startsWith(marker));
+}
+
+// Drives a before → after rewrite through the real tracker (Write, so the whole file is
+// replaced) and returns the rendered patch.
+async function diffThroughTracker(before, after) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "diff-render-"));
+  const abs = path.join(root, "f.txt");
+  await fs.writeFile(abs, before);
+  const tracker = createFileDiffTracker(root);
+  await tracker.capture({
+    type: "tool_call_requested",
+    id: "1",
+    name: "Write",
+    args: { file_path: abs, content: after },
+  });
+  await fs.writeFile(abs, after);
+  const out = await tracker.enrichResult({ type: "tool_call_result", id: "1", content: "ok" });
+  return out.tool.file_changes[0].diff;
+}

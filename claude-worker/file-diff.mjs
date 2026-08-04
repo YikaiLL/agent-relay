@@ -299,18 +299,12 @@ function renderFileDiff(filePath, oldContent, newContent, { oldExists = true, ne
   header.push(oldExists ? `--- a/${filePath}` : "--- /dev/null");
   header.push(newExists ? `+++ b/${filePath}` : "+++ /dev/null");
 
-  let body;
-  if (oldLines.length * newLines.length > MAX_LCS_CELLS) {
-    // Guard against pathological diff cost on very large files: fall back to a
-    // whole-file replacement (every old line removed, every new line added).
-    body = [
-      `@@ -${rangeHeader(oldLines.length, oldExists)} +${rangeHeader(newLines.length, newExists)} @@`,
-      ...oldLines.map((line) => `-${line}`),
-      ...newLines.map((line) => `+${line}`),
-    ];
-  } else {
-    body = buildUnifiedHunks(computeLineOps(oldLines, newLines));
-  }
+  // `null` ops means even the differing middle is too large to diff minimally, so the
+  // patch degrades to a whole-file replacement.
+  const ops = computeLineOps(oldLines, newLines);
+  const body = ops
+    ? buildUnifiedHunks(ops)
+    : replacementBody(oldLines, newLines, oldExists, newExists);
 
   // No line-level changes (e.g. only a trailing-newline difference) → no diff.
   if (!body.length) return "";
@@ -327,7 +321,68 @@ function renderFileDiff(filePath, oldContent, newContent, { oldExists = true, ne
 
 // Classic LCS line diff: returns an ordered list of {type, line} ops where type
 // is "equal" | "del" | "add". Compares lines with strict equality.
+//
+// The O(n*m) DP runs only over the lines that actually differ — a shared prefix and
+// suffix are peeled off first and re-emitted as `equal` ops. Skipping that peel is what
+// made a one-character edit to package-lock.json (5993 lines) price itself out of the
+// cost cap at 5993^2 ≈ 36M cells and degrade to a whole-file replacement, which the
+// line-budget truncation then cut off before the first `+`, rendering the edit as the
+// whole file being deleted.
+//
+// Returns null when even the differing middle is over MAX_LCS_CELLS, so the caller can
+// fall back instead of paying pathological time and memory (the DP allocates n*m
+// Int32s).
 function computeLineOps(oldLines, newLines) {
+  const shortest = Math.min(oldLines.length, newLines.length);
+  let head = 0;
+  while (head < shortest && oldLines[head] === newLines[head]) head += 1;
+  let tail = 0;
+  while (
+    tail < shortest - head &&
+    oldLines[oldLines.length - 1 - tail] === newLines[newLines.length - 1 - tail]
+  ) {
+    tail += 1;
+  }
+
+  const oldMid = oldLines.slice(head, oldLines.length - tail);
+  const newMid = newLines.slice(head, newLines.length - tail);
+  if (oldMid.length * newMid.length > MAX_LCS_CELLS) return null;
+
+  const ops = [];
+  for (let k = 0; k < head; k += 1) ops.push({ type: "equal", line: oldLines[k] });
+  for (const op of diffMiddle(oldMid, newMid)) ops.push(op);
+  for (let k = oldLines.length - tail; k < oldLines.length; k += 1) {
+    ops.push({ type: "equal", line: oldLines[k] });
+  }
+  return ops;
+}
+
+// Whole-file replacement, used only when the differing middle is still too large to diff
+// minimally. Removals and additions each get their own half of the line budget: emitting
+// every removal first lets the MAX_DIFF_LINES truncation cut the patch off before the
+// first `+`, which renders a rewrite as a whole-file deletion (-N/+0) — visually
+// identical to the file having been erased.
+function replacementBody(oldLines, newLines, oldExists, newExists) {
+  // Leaves room for the file header (up to 4 lines), the hunk header and both omission
+  // notes, so the outer truncation never has to cut this body.
+  const perSide = Math.floor((MAX_DIFF_LINES - 8) / 2);
+  return [
+    `@@ -${rangeHeader(oldLines.length, oldExists)} +${rangeHeader(newLines.length, newExists)} @@`,
+    ...budgetedSide(oldLines, "-", perSide),
+    ...budgetedSide(newLines, "+", perSide),
+  ];
+}
+
+function budgetedSide(lines, sign, limit) {
+  const shown = lines.slice(0, limit).map((line) => `${sign}${line}`);
+  if (lines.length > shown.length) {
+    const kind = sign === "-" ? "removed" : "added";
+    shown.push(`# ${lines.length - shown.length} ${kind} lines omitted by agent-relay`);
+  }
+  return shown;
+}
+
+function diffMiddle(oldLines, newLines) {
   const n = oldLines.length;
   const m = newLines.length;
   // dp[i][j] = length of the LCS of oldLines[i..] and newLines[j..].
