@@ -351,9 +351,10 @@ const state = {
   // fallbacks and the context-menu liveness check read them); a narrowed copy in there
   // would make every non-matching session look deleted. See shared/thread-search.js.
   threadSearch: { query: "", groups: [], loading: false, error: null, unavailableProviders: [] },
-  // The bell. `stickyIds` is the monotonic retention set: while the filter is on, a
-  // thread that has matched stays listed even after its state moves on, so a row cannot
-  // vanish from under the pointer because the agent answered. See shared/thread-filter.js.
+  // The bell. `retained` is the monotonic retention map (thread id → the state it was
+  // last seen in): while the filter is on, a thread that has matched stays listed even
+  // after its state moves on, so a row cannot vanish from under the pointer because the
+  // agent answered. See shared/thread-filter.js.
   threadFilter: { on: false, states: [...THREAD_STATES], retained: {} },
   projects: [],
   threadProjectId: {},
@@ -383,10 +384,6 @@ const state = {
   threadsPollTimer: null,
 };
 
-// Look a thread up by id across everything the user can currently SEE.
-//
-// A function declaration (not a const) so the lookup sites above it hoist correctly.
-// See `findVisibleThread` for why iteration must NOT use this.
 // Archive/delete remove a row from the authoritative list; the search slice holds its
 // own copy and has to be swept too.
 function dropThreadFromSearchResults(threadId) {
@@ -405,6 +402,10 @@ function dropThreadFromSearchResults(threadId) {
   };
 }
 
+// Look a thread up by id across everything the user can currently SEE.
+//
+// A function declaration (not a const) so the lookup sites above it hoist correctly.
+// See `findVisibleThread` for why iteration must NOT use this.
 function findVisible(threadId) {
   return findVisibleThread({ threads: state.threads, search: state.threadSearch }, threadId);
 }

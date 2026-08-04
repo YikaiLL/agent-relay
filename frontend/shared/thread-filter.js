@@ -36,6 +36,13 @@ function flattenThreads(groups) {
  * Drives the popover's per-state counts, so those must be computed BEFORE the filter is
  * applied — a pill reading "Working 3" has to keep saying 3 while you are looking at
  * only "Needs input", or the control cannot tell you what selecting it would give you.
+ *
+ * DELIBERATE DIVERGENCE: these count LIVE state, so they can disagree with what a bucket
+ * holds. A retained row that has gone stateless still sits in its last bucket but is
+ * counted nowhere, so "Done 0" above a visible Done row is reachable. Counting retained
+ * rows instead would make the pill stop answering "what would selecting this give me?",
+ * which is the only question it is useful for. The row itself is the tell: stateless
+ * means `selectThreadDot` returns null, so a kept row renders with no dot.
  */
 export function summarizeThreadStates(groups, stateOf) {
   const counts = { needs_input: 0, working: 0, reviewing: 0, completed: 0, total: 0 };
@@ -75,9 +82,18 @@ export function nextRetainedStates(previous, groups, filter, stateOf) {
   const states = selectedStates(filter);
   const next = { ...(previous || {}) };
   for (const thread of flattenThreads(groups)) {
-    const state = thread?.id ? stateOf(thread) : null;
-    if (state && states.includes(state)) {
-      next[thread.id] = state;
+    const id = thread?.id;
+    const state = id ? stateOf(thread) : null;
+    if (!state) {
+      continue;
+    }
+    // The selection gates ADMISSION only. Once a row is retained, every live state
+    // refreshes the memory — otherwise a row that moves to an UNSELECTED state keeps a
+    // stale one and, the moment it goes stateless, snaps back to a bucket it left long
+    // ago. Narrowed to "Needs input", answering a thread and letting it finish would
+    // file it back under "Needs input" with no dot at all.
+    if (id in next || states.includes(state)) {
+      next[id] = state;
     }
   }
   return next;
@@ -166,6 +182,33 @@ export function selectThreadFilterView({ groups = [], filter = null, stateOf = (
       ? "Nothing is running or waiting on you."
       : "No sessions in the selected states.",
   };
+}
+
+/**
+ * Reconcile the count line and empty-state copy of the two narrowing controls.
+ *
+ * They can both have something to say about the same list, and picking one wholesale
+ * produces a lie in either direction: take the search's count while the bell has
+ * filtered the rows and it claims sessions that are not on screen ("2 results · partial"
+ * over an empty list); take the bell's and an unreachable provider silently reads as an
+ * all-clear.
+ *
+ * So: the NUMBER always describes what is rendered, and the WARNING always survives.
+ * Loading and error are the exception — there the rows are stale or absent, so counting
+ * them would be counting nothing, and the search's own words are the honest ones.
+ */
+export function composeListChrome(listView, filterView) {
+  const status = listView?.status || "ok";
+  if (status === "loading" || status === "error" || !filterView?.filtering) {
+    return { countLabel: listView.countLabel, emptyMessage: listView.emptyMessage };
+  }
+  if (status === "partial") {
+    return {
+      countLabel: `${filterView.countLabel} · partial`,
+      emptyMessage: listView.emptyMessage,
+    };
+  }
+  return { countLabel: filterView.countLabel, emptyMessage: filterView.emptyMessage };
 }
 
 export { THREAD_STATES, THREAD_STATE_LABELS, selectThreadState };

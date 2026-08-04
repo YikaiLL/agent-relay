@@ -5,6 +5,7 @@ import { selectThreadDot, selectThreadState } from "./thread-dot.js";
 import {
   EMPTY_THREAD_FILTER,
   buildThreadStateGroups,
+  composeListChrome,
   isThreadFilterActive,
   nextRetainedStates,
   selectThreadFilterView,
@@ -191,6 +192,53 @@ test("a retained thread that goes fully idle keeps its last bucket", () => {
   );
 });
 
+// The two steps above pass individually and still hide this: the memory is only
+// refreshed while the live state is IN the selection, so a row that moves to an
+// UNSELECTED state keeps a stale memory. It renders correctly for as long as it has a
+// live state — and then snaps back to a bucket it left long ago the moment it goes
+// stateless. Narrowed to "Needs input", answering a thread and letting it finish put it
+// back under "Needs input" with no dot at all.
+test("a retained row remembers where it ACTUALLY was last, not where it joined", () => {
+  const filter = { ...ON, states: ["needs_input"] };
+  let retained = nextRetainedStates({}, GROUPS, filter, stateOf);
+  assert.deepEqual(retained, { needs: "needs_input" });
+
+  // 1. It moves to a state that is NOT selected.
+  const working = (thread) => (thread.id === "needs" ? "working" : stateOf(thread));
+  retained = nextRetainedStates(retained, GROUPS, filter, working);
+  assert.equal(
+    retained.needs,
+    "working",
+    "an already-retained row refreshes on any live state; the selection only gates ADMISSION"
+  );
+  assert.equal(
+    selectThreadFilterView({ groups: GROUPS, filter: { ...filter, retained }, stateOf: working })
+      .groups.find((g) => g.threads.some((t) => t.id === "needs")).state,
+    "working"
+  );
+
+  // 2. Then it loses its state entirely.
+  const gone = (thread) => (thread.id === "needs" ? null : stateOf(thread));
+  retained = nextRetainedStates(retained, GROUPS, filter, gone);
+  const view = selectThreadFilterView({
+    groups: GROUPS,
+    filter: { ...filter, retained },
+    stateOf: gone,
+  });
+  assert.equal(
+    view.groups.find((g) => g.threads.some((t) => t.id === "needs")).state,
+    "working",
+    "a stateless row must rest in the last bucket it was really in"
+  );
+});
+
+// Admission still respects the selection: an unselected state must not pull a NEW row in.
+test("a row is only admitted while its state is selected", () => {
+  const filter = { ...ON, states: ["needs_input"] };
+  const retained = nextRetainedStates({}, GROUPS, filter, stateOf);
+  assert.ok(!("work" in retained), "a working row is not retained by a needs_input filter");
+});
+
 test("a live state always wins over the remembered one", () => {
   const promoted = (thread) => (thread.id === "work" ? "needs_input" : stateOf(thread));
   const view = selectThreadFilterView({
@@ -255,4 +303,56 @@ test("an unknown state in the selection falls back to every state", () => {
 test("buildThreadStateGroups tolerates missing threads arrays", () => {
   assert.deepEqual(buildThreadStateGroups([{ key: "a", cwd: "a" }], { stateOf }), []);
   assert.deepEqual(buildThreadStateGroups(null, { stateOf }), []);
+});
+
+// --- the count line, where the search's status and the bell's narrowing meet ---------
+
+const listOk = { status: "ok", countLabel: "3 results", emptyMessage: "No sessions match “x”." };
+const listPartial = {
+  status: "partial",
+  countLabel: "2 results · partial",
+  emptyMessage: "Couldn’t search codex. Some sessions may be missing.",
+};
+const filterOff = { filtering: false };
+const filtered = (n) => ({
+  filtering: true,
+  countLabel: n === 1 ? "1 session" : `${n} sessions`,
+  emptyMessage: "No sessions in the selected states.",
+});
+
+test("with the bell off, the search speaks for itself", () => {
+  assert.deepEqual(composeListChrome(listOk, filterOff), {
+    countLabel: "3 results",
+    emptyMessage: "No sessions match “x”.",
+  });
+});
+
+test("with the bell on and nothing wrong, the count describes the filtered rows", () => {
+  assert.equal(composeListChrome(listOk, filtered(1)).countLabel, "1 session");
+});
+
+// The contradiction this exists to stop: the rendered groups are the BELL's, so a count
+// borrowed wholesale from the search claims rows that are not on screen — "2 results ·
+// partial" over an empty list. The warning has to survive; the number has to be true.
+test("partial + bell: the count follows the visible rows, the warning survives", () => {
+  const chrome = composeListChrome(listPartial, filtered(0));
+  assert.equal(chrome.countLabel, "0 sessions · partial");
+  assert.match(chrome.emptyMessage, /Couldn’t search codex/);
+
+  const some = composeListChrome(listPartial, filtered(1));
+  assert.equal(some.countLabel, "1 session · partial");
+});
+
+// Loading and error are different: the rows on screen are stale or absent, so a count of
+// them would be a count of nothing. The search's own words are the honest ones.
+test("loading and error keep the search's own label even with the bell on", () => {
+  const loading = { status: "loading", countLabel: "Searching…", emptyMessage: "Searching…" };
+  assert.equal(composeListChrome(loading, filtered(0)).countLabel, "Searching…");
+  const failed = {
+    status: "error",
+    countLabel: "Search failed",
+    emptyMessage: "Search failed: relay offline",
+  };
+  assert.equal(composeListChrome(failed, filtered(0)).countLabel, "Search failed");
+  assert.match(composeListChrome(failed, filtered(0)).emptyMessage, /relay offline/);
 });

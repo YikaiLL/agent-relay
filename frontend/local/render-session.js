@@ -52,6 +52,7 @@ import {
   selectThreadListView,
 } from "../shared/thread-search.js";
 import {
+  composeListChrome,
   isThreadFilterActive,
   nextRetainedStates,
   selectThreadFilterView,
@@ -1678,20 +1679,9 @@ export function createSessionRenderer({
     syncActivityFilterCounts(filterView.counts);
     const groups = filterView.groups;
 
-    // The bell narrows the RESULT; it has no opinion about whether the search that
-    // produced it is mid-flight, failed, or came back short a provider. Those states
-    // win, or an unreachable provider reads as "nothing is running" all over again.
-    const searchSpeaks = listView.status !== "ok";
-    const countLabel = searchSpeaks
-      ? listView.countLabel
-      : filterView.filtering
-        ? filterView.countLabel
-        : listView.countLabel;
-    const emptyMessage = searchSpeaks
-      ? listView.emptyMessage
-      : filterView.filtering
-        ? filterView.emptyMessage
-        : listView.emptyMessage;
+    // Both controls can have something to say about this list; composeListChrome keeps
+    // the count describing what is actually rendered while the search's warning survives.
+    const { countLabel, emptyMessage } = composeListChrome(listView, filterView);
 
     renderWorkspaceSuggestions(state.session);
     threadsCount.textContent = countLabel;
