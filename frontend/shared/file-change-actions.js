@@ -20,15 +20,32 @@ function headerLooksAbsolute(diff) {
   return typeof diff === "string" && diff !== "" && ABSOLUTE_HEADER.test(diff);
 }
 
+// The worker cuts a patch off at its line budget, which leaves the header intact while
+// the body stops early — git answers `corrupt patch at line N`. The marker is emitted by
+// our own renderer, so matching it beats re-implementing git's hunk arithmetic on this
+// path: the relay validates the actual `@@` counts wherever it ships a `can_apply`
+// verdict, which is every snapshot.
+const TRUNCATED_PATCH = /^# Diff truncated by agent-relay:/m;
+
+function patchWasTruncated(diff) {
+  return typeof diff === "string" && TRUNCATED_PATCH.test(diff);
+}
+
 export function canApplyPatch(tool) {
   if (!tool) return true;
   // The relay's verdict, computed while the diff was still present. Authoritative:
   // every snapshot drops diff bodies, so in the normal collapsed view there is nothing
   // here to inspect and guessing from an empty string would always say "fine".
   if (typeof tool.can_apply === "boolean") return tool.can_apply;
-  if (headerLooksAbsolute(tool.diff)) return false;
+  if (headerLooksAbsolute(tool.diff) || patchWasTruncated(tool.diff)) return false;
   const changes = Array.isArray(tool.file_changes) ? tool.file_changes : [];
-  if (changes.some((change) => headerLooksAbsolute(change?.diff))) return false;
+  if (
+    changes.some(
+      (change) => headerLooksAbsolute(change?.diff) || patchWasTruncated(change?.diff)
+    )
+  ) {
+    return false;
+  }
   // Nothing to inspect — a stripped diff body on a large transcript, or a summary that
   // never carried one. Do not hide a control that probably works: the relay still
   // rejects a bad patch with a visible error, which beats silently removing it.

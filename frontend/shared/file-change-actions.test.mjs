@@ -91,3 +91,31 @@ test("no verdict and no body stays enabled rather than guessing", () => {
   assert.equal(canApplyPatch({ diff: null, file_changes: [] }), true);
   assert.equal(canApplyPatch(null), true);
 });
+
+// On the authoritative read/detail paths there is no relay verdict, so this fallback is
+// what decides — and it only looked at the header. A patch the worker cut off at its line
+// budget keeps a perfectly good header while the body stops early, so Undo was offered
+// for something `git apply` refuses with `corrupt patch`. The truncation marker is our
+// own producer's, so a targeted check beats re-implementing git's hunk arithmetic here:
+// the relay already validates the counts on the path that carries the verdict.
+test("a truncated patch is not offered for Undo when there is no relay verdict", () => {
+  const truncated = [
+    "diff --git a/big.json b/big.json",
+    "--- a/big.json",
+    "+++ b/big.json",
+    "@@ -1,5993 +1,5993 @@",
+    "-line one",
+    "# Diff truncated by agent-relay: 10591 lines omitted",
+  ].join("\n");
+
+  assert.equal(
+    canApplyPatch({ diff: truncated, file_changes: [] }),
+    false,
+    "a truncated entry-level diff cannot be applied"
+  );
+  assert.equal(
+    canApplyPatch({ diff: null, file_changes: [{ path: "big.json", diff: truncated }] }),
+    false,
+    "a truncated per-file diff cannot be applied either"
+  );
+});

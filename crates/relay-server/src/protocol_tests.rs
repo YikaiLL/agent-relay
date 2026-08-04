@@ -2845,4 +2845,66 @@ mod can_apply_flag_tests {
             );
         }
     }
+
+    // A patch the worker truncated at its line budget keeps a perfectly well-formed
+    // header, so a header-only check calls it appliable and the UI offers Undo — then
+    // `git apply` answers `corrupt patch at line N`, because the hunk promised far more
+    // lines than the body carries. The verdict has to be computed from the body, not the
+    // header: count what each hunk actually delivers and compare it to what `@@` claims.
+    #[test]
+    fn stripping_marks_a_truncated_patch_as_not_appliable() {
+        let truncated = concat!(
+            "diff --git a/big.json b/big.json\n",
+            "--- a/big.json\n",
+            "+++ b/big.json\n",
+            "@@ -1,5993 +1,5993 @@\n",
+            "-line one\n",
+            "-line two\n",
+            "# Diff truncated by agent-relay: 10591 lines omitted\n",
+        );
+        let mut transcript = vec![turn_diff_entry(truncated)];
+        strip_file_change_diffs_for_snapshot(&mut transcript);
+        assert_eq!(
+            transcript[0].tool.as_ref().unwrap().can_apply,
+            Some(false),
+            "a truncated patch is corrupt to git, so Undo must not be offered"
+        );
+    }
+
+    // The counting must not over-reject the shapes git DOES accept: several hunks in one
+    // file, several files in one patch, and the `\ No newline at end of file` marker,
+    // which belongs to neither side's line count.
+    #[test]
+    fn stripping_keeps_well_formed_multi_hunk_patches_appliable() {
+        let ok = concat!(
+            "diff --git a/x.js b/x.js\n",
+            "--- a/x.js\n",
+            "+++ b/x.js\n",
+            "@@ -1,3 +1,3 @@\n",
+            " keep\n",
+            "-old\n",
+            "+new\n",
+            " tail\n",
+            "@@ -20,2 +20,3 @@\n",
+            " ctx\n",
+            "+added\n",
+            " end\n",
+            "diff --git a/y.txt b/y.txt\n",
+            "--- a/y.txt\n",
+            "+++ b/y.txt\n",
+            "@@ -1,2 +1,2 @@\n",
+            " a\n",
+            "-b\n",
+            "\\ No newline at end of file\n",
+            "+c\n",
+            "\\ No newline at end of file\n",
+        );
+        let mut transcript = vec![turn_diff_entry(ok)];
+        strip_file_change_diffs_for_snapshot(&mut transcript);
+        assert_eq!(
+            transcript[0].tool.as_ref().unwrap().can_apply,
+            Some(true),
+            "a valid multi-hunk, multi-file patch must stay appliable"
+        );
+    }
 }

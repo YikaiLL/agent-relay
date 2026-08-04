@@ -1624,10 +1624,18 @@ pub(crate) fn patch_for_apply(tool: &ToolCallView) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
-/// Whether a stored patch is one `git apply` will accept. Mirrors the three shapes the
-/// apply-path tests pin as rejected: an absolute path in the header (git: `invalid
+/// Whether a stored patch is one `git apply` will accept. Checks the header shapes the
+/// apply-path tests pin as rejected — an absolute path in the header (git: `invalid
 /// path`), a bare hunk with no header, and a `diff --git` line without the `---`/`+++`
-/// pair — the last of which reads as "has a header" but is still refused.
+/// pair — AND that every hunk delivers the number of lines its `@@` promises.
+///
+/// The body count is not pedantry: the worker truncates a patch at its line budget, which
+/// leaves the header perfectly well-formed while the body stops early. A header-only check
+/// called those appliable, so the UI offered Undo and `git apply` answered `corrupt patch
+/// at line N`. Deliberately still a pure, synchronous parse rather than `git apply
+/// --check`: this runs for every file-change entry each time a snapshot is serialized, so
+/// a subprocess per entry is not affordable — and the apply path itself already runs real
+/// git, which stays the authority on whether the patch lands.
 pub(crate) fn patch_is_appliable(diff: &str) -> bool {
     let diff = diff.trim();
     if diff.is_empty() {
@@ -1641,6 +1649,22 @@ pub(crate) fn patch_is_appliable(diff: &str) -> bool {
         absolute_target(rest) || (rest.starts_with('/') && rest != "/dev/null")
     }
 
+    /// `-a,b +c,d` from a `@@` header, as (old_lines, new_lines). A side with no comma
+    /// covers exactly one line, which is how git writes a single-line range.
+    fn hunk_counts(rest: &str) -> Option<(usize, usize)> {
+        fn side(value: &str, sign: char) -> Option<usize> {
+            let value = value.strip_prefix(sign)?;
+            match value.split_once(',') {
+                Some((_, count)) => count.parse().ok(),
+                None => Some(1),
+            }
+        }
+        let mut parts = rest.split_whitespace();
+        let old = side(parts.next()?, '-')?;
+        let new = side(parts.next()?, '+')?;
+        Some((old, new))
+    }
+
     // Validated per FILE SECTION, not once for the whole patch: a section that satisfies
     // nothing of its own still rides along on an earlier section's headers under a global
     // check, and git rejects it with `patch fragment without header`.
@@ -1648,9 +1672,16 @@ pub(crate) fn patch_is_appliable(diff: &str) -> bool {
     let mut has_old = false;
     let mut has_new = false;
     let mut section_open = false;
+    // Lines the hunk being read still owes, per its `@@` header. `None` between hunks —
+    // set back to `None` the moment both sides are satisfied, so a blank separator line
+    // between two joined file patches is not miscounted as context.
+    let mut owed: Option<(usize, usize)> = None;
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
+            if owed.is_some() {
+                return false;
+            }
             if section_open && !(has_old && has_new) {
                 return false;
             }
@@ -1661,6 +1692,29 @@ pub(crate) fn patch_is_appliable(diff: &str) -> bool {
             section_open = true;
             has_old = false;
             has_new = false;
+        } else if let Some(rest) = line.strip_prefix("@@ ") {
+            if owed.is_some() {
+                return false;
+            }
+            let Some((old, new)) = hunk_counts(rest) else {
+                return false;
+            };
+            owed = (old > 0 || new > 0).then_some((old, new));
+        } else if let Some((old, new)) = owed {
+            // Inside a hunk body. A `\` line is the no-newline marker and belongs to
+            // neither side's count; anything else while the hunk is still owed lines
+            // means the body ended early — exactly what truncation produces.
+            let counted = match line.chars().next() {
+                Some(' ') | None => (old.checked_sub(1), new.checked_sub(1)),
+                Some('-') => (old.checked_sub(1), Some(new)),
+                Some('+') => (Some(old), new.checked_sub(1)),
+                Some('\\') => (Some(old), Some(new)),
+                _ => return false,
+            };
+            let (Some(old), Some(new)) = counted else {
+                return false;
+            };
+            owed = (old > 0 || new > 0).then_some((old, new));
         } else if let Some(rest) = line.strip_prefix("--- ") {
             if bad_side(rest) {
                 return false;
@@ -1672,6 +1726,11 @@ pub(crate) fn patch_is_appliable(diff: &str) -> bool {
             }
             has_new = true;
         }
+    }
+
+    // A hunk still owing lines at the end of the patch is the truncated case.
+    if owed.is_some() {
+        return false;
     }
 
     // A headerless patch (a bare hunk) has no section at all; the final section must be
