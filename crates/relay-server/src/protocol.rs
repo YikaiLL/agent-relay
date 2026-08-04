@@ -2042,6 +2042,15 @@ pub struct ProviderStatusView {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadsResponse {
     pub threads: Vec<ThreadSummaryView>,
+    /// Providers whose listing call failed for this request.
+    ///
+    /// A failed provider is dropped from the merge and the request still succeeds, which
+    /// is right for the resting list (show what we have) and WRONG in silence for a
+    /// search: "0 results" is a positive claim that nothing matches, and a client cannot
+    /// tell it apart from "half the sessions were unreachable". Naming the casualties
+    /// lets the UI say "search may be incomplete" instead of "no matches".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2207,6 +2216,14 @@ pub struct ThreadsQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Title search. Absent/blank means "the normal list".
+    ///
+    /// This is a SERVER-side filter on purpose. `limit` truncates the list to the most
+    /// recent N, so a client-side filter could only ever search the page it was already
+    /// showing — and would silently report "no results" for the older sessions that are
+    /// the whole reason to search.
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

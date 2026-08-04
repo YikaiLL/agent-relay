@@ -33,6 +33,10 @@ import { providerLabel } from "../../shared/provider-labels.js";
 import { forkFieldsToPayload } from "../../shared/fork-fields.js";
 import { buildNavigationThreadGroups } from "../../shared/thread-groups.js";
 import {
+  EMPTY_THREAD_SEARCH,
+  normalizeThreadSearchQuery,
+} from "../../shared/thread-search.js";
+import {
   createThreadListQueryOptions,
   fetchThreadListFresh,
 } from "../../shared/thread-queries.js";
@@ -758,12 +762,24 @@ export function createLifecycleController(ctx) {
     renderSession(merged);
   }
 
-  async function fetchThreadList({ limit = 120 } = {}) {
+  /**
+   * The raw page, including which providers could not be listed.
+   *
+   * A failed provider is dropped from the merge and the request still returns 200, so
+   * "zero threads" and "half the providers were unreachable" arrive identically unless
+   * the caller reads this. That distinction only matters for search — where an empty
+   * answer reads as "that session does not exist" — but it is carried on both paths so
+   * there is one shape.
+   */
+  async function fetchThreadPage({ limit = 120, q = "" } = {}) {
     const url = new URL(
       "/api/threads",
       window.location.origin
     );
     url.searchParams.set("limit", String(limit));
+    if (q) {
+      url.searchParams.set("q", q);
+    }
 
     const response = await apiFetch(url);
     const payload = await response.json();
@@ -772,12 +788,79 @@ export function createLifecycleController(ctx) {
       throw new Error(payload?.error?.message || "Failed to load sessions");
     }
 
-    return payload.data?.threads || [];
+    return {
+      threads: payload.data?.threads || [],
+      unavailableProviders: payload.data?.unavailable_providers || [],
+    };
+  }
+
+  async function fetchThreadList(options = {}) {
+    return (await fetchThreadPage(options)).threads;
+  }
+
+  let threadSearchGeneration = 0;
+
+  /**
+   * Run a title search, or clear one when `rawQuery` is blank.
+   *
+   * Results land in `state.threadSearch` and NOWHERE else. Writing them into
+   * `state.threads` / `state.threadGroups` would be the tempting shortcut and a bad bug:
+   * those are the authoritative list that the 12s poll, tab restore, the delete/archive
+   * adjacent-session fallback and the context-menu liveness check all read. A narrowed
+   * copy would make every non-matching session look deleted to all of them.
+   */
+  async function searchThreads(rawQuery) {
+    const query = normalizeThreadSearchQuery(rawQuery);
+    const generation = ++threadSearchGeneration;
+
+    if (!query) {
+      // Clearing is not a fetch. Drop the results synchronously so the list snaps back
+      // to the authoritative one instead of flashing stale matches first.
+      state.threadSearch = { ...EMPTY_THREAD_SEARCH };
+      renderThreads();
+      return;
+    }
+
+    state.threadSearch = { ...state.threadSearch, query, loading: true, error: null };
+    renderThreads();
+
+    try {
+      // Deliberately NOT through the query cache: a per-keystroke cache key buys nothing
+      // (the input is already debounced) and would keep every abandoned query resident.
+      const { threads, unavailableProviders } = await fetchThreadPage({ limit: 120, q: query });
+      // A newer query started while this one was in flight. Same guard as loadThreads,
+      // and for the same reason: out-of-order answers would repaint results for a query
+      // the user has already typed past.
+      if (generation !== threadSearchGeneration) {
+        return;
+      }
+      state.threadSearch = {
+        query,
+        groups: buildNavigationThreadGroups(threads),
+        loading: false,
+        error: null,
+        unavailableProviders,
+      };
+      renderThreads();
+    } catch (error) {
+      if (generation !== threadSearchGeneration) {
+        return;
+      }
+      state.threadSearch = {
+        query,
+        groups: [],
+        loading: false,
+        error: error.message || "Search failed",
+        unavailableProviders: [],
+      };
+      renderThreads();
+    }
   }
 
   return {
     loadSession,
     loadThreads,
+    searchThreads,
     startSession,
     forkSession,
     resumeSession,

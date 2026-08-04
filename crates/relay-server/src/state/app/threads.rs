@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::protocol::ThreadSummaryView;
+
 /// Hard bounds on user-chosen session titles, for the same reason `project_action` has
 /// them: a paired device drives this path, and the map is persisted.
 ///
@@ -16,12 +18,75 @@ use super::*;
 pub(super) const MAX_THREAD_NAME_CHARS: usize = 96;
 const MAX_CUSTOM_THREAD_NAMES: usize = 10_000;
 
+/// How deep a title search scans before giving up.
+///
+/// `limit` is a PAGE size — what the sidebar shows at rest. A search must not honour it
+/// as its scan bound, or it could only ever find rows the sidebar was already showing:
+/// precisely the sessions nobody needs to search for. This bounds the scan instead;
+/// `limit` still caps what comes back.
+const SEARCH_SCAN_LIMIT: usize = 1_000;
+
+/// Normalize a raw `q` into a matchable needle, or `None` for "no search".
+///
+/// Blank and whitespace-only both mean "no search", so clearing the box restores the
+/// normal list rather than asking for every thread whose title contains "".
+/// The query is matched WHOLE, deliberately. Capping its length would make two different
+/// queries collide: the relay would answer for a prefix while the box still shows what
+/// the user typed, so the extra characters would look like they were silently ignored.
+/// (An earlier cap reasoned from `MAX_THREAD_NAME_CHARS`, which bounds user-set names —
+/// not previews, which are unbounded and are exactly what a long query matches against.)
+/// Query length is not the cost here; the provider scan is, and that is bounded
+/// separately by `SEARCH_SCAN_LIMIT`.
+fn normalize_thread_query(query: Option<&str>) -> Option<String> {
+    let trimmed = query?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed.to_lowercase())
+}
+
+/// The string the row actually SHOWS — which is what a search has to match.
+///
+/// Every surface renders `thread.name || thread.preview || shortId(id)`
+/// (`frontend/shared/thread-list-react.js`). Matching only `name` would leave a row that
+/// displays its preview — because the provider never titled it — impossible to search
+/// for while it sits visible in the list. The id is the third rung of that same ladder,
+/// and it is used ONLY when the first two are empty: the id is a fallback label, not a
+/// second searchable field, so a titled row never answers to a query that happens to
+/// look like its id.
+///
+/// `name` is already the user's rename when one exists: `apply_custom_thread_name`
+/// overlays it BEFORE this runs. That ordering is what makes a renamed session findable
+/// under its new title and not under the provider's old one.
+fn thread_display_title(thread: &ThreadSummaryView) -> &str {
+    match thread.name.as_deref() {
+        Some(name) if !name.is_empty() => name,
+        _ if !thread.preview.is_empty() => thread.preview.as_str(),
+        // The UI shows the first 8 characters; matching the whole id keeps those 8
+        // findable (they are a prefix) and also accepts a pasted full id.
+        _ => thread.id.as_str(),
+    }
+}
+
 impl AppState {
     pub async fn list_threads(
         &self,
         limit: usize,
         device_id: Option<String>,
     ) -> Result<ThreadsResponse, String> {
+        self.list_threads_matching(limit, device_id, None).await
+    }
+
+    /// `list_threads`, optionally narrowed to rows whose displayed title contains
+    /// `query` (case-insensitive).
+    pub async fn list_threads_matching(
+        &self,
+        limit: usize,
+        device_id: Option<String>,
+        query: Option<&str>,
+    ) -> Result<ThreadsResponse, String> {
+        let query = normalize_thread_query(query);
         // Read reviewer ids before the provider fetch so we can request a larger
         // page from each provider. If the newest N slots are all reviewer threads
         // we would return fewer than `limit` normal threads otherwise.
@@ -29,9 +94,21 @@ impl AppState {
             let relay = self.relay.read().await;
             relay.reviewer_thread_ids().len()
         };
-        let fetch_limit = limit.saturating_add(reviewer_count);
+        // A search asks each provider for a deep scan, because the row it is looking
+        // for is almost always one that fell off the end of a normal page.
+        let scan_limit = if query.is_some() {
+            SEARCH_SCAN_LIMIT.max(limit)
+        } else {
+            limit
+        };
+        let fetch_limit = scan_limit.saturating_add(reviewer_count);
 
         let mut all_threads = Vec::new();
+        // A provider that fails to list is dropped from the merge and the request still
+        // succeeds — right for the resting list, but it must not be SILENT. For a search
+        // the difference matters: an empty answer is otherwise read as "that session does
+        // not exist" when it means "we could not look".
+        let mut unavailable_providers = Vec::new();
         for (provider_name, bridge) in &self.providers {
             match bridge.list_threads(fetch_limit).await {
                 Ok(mut threads) => {
@@ -41,6 +118,7 @@ impl AppState {
                     all_threads.extend(threads);
                 }
                 Err(error) => {
+                    unavailable_providers.push(provider_name.clone());
                     self.push_runtime_log(
                         "warn",
                         format!("Failed to list {provider_name} threads: {error}"),
@@ -49,6 +127,8 @@ impl AppState {
                 }
             }
         }
+        // `self.providers` is a HashMap, so its iteration order is not stable.
+        unavailable_providers.sort();
         let mut relay = self.relay.write().await;
         let allowed_roots = relay.allowed_roots.clone();
         let device_scope = device_id
@@ -118,29 +198,54 @@ impl AppState {
             // re-applied here or a rename would last only until the next refresh.
             relay.apply_custom_thread_name(thread);
         }
+        // AFTER the rename overlay, so a renamed session is findable under the title it
+        // shows and not under the provider's superseded one. BEFORE `truncate`, which is
+        // the entire point: filtering the page would only search rows already on screen.
+        if let Some(needle) = &query {
+            threads.retain(|thread| thread_display_title(thread).to_lowercase().contains(needle));
+        }
         sort_threads_by_recency(&mut threads);
         threads.truncate(limit);
         let response_threads = threads.clone();
 
-        // The routing cache (relay.threads) must retain reviewer-thread rows even
-        // though they are filtered from the nav-visible response. `find_thread_provider`
-        // looks up threads by id in this cache, and a synthetic `claude-pending-…`
-        // reviewer is only there (not yet in the provider's own thread list), so
-        // losing its row would make it unroutable for `send_message_to_thread`.
-        // We preserve any reviewer rows that were already cached here.
-        let retained_reviewer_rows: Vec<_> = relay
-            .threads
-            .iter()
-            .filter(|cached| reviewer_ids.contains(&cached.id))
-            .cloned()
-            .collect();
-        let mut cached_threads = response_threads.clone();
-        cached_threads.extend(retained_reviewer_rows);
-        relay.threads = cached_threads;
+        if query.is_some() {
+            // A search is a NARROWED VIEW, not a new authoritative list. Assigning it to
+            // the routing cache would drop every non-matching thread from
+            // `find_thread_provider` — the sidebar would keep rendering those rows (the
+            // client holds its own copy) while sends to them started failing. Typing in a
+            // search box must not be able to break the session you are sitting in.
+            //
+            // Nor can the results simply be APPENDED to that cache: the next 12s poll
+            // reassigns the whole vector, so an appended hint survives about one poll and
+            // then the result the user is looking at stops opening. Hints live in their
+            // own map, which the authoritative rewrite cannot erase.
+            for thread in &response_threads {
+                relay.remember_search_routing_hint(thread);
+            }
+            // Deliberately no `notify()`. A search is one client narrowing its own view;
+            // waking every connected client per keystroke would be pure noise.
+        } else {
+            // The routing cache (relay.threads) must retain reviewer-thread rows even
+            // though they are filtered from the nav-visible response. `find_thread_provider`
+            // looks up threads by id in this cache, and a synthetic `claude-pending-…`
+            // reviewer is only there (not yet in the provider's own thread list), so
+            // losing its row would make it unroutable for `send_message_to_thread`.
+            // We preserve any reviewer rows that were already cached here.
+            let retained_reviewer_rows: Vec<_> = relay
+                .threads
+                .iter()
+                .filter(|cached| reviewer_ids.contains(&cached.id))
+                .cloned()
+                .collect();
+            let mut cached_threads = response_threads.clone();
+            cached_threads.extend(retained_reviewer_rows);
+            relay.threads = cached_threads;
 
-        relay.notify();
+            relay.notify();
+        }
         Ok(ThreadsResponse {
             threads: response_threads,
+            unavailable_providers,
         })
     }
 

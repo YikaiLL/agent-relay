@@ -4326,6 +4326,95 @@ input:focus, textarea:focus, select:focus {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Trailing icon group in the sidebar's top bar. `margin-left: auto` rather than a
+   spacer element so the brand keeps its own `min-width: 0` ellipsis behaviour. */
+.sidebar-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex: none;
+}
+.sidebar-search-toggle.is-active {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+/* Session title search. Sits directly under the top bar so the field is adjacent to
+   the icon that opened it, and above the list it narrows. */
+.sidebar-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+.sidebar-search[hidden] {
+  display: none;
+}
+/* One focus treatment, promoted to the wrapper. The global `input:focus-visible` rule
+   draws its ring with `box-shadow`, which would otherwise sit as a second, tighter
+   rectangle INSIDE this border. Moving it out keeps the a11y ring while the field reads
+   as a single control. */
+.sidebar-search:focus-within {
+  border-color: var(--border-prominent);
+  box-shadow: var(--focus-ring);
+}
+.sidebar-search-input:focus,
+.sidebar-search-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+  background: transparent;
+}
+.sidebar-search-glyph {
+  flex: none;
+  color: var(--text-tertiary);
+}
+.sidebar-search-glyph svg {
+  width: 14px;
+  height: 14px;
+}
+.sidebar-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-body);
+  padding: 7px 0;
+}
+.sidebar-search-input::placeholder {
+  color: var(--text-tertiary);
+}
+/* The type=search UA clear button duplicates ours and cannot be styled to match. */
+.sidebar-search-input::-webkit-search-cancel-button {
+  appearance: none;
+}
+.sidebar-search-clear {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.sidebar-search-clear:hover {
+  color: var(--text-primary);
+}
+.sidebar-search-clear svg {
+  width: 13px;
+  height: 13px;
+}
 .chat-header-leading {
   display: flex;
   align-items: center;

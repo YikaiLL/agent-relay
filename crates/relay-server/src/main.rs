@@ -648,7 +648,7 @@ async fn list_threads(
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     context
         .app
-        .list_threads(limit, None)
+        .list_threads_matching(limit, None, query.q.as_deref())
         .await
         .map(|threads| Json(ApiEnvelope::ok(threads)))
         .map_err(bad_gateway)

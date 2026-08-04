@@ -1605,6 +1605,7 @@ fn threads_response_compact_for_broker_limits_serialized_size() {
                 renamed: false,
             })
             .collect(),
+        unavailable_providers: Vec::new(),
     };
 
     let compacted = response.compact_for(ThreadsResponseCompactProfile::RemoteSurface);
@@ -1647,6 +1648,7 @@ fn threads_response_stays_in_budget_when_every_session_is_renamed() {
                 renamed: true,
             })
             .collect(),
+        unavailable_providers: Vec::new(),
     };
 
     let compacted = response.compact_for(ThreadsResponseCompactProfile::RemoteSurface);
@@ -1681,6 +1683,7 @@ fn threads_response_compact_for_local_web_is_less_aggressive() {
                 renamed: false,
             })
             .collect(),
+        unavailable_providers: Vec::new(),
     };
 
     let local = response
@@ -1713,6 +1716,7 @@ fn threads_response_compact_for_ios_surface_currently_reuses_remote_budget() {
                 renamed: false,
             })
             .collect(),
+        unavailable_providers: Vec::new(),
     };
 
     let ios = response

@@ -179,6 +179,7 @@ export function createSessionController({
     ensureConversationTranscript: controller.ensureConversationTranscript,
     loadSession: controller.loadSession,
     loadThreads: controller.loadThreads,
+    searchThreads: controller.searchThreads,
     maybeLoadOlderTranscript: controller.maybeLoadOlderTranscript,
     forkSession: controller.forkSession,
     resumeSession: controller.resumeSession,

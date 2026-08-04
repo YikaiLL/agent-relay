@@ -4,7 +4,7 @@ import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
-import { PLUS_SVG, CHEVRON_RIGHT_SVG, SETTINGS_SVG } from "../svg.js";
+import { PLUS_SVG, CHEVRON_RIGHT_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
 
 const h = React.createElement;
 
@@ -79,8 +79,28 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
           height: 24,
         }),
         h("span", { className: "sidebar-brand-name" }, "Sealwire")
+      ),
+      // Trailing actions. Search is a RELAY query, not a filter over the loaded rows —
+      // the list is truncated to the newest 120, so the session worth searching for is
+      // usually not in it. Wired imperatively in app.js by id.
+      h(
+        "div",
+        { className: "sidebar-top-actions" },
+        h(
+          "button",
+          {
+            className: "header-button sidebar-search-toggle",
+            id: "sidebar-search-toggle",
+            type: "button",
+            title: "Search sessions (⌘F)",
+            "aria-label": "Search sessions",
+            "aria-expanded": "false",
+          },
+          iconNode(SEARCH_SVG)
+        )
       )
     ),
+    h(SessionSearch),
     h(AuthForm),
     // Group the sidebar by cwd folders (Sessions) or by Project. Lifted to the top
     // of the sidebar to match the projects mockup; wired imperatively in app.js by id.
@@ -147,6 +167,36 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
       "aria-label": "Resize navigation panel",
       tabIndex: 0,
     })
+  );
+}
+
+// The search field. Always mounted and toggled with `hidden`, per the shell's rule that
+// nothing holding a `dom.js` handle may be conditionally rendered away.
+function SessionSearch() {
+  return h(
+    "div",
+    { className: "sidebar-search", id: "sidebar-search", hidden: true },
+    iconNode(SEARCH_SVG, "sidebar-search-glyph"),
+    h("input", {
+      autoComplete: "off",
+      className: "sidebar-search-input",
+      id: "sidebar-search-input",
+      placeholder: "Search session titles",
+      spellCheck: false,
+      type: "search",
+      "aria-label": "Search session titles",
+    }),
+    h(
+      "button",
+      {
+        className: "sidebar-search-clear",
+        id: "sidebar-search-clear",
+        type: "button",
+        title: "Clear search",
+        "aria-label": "Clear search",
+      },
+      iconNode(X_SVG)
+    )
   );
 }
 

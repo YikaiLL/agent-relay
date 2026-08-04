@@ -46,6 +46,11 @@ import {
 import { syncComposerError } from "./composer-error.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
+import {
+  findVisibleThread,
+  isThreadSearchActive,
+  selectThreadListView,
+} from "../shared/thread-search.js";
 import { canForkInSession } from "../shared/fork-fields.js";
 import {
   readActiveProjectId,
@@ -243,10 +248,15 @@ export function createSessionRenderer({
   startProjectAgent,
   openProjectContextMenu,
 }) {
+  // Look a thread up across everything the user can currently see — the authoritative
+  // list plus any search result from beyond it. Lookups only; see `findVisibleThread`.
+  const findVisible = (threadId) =>
+    findVisibleThread({ threads: state.threads, search: state.threadSearch }, threadId);
+
   // Notifications navigate locally; looking at a thread never resumes it.
   configureThreadNotifications({
     resolveThreadName: (threadId) => {
-      const thread = (state.threads || []).find((entry) => entry?.id === threadId);
+      const thread = findVisible(threadId);
       return thread ? thread.name || thread.preview || shortId(threadId) : null;
     },
     onActivateThread: (threadId) => {
@@ -1183,7 +1193,7 @@ export function createSessionRenderer({
       const activeThread = resolveActiveThread(session.active_thread_id);
       const requestedThread =
         resolveActiveThread(state.viewThreadId) ||
-        state.threads.find((thread) => thread.id === state.viewThreadId);
+        findVisible(state.viewThreadId);
 
       // Review/Code Flow briefly hands the active thread to hidden owned work. If
       // the user is sitting on the owned parent, keep the page calm instead of
@@ -1450,7 +1460,7 @@ export function createSessionRenderer({
     // since we're already inside renderThreads() and continue on to render the
     // list; then re-sync the local id so this pass doesn't highlight a ghost row.
     let openCtxThreadId = readThreadListContextMenu(state.threadListStore).threadId;
-    if (openCtxThreadId && !state.threads.some((entry) => entry.id === openCtxThreadId)) {
+    if (openCtxThreadId && !findVisible(openCtxThreadId)) {
       closeThreadContextMenu({ rerender: false });
       openCtxThreadId = readThreadListContextMenu(state.threadListStore).threadId;
     }
@@ -1459,7 +1469,12 @@ export function createSessionRenderer({
     // `state.threadGroups` stays the cwd grouping (the source of `state.threads`);
     // project groups are derived on the fly from the flat list + the fetched Projects.
     const viewMode = readThreadListViewMode(state.threadListStore);
-    const groupBy = viewMode === "projects" ? "project" : "cwd";
+    // A search cuts ACROSS the grouping mode. Leaving Projects mode in charge while a
+    // query is active would silently drop every result whose session has no project —
+    // the user would type a title they can see and be told it does not exist.
+    const searching = isThreadSearchActive(state.threadSearch);
+    const projectsMode = viewMode === "projects" && !searching;
+    const groupBy = projectsMode ? "project" : "cwd";
 
     // Fail closed: only render Project grouping when we hold a payload we can vouch
     // for as CURRENT. Bail to a placeholder not just on error or before the first
@@ -1468,7 +1483,7 @@ export function createSessionRenderer({
     // prior membership as if it were current, and a failing retry would oscillate
     // stale grouping back in. A successful fetch is the only state that renders groups.
     if (
-      viewMode === "projects" &&
+      projectsMode &&
       (state.projectsError || !state.projectsLoaded || state.projectsLoading)
     ) {
       renderWorkspaceSuggestions(state.session);
@@ -1491,7 +1506,7 @@ export function createSessionRenderer({
     // The main-area card overview is retired from view but deliberately NOT deleted —
     // its pin/order prefs are reused by these rows, and the card layout may come back
     // for another purpose.
-    if (viewMode === "projects") {
+    if (projectsMode) {
       const activeProjectId = readActiveProjectId(state.threadListStore);
       const activity = buildThreadActivityMap(state.session);
       const attention = threadAttention.snapshotMap();
@@ -1614,11 +1629,20 @@ export function createSessionRenderer({
       return;
     }
 
-    const groups = state.threadGroups || [];
+    // Searching swaps the SOURCE of the rows, not the row renderer: a result behaves
+    // exactly like the same session listed at rest (same dots, same click/right-click).
+    const listView = selectThreadListView({
+      threadGroups: state.threadGroups || [],
+      search: state.threadSearch,
+      groupBy,
+    });
+    const groups = listView.groups;
 
     renderWorkspaceSuggestions(state.session);
-    threadsCount.textContent = summarizeThreadGroups(groups, { groupBy });
-    threadsCount.title = groups.map((group) => group.cwd || group.label).join("\n");
+    threadsCount.textContent = listView.countLabel;
+    threadsCount.title = listView.searching
+      ? listView.countLabel
+      : groups.map((group) => group.cwd || group.label).join("\n");
 
     renderReactContent(
       threadsList,
@@ -1629,8 +1653,10 @@ export function createSessionRenderer({
         // mode. The header click still sets the active workspace — see
         // ThreadGroupHeader's collapsible branch.
         collapsible: true,
-        collapsedGroupCwds: threadListUi.collapsedGroupCwds || new Set(),
-        emptyMessage: "Start or open a session to build workspace groups.",
+        collapsedGroupCwds: listView.collapseGroups
+          ? threadListUi.collapsedGroupCwds || new Set()
+          : new Set(),
+        emptyMessage: listView.emptyMessage,
         expandedGroupCwds: threadListUi.expandedGroupCwds || new Set(),
         formatThreadMeta(thread) {
           return formatRelativeTime(thread.updated_at);

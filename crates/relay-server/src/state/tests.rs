@@ -321,6 +321,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         models: None,
         threads: Some(ThreadsResponse {
             threads: vec![test_thread("thread-1", "/tmp/project")],
+            unavailable_providers: Vec::new(),
         }),
         thread_entries: None,
         thread_entry_detail: None,

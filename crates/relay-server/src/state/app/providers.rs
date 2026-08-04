@@ -125,6 +125,17 @@ impl AppState {
                     return Ok((name.as_str(), bridge));
                 }
             }
+            // A thread the user reached through SEARCH is typically older than the newest
+            // page, so it is absent from `relay.threads` and from the 200-row probe
+            // below. Its hint is kept out of `relay.threads` precisely so a routine
+            // refresh cannot erase it — see `RelayState::search_routing_hints`.
+            if let Some(hint) = relay.search_routing_hint(thread_id) {
+                for candidate in [&hint.provider, &hint.source, &hint.model_provider] {
+                    if let Some((name, bridge)) = self.providers.get_key_value(candidate) {
+                        return Ok((name.as_str(), bridge));
+                    }
+                }
+            }
         }
         // Fall back to probing each provider's thread list
         for (name, bridge) in &self.providers {

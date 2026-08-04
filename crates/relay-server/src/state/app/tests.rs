@@ -3279,6 +3279,9 @@ got {}",
         // Fault injection for the first turn of a freshly-created thread, which
         // is where an image-bearing fork sends its whole payload.
         start_turn_should_fail: Arc<AtomicBool>,
+        // Models a provider that is down: `list_threads` errors, and the merge is
+        // expected to carry on with the remaining providers rather than failing.
+        list_threads_should_fail: Arc<AtomicBool>,
     }
 
     impl RecordingProvider {
@@ -3306,6 +3309,7 @@ got {}",
                 native_fork: Arc::new(AtomicBool::new(false)),
                 consumes_initial_prompt: Arc::new(AtomicBool::new(false)),
                 start_turn_should_fail: Arc::new(AtomicBool::new(false)),
+                list_threads_should_fail: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -3329,6 +3333,9 @@ got {}",
     #[async_trait::async_trait]
     impl ProviderBridge for RecordingProvider {
         async fn list_threads(&self, limit: usize) -> Result<Vec<ThreadSummaryView>, String> {
+            if self.list_threads_should_fail.load(Ordering::Relaxed) {
+                return Err(format!("{} thread/list failed", self.name));
+            }
             let hidden = self.hidden_from_list.lock().await;
             let mut threads = self
                 .threads
@@ -8313,6 +8320,444 @@ got {}",
         .await
         .expect("claude resolves \"default\" and should start successfully");
         assert_eq!(claude_provider.models_seen().await, vec!["default"]);
+    }
+    /// Seed `count` listable threads on a provider, newest first, and return the id of
+    /// the OLDEST one — the row that a `limit`-sized page can never reach.
+    async fn seed_listable_threads(
+        provider: &RecordingProvider,
+        cwd: &str,
+        count: usize,
+        oldest_name: &str,
+    ) -> String {
+        let mut threads = provider.threads.lock().await;
+        let mut oldest_id = String::new();
+        for index in 0..count {
+            let id = format!("seeded-thread-{index}");
+            let is_oldest = index + 1 == count;
+            let mut summary = ThreadSummaryView {
+                id: id.clone(),
+                name: Some(format!("Routine session {index}")),
+                preview: String::new(),
+                cwd: cwd.to_string(),
+                // Descending, so `index` doubles as "how far down the list".
+                updated_at: (count - index) as u64 * 100,
+                source: "codex".to_string(),
+                status: "idle".to_string(),
+                model_provider: "codex".to_string(),
+                provider: "codex".to_string(),
+                forked_from: None,
+                renamed: false,
+            };
+            if is_oldest {
+                summary.name = Some(oldest_name.to_string());
+                oldest_id = id.clone();
+            }
+            threads.insert(id, summary);
+        }
+        oldest_id
+    }
+
+    /// A thread the user found by searching must stay OPENABLE, not just visible.
+    ///
+    /// `list_threads` doubles as the writer of `relay.threads`, and the client re-polls
+    /// it every 12s. So any routing knowledge a search leaves in that vector is erased
+    /// within one poll — while the result stays on screen, because the client holds its
+    /// own copy. `find_thread_provider`'s last resort only probes the newest 200 per
+    /// provider, so a result ranked beyond that then fails with "not found on any
+    /// provider": the user clicks the session search just showed them and it does not
+    /// open. Routing hints therefore must NOT live in the list that gets rewritten.
+    #[tokio::test]
+    async fn searched_threads_stay_routable_across_a_normal_refresh() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        // Deeper than the 200-row fallback probe, so the cache is the ONLY thing that
+        // can route this id.
+        let buried_id = seed_listable_threads(&codex, &cwd, 300, "Refactor the auth guard").await;
+
+        let found = app
+            .list_threads_matching(20, None, Some("auth guard"))
+            .await
+            .expect("search");
+        assert_eq!(
+            found.threads.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            vec![&buried_id],
+            "precondition: the search must surface the buried thread"
+        );
+        app.find_thread_provider(&buried_id)
+            .await
+            .expect("a freshly searched thread must be routable");
+
+        // The 12s poll. This is the ordinary case, not an edge case.
+        app.list_threads(120, None).await.expect("normal refresh");
+
+        let (provider, _bridge) = app
+            .find_thread_provider(&buried_id)
+            .await
+            .expect("a searched thread must survive the next normal refresh");
+        assert_eq!(provider, "codex");
+    }
+
+    /// THE reason this feature is server-side.
+    ///
+    /// The list is truncated to `limit` before a client ever sees it, so a client-side
+    /// filter can only search the page it is already showing. The session you actually
+    /// need to find is, by definition, the one that scrolled off. If this test fails,
+    /// search has silently degraded to "filter the visible rows" and will report "no
+    /// results" for sessions that exist.
+    #[tokio::test]
+    async fn thread_search_scans_past_the_page_limit() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        let buried_id = seed_listable_threads(&codex, &cwd, 150, "Refactor the auth guard").await;
+
+        // Precondition: a normal page genuinely cannot see it.
+        let page = app.list_threads(20, None).await.expect("list");
+        assert_eq!(
+            page.threads.len(),
+            20,
+            "precondition: the page must be full"
+        );
+        assert!(
+            !page.threads.iter().any(|thread| thread.id == buried_id),
+            "precondition: the target must be buried past the page limit"
+        );
+
+        let found = app
+            .list_threads_matching(20, None, Some("auth guard"))
+            .await
+            .expect("search");
+        assert!(
+            found.threads.iter().any(|thread| thread.id == buried_id),
+            "search must look past `limit`, not filter the page it would have returned"
+        );
+        assert_eq!(
+            found.threads.len(),
+            1,
+            "only the matching row may come back, got {:?}",
+            found.threads.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Search must match what the row SHOWS. After a rename that is the user's title,
+    /// and the provider's old auto-title must stop being findable — otherwise renaming
+    /// a session leaves a second, invisible name that still answers to search.
+    #[tokio::test]
+    async fn thread_search_matches_the_rename_not_the_provider_title() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+        })
+        .await
+        .expect("start_session");
+
+        let listed = app.list_threads(50, None).await.expect("list");
+        let thread_id = listed.threads[0].id.clone();
+        assert_eq!(
+            listed.threads[0].name,
+            Some("Fake E2E Session".to_string()),
+            "precondition: the provider must be supplying a title to override"
+        );
+
+        app.rename_thread(
+            &thread_id,
+            RenameThreadInput {
+                name: Some("Auth work".to_string()),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("rename");
+
+        // Case-insensitive, and finds the user's title.
+        let found = app
+            .list_threads_matching(50, None, Some("auth WORK"))
+            .await
+            .expect("search");
+        assert_eq!(
+            found.threads.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            vec![&thread_id],
+            "the renamed title must be searchable, case-insensitively"
+        );
+
+        let stale = app
+            .list_threads_matching(50, None, Some("Fake E2E"))
+            .await
+            .expect("search");
+        assert!(
+            stale.threads.is_empty(),
+            "the overridden provider title must not stay searchable behind the rename"
+        );
+    }
+
+    /// A thread the provider never titled renders its PREVIEW. Searching only `name`
+    /// would leave that row visible in the list but impossible to search for.
+    #[tokio::test]
+    async fn thread_search_matches_the_preview_when_there_is_no_title() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(
+                "untitled".to_string(),
+                ThreadSummaryView {
+                    id: "untitled".to_string(),
+                    name: None,
+                    preview: "fix the scroll jitter".to_string(),
+                    cwd: cwd.clone(),
+                    updated_at: 500,
+                    source: "codex".to_string(),
+                    status: "idle".to_string(),
+                    model_provider: "codex".to_string(),
+                    provider: "codex".to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+            );
+            // A titled neighbour, so "found it" cannot be satisfied by returning
+            // everything.
+            threads.insert(
+                "titled".to_string(),
+                ThreadSummaryView {
+                    id: "titled".to_string(),
+                    name: Some("Something else entirely".to_string()),
+                    preview: "unrelated".to_string(),
+                    cwd: cwd.clone(),
+                    updated_at: 400,
+                    source: "codex".to_string(),
+                    status: "idle".to_string(),
+                    model_provider: "codex".to_string(),
+                    provider: "codex".to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+            );
+        }
+
+        let found = app
+            .list_threads_matching(20, None, Some("scroll jitter"))
+            .await
+            .expect("search");
+        assert_eq!(
+            found.threads.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            vec!["untitled"],
+            "a row displaying its preview must be findable by that preview"
+        );
+    }
+
+    /// A search is a NARROWED VIEW, not a new authoritative list.
+    ///
+    /// `list_threads` doubles as the writer of `relay.threads`, the routing cache
+    /// `find_thread_provider` reads. If a search overwrote it, every thread that did not
+    /// match would stop being routable — the sidebar would keep rendering those rows
+    /// (the client holds its own copy) while sends to them began failing. Typing in a
+    /// search box must not be able to break the session you are sitting in.
+    #[tokio::test]
+    async fn thread_search_does_not_evict_the_routing_cache() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+        app.list_threads(20, None).await.expect("list");
+        assert_eq!(
+            app.relay.read().await.threads.len(),
+            3,
+            "precondition: the unfiltered list must populate the routing cache"
+        );
+
+        let found = app
+            .list_threads_matching(20, None, Some("auth guard"))
+            .await
+            .expect("search");
+        assert_eq!(found.threads.len(), 1, "the response must be narrowed");
+
+        let cached = app.relay.read().await;
+        assert_eq!(
+            cached.threads.len(),
+            3,
+            "a search must not strip non-matching threads from the routing cache"
+        );
+    }
+
+    /// "No results" is a positive claim that nothing matches. A provider that failed to
+    /// list is dropped from the merge and the request still succeeds — so without naming
+    /// it, an unreachable Codex/Claude is indistinguishable from an empty search, and the
+    /// user concludes a session they own does not exist.
+    #[tokio::test]
+    async fn thread_search_reports_providers_it_could_not_reach() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&claude, &cwd, 2, "Claude auth guard").await;
+        codex
+            .list_threads_should_fail
+            .store(true, Ordering::Relaxed);
+
+        let found = app
+            .list_threads_matching(20, None, Some("auth guard"))
+            .await
+            .expect("a partial listing must still succeed");
+        assert_eq!(
+            found.unavailable_providers,
+            vec!["codex".to_string()],
+            "the failed provider must be named so the UI can say 'incomplete', not 'none'"
+        );
+
+        // And the resting list carries the same signal — it has always silently dropped
+        // a failed provider too.
+        let listed = app.list_threads(20, None).await.expect("list");
+        assert_eq!(listed.unavailable_providers, vec!["codex".to_string()]);
+
+        codex
+            .list_threads_should_fail
+            .store(false, Ordering::Relaxed);
+        let recovered = app.list_threads(20, None).await.expect("list");
+        assert!(
+            recovered.unavailable_providers.is_empty(),
+            "the signal must clear once the provider answers again"
+        );
+    }
+
+    /// A thread with neither a title nor a preview renders the first 8 characters of its
+    /// id (`thread-list-react.js`'s `shortId`). Searching only name+preview leaves that
+    /// row visible and unfindable by the only text it shows.
+    #[tokio::test]
+    async fn thread_search_matches_the_id_a_blank_row_falls_back_to() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(
+                "abcd1234-blank".to_string(),
+                ThreadSummaryView {
+                    id: "abcd1234-blank".to_string(),
+                    name: None,
+                    preview: String::new(),
+                    cwd: cwd.clone(),
+                    updated_at: 500,
+                    source: "codex".to_string(),
+                    status: "idle".to_string(),
+                    model_provider: "codex".to_string(),
+                    provider: "codex".to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+            );
+        }
+        seed_listable_threads(&codex, &cwd, 2, "Something else").await;
+
+        // Exactly the 8 characters the row displays.
+        let found = app
+            .list_threads_matching(20, None, Some("abcd1234"))
+            .await
+            .expect("search");
+        assert_eq!(
+            found.threads.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            vec!["abcd1234-blank"],
+            "a blank row must be findable by the id it displays"
+        );
+
+        // A titled row must NOT be reachable by its id: the id is a fallback, not a
+        // second searchable field, or every query would risk hitting unrelated rows.
+        let by_id = app
+            .list_threads_matching(20, None, Some("seeded-thread-0"))
+            .await
+            .expect("search");
+        assert!(
+            by_id.threads.is_empty(),
+            "the id is only searchable for rows that actually display it"
+        );
+    }
+
+    /// A query must be matched WHOLE. Truncating it makes two different queries collide:
+    /// the relay answers for a prefix while the box still shows what the user typed, so
+    /// the extra characters look like they were simply ignored.
+    #[tokio::test]
+    async fn thread_search_matches_the_whole_query_however_long() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        // Previews are not bounded by MAX_THREAD_NAME_CHARS, so a long needle is a real
+        // thing to match against — the old 96-char cap was reasoning from the wrong field.
+        let prefix = "a".repeat(120);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(
+                "long".to_string(),
+                ThreadSummaryView {
+                    id: "long".to_string(),
+                    name: None,
+                    preview: format!("{prefix}TAIL"),
+                    cwd: cwd.clone(),
+                    updated_at: 500,
+                    source: "codex".to_string(),
+                    status: "idle".to_string(),
+                    model_provider: "codex".to_string(),
+                    provider: "codex".to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+            );
+        }
+
+        let hit = app
+            .list_threads_matching(20, None, Some(&format!("{prefix}TAIL")))
+            .await
+            .expect("search");
+        assert_eq!(hit.threads.len(), 1, "the full query must still match");
+
+        let miss = app
+            .list_threads_matching(20, None, Some(&format!("{prefix}NOPE")))
+            .await
+            .expect("search");
+        assert!(
+            miss.threads.is_empty(),
+            "a query differing only past character 96 must not be treated as the same query"
+        );
+    }
+
+    /// Clearing the box restores the normal list, rather than asking for every thread
+    /// whose title contains the empty string.
+    #[tokio::test]
+    async fn thread_search_treats_a_blank_query_as_no_search() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+
+        for blank in ["", "   "] {
+            let listed = app
+                .list_threads_matching(20, None, Some(blank))
+                .await
+                .expect("search");
+            assert_eq!(
+                listed.threads.len(),
+                3,
+                "a blank query ({blank:?}) must behave as no query at all"
+            );
+        }
     }
 }
 

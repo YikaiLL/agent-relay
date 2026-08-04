@@ -93,6 +93,7 @@ fn make_threads() -> ThreadsResponse {
                 renamed: false,
             })
             .collect(),
+        unavailable_providers: Vec::new(),
     }
 }
 

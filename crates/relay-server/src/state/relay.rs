@@ -6,7 +6,7 @@ mod push;
 mod runtime;
 mod transcript;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
@@ -43,6 +43,11 @@ pub(crate) use self::transcript::TranscriptRecord;
 
 const REMOTE_ACTION_REPLAY_TTL_SECS: u64 = 600;
 const MAX_REMOTE_ACTION_REPLAY_ENTRIES: usize = 512;
+/// Backstop on remembered search routing hints. This grows with how much a user
+/// searches, not with time, and the oldest hint is the least likely to be clicked next —
+/// so a plain insertion-order FIFO is enough. Comfortably above `SEARCH_SCAN_LIMIT`'s
+/// single-query yield, so one broad search cannot evict its own results.
+const MAX_SEARCH_ROUTING_HINTS: usize = 2_000;
 /// Backstop on retained review jobs so a long-lived relay can't accumulate every
 /// recap/review body in memory. Terminal jobs otherwise persist until the user
 /// deletes them (the Reviewer panel is a persistent surface), so this cap — not
@@ -308,6 +313,21 @@ pub struct RelayState {
     pub pending_claim_challenges: HashMap<String, ClaimChallenge>,
     pub pending_broker_messages: Vec<BrokerPendingMessage>,
     pub threads: Vec<ThreadSummaryView>,
+    /// Provider routing for threads a SEARCH surfaced from beyond the normal page.
+    ///
+    /// This cannot live in `threads`: that vector is the nav-visible list and is
+    /// wholesale REASSIGNED by every `list_threads` call, which the client re-polls every
+    /// 12s. A hint parked there survives one poll, after which the row is still on the
+    /// user's screen (they hold their own copy) but `find_thread_provider` can no longer
+    /// place it — and its last-resort probe only reads the newest 200 per provider. The
+    /// user clicks the session search just showed them and gets "not found on any
+    /// provider". Keeping hints in their own map means the authoritative rewrite cannot
+    /// erase them.
+    ///
+    /// Insertion-ordered and capped: this grows with what a user searches for, never
+    /// with time, and the oldest hint is the least likely to be clicked next.
+    search_routing_hints: HashMap<String, ThreadSummaryView>,
+    search_routing_hint_order: VecDeque<String>,
     locally_deleted_thread_ids: HashSet<String>,
     pub pending_approvals: HashMap<String, PendingApproval>,
     pub pending_ask_user_questions: HashMap<String, PendingAskUserQuestion>,
@@ -422,6 +442,8 @@ impl RelayState {
             pending_claim_challenges: HashMap::new(),
             pending_broker_messages: Vec::new(),
             threads: Vec::new(),
+            search_routing_hints: HashMap::new(),
+            search_routing_hint_order: VecDeque::new(),
             locally_deleted_thread_ids: HashSet::new(),
             pending_approvals: HashMap::new(),
             pending_ask_user_questions: HashMap::new(),
@@ -870,6 +892,41 @@ impl RelayState {
                 thread.renamed = true;
             }
             None => thread.renamed = false,
+        }
+    }
+
+    /// Remember how to route a thread a search surfaced from beyond the normal page.
+    ///
+    /// Called only from the search path. See the field's doc for why this is not simply
+    /// pushed into `threads`.
+    pub(super) fn remember_search_routing_hint(&mut self, thread: &ThreadSummaryView) {
+        if thread.id.is_empty() {
+            return;
+        }
+        if self
+            .search_routing_hints
+            .insert(thread.id.clone(), thread.clone())
+            .is_none()
+        {
+            self.search_routing_hint_order.push_back(thread.id.clone());
+        }
+        while self.search_routing_hint_order.len() > MAX_SEARCH_ROUTING_HINTS {
+            if let Some(evicted) = self.search_routing_hint_order.pop_front() {
+                self.search_routing_hints.remove(&evicted);
+            }
+        }
+    }
+
+    /// Routing hint for a searched thread, if we still hold one.
+    pub(super) fn search_routing_hint(&self, thread_id: &str) -> Option<&ThreadSummaryView> {
+        self.search_routing_hints.get(thread_id)
+    }
+
+    /// Drop a hint when the thread goes away, so an archived/deleted id cannot be routed
+    /// back to life by a stale search result.
+    pub(super) fn forget_search_routing_hint(&mut self, thread_id: &str) {
+        if self.search_routing_hints.remove(thread_id).is_some() {
+            self.search_routing_hint_order.retain(|id| id != thread_id);
         }
     }
 
@@ -3039,6 +3096,9 @@ impl RelayState {
         // forever and wait to be inherited by a reused id. It joins the two persisted
         // per-thread maps this function already clears, rather than being a special case.
         self.thread_custom_name.remove(thread_id);
+        // Same reasoning: a hint left behind would keep an archived/deleted session
+        // routable from a stale search result the client still has on screen.
+        self.forget_search_routing_hint(thread_id);
         self.runtimes.remove(thread_id);
         self.drop_pending_requests_for_thread(thread_id);
         self.threads.len() != before_len

@@ -141,6 +141,7 @@ import { openSessionStream, sessionStreamUrl } from "./session-stream.js";
 import {
   buildNavigationThreadGroups,
 } from "./shared/thread-groups.js";
+import { findThreadInSearchResults, findVisibleThread } from "./shared/thread-search.js";
 import {
   createThreadListStore,
   readActiveProjectId,
@@ -343,6 +344,11 @@ const state = {
     fields: null,
   },
   threadGroups: [],
+  // Title-search results, held SEPARATELY from `state.threads`/`state.threadGroups`.
+  // Those two are the authoritative list (the poll rewrites them; tab restore, delete
+  // fallbacks and the context-menu liveness check read them); a narrowed copy in there
+  // would make every non-matching session look deleted. See shared/thread-search.js.
+  threadSearch: { query: "", groups: [], loading: false, error: null, unavailableProviders: [] },
   projects: [],
   threadProjectId: {},
   projectsLoading: false,
@@ -370,6 +376,14 @@ const state = {
   threads: [],
   threadsPollTimer: null,
 };
+
+// Look a thread up by id across everything the user can currently SEE.
+//
+// A function declaration (not a const) so the lookup sites above it hoist correctly.
+// See `findVisibleThread` for why iteration must NOT use this.
+function findVisible(threadId) {
+  return findVisibleThread({ threads: state.threads, search: state.threadSearch }, threadId);
+}
 
 const sessionViewStore = createSessionViewStore({
   initialLocation: {
@@ -674,6 +688,14 @@ function refreshThreadsIfRenamedElsewhere() {
   // `fresh`: a deduped response could predate the rename that triggered this, and the
   // revision is already consumed, so a stale title would stick until the next poll.
   void loadThreads("session renamed", { fresh: true });
+  // Search results are a separate snapshot, so refreshing only the authoritative list
+  // would leave the rows actually ON SCREEN showing the old title — the rename would
+  // look like it did nothing. Only on this known-mutation signal, not on the 12s poll:
+  // a search must not turn into a second polling loop.
+  const activeQuery = state.threadSearch?.query;
+  if (activeQuery) {
+    void searchThreads(activeQuery);
+  }
 }
 
 function refreshWorkspaceDiffIfChanged() {
@@ -911,7 +933,7 @@ renderer.renderSession = function wrappedRenderSession(session) {
   );
   if (viewedThreadWasLive) {
     const summary =
-      (state.threads || []).find((thread) => thread?.id === state.viewThreadId) || null;
+      findVisible(state.viewThreadId);
     state.viewOnlyThread = buildViewOnlyPin({
       threadId: state.viewThreadId,
       priorEntries: previousLiveSession.transcript || [],
@@ -975,7 +997,7 @@ async function loadViewOnlyTranscript(threadId) {
   const reviewSig = review ? viewOnlyReviewSignature(session, threadId) : null;
   // The viewed thread's own metadata (workspace + provider), so the projection
   // shows them instead of the live thread's for a cross-workspace saved thread.
-  const summary = (state.threads || []).find((thread) => thread?.id === threadId) || null;
+  const summary = findVisible(threadId);
   const cwd = summary?.cwd ?? null;
   const provider = summary?.provider ?? null;
   const prior = state.viewOnlyThread?.threadId === threadId ? state.viewOnlyThread : null;
@@ -1196,7 +1218,7 @@ function maybeRefreshViewOnly(session) {
   // blank metadata until then).
   const metaPin = state.viewOnlyThread;
   if (metaPin && (metaPin.cwd == null || metaPin.provider == null)) {
-    const summary = (state.threads || []).find((thread) => thread?.id === metaPin.threadId) || null;
+    const summary = findVisible(metaPin.threadId);
     if (summary && (summary.cwd != null || summary.provider != null)) {
       state.viewOnlyThread = {
         ...metaPin,
@@ -1275,6 +1297,7 @@ const {
   forkSession,
   loadSession,
   loadThreads,
+  searchThreads,
   resumeSession,
   revokeOtherDevices,
   revokePairedDevice,
@@ -1451,6 +1474,88 @@ threadsViewSessionsButton?.addEventListener("click", () => {
 });
 threadsViewProjectsButton?.addEventListener("click", () => {
   void setThreadViewMode("projects");
+});
+
+// ---------------------------------------------------------------------------
+// Session title search
+// ---------------------------------------------------------------------------
+
+const sidebarSearchToggle = document.getElementById("sidebar-search-toggle");
+const sidebarSearch = document.getElementById("sidebar-search");
+const sidebarSearchInput = document.getElementById("sidebar-search-input");
+const sidebarSearchClear = document.getElementById("sidebar-search-clear");
+
+// Each keystroke is a relay round trip, so coalesce a burst of typing into one. Short
+// enough to feel live, long enough that a word costs one request rather than five.
+const SEARCH_DEBOUNCE_MS = 180;
+let searchDebounceTimer = null;
+
+function runSearch(query) {
+  window.clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = null;
+  void searchThreads(query);
+}
+
+function queueSearch(query) {
+  window.clearTimeout(searchDebounceTimer);
+  // Clearing is not a query — apply it immediately so the list snaps back rather than
+  // sitting on stale matches for another debounce window.
+  if (!query.trim()) {
+    runSearch("");
+    return;
+  }
+  searchDebounceTimer = window.setTimeout(() => runSearch(query), SEARCH_DEBOUNCE_MS);
+}
+
+function setSearchOpen(open, { focus = true } = {}) {
+  if (!sidebarSearch || !sidebarSearchInput) {
+    return;
+  }
+  sidebarSearch.hidden = !open;
+  sidebarSearchToggle?.setAttribute("aria-expanded", String(open));
+  sidebarSearchToggle?.classList.toggle("is-active", open);
+  if (open) {
+    if (focus) {
+      sidebarSearchInput.focus();
+      sidebarSearchInput.select();
+    }
+    return;
+  }
+  // Closing must also clear: a hidden field still filtering the list is a sidebar that
+  // looks like it lost sessions, with the reason off screen.
+  sidebarSearchInput.value = "";
+  runSearch("");
+}
+
+sidebarSearchToggle?.addEventListener("click", () => {
+  setSearchOpen(Boolean(sidebarSearch?.hidden));
+});
+
+sidebarSearchInput?.addEventListener("input", (event) => {
+  queueSearch(event.target.value);
+});
+
+sidebarSearchInput?.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    setSearchOpen(false);
+  }
+});
+
+sidebarSearchClear?.addEventListener("click", () => {
+  if (!sidebarSearchInput) {
+    return;
+  }
+  sidebarSearchInput.value = "";
+  runSearch("");
+  sidebarSearchInput.focus();
+});
+
+window.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+    event.preventDefault();
+    setSearchOpen(true);
+  }
 });
 
 // Prompt for a Project name (trimmed; null aborts). Native prompt mirrors the
@@ -3089,7 +3194,7 @@ function resolveActiveThread(threadId) {
     return null;
   }
 
-  return state.threads.find((thread) => thread.id === threadId) || null;
+  return findVisible(threadId);
 }
 
 function renderForkSessionDialog() {
@@ -3331,10 +3436,7 @@ function openThreadContextMenu(threadId, clientX, clientY) {
   if (forkThreadButton) {
     // Background threads can be mid-turn too, and the relay rejects those as
     // well — gate on the same rule the server uses, not just "is active".
-    const contextThread =
-      resolveActiveThread(threadId)
-      || state.threads.find((entry) => entry.id === threadId)
-      || null;
+    const contextThread = resolveActiveThread(threadId);
     const forkBlocked = threadIsBusy(contextThread);
     forkThreadButton.disabled = forkBlocked;
     forkThreadButton.textContent = forkBlocked
@@ -3430,7 +3532,7 @@ async function renameThreadById(threadId, rawName) {
   if (!threadId) {
     return;
   }
-  const thread = state.threads.find((entry) => entry.id === threadId);
+  const thread = findVisible(threadId);
   const next = normalizeThreadName(rawName);
   // Compare against the OVERRIDE, never the displayed title. Typing the agent's current
   // title on a session that has no override is a REAL action — it pins that title
@@ -3444,10 +3546,14 @@ async function renameThreadById(threadId, rawName) {
   // causes makes us refetch too, so the row object can be replaced between the
   // optimistic write and the receipt.
   const applyName = (value) => {
+    // Every copy the user can see, not just the first match: while a search is open
+    // the same session has a row in BOTH slices, and renaming only one leaves the
+    // visible list showing the old title until the query is re-run.
     applyRenameToRow(
-      state.threads.find((entry) => entry.id === threadId),
+      (state.threads || []).find((entry) => entry.id === threadId),
       value
     );
+    applyRenameToRow(findThreadInSearchResults(state.threadSearch, threadId), value);
     state.threadGroups = buildNavigationThreadGroups(state.threads);
     renderThreads();
     renderSessionTabs();
@@ -3481,8 +3587,7 @@ async function renameThreadFromContextMenu() {
   if (!threadId) {
     return;
   }
-  const thread =
-    resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
+  const thread = resolveActiveThread(threadId);
   const current = threadNameDraft(thread, shortId(threadId));
   const answer = window.prompt(
     "Rename this session.\n\nLeave it blank to go back to the name the agent picked.",
@@ -3503,7 +3608,7 @@ async function archiveThreadFromContextMenu() {
     return;
   }
 
-  const thread = resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
+  const thread = resolveActiveThread(threadId);
   const wasViewed = state.viewThreadId === threadId;
   const fallbackThreadId = wasViewed ? findAdjacentThreadId(threadId) : null;
   const title = thread?.name || thread?.preview || shortId(threadId);
@@ -3571,7 +3676,7 @@ async function deleteThreadFromContextMenu() {
     return;
   }
 
-  const thread = resolveActiveThread(threadId) || state.threads.find((entry) => entry.id === threadId);
+  const thread = resolveActiveThread(threadId);
   const wasViewed = state.viewThreadId === threadId;
   const fallbackThreadId = wasViewed ? findAdjacentThreadId(threadId) : null;
   const title = thread?.name || thread?.preview || shortId(threadId);
@@ -3987,7 +4092,7 @@ let sessionTabsRootHandle = null;
 let sessionTabsRootElement = null;
 
 function resolveTabThread(threadId) {
-  const thread = (state.threads || []).find((entry) => entry.id === threadId);
+  const thread = findVisible(threadId);
   if (!thread) {
     // A tab can outlive its thread (deleted elsewhere, or a stale stored
     // workspace); label it rather than rendering a blank tab.
