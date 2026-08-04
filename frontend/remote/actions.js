@@ -19,7 +19,6 @@ import {
 import {
   applyRemoteSurfacePatch,
   createClaimLifecyclePatch,
-  createRemoteThreadsPatch,
 } from "./surface-state.js";
 import { sendBrokerFrame } from "./broker-client.js";
 
@@ -455,9 +454,12 @@ function handleRemoteActionResult(actionId, result) {
       onApplySessionSnapshot(result.snapshot);
     }
 
-    if (result.threads?.threads) {
-      applyRemoteSurfacePatch(createRemoteThreadsPatch(result.threads.threads));
-    }
+    // Deliberately NOT patching `state.threads` here. `list_threads` is the only action
+    // that returns a list, and its normal caller (`refreshRemoteThreads`) already writes
+    // it behind a generation guard — so this was redundant there and actively wrong for
+    // a SEARCH, whose narrowed answer would replace the authoritative list until the
+    // next poll. Who owns the list is a caller's decision, not a side effect of the
+    // frame arriving.
   } catch (error) {
     console.error("[agent-relay] remote action result side effects failed", error);
   }

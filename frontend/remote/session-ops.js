@@ -1266,9 +1266,22 @@ let remoteThreadSearchGeneration = 0;
  * Results land in `state.threadSearch` and NOWHERE else: `state.threads` stays the
  * authoritative list that the poll, the render model and every id lookup read.
  */
+export function cancelRemoteThreadSearch() {
+  // Bumping the generation is what makes an in-flight answer land nowhere. Without it a
+  // request issued against relay A resolves after the switch and writes A's results —
+  // or A's error — into the state now showing relay B.
+  remoteThreadSearchGeneration += 1;
+  applyRemoteSurfacePatch(createRemoteThreadSearchPatch({ ...EMPTY_THREAD_SEARCH }));
+}
+
 export async function searchRemoteThreads(rawQuery) {
   const query = normalizeThreadSearchQuery(rawQuery);
   const generation = ++remoteThreadSearchGeneration;
+  // Captured, not read at completion: a relay switch mid-flight must invalidate the
+  // answer even if the generation happened to line up.
+  const relayId = state.remoteAuth?.relayId || null;
+  const stillCurrent = () =>
+    generation === remoteThreadSearchGeneration && (state.remoteAuth?.relayId || null) === relayId;
 
   if (!query) {
     // Clearing is not a fetch — snap back rather than flashing stale matches.
@@ -1290,7 +1303,7 @@ export async function searchRemoteThreads(rawQuery) {
     // (THREADS_RESPONSE_REMOTE_SURFACE_BUDGET) and reduces further under byte pressure,
     // so asking for more would be silently trimmed and the count line would lie.
     const { threads, unavailableProviders } = await fetchRemoteThreadPage({ limit: 80, q: query });
-    if (generation !== remoteThreadSearchGeneration) {
+    if (!stillCurrent()) {
       return;
     }
     applyRemoteSurfacePatch(
@@ -1303,7 +1316,7 @@ export async function searchRemoteThreads(rawQuery) {
       })
     );
   } catch (error) {
-    if (generation !== remoteThreadSearchGeneration) {
+    if (!stillCurrent()) {
       return;
     }
     applyRemoteSurfacePatch(

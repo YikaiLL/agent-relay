@@ -97,6 +97,7 @@ import {
   fetchRemoteWorkflows,
   maybeLoadOlderTranscriptHistory,
   sendHeartbeat,
+  cancelRemoteThreadSearch,
   searchRemoteThreads,
 } from "./session-ops.js";
 import {
@@ -586,7 +587,12 @@ function RemoteApp() {
     );
 
   const [searchOpen, setSearchOpen] = useState(false);
-  const searchQuery = currentState.threadSearch?.query || "";
+  // The field is controlled by a LOCAL draft, never by the executed query. Binding it to
+  // `threadSearch.query` — which only advances after the debounce fires — makes React
+  // restore the previous value after every keystroke, so typing a word char by char
+  // ends up searching for its last letter. `page.fill()` sets the value in one shot and
+  // hides this completely; only real key-by-key input shows it.
+  const [searchDraft, setSearchDraft] = useState("");
   const searchDebounce = useRef(null);
   const runSearch = (value) => {
     window.clearTimeout(searchDebounce.current);
@@ -594,6 +600,7 @@ function RemoteApp() {
     void searchRemoteThreads(value);
   };
   const onSearchInput = (value) => {
+    setSearchDraft(value);
     window.clearTimeout(searchDebounce.current);
     // Clearing is applied at once — the list snaps back rather than sitting on stale
     // matches for another debounce window.
@@ -608,6 +615,7 @@ function RemoteApp() {
     // Closing must also clear: a hidden field still narrowing the list is a sidebar that
     // looks like it lost sessions, with the reason off screen.
     if (!open) {
+      setSearchDraft("");
       runSearch("");
     }
   };
@@ -620,6 +628,13 @@ function RemoteApp() {
   const activeRelayId = currentState.remoteAuth?.relayId || null;
   useEffect(() => {
     remoteUiStore.getState().setThreadFilterRetained(new Map());
+    // The draft and a pending debounce belong to the relay that was on screen. Left
+    // alone, a timer armed before the switch fires against the NEW relay with the old
+    // relay's query.
+    window.clearTimeout(searchDebounce.current);
+    searchDebounce.current = null;
+    setSearchDraft("");
+    cancelRemoteThreadSearch();
   }, [activeRelayId, remoteUiStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
@@ -1197,6 +1212,10 @@ function RemoteApp() {
     };
   }, []);
 
+  // The funnel for "the list went stale because something CHANGED it" — rename, fork,
+  // start. The 12s poll goes straight to `refreshRemoteThreads` and does not come
+  // through here, which is why re-running an open search is safe to do at this point:
+  // it follows known mutations rather than turning search into a second polling loop.
   async function runThreadRefresh(reason, { silent = false, fresh = false } = {}) {
     let completed = false;
     if (!silent) {
@@ -1205,6 +1224,14 @@ function RemoteApp() {
 
     try {
       await handlers.onRefreshThreads({ reason, silent, fresh });
+      // Search results are a separate snapshot. Refreshing only the authoritative list
+      // would leave the rows actually ON SCREEN showing the old title — a rename would
+      // look like it did nothing — and for a row past the first 80 that refresh cannot
+      // reach it at all.
+      const openQuery = currentState.threadSearch?.query;
+      if (openQuery) {
+        await searchRemoteThreads(openQuery);
+      }
       completed = true;
     } catch (error) {
       if (!silent) {
@@ -1694,7 +1721,7 @@ function RemoteApp() {
         onSetThreadFilterRetained: setThreadFilterRetained,
         threadSearch: currentState.threadSearch,
         searchOpen,
-        searchQuery,
+        searchQuery: searchDraft,
         onSetSearchOpen,
         onSearchInput,
         threadViewMode,

@@ -34,6 +34,10 @@ const THREAD_ID_2 = "thread-bell-working";
 // A third, IDLE row — the bell must drop it, and without one "the bell filtered
 // something" is indistinguishable from "the bell rendered everything".
 const THREAD_ID_3 = "thread-bell-idle";
+// Exists ONLY in a search answer. The render model injects the ACTIVE thread into the
+// list when the page does not carry it, so withholding the active row proves nothing —
+// this one is never active, and is the only way to exercise `findVisibleThread`'s union.
+const THREAD_ID_4 = "thread-bell-search-only";
 const MOBILE_VIEWPORT = { width: 390, height: 844 };
 
 async function main() {
@@ -61,7 +65,7 @@ async function main() {
 
   try {
     await page.addInitScript(
-      ({ relayId, threadId, threadId2, threadId3 }) => {
+      ({ relayId, threadId, threadId2, threadId3, threadId4 }) => {
         const REMOTE_STATE_STORAGE_KEY = "agent-relay.remote-state";
         const REMOTE_STATE_SCHEMA_VERSION = 1;
         const REMOTE_SECRET_DB_NAME = "agent-relay-secrets";
@@ -102,8 +106,14 @@ async function main() {
         const threadSummary3 = {
           ...threadSummary,
           id: threadId3,
-          name: "Quiet session",
+          name: "Resting session",
           updated_at: 3,
+        };
+        const threadSummary4 = {
+          ...threadSummary,
+          id: threadId4,
+          name: "Quiet archive dig",
+          updated_at: 0,
         };
         const snapshot = {
           provider: "codex",
@@ -267,7 +277,13 @@ async function main() {
             if (request.type === "list_threads") {
               const q = request.query?.q;
               window.__listThreadQueries.push(q ?? null);
-              const all = [threadSummary, threadSummary2, threadSummary3];
+              // The idle row is withheld from the UNFILTERED answer on purpose: that
+              // makes it exist only in the search slice, which is the one situation
+              // `findVisibleThread`'s union has to handle and the one a list containing
+              // every row can never test.
+              const all = q
+                ? [threadSummary, threadSummary2, threadSummary3, threadSummary4]
+                : [threadSummary, threadSummary2, threadSummary3];
               // Answer a search the way the relay does — matching server-side over the
               // whole set — so the test proves `q` reached the wire and the client
               // rendered the RESPONSE, rather than filtering rows it already had.
@@ -350,7 +366,7 @@ async function main() {
         }
         window.WebSocket = FakeWebSocket;
       },
-      { relayId: RELAY_ID, threadId: THREAD_ID, threadId2: THREAD_ID_2, threadId3: THREAD_ID_3 }
+      { relayId: RELAY_ID, threadId: THREAD_ID, threadId2: THREAD_ID_2, threadId3: THREAD_ID_3, threadId4: THREAD_ID_4 }
     );
 
     await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
@@ -627,13 +643,26 @@ async function main() {
       state: "visible",
       timeout: TIMEOUT_MS,
     });
-    await page.fill("#remote-sidebar-search-input", "Quiet");
+    // pressSequentially, NOT fill: `fill` sets the whole value and dispatches one event,
+    // which is exactly what hid a controlled input bound to the debounced query — real
+    // typing had React restore the old value after every keystroke, so a word ended up
+    // searching for its last letter.
+    await page.locator("#remote-sidebar-search-input").pressSequentially("Quiet", { delay: 60 });
+    await page.waitForFunction(
+      () => document.querySelector("#remote-sidebar-search-input")?.value === "Quiet",
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(
+        `the field lost characters while typing: ${await page.inputValue("#remote-sidebar-search-input")}`
+      );
+    });
     await page.waitForFunction(
       (id) => {
         const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
         return rows.length === 1 && rows[0].dataset.threadId === id;
       },
-      THREAD_ID_3,
+      THREAD_ID_4,
       { timeout: TIMEOUT_MS }
     ).catch(async () => {
       throw new Error(`search left ${JSON.stringify(await rowIds())}`);
@@ -643,16 +672,53 @@ async function main() {
     const sentQueries = await page.evaluate(() => window.__listThreadQueries);
     assert.ok(
       sentQueries.includes("Quiet"),
-      `the query must reach the wire, saw ${JSON.stringify(sentQueries)}`
+      `the WHOLE query must reach the wire, saw ${JSON.stringify(sentQueries)}`
     );
     assert.match(await countLine(), /result/, `count line: ${await countLine()}`);
+
+    // Do this FIRST, while the search answer is the most recent thing that happened: the
+    // 12s poll would otherwise repair `state.threads` before the assertion looked, and
+    // hide a search that had overwritten it. Counting requests pins the mechanism —
+    // the list must come back from state, not from a refetch.
+    const queriesBeforeClose = (await page.evaluate(() => window.__listThreadQueries)).length;
+    await page.tap("#remote-sidebar-search-toggle");
+    await page.waitForFunction((n) =>
+      document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
+      3,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(`closing search left ${JSON.stringify(await rowIds())}`);
+    });
+    const queriesAfterClose = (await page.evaluate(() => window.__listThreadQueries)).length;
+    assert.equal(
+      queriesAfterClose,
+      queriesBeforeClose,
+      "clearing a search must restore the list from state, not need a refetch — a search "
+        + "answer must never have replaced the authoritative list in the first place"
+    );
+
+    // Reopen for the remaining search assertions.
+    await page.tap("#remote-sidebar-search-toggle");
+    await page.waitForSelector("#remote-sidebar-search-input", {
+      state: "visible",
+      timeout: TIMEOUT_MS,
+    });
+    await page.locator("#remote-sidebar-search-input").pressSequentially("Quiet", { delay: 40 });
+    await page.waitForFunction(
+      (id) => {
+        const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
+        return rows.length === 1 && rows[0].dataset.threadId === id;
+      },
+      THREAD_ID_4,
+      { timeout: TIMEOUT_MS }
+    );
 
     // A search result must stay actionable — its "⋯" resolves through the same union
     // local needed, or the sheet reports no actions and does nothing.
     // The "⋯" is a SIBLING of the row button inside `.conversation-item-wrap`, not a
     // child of it — nesting buttons would be invalid HTML.
     await page.tap(
-      `.conversation-item-wrap:has([data-thread-id="${THREAD_ID_3}"]) .conversation-more`
+      `.conversation-item-wrap:has([data-thread-id="${THREAD_ID_4}"]) .conversation-more`
     );
     await page.waitForSelector(".remote-sheet, [role=dialog]", { timeout: TIMEOUT_MS }).catch(() => {});
     const sheetVisible = await page.evaluate(() =>
@@ -675,16 +741,12 @@ async function main() {
     });
     await setBell(false);
 
-    // Closing the field clears the search rather than leaving the list narrowed with the
-    // reason off screen.
     await page.tap("#remote-sidebar-search-toggle");
     await page.waitForFunction((n) =>
       document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
       3,
       { timeout: TIMEOUT_MS }
-    ).catch(async () => {
-      throw new Error(`closing search left ${JSON.stringify(await rowIds())}`);
-    });
+    );
 
     // 7. With the bell off, the resting grouping is back.
     await setBell(false);
