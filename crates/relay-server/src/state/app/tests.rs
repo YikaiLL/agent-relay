@@ -2709,6 +2709,37 @@ got {}",
         )
     }
 
+    /// Same two providers as `build_two_provider_app`, but hands back the bridge
+    /// handles so a test can assert which model id each provider was actually
+    /// given.
+    async fn build_two_provider_app_with_bridges(
+        cwd: &str,
+    ) -> (
+        AppState,
+        Arc<StatusProviderBridge>,
+        Arc<StatusProviderBridge>,
+        TempDir,
+    ) {
+        let project = TempDir::new().expect("project tempdir");
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let alpha = Arc::new(StatusProviderBridge::new("alpha", "idle"));
+        let beta = Arc::new(StatusProviderBridge::new("beta", "idle"));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("alpha".to_string(), alpha.clone());
+        providers.insert("beta".to_string(), beta.clone());
+        (
+            AppState::from_parts(relay, providers, change_tx),
+            alpha,
+            beta,
+            project,
+        )
+    }
+
     async fn build_consumed_initial_prompt_app(cwd: &str) -> (AppState, TempDir, TempDir) {
         let project = TempDir::new().expect("project tempdir");
         let outside = TempDir::new().expect("outside tempdir");
@@ -5410,6 +5441,11 @@ got {}",
         threads: Arc<std::sync::Mutex<HashMap<String, ThreadSummaryView>>>,
         running: Arc<std::sync::Mutex<HashSet<String>>>,
         next_id: AtomicU64,
+        /// Every model id this bridge was actually handed, in order. A model is
+        /// only meaningful to the provider that published it, so this is what
+        /// cross-provider leak tests must assert on — a snapshot field can look
+        /// right while the wrong id still reached the bridge.
+        seen_models: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl StatusProviderBridge {
@@ -5420,7 +5456,12 @@ got {}",
                 threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 running: Arc::new(std::sync::Mutex::new(HashSet::new())),
                 next_id: AtomicU64::new(1),
+                seen_models: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        fn models_seen(&self) -> Vec<String> {
+            self.seen_models.lock().unwrap().clone()
         }
 
         fn summary(&self, id: &str, cwd: &str) -> ThreadSummaryView {
@@ -5474,11 +5515,12 @@ got {}",
         async fn start_thread(
             &self,
             cwd: &str,
-            _model: &str,
+            model: &str,
             _approval_policy: &str,
             _sandbox: &str,
             initial_prompt: Option<&str>,
         ) -> Result<StartThreadResult, String> {
+            self.seen_models.lock().unwrap().push(model.to_string());
             let id = format!(
                 "{}-thread-{}",
                 self.name,
@@ -5565,7 +5607,7 @@ got {}",
             &self,
             thread_id: &str,
             _text: &str,
-            _model: &str,
+            model: &str,
             _effort: &str,
             _images: &[ProviderImage],
         ) -> Result<Option<String>, String> {
@@ -5576,6 +5618,9 @@ got {}",
                 .get(thread_id)
                 .map(|thread| thread.cwd.clone());
             require_live_test_cwd(self.name, thread_id, "start a turn for", recorded)?;
+            // Recorded only once the turn actually starts, so `models_seen()`
+            // never reports a model for a turn that was refused.
+            self.seen_models.lock().unwrap().push(model.to_string());
             Ok(Some(format!("{thread_id}-turn")))
         }
 
@@ -6822,6 +6867,233 @@ got {}",
             forked.model.starts_with("beta-"),
             "the target provider's own catalog answers: {}",
             forked.model
+        );
+    }
+
+    // Fork is only one of SEVEN model-resolution sites, and it is the only one
+    // that guards the provider boundary. The rest fall back to
+    // `SessionDefaults.model`, which is `RelayState.model` — a single relay-wide
+    // LAST-USED value with no provider dimension, rewritten by every send
+    // (`sessions.rs`, `relay.model = model.clone()`).
+    //
+    // So with a codex turn just sent, opening a Claude thread that has no
+    // remembered model of its own resolves that thread onto the CODEX model:
+    // the thread shows it, and the next send forwards the codex id to Claude.
+    // (`resolve_provider_model` only heals a foreign candidate when the caller
+    // did not name it explicitly, and the worker performs no validation at all —
+    // the id goes straight into the Agent SDK.)
+    //
+    // A thread reaches this state by the ordinary route: it was created outside
+    // this relay (listed from the provider), or restored from a state file
+    // written before per-thread models were persisted — `ThreadSessionSettings.model`
+    // is `#[serde(default)]`, so it deserializes empty.
+    //
+    // The relay already owns exactly this guarantee for reasoning effort:
+    // `clamp_effort_to_model` is documented as "the relay's last line of defense —
+    // it heals every client (incl. the remote app) and any thread already
+    // poisoned with a foreign effort, regardless of frontend fixes". A model id
+    // is likewise only meaningful to the provider that published it.
+    #[tokio::test]
+    async fn opening_another_providers_thread_does_not_inherit_the_last_used_model() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, alpha, beta, _p) = build_two_provider_app_with_bridges(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        // A pre-existing beta ("claude") conversation, with no model of its own
+        // remembered by this relay.
+        let beta_thread = app
+            .start_session(StartSessionInput {
+                device_id: Some("device-1".to_string()),
+                cwd: Some(cwd.to_string()),
+                model: None,
+                effort: None,
+                approval_policy: None,
+                sandbox: None,
+                provider: Some("beta".to_string()),
+                initial_prompt: None,
+            })
+            .await
+            .expect("start beta session")
+            .active_thread_id
+            .expect("beta thread id");
+        {
+            let mut relay = app.relay.write().await;
+            relay.thread_settings.remove(&beta_thread);
+        }
+
+        // The user switches to alpha ("codex") and sends — the last-used model
+        // is now an alpha id.
+        let alpha_thread = app
+            .start_session(StartSessionInput {
+                device_id: Some("device-1".to_string()),
+                cwd: Some(cwd.to_string()),
+                model: Some("alpha-fancy".to_string()),
+                effort: None,
+                approval_policy: None,
+                sandbox: None,
+                provider: Some("alpha".to_string()),
+                initial_prompt: None,
+            })
+            .await
+            .expect("start alpha session")
+            .active_thread_id
+            .expect("alpha thread id");
+        app.send_message(SendMessageInput {
+            text: "run something long".to_string(),
+            model: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            thread_id: alpha_thread,
+        })
+        .await
+        .expect("alpha send");
+        let last_used = app.relay.read().await.model.clone();
+        assert!(
+            last_used.starts_with("alpha-"),
+            "precondition: the relay-wide current model is now alpha's, got: {last_used}"
+        );
+
+        // ...and switches back to the beta conversation.
+        let transcript = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: beta_thread.clone(),
+                cursor: None,
+                before: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("read beta transcript");
+        let state = transcript.thread_state.expect("beta thread state");
+        assert!(
+            !state.model.starts_with("alpha-"),
+            "opening a beta thread must not put alpha's model on it, got: {}",
+            state.model
+        );
+        assert!(
+            state.model.starts_with("beta-"),
+            "a beta thread resolves from beta's own catalog, got: {}",
+            state.model
+        );
+
+        // And the leak must not reach the bridge: sending on the beta thread
+        // without naming a model has to hand beta one of ITS OWN model ids.
+        app.send_message(SendMessageInput {
+            text: "hello".to_string(),
+            model: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            thread_id: beta_thread,
+        })
+        .await
+        .expect("beta send");
+        let seen = beta.models_seen();
+        assert!(
+            seen.iter().all(|model| !model.starts_with("alpha-")),
+            "an alpha model id must never reach the beta bridge, saw: {seen:?}"
+        );
+        assert!(
+            alpha
+                .models_seen()
+                .iter()
+                .all(|model| !model.starts_with("beta-")),
+            "and the converse holds too"
+        );
+    }
+
+    // The other half: threads ALREADY poisoned before the fix landed. The leak
+    // was written into `RelayState.thread_settings`, which is persisted to
+    // `.agent-relay/session.json`, so a relay that ran the buggy build restarts
+    // with a Claude thread whose remembered model is a codex id — and
+    // `resolve_provider_model` treats a remembered model as an explicit choice
+    // and forwards it unchecked.
+    //
+    // "Absent from this provider's catalog" is NOT enough to condemn a model
+    // (a reviewer's own model or a per-thread override may legitimately be
+    // unlisted). Ownership is: an id that this provider does not publish and
+    // ANOTHER provider does is a leak, not a choice.
+    #[tokio::test]
+    async fn a_thread_carrying_another_providers_persisted_model_heals_on_open() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, _alpha, beta, _p) = build_two_provider_app_with_bridges(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let beta_thread = app
+            .start_session(StartSessionInput {
+                device_id: Some("device-1".to_string()),
+                cwd: Some(cwd.to_string()),
+                model: None,
+                effort: None,
+                approval_policy: None,
+                sandbox: None,
+                provider: Some("beta".to_string()),
+                initial_prompt: None,
+            })
+            .await
+            .expect("start beta session")
+            .active_thread_id
+            .expect("beta thread id");
+
+        // Load alpha's catalog too, so the relay can actually tell whose model
+        // "alpha-fancy" is.
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.to_string()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("alpha".to_string()),
+            initial_prompt: None,
+        })
+        .await
+        .expect("start alpha session");
+
+        // Restart-shaped state: the beta thread's settings survive on disk
+        // carrying the leaked alpha model; no runtime survives a restart.
+        {
+            let mut relay = app.relay.write().await;
+            relay.remember_thread_settings(
+                &beta_thread,
+                "never",
+                "read-only",
+                "low",
+                "alpha-fancy",
+            );
+            relay.runtimes.remove(&beta_thread);
+        }
+
+        let state = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: beta_thread.clone(),
+                cursor: None,
+                before: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("read beta transcript")
+            .thread_state
+            .expect("beta thread state");
+        assert!(
+            state.model.starts_with("beta-"),
+            "a persisted alpha model on a beta thread must heal to beta's own catalog, got: {}",
+            state.model
+        );
+
+        app.send_message(SendMessageInput {
+            text: "hello".to_string(),
+            model: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            thread_id: beta_thread,
+        })
+        .await
+        .expect("beta send");
+        let seen = beta.models_seen();
+        assert!(
+            seen.iter().all(|model| !model.starts_with("alpha-")),
+            "an alpha model id must never reach the beta bridge, saw: {seen:?}"
         );
     }
 

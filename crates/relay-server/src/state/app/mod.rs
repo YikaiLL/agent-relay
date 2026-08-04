@@ -461,6 +461,76 @@ in thread {thread_id}: {error}"
         }
     }
 
+    /// Resolve the model a thread should run under against ITS OWN provider's
+    /// catalog.
+    ///
+    /// The `default_model` fallback callers pass is `SessionDefaults.model` —
+    /// i.e. `RelayState.model`, a single relay-wide LAST-USED value with no
+    /// provider dimension, rewritten by every send. Taking it unchecked puts
+    /// the previously-active provider's model id on this thread: run a codex
+    /// turn, then open a Claude thread, and the Claude thread both displays and
+    /// sends the codex model. Route it through `resolve_provider_model` so the
+    /// thread's own provider always gets the last word.
+    pub(super) async fn resolve_model_for_provider(
+        &self,
+        provider_name: &str,
+        bridge: &Arc<dyn ProviderBridge>,
+        remembered_model: Option<String>,
+        default_model: String,
+    ) -> String {
+        // Prefer the cache: this runs on the transcript read, which is polled
+        // for a viewed thread, and Codex's `model/list` RPC is uncached.
+        let models = match self.cached_provider_model_catalog(provider_name).await {
+            Some(models) => Some(models),
+            None => {
+                self.load_provider_model_catalog(provider_name, bridge)
+                    .await
+            }
+        };
+        let remembered_model = match remembered_model {
+            Some(model)
+                if self
+                    .model_belongs_to_another_provider(provider_name, &model)
+                    .await =>
+            {
+                None
+            }
+            other => other,
+        };
+        resolve_provider_model(provider_name, &models, remembered_model, default_model)
+    }
+
+    /// Is this model id demonstrably owned by a DIFFERENT provider?
+    ///
+    /// `resolve_provider_model` honours a named model even when the provider's
+    /// catalog doesn't list it, and rightly so — a reviewer's own model or a
+    /// per-thread override can legitimately be unlisted. So mere absence cannot
+    /// condemn an id. Positive evidence can: an id that this provider does not
+    /// publish and another provider DOES is a leak, not a choice.
+    ///
+    /// This heals threads poisoned before the leak was closed. The damage was
+    /// written into `RelayState.thread_settings`, which is persisted, so it
+    /// outlives a restart and would otherwise keep being forwarded — the Claude
+    /// worker does not validate the id at all, and a foreign one both fails the
+    /// turn and tears down the live SDK session.
+    async fn model_belongs_to_another_provider(&self, provider_name: &str, model: &str) -> bool {
+        if model.is_empty() {
+            return false;
+        }
+        let catalogs = self.provider_model_catalogs.read().await;
+        // Only decide when this provider's own catalog is known. A cold or
+        // erroring `list_models` must never let a legitimate id look foreign.
+        let Some(own) = catalogs.get(provider_name).filter(|own| !own.is_empty()) else {
+            return false;
+        };
+        if own.iter().any(|option| option.model == model) {
+            return false;
+        }
+        catalogs.iter().any(|(other, catalog)| {
+            other != provider_name && catalog.iter().any(|option| option.model == model)
+        })
+    }
+
     async fn expire_stale_controller_if_needed(&self) {
         let mut relay = self.relay.write().await;
         expire_controller_if_needed(&mut relay);
@@ -506,17 +576,16 @@ in thread {thread_id}: {error}"
             .as_ref()
             .map(|value| value.reasoning_effort.clone())
             .unwrap_or(defaults.reasoning_effort);
-        let model = settings
+        let remembered_model = settings
             .as_ref()
             .map(|value| value.model.clone())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(defaults.model);
-        let data = self
-            .find_thread_provider(thread_id)
-            .await?
-            .1
-            .read_thread(thread_id)
-            .await?;
+            .filter(|value| !value.is_empty());
+        let (provider_name, bridge) = self.find_thread_provider(thread_id).await?;
+        let (provider_name, bridge) = (provider_name.to_string(), bridge.clone());
+        let data = bridge.read_thread(thread_id).await?;
+        let model = self
+            .resolve_model_for_provider(&provider_name, &bridge, remembered_model, defaults.model)
+            .await;
         {
             let relay = self.relay.read().await;
             let device_scope = relay.device_path_scope(device_id);
@@ -1620,6 +1689,11 @@ fn resolve_provider_model(
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     }
 
+    // Only heal a model the caller did NOT name. "Absent from the catalog" is
+    // deliberately not treated as "invalid": a reviewer's own model, a per-thread
+    // saved model, and an explicit override are all legitimate ids a provider's
+    // published catalog need not list. Cross-provider leaks are caught by
+    // ownership instead — see `model_belongs_to_another_provider`.
     if let Some(catalog) = models.as_ref().filter(|models| !models.is_empty()) {
         if !explicit_model && !catalog.iter().any(|model| model.model == candidate) {
             if let Some(preferred) = preferred_model_from_slice(catalog) {

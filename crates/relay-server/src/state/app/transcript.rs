@@ -70,7 +70,8 @@ impl AppState {
             relay.runtime_for_thread(&input.thread_id).is_none()
         };
         if runtime_missing && input.before.is_none() {
-            let (_, bridge) = self.find_thread_provider(&input.thread_id).await?;
+            let (provider_name, bridge) = self.find_thread_provider(&input.thread_id).await?;
+            let (provider_name, bridge) = (provider_name.to_string(), bridge.clone());
             if let Some(page) = bridge
                 .read_thread_transcript_page(&input.thread_id, None)
                 .await?
@@ -101,11 +102,18 @@ impl AppState {
                     .as_ref()
                     .map(|value| value.reasoning_effort.clone())
                     .unwrap_or(defaults.reasoning_effort);
-                let model = settings
+                let remembered_model = settings
                     .as_ref()
                     .map(|value| value.model.clone())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(defaults.model);
+                    .filter(|value| !value.is_empty());
+                let model = self
+                    .resolve_model_for_provider(
+                        &provider_name,
+                        &bridge,
+                        remembered_model,
+                        defaults.model,
+                    )
+                    .await;
                 let entries = page.sync.transcript.clone();
                 let paged = page.paged;
                 let prev_cursor = page.prev_cursor;

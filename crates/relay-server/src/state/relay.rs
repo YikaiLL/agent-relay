@@ -2578,12 +2578,42 @@ impl RelayState {
                 self.reasoning_effort = default_model.default_reasoning_effort;
             }
         }
+        // Push the resolved model/effort down to the active thread — but ONLY if
+        // that thread belongs to the provider this catalog describes.
+        //
+        // `start_session` loads the NEW provider's catalog and calls this while
+        // `active_thread_id` still points at the OUTGOING provider's thread
+        // (`activate_started_thread` runs after). Unguarded, starting a codex
+        // session therefore stamps codex's default model onto the Claude thread
+        // the user just left; switching back to it then shows — and sends — a
+        // codex model id on a Claude thread. A model id is only meaningful to
+        // the provider that published it.
+        //
+        // An unknown provider on either side keeps the old unconditional
+        // behaviour, so a thread whose summary hasn't been stamped yet (e.g.
+        // codex's empty-provider refreshes) still gets synced.
+        let catalog_provider = self
+            .available_models
+            .iter()
+            .map(|option| option.provider.clone())
+            .find(|provider| !provider.is_empty());
         if let Some(thread_id) = self.active_thread_id.clone() {
             let model = self.model.clone();
             let effort = self.reasoning_effort.clone();
             if let Some(runtime) = self.runtimes.get_mut(&thread_id) {
-                runtime.model = model;
-                runtime.reasoning_effort = effort;
+                let runtime_provider = runtime
+                    .summary
+                    .as_ref()
+                    .map(|summary| summary.provider.clone())
+                    .filter(|provider| !provider.is_empty());
+                let crosses_providers = matches!(
+                    (&catalog_provider, &runtime_provider),
+                    (Some(catalog), Some(thread)) if catalog != thread
+                );
+                if !crosses_providers {
+                    runtime.model = model;
+                    runtime.reasoning_effort = effort;
+                }
             }
         }
     }
