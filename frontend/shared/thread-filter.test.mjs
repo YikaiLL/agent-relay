@@ -279,6 +279,34 @@ test("ids that collide with Object.prototype are not special", () => {
   assert.deepEqual(view.groups.map((g) => g.state), ["working"]);
 });
 
+// The identity contract. Remote accumulates retention in an effect, so it needs a cheap
+// "did anything change?" test to avoid writing to its store on every render. Comparing
+// `size` is NOT that test: a row moving between states changes only a VALUE, so a
+// size-guarded write silently drops it and the row snaps back to its old bucket the
+// moment it goes stateless. Returning the SAME instance when nothing changed makes `!==`
+// the correct guard and keeps that decision here, where it can be tested.
+test("an unchanged pass returns the very same Map", () => {
+  const filter = { ...ON, states: ["needs_input"] };
+  const first = nextRetainedStates(null, GROUPS, filter, stateOf);
+  const second = nextRetainedStates(first, GROUPS, filter, stateOf);
+  assert.equal(second, first, "no change must not produce a new instance");
+});
+
+test("a VALUE-only change still produces a new Map", () => {
+  const filter = { ...ON, states: ["needs_input"] };
+  const first = nextRetainedStates(null, GROUPS, filter, stateOf);
+  const moved = (thread) => (thread.id === "needs" ? "working" : stateOf(thread));
+  const second = nextRetainedStates(first, GROUPS, filter, moved);
+  assert.notEqual(second, first, "a size-preserving change must still be observable");
+  assert.equal(second.size, first.size, "precondition: size alone cannot detect this");
+  assert.equal(second.get("needs"), "working");
+});
+
+test("turning the filter off keeps an already-empty map's identity", () => {
+  const empty = nextRetainedStates(null, GROUPS, EMPTY_THREAD_FILTER, stateOf);
+  assert.equal(nextRetainedStates(empty, GROUPS, EMPTY_THREAD_FILTER, stateOf), empty);
+});
+
 // Admission still respects the selection: an unselected state must not pull a NEW row in.
 test("a row is only admitted while its state is selected", () => {
   const filter = { ...ON, states: ["needs_input"] };

@@ -540,7 +540,13 @@ function RemoteApp() {
     remoteAuth: currentState.remoteAuth,
     session,
     threads: currentState.threads,
-    viewMode: threadViewMode,
+    // The bell cuts ACROSS the grouping mode, exactly as it does on local
+    // (render-session.js). Leaving Projects mode in charge would feed the filter a
+    // source that has already dropped the Unassigned bucket — so a session that is
+    // WORKING but belongs to no project would be missing from a control whose entire
+    // job is "show me what is going on" — and would hand it nothing at all while the
+    // Projects payload is loading or failed.
+    viewMode: remoteUi.threadFilter?.on ? "sessions" : threadViewMode,
     projects: remoteProjects.projects,
     threadProjectId: remoteProjects.threadProjectId,
     projectsError: remoteProjects.error,
@@ -560,6 +566,16 @@ function RemoteApp() {
   const setThreadFilter = (next) => remoteUiStore.getState().setThreadFilter(next);
   const setThreadFilterRetained = (retained) =>
     remoteUiStore.getState().setThreadFilterRetained(retained);
+
+  // Retention is keyed by thread id alone, and thread ids are only unique WITHIN a
+  // relay. Switching relays would otherwise let one relay's remembered states decide
+  // which of another's sessions the bell shows. The surface reset already forgets
+  // fetched Projects for the same reason (surface-state.js: "A different relay may
+  // advertise an equal projects_revision"); this is that hazard for the filter.
+  const activeRelayId = currentState.remoteAuth?.relayId || null;
+  useEffect(() => {
+    remoteUiStore.getState().setThreadFilterRetained(new Map());
+  }, [activeRelayId, remoteUiStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
   const createRemoteProjectFromToolbar = async () => {
@@ -2006,7 +2022,11 @@ function RemoteSidebar({
     stateOf
   );
   useEffect(() => {
-    if (retainedNext !== threadFilter.retained && retainedNext.size !== threadFilter.retained.size) {
+    // Identity is the whole test: `nextRetainedStates` returns the same instance when
+    // nothing changed. Comparing `size` instead would miss a row MOVING between states
+    // — value changes, size does not — and the row would snap back to its old bucket
+    // the moment it went stateless.
+    if (retainedNext !== threadFilter.retained) {
       onSetThreadFilterRetained(retainedNext);
     }
   });

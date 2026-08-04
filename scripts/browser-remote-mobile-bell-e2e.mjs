@@ -228,12 +228,29 @@ async function main() {
               // Lets the test move a thread OUT of needs_input the way answering an
               // approval would, by pushing a fresh snapshot — the same channel the real
               // relay uses, so the client path under test is the real one.
-              window.__clearApproval = () => {
-                snapshot.pending_approvals = [];
+              const push = () => {
                 this.#emit({
                   type: "message",
                   payload: { protocol_version: 1, kind: "session_snapshot", snapshot },
                 });
+              };
+              // Answering the approval, the way the real relay would: the thread stops
+              // needing input and starts WORKING. That intermediate live state is the
+              // one a size-only retention guard silently drops.
+              window.__answerApproval = () => {
+                snapshot.pending_approvals = [];
+                snapshot.thread_activity = [
+                  { thread_id: threadId, phase: "tool", tool: "bash" },
+                  { thread_id: threadId2, phase: "tool", tool: "bash" },
+                ];
+                push();
+              };
+              // ...and then it finishes, losing every state it had.
+              window.__finishTurn = () => {
+                snapshot.thread_activity = [
+                  { thread_id: threadId2, phase: "tool", tool: "bash" },
+                ];
+                push();
               };
             });
           }
@@ -252,6 +269,22 @@ async function main() {
                 ok: true,
                 snapshot,
                 threads: { threads: [threadSummary, threadSummary2, threadSummary3] },
+              });
+              return;
+            }
+            if (request.type === "fetch_projects") {
+              this.#respond(actionId, {
+                action: "fetch_projects",
+                ok: true,
+                snapshot,
+                projects: {
+                  projects: [{ id: "project-alpha", name: "Alpha project" }],
+                  // Every thread deliberately UNASSIGNED: Projects mode drops the
+                  // Unassigned bucket, so this is what makes "the bell reads the
+                  // projects-filtered source" visible as an empty bell.
+                  thread_project_id: {},
+                  projects_revision: 1,
+                },
               });
               return;
             }
@@ -358,6 +391,25 @@ async function main() {
           document.querySelector("#remote-sidebar-bell-toggle")?.classList.contains("is-active")
         )
       );
+    // Never blind-toggle: read the control, then act. A tap that assumed the wrong
+    // starting position turns "switch it off" into "switch it on" and the failure lands
+    // several assertions later, pointing at the wrong thing.
+    const setBell = async (want) => {
+      if ((await bellOn()) !== want) {
+        await page.tap("#remote-sidebar-bell-toggle");
+        await page.waitForFunction(
+          (expected) =>
+            Boolean(
+              document
+                .querySelector("#remote-sidebar-bell-toggle")
+                ?.classList.contains("is-active")
+            ) === expected,
+          want,
+          { timeout: TIMEOUT_MS }
+        );
+      }
+      assert.equal(await bellOn(), want, `bell should be ${want ? "on" : "off"}`);
+    };
 
     await openDrawer();
     await page.waitForFunction((n) =>
@@ -402,7 +454,7 @@ async function main() {
     );
 
     // 2. Turning it on buckets by state and drops the idle row.
-    await page.tap("#remote-sidebar-bell-toggle");
+    await setBell(true);
     console.error("after click:", JSON.stringify(await page.evaluate(() => ({
       active: document.querySelector("#remote-sidebar-bell-toggle")?.classList.contains("is-active"),
       pills: document.querySelectorAll("#remote-activity-filter .activity-filter-pill").length,
@@ -458,19 +510,102 @@ async function main() {
       throw new Error(`narrowing left ${JSON.stringify(await rowIds())}`);
     });
 
-    // 4. Retention, and the effect that drives it. Clear the approval: the row loses its
-    // needs_input state, which on remote also exercises the store-write-from-an-effect
-    // path — if that effect never settles the page would spin here instead of asserting.
-    await page.evaluate(() => window.__clearApproval?.());
-    await page.waitForTimeout(1500);
-    const afterAnswer = await rowIds();
+    // 4. Retention across the FULL chain: selected state → an unselected live state →
+    // stateless. Splitting it (the first draft went straight to stateless) hides the
+    // bug where the store-write is guarded on Map size: a row MOVING between states
+    // changes only a value, so the write is skipped and the row snaps back to the
+    // bucket it started in once it loses its state.
+    //
+    // This is also the only coverage of the effect that drives retention on remote — if
+    // it never settled, the page would spin here instead of asserting.
+    await page.evaluate(() => window.__answerApproval?.());
+    await page.waitForFunction(
+      (id) => {
+        const row = document.querySelector(`#remote-threads-list [data-thread-id="${id}"]`);
+        const group = row?.closest(".thread-group, [data-thread-list-scroll-root]");
+        void group;
+        const labels = [...document.querySelectorAll("#remote-threads-list .thread-group-name")]
+          .map((n) => n.textContent.trim());
+        return Boolean(row) && labels.includes("Working");
+      },
+      THREAD_ID,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(
+        `after answering, groups were ${JSON.stringify(await groupLabels())} rows ${JSON.stringify(await rowIds())}`
+      );
+    });
+
+    await page.evaluate(() => window.__finishTurn?.());
+    await page.waitForFunction(
+      () =>
+        [...document.querySelectorAll("#remote-threads-list .thread-group-name")]
+          .map((n) => n.textContent.trim())
+          .includes("Done"),
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(`after finishing, groups were ${JSON.stringify(await groupLabels())}`);
+    });
+
+    // Now make it genuinely STATELESS. A finished background thread still carries a
+    // `completed` badge; opening it clears that badge (`threadAttention.clear` in
+    // handleResumeThread), so the row loses every state it had at the exact moment the
+    // user touches it. That is when the remembered bucket is the only thing keeping it
+    // on screen — and where a store-write skipped on "same size" shows up, because the
+    // memory would still say `needs_input` from three transitions ago.
+    await page.tap(`#remote-threads-list [data-thread-id="${THREAD_ID}"]`);
+    await page.waitForTimeout(1200);
+    await openDrawer();
+    const afterOpen = await rowIds();
     assert.ok(
-      afterAnswer.includes(THREAD_ID),
-      `a row that has matched must stay listed after its state moves on, got ${JSON.stringify(afterAnswer)}`
+      afterOpen.includes(THREAD_ID),
+      `the row you just opened must not vanish, got ${JSON.stringify(afterOpen)}`
+    );
+    assert.ok(
+      !(await groupLabels()).includes("Needs input"),
+      `a stateless row must rest in the bucket it was LAST really in, not the one it joined by; groups: ${JSON.stringify(await groupLabels())}`
     );
 
-    // 5. Turning the bell off restores the resting grouping.
-    await page.tap("#remote-sidebar-bell-toggle");
+    // 5. The bell must cut ACROSS Projects mode. Remote's render model drops the
+    // Unassigned bucket in that mode, so a session that is WORKING but belongs to no
+    // project would be missing from the one control whose job is "show me what is going
+    // on" — and while the Projects payload is loading or failed it would be handed
+    // nothing at all.
+    await setBell(false);
+    await page.tap("#remote-threads-view-projects");
+    await page.waitForFunction(
+      () =>
+        [...document.querySelectorAll("#remote-threads-list .thread-group-name")]
+          .map((n) => n.textContent.trim())
+          .includes("Alpha project"),
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(`projects mode showed ${JSON.stringify(await groupLabels())}`);
+    });
+
+    await setBell(true);
+    await page.waitForFunction(
+      (id) => {
+        const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
+        const labels = [...document.querySelectorAll("#remote-threads-list .thread-group-name")]
+          .map((n) => n.textContent.trim());
+        return rows.some((row) => row.dataset.threadId === id) && labels.includes("Working");
+      },
+      THREAD_ID_2,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(
+        `the bell did not take over Projects mode: groups ${JSON.stringify(await groupLabels())} rows ${JSON.stringify(await rowIds())}`
+      );
+    });
+    await setBell(false);
+    await page.tap("#remote-threads-view-sessions");
+    await page.waitForTimeout(400);
+
+    // 6. With the bell off, the resting grouping is back.
+    await setBell(false);
     await page.waitForFunction((n) =>
       document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
       3,

@@ -78,14 +78,20 @@ export function summarizeThreadStates(groups, stateOf) {
  * `"toString"` or `"constructor"` would read as already-present on an object literal and
  * be admitted past the selection, while `"__proto__"` could never be stored at all.
  *
- * Returns the next map; callers keep it on the filter and pass it back in.
+ * Returns the next map, or the SAME instance when nothing changed. That identity
+ * contract is load-bearing for React callers, which accumulate this in an effect and
+ * need a cheap "did anything change?" test. `size` is not that test — a row moving
+ * between states changes only a value — and a size-guarded write drops the update, so
+ * the row snaps back to its old bucket the moment it goes stateless.
  */
 export function nextRetainedStates(previous, groups, filter, stateOf) {
+  const prev = previous instanceof Map ? previous : new Map();
   if (!isThreadFilterActive(filter)) {
-    return new Map();
+    return prev.size ? new Map() : prev;
   }
   const states = selectedStates(filter);
-  const next = new Map(previous || []);
+  const next = new Map(prev);
+  let changed = false;
   for (const thread of flattenThreads(groups)) {
     const id = thread?.id;
     const state = id ? stateOf(thread) : null;
@@ -98,10 +104,13 @@ export function nextRetainedStates(previous, groups, filter, stateOf) {
     // ago. Narrowed to "Needs input", answering a thread and letting it finish would
     // file it back under "Needs input" with no dot at all.
     if (next.has(id) || states.includes(state)) {
-      next.set(id, state);
+      if (next.get(id) !== state) {
+        next.set(id, state);
+        changed = true;
+      }
     }
   }
-  return next;
+  return changed ? next : prev;
 }
 
 /**
