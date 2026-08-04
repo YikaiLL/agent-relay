@@ -396,7 +396,23 @@ async function main() {
     let unassignedOpenedInSessions = null;
     if (unassignPropagated) {
       await page.click(`#threads-list [data-thread-id="${threadId}"]`, { timeout: TIMEOUT_MS });
-      await delay(600);
+      // Wait for the label rather than sleeping a fixed span — this is a POSITIVE
+      // signal, so there is something to wait for. (The negative checks in steps 8
+      // and 9 keep their fixed delay on purpose: "no placeholder ever appeared" has
+      // no event to await, and polling for absence only polls luck.)
+      //
+      // Swallowed and re-read rather than left to time out, so a failure reports
+      // WHICH project it wrongly adopted instead of an anonymous timeout.
+      // Short timeout on purpose: this is a local state update that lands in well
+      // under a second, and the wait is expected to EXPIRE when the bug is present.
+      // Borrowing the 45s default would spend 45s reaching a failure it already knew.
+      try {
+        await page.waitForFunction(
+          () => document.querySelector(".project-switcher-trigger")?.textContent?.trim() === "All sessions",
+          null,
+          { timeout: 8000 }
+        );
+      } catch {}
       unassignedOpenedInSessions = await page.evaluate(
         () => document.querySelector(".project-switcher-trigger")?.textContent?.trim() || ""
       );
