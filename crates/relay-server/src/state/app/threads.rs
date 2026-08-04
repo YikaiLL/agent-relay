@@ -209,16 +209,10 @@ impl AppState {
         let response_threads = threads.clone();
 
         if query.is_some() {
-            // A search is a NARROWED VIEW, not a new authoritative list. Assigning it to
-            // the routing cache would drop every non-matching thread from
-            // `find_thread_provider` — the sidebar would keep rendering those rows (the
-            // client holds its own copy) while sends to them started failing. Typing in a
-            // search box must not be able to break the session you are sitting in.
-            //
-            // Nor can the results simply be APPENDED to that cache: the next 12s poll
-            // reassigns the whole vector, so an appended hint survives about one poll and
-            // then the result the user is looking at stops opening. Hints live in their
-            // own map, which the authoritative rewrite cannot erase.
+            // A search is a NARROWED VIEW, not a new authoritative list: assigning it to
+            // the routing cache would stop every non-matching thread routing while the
+            // sidebar kept rendering it. Hints go in their own map instead — see
+            // `RelayState::search_routing_hints` for why appending here is not enough.
             for thread in &response_threads {
                 relay.remember_search_routing_hint(thread);
             }

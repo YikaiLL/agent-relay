@@ -93,6 +93,8 @@ export function selectThreadListView({ threadGroups = [], search = null, groupBy
     const groups = threadGroups || [];
     return {
       searching: false,
+      // "ok" means nothing here needs to speak over a downstream narrowing (the bell).
+      status: "ok",
       collapseGroups: true,
       groups,
       countLabel: summarizeThreadGroups(groups, { groupBy }),
@@ -108,6 +110,7 @@ export function selectThreadListView({ threadGroups = [], search = null, groupBy
   if (search.loading) {
     return {
       searching: true,
+      status: "loading",
       collapseGroups: false,
       // Keep the previous results on screen while a newer query is in flight. Blanking
       // the list on every keystroke makes the sidebar strobe as you type.
@@ -120,6 +123,7 @@ export function selectThreadListView({ threadGroups = [], search = null, groupBy
   if (search.error) {
     return {
       searching: true,
+      status: "error",
       collapseGroups: false,
       groups: [],
       countLabel: "Search failed",
@@ -135,6 +139,7 @@ export function selectThreadListView({ threadGroups = [], search = null, groupBy
     const names = unreachable.join(", ");
     return {
       searching: true,
+      status: "partial",
       collapseGroups: false,
       groups,
       countLabel: matches === 1 ? "1 result · partial" : `${matches} results · partial`,
@@ -148,6 +153,7 @@ export function selectThreadListView({ threadGroups = [], search = null, groupBy
 
   return {
     searching: true,
+    status: "ok",
     collapseGroups: false,
     groups,
     countLabel: matches === 1 ? "1 result" : `${matches} results`,

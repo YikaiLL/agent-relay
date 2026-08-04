@@ -138,6 +138,21 @@ test("partial results are still shown, and flagged as partial", () => {
   assert.equal(view.incomplete, true);
 });
 
+// The bell also narrows the list, and it must not be allowed to speak over these.
+// `status` is what lets the renderer tell "the bell has an opinion about the count"
+// apart from "the search itself is mid-flight, failed, or incomplete".
+test("abnormal search states are labelled so nothing downstream can overwrite them", () => {
+  const base = { query: "auth", groups: [], loading: false, error: null };
+  assert.equal(selectThreadListView({ search: { ...base, loading: true } }).status, "loading");
+  assert.equal(selectThreadListView({ search: { ...base, error: "offline" } }).status, "error");
+  assert.equal(
+    selectThreadListView({ search: { ...base, unavailableProviders: ["codex"] } }).status,
+    "partial"
+  );
+  assert.equal(selectThreadListView({ search: base }).status, "ok");
+  assert.equal(selectThreadListView({ search: EMPTY_THREAD_SEARCH }).status, "ok");
+});
+
 // The bug this guards: search exists to surface threads from BEYOND the authoritative
 // page, so a result is routinely absent from `state.threads`. Every lookup that asks
 // "does this thread exist / what is its title" must see it, or right-click closes

@@ -14,7 +14,7 @@ import { THREAD_STATES, THREAD_STATE_LABELS, selectThreadState } from "./thread-
 export const EMPTY_THREAD_FILTER = Object.freeze({
   on: false,
   states: THREAD_STATES,
-  stickyIds: Object.freeze([]),
+  retained: Object.freeze({}),
 });
 
 export function isThreadFilterActive(filter) {
@@ -50,29 +50,37 @@ export function summarizeThreadStates(groups, stateOf) {
 }
 
 /**
- * The monotonic retention set.
+ * The monotonic retention map: thread id → the state it was last seen in.
  *
  * A row must not vanish from under the pointer because the agent answered while you were
  * reaching for it. So membership only ever GROWS while a filter is on: a thread that has
  * matched once stays listed until the filter is turned off or its selection changes.
  *
+ * It remembers the STATE, not just the id, because a thread can leave the ladder
+ * entirely. The sharpest case is the one the user is most likely to be watching: a
+ * thread that finishes while you are looking at it gets no `completed` badge at all
+ * (`thread-attention.js` drops the badge for the viewed foreground thread), so it goes
+ * working → stateless. With only an id to go on there would be no bucket to keep it in
+ * and the row would vanish anyway.
+ *
  * New matches join live — that half must stay immediate, or the bell would show a
  * snapshot of the past rather than what is going on.
  *
- * Returns the next set; callers keep it on the filter and pass it back in.
+ * Returns the next map; callers keep it on the filter and pass it back in.
  */
-export function nextStickyIds(previous, groups, filter, stateOf) {
+export function nextRetainedStates(previous, groups, filter, stateOf) {
   if (!isThreadFilterActive(filter)) {
-    return [];
+    return {};
   }
   const states = selectedStates(filter);
-  const next = new Set(previous || []);
+  const next = { ...(previous || {}) };
   for (const thread of flattenThreads(groups)) {
-    if (thread?.id && states.includes(stateOf(thread))) {
-      next.add(thread.id);
+    const state = thread?.id ? stateOf(thread) : null;
+    if (state && states.includes(state)) {
+      next[thread.id] = state;
     }
   }
-  return [...next];
+  return next;
 }
 
 /**
@@ -81,19 +89,22 @@ export function nextStickyIds(previous, groups, filter, stateOf) {
  * Groups come back in the ladder's order — not by recency — because that order IS the
  * urgency order, and a bell whose first bucket moved around would stop being scannable.
  */
-export function buildThreadStateGroups(groups, { stateOf, states, retainIds = [] } = {}) {
+export function buildThreadStateGroups(groups, { stateOf, states, retained = {} } = {}) {
   const wanted = (states || THREAD_STATES).filter((state) => THREAD_STATES.includes(state));
-  const retained = new Set(retainIds);
   const buckets = new Map();
 
   for (const thread of flattenThreads(groups)) {
-    const state = stateOf(thread);
+    const live = stateOf(thread);
+    const remembered = (retained || {})[thread?.id] || null;
+    // A live state always wins, so a retained row moves to where it actually is rather
+    // than being frozen where it entered. A retained row with no live state left keeps
+    // its last bucket — that is what stops it vanishing when it goes idle.
+    const state = live || remembered;
     if (!state) {
-      // Idle. A retained id does not resurrect it: "keep what you were looking at"
-      // means keep it in a bucket, and idle has none.
+      // Never matched. Retention keeps rows, it does not admit new ones.
       continue;
     }
-    if (!wanted.includes(state) && !retained.has(thread.id)) {
+    if (!wanted.includes(state) && !remembered) {
       continue;
     }
     if (!buckets.has(state)) {
@@ -141,7 +152,7 @@ export function selectThreadFilterView({ groups = [], filter = null, stateOf = (
   const filtered = buildThreadStateGroups(groups, {
     stateOf,
     states,
-    retainIds: filter.stickyIds || [],
+    retained: filter.retained || {},
   });
   const shown = filtered.reduce((total, group) => total + group.threads.length, 0);
   const everyState = states.length === THREAD_STATES.length;

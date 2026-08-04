@@ -143,7 +143,7 @@ import {
 } from "./shared/thread-groups.js";
 import { findThreadInSearchResults, findVisibleThread } from "./shared/thread-search.js";
 import { THREAD_STATES } from "./shared/thread-dot.js";
-import { nextStickyIds } from "./shared/thread-filter.js";
+
 import {
   createThreadListStore,
   readActiveProjectId,
@@ -354,7 +354,7 @@ const state = {
   // The bell. `stickyIds` is the monotonic retention set: while the filter is on, a
   // thread that has matched stays listed even after its state moves on, so a row cannot
   // vanish from under the pointer because the agent answered. See shared/thread-filter.js.
-  threadFilter: { on: false, states: [...THREAD_STATES], stickyIds: [] },
+  threadFilter: { on: false, states: [...THREAD_STATES], retained: {} },
   projects: [],
   threadProjectId: {},
   projectsLoading: false,
@@ -387,6 +387,24 @@ const state = {
 //
 // A function declaration (not a const) so the lookup sites above it hoist correctly.
 // See `findVisibleThread` for why iteration must NOT use this.
+// Archive/delete remove a row from the authoritative list; the search slice holds its
+// own copy and has to be swept too.
+function dropThreadFromSearchResults(threadId) {
+  const search = state.threadSearch;
+  if (!search?.groups?.length) {
+    return;
+  }
+  state.threadSearch = {
+    ...search,
+    groups: search.groups
+      .map((group) => ({
+        ...group,
+        threads: (group.threads || []).filter((thread) => thread.id !== threadId),
+      }))
+      .filter((group) => group.threads.length),
+  };
+}
+
 function findVisible(threadId) {
   return findVisibleThread({ threads: state.threads, search: state.threadSearch }, threadId);
 }
@@ -1592,7 +1610,7 @@ function syncActivityFilterChrome() {
 // deliberate change of selection would instead make the new selection show rows the
 // user just excluded.
 function setActivityFilter(next) {
-  state.threadFilter = { ...state.threadFilter, ...next, stickyIds: [] };
+  state.threadFilter = { ...state.threadFilter, ...next, retained: {} };
   syncActivityFilterChrome();
   renderThreads();
 }
@@ -3322,9 +3340,13 @@ function openForkDialogForThread(threadId, upToItemId = "") {
   // Falls back to the viewed session snapshot: on a deep link the transcript
   // (and its fork buttons) render before the sidebar thread list exists, and
   // the list is paged so an older thread may never appear in it.
+  const visible = findVisible(threadId);
   const thread = resolveForkSourceThread({
     threadId,
-    threads: state.threads,
+    // The search slice too: a result from beyond the authoritative page is exactly the
+    // kind of older thread this resolver's fallbacks exist for, and forking it is one
+    // of the main reasons to have gone looking.
+    threads: visible ? [visible, ...(state.threads || [])] : state.threads,
     session: state.session,
     viewedThread: state.viewOnlyThread,
   });
@@ -3710,6 +3732,9 @@ async function archiveThreadFromContextMenu() {
     }
 
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
+    // ...and from the search results, which are a separate slice. Leaving it there
+    // keeps a dead session on screen as a clickable row until the query changes.
+    dropThreadFromSearchResults(threadId);
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
     state.removedThreadIds.add(threadId);
     rememberRemovedThreadId(threadId);
@@ -3782,6 +3807,9 @@ async function deleteThreadFromContextMenu() {
     }
 
     state.threads = state.threads.filter((entry) => entry.id !== threadId);
+    // ...and from the search results, which are a separate slice. Leaving it there
+    // keeps a dead session on screen as a clickable row until the query changes.
+    dropThreadFromSearchResults(threadId);
     // A tab pointing at a deleted session is dead — drop it before re-rendering.
     state.removedThreadIds.add(threadId);
     rememberRemovedThreadId(threadId);

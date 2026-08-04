@@ -51,7 +51,11 @@ import {
   isThreadSearchActive,
   selectThreadListView,
 } from "../shared/thread-search.js";
-import { nextStickyIds, selectThreadFilterView } from "../shared/thread-filter.js";
+import {
+  isThreadFilterActive,
+  nextRetainedStates,
+  selectThreadFilterView,
+} from "../shared/thread-filter.js";
 import { selectThreadState } from "../shared/thread-dot.js";
 import { canForkInSession } from "../shared/fork-fields.js";
 import {
@@ -1475,7 +1479,11 @@ export function createSessionRenderer({
     // query is active would silently drop every result whose session has no project —
     // the user would type a title they can see and be told it does not exist.
     const searching = isThreadSearchActive(state.threadSearch);
-    const projectsMode = viewMode === "projects" && !searching;
+    // Both the search and the bell cut ACROSS the grouping mode. Leaving Projects mode
+    // in charge while either is on renders the project tree untouched while the control
+    // sits there looking active — a filter that visibly does nothing.
+    const filtering = isThreadFilterActive(state.threadFilter);
+    const projectsMode = viewMode === "projects" && !searching && !filtering;
     const groupBy = projectsMode ? "project" : "cwd";
 
     // Fail closed: only render Project grouping when we hold a payload we can vouch
@@ -1656,8 +1664,8 @@ export function createSessionRenderer({
       });
     // Monotonic accumulator, not derived state: it only ever grows while the filter is
     // on, so computing it here cannot cause a re-render loop.
-    state.threadFilter.stickyIds = nextStickyIds(
-      state.threadFilter.stickyIds,
+    state.threadFilter.retained = nextRetainedStates(
+      state.threadFilter.retained,
       listView.groups,
       state.threadFilter,
       stateOf
@@ -1670,12 +1678,25 @@ export function createSessionRenderer({
     syncActivityFilterCounts(filterView.counts);
     const groups = filterView.groups;
 
+    // The bell narrows the RESULT; it has no opinion about whether the search that
+    // produced it is mid-flight, failed, or came back short a provider. Those states
+    // win, or an unreachable provider reads as "nothing is running" all over again.
+    const searchSpeaks = listView.status !== "ok";
+    const countLabel = searchSpeaks
+      ? listView.countLabel
+      : filterView.filtering
+        ? filterView.countLabel
+        : listView.countLabel;
+    const emptyMessage = searchSpeaks
+      ? listView.emptyMessage
+      : filterView.filtering
+        ? filterView.emptyMessage
+        : listView.emptyMessage;
+
     renderWorkspaceSuggestions(state.session);
-    threadsCount.textContent = filterView.filtering
-      ? filterView.countLabel
-      : listView.countLabel;
+    threadsCount.textContent = countLabel;
     threadsCount.title = listView.searching || filterView.filtering
-      ? threadsCount.textContent
+      ? countLabel
       : groups.map((group) => group.cwd || group.label).join("\n");
 
     renderReactContent(
@@ -1690,7 +1711,7 @@ export function createSessionRenderer({
         collapsedGroupCwds: listView.collapseGroups
           ? threadListUi.collapsedGroupCwds || new Set()
           : new Set(),
-        emptyMessage: filterView.filtering ? filterView.emptyMessage : listView.emptyMessage,
+        emptyMessage,
         expandedGroupCwds: threadListUi.expandedGroupCwds || new Set(),
         formatThreadMeta(thread) {
           return formatRelativeTime(thread.updated_at);

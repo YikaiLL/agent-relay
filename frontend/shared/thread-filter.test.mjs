@@ -6,7 +6,7 @@ import {
   EMPTY_THREAD_FILTER,
   buildThreadStateGroups,
   isThreadFilterActive,
-  nextStickyIds,
+  nextRetainedStates,
   selectThreadFilterView,
   summarizeThreadStates,
 } from "./thread-filter.js";
@@ -130,14 +130,14 @@ test("counts describe the whole list, not the current selection", () => {
 // agent answered while you were reaching for it.
 test("a thread that has matched stays listed after it leaves the selection", () => {
   const filter = { ...ON, states: ["needs_input"] };
-  const sticky = nextStickyIds([], GROUPS, filter, stateOf);
-  assert.deepEqual(sticky, ["needs"]);
+  const sticky = nextRetainedStates({}, GROUPS, filter, stateOf);
+  assert.deepEqual(sticky, { needs: "needs_input" });
 
   // The user answers it: needs_input → working. It must still be on screen.
   const answered = (thread) => (thread.id === "needs" ? "working" : stateOf(thread));
   const view = selectThreadFilterView({
     groups: GROUPS,
-    filter: { ...filter, stickyIds: sticky },
+    filter: { ...filter, retained: sticky },
     stateOf: answered,
   });
   assert.ok(
@@ -150,24 +150,62 @@ test("a thread that has matched stays listed after it leaves the selection", () 
 
 test("new matches join a live filter immediately", () => {
   const filter = { ...ON, states: ["working"] };
-  const first = nextStickyIds([], GROUPS, filter, stateOf);
-  assert.deepEqual(first, ["work"]);
+  const first = nextRetainedStates({}, GROUPS, filter, stateOf);
+  assert.deepEqual(first, { work: "working" });
   const promoted = (thread) => (thread.id === "idle" ? "working" : stateOf(thread));
-  const second = nextStickyIds(first, GROUPS, filter, promoted);
-  assert.deepEqual(second.sort(), ["idle", "work"]);
+  const second = nextRetainedStates(first, GROUPS, filter, promoted);
+  assert.deepEqual(second, { work: "working", idle: "working" });
 });
 
-test("retention never resurrects an idle thread", () => {
+test("retention never resurrects a thread that never matched", () => {
   const view = selectThreadFilterView({
     groups: GROUPS,
-    filter: { ...ON, states: ["needs_input"], stickyIds: ["idle"] },
+    filter: { ...ON, states: ["needs_input"], retained: { idle: null } },
     stateOf,
   });
   assert.ok(!view.groups.some((g) => g.threads.some((t) => t.id === "idle")));
 });
 
+// The gap the retention rule left open. A thread that finishes while you are LOOKING
+// at it gets no `completed` badge at all (thread-attention.js drops the badge for the
+// viewed foreground thread), so it goes working → stateless. Dropping stateless rows
+// meant the row still vanished from under the pointer — exactly what retention exists
+// to prevent, in the one case the user is most likely to be watching.
+test("a retained thread that goes fully idle keeps its last bucket", () => {
+  const filter = { ...ON, states: ["working"] };
+  const retained = nextRetainedStates({}, GROUPS, filter, stateOf);
+  assert.deepEqual(retained, { work: "working" });
+
+  const wentIdle = (thread) => (thread.id === "work" ? null : stateOf(thread));
+  const view = selectThreadFilterView({
+    groups: GROUPS,
+    filter: { ...filter, retained },
+    stateOf: wentIdle,
+  });
+  const shown = view.groups.flatMap((g) => g.threads.map((t) => t.id));
+  assert.ok(shown.includes("work"), "a row must not vanish just because it went idle");
+  assert.equal(
+    view.groups.find((g) => g.threads.some((t) => t.id === "work")).state,
+    "working",
+    "with no live state left, it stays in the bucket it was last seen in"
+  );
+});
+
+test("a live state always wins over the remembered one", () => {
+  const promoted = (thread) => (thread.id === "work" ? "needs_input" : stateOf(thread));
+  const view = selectThreadFilterView({
+    groups: GROUPS,
+    filter: { ...ON, states: ["working"], retained: { work: "working" } },
+    stateOf: promoted,
+  });
+  assert.equal(
+    view.groups.find((g) => g.threads.some((t) => t.id === "work")).state,
+    "needs_input"
+  );
+});
+
 test("turning the filter off clears retention", () => {
-  assert.deepEqual(nextStickyIds(["needs"], GROUPS, EMPTY_THREAD_FILTER, stateOf), []);
+  assert.deepEqual(nextRetainedStates({ needs: "needs_input" }, GROUPS, EMPTY_THREAD_FILTER, stateOf), {});
 });
 
 // The bell's buckets and the row's dot read the same session; if they could disagree,

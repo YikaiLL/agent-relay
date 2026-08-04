@@ -99,10 +99,6 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
           },
           iconNode(SEARCH_SVG)
         ),
-        // Deliberately no count badge. An ambient number on a cross-cutting control is
-        // opaque — you cannot tell what it is about, so it compels a click rather than
-        // letting you decide. The per-row dots already carry the state, and the OS/push
-        // notifications already do the "come look at this" job.
         h(
           "button",
           {
@@ -218,12 +214,8 @@ function SessionSearch() {
   );
 }
 
-// The bell's state pills. All four start selected: the bell's job is "show me what is
-// going on", and a thread moving between states (you answer it, so needs-input becomes
-// working) must not fall out of the list while you are looking at it. Narrowing to one
-// state is the deliberate, secondary act.
-//
-// Always mounted, toggled with `hidden`, like the search field.
+// The bell's state pills. Always mounted, toggled with `hidden`, like the search field:
+// nothing holding a `dom.js` handle may be conditionally rendered away.
 function ActivityFilter() {
   return h(
     "div",
