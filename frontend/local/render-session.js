@@ -51,6 +51,8 @@ import {
   isThreadSearchActive,
   selectThreadListView,
 } from "../shared/thread-search.js";
+import { nextStickyIds, selectThreadFilterView } from "../shared/thread-filter.js";
+import { selectThreadState } from "../shared/thread-dot.js";
 import { canForkInSession } from "../shared/fork-fields.js";
 import {
   readActiveProjectId,
@@ -1636,12 +1638,44 @@ export function createSessionRenderer({
       search: state.threadSearch,
       groupBy,
     });
-    const groups = listView.groups;
+
+    // Hoisted: the bell needs the same three signals the row dots do, and computing
+    // them twice would let the filter and the dots read different snapshots.
+    const threadActivityMap = buildThreadActivityMap(state.session);
+    const threadAttentionMap = threadAttention.snapshotMap();
+    const threadReviewingSet = buildReviewingThreadSet(state.session, reviewsCache.current());
+
+    // The bell narrows whatever the list would otherwise show — resting groups OR search
+    // results — which is exactly what lets the two compose instead of competing for the
+    // same surface.
+    const stateOf = (thread) =>
+      selectThreadState({
+        activity: threadActivityMap.get(thread.id) || null,
+        attentionKind: threadAttentionMap.get(thread.id) || null,
+        reviewing: threadReviewingSet.has?.(thread.id),
+      });
+    // Monotonic accumulator, not derived state: it only ever grows while the filter is
+    // on, so computing it here cannot cause a re-render loop.
+    state.threadFilter.stickyIds = nextStickyIds(
+      state.threadFilter.stickyIds,
+      listView.groups,
+      state.threadFilter,
+      stateOf
+    );
+    const filterView = selectThreadFilterView({
+      groups: listView.groups,
+      filter: state.threadFilter,
+      stateOf,
+    });
+    syncActivityFilterCounts(filterView.counts);
+    const groups = filterView.groups;
 
     renderWorkspaceSuggestions(state.session);
-    threadsCount.textContent = listView.countLabel;
-    threadsCount.title = listView.searching
-      ? listView.countLabel
+    threadsCount.textContent = filterView.filtering
+      ? filterView.countLabel
+      : listView.countLabel;
+    threadsCount.title = listView.searching || filterView.filtering
+      ? threadsCount.textContent
       : groups.map((group) => group.cwd || group.label).join("\n");
 
     renderReactContent(
@@ -1656,7 +1690,7 @@ export function createSessionRenderer({
         collapsedGroupCwds: listView.collapseGroups
           ? threadListUi.collapsedGroupCwds || new Set()
           : new Set(),
-        emptyMessage: listView.emptyMessage,
+        emptyMessage: filterView.filtering ? filterView.emptyMessage : listView.emptyMessage,
         expandedGroupCwds: threadListUi.expandedGroupCwds || new Set(),
         formatThreadMeta(thread) {
           return formatRelativeTime(thread.updated_at);
@@ -1702,9 +1736,9 @@ export function createSessionRenderer({
           renderThreads();
         },
         selectedCwd,
-        threadActivity: buildThreadActivityMap(state.session),
-        threadAttention: threadAttention.snapshotMap(),
-        threadReviewing: buildReviewingThreadSet(state.session, reviewsCache.current()),
+        threadActivity: threadActivityMap,
+        threadAttention: threadAttentionMap,
+        threadReviewing: threadReviewingSet,
       })
     );
 
@@ -1810,6 +1844,20 @@ export function createSessionRenderer({
         return option;
       })
     );
+  }
+
+  // Keep the bell's per-state counts current. They describe the WHOLE list, not the
+  // current selection, so a pill can tell you what selecting it would give you.
+  // `null` (filter off) leaves the last values in place — the popover is hidden anyway,
+  // and blanking them makes it flash zeros on the way open.
+  function syncActivityFilterCounts(counts) {
+    if (!counts) {
+      return;
+    }
+    for (const element of document.querySelectorAll("[data-count-for]")) {
+      const state = element.dataset.countFor;
+      element.textContent = String(counts[state] ?? 0);
+    }
   }
 
   function renderThreadListMessage(countLabel, message) {

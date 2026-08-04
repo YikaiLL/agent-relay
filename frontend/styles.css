@@ -1342,12 +1342,15 @@ input:focus, textarea:focus, select:focus {
   box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-primary) 60%, transparent);
   animation: agent-working-indicator-pulse 1.4s ease-in-out infinite;
 }
-/* Under review: a separate reviewer thread is working on this (idle) parent
-   thread. Same live blue pulse as "working" — the base .conversation-activity-dot
-   already supplies it — so it reads as "busy on your behalf". The modifier is an
-   explicit hook so this state can be differentiated later without touching JS. */
+/* Under review: a separate reviewer thread is working on this (idle) parent thread.
+   Keeps the live pulse — it IS busy on your behalf — but hollow, so it is tellable
+   apart from the thread's own turn. It has to be: the bell lists "Working" and
+   "Reviewing" as separate buckets, and two buckets that render identically would just
+   look like the same rows twice. */
 .conversation-activity-dot.is-reviewing {
-  background: var(--accent-primary);
+  background: transparent;
+  border: 2px solid var(--accent-primary);
+  box-sizing: border-box;
 }
 /* Attention states: the thread is no longer working but wants the user. Steady
    (no pulse) so it reads as "resolved, waiting for you" rather than "busy". */
@@ -4414,6 +4417,75 @@ input:focus, textarea:focus, select:focus {
 .sidebar-search-clear svg {
   width: 13px;
   height: 13px;
+}
+
+/* The bell. Highlighted while the filter is on, so a narrowed list always has a visible
+   reason — the same rule the search field follows. */
+.sidebar-bell-toggle.is-active {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+.sidebar-activity-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.sidebar-activity-filter[hidden] {
+  display: none;
+}
+.activity-filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+.activity-filter-pill:hover {
+  border-color: var(--border-prominent);
+  color: var(--text-primary);
+}
+.activity-filter-pill.is-selected {
+  border-color: var(--border-prominent);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+/* A deselected pill still has to be readable — it is how you get the state back. */
+.activity-filter-pill:not(.is-selected) .activity-filter-dot {
+  opacity: 0.4;
+}
+.activity-filter-count {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.activity-filter-pill.is-selected .activity-filter-count {
+  color: var(--text-secondary);
+}
+/* Same shapes as the row dots, minus the pulse: a legend should not animate. */
+.activity-filter-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  background: var(--accent-primary);
+}
+.activity-filter-dot.is-needs_input {
+  background: var(--accent-warning);
+}
+.activity-filter-dot.is-reviewing {
+  background: transparent;
+  border: 2px solid var(--accent-primary);
+}
+/* A state bucket is not a folder. The glyph is meaningful for workspace/project
+   groups and actively misleading on "Needs input". */
+.thread-group-header[data-group-kind="state"] .thread-group-icon {
+  display: none;
 }
 .chat-header-leading {
   display: flex;

@@ -556,6 +556,9 @@ export function ThreadGroupHeader({
         className: "thread-group-header" + (selectable ? " is-clickable" : ""),
         onClick: selectable ? selectWorkspace : undefined,
         title: headerTitle,
+        // Present only for the bell's state buckets, so CSS can drop the folder glyph.
+        // "Needs input" is not a directory, and absent renders exactly as before.
+        "data-group-kind": group.state ? "state" : undefined,
       },
       h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
       selectable

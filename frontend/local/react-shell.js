@@ -4,7 +4,8 @@ import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
-import { PLUS_SVG, CHEVRON_RIGHT_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
+import { BELL_SVG, PLUS_SVG, CHEVRON_RIGHT_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
+import { THREAD_STATES, THREAD_STATE_LABELS } from "../shared/thread-dot.js";
 
 const h = React.createElement;
 
@@ -97,10 +98,27 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
             "aria-expanded": "false",
           },
           iconNode(SEARCH_SVG)
+        ),
+        // Deliberately no count badge. An ambient number on a cross-cutting control is
+        // opaque — you cannot tell what it is about, so it compels a click rather than
+        // letting you decide. The per-row dots already carry the state, and the OS/push
+        // notifications already do the "come look at this" job.
+        h(
+          "button",
+          {
+            className: "header-button sidebar-bell-toggle",
+            id: "sidebar-bell-toggle",
+            type: "button",
+            title: "Filter by activity",
+            "aria-label": "Filter by activity",
+            "aria-expanded": "false",
+          },
+          iconNode(BELL_SVG)
         )
       )
     ),
     h(SessionSearch),
+    h(ActivityFilter),
     h(AuthForm),
     // Group the sidebar by cwd folders (Sessions) or by Project. Lifted to the top
     // of the sidebar to match the projects mockup; wired imperatively in app.js by id.
@@ -196,6 +214,40 @@ function SessionSearch() {
         "aria-label": "Clear search",
       },
       iconNode(X_SVG)
+    )
+  );
+}
+
+// The bell's state pills. All four start selected: the bell's job is "show me what is
+// going on", and a thread moving between states (you answer it, so needs-input becomes
+// working) must not fall out of the list while you are looking at it. Narrowing to one
+// state is the deliberate, secondary act.
+//
+// Always mounted, toggled with `hidden`, like the search field.
+function ActivityFilter() {
+  return h(
+    "div",
+    {
+      className: "sidebar-activity-filter",
+      id: "sidebar-activity-filter",
+      hidden: true,
+      role: "group",
+      "aria-label": "Filter sessions by activity",
+    },
+    ...THREAD_STATES.map((state) =>
+      h(
+        "button",
+        {
+          className: "activity-filter-pill is-selected",
+          "data-state": state,
+          id: `activity-filter-${state}`,
+          type: "button",
+          "aria-pressed": "true",
+        },
+        h("span", { className: `activity-filter-dot is-${state}`, "aria-hidden": "true" }),
+        h("span", { className: "activity-filter-label" }, THREAD_STATE_LABELS[state]),
+        h("span", { className: "activity-filter-count", "data-count-for": state }, "0")
+      )
     )
   );
 }
