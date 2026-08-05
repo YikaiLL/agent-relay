@@ -292,9 +292,15 @@ const state = {
   // Latest server (relay) log entries, refreshed from each session snapshot.
   relayLogLines: [],
   deviceId: loadOrCreateDeviceId(),
-  // Identifies this TAB (sessionStorage), where deviceId identifies the browser
-  // (localStorage). The relay filters the live delta stream per surface so two tabs
-  // can watch different threads without silencing each other.
+  // Identifies this PAGE LOAD, held only in memory, where deviceId identifies the
+  // browser (localStorage). The relay filters the live delta stream per surface so two
+  // tabs can watch different threads without silencing each other.
+  //
+  // Deliberately NOT sessionStorage: the browser copies sessionStorage into a duplicated
+  // tab, so both copies would claim one surface id, the later connection generation would
+  // win, and the loser's live tail would stop with no error and no spinner — snapshots
+  // keep arriving, so the sidebar and status dots still look healthy. An in-memory id
+  // cannot be copied, so duplicating a tab always yields a fresh surface.
   surfaceId: loadOrCreateSurfaceId(),
   defaultsSeeded: false,
   selectedCwd: "",
@@ -1211,7 +1217,8 @@ const syncWatchedThreads = createWatchedThreadsSync({
   deviceId: () => state.deviceId,
   // Per TAB, not per device: the device id lives in localStorage and is shared by every
   // tab, so a per-device watch set would let whichever tab declared last silence the
-  // others. sessionStorage is per-tab, which is exactly the scope we want.
+  // others. See loadOrCreateSurfaceId for why this id is per page load and in memory
+  // rather than in sessionStorage, which a duplicated tab would copy.
   surfaceId: () => state.surfaceId,
   surfaceGeneration: () => state.surfaceGeneration ?? null,
   onError: (error) => logLine(`Failed to declare watched threads: ${error.message}`),

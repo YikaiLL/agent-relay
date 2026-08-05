@@ -636,10 +636,18 @@ async fn session_stream(
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty());
 
+    // Every local surface renders the identical LocalWeb-compacted snapshot, so the build
+    // is shared across one notify's fan-out instead of repeated per connection. Building
+    // takes the relay WRITE lock, so a per-connection build made N surfaces contend N
+    // times for that exclusive lock on every notify.
+    //
+    // The FIRST frame is exempt: a connecting surface gets a point-in-time snapshot,
+    // because same-revision snapshots still differ in `server_time`/`devices_revision`,
+    // and this frame lands on top of whatever the client just fetched from `/api/session`.
     let initial = stream::once(async move {
-        Ok::<Event, Infallible>(snapshot_event(compact_local_snapshot(
-            initial_state.snapshot().await,
-        )))
+        Ok::<Event, Infallible>(snapshot_event(
+            &initial_state.fresh_local_snapshot_payload().await,
+        ))
     });
 
     let updates = stream::unfold(
@@ -650,9 +658,7 @@ async fn session_stream(
             }
 
             Some((
-                Ok::<Event, Infallible>(snapshot_event(compact_local_snapshot(
-                    state.snapshot().await,
-                ))),
+                Ok::<Event, Infallible>(snapshot_event(&state.local_snapshot_payload().await)),
                 (state, receiver),
             ))
         },
@@ -1540,15 +1546,10 @@ fn is_path_policy_error(message: &str) -> bool {
     message.contains("outside this relay's allowed roots")
 }
 
-fn snapshot_event(snapshot: SessionSnapshot) -> Event {
-    Event::default()
-        .event("session")
-        .json_data(snapshot)
-        .unwrap_or_else(|error| {
-            Event::default().event("session").data(format!(
-                "{{\"ok\":false,\"error\":\"failed_to_encode_snapshot:{error}\"}}"
-            ))
-        })
+/// The payload is already serialized (and shared) by `local_snapshot_payload`, which is
+/// what keeps one notify from costing N snapshot builds and N write-lock acquisitions.
+fn snapshot_event(payload: &str) -> Event {
+    Event::default().event("session").data(payload)
 }
 
 /// Removes a surface's thread-watch set when its SSE stream is dropped, however that

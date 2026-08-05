@@ -24,8 +24,8 @@ use crate::{
         ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
         ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
         ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-        StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
-        ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
+        SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput,
+        TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
         ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView, ThreadTranscriptResponse,
         ThreadsResponse, ToolCallView, TranscriptDeltaEvent, UpdateSessionSettingsInput,
         WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
@@ -116,6 +116,25 @@ pub struct AppState {
     /// Review job ids whose orchestrators must stop before starting another turn.
     /// A set is required because unrelated parent threads may be reviewed concurrently.
     cancel_requested_jobs: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// The compacted, pre-serialized local snapshot for one change version, shared by
+    /// every SSE surface that wakes on it.
+    ///
+    /// Building it takes the relay WRITE lock — `snapshot()` runs the expiry sweeps —
+    /// so before this cache existed each connection independently contended for that
+    /// exclusive lock on every notify. N tabs meant N write-lock acquisitions per
+    /// provider event against the same lock the provider bridges and every API handler
+    /// need, which is a self-DoS amplifier no per-device surface cap can bound: a
+    /// handful of connections can saturate the lock on their own.
+    local_snapshot_cache: Arc<tokio::sync::Mutex<Option<(u64, Arc<str>)>>>,
+    /// Counts real builds of the local snapshot payload so a test can prove concurrent
+    /// waiters on one version collapse into a single build.
+    local_snapshot_builds: Arc<std::sync::atomic::AtomicU64>,
+    /// Counts ENTRIES into the shared fan-out path. A test that stalls the in-flight
+    /// builder waits on this reaching the surface count before releasing it, so the
+    /// overlap it asserts is a real condition rather than a slept-through duration —
+    /// a timing window that closed early would silently downgrade that test to proving
+    /// nothing instead of failing.
+    local_snapshot_waiters: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A real provider/thread id is short; cap the key length so a paired device can't
@@ -215,6 +234,9 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -311,6 +333,9 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         state.spawn_initial_model_catalog_refresh();
@@ -337,6 +362,88 @@ impl AppState {
         expire_controller_if_needed(&mut relay);
         expire_turn_liveness_if_needed(&mut relay);
         relay.snapshot()
+    }
+
+    /// A point-in-time local snapshot for a surface that just CONNECTED.
+    ///
+    /// Never served from the cache. A snapshot is not a pure function of the revision:
+    /// `server_time` and `devices_revision` are derived from the clock, and the build
+    /// runs the controller/turn-liveness expiry sweeps. A connection arriving during a
+    /// quiet period would otherwise be handed a frame built arbitrarily long ago, and
+    /// that frame — same revision, older time metadata — would overwrite the state the
+    /// client just fetched from `/api/session`.
+    pub async fn fresh_local_snapshot_payload(&self) -> Arc<str> {
+        let mut cache = self.local_snapshot_cache.lock().await;
+        let version = *self.change_tx.borrow();
+        let payload = self.build_local_snapshot_payload().await;
+        // Repopulate rather than bypass: this frame is strictly newer than whatever the
+        // entry held, so surfaces woken later in the same revision should get this one.
+        *cache = Some((version, payload.clone()));
+        payload
+    }
+
+    async fn build_local_snapshot_payload(&self) -> Arc<str> {
+        let snapshot = self
+            .snapshot()
+            .await
+            .compact_for(SessionSnapshotCompactProfile::LocalWeb);
+        let payload: Arc<str> = match serde_json::to_string(&snapshot) {
+            Ok(payload) => Arc::from(payload.as_str()),
+            Err(error) => Arc::from(
+                format!("{{\"ok\":false,\"error\":\"failed_to_encode_snapshot:{error}\"}}")
+                    .as_str(),
+            ),
+        };
+        // Counted on COMPLETION, so a test can hold the relay lock and assert that no
+        // build has finished — which is what proves other surfaces are queued behind this
+        // one rather than each building their own.
+        self.local_snapshot_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        payload
+    }
+
+    /// The compacted local-web snapshot, already serialized, for surfaces woken by a
+    /// notify.
+    ///
+    /// Every local surface renders the identical `LocalWeb`-compacted snapshot, so the
+    /// build is shared across the fan-out of ONE notification rather than repeated per
+    /// connection. See `local_snapshot_cache` for why the write lock makes that sharing
+    /// load-bearing. Staleness is bounded by how long a woken surface takes to be
+    /// polled, because only waiters on the current revision read the entry.
+    pub async fn local_snapshot_payload(&self) -> Arc<str> {
+        // Recorded before the mutex: past this point the only way forward is through it,
+        // so a test observing this count knows the surface is committed to queueing.
+        self.local_snapshot_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Held across the build on purpose: surfaces woken by the same notify must queue
+        // behind ONE builder and then read its result, rather than each independently
+        // taking the relay write lock.
+        let mut cache = self.local_snapshot_cache.lock().await;
+        // Read the version BEFORE building. If state advances mid-build the entry is
+        // stamped with the older version, so the next caller rebuilds — stale-conservative
+        // rather than stale-sticky, which is the failure that would freeze every surface.
+        let version = *self.change_tx.borrow();
+        if let Some((cached_version, payload)) = cache.as_ref() {
+            if *cached_version == version {
+                return payload.clone();
+            }
+        }
+
+        let payload = self.build_local_snapshot_payload().await;
+        *cache = Some((version, payload.clone()));
+        payload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_snapshot_waiter_count(&self) -> u64 {
+        self.local_snapshot_waiters
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_snapshot_build_count(&self) -> u64 {
+        self.local_snapshot_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn spawn_stale_turn_liveness_watchdog(&self) {

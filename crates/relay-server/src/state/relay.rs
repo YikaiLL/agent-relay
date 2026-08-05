@@ -521,7 +521,12 @@ impl RelayState {
 
     pub fn notify(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        let _ = self.change_tx.send(self.revision);
+        // `send` REFUSES to store the value when no receiver is alive, which would leave
+        // the channel advertising a stale revision. The local snapshot cache keys off
+        // that value, so a dropped-to-zero receiver count would pin every surface to the
+        // last snapshot built while someone happened to be listening. `send_replace`
+        // always stores; notifying nobody is fine, forgetting the revision is not.
+        let _ = self.change_tx.send_replace(self.revision);
     }
 
     /// Subscribe to live transcript appends (local SSE surfaces).

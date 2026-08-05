@@ -882,3 +882,81 @@ async fn rename_thread_accepts_an_explicit_null_name_as_a_reset() {
         .expect("router should respond");
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+// The FIRST frame on `/api/stream` must be built point-in-time, never served from the
+// notify fan-out cache.
+//
+// This is a WIRING test, and it exists because the unit level cannot fail here: both
+// `local_snapshot_payload` (shared across one notification's fan-out) and
+// `fresh_local_snapshot_payload` (point-in-time) are correct in isolation. The defect is
+// handing a CONNECTING surface the shared one — a pairing only the endpoint expresses.
+// A snapshot is not a pure function of the revision (`server_time` and `devices_revision`
+// come from the clock, and building one runs the expiry sweeps), so a reconnect landing
+// in a quiet period would otherwise get a frame built arbitrarily long ago and overwrite
+// the state the client just fetched from `/api/session`.
+#[tokio::test]
+async fn the_first_stream_frame_is_built_fresh_not_served_from_the_fanout_cache() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use futures_util::StreamExt;
+    use tower::ServiceExt;
+
+    let project = tempfile::TempDir::new().expect("project tempdir");
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        project.path().display().to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    let app =
+        crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx);
+
+    // An earlier notify fan-out warmed the cache, and then the relay went quiet — the
+    // revision never moves again, so a naive cache would serve this entry forever.
+    let warm = app.local_snapshot_payload().await;
+    assert_eq!(app.local_snapshot_build_count(), 1);
+    drop(warm);
+
+    let context = AppContext {
+        app: app.clone(),
+        auth: test_auth(),
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+    };
+    let router = build_router(context, WebAssets::Embedded);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/stream?surface_id=surface-1")
+                .header(header::HOST, "127.0.0.1:8787")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Read only the first frame; an SSE stream never ends on its own.
+    let mut frames = response.into_body().into_data_stream();
+    let first = frames
+        .next()
+        .await
+        .expect("the stream must emit an initial frame")
+        .expect("the initial frame should read");
+    let text = String::from_utf8_lossy(&first);
+    assert!(
+        text.contains("event: session"),
+        "the first frame should be the session snapshot, got: {text}"
+    );
+
+    assert_eq!(
+        app.local_snapshot_build_count(),
+        2,
+        "a connecting surface must build its own snapshot; serving the warm fan-out \
+         entry would hand it `server_time`/`devices_revision` from an arbitrarily old \
+         build and skip the expiry sweeps that building runs"
+    );
+}

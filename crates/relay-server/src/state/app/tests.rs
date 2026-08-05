@@ -16420,3 +16420,165 @@ mod double_approve_race {
         );
     }
 }
+
+// The local SSE fan-out must share ONE compacted+serialized snapshot per change version.
+//
+// Each build takes the relay WRITE lock — `AppState::snapshot` runs the expiry sweeps —
+// so a per-connection build turns N surfaces into N exclusive-lock acquisitions on every
+// notify, against the same lock the provider bridges and every API handler also need.
+// That is the dominant multi-surface cost, and a per-device surface cap cannot bound it:
+// a handful of connections saturate the lock on their own. Sharing the build is what
+// actually removes the amplifier.
+#[cfg(test)]
+mod local_snapshot_sharing {
+    use super::super::*;
+    use crate::fake_provider::FakeProviderBridge;
+    use crate::state::security::SecurityProfile;
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    async fn build_app() -> (AppState, Arc<RwLock<RelayState>>) {
+        let (change_tx, _keep) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            ".".to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = FakeProviderBridge::spawn(relay.clone())
+            .await
+            .expect("fake provider should spawn");
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("fake".to_string(), Arc::new(bridge));
+        (
+            AppState::from_parts(relay.clone(), providers, change_tx),
+            relay,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_surfaces_share_one_snapshot_build_per_version() {
+        let (app, relay) = build_app().await;
+
+        // Hold the relay write lock so the first builder STALLS inside the build. That
+        // makes the three surfaces provably overlap; merely spawning them would pass
+        // even if they ran one after another, each just hitting a warm cache, which
+        // would not demonstrate single-flight under contention at all.
+        let gate = relay.write().await;
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let app = app.clone();
+                tokio::spawn(async move { app.local_snapshot_payload().await })
+            })
+            .collect();
+
+        // Wait on a CONDITION, not a duration: every surface must have entered the shared
+        // path (and so be committed to queueing behind the stalled builder) before the
+        // gate lifts. A fixed sleep that expired early would let the builder finish and
+        // the others merely hit a warm cache — the count would still be 1 and this test
+        // would pass while proving nothing.
+        let mut spins = 0;
+        while app.local_snapshot_waiter_count() < 3 {
+            tokio::task::yield_now().await;
+            spins += 1;
+            assert!(
+                spins < 100_000,
+                "surfaces never reached the shared path; only {} of 3 entered",
+                app.local_snapshot_waiter_count()
+            );
+        }
+
+        assert_eq!(
+            app.local_snapshot_build_count(),
+            0,
+            "with the relay write lock held no build can finish — if this trips, the \
+             surfaces were not actually overlapping and the rest of this test proves nothing"
+        );
+
+        drop(gate);
+
+        let mut payloads = Vec::new();
+        for handle in handles {
+            payloads.push(handle.await.expect("surface task should not panic"));
+        }
+
+        assert_eq!(
+            app.local_snapshot_build_count(),
+            1,
+            "three surfaces waking on one change version must collapse into a single \
+             build; per-connection builds mean N write-lock acquisitions per notify"
+        );
+        assert!(
+            Arc::ptr_eq(&payloads[0], &payloads[1]) && Arc::ptr_eq(&payloads[1], &payloads[2]),
+            "surfaces must share one payload allocation, not N equal copies"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_change_version_rebuilds_instead_of_serving_the_stale_payload() {
+        let (app, relay) = build_app().await;
+
+        let first = app.local_snapshot_payload().await;
+        let cached = app.local_snapshot_payload().await;
+        assert_eq!(
+            app.local_snapshot_build_count(),
+            1,
+            "a second surface on the same version must reuse the build"
+        );
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        relay.write().await.notify();
+
+        let after_notify = app.local_snapshot_payload().await;
+        assert_eq!(
+            app.local_snapshot_build_count(),
+            2,
+            "a cache that never invalidates would freeze every local surface on the \
+             first snapshot it ever saw"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &after_notify),
+            "the post-notify payload must be a fresh build, not the stale allocation"
+        );
+    }
+
+    // A snapshot is NOT a pure function of the revision: `server_time` and
+    // `devices_revision` come from the clock, and building one runs the controller /
+    // turn-liveness expiry sweeps. So the cache may only serve the fan-out of one
+    // notification. A surface that CONNECTS during a quiet period must get a
+    // point-in-time frame — otherwise it is handed a snapshot built arbitrarily long
+    // ago, and that frame, carrying the same revision but older time metadata, lands on
+    // top of the state the client just fetched from `/api/session`.
+    #[tokio::test]
+    async fn a_connecting_surface_is_never_served_a_cached_frame() {
+        let (app, _relay) = build_app().await;
+
+        // Warm the cache the way a notify fan-out would, and then do NOT bump the
+        // revision: this is the quiet period a reconnect can land in.
+        let fanned_out = app.local_snapshot_payload().await;
+        assert_eq!(app.local_snapshot_build_count(), 1);
+
+        let connecting = app.fresh_local_snapshot_payload().await;
+
+        assert_eq!(
+            app.local_snapshot_build_count(),
+            2,
+            "a connecting surface must build its own point-in-time snapshot even though \
+             a cache entry for this revision already exists"
+        );
+        assert!(
+            !Arc::ptr_eq(&fanned_out, &connecting),
+            "the connecting surface must not receive the cached allocation"
+        );
+
+        // The fresh build also refreshes the entry, so surfaces woken later within this
+        // same revision get the newer frame rather than the one it just superseded.
+        let later_waiter = app.local_snapshot_payload().await;
+        assert_eq!(
+            app.local_snapshot_build_count(),
+            2,
+            "the fresh build must repopulate the cache, not bypass and abandon it"
+        );
+        assert!(Arc::ptr_eq(&connecting, &later_waiter));
+    }
+}
