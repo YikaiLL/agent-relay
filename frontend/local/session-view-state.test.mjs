@@ -6,6 +6,7 @@ import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
 import {
   createSessionViewState,
   reduceSessionView,
+  selectContextAfterProjectDelete,
   selectOwningContext,
   sessionViewContextKey,
   sessionViewHistoryEntry,
@@ -610,5 +611,63 @@ test("selectOwningContext never returns null, so no caller can fall back to curr
   ]) {
     const context = selectOwningContext(args);
     assert.ok(context && typeof context.kind === "string", `null-ish context for ${JSON.stringify(args)}`);
+  }
+});
+
+// --- where deleting a project leaves you ------------------------------------
+
+test("deleting the project you are IN returns you to the default workspace", () => {
+  assert.deepEqual(
+    selectContextAfterProjectDelete({
+      context: { kind: "project", projectId: "proj_a" },
+      deletedProjectId: "proj_a",
+    }),
+    { kind: "sessions" }
+  );
+});
+
+// The receipt lists every surviving project, and the old inline branch navigated to
+// the first of them. Nothing here can consult that list, which is the point: there is
+// no number of survivors — zero, one, many — that changes the answer.
+test("deleting the project you are in ignores how many projects survive", () => {
+  const answer = selectContextAfterProjectDelete({
+    context: { kind: "project", projectId: "proj_a" },
+    deletedProjectId: "proj_a",
+  });
+  assert.deepEqual(answer, { kind: "sessions" });
+  assert.equal(
+    selectContextAfterProjectDelete.length <= 1,
+    true,
+    "it takes one options object and no survivor list — a list it cannot see is a list it cannot follow"
+  );
+});
+
+// Null, not `{kind:"sessions"}`: the caller reads null as "do not navigate". Returning
+// the sessions context here would make deleting some OTHER project from a menu throw
+// you out of the project you are working in.
+test("deleting a different project does not move you", () => {
+  assert.equal(
+    selectContextAfterProjectDelete({
+      context: { kind: "project", projectId: "proj_a" },
+      deletedProjectId: "proj_b",
+    }),
+    null
+  );
+});
+
+test("deleting a project while in the default workspace does not move you", () => {
+  assert.equal(
+    selectContextAfterProjectDelete({ context: { kind: "sessions" }, deletedProjectId: "proj_a" }),
+    null
+  );
+});
+
+test("a missing project id is never treated as a match", () => {
+  for (const deletedProjectId of ["", null, undefined, 0]) {
+    assert.equal(
+      selectContextAfterProjectDelete({ context: { kind: "project", projectId: "proj_a" }, deletedProjectId }),
+      null,
+      `${JSON.stringify(deletedProjectId)} must not match a real selection`
+    );
   }
 });

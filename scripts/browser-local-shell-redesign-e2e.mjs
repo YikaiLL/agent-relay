@@ -287,19 +287,75 @@ async function run() {
     // with no mode to enter, landing you in an arbitrary surviving project would be the
     // sidebar choosing a container on your behalf. No selection means the default
     // workspace, which is a real destination.
+    // Record every routed context for the duration of the delete. The END state cannot
+    // tell the two candidate behaviours apart: navigating to a surviving project and
+    // then having `dropStaleProjectSelection` clear it lands in exactly the same place
+    // as never navigating at all. Only the TRANSIT differs — and a user sees it as a
+    // flash of someone else's session list. Verified: with the survivor branch restored,
+    // every end-state assertion below still passes and this one fails.
+    const deletedProjectId = await page.evaluate(
+      () => document.querySelector("#threads-list .thread-group-header-project")?.dataset.projectId || null
+    );
+    assert.ok(deletedProjectId, "the project about to be deleted is the pinned one");
+    await page.evaluate(() => {
+      window.__routedContexts = [];
+      for (const name of ["pushState", "replaceState"]) {
+        const original = history[name].bind(history);
+        history[name] = (state, title, url) => {
+          window.__routedContexts.push(state?.context ?? null);
+          return original(state, title, url);
+        };
+      }
+    });
+
     await page.locator("#threads-list .thread-group-header-project", { hasText: "Gamma" }).first().click({ button: "right" });
     await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
     await page.click("#delete-project-button");
+    // Settle on the REFRESHED switcher, not on the header disappearing. "No project
+    // header" is also true for a frame in the middle of the refetch, so waiting for it
+    // can pass against a fallback navigation that has not run yet — and then the next
+    // step selects the survivor anyway, hiding the difference completely.
+    await page.click(".project-switcher-trigger");
+    await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
     await page.waitForFunction(
       () => {
-        const names = [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim());
-        return (
-          !names.some((n) => /Gamma/.test(n))
-          && !document.querySelector("#threads-list .thread-group-header-project")
-        );
+        const options = [...document.querySelectorAll(".project-switcher-option")]
+          .map((node) => node.textContent.trim());
+        return options.includes("Second Project") && !options.includes("Gamma Project");
       },
       { timeout: TIMEOUT_MS }
     );
+    const afterDelete = await page.evaluate(() => ({
+      activeOption: document.querySelector(".project-switcher-option.is-active")?.textContent?.trim() || null,
+      routedProjectId: window.history.state?.context?.projectId || null,
+      projectHeaders: document.querySelectorAll("#threads-list .thread-group-header-project").length,
+    }));
+    await page.keyboard.press("Escape");
+
+    // A survivor EXISTS at this point, which is the whole point: deleting the project
+    // you are in returns you to the default workspace rather than to whichever project
+    // happens to sort first.
+    assert.equal(
+      afterDelete.routedProjectId,
+      null,
+      `deleting the selected project must land in the default workspace, got ${afterDelete.routedProjectId}`
+    );
+    assert.equal(afterDelete.activeOption, "Default Workspace", "and the menu says so");
+    assert.equal(afterDelete.projectHeaders, 0, "with no project pinned in the list");
+
+    const strayed = await page.evaluate(
+      (deleted) =>
+        (window.__routedContexts || [])
+          .map((context) => context?.projectId || null)
+          .filter((id) => id && id !== deleted),
+      deletedProjectId
+    );
+    assert.deepEqual(
+      strayed,
+      [],
+      `deleting a project must not route through another one on the way out, got ${JSON.stringify(strayed)}`
+    );
+
     // Delete the remaining project too. Its header exists only while it is pinned, so
     // reaching it goes through the switcher — which is the point of the control.
     await selectProjectInSwitcher(page, "Second Project");

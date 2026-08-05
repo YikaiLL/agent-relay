@@ -228,6 +228,7 @@ import {
   browserSessionViewPersistence,
 } from "./local/session-view-persistence.js";
 import {
+  selectContextAfterProjectDelete,
   sessionViewContextKey,
 } from "./local/session-view-state.js";
 import {
@@ -1647,18 +1648,19 @@ async function deleteProjectFromHeader(projectId, name) {
     return;
   }
   try {
-    const context = sessionViewStore.getState().location.context;
-    const wasSelected =
-      context.kind === "project" && context.projectId === projectId;
-    const receipt = await deleteProject(apiFetch, projectId);
-    if (wasSelected) {
-      const fallbackProjectId = receipt?.projects?.[0]?.id || null;
-      await sessionViewController.showOverview(
-        fallbackProjectId
-          ? { kind: "project", projectId: fallbackProjectId }
-          : { kind: "sessions" },
-        { replace: true }
-      );
+    // Decided BEFORE the await, from the context you were actually in. The receipt's
+    // surviving-project list is deliberately not consulted: this used to navigate to
+    // `receipt.projects[0]`, which raced `dropStaleProjectSelection` clearing the same
+    // selection — two mechanisms with opposite answers, and whichever landed last won.
+    // The clearing one happened to win, so the behaviour was right while the code said
+    // the opposite.
+    const nextContext = selectContextAfterProjectDelete({
+      context: sessionViewStore.getState().location.context,
+      deletedProjectId: projectId,
+    });
+    await deleteProject(apiFetch, projectId);
+    if (nextContext) {
+      await sessionViewController.showOverview(nextContext, { replace: true });
     }
     logLine(`Deleted project "${name}".`);
   } catch (error) {

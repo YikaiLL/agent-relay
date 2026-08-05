@@ -80,6 +80,39 @@ export function selectOwningContext({ threadId = null, threadProjectId = null } 
   return projectId ? { kind: "project", projectId } : { kind: "sessions" };
 }
 
+/**
+ * Where to go after deleting a project.
+ *
+ * Returns null when the deletion does not concern the current context — the caller must
+ * not navigate at all then, or deleting a project from a list would yank you out of the
+ * one you are in.
+ *
+ * When it IS the one you are in, the answer is the sessions context and nothing else.
+ * It used to be "the first surviving project", which existed so that entering Projects
+ * mode always had something to show; with no mode to enter, landing you in whichever
+ * project happens to sort first is the sidebar choosing a container on your behalf —
+ * and it can put the next agent you start somewhere you never looked at.
+ *
+ * Extracted because it was an inline branch racing `dropStaleProjectSelection`: one
+ * navigated to a survivor, the other cleared the selection, and which won decided the
+ * behaviour. The observable outcome happened to be the intended one, which is the
+ * worst kind of correct — the code said the opposite of what shipped.
+ *
+ * Deliberately takes no survivor list. There is no receipt shape that changes the
+ * answer, so there is none to get wrong.
+ */
+export function selectContextAfterProjectDelete({ context = null, deletedProjectId = "" } = {}) {
+  const deleted = stringId(deletedProjectId);
+  if (!deleted) {
+    return null;
+  }
+  const current = normalizeSessionViewContext(context);
+  if (current.kind !== "project" || current.projectId !== deleted) {
+    return null;
+  }
+  return { kind: "sessions" };
+}
+
 export function sessionViewContextKey(context) {
   const normalized = normalizeSessionViewContext(context);
   if (normalized.kind === "sessions") {
