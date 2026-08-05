@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+
+import { DEFAULT_WORKSPACE_LABEL } from "../frontend/local/header-labels.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -63,17 +65,16 @@ async function main() {
       const log = document.querySelector("#client-log-root")?.textContent || "";
       return log.includes("Relay booted");
     });
-    // Before any conversation is open the header shows the product name ("Relay
-    // console"), never the workspace basename — under the new rules the workspace name
-    // is not a header title. We still accept the basename / a transient "Ready in …"
-    // so this stays robust across shell states.
+    // The header title is the Project switcher's trigger now, so it names the
+    // container that switcher selects — a project, or the default workspace. It is
+    // never the product name and never the workspace basename: the switcher cannot
+    // select a directory, so naming one would leave the trigger disagreeing with
+    // the option marked active in its own menu. The cwd is the tooltip instead.
     const launchWorkspaceTitle = (await page.textContent("#workspace-title")) || "";
-    const expectedWorkspaceName = path.basename(ROOT);
-    assert.ok(
-      launchWorkspaceTitle === "Relay console"
-        || /^Ready in .+$/.test(launchWorkspaceTitle)
-        || launchWorkspaceTitle === expectedWorkspaceName,
-      `workspace header should render the launch or active workspace state (got "${launchWorkspaceTitle}")`
+    assert.equal(
+      launchWorkspaceTitle,
+      DEFAULT_WORKSPACE_LABEL,
+      `header names the selected container, not the product or the folder (got "${launchWorkspaceTitle}")`
     );
     assert.ok(
       ((await page.textContent("#overview-security-badges")) || "").trim().length > 0,

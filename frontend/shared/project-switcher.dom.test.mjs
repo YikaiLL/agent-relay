@@ -1,8 +1,8 @@
 // The Project switcher's behaviour contract.
 //
 // The switcher is navigation, not filtering: every selection leaves the session
-// list complete, so "All sessions" is a real destination rather than a way out of
-// a narrowed state. These tests pin the parts that are easy to get subtly wrong —
+// list complete, so the default workspace is a real destination rather than a way
+// out of a narrowed state. These tests pin the parts that are easy to get subtly wrong —
 // a stale selection, and Escape.
 //
 // Kept in its own file so the DOM globals below don't leak into the static suite.
@@ -20,7 +20,7 @@ global.IS_REACT_ACT_ENVIRONMENT = true;
 const React = (await import("react")).default;
 const { act } = await import("react");
 const { createRoot } = await import("react-dom/client");
-const { ProjectSwitcher } = await import("./project-switcher.js");
+const { ALL_SESSIONS_LABEL, ProjectSwitcher } = await import("./project-switcher.js");
 
 const PROJECTS = [
   { id: "proj_pay", name: "Payments rework" },
@@ -74,9 +74,9 @@ function open(host) {
   });
 }
 
-test("with nothing selected it reads as All sessions", () => {
+test("with nothing selected it reads as the default workspace", () => {
   const view = mount({ activeProjectId: null });
-  assert.equal(trigger(view.host).textContent, "All sessions");
+  assert.equal(trigger(view.host).textContent, ALL_SESSIONS_LABEL);
   view.cleanup();
 });
 
@@ -90,17 +90,17 @@ test("with a project selected it names the project", () => {
 // grouper independently falls back to plain cwd grouping for an id it cannot
 // resolve, so the control has to reach the same answer or the header would name a
 // project the list is no longer showing.
-test("a selection whose project is gone falls back to All sessions, not a dangling name", () => {
+test("a selection whose project is gone falls back to the default workspace, not a dangling name", () => {
   const view = mount({ activeProjectId: "proj_deleted" });
-  assert.equal(trigger(view.host).textContent, "All sessions");
+  assert.equal(trigger(view.host).textContent, ALL_SESSIONS_LABEL);
   view.cleanup();
 });
 
-test("the menu lists All sessions, every project, and the create action", () => {
+test("the menu lists the default workspace, every project, and the create action", () => {
   const view = mount({ activeProjectId: null, onCreateProject() {} });
   open(view.host);
   assert.deepEqual(options(view.host), [
-    "All sessions",
+    ALL_SESSIONS_LABEL,
     "Payments rework",
     "Docs",
     "New project",
@@ -129,11 +129,11 @@ test("choosing a project reports its id and closes the menu", () => {
 // Null, not the string "sessions" or an empty string: the caller maps it to the
 // sessions context, and a falsy-but-not-null id would read as "some project" to a
 // truthiness check downstream.
-test("choosing All sessions reports null", () => {
+test("choosing the default workspace reports null", () => {
   const chosen = [];
   const view = mount({ activeProjectId: "proj_pay", onSelectProject: (id) => chosen.push(id) });
   open(view.host);
-  clickOption(view.host, "All sessions");
+  clickOption(view.host, ALL_SESSIONS_LABEL);
 
   assert.deepEqual(chosen, [null]);
   view.cleanup();
@@ -183,9 +183,9 @@ test("Escape closes the menu without letting the key reach the surface behind it
   view.cleanup();
 });
 
-test("an empty project list still offers All sessions and creating one", () => {
+test("an empty project list still offers the default workspace and creating one", () => {
   const view = mount({ activeProjectId: null, onCreateProject() {}, projects: [] });
   open(view.host);
-  assert.deepEqual(options(view.host), ["All sessions", "New project"]);
+  assert.deepEqual(options(view.host), [ALL_SESSIONS_LABEL, "New project"]);
   view.cleanup();
 });

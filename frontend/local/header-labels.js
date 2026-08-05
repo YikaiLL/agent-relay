@@ -12,12 +12,23 @@
 //    thread and never the workspace; that rule existed to stop the workspace
 //    name dominating every screen, which the tab strip has since made moot.)
 //
-//  - Which container depends on how you are browsing. In Projects mode the
-//    container is the selected project, and it carries the New agent action,
-//    because starting an agent *into a project* is the thing you do from there.
-//    In Sessions mode sessions are grouped by working directory, so the folder
-//    is the container. A project never leaks into Sessions mode: it would name
-//    a grouping the user isn't looking at.
+//  - The title IS the Project switcher's trigger. Adding the switcher as its own
+//    row re-created the very duplication the rule above exists to prevent — the
+//    project name once in the header and again immediately beneath it — so the
+//    two are one control: what it says is where you are, clicking it is how you
+//    go elsewhere.
+//
+//  - The container is the selected project, or "Default Workspace" when none is
+//    selected. It is not the working directory. The folder used to be the title
+//    in Sessions mode, but a title that is also a switcher trigger has to name
+//    something the switcher can actually switch to, and it cannot switch
+//    directories. The folder is not lost: it is the tooltip, and the sidebar
+//    still groups by it.
+//
+//  - "Default Workspace" is where sessions in no project live. Note this repo
+//    already uses "workspace" for a git working tree (workspace_diff, the
+//    Workspace panel) and for a tab set (tab-workspace-store). This is the tab-set
+//    sense. If that collision ever bites, this constant is the only place to change.
 //
 //  - The title is a basename, not a path. Full paths do not survive a title bar
 //    at any useful width; the path goes on `titleTooltip` so nothing is lost.
@@ -26,6 +37,11 @@
 //    type, it's live) and it collided with the run-state badge ("Idle") beside it.
 //
 //  - "read-only" stays: it's a real warning (the composer is disabled).
+// Where sessions in no project live. Exported so the switcher's menu and the
+// header trigger cannot drift apart — they render the same string or neither is
+// telling the truth.
+export const DEFAULT_WORKSPACE_LABEL = "Default Workspace";
+
 export function selectHeaderLabels({
   hasWorkspace = false,
   activeThreadId = null,
@@ -42,22 +58,23 @@ export function selectHeaderLabels({
   const label = threadLabel || "";
   const inConversation = Boolean(viewingConversation && activeThreadId);
 
-  // Projects mode wins only when a project is actually selected; otherwise fall
-  // through to the folder rather than showing a bare product name over a real
-  // conversation.
+  // Projects mode wins only when a project is actually selected; otherwise this
+  // is the default workspace.
   const inProjectsMode = sidebarMode === "projects" && Boolean(projectName);
 
-  let title;
+  // The title is the switcher's trigger, so it names what the switcher selects:
+  // a project, or the default workspace. The working directory is a grouping the
+  // switcher cannot select, so it rides along as the tooltip instead of taking
+  // the title — which also keeps the trigger's text agreeing with the option
+  // marked active in its own menu.
+  const title = inProjectsMode ? projectName : DEFAULT_WORKSPACE_LABEL;
   let titleTooltip;
   if (inProjectsMode) {
-    title = projectName;
     titleTooltip = projectName;
-  } else if (inConversation && workspaceName) {
-    title = workspaceName;
+  } else if (workspacePath || workspaceName) {
     titleTooltip = workspacePath || workspaceName;
   } else {
-    title = "Relay console";
-    titleTooltip = "";
+    titleTooltip = DEFAULT_WORKSPACE_LABEL;
   }
 
   // The New agent button belongs to a project, so it appears exactly where a

@@ -537,7 +537,10 @@ function ChatHeader() {
         h(
           "div",
           { className: "chat-heading-title-row" },
-          h("h1", { id: "workspace-title" }, "Relay console"),
+          // The Project switcher IS the header title — one control answering
+          // "where am I", not a title plus a switcher naming the same thing one
+          // row below it. Its own sub-root, filled by renderProjectSwitcher().
+          h("div", { className: "project-switcher-mount", id: "project-switcher-mount" }),
           h(
             "button",
             {
@@ -760,10 +763,6 @@ function ChatShell() {
     "main",
     { className: "chat-shell", "data-view": "console" },
     h(ChatHeader),
-    // Project switcher, directly above the tab strip because the two are one
-    // hierarchy: the switcher picks the container, the strip shows that
-    // container's open sessions. Its own sub-root, same reason as the strip.
-    h("div", { className: "project-switcher-mount", id: "project-switcher-mount" }),
     // Tab strip for the active project's open sessions. Filled by
     // renderSessionTabs() through its own React sub-root, like #client-log-root —
     // the shell is rendered once, so anything data-driven needs its own root.

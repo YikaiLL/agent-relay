@@ -79,7 +79,6 @@ import {
   threadsList,
   threadsRefreshButton,
   transcript,
-  workspaceTitle,
   workspaceSubtitle,
   workspaceDiffModal,
   closeWorkspaceDiffModalButton,
@@ -927,6 +926,7 @@ const renderer = createSessionRenderer({
   // method here because several call sites (sidebar rows, tab strip) need the one
   // implementation — they used to each inline a copy of its body.
   viewThread: viewThreadById,
+  renderProjectSwitcher,
   renderSessionTabs,
   // Projects master-detail: select a project and show its card overview in the main
   // area. Clears any open session so the overview (not a transcript) is what renders;
@@ -4196,7 +4196,15 @@ let projectSwitcherRootElement = null;
 
 // The Project switcher above the tab strip. Its own sub-root for the same reason
 // the strip has one: the shell renders once, so anything data-driven needs its own.
-function renderProjectSwitcher() {
+// `label`/`labelTooltip` come from render-session's headerLabels — the switcher is
+// the header title, so its text is that module's decision, not this one's. The
+// last labels are remembered because navigation and Projects-store changes also
+// re-render this control, and they have no opinion about the title.
+let lastSwitcherLabels = { label: "", labelTooltip: "" };
+function renderProjectSwitcher(labels = null) {
+  if (labels) {
+    lastSwitcherLabels = labels;
+  }
   const mount = document.getElementById("project-switcher-mount");
   if (!mount) {
     return;
@@ -4212,7 +4220,10 @@ function renderProjectSwitcher() {
   projectSwitcherRootHandle.render(
     React.createElement(ProjectSwitcher, {
       activeProjectId: context?.kind === "project" ? context.projectId : null,
+      label: lastSwitcherLabels.label,
+      labelTooltip: lastSwitcherLabels.labelTooltip,
       projects: state.projects || [],
+      titleId: "workspace-title",
       onCreateProject() {
         void createProjectFromToolbar();
       },

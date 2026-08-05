@@ -13,6 +13,7 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { DEFAULT_WORKSPACE_LABEL } from "../frontend/local/header-labels.js";
 import { prepareSeededCodexHome } from "./e2e-codex-home.mjs";
 import { launchBrowser } from "./e2e/harness/browser.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
@@ -408,8 +409,8 @@ async function main() {
       // Borrowing the 45s default would spend 45s reaching a failure it already knew.
       try {
         await page.waitForFunction(
-          () => document.querySelector(".project-switcher-trigger")?.textContent?.trim() === "All sessions",
-          null,
+          (expected) => document.querySelector(".project-switcher-trigger")?.textContent?.trim() === expected,
+          DEFAULT_WORKSPACE_LABEL,
           { timeout: 8000 }
         );
       } catch {}
@@ -759,7 +760,7 @@ async function main() {
     );
     assert.equal(
       unassignedOpenedInSessions,
-      "All sessions",
+      DEFAULT_WORKSPACE_LABEL,
       `opening an unassigned row must leave the selected project, not adopt it into P's tab set: ${unassignedOpenedInSessions}`
     );
 

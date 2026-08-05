@@ -253,6 +253,7 @@ export function createSessionRenderer({
   viewThread,
   // Re-render the open-session tab strip. Injected (rather than imported) because
   // it owns its own React sub-root over in app.js, same as the client log.
+  renderProjectSwitcher = () => {},
   renderSessionTabs = () => {},
   enterProjectOverview,
   startProjectAgent,
@@ -387,8 +388,12 @@ export function createSessionRenderer({
       workspaceName: workspace ? workspaceBasename(workspace) : "",
       workspacePath: workspace,
     });
-    workspaceTitle.textContent = headerLabels.title;
-    workspaceTitle.title = headerLabels.titleTooltip;
+    // The title is the switcher's trigger now, so it is rendered rather than
+    // written: one control, one owner. `header-labels.js` still decides the text.
+    renderProjectSwitcher({
+      label: headerLabels.title,
+      labelTooltip: headerLabels.titleTooltip,
+    });
     workspaceSubtitle.textContent = headerLabels.subtitle;
     if (headerNewAgentButton) {
       // The id rides on the element so the click handler in app.js doesn't have to

@@ -5612,38 +5612,61 @@ body.is-resizing-panel {
   margin-left: auto;
 }
 
-/* ===== Project switcher — picks which project is pinned to the top of the list ===== */
-/* Sits directly above the tab strip because the two are one hierarchy: this picks
- * the container, the strip shows that container's open sessions. Styled to read as
- * a breadcrumb rather than a segmented control — it is a place you ARE, not a mode
- * you toggle, and the list below it stays complete in every selection. */
+/* ===== Project switcher — the header title, and how you change containers ===== */
+/* This IS the <h1>. It was briefly a separate row under the header, which put the
+ * project name on screen twice — the duplication header-labels.js exists to
+ * prevent, one layer up. One control: what it says is where you are. */
 .project-switcher {
   position: relative;
   display: flex;
   align-items: center;
-  padding: 4px 6px 0;
-  background: var(--bg-surface);
+  min-width: 0;
+}
+
+/* Standalone default; on local `.chat-heading h1` overrides it so the trigger is
+ * typographically the title it replaced, to the pixel. */
+.project-switcher-heading {
+  margin: 0;
+  min-width: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  font-weight: var(--weight-strong);
+  line-height: var(--leading-tight);
+}
+
+/* `.local-frame .chat-heading h1` clips with an ellipsis — written when the
+ * heading held plain text. It now holds this button, whose LABEL owns the
+ * ellipsis, and clipping at both levels truncates the text before the button has
+ * spent the width it was given. One clipper, and it is the label. */
+.local-frame .chat-heading h1.project-switcher-heading {
+  max-width: none;
+  overflow: visible;
 }
 
 .project-switcher-trigger {
   display: inline-flex;
   align-items: center;
+  /* Buttons are centred flex containers globally, so left alignment needs BOTH
+   * this and text-align — text-align alone silently does nothing. */
+  justify-content: flex-start;
   gap: 6px;
-  max-width: 100%;
+  min-width: 0;
   border: 0;
-  padding: 4px 8px;
-  border-radius: 6px;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border-radius: var(--r-sm);
+  /* Inherit from the heading rather than restate a size: the heading is what the
+   * surface styles, so the trigger cannot drift away from the title it is. */
   font: inherit;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-strong);
-  color: var(--text-primary);
+  color: var(--text-1);
+  text-align: left;
   background: transparent;
   cursor: pointer;
 }
 
 .project-switcher-trigger:hover,
 .project-switcher-trigger[aria-expanded="true"] {
-  background: var(--surface-2, var(--bg-surface));
+  background: var(--surface-2);
 }
 
 .project-switcher-label {
@@ -5652,30 +5675,31 @@ body.is-resizing-panel {
   white-space: nowrap;
 }
 
-/* A caret drawn in CSS rather than an icon import: one glyph, and it has to flip. */
+/* Drawn in CSS rather than imported: one glyph, and it has to flip. */
 .project-switcher-caret {
   flex: 0 0 auto;
   width: 0;
   height: 0;
   border-left: 4px solid transparent;
   border-right: 4px solid transparent;
-  border-top: 5px solid var(--text-secondary);
+  border-top: 5px solid var(--text-2);
+  transition: transform 120ms ease;
 }
 
 .project-switcher-trigger[aria-expanded="true"] .project-switcher-caret {
   transform: rotate(180deg);
 }
 
-/* Absolute, not fixed: it is anchored to the trigger and scrolls with it. (The
- * sidebar's .context-menu is fixed and needs bounding-box measurement; this does
- * not, which is the difference worth remembering when testing them.) */
+/* Absolute, not fixed: anchored to the trigger and scrolls with it. (The sidebar's
+ * .context-menu is fixed and needs bounding-box measurement; this does not — worth
+ * remembering when testing them.) Left edge flush with the title. */
 .project-switcher-menu {
   position: absolute;
   z-index: 40;
-  top: calc(100% + 2px);
-  left: 6px;
-  min-width: 200px;
-  max-width: 320px;
+  top: calc(100% + 4px);
+  left: -6px;
+  min-width: 220px;
+  max-width: 340px;
   max-height: 60vh;
   overflow-y: auto;
   display: flex;
@@ -5687,30 +5711,43 @@ body.is-resizing-panel {
   border-radius: var(--r-md);
   background: var(--surface-2);
   box-shadow: var(--shadow-popover);
+  animation: surface-enter 120ms ease;
 }
 
 .project-switcher-option {
+  width: 100%;
   border: 0;
-  padding: 6px 10px;
-  border-radius: 6px;
-  font: inherit;
-  font-size: var(--text-sm);
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  font-weight: var(--weight-medium);
+  /* See the trigger: justify-content is the one that actually left-aligns. */
+  justify-content: flex-start;
   text-align: left;
-  color: var(--text-primary);
+  color: var(--text-1);
   background: transparent;
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: background 90ms ease, color 90ms ease;
 }
 
-.project-switcher-option:hover {
-  background: var(--surface-2, var(--bg-surface));
+/* --surface-3, not --surface-2: the MENU is surface-2, so hovering to the same
+ * token painted an invisible highlight. */
+.project-switcher-option:hover,
+.project-switcher-option:focus-visible {
+  background: var(--surface-3);
 }
 
 .project-switcher-option.is-active {
   font-weight: var(--weight-strong);
-  background: var(--surface-2, var(--bg-surface));
+  background: var(--surface-3);
+}
+
+.project-switcher-option.is-active:hover {
+  background: var(--surface-4, var(--surface-3));
 }
 
 /* Creating is a different KIND of act from navigating, so it is separated rather
@@ -5718,7 +5755,11 @@ body.is-resizing-panel {
 .project-switcher-create {
   margin-top: 4px;
   padding-top: 8px;
-  border-top: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
-  border-radius: 0 0 6px 6px;
+  border-top: 1px solid var(--border-faint);
+  color: var(--text-2);
+  border-radius: 0 0 var(--r-sm) var(--r-sm);
+}
+
+.project-switcher-create:hover {
+  color: var(--text-1);
 }

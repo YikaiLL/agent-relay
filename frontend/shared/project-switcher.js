@@ -20,15 +20,22 @@ import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 
 const h = React.createElement;
 
-export const ALL_SESSIONS_LABEL = "All sessions";
+export const ALL_SESSIONS_LABEL = "Default Workspace";
 
 export function ProjectSwitcher({
   activeProjectId = null,
   className = "",
   createLabel = "New project",
+  // The trigger's text and tooltip. Supplied by the surface rather than derived
+  // here, because on local this control IS the header title and that decision
+  // lives in `header-labels.js` — one tested place for "what does the header
+  // say", instead of two that agree until they don't.
+  label = "",
+  labelTooltip = "",
   onCreateProject = null,
   onSelectProject = null,
   projects = [],
+  titleId = null,
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef(null);
@@ -74,9 +81,10 @@ export function ProjectSwitcher({
   // default rather than a dangling name. The grouper independently falls back to
   // plain cwd grouping for the same id, so the control and the list agree without
   // either having to tell the other.
-  const currentLabel = activeProject
+  const derivedLabel = activeProject
     ? activeProject.name || activeProject.id
     : ALL_SESSIONS_LABEL;
+  const currentLabel = label || derivedLabel;
 
   const choose = (projectId) => {
     close();
@@ -89,20 +97,32 @@ export function ProjectSwitcher({
       className: `project-switcher${className ? ` ${className}` : ""}`,
       ref: rootRef,
     },
+    // An <h1> wrapping the <button>, not the other way round: a heading is flow
+    // content and would be invalid inside a button, and this element IS the page
+    // heading on local — the switcher replaced the header title rather than
+    // sitting under it.
     h(
-      "button",
-      {
-        "aria-expanded": open ? "true" : "false",
-        "aria-haspopup": "menu",
-        "aria-controls": open ? menuId : undefined,
-        className: "project-switcher-trigger",
-        "data-active-project-id": activeProjectId || "",
-        onClick: () => setOpen((wasOpen) => !wasOpen),
-        title: `Project: ${currentLabel}`,
-        type: "button",
-      },
-      h("span", { className: "project-switcher-label" }, currentLabel),
-      h("span", { "aria-hidden": "true", className: "project-switcher-caret" })
+      "h1",
+      { className: "project-switcher-heading" },
+      h(
+        "button",
+        {
+          "aria-expanded": open ? "true" : "false",
+          "aria-haspopup": "menu",
+          "aria-controls": open ? menuId : undefined,
+          className: "project-switcher-trigger",
+          "data-active-project-id": activeProjectId || "",
+          onClick: () => setOpen((wasOpen) => !wasOpen),
+          title: labelTooltip || currentLabel,
+          type: "button",
+        },
+        h(
+          "span",
+          { className: "project-switcher-label", id: titleId || undefined },
+          currentLabel
+        ),
+        h("span", { "aria-hidden": "true", className: "project-switcher-caret" })
+      )
     ),
     open
       ? h(
