@@ -418,25 +418,22 @@ async function run() {
     assert.ok(survivorId, "parked on the surviving project before releasing the delete");
 
     releaseDelete();
+    // Open the menu FIRST, then wait for its refreshed contents. The previous version
+    // required the menu to already be open inside the predicate — which selecting
+    // "Fresh Project" had just closed — so it burned Playwright's default timeout on
+    // every run and only ever reached the list through its own `.catch()`. It also
+    // passed `{ timeout }` as the predicate's ARGUMENT rather than as options, so the
+    // timeout it did wait was the default rather than the one written here.
+    await page.click(".project-switcher-trigger");
+    await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
     await page.waitForFunction(
-      () => {
-        const trigger = document.querySelector(".project-switcher-trigger");
-        if (trigger?.getAttribute("aria-expanded") !== "true") return false;
-        const options = [...document.querySelectorAll(".project-switcher-option")].map((n) => n.textContent.trim());
-        return !options.includes("Race Project");
-      },
-      { timeout: TIMEOUT_MS },
-      // Open the menu so the wait can observe the refreshed project list.
-    ).catch(async () => {
-      await page.click(".project-switcher-trigger");
-      await page.waitForFunction(
-        () =>
-          ![...document.querySelectorAll(".project-switcher-option")]
-            .map((n) => n.textContent.trim())
-            .includes("Race Project"),
-        { timeout: TIMEOUT_MS }
-      );
-    });
+      () =>
+        ![...document.querySelectorAll(".project-switcher-option")]
+          .map((node) => node.textContent.trim())
+          .includes("Race Project"),
+      undefined,
+      { timeout: TIMEOUT_MS }
+    );
     await page.keyboard.press("Escape");
 
     assert.equal(

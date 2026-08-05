@@ -514,7 +514,7 @@ projectsStore.subscribe((projectsState) => {
   // pinned group's name and its activity roll-up — so gating this on "a project is
   // selected" would leave a rename unpainted exactly when the rename mattered.
   if (projectsState.loaded && !projectsState.loading && !projectsState.error) {
-    dropStaleProjectSelection();
+    void dropStaleProjectSelection();
   }
   renderThreads();
   if (state.session) {
@@ -1434,7 +1434,11 @@ function syncThreadListViewFromContext(context) {
 // that half went with the mode. "No project selected" is now the default workspace,
 // and auto-jumping into an arbitrary project would be the sidebar choosing a container
 // on your behalf.
-function dropStaleProjectSelection() {
+async function dropStaleProjectSelection() {
+  // Same hazard as the delete handler, same fix: a project click that has not finished
+  // persisting still reports as the previous context, so sweeping without draining the
+  // queue first would clear a selection the user has just made.
+  await sessionViewController.whenIdle();
   const context = sessionViewStore.getState().location.context;
   if (context.kind !== "project") {
     return;
@@ -1649,19 +1653,26 @@ async function deleteProjectFromHeader(projectId, name) {
   }
   try {
     await deleteProject(apiFetch, projectId);
-    // Decided AFTER the await, from the context as it is when the delete COMPLETES —
-    // not as it was when you confirmed. The switcher stays interactive for the whole
-    // round trip, so a confirm-time decision outlives the request: delete A, pick B
-    // while it is in flight, and the response yanks you back out of B.
+    // Decided AFTER the await AND after the controller settles — not from a snapshot
+    // taken at confirm time, and not from `getState()` alone.
     //
-    // Reading it late is safe in the other direction too. The only thing that moves the
-    // context by itself is `dropStaleProjectSelection`, which goes to the sessions
-    // context and nowhere else — so a late read either still sees the deleted project
-    // (navigate) or already sees where we wanted to end up (do nothing).
+    // The confirm-time snapshot outlived the request: the switcher stays interactive
+    // for the whole round trip, so deleting A and then picking B let the response yank
+    // you back out of B. Reading `getState()` late fixes that only for a navigation
+    // that has already COMMITTED — the controller assigns state after its IndexedDB
+    // transaction resolves, so a click on B that is still persisting reports as "you
+    // are in A", and the reconciliation then queues its own navigation behind B's and
+    // overwrites it.
+    //
+    // `whenIdle` drains that queue, and its loop matters: it re-checks until the queue
+    // stops growing, so a dispatch that lands while we are waiting is waited for too.
+    // A user action arriving AFTER it resolves is dispatched after this reconciliation
+    // and wins on its own, which is the right order.
     //
     // The receipt's surviving-project list is deliberately not consulted. It used to
     // navigate to `receipt.projects[0]`, which raced the same clearing mechanism with
     // the opposite answer.
+    await sessionViewController.whenIdle();
     const nextContext = selectContextAfterProjectDelete({
       context: sessionViewStore.getState().location.context,
       deletedProjectId: projectId,

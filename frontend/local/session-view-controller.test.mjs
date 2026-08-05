@@ -8,6 +8,7 @@ import {
   tabIdForThread,
 } from "../shared/tab-layout.js";
 import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
+import { selectContextAfterProjectDelete } from "./session-view-state.js";
 import {
   createBrowserSessionViewHistoryAdapter,
   createSessionViewController,
@@ -783,4 +784,111 @@ test("booting on a persisted preview tab restores it as a peek, not a keep", asy
   // And it is still the slot the next peek takes.
   await controller.openThread("b", { preview: true });
   assert.deepEqual(threadIds(store.getState().workspaces[SESSIONS_KEY]), ["b"]);
+});
+
+// --- reconciliation must not read a context the user has already left -------
+
+// `performDispatch` assigns `state` only AFTER its persistence transaction resolves,
+// so between clicking a project and that transaction landing, `getState()` still
+// reports the previous context. Anything that reconciles against "where am I" — the
+// project-delete handler, the stale-selection sweep — would decide on the stale answer
+// and then queue its own navigation BEHIND the user's, overwriting it.
+//
+// The browser test for this cannot reach the window: it has to wait for the new
+// project's header before releasing the delete, which means waiting for exactly the
+// commit that closes the gap. Dropping the `whenIdle()` drain leaves that e2e green.
+// This is where the ordering is observable.
+test("a switch that is still persisting reports as the OLD context until it commits", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const inner = fakePersistence();
+  const persistence = {
+    ...inner,
+    async transact(operation) {
+      await gate;
+      return inner.transact(operation);
+    },
+  };
+  const store = createSessionViewStore({
+    initialLocation: { context: project("project-a"), threadId: null },
+    persistence,
+  });
+  const controller = createSessionViewController({
+    store,
+    getProjectIds: () => ["project-a", "project-b"],
+  });
+
+  // The user clicks project B. Do not await it — this is the pending window.
+  const switching = controller.switchContext(project("project-b"));
+  // Let the dispatch actually BEGIN before reading. Reading in the same synchronous
+  // turn observes a state nothing has touched yet, which passes whether or not the
+  // controller assigns eagerly — the read has to happen while the transaction is in
+  // flight, which is the window the bug lives in.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(
+    controller.getState().location.context,
+    project("project-a"),
+    "precondition: the pending switch is invisible to getState()"
+  );
+
+  // What a reconciliation deciding on that stale read would conclude: project A is the
+  // one being deleted, it looks like the current context, so navigate away — straight
+  // over the top of the switch the user just made.
+  assert.deepEqual(
+    selectContextAfterProjectDelete({
+      context: controller.getState().location.context,
+      deletedProjectId: "project-a",
+    }),
+    sessions(),
+    "reading without draining decides to navigate, which would overwrite the user"
+  );
+
+  release();
+  await switching;
+  await controller.whenIdle();
+
+  assert.deepEqual(
+    controller.getState().location.context,
+    project("project-b"),
+    "after the drain the committed context is the one the user chose"
+  );
+  assert.equal(
+    selectContextAfterProjectDelete({
+      context: controller.getState().location.context,
+      deletedProjectId: "project-a",
+    }),
+    null,
+    "and the same decision now leaves them where they went"
+  );
+});
+
+// The loop in `whenIdle` is load-bearing: a dispatch that arrives while it is already
+// waiting must be waited for too, or draining just moves the window rather than
+// closing it.
+test("whenIdle keeps waiting for work queued while it is already waiting", async () => {
+  const store = createSessionViewStore({
+    initialLocation: { context: sessions(), threadId: null },
+    persistence: fakePersistence(),
+  });
+  const controller = createSessionViewController({
+    store,
+    getProjectIds: () => ["project-a", "project-b"],
+  });
+
+  const first = controller.switchContext(project("project-a"));
+  const idle = controller.whenIdle();
+  const second = controller.switchContext(project("project-b"));
+
+  // Assert straight off `idle`, WITHOUT awaiting `second`. Awaiting it first would
+  // make this pass against a `whenIdle` that returns after a single queue tick, which
+  // is precisely the version that leaves the window open.
+  await idle;
+  assert.deepEqual(
+    controller.getState().location.context,
+    project("project-b"),
+    "whenIdle resolved no earlier than the dispatch queued while it was waiting"
+  );
+  await Promise.all([first, second]);
 });
