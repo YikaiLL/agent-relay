@@ -924,34 +924,6 @@ input:focus, textarea:focus, select:focus {
   gap: 12px;
 }
 
-/* Sessions / Projects grouping toggle */
-.thread-view-toggle {
-  display: inline-flex;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 8px;
-  background: var(--surface-2, var(--bg-surface));
-}
-
-.thread-view-toggle-button {
-  flex: 1 1 auto;
-  border: 0;
-  padding: 5px 12px;
-  border-radius: 6px;
-  font: inherit;
-  font-size: var(--text-sm);
-  color: var(--text-secondary);
-  background: transparent;
-  cursor: pointer;
-}
-
-.thread-view-toggle-button.is-active {
-  color: var(--text-primary);
-  background: var(--bg-surface);
-  font-weight: var(--weight-strong);
-  box-shadow: var(--shadow-segmented-selected);
-}
-
 /* THREAD LIST */
 .conversation-list {
   flex: 1 1 auto;
