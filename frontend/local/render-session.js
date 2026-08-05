@@ -30,7 +30,6 @@ import {
   threadsList,
   projectOverviewMount,
   transcript,
-  workspaceTitle,
   workspaceSubtitle,
   headerNewAgentButton,
   workspaceSuggestionsList,
