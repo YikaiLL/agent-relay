@@ -98,6 +98,11 @@ export function selectOwningContext({ threadId = null, threadProjectId = null } 
  * behaviour. The observable outcome happened to be the intended one, which is the
  * worst kind of correct — the code said the opposite of what shipped.
  *
+ * Call it with the context as it is when the delete COMPLETES, never with a snapshot
+ * taken at confirm time. The request is a full round trip and the switcher stays live
+ * throughout it, so a confirm-time answer can overrule a navigation the user made in
+ * between — the null branch above is what makes a late read do the right thing.
+ *
  * Deliberately takes no survivor list. There is no receipt shape that changes the
  * answer, so there is none to get wrong.
  */

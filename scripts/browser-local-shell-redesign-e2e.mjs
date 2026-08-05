@@ -379,6 +379,73 @@ async function run() {
       { timeout: TIMEOUT_MS }
     );
 
+    // --- A late-resolving delete must not overrule where you went meanwhile ---
+    // The delete decides where to leave you. Deciding at CONFIRM time makes that
+    // decision outlive the request: the switcher stays interactive for the whole round
+    // trip, so a user who deletes A and then picks B gets yanked back out of B when the
+    // response lands. The window is one network round trip, which is exactly long
+    // enough for a phone on a slow link.
+    promptValue = "Race Project";
+    await createProjectFromSwitcher(page);
+    await page.waitForFunction(
+      () =>
+        document.querySelector("#threads-list .thread-group-header-project.is-active .thread-group-name")
+          ?.textContent?.trim() === "Race Project",
+      { timeout: TIMEOUT_MS }
+    );
+
+    let releaseDelete;
+    const deleteGate = new Promise((resolve) => { releaseDelete = resolve; });
+    let gatingDelete = true;
+    await page.route("**/api/projects", async (route) => {
+      const request = route.request();
+      if (gatingDelete && request.method() === "POST" && (request.postData() || "").includes('"delete"')) {
+        gatingDelete = false;
+        await deleteGate;
+      }
+      return route.continue();
+    });
+
+    await page.locator("#threads-list .thread-group-header-project", { hasText: "Race Project" }).first().click({ button: "right" });
+    await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
+    await page.click("#delete-project-button");
+
+    // ...and while it is in flight, go somewhere else on purpose.
+    await selectProjectInSwitcher(page, "Fresh Project");
+    const survivorId = await page.evaluate(
+      () => document.querySelector("#threads-list .thread-group-header-project")?.dataset.projectId || null
+    );
+    assert.ok(survivorId, "parked on the surviving project before releasing the delete");
+
+    releaseDelete();
+    await page.waitForFunction(
+      () => {
+        const trigger = document.querySelector(".project-switcher-trigger");
+        if (trigger?.getAttribute("aria-expanded") !== "true") return false;
+        const options = [...document.querySelectorAll(".project-switcher-option")].map((n) => n.textContent.trim());
+        return !options.includes("Race Project");
+      },
+      { timeout: TIMEOUT_MS },
+      // Open the menu so the wait can observe the refreshed project list.
+    ).catch(async () => {
+      await page.click(".project-switcher-trigger");
+      await page.waitForFunction(
+        () =>
+          ![...document.querySelectorAll(".project-switcher-option")]
+            .map((n) => n.textContent.trim())
+            .includes("Race Project"),
+        { timeout: TIMEOUT_MS }
+      );
+    });
+    await page.keyboard.press("Escape");
+
+    assert.equal(
+      await page.evaluate(() => window.history.state?.context?.projectId || null),
+      survivorId,
+      "a delete that resolves late must not overrule a navigation made while it was in flight"
+    );
+    await page.unroute("**/api/projects");
+
     // --- Real SSE disconnect -> polling -> reconnect updates the footer status ---
     // Block the stream so the client falls back to /api/session polling (footer
     // "Polling"), then restore it so the stream reconnects (footer "Live").

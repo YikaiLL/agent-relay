@@ -1648,17 +1648,24 @@ async function deleteProjectFromHeader(projectId, name) {
     return;
   }
   try {
-    // Decided BEFORE the await, from the context you were actually in. The receipt's
-    // surviving-project list is deliberately not consulted: this used to navigate to
-    // `receipt.projects[0]`, which raced `dropStaleProjectSelection` clearing the same
-    // selection — two mechanisms with opposite answers, and whichever landed last won.
-    // The clearing one happened to win, so the behaviour was right while the code said
-    // the opposite.
+    await deleteProject(apiFetch, projectId);
+    // Decided AFTER the await, from the context as it is when the delete COMPLETES —
+    // not as it was when you confirmed. The switcher stays interactive for the whole
+    // round trip, so a confirm-time decision outlives the request: delete A, pick B
+    // while it is in flight, and the response yanks you back out of B.
+    //
+    // Reading it late is safe in the other direction too. The only thing that moves the
+    // context by itself is `dropStaleProjectSelection`, which goes to the sessions
+    // context and nowhere else — so a late read either still sees the deleted project
+    // (navigate) or already sees where we wanted to end up (do nothing).
+    //
+    // The receipt's surviving-project list is deliberately not consulted. It used to
+    // navigate to `receipt.projects[0]`, which raced the same clearing mechanism with
+    // the opposite answer.
     const nextContext = selectContextAfterProjectDelete({
       context: sessionViewStore.getState().location.context,
       deletedProjectId: projectId,
     });
-    await deleteProject(apiFetch, projectId);
     if (nextContext) {
       await sessionViewController.showOverview(nextContext, { replace: true });
     }

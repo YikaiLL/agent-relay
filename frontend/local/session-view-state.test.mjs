@@ -671,3 +671,23 @@ test("a missing project id is never treated as a match", () => {
     );
   }
 });
+
+// The same shape as "a different project", but this is the case it exists for: the
+// caller reads the context AFTER the delete resolves, so a user who navigated away
+// while the request was in flight presents as "you are not in the deleted project".
+// Deciding at confirm time instead made a late response yank them back out.
+test("a context that moved on while the delete was in flight is left alone", () => {
+  const whenConfirmed = { kind: "project", projectId: "proj_deleted" };
+  const whenCompleted = { kind: "project", projectId: "proj_user_went_here" };
+
+  assert.deepEqual(
+    selectContextAfterProjectDelete({ context: whenConfirmed, deletedProjectId: "proj_deleted" }),
+    { kind: "sessions" },
+    "the confirm-time context would have navigated"
+  );
+  assert.equal(
+    selectContextAfterProjectDelete({ context: whenCompleted, deletedProjectId: "proj_deleted" }),
+    null,
+    "the completion-time context must not"
+  );
+});
