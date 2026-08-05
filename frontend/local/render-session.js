@@ -64,7 +64,6 @@ import {
   readActiveProjectId,
   readThreadListContextMenu,
   readThreadListUi,
-  readThreadListViewMode,
 } from "../shared/thread-list-store.js";
 import { ProjectOverview, ProjectSidebarList } from "../shared/project-overview-react.js";
 import {
@@ -361,7 +360,6 @@ export function createSessionRenderer({
     const threadListUi = readThreadListUi(state.threadListStore);
     state.currentApprovalId = approval?.request_id || null;
 
-    const projectsViewMode = readThreadListViewMode(state.threadListStore) === "projects";
     const activeProjectId = readActiveProjectId(state.threadListStore);
 
     // Title/subtitle rules live in one tested place (header-labels.js): the title
@@ -381,7 +379,6 @@ export function createSessionRenderer({
       viewOnly: session.view_only,
       reviewInProgress: Boolean(state.viewOnlyThread?.review),
       threadLabel,
-      sidebarMode: projectsViewMode ? "projects" : "sessions",
       projectId: activeProjectId,
       projectName: activeProject?.name || "",
       workspaceName: workspace ? workspaceBasename(workspace) : "",
@@ -408,11 +405,10 @@ export function createSessionRenderer({
     // nested under their project in the sidebar, so the cards would duplicate that list;
     // the component, its model and its pin/order prefs all stay because those prefs back
     // the sidebar rows and the card layout may return for another purpose. Flip this back
-    // to `!viewingConversation && projectsViewMode && Boolean(activeProjectId)` to
-    // resurrect it.
+    // to `!viewingConversation && Boolean(activeProjectId)` to resurrect it — the
+    // `projectsViewMode` half of that condition went with the Sessions/Projects toggle.
     const showProjectOverview = false;
     void activeProjectId;
-    void projectsViewMode;
     const mainView = viewingConversation
       ? "conversation"
       : showProjectOverview
@@ -425,11 +421,13 @@ export function createSessionRenderer({
       appShell.dataset.view = mainView;
     }
     if (sessionHistoryDrawer) {
-      // Projects mode keeps the drawer open: the project tree IS the navigation there,
-      // and the old rule (open only while viewing a conversation) left it collapsed —
-      // measurable but clipped — whenever no session was open, hiding the whole list.
+      // A pinned project keeps the drawer open: picking one is a request to see its
+      // sessions, and the old rule (open only while viewing a conversation) left the
+      // drawer collapsed — measurable but clipped — whenever no session was open,
+      // hiding the whole list. `projectsViewMode` here became `activeProjectId` when the
+      // toggle went; the reason is unchanged.
       sessionHistoryDrawer.open =
-        viewingConversation || projectsViewMode || Boolean(threadListUi.drawerOpen);
+        viewingConversation || Boolean(activeProjectId) || Boolean(threadListUi.drawerOpen);
     }
 
     syncThreadHistoryScroll();
@@ -1483,7 +1481,6 @@ export function createSessionRenderer({
     // group at the top, and everything else stays where it was. The list is therefore
     // always the full list — picking a project can never hide a session. That replaced
     // the old two-axis "Projects mode", which swapped cwd grouping out entirely.
-    const viewMode = readThreadListViewMode(state.threadListStore);
     // A search cuts ACROSS the pin: it swaps the row SOURCE for a server-side slice
     // that can contain sessions absent from `state.threads` entirely, so there is
     // nothing coherent to lift out of.
@@ -1493,9 +1490,11 @@ export function createSessionRenderer({
     // pinned group cannot survive it. Standing the pin down beats rendering a control
     // that visibly does nothing.
     const filtering = isThreadFilterActive(state.threadFilter);
+    // Gated on the selection alone. It used to require `viewMode === "projects"` as
+    // well, which was the toggle's last hold on the list: with the toggle gone that
+    // condition is permanently false, so the pin would simply never apply.
     const pinnedProjectId = selectPinnedProjectId({
-      activeProjectId:
-        viewMode === "projects" ? readActiveProjectId(state.threadListStore) : null,
+      activeProjectId: readActiveProjectId(state.threadListStore),
       searching,
       filtering,
     });

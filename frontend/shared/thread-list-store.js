@@ -18,15 +18,14 @@ export function createThreadListStore(initialThreadList = {}) {
       clientY: 0,
       threadId: null,
     },
-    // Sidebar grouping mode: "sessions" (by cwd/folder, the default) or "projects".
-    viewMode: initialThreadList.viewMode === "projects" ? "projects" : "sessions",
-    setViewMode(mode) {
-      set({ viewMode: mode === "projects" ? "projects" : "sessions" });
-    },
-    // Projects view is master-detail: the project whose card overview fills the main
-    // area. Null = no project selected yet. A display-only selection — never sent to
-    // the backend — so it holds a real project id or null (never the Unassigned
-    // sentinel, which the Projects view does not surface).
+    // The selected project, and the ONLY distinction the sidebar still draws. It used
+    // to sit beside a `viewMode` that swapped the grouping axis; selecting a project
+    // now PINS it to the top of a list that stays complete, so "which mode" had exactly
+    // two states and one of them was "no project selected". Deleted rather than
+    // defaulted, so nothing can reintroduce a second source of truth.
+    //
+    // Display-only — never sent to the backend — so it holds a real project id or null
+    // (never the Unassigned sentinel, which is a grouping key rather than an id).
     activeProjectId:
       typeof initialThreadList.activeProjectId === "string"
         ? initialThreadList.activeProjectId
@@ -106,10 +105,6 @@ export function readThreadListContextMenu(store) {
     clientY: 0,
     threadId: null,
   };
-}
-
-export function readThreadListViewMode(store) {
-  return store?.getState?.().viewMode === "projects" ? "projects" : "sessions";
 }
 
 export function readActiveProjectId(store) {

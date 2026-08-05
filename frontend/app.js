@@ -73,8 +73,6 @@ import {
   threadProjectSubmenu,
   threadProjectSubmenuTrigger,
   threadProjectCurrentLabel,
-  projectsToolbar,
-  projectsCreateButton,
   threadsCount,
   threadsList,
   threadsRefreshButton,
@@ -148,7 +146,6 @@ import {
   readActiveProjectId,
   readThreadListContextMenu,
   readThreadListUi,
-  readThreadListViewMode,
 } from "./shared/thread-list-store.js";
 import { createProjectsStore } from "./shared/projects-store.js";
 import { createDevicesCache } from "./shared/devices-cache.js";
@@ -512,20 +509,15 @@ projectsStore.subscribe((projectsState) => {
   // `renderThreads`/`renderSession` are module consts defined below; this callback
   // only ever fires asynchronously (after a fetch settles), by which point they are
   // initialized.
-  if (readThreadListViewMode(state.threadListStore) === "projects") {
-    if (
-      autoSelectFirstProjectWhenLoaded
-      && projectsState.loaded
-      && !projectsState.loading
-      && !projectsState.error
-    ) {
-      autoSelectFirstProjectWhenLoaded = false;
-      ensureActiveProjectSelected();
-    }
-    renderThreads();
-    if (state.session) {
-      renderSession(state.session);
-    }
+  // Unconditional now. The sidebar renders project-derived data in EVERY state — the
+  // pinned group's name and its activity roll-up — so gating this on "a project is
+  // selected" would leave a rename unpainted exactly when the rename mattered.
+  if (projectsState.loaded && !projectsState.loading && !projectsState.error) {
+    dropStaleProjectSelection();
+  }
+  renderThreads();
+  if (state.session) {
+    renderSession(state.session);
   }
   // Project ids become authoritative only after a successful payload. Re-run the
   // current location as RESTORE_HISTORY once per project set so a deleted selected
@@ -1422,90 +1414,35 @@ for (const key of SETTINGS_TABS) {
     ?.addEventListener("click", () => setSettingsTab(key));
 }
 
-// Sessions/Projects sidebar grouping toggle (static-shell buttons wired by id).
-const threadsViewSessionsButton = document.getElementById("threads-view-sessions");
-const threadsViewProjectsButton = document.getElementById("threads-view-projects");
-let autoSelectFirstProjectWhenLoaded = false;
-
-function syncThreadViewChrome(isProjects) {
-  threadsViewProjectsButton?.classList.toggle("is-active", isProjects);
-  threadsViewSessionsButton?.classList.toggle("is-active", !isProjects);
-  if (sidebarElement) {
-    sidebarElement.dataset.threadView = isProjects ? "projects" : "sessions";
-  }
-  if (projectsToolbar) {
-    projectsToolbar.hidden = !isProjects;
-  }
-}
-
+// Keeps the sidebar's pinned selection in step with the routed context. There is no
+// grouping mode to sync any more — the context IS the selection.
 function syncThreadListViewFromContext(context) {
   const store = state.threadListStore.getState();
-  const isProjects = context?.kind !== "sessions";
-  const viewMode = isProjects ? "projects" : "sessions";
-  if (store.viewMode !== viewMode) {
-    store.setViewMode(viewMode);
-  }
   const projectId = context?.kind === "project" ? context.projectId : null;
   if (readActiveProjectId(state.threadListStore) !== projectId) {
     store.setActiveProject(projectId);
   }
-  syncThreadViewChrome(isProjects);
   // Unconditional: the switcher offers the project list from every context, so
   // gating the fetch on Projects mode would leave it empty exactly where it is the
   // only way IN to a project.
   projectsStore.syncToRevision(state.session?.projects_revision || 0);
 }
 
-// Land on a project (the first, by list order) when Projects mode is active but none
-// is validly selected — so the main area shows a card overview rather than the console
-// home. Also drops a STALE selection: if the active project was deleted (locally or by
-// a remote peer), its id lingers in the store and would keep the view stuck in a
-// project-overview for a project that no longer exists (rendering "Select a project"),
-// and block newly-created projects from auto-selecting. Re-point to the first remaining
-// project, or clear the selection when none remain.
-function ensureActiveProjectSelected() {
-  const projects = state.projects || [];
+// Drop a selection whose project is gone (deleted here or by a remote peer). It used
+// to ALSO land you on the first project when Projects mode was entered without one;
+// that half went with the mode. "No project selected" is now the default workspace,
+// and auto-jumping into an arbitrary project would be the sidebar choosing a container
+// on your behalf.
+function dropStaleProjectSelection() {
   const context = sessionViewStore.getState().location.context;
-  if (
-    context.kind === "project"
-    && projects.some((project) => project.id === context.projectId)
-  ) {
+  if (context.kind !== "project") {
     return;
   }
-  const nextId = projects[0]?.id || null;
-  void sessionViewController.showOverview(
-    nextId
-      ? { kind: "project", projectId: nextId }
-      : { kind: "projects-home" },
-    { replace: true }
-  );
-}
-
-async function setThreadViewMode(mode) {
-  const isProjects = mode === "projects";
-  if (!isProjects) {
-    await sessionViewController.switchContext({ kind: "sessions" });
+  if ((state.projects || []).some((project) => project.id === context.projectId)) {
     return;
   }
-  projectsStore.syncToRevision(state.session?.projects_revision || 0);
-  const activeId = readActiveProjectId(state.threadListStore);
-  const projectId =
-    (activeId && state.projects.some((project) => project.id === activeId)
-      ? activeId
-      : state.projects[0]?.id) || null;
-  autoSelectFirstProjectWhenLoaded = !projectId && !state.projectsLoaded;
-  await sessionViewController.switchContext(
-    projectId
-      ? { kind: "project", projectId }
-      : { kind: "projects-home" }
-  );
+  void sessionViewController.showOverview({ kind: "sessions" }, { replace: true });
 }
-threadsViewSessionsButton?.addEventListener("click", () => {
-  void setThreadViewMode("sessions");
-});
-threadsViewProjectsButton?.addEventListener("click", () => {
-  void setThreadViewMode("projects");
-});
 
 // ---------------------------------------------------------------------------
 // Session title search
@@ -1678,9 +1615,6 @@ async function createProjectFromToolbar() {
     logLine(`Failed to create project: ${error.message}`);
   }
 }
-projectsCreateButton?.addEventListener("click", () => {
-  void createProjectFromToolbar();
-});
 
 // Rename a Project from its group header (Projects view). Prompt pre-filled with the
 // current name; refresh rides the projects_revision snapshot bump like every mutation.
@@ -1722,7 +1656,7 @@ async function deleteProjectFromHeader(projectId, name) {
       await sessionViewController.showOverview(
         fallbackProjectId
           ? { kind: "project", projectId: fallbackProjectId }
-          : { kind: "projects-home" },
+          : { kind: "sessions" },
         { replace: true }
       );
     }

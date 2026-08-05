@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { layoutThreadIds, setTabPinned, tabIdForThread } from "../shared/tab-layout.js";
-import { NO_PROJECT_KEY, SESSIONS_KEY } from "../shared/tab-workspace-store.js";
+import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
 import {
   createSessionViewState,
   reduceSessionView,
@@ -14,7 +14,12 @@ import {
 
 const sessions = () => ({ kind: "sessions" });
 const project = (projectId) => ({ kind: "project", projectId });
-const projectsHome = () => ({ kind: "projects-home" });
+// `projects-home` is gone: it meant "in Projects mode with nothing selected", and the
+// toggle that could put you there no longer exists. Everything that used to land there
+// lands in the sessions context, which the switcher calls Default Workspace. The
+// invariant these tests guard is unchanged — a deleted project must not hydrate its
+// cold tab set — only where the fallback lands.
+const projectsHome = () => ({ kind: "sessions" });
 
 function transition(state, action, facts = {}) {
   const next = reduceSessionView(state, action, facts);
@@ -299,7 +304,9 @@ test("history naming a deleted project falls back without creating its tab set",
     threadId: null,
   });
   assert.equal(state.workspaces["deleted-project"], undefined);
-  assert.equal(sessionViewContextKey(state.location.context), NO_PROJECT_KEY);
+  // SESSIONS_KEY, not the old NO_PROJECT_KEY: the fallback context IS the sessions
+  // context now, so it keys the sessions tab set rather than a third one of its own.
+  assert.equal(sessionViewContextKey(state.location.context), SESSIONS_KEY);
 });
 
 test("a tombstoned history thread is swept and falls back inside the restored context", () => {

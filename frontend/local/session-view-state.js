@@ -28,7 +28,7 @@ import {
   retargetThread,
   setTabPinned,
 } from "../shared/tab-layout.js";
-import { NO_PROJECT_KEY, SESSIONS_KEY } from "../shared/tab-workspace-store.js";
+import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
 
 const HISTORY_VERSION = 1;
 
@@ -44,13 +44,18 @@ function stringSet(values) {
   );
 }
 
+// Two contexts, not three. `projects-home` meant "in Projects mode, with no project
+// selected" — a state that only existed because a toggle could put you in that mode
+// without a selection. With the toggle gone there is no way to reach it and nothing
+// for it to mean: "no project selected" IS the sessions context, which is what the
+// switcher calls Default Workspace.
+//
+// Everything that used to produce it now produces `sessions`, including a persisted
+// entry naming a project that no longer exists.
 export function normalizeSessionViewContext(context) {
   if (context?.kind === "project") {
     const projectId = stringId(context.projectId);
-    return projectId ? { kind: "project", projectId } : { kind: "projects-home" };
-  }
-  if (context?.kind === "projects-home") {
-    return { kind: "projects-home" };
+    return projectId ? { kind: "project", projectId } : { kind: "sessions" };
   }
   return { kind: "sessions" };
 }
@@ -79,9 +84,6 @@ export function sessionViewContextKey(context) {
   const normalized = normalizeSessionViewContext(context);
   if (normalized.kind === "sessions") {
     return SESSIONS_KEY;
-  }
-  if (normalized.kind === "projects-home") {
-    return NO_PROJECT_KEY;
   }
   return normalized.projectId;
 }
@@ -194,7 +196,7 @@ function contextFromHistory(
       && context.kind === "project"
       && !knownProjects.has(context.projectId)
     ) {
-      return { kind: "projects-home" };
+      return { kind: "sessions" };
     }
     return context;
   }
@@ -203,11 +205,14 @@ function contextFromHistory(
   if (entry?.viewMode === "sessions") {
     return { kind: "sessions" };
   }
+  // `viewMode` is gone from the store, but entries written before it went are still on
+  // disk and still name a mode. A project that still exists is still restorable; the
+  // mode itself no longer restores to anything.
   if (entry?.viewMode === "projects") {
     const projectId = stringId(entry.projectId);
     return projectId && (!projectIdsComplete || knownProjects.has(projectId))
       ? { kind: "project", projectId }
-      : { kind: "projects-home" };
+      : { kind: "sessions" };
   }
 
   // Legacy `{}` / null / external links carry no context. Keep the context already

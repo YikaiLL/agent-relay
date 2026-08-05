@@ -49,7 +49,10 @@ function iconNode(svgMarkup, extraClass = "") {
 function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
   return h(
     "aside",
-    { className: "sidebar", "data-thread-view": "sessions" },
+    // No `data-thread-view`: it gated the primary action on the Sessions/Projects
+    // toggle, and with the toggle gone nothing writes it and nothing reads it. New
+    // session is now the sidebar's only primary action in every state.
+    { className: "sidebar" },
     h(
       "div",
       { className: "sidebar-top-bar" },
@@ -116,37 +119,10 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
     h(SessionSearch),
     h(ActivityFilter),
     h(AuthForm),
-    // Group the sidebar by cwd folders (Sessions) or by Project. Lifted to the top
-    // of the sidebar to match the projects mockup; wired imperatively in app.js by id.
-    h(
-      "div",
-      { className: "thread-view-toggle", role: "group", "aria-label": "Group sessions by" },
-      h(
-        "button",
-        { className: "thread-view-toggle-button is-active", id: "threads-view-sessions", type: "button" },
-        "Sessions"
-      ),
-      h(
-        "button",
-        { className: "thread-view-toggle-button", id: "threads-view-projects", type: "button" },
-        "Projects"
-      )
-    ),
-    // Mode-gated primary actions: Sessions → New session; Projects → + New
-    // project. Both stay mounted (ids intact); CSS hides the inactive one via
-    // the sidebar's data-thread-view attribute. Neither is hidden in the
-    // conversation view — the primary action stays reachable from a session.
+    // No Sessions/Projects toggle: selecting a project PINS it to the top of a list
+    // that stays complete, so there was never a second mode to be in. The Project
+    // switcher in the header is the whole control.
     h(LaunchPanel, { launchModel, onLaunchFieldChange, onLaunchStart }),
-    h(
-      "div",
-      { className: "projects-toolbar", id: "projects-toolbar" },
-      h(
-        "button",
-        { className: "start-session-button", id: "projects-create-button", type: "button" },
-        iconNode(PLUS_SVG),
-        h("span", null, "New project")
-      )
-    ),
     h(ThreadDrawer),
     h(ThreadContextMenu),
     h(ProjectContextMenu),

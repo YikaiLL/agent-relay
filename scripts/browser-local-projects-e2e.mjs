@@ -5,7 +5,7 @@
 // pinned yet), the thread context-menu project actions (assign / unassign /
 // new+assign) and their fail-closed/stale guards, and project Rename/Delete via the
 // project context menu, which now lives on the pinned group's own header.
-// Run: AGENT_PROVIDERS=fake node scripts/browser-local-projects-toggle-e2e.mjs
+// Run: AGENT_PROVIDERS=fake node scripts/browser-local-projects-e2e.mjs
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -216,6 +216,27 @@ async function selectProjectInSwitcher(page, name) {
   );
 }
 
+// The switcher's own way back to an unpinned list.
+async function selectDefaultWorkspaceInSwitcher(page) {
+  await page.waitForSelector(".project-switcher-trigger", { state: "attached", timeout: TIMEOUT_MS });
+  const alreadyOpen = await page.evaluate(
+    () => document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded") === "true"
+  );
+  if (!alreadyOpen) {
+    await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  }
+  await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+  await page
+    .locator(".project-switcher-option", { hasText: /^Default Workspace$/ })
+    .first()
+    .click({ timeout: TIMEOUT_MS });
+  await page.waitForFunction(
+    () => !document.querySelector("#threads-list .thread-group-header-project"),
+    undefined,
+    { timeout: TIMEOUT_MS }
+  );
+}
+
 // Right-click the pinned project's header to open the project context menu.
 async function openProjectMenu(page, name) {
   await selectProjectInSwitcher(page, name);
@@ -289,10 +310,16 @@ async function main() {
     const sessionsView = await page.evaluate(() => ({
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
       groupLabels: [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()),
-      hasToggle: !!document.querySelector("#threads-view-projects") && !!document.querySelector("#threads-view-sessions"),
+      // Inverted deliberately: this asserted the toggle EXISTED. Selecting a project
+      // pins it to the top of a list that stays complete, so there was never a second
+      // mode to switch into — the switcher is the whole control, and a leftover toggle
+      // would be a second, disagreeing answer to "what am I looking at".
+      hasToggle: !!document.querySelector("#threads-view-projects") || !!document.querySelector("#threads-view-sessions"),
+      hasSwitcher: !!document.querySelector(".project-switcher-trigger"),
     }));
-    assert.ok(sessionsView.hasToggle, "the Sessions/Projects toggle buttons exist");
-    assert.match(sessionsView.countText, /folder/, `Sessions mode shows folder grouping: ${sessionsView.countText}`);
+    assert.equal(sessionsView.hasToggle, false, "the Sessions/Projects toggle is gone");
+    assert.ok(sessionsView.hasSwitcher, "and the switcher is what replaced it");
+    assert.match(sessionsView.countText, /folder/, `default workspace shows folder grouping: ${sessionsView.countText}`);
 
     step("4b. the switcher menu actually reacts to the cursor");
 
@@ -337,16 +364,11 @@ async function main() {
       );
     }
 
-    step("5. Projects mode rows");
+    step("5. the pinned project's rows");
 
-    // 5. Switch to Projects: the sidebar lists each project as a group header,
-    //    with its sessions nested underneath.
-    await page.evaluate(() => document.querySelector("#threads-view-projects").click());
-    await page.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
-      "VerifyProj",
-      { timeout: TIMEOUT_MS }
-    );
+    // 5. Pin a project from the switcher: its group leads the list, with its sessions
+    //    nested underneath — and every other session stays exactly where it was.
+    await selectProjectInSwitcher(page, "VerifyProj");
     const projectsView = await page.evaluate(({ name, threadId }) => {
       const row = [...document.querySelectorAll("#threads-list .thread-group-header-project")].find(
         (r) => r.querySelector(".thread-group-name")?.textContent?.trim() === name
@@ -363,17 +385,18 @@ async function main() {
         ),
         verifyBadge: row?.querySelector(".thread-group-badges")?.textContent?.trim() || "",
         hasActionsButton: !!row?.closest(".thread-group-header-project")?.querySelector(".thread-group-action"),
-        projectsButtonActive: document.querySelector("#threads-view-projects")?.classList.contains("is-active") || false,
+        pinnedFirst:
+          [...document.querySelectorAll("#threads-list .thread-group-header")][0]
+            ?.classList.contains("thread-group-header-project") || false,
       };
     }, { name: "VerifyProj", threadId });
 
-    step("6. back to Sessions");
+    step("6. back to the default workspace");
 
-    // 6. Switch back to Sessions.
-    await page.evaluate(() => document.querySelector("#threads-view-sessions").click());
-    await delay(300);
+    // 6. Unpin by choosing the default workspace — the switcher's own way back.
+    await selectDefaultWorkspaceInSwitcher(page);
     const backToSessions = await page.evaluate(() => ({
-      sessionsButtonActive: document.querySelector("#threads-view-sessions")?.classList.contains("is-active") || false,
+      noProjectGroup: !document.querySelector("#threads-list .thread-group-header-project"),
       countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
     }));
 
@@ -382,12 +405,7 @@ async function main() {
     // 7. Passive propagation: an API unassign (no browser action) flows through the
     // snapshot's projects_revision -> refetch -> re-render, dropping the project's
     // session count. Then re-assign restores it.
-    await page.evaluate(() => document.querySelector("#threads-view-projects").click());
-    await page.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
-      "VerifyProj",
-      { timeout: TIMEOUT_MS }
-    );
+    await selectProjectInSwitcher(page, "VerifyProj");
     const verifyBadge = (page) =>
       page.evaluate((name) => {
         const row = [...document.querySelectorAll("#threads-list .thread-group-header-project")].find(
@@ -486,7 +504,10 @@ async function main() {
     await failPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await openDrawer(failPage);
     await failPage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
-    await failPage.evaluate(() => document.querySelector("#threads-view-projects").click());
+    await selectProjectInSwitcher(failPage, "VerifyProj").catch(() => {
+      // Expected on this page: the projects GET fails, so the switcher can offer no
+      // project to pin. The point of the step is what the LIST does about it.
+    });
     // Give the (failing) fetch time to settle so this observes the resolved state
     // rather than the moment before it: with no placeholder to wait FOR, a bare
     // assertion here would pass trivially against the pre-click list.
@@ -520,12 +541,7 @@ async function main() {
     await gatePage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await openDrawer(gatePage);
     await gatePage.waitForFunction(() => document.querySelectorAll("#threads-list .thread-group").length >= 1, null, { timeout: TIMEOUT_MS });
-    await gatePage.evaluate(() => document.querySelector("#threads-view-projects").click());
-    await gatePage.waitForFunction(
-      (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
-      "VerifyProj",
-      { timeout: TIMEOUT_MS }
-    );
+    await selectProjectInSwitcher(gatePage, "VerifyProj");
     holdRefresh = true;
     await api(relayPort, "POST", "/api/projects", { action: "create", name: "GateProj2" });
     // Long enough for a blanking regression to be observable: the old code swapped
@@ -572,14 +588,24 @@ async function main() {
     let geometry = null;
     let keyboardNav = null;
     try {
-      step("10. crud flow: create UiCrudProj from the toolbar");
-      // Create "UiCrudProj" from the Projects toolbar.
-      await crudPage.evaluate(() => document.querySelector("#threads-view-projects").click());
-      await crudPage.waitForFunction(() => { const b = document.querySelector("#projects-toolbar"); return b && !b.hidden; }, null, { timeout: TIMEOUT_MS });
+      step("10. crud flow: create UiCrudProj from the switcher menu");
+      // The Projects toolbar and its create button went with the toggle — "New project"
+      // is an entry in the switcher's own menu now, which is also the only place it can
+      // live once there is no mode whose chrome could host it.
+      await crudPage.waitForSelector(".project-switcher-trigger", { timeout: TIMEOUT_MS });
       nextPrompt = "UiCrudProj";
-      await crudPage.evaluate(() => document.querySelector("#projects-create-button").click());
+      await crudPage.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+      await crudPage.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+      await crudPage
+        .locator(".project-switcher-option", { hasText: /^New project$/ })
+        .first()
+        .click({ timeout: TIMEOUT_MS });
       await crudPage.waitForFunction(
-        (name) => [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim()).includes(name),
+        async (name) => {
+          const response = await fetch("/api/projects");
+          const data = await response.json();
+          return (data.projects || []).some((project) => project.name === name);
+        },
         "UiCrudProj",
         { timeout: TIMEOUT_MS }
       );
@@ -587,8 +613,9 @@ async function main() {
       const uiProjId = afterCreate.projects.find((p) => p.name === "UiCrudProj")?.id;
       assert.ok(uiProjId, `toolbar-created project id: ${JSON.stringify(afterCreate.projects.map((p) => p.name))}`);
 
-      // Assign / unassign / new+assign via the THREAD context menu (Sessions mode).
-      await crudPage.evaluate(() => document.querySelector("#threads-view-sessions").click());
+      // Assign / unassign / new+assign via the THREAD context menu, from an unpinned
+      // list — the row's own menu, not the switcher's.
+      await selectDefaultWorkspaceInSwitcher(crudPage);
       step("10a. first level only (no flyout)");
       // Level one on its own: Projects are NOT here, just the trigger row naming one.
       firstLevel = await readThreadMenuFirstLevel(crudPage, threadId);
@@ -659,8 +686,9 @@ async function main() {
         await delay(150);
       }
 
-      // Rename + delete "UiCrudProj" via the PROJECT context menu (Projects mode).
-      await crudPage.evaluate(() => document.querySelector("#threads-view-projects").click());
+      // Rename + delete "UiCrudProj" via the PROJECT context menu. Its header exists
+      // only while that project is pinned, which `openProjectMenu` handles by selecting
+      // it first.
       const renameTargetId = uiProjId;
       nextPrompt = "UiRenamedProj";
       await openProjectMenu(crudPage, "UiCrudProj");
@@ -728,7 +756,6 @@ async function main() {
       note: document.querySelector("#thread-project-actions .context-menu-note")?.textContent?.trim() || null,
       // Must NOT read "None" — that would assert non-membership we can't vouch for.
       triggerValue: document.querySelector("#thread-project-current-label")?.textContent?.trim() || null,
-      sessionsActive: document.querySelector("#threads-view-sessions")?.classList.contains("is-active") || false,
     }));
     await menuFailPage.close();
 
@@ -812,8 +839,8 @@ async function main() {
       `the assigned session shows under its pinned project: ${JSON.stringify(projectsView.projectRows)}`
     );
     assert.ok(projectsView.hasActionsButton, "each project header exposes visible action buttons (touch/keyboard reachable)");
-    assert.ok(projectsView.projectsButtonActive, "Projects toggle button is active");
-    assert.ok(backToSessions.sessionsButtonActive, "Sessions toggle re-activates");
+    assert.ok(projectsView.pinnedFirst, "the pinned project's group leads the list");
+    assert.ok(backToSessions.noProjectGroup, "and choosing the default workspace unpins it");
     assert.match(backToSessions.countText, /folder/, `back to Sessions shows folder grouping: ${backToSessions.countText}`);
     assert.ok(
       unassignPropagated,
@@ -928,7 +955,6 @@ async function main() {
     assert.ok(deleteConfirmed, "deleting via the project context menu removes the project server-side");
     assert.ok(projectMenuClosedOnBump, "an open project menu closes fail-closed when the projects revision changes");
 
-    assert.equal(menuFailClosed.sessionsActive, true, "thread-menu fail-closed probe stays in Sessions mode");
     assert.equal(menuFailClosed.buttonCount, 0, `no Project mutation buttons while the fetch is failing: ${menuFailClosed.buttonCount}`);
     assert.match(menuFailClosed.note || "", /Projects unavailable|Loading projects/, `a fail-closed note replaces the controls: ${menuFailClosed.note}`);
     assert.match(

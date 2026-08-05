@@ -1525,18 +1525,6 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-tertiary);
 }
 
-/* Projects toolbar — a single prominent "New project" action, not an empty box.
-   The button is a plain .start-session-button (the shared PRIMARY archetype), so
-   it is pixel-identical to "New session"; the two only ever differ by label. It
-   used to carry a .projects-create-button.projects-create-button override
-   (12px/600/9px-12px/r-md/shadow) that opted out of the button system above.
-   Padding is 0 to match .launch-panel, so switching Sessions↔Projects doesn't
-   nudge the thread list. */
-.projects-toolbar {
-  display: block;
-  padding: 0;
-}
-
 /* ===== Projects-mode sidebar: a list of project rows (no sessions inline) ===== */
 .project-sidebar-list {
   display: flex;
@@ -4225,15 +4213,6 @@ input:focus, textarea:focus, select:focus {
 /* Settings entry: the icon-rail gear is the desktop entry; this header gear is the
    mobile fallback (rail hidden ≤960px). Hidden on desktop, shown on mobile. */
 .header-settings-button {
-  display: none;
-}
-
-/* Sidebar mode gating: the primary action follows the Sessions/Projects toggle.
-   Nodes stay mounted (ids intact); only visibility flips. */
-.sidebar[data-thread-view="projects"] .launch-panel {
-  display: none;
-}
-.sidebar[data-thread-view="sessions"] #projects-toolbar {
   display: none;
 }
 

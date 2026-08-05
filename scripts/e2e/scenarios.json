@@ -16,7 +16,7 @@
       "local-transcript-load",
       "local-thread-settings",
       "local-thread-groups",
-      "local-projects-toggle",
+      "local-projects",
       "local-search-filter",
       "local-shell-redesign",
       "local-session-tabs",
@@ -42,7 +42,7 @@
       "local-transcript-load",
       "local-thread-settings",
       "local-thread-groups",
-      "local-projects-toggle",
+      "local-projects",
       "local-search-filter",
       "local-shell-redesign",
       "local-session-tabs",
@@ -298,13 +298,13 @@
         "activity-filter"
       ]
     },
-    "local-projects-toggle": {
-      "script": "browser-local-projects-toggle-e2e.mjs",
+    "local-projects": {
+      "script": "browser-local-projects-e2e.mjs",
       "tier": "core",
       "provider": "fake",
       "transport": "local",
       "coverage": [
-        "projects-toggle",
+        "projects",
         "projects-pin-degrades-open"
       ]
     },

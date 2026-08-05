@@ -31,6 +31,43 @@ async function openThreadDrawer(page) {
 // Pick a project in the switcher above the tab strip. Exactly one project is
 // pinned at a time, so its header — and the rename/delete affordances on it —
 // exist only while it is the selection; this is the way to any other project.
+// "New project" moved into the switcher's own menu when the Projects toolbar went with
+// the Sessions/Projects toggle. Three call sites, one path.
+async function createProjectFromSwitcher(page) {
+  await page.waitForSelector(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  const alreadyOpen = await page.evaluate(
+    () => document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded") === "true"
+  );
+  if (!alreadyOpen) {
+    await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  }
+  await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+  await page
+    .locator(".project-switcher-option", { hasText: /^New project$/ })
+    .first()
+    .click({ timeout: TIMEOUT_MS });
+}
+
+// The switcher's way back to an unpinned list.
+async function selectDefaultWorkspaceInSwitcher(page) {
+  await page.waitForSelector(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  const alreadyOpen = await page.evaluate(
+    () => document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded") === "true"
+  );
+  if (!alreadyOpen) {
+    await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  }
+  await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+  await page
+    .locator(".project-switcher-option", { hasText: /^Default Workspace$/ })
+    .first()
+    .click({ timeout: TIMEOUT_MS });
+  await page.waitForFunction(
+    () => !document.querySelector("#threads-list .thread-group-header-project"),
+    { timeout: TIMEOUT_MS }
+  );
+}
+
 async function selectProjectInSwitcher(page, name) {
   await page.waitForSelector(".project-switcher-trigger", { state: "attached", timeout: TIMEOUT_MS });
   // Read-then-act: blind-toggling would CLOSE an already-open menu and hang the
@@ -176,9 +213,12 @@ async function run() {
     await page.waitForFunction(() => !document.body.classList.contains("sidebar-collapsed"), { timeout: TIMEOUT_MS });
 
     // --- Project actions: visible button opens the menu, Rename works ---
-    await page.click("#threads-view-projects");
+    // The Sessions/Projects toggle and its toolbar are gone: "New project" is an entry
+    // in the switcher's own menu, and the project's header exists only while that
+    // project is PINNED — which creating it does.
     await openThreadDrawer(page);
-    await page.click("#projects-create-button");
+    await createProjectFromSwitcher(page);
+    await selectProjectInSwitcher(page, "Alpha Project");
     // Projects mode now lists each project as a GROUP HEADER with its sessions nested
     // underneath, so project actions moved from a "⋯ opens a menu" row onto inline
     // buttons on the header. The three access paths this guards are unchanged:
@@ -223,7 +263,7 @@ async function run() {
     // --- Deleting the selected project must not strand a stale selection ---
     // Add a sibling so there's something to fall back to after deletion.
     promptValue = "Second Project";
-    await page.click("#projects-create-button");
+    await createProjectFromSwitcher(page);
     await page.waitForFunction(
       () => [...document.querySelectorAll("#threads-list .thread-group-name")].some((n) => /Second/.test(n.textContent || "")),
       { timeout: TIMEOUT_MS }
@@ -241,19 +281,28 @@ async function run() {
           ?.textContent?.trim() === "Gamma Project",
       { timeout: TIMEOUT_MS }
     );
-    // Delete it -> the sibling "Second Project" must auto-select (not linger on the dead id).
+    // Delete it -> the selection CLEARS. This used to assert that the sibling "Second
+    // Project" auto-selected instead. That behaviour went with the Sessions/Projects
+    // toggle: it existed so entering Projects mode always had something to show, and
+    // with no mode to enter, landing you in an arbitrary surviving project would be the
+    // sidebar choosing a container on your behalf. No selection means the default
+    // workspace, which is a real destination.
     await page.locator("#threads-list .thread-group-header-project", { hasText: "Gamma" }).first().click({ button: "right" });
     await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
     await page.click("#delete-project-button");
     await page.waitForFunction(
       () => {
         const names = [...document.querySelectorAll("#threads-list .thread-group-name")].map((n) => n.textContent.trim());
-        const active = document.querySelector("#threads-list .thread-group-header-project.is-active .thread-group-name")?.textContent?.trim();
-        return !names.some((n) => /Gamma/.test(n)) && active === "Second Project";
+        return (
+          !names.some((n) => /Gamma/.test(n))
+          && !document.querySelector("#threads-list .thread-group-header-project")
+        );
       },
       { timeout: TIMEOUT_MS }
     );
-    // Delete the LAST remaining project -> the selection clears.
+    // Delete the remaining project too. Its header exists only while it is pinned, so
+    // reaching it goes through the switcher — which is the point of the control.
+    await selectProjectInSwitcher(page, "Second Project");
     await page.locator("#threads-list .thread-group-header-project", { hasText: "Second" }).first().click({ button: "right" });
     await page.waitForSelector("#project-context-menu:not([hidden])", { timeout: TIMEOUT_MS });
     await page.click("#delete-project-button");
@@ -263,9 +312,9 @@ async function run() {
         && !document.querySelector("#threads-list .thread-group-header-project.is-active"),
       { timeout: TIMEOUT_MS }
     );
-    // A newly-created project auto-selects again (the stale id no longer blocks it).
+    // A newly-created project auto-selects (the stale id no longer blocks it).
     promptValue = "Fresh Project";
-    await page.click("#projects-create-button");
+    await createProjectFromSwitcher(page);
     await page.waitForFunction(
       () => {
         const active = document.querySelector("#threads-list .thread-group-header-project.is-active .thread-group-name")?.textContent?.trim();
@@ -307,13 +356,9 @@ async function run() {
     // --- Mobile (narrow) viewport: rail hidden, header gear reaches Settings ---
     // Reload into a clean state so the stacked mobile layout puts the sticky header
     // near the top (the prior projects/drawer state would push it far down).
-    // View context now deliberately survives reload, so select Sessions explicitly
-    // instead of relying on reload to reset a preceding Projects-mode scenario.
-    await page.click("#threads-view-sessions");
-    await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
-      { timeout: TIMEOUT_MS }
-    );
+    // View context deliberately survives reload, so return to the default workspace
+    // explicitly instead of relying on reload to unpin a preceding project.
+    await selectDefaultWorkspaceInSwitcher(page);
     await page.setViewportSize({ width: 390, height: 780 });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".local-frame", { timeout: TIMEOUT_MS });

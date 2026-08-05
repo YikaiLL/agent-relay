@@ -95,9 +95,12 @@ function validHistoryWorkspaces(workspaces, action, facts) {
   ) {
     return workspaces;
   }
+  // `projects-home` used to key a workspace of its own; it now normalizes to
+  // `sessions`, so listing it here would add the same key twice. Any workspace still
+  // stored under the old NO_PROJECT_KEY is dropped by this filter, which is the
+  // intended outcome — that context has no way to be entered again.
   const validKeys = new Set([
     sessionViewContextKey({ kind: "sessions" }),
-    sessionViewContextKey({ kind: "projects-home" }),
     ...(facts?.projectIds || []),
   ]);
   return Object.fromEntries(

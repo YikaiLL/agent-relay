@@ -48,7 +48,6 @@ export function selectHeaderLabels({
   viewOnly = false,
   reviewInProgress = false,
   threadLabel = "",
-  sidebarMode = "sessions",
   projectId = null,
   projectName = "",
   workspaceName = "",
@@ -57,9 +56,11 @@ export function selectHeaderLabels({
   const label = threadLabel || "";
   const inConversation = Boolean(viewingConversation && activeThreadId);
 
-  // Projects mode wins only when a project is actually selected; otherwise this
-  // is the default workspace.
-  const inProjectsMode = sidebarMode === "projects" && Boolean(projectName);
+  // A project is selected, or it is not — there is no mode any more. This used to also
+  // require `sidebarMode === "projects"`, which was the Sessions/Projects toggle's last
+  // reach into the header; with the toggle gone that flag is permanently "sessions" and
+  // the title would have named the default workspace even while a project was pinned.
+  const inProjectsMode = Boolean(projectName);
 
   // The title is the switcher's trigger, so it names what the switcher selects:
   // a project, or the default workspace. The working directory is a grouping the

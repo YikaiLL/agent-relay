@@ -37,12 +37,11 @@ const CONVERSATION = {
   workspacePath: "/Users/luchi/git/agent-relay",
 };
 
-// --- Projects mode ----------------------------------------------------------
+// --- with a project selected ------------------------------------------------
 
-test("projects mode names the selected project", () => {
+test("a selected project names the title", () => {
   const { title, newAgentProjectId } = selectHeaderLabels({
     ...CONVERSATION,
-    sidebarMode: "projects",
     projectId: "proj-1",
     projectName: "Alpha",
   });
@@ -51,10 +50,9 @@ test("projects mode names the selected project", () => {
   assert.equal(newAgentProjectId, "proj-1");
 });
 
-test("projects mode with no project selected is the default workspace", () => {
+test("no project selected is the default workspace", () => {
   const { title, newAgentProjectId } = selectHeaderLabels({
     ...CONVERSATION,
-    sidebarMode: "projects",
     projectId: null,
     projectName: "",
   });
@@ -62,12 +60,11 @@ test("projects mode with no project selected is the default workspace", () => {
   assert.equal(newAgentProjectId, null, "no project means no project action");
 });
 
-// --- Sessions mode ----------------------------------------------------------
+// --- with none selected -----------------------------------------------------
 
-test("sessions mode is the default workspace, and keeps the folder as the tooltip", () => {
+test("the default workspace keeps the folder as the tooltip", () => {
   const { title, titleTooltip, newAgentProjectId } = selectHeaderLabels({
     ...CONVERSATION,
-    sidebarMode: "sessions",
   });
   assert.equal(title, DEFAULT_WORKSPACE_LABEL);
   // The folder is not lost, it is demoted: the title has to name what the
@@ -76,24 +73,21 @@ test("sessions mode is the default workspace, and keeps the folder as the toolti
   assert.equal(newAgentProjectId, null);
 });
 
-// A selected project must not leak into Sessions mode: there, sessions are
-// grouped by folder, and a project name would name the wrong container.
-test("sessions mode ignores a selected project", () => {
-  const { title, newAgentProjectId } = selectHeaderLabels({
-    ...CONVERSATION,
-    sidebarMode: "sessions",
-    projectId: "proj-1",
-    projectName: "Alpha",
-  });
-  assert.equal(title, DEFAULT_WORKSPACE_LABEL);
-  assert.equal(newAgentProjectId, null);
+// This used to assert the OPPOSITE — that a selected project must not leak into
+// Sessions mode, because there sessions were grouped by folder and a project name would
+// name the wrong container. Both modes are gone: a project is selected or it is not, and
+// when it is, it is what the title names. Reading the old assertion as still-true would
+// reintroduce a mode nothing can enter.
+test("a project name with no id still titles the container it names", () => {
+  const { title } = selectHeaderLabels({ ...CONVERSATION, projectId: null, projectName: "Alpha" });
+  assert.equal(title, "Alpha", "the NAME is what the header shows");
 });
 
 // --- the thread label is gone from the title --------------------------------
 
 test("the thread label never becomes the title (that is the tab's job)", () => {
-  for (const sidebarMode of ["sessions", "projects"]) {
-    const { title } = selectHeaderLabels({ ...CONVERSATION, sidebarMode });
+  for (const projectName of ["", "Alpha"]) {
+    const { title } = selectHeaderLabels({ ...CONVERSATION, projectName });
     assert.notEqual(title, "Dry run git rewrite");
   }
 });
@@ -120,9 +114,9 @@ test("every project-less state produces the SAME title", () => {
   const titles = new Set(
     [
       { hasWorkspace: true, activeThreadId: null },
-      { ...CONVERSATION, sidebarMode: "sessions" },
-      { ...CONVERSATION, sidebarMode: "projects", projectName: "" },
-      { ...CONVERSATION, sidebarMode: "sessions", projectId: "p", projectName: "Alpha" },
+      { ...CONVERSATION },
+      { ...CONVERSATION, projectName: "" },
+      { ...CONVERSATION, projectId: "p", projectName: "" },
     ].map((args) => selectHeaderLabels(args).title)
   );
   assert.deepEqual([...titles], [DEFAULT_WORKSPACE_LABEL]);
@@ -133,7 +127,6 @@ test("every project-less state produces the SAME title", () => {
 test("read-only stays a warning, and does not repeat the title", () => {
   const { title, subtitle } = selectHeaderLabels({
     ...CONVERSATION,
-    sidebarMode: "sessions",
     viewOnly: true,
   });
   assert.equal(title, DEFAULT_WORKSPACE_LABEL);
@@ -150,7 +143,7 @@ test("read-only + review in progress keeps its distinct wording", () => {
 });
 
 test("a live conversation has no subtitle", () => {
-  assert.equal(selectHeaderLabels({ ...CONVERSATION, sidebarMode: "sessions" }).subtitle, "");
+  assert.equal(selectHeaderLabels({ ...CONVERSATION }).subtitle, "");
 });
 
 test("console home names the running session in the subtitle, without 'live'", () => {

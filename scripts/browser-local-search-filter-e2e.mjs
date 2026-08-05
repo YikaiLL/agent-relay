@@ -458,7 +458,7 @@ async function main() {
       "the row you just clicked must still be listed after its badge is cleared"
     );
 
-    step("8. the bell cuts across Projects mode");
+    step("8. the bell cuts across a pinned project");
     await setBell(page, false);
     const created = await api(relayPort, "POST", "/api/projects", {
       action: "create",
@@ -466,7 +466,14 @@ async function main() {
     });
     const projectId = created.projects.find((p) => p.name === "Alpha")?.id;
     assert.ok(projectId, `created project: ${JSON.stringify(created)}`);
-    await page.click("#threads-view-projects");
+    // The Sessions/Projects toggle is gone; a project is reached by selecting it in the
+    // switcher, which PINS it to the top of a list that stays complete.
+    await page.click(".project-switcher-trigger");
+    await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+    await page
+      .locator(".project-switcher-option", { hasText: /^Alpha$/ })
+      .first()
+      .click({ timeout: TIMEOUT_MS });
     await page.waitForFunction(
       () =>
         [...document.querySelectorAll("#threads-list .thread-group-name")].some(
@@ -501,7 +508,20 @@ async function main() {
       undefined,
       { timeout: TIMEOUT_MS }
     );
-    await page.click("#threads-view-sessions");
+    // Unpin through the switcher — the Sessions/Projects toggle it used to click no
+    // longer exists, and leaving "Alpha" pinned would put a project group at the top of
+    // every bucket assertion below.
+    await page.click(".project-switcher-trigger");
+    await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+    await page
+      .locator(".project-switcher-option", { hasText: /^Default Workspace$/ })
+      .first()
+      .click({ timeout: TIMEOUT_MS });
+    await page.waitForFunction(
+      () => !document.querySelector("#threads-list .thread-group-header-project"),
+      undefined,
+      { timeout: TIMEOUT_MS }
+    );
 
     step("9. a live review puts its PARENT in the Reviewing bucket");
     // `last_message` skips the parent's own recap turn, so the parent stays idle while a

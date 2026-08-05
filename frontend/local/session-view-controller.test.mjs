@@ -256,7 +256,7 @@ test("history recovery drops a now-deleted project reintroduced by the dirty jou
   );
 
   assert.deepEqual(store.getState().location, {
-    context: { kind: "projects-home" },
+    context: { kind: "sessions" },
     threadId: null,
   });
   assert.equal(store.getState().workspaces["deleted-project"], undefined);
@@ -470,7 +470,7 @@ test("restoring a deleted project never hydrates that cold persisted tab set", a
   );
 
   assert.deepEqual(result.next.location, {
-    context: { kind: "projects-home" },
+    context: { kind: "sessions" },
     threadId: null,
   });
   assert.equal(result.next.workspaces["deleted-project"], undefined);

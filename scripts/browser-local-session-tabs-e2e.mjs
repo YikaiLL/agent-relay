@@ -17,6 +17,10 @@ import { getFreePort } from "./e2e/harness/ports.mjs";
 import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
 
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
+// A second tab bucket now means a second real PROJECT. It used to mean "Projects mode
+// with nothing selected" — a context that only existed because a toggle could put you
+// there, and which no longer has an entrance.
+const TABS_PROJECT = "Tabs Project";
 const SHOT_DIR = process.env.BROWSER_E2E_SHOT_DIR || "";
 
 // The view route is the ONLY thing that puts a session on screen: with no `?thread=`
@@ -101,9 +105,56 @@ async function waitForCoherent(page, label, timeoutMs = TIMEOUT_MS) {
   return last;
 }
 
+// The sidebar no longer carries a `data-thread-view` mode — there is no mode. What a
+// tab bucket belongs to is the routed CONTEXT: the default workspace, or a pinned
+// project. Read from history state, which is what the tab workspaces are keyed on.
 function sidebarViewMode(page) {
-  return page.evaluate(
-    () => document.querySelector(".sidebar")?.dataset.threadView || null
+  return page.evaluate(() =>
+    window.history.state?.context?.projectId ? "projects" : "sessions"
+  );
+}
+
+// Pin a project from the switcher. Replaces `click("#threads-view-projects")`: with the
+// toggle gone there is no project-less "Projects mode" to enter — a second tab bucket
+// now means a second real project.
+async function selectProjectInSwitcher(page, name) {
+  await page.waitForSelector(".project-switcher-trigger", { state: "attached", timeout: TIMEOUT_MS });
+  const alreadyOpen = await page.evaluate(
+    () => document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded") === "true"
+  );
+  if (!alreadyOpen) {
+    await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  }
+  await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+  await page
+    .locator(".project-switcher-option", { hasText: new RegExp(`^${name}$`) })
+    .first()
+    .click({ timeout: TIMEOUT_MS });
+  await page.waitForFunction(
+    (target) => window.history.state?.context?.projectId
+      && [...document.querySelectorAll("#threads-list .thread-group-header-project .thread-group-name")]
+        .some((node) => node.textContent.trim() === target),
+    name,
+    { timeout: TIMEOUT_MS }
+  );
+}
+
+async function selectDefaultWorkspaceInSwitcher(page) {
+  await page.waitForSelector(".project-switcher-trigger", { state: "attached", timeout: TIMEOUT_MS });
+  const alreadyOpen = await page.evaluate(
+    () => document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded") === "true"
+  );
+  if (!alreadyOpen) {
+    await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+  }
+  await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+  await page
+    .locator(".project-switcher-option", { hasText: /^Default Workspace$/ })
+    .first()
+    .click({ timeout: TIMEOUT_MS });
+  await page.waitForFunction(
+    () => !window.history.state?.context?.projectId,
+    { timeout: TIMEOUT_MS }
   );
 }
 
@@ -371,7 +422,7 @@ async function run() {
     // must stay as immediate as it always was.
     await clearTabPersistence(page);
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
+    await page.waitForSelector(".project-switcher-trigger", { timeout: TIMEOUT_MS });
     await openThreadDrawer(page);
     await page.waitForSelector(`button.conversation-item[data-thread-id="${threadA}"]`, {
       timeout: TIMEOUT_MS,
@@ -515,8 +566,13 @@ async function run() {
     // back/forward re-open) leave persisted tabs behind, and this assertion is about
     // isolation between buckets, not about what those steps left.
     await clearTabPersistence(page);
+    await fetch(`http://127.0.0.1:${relayPort}/api/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "create", name: TABS_PROJECT }),
+    });
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
+    await page.waitForSelector(".project-switcher-trigger", { timeout: TIMEOUT_MS });
     await openThreadDrawer(page);
 
     await page.waitForSelector(`button.conversation-item[data-thread-id="${threadA}"]`, {
@@ -533,7 +589,7 @@ async function run() {
 
     await waitForCoherent(page, "sessions mode with one open session");
 
-    await page.click("#threads-view-projects");
+    await selectProjectInSwitcher(page, TABS_PROJECT);
     await page.waitForFunction(() => document.querySelectorAll(".session-tab").length === 0, {
       timeout: TIMEOUT_MS,
     });
@@ -554,7 +610,7 @@ async function run() {
     );
     await shoot(page, "07-projects-mode-empty");
 
-    await page.click("#threads-view-sessions");
+    await selectDefaultWorkspaceInSwitcher(page);
     await page.waitForFunction(
       (id) => [...document.querySelectorAll(".session-tab")].some((tab) => tab.dataset.threadId === id),
       threadA,
@@ -581,16 +637,12 @@ async function run() {
     // adopted into a project's strip just because you pressed back while that project
     // was selected. The entry carries its own view mode, so back returns there.
     assert.equal(await sidebarViewMode(page), "sessions", "starting in Sessions mode");
-    await page.click("#threads-view-projects");
-    await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
-      { timeout: TIMEOUT_MS }
-    );
+    await selectProjectInSwitcher(page, TABS_PROJECT);
     const projectsStrip = (await tabState(page)).threadIds;
 
     await page.goBack({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
+      () => !window.history.state?.context?.projectId,
       { timeout: TIMEOUT_MS }
     );
     const restored = await waitForCoherent(page, "after back from Projects into Sessions");
@@ -601,54 +653,48 @@ async function run() {
     );
 
     // And the Projects strip is untouched — nothing was adopted into it.
-    await page.click("#threads-view-projects");
-    await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
-      { timeout: TIMEOUT_MS }
-    );
+    await selectProjectInSwitcher(page, TABS_PROJECT);
     assert.deepEqual(
       (await tabState(page)).threadIds,
       projectsStrip,
       "the project's tab set gained nothing from the back navigation"
     );
-    await page.click("#threads-view-sessions");
-    await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
-      { timeout: TIMEOUT_MS }
-    );
+    await selectDefaultWorkspaceInSwitcher(page);
     await shoot(page, "08b-context-restored");
 
     // --- A reload keeps the view context, not just the thread ---
     // The URL only carries the thread, so a reload used to come back in the default
     // Sessions context and drop the session into the wrong tab set.
-    await page.click("#threads-view-projects");
+    await selectProjectInSwitcher(page, TABS_PROJECT);
+    // A SECOND project, so the restore is provably project-specific rather than just
+    // "some project". Creating one selects it, which is what makes the tab bucket its own.
+    promptValue = "Reload Project";
+    await page.click(".project-switcher-trigger");
+    await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+    await page
+      .locator(".project-switcher-option", { hasText: /^New project$/ })
+      .first()
+      .click({ timeout: TIMEOUT_MS });
+    // Wait for the NAME, not merely for "some project is pinned" — the previously
+    // pinned one is still pinned for a render or two, so a bare selector wait passes
+    // against the wrong project and the assertion below then reports it as a failure
+    // of creation rather than of the wait.
     await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
+      () =>
+        (document.querySelector(".thread-group-header-project.is-active .thread-group-name")
+          ?.textContent || "").includes("Reload Project"),
       { timeout: TIMEOUT_MS }
     );
-    // A real project, so the Projects context has something to restore. Creating one
-    // selects it, which is what makes the tab bucket project-specific.
-    promptValue = "Reload Project";
-    await page.click("#projects-create-button");
-    await page.waitForSelector(".thread-group-header-project.is-active", { timeout: TIMEOUT_MS });
-    const selectedProject = await page.evaluate(
-      () => document.querySelector(".thread-group-header-project.is-active")?.textContent || ""
-    );
-    assert.match(selectedProject, /Reload Project/, "the new project is selected");
 
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".session-tab-strip", {
       state: "attached",
       timeout: TIMEOUT_MS,
     });
-    await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "projects",
-      { timeout: TIMEOUT_MS }
-    );
     assert.equal(
       await sidebarViewMode(page),
       "projects",
-      "a reload restores the Projects context rather than defaulting to Sessions"
+      "a reload restores the pinned project rather than defaulting to the default workspace"
     );
     // Reload closes the sidebar drawer in conversation-sized layouts. The selected
     // project row still renders inside it, so this assertion is about state/identity,
@@ -677,15 +723,8 @@ async function run() {
     await historyPage.goto(`http://127.0.0.1:${relayPort}`, {
       waitUntil: "domcontentloaded",
     });
-    await historyPage.waitForSelector("#threads-view-projects", { timeout: TIMEOUT_MS });
-    await historyPage.click("#threads-view-projects");
-    await historyPage.waitForFunction(
-      () =>
-        document.querySelector(".sidebar")?.dataset.threadView === "projects"
-        && Boolean(window.history.state?.context?.projectId)
-        && Boolean(document.querySelector(".thread-group-header-project.is-active")),
-      { timeout: TIMEOUT_MS }
-    );
+    await historyPage.waitForSelector(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+    await selectProjectInSwitcher(historyPage, TABS_PROJECT);
     const validProjectEntry = await historyPage.evaluate(() => window.history.state);
     const validProjectTitle = await historyPage.evaluate(
       () => document.querySelector(".thread-group-header-project.is-active")?.textContent || ""
@@ -736,10 +775,15 @@ async function run() {
       () => !document.querySelector(".thread-group-header-project.is-active"),
       { timeout: TIMEOUT_MS }
     );
+    // Was "projects": a legacy entry naming a deleted project used to keep you in
+    // Projects mode with nothing selected. That landing spot is gone with the toggle —
+    // "no project selected" IS the default workspace — so the fallback is `sessions`.
+    // The invariant the step actually guards is the line below it, unchanged: the
+    // deleted project must not get a persisted tab workspace out of being restored.
     assert.equal(
       await sidebarViewMode(historyPage),
-      "projects",
-      "a deleted project entry may keep Projects mode while dropping its invalid selection"
+      "sessions",
+      "a deleted project entry falls back to the default workspace, dropping its invalid selection"
     );
     assert.equal(
       await persistedWorkspace(historyPage, deletedProjectId),
@@ -748,11 +792,7 @@ async function run() {
     );
     await historyPage.close();
 
-    await page.click("#threads-view-sessions");
-    await page.waitForFunction(
-      () => document.querySelector(".sidebar")?.dataset.threadView === "sessions",
-      { timeout: TIMEOUT_MS }
-    );
+    await selectDefaultWorkspaceInSwitcher(page);
 
     // --- Deleting a session must not let history resurrect its tab ---
     // History entries outlive threads, so backing onto a deleted session's entry
