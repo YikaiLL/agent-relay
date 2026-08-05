@@ -1553,7 +1553,6 @@ export function createSessionRenderer({
       filter: state.threadFilter,
       stateOf,
     });
-    syncActivityFilterCounts(filterView.counts);
     // The pinned group's header carries the same activity roll-up ("2 working" /
     // "1 needs input") the project headers showed before, so lifting a project to the
     // top does not cost it the badges it had. This is a no-op without a pin — only
@@ -1765,20 +1764,6 @@ export function createSessionRenderer({
         return option;
       })
     );
-  }
-
-  // Keep the bell's per-state counts current. They describe the WHOLE list, not the
-  // current selection, so a pill can tell you what selecting it would give you.
-  // `null` (filter off) leaves the last values in place — the popover is hidden anyway,
-  // and blanking them makes it flash zeros on the way open.
-  function syncActivityFilterCounts(counts) {
-    if (!counts) {
-      return;
-    }
-    for (const element of document.querySelectorAll("[data-count-for]")) {
-      const state = element.dataset.countFor;
-      element.textContent = String(counts[state] ?? 0);
-    }
   }
 
   function renderThreadListMessage(countLabel, message) {

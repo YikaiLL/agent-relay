@@ -9,7 +9,6 @@ import {
   isThreadFilterActive,
   nextRetainedStates,
   selectThreadFilterView,
-  summarizeThreadStates,
 } from "./thread-filter.js";
 
 // Two cwd groups, the shape the sidebar normally renders.
@@ -53,10 +52,9 @@ test("off → the list passes straight through", () => {
   assert.equal(isThreadFilterActive(EMPTY_THREAD_FILTER), false);
 });
 
-// The bell's default is every state, i.e. "everything that is not idle" — not a
-// four-way choice. This is what keeps a thread from vanishing when it moves between
-// states while you watch.
-test("on with the default selection → everything except idle, bucketed by state", () => {
+// The bell is "everything that is not idle" — not a four-way choice. This is what keeps
+// a thread from vanishing when it moves between states while you watch.
+test("on → everything except idle, bucketed by state", () => {
   const view = selectThreadFilterView({ groups: GROUPS, filter: ON, stateOf });
   assert.equal(view.filtering, true);
   assert.deepEqual(
@@ -82,14 +80,29 @@ test("buckets keep ladder order regardless of recency", () => {
   assert.deepEqual(view.groups.map((g) => g.state), ["needs_input", "completed"]);
 });
 
-test("narrowing to one state drops the rest", () => {
+// The bell is ON or OFF. There is no per-state selection to be in: a pill row above the
+// list would only restate the bucket headers under it. A `states` field left on a filter
+// by a stale caller must therefore narrow NOTHING — silently honouring it would hide
+// sessions with no control on screen saying why.
+test("the bell has no per-state selection: a stray `states` field narrows nothing", () => {
   const view = selectThreadFilterView({
     groups: GROUPS,
     filter: { ...ON, states: ["needs_input"] },
     stateOf,
   });
-  assert.deepEqual(view.groups.map((g) => g.state), ["needs_input"]);
-  assert.equal(view.countLabel, "1 session");
+  assert.deepEqual(view.groups.map((g) => g.state), [
+    "needs_input",
+    "working",
+    "reviewing",
+    "completed",
+  ]);
+  assert.equal(view.countLabel, "4 sessions");
+});
+
+// The pills carried per-state counts; nothing else ever consumed them, so the view stops
+// computing a number no surface renders.
+test("the view exposes no per-state counts", () => {
+  assert.equal(selectThreadFilterView({ groups: GROUPS, filter: ON, stateOf }).counts, undefined);
 });
 
 test("an idle thread is never bucketed", () => {
@@ -108,37 +121,26 @@ test("state buckets carry no cwd, so their headers stay inert", () => {
   }
 });
 
-test("counts describe the whole list, not the current selection", () => {
-  const counts = summarizeThreadStates(GROUPS, stateOf);
-  assert.deepEqual(counts, {
-    needs_input: 1,
-    working: 1,
-    reviewing: 1,
-    completed: 1,
-    total: 4,
-  });
-
-  // Narrowed to one state, the pills must still report what the others hold.
-  const view = selectThreadFilterView({
-    groups: GROUPS,
-    filter: { ...ON, states: ["needs_input"] },
-    stateOf,
-  });
-  assert.equal(view.counts.working, 1);
-});
-
 // The retention rule: a row must not disappear from under the pointer because the
 // agent answered while you were reaching for it.
-test("a thread that has matched stays listed after it leaves the selection", () => {
-  const filter = { ...ON, states: ["needs_input"] };
-  const sticky = nextRetainedStates(null, GROUPS, filter, stateOf);
-  assert.deepEqual(sticky, new Map([["needs", "needs_input"]]));
+test("a thread that has matched stays listed after its state moves on", () => {
+  const sticky = nextRetainedStates(null, GROUPS, ON, stateOf);
+  assert.deepEqual(
+    sticky,
+    new Map([
+      ["needs", "needs_input"],
+      ["work", "working"],
+      ["review", "reviewing"],
+      ["done", "completed"],
+    ]),
+    "every non-idle row is retained: the bell has no selection to gate admission on"
+  );
 
   // The user answers it: needs_input → working. It must still be on screen.
   const answered = (thread) => (thread.id === "needs" ? "working" : stateOf(thread));
   const view = selectThreadFilterView({
     groups: GROUPS,
-    filter: { ...filter, retained: sticky },
+    filter: { ...ON, retained: sticky },
     stateOf: answered,
   });
   assert.ok(
@@ -150,18 +152,17 @@ test("a thread that has matched stays listed after it leaves the selection", () 
 });
 
 test("new matches join a live filter immediately", () => {
-  const filter = { ...ON, states: ["working"] };
-  const first = nextRetainedStates(null, GROUPS, filter, stateOf);
-  assert.deepEqual(first, new Map([["work", "working"]]));
+  const first = nextRetainedStates(null, GROUPS, ON, stateOf);
+  assert.ok(!first.has("idle"), "an idle row has no state, so it is not retained");
   const promoted = (thread) => (thread.id === "idle" ? "working" : stateOf(thread));
-  const second = nextRetainedStates(first, GROUPS, filter, promoted);
-  assert.deepEqual(second, new Map([["work", "working"], ["idle", "working"]]));
+  const second = nextRetainedStates(first, GROUPS, ON, promoted);
+  assert.equal(second.get("idle"), "working");
 });
 
 test("retention never resurrects a thread that never matched", () => {
   const view = selectThreadFilterView({
     groups: GROUPS,
-    filter: { ...ON, states: ["needs_input"], retained: new Map([["idle", null]]) },
+    filter: { ...ON, retained: new Map([["idle", null]]) },
     stateOf,
   });
   assert.ok(!view.groups.some((g) => g.threads.some((t) => t.id === "idle")));
@@ -173,14 +174,13 @@ test("retention never resurrects a thread that never matched", () => {
 // meant the row still vanished from under the pointer — exactly what retention exists
 // to prevent, in the one case the user is most likely to be watching.
 test("a retained thread that goes fully idle keeps its last bucket", () => {
-  const filter = { ...ON, states: ["working"] };
-  const retained = nextRetainedStates(null, GROUPS, filter, stateOf);
-  assert.deepEqual(retained, new Map([["work", "working"]]));
+  const retained = nextRetainedStates(null, GROUPS, ON, stateOf);
+  assert.equal(retained.get("work"), "working");
 
   const wentIdle = (thread) => (thread.id === "work" ? null : stateOf(thread));
   const view = selectThreadFilterView({
     groups: GROUPS,
-    filter: { ...filter, retained },
+    filter: { ...ON, retained },
     stateOf: wentIdle,
   });
   const shown = view.groups.flatMap((g) => g.threads.map((t) => t.id));
@@ -192,37 +192,35 @@ test("a retained thread that goes fully idle keeps its last bucket", () => {
   );
 });
 
-// The two steps above pass individually and still hide this: the memory is only
-// refreshed while the live state is IN the selection, so a row that moves to an
-// UNSELECTED state keeps a stale memory. It renders correctly for as long as it has a
-// live state — and then snaps back to a bucket it left long ago the moment it goes
-// stateless. Narrowed to "Needs input", answering a thread and letting it finish put it
-// back under "Needs input" with no dot at all.
+// The two steps above pass individually and still hide this: a row that changes bucket
+// renders correctly for as long as it has a live state — and then snaps back to a bucket
+// it left long ago the moment it goes stateless, unless the memory is refreshed on EVERY
+// pass. Answering a thread and letting it finish used to file it back under "Needs
+// input" with no dot at all.
 test("a retained row remembers where it ACTUALLY was last, not where it joined", () => {
-  const filter = { ...ON, states: ["needs_input"] };
-  let retained = nextRetainedStates(null, GROUPS, filter, stateOf);
-  assert.deepEqual(retained, new Map([["needs", "needs_input"]]));
+  let retained = nextRetainedStates(null, GROUPS, ON, stateOf);
+  assert.equal(retained.get("needs"), "needs_input");
 
-  // 1. It moves to a state that is NOT selected.
+  // 1. It moves to another bucket.
   const working = (thread) => (thread.id === "needs" ? "working" : stateOf(thread));
-  retained = nextRetainedStates(retained, GROUPS, filter, working);
+  retained = nextRetainedStates(retained, GROUPS, ON, working);
   assert.equal(
     retained.get("needs"),
     "working",
-    "an already-retained row refreshes on any live state; the selection only gates ADMISSION"
+    "a retained row refreshes on any live state, so the memory is never stale"
   );
   assert.equal(
-    selectThreadFilterView({ groups: GROUPS, filter: { ...filter, retained }, stateOf: working })
+    selectThreadFilterView({ groups: GROUPS, filter: { ...ON, retained }, stateOf: working })
       .groups.find((g) => g.threads.some((t) => t.id === "needs")).state,
     "working"
   );
 
   // 2. Then it loses its state entirely.
   const gone = (thread) => (thread.id === "needs" ? null : stateOf(thread));
-  retained = nextRetainedStates(retained, GROUPS, filter, gone);
+  retained = nextRetainedStates(retained, GROUPS, ON, gone);
   const view = selectThreadFilterView({
     groups: GROUPS,
-    filter: { ...filter, retained },
+    filter: { ...ON, retained },
     stateOf: gone,
   });
   assert.equal(
@@ -234,10 +232,9 @@ test("a retained row remembers where it ACTUALLY was last, not where it joined",
 
 // Thread ids are arbitrary strings on the wire — `ThreadSummaryView.id` is a bare
 // `String` and no parser constrains it to a UUID — so the retention store must not be a
-// plain object. On one, `"toString" in map` is true and `map["toString"]` is a function,
-// which admits rows the selection excluded and hands `buildThreadStateGroups` a function
-// where a state key belongs. `"__proto__"` is worse still: assigning it is silently
-// dropped, so such a row could never be retained at all.
+// plain object. On one, `map["toString"]` is a function, which hands
+// `buildThreadStateGroups` a function where a state key belongs. `"__proto__"` is worse
+// still: assigning it is silently dropped, so such a row could never be retained at all.
 test("ids that collide with Object.prototype are not special", () => {
   const hostile = [
     {
@@ -247,28 +244,18 @@ test("ids that collide with Object.prototype are not special", () => {
       threads: [{ id: "constructor" }, { id: "toString" }, { id: "__proto__" }],
     },
   ];
-  const filter = { ...ON, states: ["needs_input"] };
   const allWorking = () => "working";
 
-  // None of them is needs_input, so none may be admitted.
-  const retained = nextRetainedStates(undefined, hostile, filter, allWorking);
+  const kept = nextRetainedStates(undefined, hostile, ON, allWorking);
   for (const id of ["constructor", "toString", "__proto__"]) {
-    assert.equal(
-      selectThreadFilterView({ groups: hostile, filter: { ...filter, retained }, stateOf: allWorking })
-        .groups.flatMap((g) => g.threads.map((t) => t.id))
-        .includes(id),
-      false,
-      `${id} must not be admitted by a needs_input filter`
-    );
+    assert.equal(kept.get(id), "working", `${id} must be retained like any other id`);
   }
 
-  // And once genuinely admitted, they must retain and re-read like any other id.
-  const wide = { ...ON, states: ["working"] };
-  const kept = nextRetainedStates(undefined, hostile, wide, allWorking);
+  // And once retained, they must re-read like any other id when the state goes away.
   const goneIdle = () => null;
   const view = selectThreadFilterView({
     groups: hostile,
-    filter: { ...wide, retained: kept },
+    filter: { ...ON, retained: kept },
     stateOf: goneIdle,
   });
   assert.deepEqual(
@@ -286,17 +273,15 @@ test("ids that collide with Object.prototype are not special", () => {
 // moment it goes stateless. Returning the SAME instance when nothing changed makes `!==`
 // the correct guard and keeps that decision here, where it can be tested.
 test("an unchanged pass returns the very same Map", () => {
-  const filter = { ...ON, states: ["needs_input"] };
-  const first = nextRetainedStates(null, GROUPS, filter, stateOf);
-  const second = nextRetainedStates(first, GROUPS, filter, stateOf);
+  const first = nextRetainedStates(null, GROUPS, ON, stateOf);
+  const second = nextRetainedStates(first, GROUPS, ON, stateOf);
   assert.equal(second, first, "no change must not produce a new instance");
 });
 
 test("a VALUE-only change still produces a new Map", () => {
-  const filter = { ...ON, states: ["needs_input"] };
-  const first = nextRetainedStates(null, GROUPS, filter, stateOf);
+  const first = nextRetainedStates(null, GROUPS, ON, stateOf);
   const moved = (thread) => (thread.id === "needs" ? "working" : stateOf(thread));
-  const second = nextRetainedStates(first, GROUPS, filter, moved);
+  const second = nextRetainedStates(first, GROUPS, ON, moved);
   assert.notEqual(second, first, "a size-preserving change must still be observable");
   assert.equal(second.size, first.size, "precondition: size alone cannot detect this");
   assert.equal(second.get("needs"), "working");
@@ -307,18 +292,11 @@ test("turning the filter off keeps an already-empty map's identity", () => {
   assert.equal(nextRetainedStates(empty, GROUPS, EMPTY_THREAD_FILTER, stateOf), empty);
 });
 
-// Admission still respects the selection: an unselected state must not pull a NEW row in.
-test("a row is only admitted while its state is selected", () => {
-  const filter = { ...ON, states: ["needs_input"] };
-  const retained = nextRetainedStates(null, GROUPS, filter, stateOf);
-  assert.ok(!retained.has("work"), "a working row is not retained by a needs_input filter");
-});
-
 test("a live state always wins over the remembered one", () => {
   const promoted = (thread) => (thread.id === "work" ? "needs_input" : stateOf(thread));
   const view = selectThreadFilterView({
     groups: GROUPS,
-    filter: { ...ON, states: ["working"], retained: new Map([["work", "working"]]) },
+    filter: { ...ON, retained: new Map([["work", "working"]]) },
     stateOf: promoted,
   });
   assert.equal(
@@ -358,24 +336,12 @@ test("every bucket agrees with the dot the row renders", () => {
   assert.equal(selectThreadState({ reviewing: true, attentionKind: "completed" }), "reviewing");
 });
 
-test("empty copy distinguishes 'nothing going on' from 'nothing in this selection'", () => {
+// One empty message, because there is one thing the bell can mean. It used to have to
+// distinguish "nothing going on" from "nothing in the states you picked"; with the pills
+// gone, the second sentence has no situation left to describe.
+test("empty copy says nothing is going on", () => {
   const all = selectThreadFilterView({ groups: [], filter: ON, stateOf });
   assert.match(all.emptyMessage, /Nothing is running/);
-  const narrowed = selectThreadFilterView({
-    groups: [],
-    filter: { ...ON, states: ["reviewing"] },
-    stateOf,
-  });
-  assert.match(narrowed.emptyMessage, /selected states/);
-});
-
-test("an unknown state in the selection falls back to every state", () => {
-  const view = selectThreadFilterView({
-    groups: GROUPS,
-    filter: { ...ON, states: ["nonsense"] },
-    stateOf,
-  });
-  assert.equal(view.groups.length, 4);
 });
 
 test("buildThreadStateGroups tolerates missing threads arrays", () => {
@@ -395,7 +361,7 @@ const filterOff = { filtering: false };
 const filtered = (n) => ({
   filtering: true,
   countLabel: n === 1 ? "1 session" : `${n} sessions`,
-  emptyMessage: "No sessions in the selected states.",
+  emptyMessage: "Nothing is running or waiting on you.",
 });
 
 test("with the bell off, the search speaks for itself", () => {

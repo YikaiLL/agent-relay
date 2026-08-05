@@ -4392,63 +4392,8 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-primary);
   background: var(--bg-hover);
 }
-.sidebar-activity-filter {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-.sidebar-activity-filter[hidden] {
-  display: none;
-}
-.activity-filter-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: var(--text-sm);
-  cursor: pointer;
-}
-.activity-filter-pill:hover {
-  border-color: var(--border-prominent);
-  color: var(--text-primary);
-}
-.activity-filter-pill.is-selected {
-  border-color: var(--border-prominent);
-  background: var(--bg-elevated);
-  color: var(--text-primary);
-}
-/* A deselected pill still has to be readable — it is how you get the state back. */
-.activity-filter-pill:not(.is-selected) .activity-filter-dot {
-  opacity: 0.4;
-}
-.activity-filter-count {
-  color: var(--text-tertiary);
-  font-variant-numeric: tabular-nums;
-}
-.activity-filter-pill.is-selected .activity-filter-count {
-  color: var(--text-secondary);
-}
-/* Same shapes as the row dots, minus the pulse: a legend should not animate. */
-.activity-filter-dot {
-  flex: none;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  box-sizing: border-box;
-  background: var(--accent-primary);
-}
-.activity-filter-dot.is-needs_input {
-  background: var(--accent-warning);
-}
-.activity-filter-dot.is-reviewing {
-  background: transparent;
-  border: 2px solid var(--accent-primary);
-}
+/* No pill row under the bell: it restated the bucket headers it sat on top of. The
+   buckets ARE the control. */
 /* A state bucket is not a folder. The glyph is meaningful for workspace/project
    groups and actively misleading on "Needs input". */
 .thread-group-header[data-group-kind="state"] .thread-group-icon {

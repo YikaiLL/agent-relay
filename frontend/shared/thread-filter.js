@@ -7,13 +7,18 @@
 // Buckets come from `selectThreadState`, the same ladder the per-row dot uses, so a row
 // showing an amber dot is necessarily in the "Needs input" bucket. Idle threads have no
 // state and no bucket: the bell shows everything that is NOT idle.
+//
+// It is ON or OFF, with no per-state selection. There used to be a row of state pills
+// above the list; they said exactly what the bucket headers underneath already said
+// (the same four labels, in the same order, over the same rows), so the pills were a
+// second reading of the list sitting on top of the list. Whichever state you want, its
+// bucket is already right there — scroll, don't narrow.
 
 import { THREAD_STATES, THREAD_STATE_LABELS, selectThreadState } from "./thread-dot.js";
 
-/** All four states selected — the bell's default and its most useful setting. */
+/** The bell at rest: off, remembering nothing. */
 export const EMPTY_THREAD_FILTER = Object.freeze({
   on: false,
-  states: THREAD_STATES,
   retained: new Map(),
 });
 
@@ -21,39 +26,8 @@ export function isThreadFilterActive(filter) {
   return Boolean(filter?.on);
 }
 
-function selectedStates(filter) {
-  const states = (filter?.states || []).filter((state) => THREAD_STATES.includes(state));
-  return states.length ? states : THREAD_STATES;
-}
-
 function flattenThreads(groups) {
   return (groups || []).flatMap((group) => group?.threads || []);
-}
-
-/**
- * How many threads sit in each state, across the whole (unfiltered) list.
- *
- * Drives the popover's per-state counts, so those must be computed BEFORE the filter is
- * applied — a pill reading "Working 3" has to keep saying 3 while you are looking at
- * only "Needs input", or the control cannot tell you what selecting it would give you.
- *
- * DELIBERATE DIVERGENCE: these count LIVE state, so they can disagree with what a bucket
- * holds. A retained row that has gone stateless still sits in its last bucket but is
- * counted nowhere, so "Done 0" above a visible Done row is reachable. Counting retained
- * rows instead would make the pill stop answering "what would selecting this give me?",
- * which is the only question it is useful for. The row itself is the tell: stateless
- * means `selectThreadDot` returns null, so a kept row renders with no dot.
- */
-export function summarizeThreadStates(groups, stateOf) {
-  const counts = { needs_input: 0, working: 0, reviewing: 0, completed: 0, total: 0 };
-  for (const thread of flattenThreads(groups)) {
-    const state = stateOf(thread);
-    if (state && state in counts) {
-      counts[state] += 1;
-      counts.total += 1;
-    }
-  }
-  return counts;
 }
 
 /**
@@ -71,7 +45,8 @@ export function summarizeThreadStates(groups, stateOf) {
  * and the row would vanish anyway.
  *
  * New matches join live — that half must stay immediate, or the bell would show a
- * snapshot of the past rather than what is going on.
+ * snapshot of the past rather than what is going on. Every non-idle thread is admitted:
+ * the bell has no selection to gate on.
  *
  * A `Map`, not a plain object. Thread ids are arbitrary strings on the wire —
  * `ThreadSummaryView.id` is a bare `String` and no parser constrains it — so an id of
@@ -89,7 +64,6 @@ export function nextRetainedStates(previous, groups, filter, stateOf) {
   if (!isThreadFilterActive(filter)) {
     return prev.size ? new Map() : prev;
   }
-  const states = selectedStates(filter);
   const next = new Map(prev);
   let changed = false;
   for (const thread of flattenThreads(groups)) {
@@ -98,29 +72,24 @@ export function nextRetainedStates(previous, groups, filter, stateOf) {
     if (!state) {
       continue;
     }
-    // The selection gates ADMISSION only. Once a row is retained, every live state
-    // refreshes the memory — otherwise a row that moves to an UNSELECTED state keeps a
-    // stale one and, the moment it goes stateless, snaps back to a bucket it left long
-    // ago. Narrowed to "Needs input", answering a thread and letting it finish would
-    // file it back under "Needs input" with no dot at all.
-    if (next.has(id) || states.includes(state)) {
-      if (next.get(id) !== state) {
-        next.set(id, state);
-        changed = true;
-      }
+    // Every live state refreshes the memory, so a row is remembered where it ACTUALLY
+    // was last — not where it first joined. Otherwise a row that moved buckets would
+    // snap back to the old one the moment it went stateless.
+    if (next.get(id) !== state) {
+      next.set(id, state);
+      changed = true;
     }
   }
   return changed ? next : prev;
 }
 
 /**
- * Re-bucket the list by state, dropping idle threads and anything outside the selection.
+ * Re-bucket the list by state, dropping idle threads.
  *
  * Groups come back in the ladder's order — not by recency — because that order IS the
  * urgency order, and a bell whose first bucket moved around would stop being scannable.
  */
-export function buildThreadStateGroups(groups, { stateOf, states, retained = new Map() } = {}) {
-  const wanted = (states || THREAD_STATES).filter((state) => THREAD_STATES.includes(state));
+export function buildThreadStateGroups(groups, { stateOf, retained = new Map() } = {}) {
   const buckets = new Map();
 
   for (const thread of flattenThreads(groups)) {
@@ -134,9 +103,8 @@ export function buildThreadStateGroups(groups, { stateOf, states, retained = new
       // Never matched. Retention keeps rows, it does not admit new ones.
       continue;
     }
-    if (!wanted.includes(state) && !remembered) {
-      continue;
-    }
+    // Anything off the ladder never reaches the output: the return below walks
+    // THREAD_STATES, so a bucket keyed by something else is simply not emitted.
     if (!buckets.has(state)) {
       buckets.set(state, {
         key: `state:${state}`,
@@ -174,27 +142,20 @@ export function buildThreadStateGroups(groups, { stateOf, states, retained = new
  */
 export function selectThreadFilterView({ groups = [], filter = null, stateOf = () => null } = {}) {
   if (!isThreadFilterActive(filter)) {
-    return { filtering: false, groups, counts: null };
+    return { filtering: false, groups };
   }
 
-  const states = selectedStates(filter);
-  const counts = summarizeThreadStates(groups, stateOf);
   const filtered = buildThreadStateGroups(groups, {
     stateOf,
-    states,
     retained: filter.retained || new Map(),
   });
   const shown = filtered.reduce((total, group) => total + group.threads.length, 0);
-  const everyState = states.length === THREAD_STATES.length;
 
   return {
     filtering: true,
     groups: filtered,
-    counts,
     countLabel: shown === 1 ? "1 session" : `${shown} sessions`,
-    emptyMessage: everyState
-      ? "Nothing is running or waiting on you."
-      : "No sessions in the selected states.",
+    emptyMessage: "Nothing is running or waiting on you.",
   };
 }
 

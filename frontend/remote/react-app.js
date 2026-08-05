@@ -129,7 +129,7 @@ import {
   selectReviewLaunchModel,
 } from "../shared/review-state.js";
 import { BELL_SVG, SEARCH_SVG, X_SVG } from "../svg.js";
-import { THREAD_STATES, THREAD_STATE_LABELS, selectThreadState } from "../shared/thread-dot.js";
+import { selectThreadState } from "../shared/thread-dot.js";
 import {
   composeListChrome,
   nextRetainedStates,
@@ -1971,53 +1971,8 @@ function findThreadNameInGroups(groups, threadId) {
   return null;
 }
 
-// The bell's state pills. Mirrors local's `ActivityFilter`, but rendered from props
-// rather than toggled through `hidden`: remote is fully React and holds no `dom.js`
-// handles, so it can be conditional.
-function RemoteActivityFilter({ counts = null, filter, onSetThreadFilter }) {
-  if (!filter?.on) {
-    return null;
-  }
-  const selected = filter.states || THREAD_STATES;
-  return h(
-    "div",
-    {
-      className: "sidebar-activity-filter",
-      id: "remote-activity-filter",
-      role: "group",
-      "aria-label": "Filter sessions by activity",
-    },
-    ...THREAD_STATES.map((state) => {
-      const isSelected = selected.includes(state);
-      return h(
-        "button",
-        {
-          key: state,
-          className: "activity-filter-pill" + (isSelected ? " is-selected" : ""),
-          "data-state": state,
-          id: `remote-activity-filter-${state}`,
-          type: "button",
-          "aria-pressed": String(isSelected),
-          onClick: () => {
-            const next = isSelected
-              ? selected.filter((entry) => entry !== state)
-              : THREAD_STATES.filter((entry) => selected.includes(entry) || entry === state);
-            // Deselecting the last pill would show nothing with no way back except the
-            // bell itself; empty already means "all" to the filter.
-            onSetThreadFilter({ states: next.length ? next : [...THREAD_STATES] });
-          },
-        },
-        h("span", { className: `activity-filter-dot is-${state}`, "aria-hidden": "true" }),
-        h("span", { className: "activity-filter-label" }, THREAD_STATE_LABELS[state]),
-        h(
-          "span",
-          { className: "activity-filter-count", "data-count-for": state },
-          String(counts?.[state] ?? 0)
-        )
-      );
-    })
-  );
-}
+// The bell has no pills on either surface — turning it on re-groups the list by state,
+// and the bucket headers underneath already carry those four labels.
 
 function RemoteSidebar({
   currentState,
@@ -2231,9 +2186,10 @@ function RemoteSidebar({
             type: "button",
             title: "Filter by activity",
             "aria-label": "Filter by activity",
-            "aria-expanded": String(threadFilter.on),
-            onClick: () =>
-              onSetThreadFilter({ on: !threadFilter.on, states: [...THREAD_STATES] }),
+            // A toggle, not a disclosure: it re-groups the list in place and there is
+            // no popover under it to expand.
+            "aria-pressed": String(threadFilter.on),
+            onClick: () => onSetThreadFilter({ on: !threadFilter.on }),
           },
           h("span", {
             className: "inline-icon",
@@ -2287,11 +2243,6 @@ function RemoteSidebar({
           )
         )
       : null,
-    h(RemoteActivityFilter, {
-      counts: filterView.counts,
-      filter: threadFilter,
-      onSetThreadFilter,
-    }),
     h(
       "div",
       { className: "sidebar-row" },

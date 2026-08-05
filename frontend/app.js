@@ -139,7 +139,6 @@ import {
   buildNavigationThreadGroups,
 } from "./shared/thread-groups.js";
 import { findThreadInSearchResults, findVisibleThread } from "./shared/thread-search.js";
-import { THREAD_STATES } from "./shared/thread-dot.js";
 
 import {
   createThreadListStore,
@@ -393,7 +392,7 @@ const state = {
   // last seen in): while the filter is on, a thread that has matched stays listed even
   // after its state moves on, so a row cannot vanish from under the pointer because the
   // agent answered. See shared/thread-filter.js.
-  threadFilter: { on: false, states: [...THREAD_STATES], retained: new Map() },
+  threadFilter: { on: false, retained: new Map() },
   projects: [],
   threadProjectId: {},
   projectsLoading: false,
@@ -1593,28 +1592,16 @@ window.addEventListener("keydown", (event) => {
 // ---------------------------------------------------------------------------
 
 const sidebarBellToggle = document.getElementById("sidebar-bell-toggle");
-const sidebarActivityFilter = document.getElementById("sidebar-activity-filter");
 
 function syncActivityFilterChrome() {
-  const { on, states } = state.threadFilter;
+  const { on } = state.threadFilter;
   sidebarBellToggle?.classList.toggle("is-active", on);
-  sidebarBellToggle?.setAttribute("aria-expanded", String(on));
-  if (sidebarActivityFilter) {
-    sidebarActivityFilter.hidden = !on;
-  }
-  for (const state_ of THREAD_STATES) {
-    const pill = document.getElementById(`activity-filter-${state_}`);
-    if (!pill) continue;
-    const selected = states.includes(state_);
-    pill.classList.toggle("is-selected", selected);
-    pill.setAttribute("aria-pressed", String(selected));
-  }
+  sidebarBellToggle?.setAttribute("aria-pressed", String(on));
 }
 
-// Turning the filter on or changing which states it covers RESETS retention. The
-// retention set exists so a row cannot vanish mid-reach; carrying it across a
-// deliberate change of selection would instead make the new selection show rows the
-// user just excluded.
+// Toggling the filter RESETS retention. The retention set exists so a row cannot
+// vanish mid-reach; carrying it across a deliberate off/on would instead re-list
+// rows that stopped being interesting long ago.
 function setActivityFilter(next) {
   state.threadFilter = { ...state.threadFilter, ...next, retained: new Map() };
   syncActivityFilterChrome();
@@ -1622,30 +1609,7 @@ function setActivityFilter(next) {
 }
 
 sidebarBellToggle?.addEventListener("click", () => {
-  const turningOn = !state.threadFilter.on;
-  setActivityFilter({
-    on: turningOn,
-    // Re-opening always starts from "show me everything that is going on". A
-    // narrowing from ten minutes ago is not a preference worth restoring — it would
-    // silently hide sessions with the reason scrolled out of memory.
-    states: [...THREAD_STATES],
-  });
-});
-
-sidebarActivityFilter?.addEventListener("click", (event) => {
-  const pill = event.target.closest?.(".activity-filter-pill");
-  const picked = pill?.dataset.state;
-  if (!picked) {
-    return;
-  }
-  const current = state.threadFilter.states;
-  const next = current.includes(picked)
-    ? current.filter((entry) => entry !== picked)
-    : [...THREAD_STATES].filter((entry) => current.includes(entry) || entry === picked);
-  // Deselecting the last pill would show nothing with no way back except the bell
-  // itself. Treat it as "all", which is what the empty selection already means to
-  // the filter.
-  setActivityFilter({ states: next.length ? next : [...THREAD_STATES] });
+  setActivityFilter({ on: !state.threadFilter.on });
 });
 
 // Prompt for a Project name (trimmed; null aborts). Native prompt mirrors the

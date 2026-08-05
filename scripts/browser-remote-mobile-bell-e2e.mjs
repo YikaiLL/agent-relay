@@ -549,7 +549,6 @@ async function main() {
     await setBell(true);
     console.error("after click:", JSON.stringify(await page.evaluate(() => ({
       active: document.querySelector("#remote-sidebar-bell-toggle")?.classList.contains("is-active"),
-      pills: document.querySelectorAll("#remote-activity-filter .activity-filter-pill").length,
       groups: [...document.querySelectorAll("#remote-threads-list .thread-group-name")].map((n) => n.textContent.trim()),
       rows: [...document.querySelectorAll("#remote-threads-list .conversation-item")].map((n) => n.dataset.threadId),
     }))));
@@ -568,45 +567,22 @@ async function main() {
     assert.deepEqual(bucketed, [THREAD_ID, THREAD_ID_2], `bucketed rows: ${JSON.stringify(bucketed)}`);
     assert.ok(!bucketed.includes(THREAD_ID_3), "an idle session has no state and no bucket");
 
-    // The pills must fit the drawer rather than spilling out of it.
-    const pills = await page.evaluate(() => {
-      const nodes = [...document.querySelectorAll("#remote-activity-filter .activity-filter-pill")];
-      return nodes.map((n) => {
-        const rect = n.getBoundingClientRect();
-        return {
-          state: n.dataset.state,
-          count: n.querySelector("[data-count-for]")?.textContent?.trim(),
-          selected: n.classList.contains("is-selected"),
-          overflows: rect.right > window.innerWidth + 1,
-        };
-      });
-    });
-    assert.equal(pills.length, 4, `four pills: ${JSON.stringify(pills)}`);
-    assert.ok(pills.every((pill) => !pill.overflows), `pills must stay inside the drawer: ${JSON.stringify(pills)}`);
-    assert.ok(pills.every((pill) => pill.selected), "every state starts selected");
-    assert.equal(pills.find((p) => p.state === "needs_input").count, "1");
-    assert.equal(pills.find((p) => p.state === "working").count, "1");
+    // 3. No pill row, on either surface. The drawer is 390px wide: a row of four pills
+    // above the list restated the bucket headers underneath it and spent the scarcest
+    // vertical space on the phone doing it.
+    assert.equal(
+      await page.evaluate(
+        () => document.querySelectorAll("#remote-activity-filter, .activity-filter-pill").length
+      ),
+      0,
+      "the bell must not render a pill row"
+    );
 
-    // 3. Narrowing to one state.
-    for (const state of ["working", "reviewing", "completed"]) {
-      await page.tap(`#remote-activity-filter-${state}`);
-    }
-    await page.waitForFunction(
-      (id) => {
-        const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
-        return rows.length === 1 && rows[0].dataset.threadId === id;
-      },
-      THREAD_ID,
-      { timeout: TIMEOUT_MS }
-    ).catch(async () => {
-      throw new Error(`narrowing left ${JSON.stringify(await rowIds())}`);
-    });
-
-    // 4. Retention across the FULL chain: selected state → an unselected live state →
-    // stateless. Splitting it (the first draft went straight to stateless) hides the
-    // bug where the store-write is guarded on Map size: a row MOVING between states
-    // changes only a value, so the write is skipped and the row snaps back to the
-    // bucket it started in once it loses its state.
+    // 4. Retention across the FULL chain: one bucket → another live state → stateless.
+    // Splitting it (the first draft went straight to stateless) hides the bug where the
+    // store-write is guarded on Map size: a row MOVING between states changes only a
+    // value, so the write is skipped and the row snaps back to the bucket it started in
+    // once it loses its state.
     //
     // This is also the only coverage of the effect that drives retention on remote — if
     // it never settled, the page would spin here instead of asserting.
@@ -979,10 +955,13 @@ async function main() {
       throw new Error(`turning the bell off left ${JSON.stringify(await rowIds())}`);
     });
     assert.equal(await bellOn(), false);
-    assert.equal(
-      await page.evaluate(() => Boolean(document.querySelector("#remote-activity-filter"))),
-      false,
-      "the pills go away with the filter"
+    assert.ok(
+      !(await groupLabels()).some((label) =>
+        ["Needs input", "Working", "Reviewing", "Done"].includes(label)
+      ),
+      `turning the bell off must restore the resting grouping, got ${JSON.stringify(
+        await groupLabels()
+      )}`
     );
 
     // Deleting the project you are IN. The store held the id, and nothing cleared it:

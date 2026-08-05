@@ -5,7 +5,6 @@ import {
   loadLastEffort,
 } from "../shared/last-used-settings.js";
 import { loadDeviceLabel } from "./state.js";
-import { THREAD_STATES } from "../shared/thread-dot.js";
 import { notificationPermission } from "../shared/thread-notify.js";
 import { pushSupported } from "./push-subscribe.js";
 
@@ -56,7 +55,7 @@ export function createRemoteUiStore(initialState = {}) {
     // The bell. Same shape and rules as local's `state.threadFilter` — see
     // shared/thread-filter.js — but held here because remote has no imperative `state`
     // object. `retained` is a Map on purpose: thread ids are arbitrary strings.
-    threadFilter: { on: false, states: [...THREAD_STATES], retained: new Map() },
+    threadFilter: { on: false, retained: new Map() },
     sessionDraft: createDefaultSessionDraft(),
     sessionPanelOpen: false,
     sessionStartPending: false,

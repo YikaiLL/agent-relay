@@ -5,7 +5,6 @@ import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
 import { BELL_SVG, PLUS_SVG, CHEVRON_RIGHT_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
-import { THREAD_STATES, THREAD_STATE_LABELS } from "../shared/thread-dot.js";
 
 const h = React.createElement;
 
@@ -110,14 +109,17 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
             type: "button",
             title: "Filter by activity",
             "aria-label": "Filter by activity",
-            "aria-expanded": "false",
+            // A toggle, not a disclosure: it re-groups the list in place and there is
+            // no popover under it to expand.
+            "aria-pressed": "false",
           },
           iconNode(BELL_SVG)
         )
       )
     ),
     h(SessionSearch),
-    h(ActivityFilter),
+    // No state pills under the bell: turning it on re-groups the list by state, and
+    // those bucket headers already say everything a pill row could.
     h(AuthForm),
     // No Sessions/Projects toggle: selecting a project PINS it to the top of a list
     // that stays complete, so there was never a second mode to be in. The Project
@@ -186,36 +188,6 @@ function SessionSearch() {
         "aria-label": "Clear search",
       },
       iconNode(X_SVG)
-    )
-  );
-}
-
-// The bell's state pills. Always mounted, toggled with `hidden`, like the search field:
-// nothing holding a `dom.js` handle may be conditionally rendered away.
-function ActivityFilter() {
-  return h(
-    "div",
-    {
-      className: "sidebar-activity-filter",
-      id: "sidebar-activity-filter",
-      hidden: true,
-      role: "group",
-      "aria-label": "Filter sessions by activity",
-    },
-    ...THREAD_STATES.map((state) =>
-      h(
-        "button",
-        {
-          className: "activity-filter-pill is-selected",
-          "data-state": state,
-          id: `activity-filter-${state}`,
-          type: "button",
-          "aria-pressed": "true",
-        },
-        h("span", { className: `activity-filter-dot is-${state}`, "aria-hidden": "true" }),
-        h("span", { className: "activity-filter-label" }, THREAD_STATE_LABELS[state]),
-        h("span", { className: "activity-filter-count", "data-count-for": state }, "0")
-      )
     )
   );
 }

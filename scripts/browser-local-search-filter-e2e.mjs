@@ -384,23 +384,19 @@ async function main() {
     assert.ok(!bellIds.includes(idleId), "an idle session has no state and no bucket");
     assert.ok(bellIds.includes(blockedId), "the parked session belongs to Needs input");
 
-    const counts = await page.evaluate(() =>
-      Object.fromEntries(
-        [...document.querySelectorAll("[data-count-for]")].map((n) => [
-          n.dataset.countFor,
-          n.textContent.trim(),
-        ])
-      )
+    // The bell is a plain on/off toggle: no pill row, no per-state selection. The bucket
+    // headers ARE the readout, so a second one above the list would only restate them.
+    assert.equal(
+      await page.evaluate(() => document.querySelectorAll(".activity-filter-pill").length),
+      0,
+      "the bell must not render a pill row"
     );
-    assert.equal(counts.needs_input, "1", `needs_input pill count: ${JSON.stringify(counts)}`);
-    assert.equal(counts.completed, "1", `completed pill count: ${JSON.stringify(counts)}`);
 
-    step("7. narrowing to one state, then retention when that state changes");
-    for (const state of ["working", "reviewing", "completed"]) {
-      await page.click(`#activity-filter-${state}`);
-    }
-    await waitForRowCount(page, 1, "narrowed to Needs input");
-    assert.deepEqual(await groupLabels(page), ["Needs input"]);
+    step("7. retention when a bucketed row's state changes");
+    assert.ok(
+      (await groupLabels(page)).includes("Needs input"),
+      "precondition: the parked session is the only thing under Needs input"
+    );
 
     // Answer it. The row must NOT vanish — it moves to the bucket it is actually in.
     await approveFor(relayPort, blockedId);
@@ -433,24 +429,15 @@ async function main() {
     // onResumeThread). A "Done" row therefore becomes STATELESS the instant you click
     // it — and without retention remembering the bucket it was last in, it would drop
     // out of the list under the pointer, which is the worst possible moment.
-    // Reopening the bell resets the selection to all four, so this does not depend on
-    // whatever step 7 left behind.
-    await setBell(page, false);
-    await setBell(page, true);
-    for (const state of ["needs_input", "working", "reviewing"]) {
-      await page.click(`#activity-filter-${state}`);
-    }
-    await page.waitForFunction(
-      () =>
-        [...document.querySelectorAll(".activity-filter-pill.is-selected")].map(
-          (n) => n.dataset.state
-        ).join() === "completed",
-      undefined,
-      { timeout: TIMEOUT_MS }
+    assert.ok(
+      (await groupLabels(page)).includes("Done"),
+      "precondition: the finished session sits under Done"
     );
-    const doneRows = await rowIds(page);
-    assert.ok(doneRows.length > 0, "the Done bucket should have something to click");
-    const clickTarget = doneRows[0];
+    const clickTarget = doneId;
+    assert.ok(
+      (await rowIds(page)).includes(clickTarget),
+      "precondition: the finished session is listed before it is clicked"
+    );
     await page.click(`#threads-list [data-thread-id="${clickTarget}"]`);
     await delay(1200);
     assert.ok(
