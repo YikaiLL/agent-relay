@@ -1,6 +1,5 @@
 import {
   buildNavigationThreadGroups,
-  isUnassignedProject,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
 import { isReviewInProgressForThread } from "../shared/review-state.js";
@@ -96,14 +95,17 @@ export function selectThreadsRenderModel({
   remoteAuth,
   relayDirectory,
   session,
-  // Projects grouping (mirrors the local surface). Defaults keep the pre-Projects
-  // behavior (session/cwd grouping) for any caller that doesn't pass them.
-  viewMode = "sessions",
+  // The Project switcher's selection, ALREADY run through `selectPinnedProjectId`
+  // by the caller — that policy is where "a search or the bell stands the pin down"
+  // lives, and it is deliberately not re-decided here.
+  //
+  // This replaced a `viewMode` that swapped the grouping axis between cwd and
+  // project. A pin is additive instead: it lifts one project's sessions to the top
+  // and leaves everything else exactly where it was, so there is no mode in which
+  // the list is anything but complete.
+  pinnedProjectId = null,
   projects = [],
   threadProjectId = {},
-  projectsError = null,
-  projectsLoaded = false,
-  projectsLoading = false,
 }) {
   let normalizedThreads = Array.isArray(threads) ? [...threads] : [];
   if (
@@ -116,12 +118,9 @@ export function selectThreadsRenderModel({
     }
   }
 
-  const groupByProject = viewMode === "projects";
-
   if (!remoteAuth) {
     return {
       activeThreadId,
-      viewMode,
       countLabel: "Remote session history",
       emptyMessage: relayDirectory?.length
         ? "Open a relay to view its session history."
@@ -133,53 +132,30 @@ export function selectThreadsRenderModel({
   if (error) {
     return {
       activeThreadId,
-      viewMode,
       countLabel: "Error",
       emptyMessage: error,
       groups: [],
     };
   }
 
-  // Fail closed: in Projects mode, never present sessions as authoritative membership
-  // until the dedicated payload is fresh (mirrors the local renderer/menu guard).
-  if (groupByProject && (projectsError || !projectsLoaded || projectsLoading)) {
-    return {
-      activeThreadId,
-      viewMode,
-      countLabel: projectsError ? "Projects unavailable" : "Loading projects…",
-      emptyMessage: projectsError
-        ? `Failed to load projects: ${projectsError}`
-        : "Loading projects…",
-      groups: [],
-    };
-  }
-
-  // Projects mode must not surface the "Unassigned" bucket. Shared grouping always
-  // creates one for any thread without a project (shared/thread-groups.js:124-126),
-  // which flooded the phone's Projects view with every unassigned session. The
-  // local sidebar avoids this by listing projects only and moving sessions into a
-  // main-area card overview (local/render-session.js:1445); remote has no such
-  // main area yet, so it keeps the grouped list and drops the bucket instead —
-  // otherwise Projects mode would show rows with no way to open a session.
-  const groups = groupByProject
-    ? buildNavigationThreadGroups(normalizedThreads, {
-        groupBy: "project",
-        projects,
-        threadProjectId,
-      }).filter((group) => !isUnassignedProject(group.key))
-    : buildNavigationThreadGroups(normalizedThreads);
+  // No fail-closed gate on the Projects payload any more, and that is a deliberate
+  // reversal rather than an omission. Projects MODE had to withhold the list until
+  // the payload was fresh, because a stale membership map would have mis-grouped
+  // every row. A pin can only mis-place the rows it lifts: an unresolved project id
+  // degrades to plain cwd grouping (`resolvePinnedProject`), which shows every
+  // session correctly and merely fails to lift one group. Blanking a complete list
+  // behind "Loading projects…" is the worse answer to "not yet sorted" — and on a
+  // phone it also meant a refresh emptied a sidebar that was entirely correct.
+  const groups = buildNavigationThreadGroups(normalizedThreads, {
+    pinnedProjectId,
+    projects,
+    threadProjectId,
+  });
 
   return {
     activeThreadId,
-    viewMode,
-    countLabel: loading
-      ? "Loading..."
-      : summarizeThreadGroups(groups, { groupBy: groupByProject ? "project" : "cwd" }),
-    emptyMessage: groups.length
-      ? null
-      : groupByProject
-        ? "No projects yet — create one to group sessions."
-        : "No remote sessions found yet.",
+    countLabel: loading ? "Loading..." : summarizeThreadGroups(groups),
+    emptyMessage: groups.length ? null : "No remote sessions found yet.",
     groups,
   };
 }

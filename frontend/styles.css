@@ -1101,7 +1101,14 @@ input:focus, textarea:focus, select:focus {
    to tertiary so it labels the group and then gets out of the way; the same move
    the workspace-changes rail already makes with its row label. Selection still
    wins it back via .is-selected-workspace (accent) below. */
-.thread-group-name {
+/* The pinned chip's label shares this rule rather than restating it. It stands in for
+ * the group header it replaced, so it has to read as a sibling of "agent-relay" — and
+ * matching by copying the declarations is exactly what let it drift: the source strings
+ * agreed while the ≤960px step-up moved one of them and not the other, so the chip
+ * shipped a size smaller than its own peers on the only device that renders it.
+ * Sharing the selector makes divergence impossible rather than merely detectable. */
+.thread-group-name,
+.pinned-project-chip-name {
   min-width: 0;
   flex: 1 1 auto;
   font-size: var(--text-sm);
@@ -3885,7 +3892,8 @@ input:focus, textarea:focus, select:focus {
   .conversation-item { padding: 8px 10px 8px 12px; }
   .conversation-title { font-size: var(--text-body); }
   .conversation-meta { font-size: var(--text-sm); }
-  .thread-group-name { font-size: var(--text-ui); }
+  .thread-group-name,
+  .pinned-project-chip-name { font-size: var(--text-ui); }
   .sidebar-host-status { font-size: var(--text-sm); }
 
   .chat-shell { height: auto; overflow: visible; }
@@ -4303,6 +4311,9 @@ input:focus, textarea:focus, select:focus {
 /* Sidebar-top toggle: visible while sidebar is open.
  * Collapsed-actions in the chat header: visible only when sidebar is closed. */
 .sidebar-top-bar {
+  /* The containing block for the Project switcher's menu, which spans this bar
+     rather than hanging off its 32px trigger — see .project-switcher-top below. */
+  position: relative;
   display: flex;
   align-items: center;
   padding-bottom: 4px;
@@ -5648,6 +5659,101 @@ body.is-resizing-panel {
   overflow: visible;
 }
 
+/* Remote's placement: NOT a row above the list. Switching projects is a
+ * low-frequency act on a phone — the drawer defaults to sessions and search/filter
+ * are the fast paths — so the control is one icon beside search and the bell, and the
+ * pinned state is reported by a quiet chip instead of a heading.
+ *
+ * It is also not in the chat header: at 390px that title row carries a status badge,
+ * a model badge and an info button, and a trigger measured there got 58px for a 144px
+ * label. A control whose entire job is to name where you are cannot live where it can
+ * only render "Defa…". */
+/* The top-bar menu is anchored to the TOP BAR, not to its 32px trigger.
+ *
+ * Anchoring it to the button cannot work at drawer widths and the side makes no
+ * difference: the drawer is `min(360px, 100vw - 48px)`, so at 320px it is 272px wide
+ * while the menu's own minimum is 220px. Left-anchored it ran off the right edge;
+ * right-anchored it ran off the LEFT edge (measured at -51px) — and `.sidebar` clips
+ * horizontal overflow, so either way the far side simply was not reachable.
+ *
+ * Spanning the bar sidesteps the arithmetic entirely: the menu is as wide as the drawer
+ * allows at every width, which is also how a menu on a phone should behave. */
+.project-switcher-top {
+  position: static;
+}
+
+.project-switcher-top .project-switcher-menu {
+  top: calc(100% + 4px);
+  left: 8px;
+  right: 8px;
+  min-width: 0;
+  max-width: none;
+}
+
+.project-switcher-icon-trigger {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  margin: 0;
+  justify-content: center;
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+}
+
+.project-switcher-icon-trigger.is-active {
+  color: var(--accent-strong, var(--text-1));
+  background: var(--surface-2);
+}
+
+/* The pinned project, said once, quietly. Without it the lifted sessions sit at the
+ * top of the list with no group header and nothing explaining why they are there —
+ * every other group has a header, so they read as a rendering fault rather than as a
+ * selection. The × is the way back to the default workspace.
+ *
+ * Typography is taken from `.thread-group-name` deliberately: this chip stands in for
+ * the group header it replaced, so it should read as a sibling of "agent-relay" and
+ * "sealwire-site" rather than as a new kind of thing. A style guard holds the two in
+ * step. */
+.pinned-project-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  /* This is a flex ITEM of `.remote-access-shell`, which means two things that are easy
+   * to get wrong together: the `inline-flex` above is blockified to `flex`, and the
+   * item's automatic minimum size (`min-width: auto`) OVERRIDES `max-width: 100%`. A
+   * long project name therefore grew the chip past the drawer — 420px inside a 309px
+   * column — and pushed its own × off screen while the label never clipped. */
+  min-width: 0;
+  /* ...and without this it would stretch to the full column width, which turns a pill
+   * into a bar. */
+  align-self: flex-start;
+  max-width: 100%;
+  margin: 0 0 8px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+.pinned-project-chip-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: var(--text-3);
+  background: transparent;
+  cursor: pointer;
+}
+
+.pinned-project-chip-clear:hover {
+  color: var(--text-1);
+  background: var(--surface-3);
+}
+
 .project-switcher-trigger {
   display: inline-flex;
   align-items: center;
@@ -5771,4 +5877,31 @@ body.is-resizing-panel {
 
 .project-switcher-create:hover {
   color: var(--text-1);
+}
+
+/* Managing the project you are IN is a different kind of act again from creating one,
+ * so it gets its own group at the bottom. The divider sits on whatever comes first in
+ * that group rather than on every member — a border on each would draw a line between
+ * rename and delete, which belong together. */
+.project-switcher-manage {
+  color: var(--text-2);
+}
+
+.project-switcher-option:not(.project-switcher-manage) + .project-switcher-manage {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-faint);
+}
+
+/* Same tokens the project header's delete button uses, so "destructive" looks the same
+ * wherever it is offered. Referenced bare: an undefined token must break loudly rather
+ * than fall back to something that merely looks deliberate. */
+.project-switcher-danger {
+  color: var(--err-fg);
+}
+
+.project-switcher-danger:hover,
+.project-switcher-danger:focus-visible {
+  color: var(--err-fg);
+  background: var(--err-bg);
 }

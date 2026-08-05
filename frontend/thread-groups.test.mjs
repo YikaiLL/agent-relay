@@ -278,3 +278,92 @@ test("summarizeThreadGroups and canonicalizeWorkspace produce stable display val
   assert.equal(summarizeThreadGroups(groups), "2 folders · 2 sessions");
   assert.equal(summarizeThreadGroups([]), "No saved sessions yet.");
 });
+
+// --- the pinned group's header row, and the three states that could strand it -------
+
+const pinnedGroup = (threadCount) => ({
+  key: "proj_a",
+  cwd: "",
+  projectId: "proj_a",
+  pinned: true,
+  label: "Pinned",
+  threads: Array.from({ length: threadCount }, (_, index) => ({
+    id: `t${index}`,
+    updated_at: threadCount - index,
+  })),
+});
+
+const cwdGroup = {
+  key: "/work/a",
+  cwd: "/work/a",
+  label: "a",
+  threads: [{ id: "other", updated_at: 1 }],
+};
+
+test("hidePinnedGroupHeader drops the pinned group's header row and keeps its sessions", () => {
+  const groups = [pinnedGroup(2), cwdGroup];
+  const withHeader = createThreadListRows({ groups, collapsible: true });
+  const without = createThreadListRows({ groups, collapsible: true, hidePinnedGroupHeader: true });
+
+  // Positive control: the flag has to remove something that was there.
+  assert.equal(
+    withHeader.filter((row) => row.type === "group").length,
+    2,
+    "precondition: both groups normally emit a header"
+  );
+  assert.deepEqual(
+    without.filter((row) => row.type === "group").map((row) => row.normalizedCwd),
+    ["/work/a"],
+    "only the pinned group loses its header"
+  );
+  assert.deepEqual(
+    without.filter((row) => row.type === "thread").map((row) => row.thread.id),
+    ["t0", "t1", "other"],
+    "and every session is still listed, in order"
+  );
+});
+
+// The disclosure control lives ON the header. A headerless group that honoured a
+// remembered collapse would hide its sessions with nothing on screen to bring them
+// back — and the collapsed set is persisted, so it would stay that way across reloads.
+test("a headerless pinned group cannot be stranded by a remembered collapse", () => {
+  const rows = createThreadListRows({
+    groups: [pinnedGroup(2)],
+    collapsible: true,
+    collapsedGroupCwds: new Set(["proj_a"]),
+    hidePinnedGroupHeader: true,
+  });
+
+  assert.deepEqual(
+    rows.map((row) => row.type),
+    ["thread", "thread"],
+    "its sessions render regardless of the collapsed set"
+  );
+});
+
+test("an EMPTY pinned group contributes no rows at all rather than a bare header", () => {
+  const rows = createThreadListRows({
+    groups: [pinnedGroup(0), cwdGroup],
+    collapsible: true,
+    hidePinnedGroupHeader: true,
+  });
+
+  assert.deepEqual(rows.map((row) => row.key), ["group:/work/a", "thread:other"]);
+});
+
+// The "show more" row is emitted per group and keyed on the group, not on the header.
+// Losing the header must not lose the overflow control with it.
+test("a headerless pinned group past the visible limit still offers show-more", () => {
+  const rows = createThreadListRows({
+    groups: [pinnedGroup(12)],
+    collapsible: true,
+    hidePinnedGroupHeader: true,
+    visibleThreadLimit: 10,
+  });
+
+  assert.equal(rows.filter((row) => row.type === "group").length, 0, "no header");
+  assert.equal(rows.filter((row) => row.type === "thread").length, 10, "capped at the limit");
+  const more = rows.find((row) => row.type === "show-more");
+  assert.ok(more, "and the overflow row survives");
+  assert.equal(more.hiddenCount, 2);
+});

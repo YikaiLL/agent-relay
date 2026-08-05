@@ -257,6 +257,14 @@ async function main() {
                 push();
               };
               // ...and then it finishes, losing every state it had.
+              // Another device deletes the project while this one still has it pinned.
+              // Not the same path as deleting it HERE: nothing clears the local
+              // selection, so this is the only way to exercise the fail-open branch.
+              window.__setProjectsGone = (gone) => {
+                window.__projectsGone = gone;
+                snapshot.projects_revision = (snapshot.projects_revision || 1) + 1;
+                push();
+              };
               window.__finishTurn = () => {
                 snapshot.thread_activity = [
                   { thread_id: threadId2, phase: "tool", tool: "bash" },
@@ -304,11 +312,22 @@ async function main() {
                 ok: true,
                 snapshot,
                 projects: {
-                  projects: [{ id: "project-alpha", name: "Alpha project" }],
-                  // Every thread deliberately UNASSIGNED: Projects mode drops the
-                  // Unassigned bucket, so this is what makes "the bell reads the
-                  // projects-filtered source" visible as an empty bell.
-                  thread_project_id: {},
+                  projects: window.__projectsGone
+                    ? []
+                    : [{ id: "project-alpha", name: "Alpha project" }],
+                  // The WORKING thread is the member, and the other two stay out. Under
+                  // the pin that makes all three visible at once — one lifted into the
+                  // project group, two left in their cwd group — which is what lets step
+                  // 5 tell "the bell replaced the pinned group" apart from "the list
+                  // happened to look the same".
+                  //
+                  // This map used to be deliberately EMPTY, because Projects mode
+                  // dropped the Unassigned bucket and an empty bell was the symptom
+                  // worth catching. There is no bucket to drop under a pin, so that
+                  // fixture would now prove nothing.
+                  thread_project_id: window.__projectsGone
+                    ? {}
+                    : { [threadId2]: "project-alpha" },
                   projects_revision: 1,
                 },
               });
@@ -440,6 +459,49 @@ async function main() {
       }
       assert.equal(await bellOn(), want, `bell should be ${want ? "on" : "off"}`);
     };
+
+    // The Project switcher sits at the top of the drawer, where the Sessions/Projects
+    // toggle used to be. Same read-then-act discipline as `setBell`: a blind tap on an
+    // already-open menu closes it, and the option wait below would then hang for the
+    // full timeout pointing at the wrong thing.
+    const openSwitcherMenu = async () => {
+      await page.waitForSelector(".project-switcher-trigger", {
+        state: "visible",
+        timeout: TIMEOUT_MS,
+      });
+      const alreadyOpen = await page.evaluate(
+        () =>
+          document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded")
+          === "true"
+      );
+      if (!alreadyOpen) {
+        await page.tap(".project-switcher-trigger");
+      }
+      await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+    };
+
+    const chooseSwitcherOption = async (label) => {
+      await openSwitcherMenu();
+      await page
+        .locator(".project-switcher-option", { hasText: new RegExp(`^${label}$`) })
+        .first()
+        .tap({ timeout: TIMEOUT_MS });
+      // Settle on the CHIP, not on a timer: the menu closes immediately while the list
+      // regroups a render later. The trigger is an icon now and says nothing, so the
+      // chip is the only thing that reports which project is pinned.
+      await page.waitForFunction(
+        (expected) => {
+          const chip = document.querySelector("#remote-pinned-project .pinned-project-chip-name");
+          return expected === "Default Workspace"
+            ? !document.querySelector("#remote-pinned-project")
+            : chip?.textContent?.trim() === expected;
+        },
+        label,
+        { timeout: TIMEOUT_MS }
+      );
+    };
+
+    const selectDefaultWorkspaceInSwitcher = () => chooseSwitcherOption("Default Workspace");
 
     await openDrawer();
     await page.waitForFunction((n) =>
@@ -597,23 +659,45 @@ async function main() {
       `a stateless row must rest in the bucket it was LAST really in, not the one it joined by; groups: ${JSON.stringify(await groupLabels())}`
     );
 
-    // 5. The bell must cut ACROSS Projects mode. Remote's render model drops the
-    // Unassigned bucket in that mode, so a session that is WORKING but belongs to no
-    // project would be missing from the one control whose job is "show me what is going
-    // on" — and while the Projects payload is loading or failed it would be handed
-    // nothing at all.
+    // 5. The bell must STAND THE PIN DOWN, and the pin must come back afterwards.
+    //
+    // This step used to drive a Sessions/Projects toggle. That toggle is gone: the
+    // Project switcher pins a project to the top of the list instead of swapping the
+    // grouping axis. The invariant survived the mechanism change but its failure mode
+    // did not — the bell no longer risks reading a projects-filtered source, it risks
+    // COMPOSING with the pin, which cannot work: `buildThreadStateGroups` replaces the
+    // group structure outright rather than narrowing rows inside it. A pinned group
+    // that appeared to survive the bell would be a stale render, not a feature.
     await setBell(false);
-    await page.tap("#remote-threads-view-projects");
-    await page.waitForFunction(
-      () =>
-        [...document.querySelectorAll("#remote-threads-list .thread-group-name")]
-          .map((n) => n.textContent.trim())
-          .includes("Alpha project"),
-      undefined,
-      { timeout: TIMEOUT_MS }
-    ).catch(async () => {
-      throw new Error(`projects mode showed ${JSON.stringify(await groupLabels())}`);
-    });
+    await chooseSwitcherOption("Alpha project");
+
+    // Pinned: the project leads the list, and the sessions that are NOT in it are
+    // still listed below. Asserting only the first half would pass a pin that had
+    // quietly become a filter.
+    //
+    // The pinned group renders NO header at all — the chip above the list names it — so
+    // "is it pinned" is answered by the ROW ORDER plus the chip, never by a header
+    // label. Asserting on a label here would be asserting the duplication this design
+    // exists to remove.
+    assert.equal(
+      await page.evaluate(() =>
+        document.querySelector("#remote-pinned-project .pinned-project-chip-name")?.textContent?.trim()
+      ),
+      "Alpha project",
+      "the chip names the pinned project"
+    );
+    assert.equal(
+      (await rowIds())[0],
+      THREAD_ID_2,
+      `the pinned project's session must lead the list, got ${JSON.stringify(await rowIds())}`
+    );
+    const pinnedRows = await rowIds();
+    for (const id of [THREAD_ID, THREAD_ID_2, THREAD_ID_3]) {
+      assert.ok(
+        pinnedRows.includes(id),
+        `a pin hides nothing — ${id} missing from ${JSON.stringify(pinnedRows)}`
+      );
+    }
 
     await setBell(true);
     await page.waitForFunction(
@@ -621,18 +705,155 @@ async function main() {
         const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
         const labels = [...document.querySelectorAll("#remote-threads-list .thread-group-name")]
           .map((n) => n.textContent.trim());
-        return rows.some((row) => row.dataset.threadId === id) && labels.includes("Working");
+        return (
+          rows.some((row) => row.dataset.threadId === id)
+          && labels.includes("Working")
+          // The pin stood down entirely, chip included — the bell replaces the group
+          // structure rather than narrowing inside it.
+          && !document.querySelector("#remote-pinned-project")
+        );
       },
       THREAD_ID_2,
       { timeout: TIMEOUT_MS }
     ).catch(async () => {
       throw new Error(
-        `the bell did not take over Projects mode: groups ${JSON.stringify(await groupLabels())} rows ${JSON.stringify(await rowIds())}`
+        `the bell did not stand the pin down: groups ${JSON.stringify(await groupLabels())} rows ${JSON.stringify(await rowIds())}`
       );
     });
+
+    // ...and switching the bell off restores the pin rather than leaving the selection
+    // stranded. The selection lives in the store and the pin is derived per render, so
+    // a stand-down that mutated the selection would look identical here until you
+    // turned the bell off.
     await setBell(false);
-    await page.tap("#remote-threads-view-sessions");
-    await page.waitForTimeout(400);
+    await page.waitForFunction(
+      () =>
+        document.querySelector("#remote-pinned-project .pinned-project-chip-name")
+          ?.textContent?.trim() === "Alpha project",
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(async () => {
+      throw new Error(
+        `the pin did not come back after the bell: ${JSON.stringify(await groupLabels())}`
+      );
+    });
+
+    // The menu has to LAND inside the drawer, not merely declare a right anchor. It
+    // opens from a right-aligned top-bar button, carries a 220px minimum width, and the
+    // drawer clips horizontal overflow — so a left-anchored menu put its far edge and
+    // its first option somewhere the user could not reach, with nothing failing.
+    //
+    // Checked at two widths because the drawer is `min(360px, 100vw - 48px)`: at 390px
+    // it is 342px and at 320px it is 272px, which is only 52px wider than the menu's
+    // own minimum. A single width would not notice an anchor that merely happens to fit.
+    for (const width of [390, 320]) {
+      await page.setViewportSize({ width, height: 844 });
+      await openSwitcherMenu();
+      const box = await page.evaluate(() => {
+        const menu = document.querySelector(".project-switcher-menu");
+        const drawer = document.querySelector(".remote-app-shell .sidebar");
+        const m = menu.getBoundingClientRect();
+        const d = drawer.getBoundingClientRect();
+        return { left: m.left, right: m.right, dLeft: d.left, dRight: d.right, w: m.width };
+      });
+      assert.ok(
+        box.left >= box.dLeft - 1 && box.right <= box.dRight + 1,
+        `at ${width}px the switcher menu escapes the drawer: menu [${Math.round(box.left)}, `
+          + `${Math.round(box.right)}] vs drawer [${Math.round(box.dLeft)}, ${Math.round(box.dRight)}]`
+      );
+      // Escape rather than a blind tap: the trigger may be under the open menu.
+      await page.keyboard.press("Escape");
+      await page.waitForSelector(".project-switcher-menu", { state: "detached", timeout: TIMEOUT_MS });
+    }
+    await page.setViewportSize(MOBILE_VIEWPORT);
+
+    // Two things only a browser can answer, and both shipped broken while the
+    // source-level stylesheet guard stayed green — it resolves declarations, it does
+    // not run a cascade or a layout.
+    //
+    // 1. The chip must read as a sibling of the group headers below it. Its rule and
+    //    theirs agreed in the source while a `@media (max-width: 960px)` step-up moved
+    //    only theirs, so the chip rendered a size smaller on the one device it exists
+    //    for.
+    const typography = await page.evaluate(() => {
+      const pick = (el) => {
+        if (!el) return null;
+        const s = getComputedStyle(el);
+        return { fontSize: s.fontSize, fontWeight: s.fontWeight, color: s.color };
+      };
+      return {
+        chip: pick(document.querySelector(".pinned-project-chip-name")),
+        header: pick(document.querySelector("#remote-threads-list .thread-group-name")),
+      };
+    });
+    assert.ok(typography.chip && typography.header, "both the chip and a cwd header render");
+    assert.deepEqual(
+      typography.chip,
+      typography.header,
+      "the chip must be typographically identical to the group headers it stands in for"
+    );
+
+    // 2. A long name must clip inside the chip. The chip is a flex ITEM, whose automatic
+    //    minimum size overrides `max-width: 100%` — so before this was fixed a long name
+    //    grew it past the drawer and pushed its own × off screen.
+    const overflow = await page.evaluate(() => {
+      const name = document.querySelector(".pinned-project-chip-name");
+      const chip = document.querySelector("#remote-pinned-project");
+      const clear = document.querySelector(".pinned-project-chip-clear");
+      name.textContent = "A ludicrously long project name that no drawer could ever hold";
+      const parent = chip.parentElement.getBoundingClientRect();
+      return {
+        clipped: name.clientWidth < name.scrollWidth,
+        clearInside: clear.getBoundingClientRect().right <= parent.right + 1,
+      };
+    });
+    assert.equal(overflow.clipped, true, "a long project name ellipsizes");
+    assert.equal(overflow.clearInside, true, "and the × stays inside the drawer");
+
+    // The pin must fail OPEN when its project disappears from under it. The sessions
+    // are all still there — blanking a list that has nothing wrong with it is the worse
+    // answer once the failure mode is "not yet sorted" rather than "wrong". This is the
+    // path a local delete cannot reach: the stored id survives, so every consumer has to
+    // agree that it resolves to nothing.
+    await page.evaluate(() => window.__setProjectsGone(true));
+    await page.waitForFunction(
+      () => !document.querySelector("#remote-pinned-project"),
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(() => {
+      throw new Error("the chip outlived the project it names");
+    });
+
+    const survivors = await rowIds();
+    for (const id of [THREAD_ID, THREAD_ID_2, THREAD_ID_3]) {
+      assert.ok(
+        survivors.includes(id),
+        `failing open must keep the WHOLE list — ${id} missing from ${JSON.stringify(survivors)}`
+      );
+    }
+    assert.equal(
+      await page.evaluate(() =>
+        document.querySelector(".project-switcher-trigger")?.classList.contains("is-active")
+      ),
+      false,
+      "and the icon must not stay lit for a project that no longer exists"
+    );
+
+    // Reversible: the selection was never destroyed, only unresolvable, so the project
+    // coming back re-pins it without the user re-choosing.
+    await page.evaluate(() => window.__setProjectsGone(false));
+    await page.waitForFunction(
+      () =>
+        document.querySelector("#remote-pinned-project .pinned-project-chip-name")
+          ?.textContent?.trim() === "Alpha project",
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(() => {
+      throw new Error("the pin did not recover when its project came back");
+    });
+
+    // Back to the default workspace, so the steps below see an unpinned list.
+    await selectDefaultWorkspaceInSwitcher();
 
     // 6. Search. The relay-side filter is what makes this worth having on a phone: the
     // list is truncated before it ever reaches the device, so a client-side filter could
@@ -763,6 +984,47 @@ async function main() {
       false,
       "the pills go away with the filter"
     );
+
+    // Deleting the project you are IN. The store held the id, and nothing cleared it:
+    // the chip vanished and cwd grouping came back (the switcher fails open on an id it
+    // cannot resolve) while the top-bar icon stayed lit and no menu row was marked — one
+    // control giving two answers. Worse, the dead id survived, so the next payload that
+    // happened to carry that id would silently re-pin it.
+    //
+    // The stub keeps returning the project after the delete, which is what makes this
+    // test about the STORE rather than about the payload: if the selection were not
+    // cleared, the refetch would resolve it again and the chip would come straight back.
+    page.on("dialog", (dialog) => void dialog.accept());
+    await chooseSwitcherOption("Alpha project");
+    await openSwitcherMenu();
+    await page
+      .locator(".project-switcher-option", { hasText: /^Delete project$/ })
+      .first()
+      .tap({ timeout: TIMEOUT_MS });
+
+    await page.waitForFunction(
+      () => !document.querySelector("#remote-pinned-project"),
+      undefined,
+      { timeout: TIMEOUT_MS }
+    ).catch(() => {
+      throw new Error("the chip survived deleting its own project");
+    });
+    assert.equal(
+      await page.evaluate(() =>
+        document.querySelector(".project-switcher-trigger")?.classList.contains("is-active")
+      ),
+      false,
+      "the top-bar icon must not stay lit for a project that no longer exists"
+    );
+    await openSwitcherMenu();
+    assert.equal(
+      await page.evaluate(() =>
+        document.querySelector(".project-switcher-option.is-active")?.textContent?.trim()
+      ),
+      "Default Workspace",
+      "and the menu marks where you actually are"
+    );
+    await page.keyboard.press("Escape");
 
     console.log("REMOTE_MOBILE_BELL_E2E: PASS");
   } catch (error) {

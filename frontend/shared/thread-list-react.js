@@ -124,6 +124,7 @@ export function ThreadGroupList({
   onDeleteProject = null,
   activeProjectId = null,
   onContextProject = null,
+  hidePinnedGroupHeader = false,
   onRenameProject = null,
   onSelectProject = null,
   onResumeThread = null,
@@ -149,9 +150,10 @@ export function ThreadGroupList({
         collapsible,
         expandedGroupCwds,
         groups,
+        hidePinnedGroupHeader,
         visibleThreadLimit: VISIBLE_THREAD_LIMIT,
       }),
-    [collapsedGroupCwds, collapsible, expandedGroupCwds, groups]
+    [collapsedGroupCwds, collapsible, expandedGroupCwds, groups, hidePinnedGroupHeader]
   );
   const virtualizer = useThreadListVirtualizer(rows);
   const virtualRows = virtualizer.getVirtualItems();

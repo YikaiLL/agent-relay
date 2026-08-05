@@ -184,6 +184,185 @@ test("Escape closes the menu without letting the key reach the surface behind it
   view.cleanup();
 });
 
+// Remote hosts this control in its SIDEBAR while its chat header already owns an
+// `<h1 id="remote-workspace-title">`. Rendering the heading there would put two page
+// headings on one screen — the same duplication local's header rule exists to
+// prevent, one surface over. So the heading is opt-out, and opting out has to leave
+// a control that still works rather than a stripped one.
+test("renderHeading:false drops the heading element and keeps the control whole", () => {
+  const view = mount({ activeProjectId: "proj_pay", onCreateProject() {}, renderHeading: false });
+
+  assert.equal(view.host.querySelector("h1"), null, "no heading element at all");
+  assert.equal(trigger(view.host)?.textContent, "Payments rework", "trigger still names the project");
+
+  open(view.host);
+  assert.deepEqual(options(view.host), [
+    DEFAULT_WORKSPACE_LABEL,
+    "Payments rework",
+    "Docs",
+    "New project",
+  ]);
+  view.cleanup();
+});
+
+// The default has to stay the heading, because on local this control IS the page
+// title. A prop that silently flipped that would demote local's <h1> to a <div> and
+// nothing in the local suite asks for the element name.
+test("the heading is rendered by default, so local's header title keeps its h1", () => {
+  const view = mount({ activeProjectId: null });
+  const heading = view.host.querySelector("h1.project-switcher-heading");
+
+  assert.ok(heading, "default renders the h1");
+  assert.ok(heading.contains(trigger(view.host)), "and the trigger lives inside it");
+  view.cleanup();
+});
+
+// On a phone, switching projects is a LOW-FREQUENCY act — the list defaults to
+// sessions and search/filter are the fast paths — so remote puts this control behind
+// one icon beside search and the bell rather than giving it a row above the list.
+// The trigger becomes the icon; the label survives as its tooltip, which is the only
+// thing left saying where you are when the menu is shut.
+test("triggerIcon renders an icon trigger that still carries the label as its title", () => {
+  const view = mount({ activeProjectId: "proj_pay", triggerIcon: React.createElement("i", { className: "glyph" }) });
+  const button = trigger(view.host);
+
+  assert.equal(button.querySelector("i.glyph") !== null, true, "the icon is rendered");
+  assert.equal(view.host.querySelector(".project-switcher-label"), null, "and the text label is not");
+  assert.equal(button.getAttribute("title"), "Payments rework", "the name survives as the tooltip");
+  view.cleanup();
+});
+
+// Marked the way the search and bell toggles are, so a pinned project is legible from
+// the top bar without opening anything.
+test("the icon trigger is marked active only while a project is pinned", () => {
+  const pinned = mount({ activeProjectId: "proj_pay", triggerIcon: React.createElement("i", null) });
+  assert.equal(trigger(pinned.host).classList.contains("is-active"), true);
+  pinned.cleanup();
+
+  const none = mount({ activeProjectId: null, triggerIcon: React.createElement("i", null) });
+  assert.equal(trigger(none.host).classList.contains("is-active"), false);
+  none.cleanup();
+});
+
+// Rename/delete moved INTO this menu. The handover recorded the opposite decision —
+// "not in the switcher menu; two places to keep in step, and a destructive action one
+// keystroke from a navigation action" — but its premise was that the pinned group's
+// own header offered them. On a touch surface that header could not: the buttons were
+// opacity 0 behind :hover, and the row itself is now gone. The user reversed the call
+// deliberately; the divider keeps the destructive pair off the navigation list.
+test("the menu offers rename/delete for the ACTIVE project only", () => {
+  const view = mount({ activeProjectId: "proj_pay", onRenameProject() {}, onDeleteProject() {} });
+  open(view.host);
+
+  assert.deepEqual(options(view.host), [
+    DEFAULT_WORKSPACE_LABEL,
+    "Payments rework",
+    "Docs",
+    "Rename project",
+    "Delete project",
+  ]);
+  view.cleanup();
+});
+
+// PRODUCTION passes all three handlers, and none of the tests above did — so the order
+// they actually render in was never asserted. It was wrong: rename/delete came out
+// ABOVE "New project", i.e. destructive actions sitting in the middle of the list of
+// places you can navigate to, which is the arrangement the whole "put them behind a
+// divider" argument exists to avoid.
+test("with create AND management enabled, the destructive pair is last", () => {
+  const view = mount({
+    activeProjectId: "proj_pay",
+    onCreateProject() {},
+    onRenameProject() {},
+    onDeleteProject() {},
+  });
+  open(view.host);
+
+  assert.deepEqual(options(view.host), [
+    DEFAULT_WORKSPACE_LABEL,
+    "Payments rework",
+    "Docs",
+    "New project",
+    "Rename project",
+    "Delete project",
+  ]);
+  view.cleanup();
+});
+
+test("choosing delete reports the active project's id and name, and closes", () => {
+  const deleted = [];
+  const view = mount({
+    activeProjectId: "proj_docs",
+    onCreateProject() {},
+    onRenameProject() {},
+    onDeleteProject: (id, name) => deleted.push([id, name]),
+  });
+  open(view.host);
+  clickOption(view.host, "Delete project");
+
+  assert.deepEqual(deleted, [["proj_docs", "Docs"]]);
+  assert.equal(view.host.querySelector(".project-switcher-menu"), null, "menu closes");
+  view.cleanup();
+});
+
+// A selection whose project is gone must read as the default EVERYWHERE, not just in
+// the label. The trigger already fell back for its text while `data-active-project-id`,
+// the `is-active` highlight and the menu's tick all still used the raw id — so after
+// deleting the selected project the icon stayed lit and no menu row was marked, while
+// the list had already gone back to plain cwd grouping. Three surfaces, two answers.
+test("a stale selection reads as the default workspace in the marking too, not just the label", () => {
+  const view = mount({
+    activeProjectId: "proj_deleted",
+    triggerIcon: React.createElement("i", null),
+    onCreateProject() {},
+  });
+
+  const button = trigger(view.host);
+  assert.equal(button.classList.contains("is-active"), false, "the icon must not stay lit");
+  assert.equal(button.getAttribute("data-active-project-id"), "", "and must not advertise a dead id");
+
+  open(view.host);
+  const active = view.host.querySelector(".project-switcher-option.is-active");
+  assert.equal(active?.textContent, DEFAULT_WORKSPACE_LABEL, "the default is the marked row");
+  view.cleanup();
+});
+
+test("with no project selected there is nothing to rename or delete", () => {
+  // Positive control first. "Rename project is absent" is equally true of a switcher
+  // that never learned to offer it, so without this the test is green against the
+  // feature being missing entirely — which is exactly how it first ran.
+  const pinned = mount({ activeProjectId: "proj_pay", onRenameProject() {}, onDeleteProject() {} });
+  open(pinned.host);
+  assert.equal(
+    options(pinned.host).includes("Rename project"),
+    true,
+    "precondition: the menu can offer rename at all"
+  );
+  pinned.cleanup();
+
+  const view = mount({ activeProjectId: null, onRenameProject() {}, onDeleteProject() {} });
+  open(view.host);
+
+  assert.equal(options(view.host).includes("Rename project"), false);
+  assert.equal(options(view.host).includes("Delete project"), false);
+  view.cleanup();
+});
+
+test("choosing rename reports the active project's id and name, and closes", () => {
+  const renamed = [];
+  const view = mount({
+    activeProjectId: "proj_docs",
+    onRenameProject: (id, name) => renamed.push([id, name]),
+    onDeleteProject() {},
+  });
+  open(view.host);
+  clickOption(view.host, "Rename project");
+
+  assert.deepEqual(renamed, [["proj_docs", "Docs"]]);
+  assert.equal(view.host.querySelector(".project-switcher-menu"), null, "menu closes");
+  view.cleanup();
+});
+
 test("an empty project list still offers the default workspace and creating one", () => {
   const view = mount({ activeProjectId: null, onCreateProject() {}, projects: [] });
   open(view.host);

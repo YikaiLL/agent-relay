@@ -16,10 +16,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const CSS = fs.readFileSync(
+const RAW_CSS = fs.readFileSync(
   path.join(path.dirname(fileURLToPath(import.meta.url)), "styles.css"),
   "utf8"
 );
+
+// Comments are stripped ONCE, up front, and everything below reads the stripped text.
+// A rule head is located by scanning backwards to whatever ended the previous
+// statement, and the prose comments in this stylesheet contain semicolons, braces and
+// selector names in backticks. Any of those truncates the scan and the rule becomes
+// unfindable — which surfaces as "no rule found", i.e. indistinguishable from someone
+// having deleted the rule the guard exists to watch.
+const CSS = RAW_CSS.replace(/\/\*[\s\S]*?\*\//g, "");
 
 // --- reading the stylesheet -------------------------------------------------
 
@@ -27,27 +35,39 @@ const CSS = fs.readFileSync(
 // `a:hover,\n  a:focus-visible {` is the normal way to write one here), and a
 // single-line pattern silently finds nothing — which reads as "the rule is fine"
 // rather than "the test cannot see it".
-function ruleBody(selector) {
+//
+// The match is decided by parsing the whole rule HEAD and comparing complete
+// selectors, not by looking at the characters around the hit. Checking neighbours
+// catches a prefix (`-options`) but not a descendant rule ENDING in the same string,
+// so `.project-switcher-sidebar .project-switcher-trigger` was read as
+// `.project-switcher-trigger` — a guard quietly reporting on a rule it never named.
+function ruleBody(selector, css = CSS) {
   for (let from = 0; ; ) {
-    const at = CSS.indexOf(selector, from);
+    const at = css.indexOf(selector, from);
     assert.notEqual(at, -1, `no rule found for ${selector}`);
     from = at + selector.length;
 
-    // A whole selector, not a prefix of a longer one (`.project-switcher-option`
-    // must not match `.project-switcher-options`).
-    if (/[\w-]/.test(CSS.slice(from, from + 1))) {
-      continue;
-    }
-    const open = CSS.indexOf("{", from);
-    const close = CSS.indexOf("}", open);
+    const open = css.indexOf("{", at);
+    const close = css.indexOf("}", open);
     if (open === -1 || close === -1) {
       continue;
     }
-    // Nothing but selector characters between here and the brace.
-    if (/[;]/.test(CSS.slice(from, open))) {
+
+    // The head runs back to whatever ended the previous statement or opened the
+    // enclosing block (a media query, for the ≤960px rules).
+    const headStart = Math.max(
+      css.lastIndexOf("}", at),
+      css.lastIndexOf("{", at),
+      css.lastIndexOf(";", at)
+    ) + 1;
+    const selectors = css.slice(headStart, open)
+      .split(",")
+      .map((one) => one.trim());
+
+    if (!selectors.includes(selector)) {
       continue;
     }
-    return CSS.slice(open + 1, close);
+    return css.slice(open + 1, close);
   }
 }
 
@@ -186,6 +206,124 @@ test("the active option still changes colour under the cursor, in both themes", 
       `${theme.name}: the active row would not react to the cursor`
     );
   }
+});
+
+// Every rule that sizes or colours a group name, paired with whether it also names the
+// chip. Returns heads so a failure can say WHICH rule forgot it.
+function typographyRulesFor(selector) {
+  const found = [];
+  const pattern = /([^{}]*)\{([^{}]*)\}/g;
+  for (const match of CSS.matchAll(pattern)) {
+    const head = match[1];
+    const selectors = head.split(",").map((one) => one.trim()).filter(Boolean);
+    if (!selectors.includes(selector)) continue;
+    if (!/(^|;|\n)\s*(font-size|font-weight|color)\s*:/.test(match[2])) continue;
+    found.push({ selectors, body: match[2] });
+  }
+  return found;
+}
+
+// The chip's label SHARES the group header's rules rather than restating them.
+//
+// This guard used to compare the two rules' declarations, and it was green while the
+// chip rendered a size smaller than the header it stands in for: both sources said
+// `var(--text-sm)`, and a `@media (max-width: 960px)` step-up moved `.thread-group-name`
+// to `--text-ui` and left the chip behind — on the only device that renders the chip.
+// A source-level resolver cannot see one rule overriding another, so matching by value
+// is not a property this file can check. Sharing the selector is.
+test("the pinned chip's label is named by every rule that types the group header", () => {
+  const rules = typographyRulesFor(".thread-group-name");
+  assert.ok(rules.length >= 2, `expected the base rule and the ≤960px step-up, got ${rules.length}`);
+
+  for (const rule of rules) {
+    assert.ok(
+      rule.selectors.includes(".pinned-project-chip-name"),
+      `this rule types .thread-group-name but not the chip that replaces it — `
+        + `{${rule.selectors.join(", ")}}. Copying the declaration is not enough: a later `
+        + "override moves one and not the other, and the source keeps agreeing."
+    );
+  }
+});
+
+test("the tokens those shared rules name are defined in both themes", () => {
+  for (const rule of typographyRulesFor(".thread-group-name")) {
+    for (const property of ["font-size", "font-weight", "color"]) {
+      const value = declaration(rule.body, property);
+      if (!value) continue;
+      for (const theme of THEMES) {
+        const missing = new Set();
+        resolve(value, theme.tokens, missing);
+        assert.deepEqual(
+          [...missing],
+          [],
+          `${theme.name}: ${property} names undefined ${[...missing].join(", ")}`
+        );
+      }
+    }
+  }
+});
+
+// The recap promised "at the bottom, behind a divider, with the destructive one marked".
+// None of that existed: the classes were emitted but no rule matched them, so rename and
+// delete rendered as ordinary navigation entries — and above "New project" at that.
+test("the management group is separated by a divider and the destructive one is marked", () => {
+  const divider = ruleBody(".project-switcher-option:not(.project-switcher-manage) + .project-switcher-manage");
+  assert.match(declaration(divider, "border-top") || "", /1px solid/, "a real divider rule exists");
+
+  for (const theme of THEMES) {
+    const danger = declaration(ruleBody(".project-switcher-danger"), "color");
+    const ordinary = declaration(ruleBody(".project-switcher-option"), "color");
+    assert.ok(danger && ordinary, "both declare a colour");
+    const missing = new Set();
+    const dangerValue = resolve(danger, theme.tokens, missing);
+    assert.deepEqual([...missing], [], `${theme.name}: danger colour names undefined ${[...missing].join(", ")}`);
+    assert.notEqual(
+      dangerValue,
+      resolve(ordinary, theme.tokens, new Set()),
+      `${theme.name}: delete paints the same colour as a navigation entry, so nothing marks it`
+    );
+  }
+});
+
+// The top-bar placement lives in a right-aligned group inside a drawer that clips
+// horizontal overflow, so the shared menu's left anchor put its 220px minimum width off
+// screen. Asserted at the source AND in the browser (bell e2e) — this rule is necessary
+// but a source check cannot prove the box actually lands inside the drawer.
+test("the top-bar menu spans the bar rather than hanging off its trigger", () => {
+  const shared = ruleBody(".project-switcher-menu");
+  assert.equal(declaration(shared, "left"), "-6px", "the shared anchor is still the trigger");
+  assert.equal(declaration(shared, "min-width"), "220px", "and still carries a minimum width");
+
+  // Both edges pinned, and the trigger-sized minimum released. Pinning one edge only
+  // moves the overflow to the other side — that is precisely what the first fix did.
+  const top = ruleBody(".project-switcher-top .project-switcher-menu");
+  assert.ok(declaration(top, "left"), "the top-bar variant pins its left edge");
+  assert.ok(declaration(top, "right"), "and its right edge");
+  assert.equal(declaration(top, "min-width"), "0", "and releases the 220px minimum");
+
+  // The anchor only reaches the bar because the switcher itself stops being the
+  // containing block. Without this pair the rule above silently re-anchors to the 32px
+  // trigger and the widths mean nothing.
+  assert.equal(declaration(ruleBody(".project-switcher-top"), "position"), "static");
+  assert.equal(declaration(ruleBody(".sidebar-top-bar"), "position"), "relative");
+});
+
+// `ruleBody` is as load-bearing as the resolver, and it had the same shape of hole.
+// It rejected a PREFIX match (`.project-switcher-option` must not read `-options`) but
+// not a DESCENDANT rule ending in the same string, so a `.x .y { }` written above
+// `.y { }` was returned as `.y`. Exercised against a synthetic sheet rather than
+// whatever the real one happens to contain today: the hole only opens when the
+// descendant rule comes FIRST, and that is an accident of file order nobody maintains.
+test("ruleBody matches a whole selector, not a rule that merely ends with it", () => {
+  const css = ".outer .target { width: 100%; }\n.target { text-align: left; }";
+  assert.match(ruleBody(".target", css), /text-align:\s*left/);
+  assert.equal(/width/.test(ruleBody(".target", css)), false);
+});
+
+// And the prefix case it already handled, kept so a rewrite cannot lose it.
+test("ruleBody does not match a selector that merely starts with the one asked for", () => {
+  const css = ".targetish { width: 100%; }\n.target { text-align: left; }";
+  assert.match(ruleBody(".target", css), /text-align:\s*left/);
 });
 
 // The resolver is the load-bearing part of the two tests above, so it gets its own

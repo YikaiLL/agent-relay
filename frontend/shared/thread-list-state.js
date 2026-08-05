@@ -104,6 +104,14 @@ export function createThreadListRows({
   collapsible = false,
   expandedGroupCwds = new Set(),
   groups = [],
+  // Drop the PINNED group's header row entirely. The surface that pins is the surface
+  // that names the pin somewhere else — remote shows a quiet chip above the list — so
+  // the header would be a row whose only content is a string already on screen.
+  //
+  // Dropped HERE rather than hidden in CSS: the list is virtualized and measures every
+  // row it emits, so a `display: none` header still reserves its height and leaves a
+  // gap that looks like a rendering fault.
+  hidePinnedGroupHeader = false,
   visibleThreadLimit = 10,
 } = {}) {
   const rows = [];
@@ -114,19 +122,26 @@ export function createThreadListRows({
     // are keyed on this uniformly (kept under the `normalizedCwd` field name so the
     // existing toggle handlers keep working — canonicalize is a no-op on ids).
     const normalizedCwd = canonicalizeWorkspace(group.key ?? group.cwd);
-    const isCollapsed = collapsible && collapsedGroupCwds.has(normalizedCwd);
+    const headerless = hidePinnedGroupHeader && Boolean(group.pinned);
+    // A headerless group can never be folded. The disclosure control lives ON the
+    // header, so a collapsed one would hide its sessions with nothing left on screen
+    // to reopen it — and the collapsed set survives reloads, so it would stay that way.
+    const isCollapsed =
+      !headerless && collapsible && collapsedGroupCwds.has(normalizedCwd);
     const allThreads = group.threads || [];
     const showAll = expandedGroupCwds.has(normalizedCwd);
     const visibleThreads = showAll ? allThreads : allThreads.slice(0, visibleThreadLimit);
     const hiddenCount = allThreads.length - visibleThreads.length;
 
-    rows.push({
-      group,
-      isCollapsed,
-      key: `group:${normalizedCwd}`,
-      normalizedCwd,
-      type: "group",
-    });
+    if (!headerless) {
+      rows.push({
+        group,
+        isCollapsed,
+        key: `group:${normalizedCwd}`,
+        normalizedCwd,
+        type: "group",
+      });
+    }
 
     if (isCollapsed) {
       continue;

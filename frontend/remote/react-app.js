@@ -190,8 +190,11 @@ const subscribeThreadAttention = (listener) => threadAttention.subscribe(listene
 const getThreadAttentionVersion = () => threadAttention.getVersion();
 import {
   createThreadListStore,
-  readThreadListViewMode,
+  readActiveProjectId,
 } from "../shared/thread-list-store.js";
+import { ProjectSwitcher } from "../shared/project-switcher.js";
+import { resetRelayScopedState } from "./relay-scoped-state.js";
+import { selectPinnedProjectId } from "../shared/thread-groups.js";
 import {
   useRemoteProjects,
   notifyRemoteProjects,
@@ -232,15 +235,16 @@ function useThreadListStoreState(store) {
   );
 }
 
-// viewMode lives as a SIBLING field of `threadList`, so useThreadListStoreState (which
-// snapshots only `threadList`) never re-renders on setViewMode. Snapshot the viewMode
-// string directly so toggling Sessions/Projects updates the UI immediately. The string
-// is stable between changes, so this only re-renders when the mode actually flips.
-function useThreadListViewMode(store) {
+// activeProjectId lives as a SIBLING field of `threadList`, so useThreadListStoreState
+// (which snapshots only `threadList`) never re-renders when it changes. Snapshot the id
+// directly so picking a project in the switcher updates the list immediately. The value
+// is a stable string-or-null between changes, so this only re-renders on a real
+// selection — returning a fresh object here would spin useSyncExternalStore forever.
+function useActiveProjectId(store) {
   return useSyncExternalStore(
     store.subscribe,
-    () => readThreadListViewMode(store),
-    () => readThreadListViewMode(store)
+    () => readActiveProjectId(store),
+    () => readActiveProjectId(store)
   );
 }
 
@@ -324,7 +328,7 @@ function RemoteApp() {
   // projects_revision via the `fetch_projects` broker action. Re-renders the sidebar
   // as it loads/errors.
   const remoteProjects = useRemoteProjects();
-  const threadViewMode = useThreadListViewMode(threadListStore);
+  const activeProjectId = useActiveProjectId(threadListStore);
   // Which session the actions sheet is open for (null = closed). Held by id, not by
   // object, so the sheet keeps tracking the thread across list refreshes.
   const [actionsSheetThreadId, setActionsSheetThreadId] = useState(null);
@@ -547,21 +551,20 @@ function RemoteApp() {
     remoteAuth: currentState.remoteAuth,
     session,
     threads: currentState.threads,
-    // The bell cuts ACROSS the grouping mode, exactly as it does on local
-    // (render-session.js). Leaving Projects mode in charge would feed the filter a
-    // source that has already dropped the Unassigned bucket — so a session that is
-    // WORKING but belongs to no project would be missing from a control whose entire
-    // job is "show me what is going on" — and would hand it nothing at all while the
-    // Projects payload is loading or failed.
-    viewMode:
-      remoteUi.threadFilter?.on || isThreadSearchActive(currentState.threadSearch)
-        ? "sessions"
-        : threadViewMode,
+    // Both the bell and a search cut ACROSS the pin, exactly as on local. The policy
+    // for when a pin stands down is `selectPinnedProjectId` rather than a condition
+    // written out here, because the plausible reading — "the bell just narrows rows,
+    // so a pinned group survives it" — is wrong: `buildThreadStateGroups` REPLACES
+    // the group structure with state buckets. A search is a different failure again;
+    // it swaps the row source for a server-side slice, so there is nothing coherent
+    // to lift out of.
+    pinnedProjectId: selectPinnedProjectId({
+      activeProjectId,
+      filtering: Boolean(remoteUi.threadFilter?.on),
+      searching: isThreadSearchActive(currentState.threadSearch),
+    }),
     projects: remoteProjects.projects,
     threadProjectId: remoteProjects.threadProjectId,
-    projectsError: remoteProjects.error,
-    projectsLoaded: remoteProjects.loaded,
-    projectsLoading: remoteProjects.loading,
   });
   // Whether the Projects payload is fresh enough to expose mutation controls
   // (mirrors the local fail-closed rule for the toolbar + header actions).
@@ -572,7 +575,8 @@ function RemoteApp() {
   });
   const promptRemoteProjectName = (current = "") =>
     normalizeProjectName(window.prompt("Project name", current));
-  const setThreadViewMode = (mode) => threadListStore.getState().setViewMode(mode);
+  const setActiveProject = (projectId) =>
+    threadListStore.getState().setActiveProject(projectId);
   const setThreadFilter = (next) => remoteUiStore.getState().setThreadFilter(next);
   const setThreadFilterRetained = (retained) =>
     remoteUiStore.getState().setThreadFilterRetained(retained);
@@ -627,8 +631,8 @@ function RemoteApp() {
   // advertise an equal projects_revision"); this is that hazard for the filter.
   const activeRelayId = currentState.remoteAuth?.relayId || null;
   useEffect(() => {
-    remoteUiStore.getState().setThreadFilterRetained(new Map());
-  }, [activeRelayId, remoteUiStore]);
+    resetRelayScopedState({ remoteUiStore, threadListStore });
+  }, [activeRelayId, remoteUiStore, threadListStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
   const createRemoteProjectFromToolbar = async () => {
@@ -660,6 +664,13 @@ function RemoteApp() {
     if (!confirmed) return;
     try {
       await deleteRemoteProject(projectId);
+      // Stand the pin down BEFORE the refetch. The switcher already fails open on an id
+      // it cannot resolve, so the screen would recover either way — but leaving a dead
+      // id in the store means the next payload that happens to contain a project with
+      // that id silently re-pins it.
+      if (readActiveProjectId(threadListStore) === projectId) {
+        threadListStore.getState().setActiveProject(null);
+      }
       refreshRemoteProjects();
       renderLog(`Deleted project "${name}".`);
     } catch (error) {
@@ -1717,9 +1728,10 @@ function RemoteApp() {
         searchQuery: searchDraft,
         onSetSearchOpen,
         onSearchInput,
-        threadViewMode,
+        activeProjectId,
+        projects: remoteProjects.projects,
         projectsReady: remoteProjectsReady,
-        onSetThreadViewMode: setThreadViewMode,
+        onSelectProject: setActiveProject,
         onCreateProject: createRemoteProjectFromToolbar,
         onRenameProject: handleRenameRemoteProject,
         onDeleteProject: handleDeleteRemoteProject,
@@ -2027,9 +2039,10 @@ function RemoteSidebar({
   searchQuery,
   onSetSearchOpen,
   onSearchInput,
-  threadViewMode,
+  activeProjectId,
+  projects,
   projectsReady,
-  onSetThreadViewMode,
+  onSelectProject,
   onCreateProject,
   onRenameProject,
   onDeleteProject,
@@ -2130,6 +2143,16 @@ function RemoteSidebar({
   });
   const listChrome = composeListChrome(listView, filterView);
 
+  // Hoisted so the chip and the list read the SAME decorated groups. Deriving the
+  // chip's name from `projects` and its badges from the groups would let the two
+  // disagree for a render whenever a project is renamed or deleted elsewhere.
+  const decoratedGroups = attachProjectSummaries(filterView.groups, {
+    threadActivity: threadActivityMap,
+    threadAttention: threadAttentionMap,
+    threadReviewing: threadReviewingSet,
+  });
+  const pinnedProject = decoratedGroups.find((group) => group.pinned) || null;
+
   return h(
     "aside",
     {
@@ -2165,6 +2188,22 @@ function RemoteSidebar({
       h(
         "div",
         { className: "sidebar-top-actions" },
+        // Switching projects is a LOW-FREQUENCY act on a phone — the drawer defaults to
+        // sessions and search/filter are the fast paths — so this is one icon beside
+        // them rather than a heading above the list. The name it would have displayed
+        // lives on the chip below, which only exists while a project is actually
+        // pinned.
+        h(ProjectSwitcher, {
+          activeProjectId,
+          className: "project-switcher-top",
+          onCreateProject: projectsReady ? () => onCreateProject() : null,
+          onDeleteProject: projectsReady ? onDeleteProject : null,
+          onRenameProject: projectsReady ? onRenameProject : null,
+          onSelectProject,
+          projects,
+          renderHeading: false,
+          triggerIcon: h(RemoteProjectIcon),
+        }),
         h(
           "button",
           {
@@ -2358,46 +2397,15 @@ function RemoteSidebar({
           onClick: () => onRefreshThreads(),
         })
       ),
-      h(
-        "div",
-        { className: "thread-view-toggle", role: "group", "aria-label": "Group sessions by" },
-        h(
-          "button",
-          {
-            type: "button",
-            className: `thread-view-toggle-button${threadViewMode !== "projects" ? " is-active" : ""}`,
-            id: "remote-threads-view-sessions",
-            onClick: () => onSetThreadViewMode("sessions"),
-          },
-          "Sessions"
-        ),
-        h(
-          "button",
-          {
-            type: "button",
-            className: `thread-view-toggle-button${threadViewMode === "projects" ? " is-active" : ""}`,
-            id: "remote-threads-view-projects",
-            onClick: () => onSetThreadViewMode("projects"),
-          },
-          "Projects"
-        )
-      ),
-      threadViewMode === "projects"
-        ? h(
-            "div",
-            { className: "projects-toolbar", id: "remote-projects-toolbar" },
-            h(
-              "button",
-              {
-                type: "button",
-                className: "start-session-button",
-                id: "remote-projects-create-button",
-                onClick: () => onCreateProject(),
-              },
-              h("span", { className: "inline-icon", "aria-hidden": "true" }, h(RemotePlusIcon)),
-              h("span", null, "New project")
-            )
-          )
+      // The pinned project, said once and quietly. Without it the lifted sessions sit
+      // at the top of the list with no group header and nothing saying why — every
+      // other group has one, so they read as a rendering fault rather than a selection.
+      pinnedProject
+        ? h(PinnedProjectChip, {
+            name: pinnedProject.label,
+            summary: pinnedProject.summary || null,
+            onClear: () => onSelectProject(null),
+          })
         : null,
       h(
         "div",
@@ -2418,19 +2426,16 @@ function RemoteSidebar({
           // is where all three per-thread maps are in scope.
           // `attachProjectSummaries` only decorates groups carrying a projectId, so the
           // bell's state buckets pass through it untouched.
-          groups: attachProjectSummaries(filterView.groups, {
-            threadActivity: threadActivityMap,
-            threadAttention: threadAttentionMap,
-            threadReviewing: threadReviewingSet,
-          }),
+          groups: decoratedGroups,
           includePreview: true,
           onContextThread,
           onThreadActions,
-          // Rename/delete on real project headers — only in Projects mode and only when
-          // the payload is fresh (fail closed; the render model already returns no
-          // groups otherwise, this is defence in depth).
-          onRenameProject: threadViewMode === "projects" && projectsReady ? onRenameProject : null,
-          onDeleteProject: threadViewMode === "projects" && projectsReady ? onDeleteProject : null,
+          // The pinned group renders NO header: the chip above the list already names
+          // it, and a header row whose only content is a string already on screen was
+          // the duplication that got local's title rewritten. Dropped at the ROW level
+          // rather than hidden in CSS — the list is virtualized and reserves height for
+          // every row it emits.
+          hidePinnedGroupHeader: true,
           onResumeThread,
           onToggleExpandedGroup,
           onToggleGroup,
@@ -2456,26 +2461,63 @@ function RemoteSidebar({
   );
 }
 
-// Geometry copied from PLUS_SVG in ../svg.js so "New project" is pixel-identical
-// to local's. Re-declared as a React element rather than imported, because the
-// shared constant is a markup string and this surface renders zero
-// dangerouslySetInnerHTML — worth keeping that way for one icon.
-function RemotePlusIcon() {
+// Geometry is a plain folder outline rather than anything project-specific: the
+// drawer already spends its folder glyph on cwd groups, and at 16px a second bespoke
+// mark would just be noise. What identifies this control is its position beside search
+// and the bell, plus `is-active` when a project is pinned.
+function RemoteProjectIcon() {
   return h(
     "svg",
     {
       "aria-hidden": "true",
       fill: "none",
-      height: "14",
+      height: "16",
       viewBox: "0 0 24 24",
-      width: "14",
+      width: "16",
       stroke: "currentColor",
-      strokeWidth: "2",
+      strokeWidth: "1.8",
       strokeLinecap: "round",
       strokeLinejoin: "round",
     },
-    h("path", { d: "M5 12h14" }),
-    h("path", { d: "M12 5v14" })
+    h("path", { d: "M3 7.5h6l2 2h10v9.5H3z" }),
+    h("path", { d: "M3 7.5V5h5.5l2 2.5" })
+  );
+}
+
+// The pinned project, named once. Carries the same activity roll-up the group header
+// it replaced used to show, because "which project has something going on" is the one
+// thing the header said that the chip would otherwise drop.
+function PinnedProjectChip({ name, onClear, summary }) {
+  return h(
+    "div",
+    { className: "pinned-project-chip", id: "remote-pinned-project" },
+    h("span", { className: "pinned-project-chip-name", title: name }, name),
+    summary?.working
+      ? h(
+          "span",
+          { className: "project-sidebar-badge is-working" },
+          `${summary.working} working`
+        )
+      : null,
+    summary?.needsInput
+      ? h(
+          "span",
+          { className: "project-sidebar-badge is-attention" },
+          `${summary.needsInput} needs input`
+        )
+      : null,
+    h(
+      "button",
+      {
+        type: "button",
+        className: "pinned-project-chip-clear",
+        id: "remote-pinned-project-clear",
+        title: "Back to the default workspace",
+        "aria-label": "Back to the default workspace",
+        onClick: onClear,
+      },
+      "\u00d7"
+    )
   );
 }
 
