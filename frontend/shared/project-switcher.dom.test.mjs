@@ -20,7 +20,8 @@ global.IS_REACT_ACT_ENVIRONMENT = true;
 const React = (await import("react")).default;
 const { act } = await import("react");
 const { createRoot } = await import("react-dom/client");
-const { ALL_SESSIONS_LABEL, ProjectSwitcher } = await import("./project-switcher.js");
+const { ProjectSwitcher } = await import("./project-switcher.js");
+const { DEFAULT_WORKSPACE_LABEL } = await import("./project-labels.js");
 
 const PROJECTS = [
   { id: "proj_pay", name: "Payments rework" },
@@ -76,7 +77,7 @@ function open(host) {
 
 test("with nothing selected it reads as the default workspace", () => {
   const view = mount({ activeProjectId: null });
-  assert.equal(trigger(view.host).textContent, ALL_SESSIONS_LABEL);
+  assert.equal(trigger(view.host).textContent, DEFAULT_WORKSPACE_LABEL);
   view.cleanup();
 });
 
@@ -92,7 +93,7 @@ test("with a project selected it names the project", () => {
 // project the list is no longer showing.
 test("a selection whose project is gone falls back to the default workspace, not a dangling name", () => {
   const view = mount({ activeProjectId: "proj_deleted" });
-  assert.equal(trigger(view.host).textContent, ALL_SESSIONS_LABEL);
+  assert.equal(trigger(view.host).textContent, DEFAULT_WORKSPACE_LABEL);
   view.cleanup();
 });
 
@@ -100,7 +101,7 @@ test("the menu lists the default workspace, every project, and the create action
   const view = mount({ activeProjectId: null, onCreateProject() {} });
   open(view.host);
   assert.deepEqual(options(view.host), [
-    ALL_SESSIONS_LABEL,
+    DEFAULT_WORKSPACE_LABEL,
     "Payments rework",
     "Docs",
     "New project",
@@ -133,7 +134,7 @@ test("choosing the default workspace reports null", () => {
   const chosen = [];
   const view = mount({ activeProjectId: "proj_pay", onSelectProject: (id) => chosen.push(id) });
   open(view.host);
-  clickOption(view.host, ALL_SESSIONS_LABEL);
+  clickOption(view.host, DEFAULT_WORKSPACE_LABEL);
 
   assert.deepEqual(chosen, [null]);
   view.cleanup();
@@ -186,6 +187,6 @@ test("Escape closes the menu without letting the key reach the surface behind it
 test("an empty project list still offers the default workspace and creating one", () => {
   const view = mount({ activeProjectId: null, onCreateProject() {}, projects: [] });
   open(view.host);
-  assert.deepEqual(options(view.host), [ALL_SESSIONS_LABEL, "New project"]);
+  assert.deepEqual(options(view.host), [DEFAULT_WORKSPACE_LABEL, "New project"]);
   view.cleanup();
 });

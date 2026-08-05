@@ -1,3 +1,5 @@
+import { DEFAULT_WORKSPACE_LABEL } from "../shared/project-labels.js";
+
 // The session header's title + subtitle text as ONE pure decision — mirroring
 // status-badge.js, so the "what does the header say" rules live in a single tested
 // place instead of drifting across inline branches in renderHeader.
@@ -37,10 +39,7 @@
 //    type, it's live) and it collided with the run-state badge ("Idle") beside it.
 //
 //  - "read-only" stays: it's a real warning (the composer is disabled).
-// Where sessions in no project live. Exported so the switcher's menu and the
-// header trigger cannot drift apart — they render the same string or neither is
-// telling the truth.
-export const DEFAULT_WORKSPACE_LABEL = "Default Workspace";
+export { DEFAULT_WORKSPACE_LABEL };
 
 export function selectHeaderLabels({
   hasWorkspace = false,

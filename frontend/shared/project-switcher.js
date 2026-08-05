@@ -3,8 +3,9 @@
 //
 // It is not a filter and it is not a mode. The list below it is always the full
 // list; selecting a project only lifts that project's sessions into a group at the
-// top (see `buildThreadGroups`' `pinnedProjectId`). "All sessions" is therefore a
-// real, safe default rather than an escape hatch — nothing is hidden in any state.
+// top (see `buildThreadGroups`' `pinnedProjectId`). The default workspace is
+// therefore a real destination rather than an escape hatch — nothing is hidden in
+// any state.
 //
 // Shared by local and remote deliberately. The control is identical on both — a
 // menu of names — and the surfaces differ only in what selecting one does, which
@@ -18,9 +19,9 @@
 
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 
-const h = React.createElement;
+import { DEFAULT_WORKSPACE_LABEL } from "./project-labels.js";
 
-export const ALL_SESSIONS_LABEL = "Default Workspace";
+const h = React.createElement;
 
 export function ProjectSwitcher({
   activeProjectId = null,
@@ -83,7 +84,7 @@ export function ProjectSwitcher({
   // either having to tell the other.
   const derivedLabel = activeProject
     ? activeProject.name || activeProject.id
-    : ALL_SESSIONS_LABEL;
+    : DEFAULT_WORKSPACE_LABEL;
   const currentLabel = label || derivedLabel;
 
   const choose = (projectId) => {
@@ -138,7 +139,7 @@ export function ProjectSwitcher({
               role: "menuitem",
               type: "button",
             },
-            ALL_SESSIONS_LABEL
+            DEFAULT_WORKSPACE_LABEL
           ),
           projects.map((project) =>
             h(

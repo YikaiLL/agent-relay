@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import path from "node:path";
+import { readdir, readFile } from "node:fs/promises";
+
 import { DEFAULT_WORKSPACE_LABEL, selectHeaderLabels } from "./header-labels.js";
 
 // THE RULE THIS FILE ENCODES
@@ -165,4 +168,31 @@ test("console home names the running session in the subtitle, without 'live'", (
 test("standby / no-workspace subtitles are unchanged", () => {
   assert.equal(selectHeaderLabels({ hasWorkspace: true }).subtitle, "standby");
   assert.equal(selectHeaderLabels({ hasWorkspace: false }).subtitle, "no workspace selected");
+});
+
+// The header trigger and the option marked active in its own menu are the SAME
+// claim rendered twice. They were briefly two constants holding equal strings
+// under a comment asserting they could not drift — nothing compared them, so they
+// could. This pins the single definition instead of re-checking equality.
+test("the default workspace label has exactly one definition in the tree", async () => {
+  const { DEFAULT_WORKSPACE_LABEL: fromLabels } = await import("../shared/project-labels.js");
+  assert.equal(DEFAULT_WORKSPACE_LABEL, fromLabels);
+
+  const roots = ["frontend/shared", "frontend/local", "frontend"];
+  const seen = [];
+  for (const root of roots) {
+    for (const entry of await readdir(root)) {
+      if (!entry.endsWith(".js")) continue;
+      const source = await readFile(path.join(root, entry), "utf8");
+      // A second `= "Default Workspace"` anywhere is a copy, whatever it is called.
+      if (/=\s*"Default Workspace"/.test(source)) {
+        seen.push(`${root}/${entry}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    seen,
+    ["frontend/shared/project-labels.js"],
+    `the string is assigned in more than one module: ${seen.join(", ")}`
+  );
 });
