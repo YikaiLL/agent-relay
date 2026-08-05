@@ -276,6 +276,35 @@ import {
 const DEVICE_STORAGE_KEY = "agent-relay.device-id";
 const API_TOKEN_STORAGE_KEY = "agent-relay.api-token";
 
+// Identifies this page load as a CONNECTION, distinct from the device identity below.
+//
+// Deliberately NOT persisted. sessionStorage looks per-tab, but the browser COPIES it
+// into a tab you duplicate (and into `window.open`/`target=_blank` children), so both
+// tabs would come up claiming the same surface id and the relay — which keys watch sets
+// by surface — would treat them as one. The later one would win and the other's live
+// tail would just stop.
+//
+// A fresh id per page load has no such failure mode and costs nothing: it is stable for
+// the page's lifetime (so an SSE reconnect keeps it, and the connection generation
+// arbitrates old vs new stream), and a reload's orphaned entry is removed when its SSE
+// stream drops.
+//
+// This cache MUST stay above `state`: `state` is built during module evaluation and
+// calls loadOrCreateSurfaceId(). The function declaration hoists, but a `let` below
+// `state` would still be in its temporal dead zone when that call runs, so the whole
+// module throws "Cannot access 'cachedSurfaceId' before initialization" and the app
+// never boots.
+let cachedSurfaceId = null;
+
+function loadOrCreateSurfaceId() {
+  cachedSurfaceId ||= window.crypto?.randomUUID?.()
+    ? window.crypto.randomUUID()
+    : `surface-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return cachedSurfaceId;
+}
+
+export { loadOrCreateSurfaceId };
+
 const state = {
   apiToken: loadApiToken(),
   authRequired: false,
@@ -4100,29 +4129,6 @@ function workspaceBasename(cwd) {
 function shortId(value) {
   return value ? value.slice(0, 8) : "unknown";
 }
-
-// Identifies this page load as a CONNECTION, distinct from the device identity above.
-//
-// Deliberately NOT persisted. sessionStorage looks per-tab, but the browser COPIES it
-// into a tab you duplicate (and into `window.open`/`target=_blank` children), so both
-// tabs would come up claiming the same surface id and the relay — which keys watch sets
-// by surface — would treat them as one. The later one would win and the other's live
-// tail would just stop.
-//
-// A fresh id per page load has no such failure mode and costs nothing: it is stable for
-// the page's lifetime (so an SSE reconnect keeps it, and the connection generation
-// arbitrates old vs new stream), and a reload's orphaned entry is removed when its SSE
-// stream drops.
-let cachedSurfaceId = null;
-
-function loadOrCreateSurfaceId() {
-  cachedSurfaceId ||= window.crypto?.randomUUID?.()
-    ? window.crypto.randomUUID()
-    : `surface-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return cachedSurfaceId;
-}
-
-export { loadOrCreateSurfaceId };
 
 function loadOrCreateDeviceId() {
   const existing = window.localStorage.getItem(DEVICE_STORAGE_KEY);
