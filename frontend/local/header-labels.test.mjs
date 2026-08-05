@@ -178,16 +178,32 @@ test("the default workspace label has exactly one definition in the tree", async
   const { DEFAULT_WORKSPACE_LABEL: fromLabels } = await import("../shared/project-labels.js");
   assert.equal(DEFAULT_WORKSPACE_LABEL, fromLabels);
 
-  const roots = ["frontend/shared", "frontend/local", "frontend"];
-  const seen = [];
-  for (const root of roots) {
-    for (const entry of await readdir(root)) {
-      if (!entry.endsWith(".js")) continue;
-      const source = await readFile(path.join(root, entry), "utf8");
-      // A second `= "Default Workspace"` anywhere is a copy, whatever it is called.
-      if (/=\s*"Default Workspace"/.test(source)) {
-        seen.push(`${root}/${entry}`);
+  // Walk the whole tree, not a hand-listed set of directories. The first version
+  // listed frontend/shared, frontend/local and frontend — and NOT frontend/remote,
+  // which is exactly where the next surface gets built. A guard that stops
+  // covering the place the next copy will appear is worse than none, because it
+  // reads as coverage.
+  async function jsFilesUnder(dir) {
+    const found = [];
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        found.push(...(await jsFilesUnder(full)));
+      } else if (/\.m?js$/.test(entry.name)) {
+        found.push(full);
       }
+    }
+    return found;
+  }
+
+  const seen = [];
+  for (const file of await jsFilesUnder("frontend")) {
+    const source = await readFile(file, "utf8");
+    // An ASSIGNMENT of the string is a copy, whatever it is called and whichever
+    // quote style it uses. Comparisons against it (tests, assertions) are fine.
+    if (/=\s*(["'`])Default Workspace\1/.test(source)) {
+      seen.push(file);
     }
   }
   assert.deepEqual(

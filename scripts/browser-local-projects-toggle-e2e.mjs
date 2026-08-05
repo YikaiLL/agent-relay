@@ -294,6 +294,49 @@ async function main() {
     assert.ok(sessionsView.hasToggle, "the Sessions/Projects toggle buttons exist");
     assert.match(sessionsView.countText, /folder/, `Sessions mode shows folder grouping: ${sessionsView.countText}`);
 
+    step("4b. the switcher menu actually reacts to the cursor");
+
+    // A real computed-style check, in the browser, of what the stylesheet guard can
+    // only approximate. That guard resolves var() chains itself and cannot see the
+    // full cascade — and its first version was green while the active row's hover
+    // painted the row's own colour, because it compared declaration source text.
+    // Here the browser does the resolving.
+    let hoverColours = null;
+    {
+      await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
+      await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+      const bg = (selector) =>
+        page.evaluate(
+          (sel) => getComputedStyle(document.querySelector(sel)).backgroundColor,
+          selector
+        );
+      const menu = await bg(".project-switcher-menu");
+      // The default-workspace row is the active one here (no project selected yet).
+      const activeRest = await bg(".project-switcher-option.is-active");
+      const plainRest = await bg(".project-switcher-option:not(.is-active)");
+      // Settle past the transition before reading. `button` carries
+      // `transition: background 120ms` globally, so an immediate read returns the
+      // value the colour is animating AWAY from — this check reported every hover
+      // as dead on its first run for exactly that reason. A fixed wait is right
+      // here: it waits out a known-duration animation rather than polling for the
+      // assertion, which would make the test true by construction.
+      const SETTLE_MS = 300;
+      await page.hover(".project-switcher-option:not(.is-active)", { timeout: TIMEOUT_MS });
+      await delay(SETTLE_MS);
+      const plainHover = await bg(".project-switcher-option:not(.is-active)");
+      await page.hover(".project-switcher-option.is-active", { timeout: TIMEOUT_MS });
+      await delay(SETTLE_MS);
+      const activeHover = await bg(".project-switcher-option.is-active");
+      hoverColours = { menu, activeRest, plainRest, plainHover, activeHover };
+      // Leave the menu closed; an open overlay sits on top of the rows step 5 clicks.
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(
+        () => !document.querySelector(".project-switcher-menu"),
+        null,
+        { timeout: TIMEOUT_MS }
+      );
+    }
+
     step("5. Projects mode rows");
 
     // 5. Switch to Projects: the sidebar lists each project as a group header,
@@ -737,6 +780,24 @@ async function main() {
     }, null, 2));
 
     // --- Assertions ---
+    // Computed, not declared: this is the assertion the stylesheet guard cannot
+    // make, and the one that was silently false for a whole commit.
+    assert.notEqual(
+      hoverColours.plainHover,
+      hoverColours.plainRest,
+      `a menu row must change colour under the cursor: ${JSON.stringify(hoverColours)}`
+    );
+    assert.notEqual(
+      hoverColours.plainHover,
+      hoverColours.menu,
+      `the hover highlight must differ from the menu it sits on: ${JSON.stringify(hoverColours)}`
+    );
+    assert.notEqual(
+      hoverColours.activeHover,
+      hoverColours.activeRest,
+      `the SELECTED row must react too, or it is the one row that goes dead: ${JSON.stringify(hoverColours)}`
+    );
+
     assert.ok(projectsView.projectRows.includes("VerifyProj"), "the selected project is pinned as a group");
     // The count describes FOLDERS and sessions, not projects: a pinned project is
     // lifted on top of cwd grouping rather than replacing it, and the pinned group
