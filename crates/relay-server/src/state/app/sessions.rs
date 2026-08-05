@@ -757,6 +757,59 @@ marking idle locally."
         }
     }
 
+    /// Record which threads a surface currently has on screen. Transcript deltas are
+    /// then published only to the devices that can render them, which is what makes it
+    /// affordable for every background thread to stream live instead of only the one
+    /// globally-active thread.
+    ///
+    /// Deliberately does NOT `notify()`: a watch declaration changes nothing any client
+    /// renders, and clients re-declare on every navigation — waking the snapshot
+    /// publisher here would turn routine scrolling into a broadcast storm.
+    pub async fn set_watched_threads(&self, input: WatchThreadsInput) -> Result<(), String> {
+        let device_id = require_device_id(input.device_id)?;
+        let mut relay = self.relay.write().await;
+        // A broker surface is identified by the peer id the relay already bound at
+        // join, never by a value the client sent — otherwise one phone could take over
+        // another connection's watch slot. Local surfaces send their own per-tab id;
+        // that is only a routing key inside an already-authenticated device.
+        let broker_peer_id = relay.paired_device_peer_id(&device_id);
+        let surface_id = match broker_peer_id {
+            Some(peer_id) => {
+                relay.register_broker_surface(&peer_id);
+                peer_id
+            }
+            None => non_empty(input.surface_id).unwrap_or_else(|| device_id.clone()),
+        };
+        relay.set_watched_threads_for_generation(
+            &surface_id,
+            &device_id,
+            input.thread_ids,
+            input.surface_generation,
+        );
+        Ok(())
+    }
+
+    /// Open a connection generation for an SSE surface. The returned value is what the
+    /// stream's teardown must present to be allowed to unsubscribe.
+    pub async fn open_surface_generation(&self, surface_id: &str, claimed: Option<u64>) -> u64 {
+        let mut relay = self.relay.write().await;
+        relay.open_surface_generation(surface_id, claimed)
+    }
+
+    /// Drop a surface's watch set when its connection ends — but only if this is still
+    /// the current connection for that surface id. A page refresh reuses the id, so the
+    /// old stream's teardown can land AFTER its replacement has already declared.
+    pub async fn drop_watched_surface_generation(&self, surface_id: &str, generation: u64) {
+        let mut relay = self.relay.write().await;
+        relay.drop_watched_surface_generation(surface_id, generation);
+    }
+
+    /// Whether one surface should receive deltas for a thread (local SSE filter).
+    pub async fn surface_watches_thread(&self, surface_id: &str, thread_id: &str) -> bool {
+        let relay = self.relay.read().await;
+        relay.surface_watches_thread(surface_id, thread_id)
+    }
+
     pub async fn heartbeat_session(
         &self,
         input: HeartbeatInput,

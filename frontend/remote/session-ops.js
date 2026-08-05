@@ -84,6 +84,9 @@ let viewOnlyNavigationGeneration = 0;
 let viewOnlyRefreshInFlight = false;
 let viewOnlyLastRefreshAt = 0;
 let viewOnlyWasWorking = false;
+// Last thread-watch set declared to the relay, so a snapshot that changes nothing about
+// what is on screen does not become an outbound frame.
+let lastDeclaredWatchKey = null;
 const transcriptFrameRenderQueue = createFrameRenderQueue({
   render() {
     if (state.session) {
@@ -102,6 +105,9 @@ function invalidateViewOnlyNavigation() {
   viewOnlyRefreshInFlight = false;
   viewOnlyLastRefreshAt = 0;
   viewOnlyWasWorking = false;
+  // The relay drops watch sets when the broker connection goes, so the phone must
+  // forget what it declared or it would never re-declare after reconnecting.
+  lastDeclaredWatchKey = null;
 }
 
 function remoteQueryScope() {
@@ -146,15 +152,33 @@ export function applyTranscriptDelta({
   if (typeof window !== "undefined" && typeof window.__transcriptDeltaCount === "number") {
     window.__transcriptDeltaCount++;
   }
-  const currentSession = currentLiveSession();
-  if (!currentSession) return;
-  const currentThreadId = currentSession.active_thread_id || null;
-  if (thread_id && currentThreadId && thread_id !== currentThreadId) {
-    const message = `[transcript-delta] ignored thread=${thread_id} current=${currentThreadId} item=${item_id || "-"} kind=${delta_kind || kind || "-"}`;
-    renderLog(message);
-    // TODO(remote-monitor-debug): Remove this console mirror once transcript routing is stable.
-    console.log(message);
-    return;
+  const liveSession = currentLiveSession();
+  if (!liveSession) return;
+  const liveThreadId = liveSession.active_thread_id || null;
+
+  // Which session does this delta belong to?
+  //
+  // The relay now streams every thread this surface has declared it is watching, not
+  // just the one globally-active thread. So a delta whose thread isn't the live one is
+  // no longer automatically junk — it may be the thread being read view-only, whose
+  // transcript lives in the PROJECTED session (`state.session`), not the live one.
+  // Dropping it was what made a watched background thread update only when a poll
+  // happened to land.
+  let currentSession = liveSession;
+  let commit = commitLiveSession;
+  let currentThreadId = liveThreadId;
+  if (thread_id && liveThreadId && thread_id !== liveThreadId) {
+    if (viewOnlyThreadId && thread_id === viewOnlyThreadId && state.session?.view_only) {
+      currentSession = state.session;
+      currentThreadId = viewOnlyThreadId;
+      commit = commitViewedSession;
+    } else {
+      const message = `[transcript-delta] ignored thread=${thread_id} current=${liveThreadId} item=${item_id || "-"} kind=${delta_kind || kind || "-"}`;
+      renderLog(message);
+      // TODO(remote-monitor-debug): Remove this console mirror once transcript routing is stable.
+      console.log(message);
+      return;
+    }
   }
   const currentRevision = numericRevision(currentSession.transcript_revision);
   const deltaBaseRevision = numericRevision(base_revision);
@@ -219,6 +243,7 @@ export function applyTranscriptDelta({
     // Contiguous, or partially-overlapping re-delivery: append only the tail we
     // are missing so re-delivery stays idempotent.
     commitTranscriptDeltaAppend({
+      commit,
       currentSession,
       transcript,
       entryIndex,
@@ -249,6 +274,7 @@ export function applyTranscriptDelta({
     return;
   }
   commitTranscriptDeltaAppend({
+    commit,
     currentSession,
     transcript,
     entryIndex,
@@ -263,6 +289,7 @@ export function applyTranscriptDelta({
 }
 
 function commitTranscriptDeltaAppend({
+  commit = commitLiveSession,
   currentSession,
   transcript,
   entryIndex,
@@ -316,7 +343,7 @@ function commitTranscriptDeltaAppend({
   if (Number.isSafeInteger(server_time)) {
     nextSession.server_time = server_time;
   }
-  commitLiveSession(nextSession);
+  commit(nextSession);
 }
 
 // Highest target revision we still owe a repair for, per thread. A Map (not a
@@ -353,11 +380,25 @@ function scheduleTranscriptGapRepair(threadId, reason, targetRevision, detail = 
 
 const MAX_TRANSCRIPT_REPAIR_FAILURES = 3;
 
+/// Is this thread still one we are actually showing?
+///
+/// Repair used to test only the LIVE thread, which meant a gap on a background thread
+/// being read view-only exited the loop immediately and discarded the pending repair —
+/// so the missing text sat there until polling or end-of-turn happened to refill it.
+/// Now that a watched background thread streams, it can gap like any other and has to
+/// be repairable too.
+function isRepairableThread(threadId) {
+  return (
+    currentLiveSession()?.active_thread_id === threadId
+    || (viewOnlyThreadId != null && viewOnlyThreadId === threadId)
+  );
+}
+
 async function runTranscriptRepairLoop(threadId) {
   let repairedToRevision = -1;
   let consecutiveFailures = 0;
   try {
-    while (currentLiveSession()?.active_thread_id === threadId) {
+    while (isRepairableThread(threadId)) {
       const target = pendingGapRepairThreads.get(threadId) ?? 0;
       if (target <= repairedToRevision) {
         break;
@@ -393,9 +434,17 @@ async function runTranscriptRepairLoop(threadId) {
 // dropped live chunk is actually re-fetched and healed rather than only logged.
 async function repairActiveTranscriptTail(threadId, targetRevision) {
   const page = await fetchRawTranscriptPage({ threadId, before: null });
-  // The active thread may have changed while the fetch was in flight — a
-  // legitimate no-op (the user moved on), not a failure to retry.
-  const liveSession = currentLiveSession();
+  // Repair whichever session actually holds this thread's transcript: the live one, or
+  // the view-only projection when the thread is being read in the background. Writing
+  // a background thread's repaired tail into the live session would corrupt the live
+  // thread's transcript, so the target is chosen the same way the delta path chooses it.
+  const live = currentLiveSession();
+  const viewingThisThread =
+    viewOnlyThreadId === threadId && state.session?.view_only && threadId != null;
+  const liveSession = viewingThisThread ? state.session : live;
+  const commit = viewingThisThread ? commitViewedSession : commitLiveSession;
+  // The thread may have changed while the fetch was in flight — a legitimate no-op
+  // (the user moved on), not a failure to retry.
   if (!liveSession || liveSession.active_thread_id !== threadId) {
     return;
   }
@@ -449,7 +498,7 @@ async function repairActiveTranscriptTail(threadId, targetRevision) {
   if (nextRevision > 0) {
     nextSession.transcript_revision = nextRevision;
   }
-  commitLiveSession(nextSession);
+  commit(nextSession);
 }
 
 export function applyTranscriptEvent(event) {
@@ -592,6 +641,9 @@ export function applySessionSnapshot(snapshot) {
     hydrateTranscript: !viewOnlyThreadId || viewingLiveThread,
   });
   maybeRefreshRemoteViewedThread(displaySnapshot);
+  // Keep the relay's idea of what this phone is watching in step with what it is
+  // actually rendering. Deduped internally, so this is one frame per real change.
+  declareWatchedThreads();
   // Derive per-thread attention flags from the snapshot stream and fire browser
   // notifications for threads the user isn't actively watching. Best-effort:
   // never let a notification hiccup break snapshot rendering.
@@ -973,6 +1025,69 @@ function shouldAcceptTranscriptRevision(event) {
 
 function currentLiveSession() {
   return state.session?.view_only ? state.realSession : state.session;
+}
+
+/// Commit a delta into the VIEW-ONLY projection.
+///
+/// Deliberately does not touch `state.realSession`: the live session still belongs to
+/// whatever thread the relay has active, and folding a watched background thread's
+/// text into it would corrupt the transcript the user sees on switching back.
+// Declaring which threads this phone has on screen, so the relay streams their deltas
+// here and nothing else. Without a declaration the relay falls back to "just the active
+// thread", which is exactly the pre-subscription behavior — so a stale client degrades
+// rather than going silent.
+/// Forget the last declaration so the next snapshot re-sends it.
+///
+/// The relay clears a surface's watch set when the broker connection drops, so a
+/// reconnect starts unsubscribed. Without this the phone would consider the set
+/// already sent and never re-declare, leaving background threads on polling.
+export function resetDeclaredWatchedThreads() {
+  lastDeclaredWatchKey = null;
+}
+
+export function declareWatchedThreads() {
+  const live = state.realSession || state.session;
+  const threadIds = [];
+  // The phone renders ONE conversation: the pinned thread when reading view-only,
+  // otherwise the live thread.
+  const viewed = viewOnlyThreadId || live?.active_thread_id || null;
+  if (viewed) {
+    threadIds.push(viewed);
+  }
+  // The peer id is part of the key BECAUSE the relay stores watch sets per broker
+  // peer and drops them when the connection ends. A reconnect mints a new peer id, so
+  // including it makes the identical thread set re-declare automatically — without it
+  // the dedupe would suppress the re-send and background threads would silently fall
+  // back to polling until the user switched threads.
+  const key = `${state.socketPeerId || "-"}|${threadIds.join(" ")}`;
+  // Called from the snapshot path, so without this dedupe every snapshot would
+  // become an outbound frame.
+  if (key === lastDeclaredWatchKey) {
+    return false;
+  }
+  lastDeclaredWatchKey = key;
+  // `dispatchRemoteActionWithoutReply` is async, so a socket that is not up yet
+  // REJECTS rather than throwing — a try/catch around the call would miss it and
+  // leave an unhandled rejection behind.
+  dispatchRemoteActionWithoutReply("watch_threads", {
+    input: { thread_ids: threadIds },
+  }).catch((error) => {
+    // Not paired / not connected yet. Forget the key so the next snapshot retries,
+    // otherwise this surface would sit on a subscription the relay never received.
+    lastDeclaredWatchKey = null;
+    renderLog(`[watch-threads] declaration failed: ${error?.message || error}`);
+  });
+  return true;
+}
+
+/// Commit a delta into the VIEW-ONLY projection.
+///
+/// Deliberately does not touch `state.realSession`: the live session still belongs to
+/// whatever thread the relay has active, and folding a watched background thread's
+/// text into it would corrupt the transcript the user sees on switching back.
+function commitViewedSession(nextViewedSession) {
+  state.session = nextViewedSession;
+  transcriptFrameRenderQueue.queue();
 }
 
 function commitLiveSession(nextLiveSession) {

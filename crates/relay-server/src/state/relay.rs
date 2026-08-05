@@ -9,13 +9,13 @@ mod transcript;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::{
     protocol::{
         ApprovalReceipt, FileChangeApplyState, LogEntryView, ModelOptionView, SessionSnapshot,
         ThreadActivityView, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadSummaryView,
-        ThreadTranscriptResponse, ThreadsResponse,
+        ThreadTranscriptResponse, ThreadsResponse, TranscriptDeltaEvent,
     },
     provider::ThreadSyncData,
 };
@@ -209,8 +209,34 @@ enum CachedRemoteActionState {
     },
 }
 
+/// One surface's declared watch set, plus the device it belongs to.
+///
+/// The device id is kept because authorization and delivery are device-level: path
+/// scope is a device grant, and the E2EE payload secret is per device. Identity is
+/// per surface; permission is per device.
+#[derive(Debug, Clone)]
+pub(crate) struct WatchedSurface {
+    pub(crate) device_id: String,
+    pub(crate) thread_ids: HashSet<String>,
+    /// Which connection generation owns this entry.
+    ///
+    /// A surface id is stable across reconnects (it identifies the TAB), so a refreshed
+    /// page reuses it. Without a generation, the OLD connection's teardown — which can
+    /// run after the new one has already declared — would delete the new connection's
+    /// subscription, and the client's dedupe would then suppress re-declaring it.
+    pub(crate) generation: u64,
+}
+
 pub struct RelayState {
     change_tx: watch::Sender<u64>,
+    /// Live transcript appends for LOCAL SSE subscribers.
+    ///
+    /// Deliberately separate from `pending_broker_messages`: the broker publisher
+    /// drains that queue with `mem::take`, so a second consumer would steal frames
+    /// from it. A broadcast channel instead lets every open `/api/stream` connection
+    /// see every delta, and a lagging subscriber drops old frames rather than
+    /// stalling the relay — the snapshot that follows repairs any gap.
+    delta_tx: broadcast::Sender<TranscriptDeltaEvent>,
     revision: u64,
     transcript_revision: u64,
     security: SecurityProfile,
@@ -307,6 +333,25 @@ pub struct RelayState {
     pub paired_devices: HashMap<String, PairedDevice>,
     online_surface_peer_ids: HashSet<String>,
     online_surface_peer_devices: HashMap<String, String>,
+    /// Which threads each SURFACE is currently looking at, so transcript deltas are
+    /// published only where they can be rendered.
+    ///
+    /// Keyed by surface (one browser tab / one broker peer), NOT by device. "What is on
+    /// screen" is a property of a connection: two tabs of the same browser share one
+    /// device id, so a per-device set would let whichever tab declared last silence the
+    /// other. It also lets a surface be dropped precisely when ITS connection ends,
+    /// instead of guessing from unrelated broker presence churn.
+    ///
+    /// Ephemeral — never persisted. A surface with no entry is not "watching nothing":
+    /// it falls back to the active thread (see `device_watches_thread`), which is
+    /// exactly the pre-subscription behavior for a client that never declares.
+    watched_threads: HashMap<String, WatchedSurface>,
+    /// Surface ids that are broker peer ids, so peer-presence pruning touches only
+    /// those and never a local tab's subscription.
+    broker_surface_ids: HashSet<String>,
+    /// Current connection generation per surface id, so a stale connection's teardown
+    /// cannot unsubscribe its own replacement.
+    surface_generations: HashMap<String, u64>,
     pub pending_pairings: HashMap<String, PendingPairing>,
     pub pending_pairing_requests: HashMap<String, PendingPairingRequest>,
     pub completed_pairings: HashMap<String, CompletedPairing>,
@@ -393,8 +438,13 @@ impl RelayState {
         change_tx: watch::Sender<u64>,
         security: SecurityProfile,
     ) -> Self {
+        // Bounded: a subscriber that falls this far behind gets a Lagged error and
+        // resyncs from the next snapshot, which is strictly better than letting one
+        // slow SSE reader pin delta history in memory.
+        let (delta_tx, _) = broadcast::channel(1024);
         let mut state = Self {
             change_tx,
+            delta_tx,
             revision: 0,
             transcript_revision: 0,
             security,
@@ -436,6 +486,9 @@ impl RelayState {
             paired_devices: HashMap::new(),
             online_surface_peer_ids: HashSet::new(),
             online_surface_peer_devices: HashMap::new(),
+            watched_threads: HashMap::new(),
+            broker_surface_ids: HashSet::new(),
+            surface_generations: HashMap::new(),
             pending_pairings: HashMap::new(),
             pending_pairing_requests: HashMap::new(),
             completed_pairings: HashMap::new(),
@@ -469,6 +522,31 @@ impl RelayState {
     pub fn notify(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         let _ = self.change_tx.send(self.revision);
+    }
+
+    /// Subscribe to live transcript appends (local SSE surfaces).
+    pub fn subscribe_transcript_deltas(&self) -> broadcast::Receiver<TranscriptDeltaEvent> {
+        self.delta_tx.subscribe()
+    }
+
+    /// Fan a delta out to local SSE subscribers. `send` fails only when nobody is
+    /// subscribed, which is the common case for a headless relay — not an error.
+    fn emit_local_transcript_delta(&self, delta: &PendingTranscriptDelta) {
+        let _ = self.delta_tx.send(TranscriptDeltaEvent {
+            thread_id: delta.thread_id.clone(),
+            base_revision: delta.base_revision,
+            revision: delta.revision,
+            entry_seq: delta.entry_seq,
+            server_time: delta.server_time,
+            item_id: delta.item_id.clone(),
+            turn_id: delta.turn_id.clone(),
+            delta: delta.delta.clone(),
+            delta_kind: match delta.kind {
+                TranscriptDeltaKind::AgentText => "agent_text".to_string(),
+                TranscriptDeltaKind::CommandOutput => "command_output".to_string(),
+            },
+            text_offset: delta.text_offset,
+        });
     }
 
     // --- Web Push --------------------------------------------------------
@@ -3200,6 +3278,13 @@ impl RelayState {
         if !connected {
             self.online_surface_peer_ids.clear();
             self.online_surface_peer_devices.clear();
+            // Broker surfaces are gone with the connection, so their watch sets go too
+            // (the client re-declares on reconnect). LOCAL tabs are NOT affected — they
+            // are still connected over SSE, and wiping them here would silently
+            // downgrade the local live tail to polling every time the broker blipped.
+            let broker_surfaces = std::mem::take(&mut self.broker_surface_ids);
+            self.watched_threads
+                .retain(|surface_id, _| !broker_surfaces.contains(surface_id));
         }
     }
 
@@ -3264,7 +3349,9 @@ impl RelayState {
 
     pub fn mark_surface_peer_offline(&mut self, peer_id: &str) -> bool {
         self.online_surface_peer_devices.remove(peer_id);
-        self.online_surface_peer_ids.remove(peer_id)
+        let removed = self.online_surface_peer_ids.remove(peer_id);
+        self.prune_offline_broker_surfaces();
+        removed
     }
 
     pub fn replace_online_surface_peers<I>(&mut self, peer_ids: I)
@@ -3274,6 +3361,284 @@ impl RelayState {
         self.online_surface_peer_ids = peer_ids.into_iter().collect();
         self.online_surface_peer_devices
             .retain(|peer_id, _| self.online_surface_peer_ids.contains(peer_id));
+        self.prune_offline_broker_surfaces();
+    }
+
+    /// Drop watch sets for BROKER surfaces whose peer has gone.
+    ///
+    /// Scoped to surfaces keyed by a broker peer id. A local browser tab is also a
+    /// surface but has no broker peer, so a blanket "retain only surfaces with an
+    /// online peer" would delete every local tab's subscription the moment any phone
+    /// joined or left — silently downgrading the local live tail to polling.
+    fn prune_offline_broker_surfaces(&mut self) {
+        // Retain by VALUE first so the closures below don't borrow `self` twice.
+        let online = self.online_surface_peer_ids.clone();
+        let broker_surfaces = std::mem::take(&mut self.broker_surface_ids);
+        self.watched_threads.retain(|surface_id, _| {
+            !broker_surfaces.contains(surface_id) || online.contains(surface_id)
+        });
+        // Also drop the departed ids themselves: a phone that reconnects mints a new
+        // peer id every time, so keeping the old ones grows this set without bound for
+        // as long as the relay's own broker connection stays up.
+        self.broker_surface_ids = broker_surfaces
+            .into_iter()
+            .filter(|surface_id| online.contains(surface_id))
+            .collect();
+    }
+
+    /// Replace a surface's watch set, keeping only threads the DEVICE is allowed to
+    /// read. Returns true when the stored set changed.
+    ///
+    /// Scope is enforced here because a watch declaration is a content grant: the relay
+    /// streams the thread's transcript to whoever declares it. Every other content path
+    /// (transcript pages, approvals, fork, review, workflow) checks
+    /// `ensure_path_within_device_scope`, and a subscription must not be the one way
+    /// around it. E2EE does not mitigate this — the declaring device holds the key.
+    ///
+    /// A thread whose runtime is not loaded has no known cwd, so it cannot be proven
+    /// in scope and is refused. Unscoped devices (empty `path_scope`) are unaffected.
+    pub fn set_watched_threads(
+        &mut self,
+        surface_id: &str,
+        device_id: &str,
+        thread_ids: Vec<String>,
+    ) -> bool {
+        self.set_watched_threads_for_generation(surface_id, device_id, thread_ids, None)
+    }
+
+    /// As `set_watched_threads`, but refuses a declaration from a superseded connection.
+    ///
+    /// `generation` is what the caller's SSE stream was given. `None` means the client
+    /// did not supply one (an older client), in which case the declaration is accepted —
+    /// the same backwards-compatible posture as a missing watch set.
+    pub fn set_watched_threads_for_generation(
+        &mut self,
+        surface_id: &str,
+        device_id: &str,
+        thread_ids: Vec<String>,
+        generation: Option<u64>,
+    ) -> bool {
+        if let Some(generation) = generation {
+            let current = self
+                .surface_generations
+                .get(surface_id)
+                .copied()
+                .unwrap_or(0);
+            if generation < current {
+                // A stale page's POST arriving after its replacement declared.
+                return false;
+            }
+        }
+        let device_scope = self.device_path_scope(device_id);
+        let allowed_roots = self.allowed_roots.clone();
+        let next: HashSet<String> = thread_ids
+            .into_iter()
+            .filter(|id| !id.is_empty())
+            // Reject only what is PROVABLY out of bounds. A thread whose runtime is not
+            // loaded has no cwd to judge, and local navigation declares the watch BEFORE
+            // the transcript fetch loads it — filtering it here muted that thread until
+            // the next reconnect, because the client has already recorded the declaration
+            // as delivered and dedupes the retry.
+            //
+            // Nothing is lost by admitting it: delivery re-checks readability on every
+            // frame (`thread_is_readable_by_device`), so an unloaded or out-of-scope
+            // thread still sends nothing. Declaration-time filtering is an early reject;
+            // delivery is the gate.
+            .filter(|thread_id| match self.runtime_for_thread(thread_id) {
+                Some(runtime) if !runtime.current_cwd.trim().is_empty() => {
+                    Self::thread_is_readable_by(
+                        Some(runtime.current_cwd.as_str()),
+                        &device_scope,
+                        &allowed_roots,
+                    )
+                }
+                _ => true,
+            })
+            .collect();
+
+        // An explicit declaration ALWAYS replaces, including an empty one. Removing the
+        // entry instead would restore the never-declared fallback (the active thread),
+        // which is how a fully-filtered-out declaration used to hand a scoped device the
+        // very content the filter had just refused.
+        match self.watched_threads.get(surface_id) {
+            Some(current)
+                if current.thread_ids == next
+                    && current.device_id == device_id
+                    && current.generation
+                        == self
+                            .surface_generations
+                            .get(surface_id)
+                            .copied()
+                            .unwrap_or(0) =>
+            {
+                false
+            }
+            _ => {
+                let generation = self
+                    .surface_generations
+                    .get(surface_id)
+                    .copied()
+                    .unwrap_or(0);
+                self.watched_threads.insert(
+                    surface_id.to_string(),
+                    WatchedSurface {
+                        device_id: device_id.to_string(),
+                        thread_ids: next,
+                        generation,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Mark a surface id as belonging to a broker peer, so it is pruned when that peer
+    /// goes offline. Local surfaces are never registered here.
+    pub fn register_broker_surface(&mut self, surface_id: &str) {
+        self.broker_surface_ids.insert(surface_id.to_string());
+    }
+
+    /// Test hook: whether a surface id is still tracked as a broker surface.
+    #[cfg(test)]
+    pub fn broker_surface_id_is_tracked(&self, surface_id: &str) -> bool {
+        self.broker_surface_ids.contains(surface_id)
+    }
+
+    /// Record a connection generation for a surface id, returning the one now in force.
+    /// A reconnect on the same surface id supersedes the previous connection.
+    ///
+    /// `claimed` is the client's own value (its connect timestamp), which survives a page
+    /// reload — a purely server-minted counter would restart at 1 and could not tell a
+    /// reloaded page from its predecessor. An older or absent claim never lowers what is
+    /// already in force.
+    pub fn open_surface_generation(&mut self, surface_id: &str, claimed: Option<u64>) -> u64 {
+        let current = self
+            .surface_generations
+            .get(surface_id)
+            .copied()
+            .unwrap_or(0);
+        let next = match claimed {
+            Some(claimed) if claimed > current => claimed,
+            Some(_) => current,
+            None => current.saturating_add(1),
+        };
+        self.surface_generations
+            .insert(surface_id.to_string(), next);
+        next
+    }
+
+    /// Drop a surface's watch set ONLY if `generation` is still the current one.
+    ///
+    /// The teardown of a closed connection races the setup of its replacement (a page
+    /// refresh reuses the surface id). Unconditional removal here would silently
+    /// unsubscribe the live connection.
+    pub fn drop_watched_surface_generation(&mut self, surface_id: &str, generation: u64) -> bool {
+        if self.surface_generations.get(surface_id).copied() != Some(generation) {
+            return false;
+        }
+        self.surface_generations.remove(surface_id);
+        self.broker_surface_ids.remove(surface_id);
+        self.watched_threads.remove(surface_id).is_some()
+    }
+
+    /// Drop one surface's watch set unconditionally (peer left; no generation race).
+    pub fn drop_watched_surface(&mut self, surface_id: &str) -> bool {
+        self.surface_generations.remove(surface_id);
+        self.broker_surface_ids.remove(surface_id);
+        self.watched_threads.remove(surface_id).is_some()
+    }
+
+    /// Drop every watch set belonging to a device (device revoked / unpaired).
+    pub fn clear_watched_threads_for_device(&mut self, device_id: &str) -> bool {
+        let before = self.watched_threads.len();
+        self.watched_threads
+            .retain(|_, watched| watched.device_id != device_id);
+        before != self.watched_threads.len()
+    }
+
+    /// Whether a specific SURFACE should receive deltas for `thread_id`. This is the
+    /// filter a local SSE connection uses, so two tabs get exactly what each is showing.
+    pub fn surface_watches_thread(&self, surface_id: &str, thread_id: &str) -> bool {
+        match self.watched_threads.get(surface_id) {
+            Some(watched) => {
+                watched.thread_ids.contains(thread_id)
+                    && self.thread_is_readable_by_device(thread_id, &watched.device_id)
+            }
+            // Never declared: the pre-subscription behavior was the active thread — but
+            // still only if this device may read it.
+            None => self.active_thread_id.as_deref() == Some(thread_id),
+        }
+    }
+
+    /// Whether a device may read a thread's content at all, re-derived from CURRENT
+    /// scope and roots. Checked on every delivery, not just at declaration time: a
+    /// device whose scope (or the relay's allowed roots) is tightened afterwards must
+    /// stop receiving a thread it was already watching.
+    pub fn thread_is_readable_by_device(&self, thread_id: &str, device_id: &str) -> bool {
+        Self::thread_is_readable_by(
+            self.runtime_for_thread(thread_id)
+                .map(|r| r.current_cwd.as_str()),
+            &self.device_path_scope(device_id),
+            &self.allowed_roots,
+        )
+    }
+
+    /// A thread is readable when its cwd is inside the relay's allowed roots AND (when
+    /// the device is scoped) inside that device's grant.
+    ///
+    /// An unknown cwd — no runtime loaded yet, or a runtime with a blank cwd — cannot be
+    /// PROVEN in scope, so it is refused whenever there is a restriction to enforce.
+    /// When neither a device scope nor relay roots exist there is nothing to violate, so
+    /// an unloaded thread stays declarable (a client may legitimately declare a thread
+    /// before its runtime materializes).
+    fn thread_is_readable_by(
+        cwd: Option<&str>,
+        device_scope: &[String],
+        allowed_roots: &[String],
+    ) -> bool {
+        let unrestricted = device_scope.is_empty() && allowed_roots.is_empty();
+        match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+            Some(cwd) => {
+                crate::state::ensure_path_within_device_scope(cwd, device_scope, allowed_roots)
+                    .is_ok()
+            }
+            None => unrestricted,
+        }
+    }
+
+    /// Whether a DEVICE should receive deltas for `thread_id` — true when any of its
+    /// surfaces is watching. Broker delivery is per device (the payload secret is), so
+    /// one device with two surfaces gets the union.
+    pub fn device_watches_thread(&self, device_id: &str, thread_id: &str) -> bool {
+        let mut declared = false;
+        let mut wants = false;
+        for watched in self.watched_threads.values() {
+            if watched.device_id != device_id {
+                continue;
+            }
+            declared = true;
+            if watched.thread_ids.contains(thread_id) {
+                wants = true;
+                break;
+            }
+        }
+        if !declared {
+            // No declaration from this device at all -> pre-subscription behavior.
+            wants = self.active_thread_id.as_deref() == Some(thread_id);
+        }
+        // Re-derived every time, so tightening a scope revokes an existing watch.
+        wants && self.thread_is_readable_by_device(thread_id, device_id)
+    }
+
+    /// True when at least one surface wants deltas for this thread. Providers use this
+    /// to skip queueing entirely for a thread nobody is looking at.
+    pub fn any_device_watches_thread(&self, thread_id: &str) -> bool {
+        if self.active_thread_id.as_deref() == Some(thread_id) {
+            return true;
+        }
+        self.watched_threads
+            .values()
+            .any(|watched| watched.thread_ids.contains(thread_id))
     }
 
     pub fn bind_surface_peer_to_device(&mut self, device_id: &str, peer_id: &str) {
@@ -3288,8 +3653,15 @@ impl RelayState {
     /// recoverable — the broker republishes an authoritative snapshot on reconnect).
     /// Pairing results have their own retention semantics and are always kept.
     pub fn queue_broker_message(&mut self, message: BrokerPendingMessage) {
-        if matches!(message, BrokerPendingMessage::TranscriptDelta(_)) && !self.broker_configured {
-            return;
+        if let BrokerPendingMessage::TranscriptDelta(delta) = &message {
+            // Tee to the local SSE subscribers FIRST — before the broker-only guard
+            // below. A relay with no broker still has a local surface, and that
+            // surface still wants a live tail. Every provider funnels its deltas
+            // through here, so this is the one place that has to be right.
+            self.emit_local_transcript_delta(delta);
+            if !self.broker_configured {
+                return;
+            }
         }
         self.pending_broker_messages.push(message);
         self.bound_pending_transcript_deltas();
@@ -3654,6 +4026,32 @@ impl RelayState {
                     peer_id.clone(),
                     device.payload_secret.clone(),
                 ))
+            })
+            .collect()
+    }
+
+    /// Broker targets narrowed to the devices watching `thread_id`. This is what makes
+    /// "stream every thread" affordable: without it, opening N background threads on
+    /// one phone would fan every thread's deltas out to every other paired surface.
+    pub fn broker_targets_for_thread(&self, thread_id: &str) -> Vec<(String, String, String)> {
+        self.broker_targets()
+            .into_iter()
+            .filter(|(device_id, peer_id, _)| {
+                // Filter by the PEER's own declaration, not the device's union: two tabs
+                // on one phone are two peers, and sending each of them both tabs' threads
+                // defeats the point of declaring. Permission is still device-level —
+                // surface_watches_thread re-checks scope via the surface's device.
+                if self.watched_threads.contains_key(peer_id) {
+                    return self.surface_watches_thread(peer_id, thread_id);
+                }
+                // Peer has not declared (an older client). Its fallback must be
+                // INDEPENDENT — the active thread, subject to the current ACL. Using the
+                // device-level answer would union in whatever a NEWER tab on the same
+                // device declared, so that tab opening a background thread would both
+                // push B at the legacy tab and stop sending it the active thread A it is
+                // actually rendering — i.e. its live tail would just stop.
+                self.active_thread_id.as_deref() == Some(thread_id)
+                    && self.thread_is_readable_by_device(thread_id, device_id)
             })
             .collect()
     }

@@ -986,6 +986,12 @@ test("remote send clamps a foreign effort the codex model rejects", async () => 
     readyState: 1,
     send(frameText) {
       const frame = JSON.parse(frameText);
+      // Only the send_message frame carries an effort. The surface also emits
+      // watch_threads frames to declare what it has on screen, and capturing
+      // whichever frame happened to go last would read null off one of those.
+      if (frame.payload?.request?.type !== "send_message") {
+        return;
+      }
       sentEffort = frame.payload?.request?.input?.effort ?? null;
       setImmediate(async () => {
         await handleRemoteBrokerPayload({
@@ -4235,4 +4241,190 @@ test("projectRemoteViewedSession keeps activity authoritative without server_tim
 
   assert.equal(projected.active_turn_id, "view:viewed-thread");
   assert.equal(sessionIsWorking(projected), true);
+});
+
+// A thread being read view-only used to be a POLLED snapshot: the relay streamed
+// deltas only for the single globally-active thread, so a phone watching a background
+// thread saw text arrive in lumps whenever a refresh happened to land. Now that the
+// relay streams every thread this surface declares it is watching, a delta for the
+// pinned thread must land in the projection instead of being discarded.
+test("a delta for the view-only thread updates the projection, not the live session", async () => {
+  activeBrowser = installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { applySessionSnapshot, applyTranscriptDelta, clearSessionRuntime, viewRemoteThread } =
+    await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-view-delta",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+  seedTranscriptHydrationState(state);
+  state.threads = [
+    { id: "thread-a", cwd: "/tmp/a", status: "active" },
+    { id: "thread-b", cwd: "/tmp/b", status: "active" },
+  ];
+
+  // thread-a is active and gets pinned; then thread-b takes over as the live thread,
+  // leaving thread-a as the background thread being read view-only.
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript: [
+      {
+        item_id: "a-1",
+        kind: "agent_text",
+        status: "running",
+        text: "Hello",
+        turn_id: "turn-a",
+        tool: null,
+      },
+    ],
+    transcript_revision: 1,
+    transcript_truncated: false,
+  });
+  assert.equal(await viewRemoteThread("thread-a"), true);
+  applySessionSnapshot({
+    active_thread_id: "thread-b",
+    active_turn_id: "turn-b",
+    current_cwd: "/tmp/b",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript: [{ item_id: "b-1", kind: "agent_text", text: "thread B", turn_id: "turn-b" }],
+    transcript_revision: 5,
+    transcript_truncated: false,
+  });
+
+  assert.equal(state.session.view_only, true, "thread-a must now be a view-only projection");
+  assert.equal(state.session.active_thread_id, "thread-a");
+  assert.equal(state.realSession.active_thread_id, "thread-b");
+
+  applyTranscriptDelta({
+    thread_id: "thread-a",
+    base_revision: 1,
+    revision: 2,
+    item_id: "a-1",
+    turn_id: "turn-a",
+    delta: " world",
+    delta_kind: "agent_text",
+    text_offset: 5,
+  });
+
+  const viewedEntry = state.session.transcript.find((entry) => entry.item_id === "a-1");
+  assert.equal(
+    viewedEntry.text,
+    "Hello world",
+    "the watched background thread's delta must reach the projection"
+  );
+  // The live session belongs to thread-b. Folding thread-a's text into it would
+  // corrupt the transcript the user sees on switching back.
+  assert.equal(state.realSession.active_thread_id, "thread-b");
+  assert.equal(state.realSession.transcript[0].text, "thread B");
+
+  clearSessionRuntime();
+  state.socket = null;
+});
+
+// The routing must stay narrow: only the PINNED thread is rescued from the drop. A
+// third thread's delta has nowhere to render, and letting it through would splice one
+// thread's text into another's transcript.
+test("a delta for a thread that is neither live nor pinned is still ignored", async () => {
+  activeBrowser = installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { applySessionSnapshot, applyTranscriptDelta, clearSessionRuntime, viewRemoteThread } =
+    await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-view-delta-2",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  remoteQueryClient.clear();
+  seedTranscriptHydrationState(state);
+  state.threads = [
+    { id: "thread-a", cwd: "/tmp/a", status: "active" },
+    { id: "thread-b", cwd: "/tmp/b", status: "active" },
+  ];
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "Hello", turn_id: "turn-a" }],
+    transcript_revision: 1,
+    transcript_truncated: false,
+  });
+  assert.equal(await viewRemoteThread("thread-a"), true);
+  applySessionSnapshot({
+    active_thread_id: "thread-b",
+    active_turn_id: "turn-b",
+    current_cwd: "/tmp/b",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript: [{ item_id: "b-1", kind: "agent_text", text: "thread B", turn_id: "turn-b" }],
+    transcript_revision: 5,
+    transcript_truncated: false,
+  });
+
+  const viewedBefore = JSON.stringify(state.session.transcript);
+  const liveBefore = JSON.stringify(state.realSession.transcript);
+
+  applyTranscriptDelta({
+    thread_id: "thread-c",
+    base_revision: 1,
+    revision: 2,
+    item_id: "c-1",
+    turn_id: "turn-c",
+    delta: "stray text",
+    delta_kind: "agent_text",
+    text_offset: 0,
+  });
+
+  assert.equal(JSON.stringify(state.session.transcript), viewedBefore, "projection untouched");
+  assert.equal(JSON.stringify(state.realSession.transcript), liveBefore, "live session untouched");
+
+  clearSessionRuntime();
+  state.socket = null;
 });

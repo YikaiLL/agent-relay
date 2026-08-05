@@ -1,4 +1,11 @@
 import { openSessionStream, sessionStreamUrl } from "../../session-stream.js";
+import { applyDeltaToViewOnlyPin } from "../view-only-thread.js";
+import {
+  appendTranscriptDelta,
+  invalidateTranscriptWindowForRepair,
+  resolveDeltaAppend,
+  transcriptWindowIsLoaded,
+} from "../transcript/store.js";
 
 export function createStreamController(ctx) {
   const {
@@ -9,6 +16,9 @@ export function createStreamController(ctx) {
     handleUnauthorized,
   } = ctx;
   const applySessionSnapshot = (...args) => ctx.applySessionSnapshot(...args);
+  // Resolved lazily: the controller is built before the transcript controller exists.
+  const ensureConversationTranscript = (...args) =>
+    ctx.ensureConversationTranscript?.(...args);
   const cancelSessionPoll = (...args) => ctx.cancelSessionPoll(...args);
   const cancelStreamReconnect = (...args) => ctx.cancelStreamReconnect(...args);
   const scheduleSessionPoll = (...args) => ctx.scheduleSessionPoll(...args);
@@ -56,8 +66,16 @@ export function createStreamController(ctx) {
       state.sessionStream.close();
     }
 
+    // A monotonic per-connection id. Wall-clock rather than a counter so it keeps
+    // increasing across a page reload — a reset counter could not distinguish a reloaded
+    // page from the one it replaced.
+    state.surfaceGeneration = Date.now();
     const stream = openSessionStream({
-      url: sessionStreamUrl(window.location.origin),
+      url: sessionStreamUrl(window.location.origin, {
+        deviceId: state.deviceId,
+        surfaceId: state.surfaceId,
+        surfaceGeneration: state.surfaceGeneration,
+      }),
       apiToken: state.apiToken,
       onSession(data) {
         try {
@@ -83,6 +101,11 @@ export function createStreamController(ctx) {
         if (!state.streamConnected) {
           logLine("Session stream connected.");
         }
+        // The relay drops a surface's watch set when its stream ends, so a reconnect
+        // starts with no subscription. Forget what we think we declared, or the
+        // dedupe would suppress the re-declaration and this tab's background threads
+        // would silently fall back to polling.
+        state.resetWatchedThreadsDeclaration?.();
         state.streamConnected = true;
         cancelSessionPoll();
         cancelStreamReconnect();
@@ -118,6 +141,20 @@ export function createStreamController(ctx) {
       return;
     }
     const kind = event?.kind || type;
+    if (kind === "transcript_stream_lagged") {
+      // We missed delta frames. Our cached bodies may be short, and a compacted
+      // snapshot cannot fix that on its own (the merge keeps the longer local body
+      // over a shorter preview).
+      //
+      // Marking the window dirty is NOT enough: the re-hydration gate only fires on a
+      // later render whose snapshot still says truncated, and snapshot/delta frames are
+      // merged with `stream::select` — so the newest snapshot can arrive BEFORE this
+      // notice. With no further state change afterwards, nothing would ever refetch.
+      // Drive the fetch directly instead.
+      invalidateTranscriptWindowForRepair(state);
+      void ensureConversationTranscript?.(state.session);
+      return;
+    }
     if (kind === "session_meta_updated") {
       const { transcript: _transcript, transcript_truncated: _truncated, ...metadata } =
         event.session || event.patch || event;
@@ -179,11 +216,71 @@ export function createStreamController(ctx) {
     }
     const currentThreadId = state.session.active_thread_id || null;
     if (event.thread_id && currentThreadId && event.thread_id !== currentThreadId) {
+      // Not the active thread — but it may be the thread this surface is watching
+      // read-only. Route it to the pin instead of dropping it: dropping is what made
+      // a background thread's transcript update only when a poll happened to land.
+      const pin = state.viewOnlyThread;
+      const nextPin = applyDeltaToViewOnlyPin(pin, event);
+      if (nextPin !== pin) {
+        state.viewOnlyThread = nextPin;
+        queueTranscriptRender(state.session);
+      }
       return;
     }
+    // Monotonic. A delta already covered by the initial snapshot legitimately arrives
+    // afterwards (the stream subscribes before the snapshot is rendered), and taking its
+    // revision verbatim would walk the cursor BACKWARDS — making later snapshots look
+    // stale and breaking the freshness checks that depend on it.
+    const currentRevision = Number.isSafeInteger(state.session.transcript_revision)
+      ? state.session.transcript_revision
+      : null;
+    const eventRevision = Number.isSafeInteger(event.revision) ? event.revision : null;
+    const nextRevision =
+      eventRevision == null
+        ? state.session.transcript_revision
+        : currentRevision == null
+          ? eventRevision
+          : Math.max(currentRevision, eventRevision);
+
+    // The hydration window, when loaded, is the ONE place the delta is reconciled: it
+    // owns the text_offset bookkeeping that makes re-delivery idempotent. The rendered
+    // transcript is then derived FROM that result rather than appending the delta a
+    // second time — doing both is how a re-delivered chunk rendered as duplicated text
+    // even though the stored copy was correct.
+    if (transcriptWindowIsLoaded(state, currentThreadId)) {
+      appendTranscriptDelta(state, event);
+      queueTranscriptRender({
+        ...state.session,
+        transcript: renderedTranscriptFromWindow(state, state.session),
+        transcript_revision: nextRevision,
+      });
+      return;
+    }
+
+    // No window yet (deltas can arrive before the first hydration). Reconcile against
+    // the rendered transcript directly, with the SAME offset rules — otherwise the live
+    // tail would either vanish before hydration or double-append on re-delivery.
     const entryIndex = state.session.transcript.findIndex(
       (candidate) => candidate?.item_id === event.item_id
     );
+    const deltaText = event.delta ?? "";
+    const startsAtZero =
+      event.text_offset == null
+      || (Number.isSafeInteger(event.text_offset) && event.text_offset === 0);
+    const appendText =
+      entryIndex >= 0
+        ? resolveDeltaAppend(
+          state.session.transcript[entryIndex].text ?? "",
+          deltaText,
+          event.text_offset
+        )
+        : (startsAtZero ? deltaText : null);
+    if (appendText == null || appendText === "") {
+      // Duplicate, gap, or a body that starts mid-stream. Hydration is authoritative
+      // for all three; splicing here would corrupt the text it will later reconcile.
+      return;
+    }
+
     const nextTranscript = entryIndex >= 0
       ? state.session.transcript.map((entry, index) =>
           index === entryIndex
@@ -194,7 +291,7 @@ export function createStreamController(ctx) {
                 : entry.entry_seq,
               kind: entry.kind || normalizeLocalDeltaKind(event.delta_kind || event.entry_kind),
               status: "running",
-              text: `${entry.text ?? ""}${event.delta ?? ""}`,
+              text: `${entry.text ?? ""}${appendText}`,
               turn_id: entry.turn_id || event.turn_id || null,
             }
             : entry
@@ -206,7 +303,7 @@ export function createStreamController(ctx) {
             item_id: event.item_id,
             kind: normalizeLocalDeltaKind(event.delta_kind || event.entry_kind),
             status: "running",
-            text: event.delta ?? "",
+            text: appendText,
             tool: null,
             turn_id: event.turn_id || null,
           },
@@ -214,11 +311,29 @@ export function createStreamController(ctx) {
     queueTranscriptRender({
       ...state.session,
       transcript: nextTranscript,
-      transcript_revision: Number.isSafeInteger(event.revision)
-        ? event.revision
-        : state.session.transcript_revision,
+      transcript_revision: nextRevision,
     });
   }
+
+  /// Project the hydration window onto the rendered transcript.
+  ///
+  /// Falls back to the session's own transcript when the window is not loaded for this
+  /// thread (a delta can arrive before the first hydration), so the live tail still
+  /// shows rather than blanking.
+  function renderedTranscriptFromWindow(state, session) {
+    const entries = state.transcriptHydrationEntries;
+    const order = state.transcriptHydrationOrder;
+    if (
+      state.transcriptHydrationThreadId !== session?.active_thread_id
+      || !(entries instanceof Map)
+      || !Array.isArray(order)
+      || !order.length
+    ) {
+      return session?.transcript || [];
+    }
+    return order.map((itemId) => entries.get(itemId)).filter(Boolean);
+  }
+
 
   function normalizeLocalDeltaKind(kind) {
     return kind === "command_output" ? "command" : kind || "agent_text";

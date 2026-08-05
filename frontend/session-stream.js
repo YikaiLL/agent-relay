@@ -9,8 +9,26 @@ function sessionStreamHeaders(apiToken) {
   return headers;
 }
 
-export function sessionStreamUrl(baseOrigin = window.location.origin) {
-  return new URL("/api/stream", baseOrigin).toString();
+export function sessionStreamUrl(
+  baseOrigin = window.location.origin,
+  { deviceId = null, surfaceId = null, surfaceGeneration = null } = {}
+) {
+  const url = new URL("/api/stream", baseOrigin);
+  // The relay filters the live delta tail by this SURFACE's declared watch set. Two
+  // tabs share a device id, so the surface id is what keeps their streams apart;
+  // device_id remains the fallback for a client that has not adopted one.
+  if (surfaceId) {
+    url.searchParams.set("surface_id", surfaceId);
+  }
+  // Identifies THIS connection. A reloaded page opens a newer generation, so a stale
+  // page's in-flight watch declaration can be refused instead of clobbering the live one.
+  if (surfaceGeneration != null) {
+    url.searchParams.set("surface_generation", String(surfaceGeneration));
+  }
+  if (deviceId) {
+    url.searchParams.set("device_id", deviceId);
+  }
+  return url.toString();
 }
 
 export function openSessionStream({

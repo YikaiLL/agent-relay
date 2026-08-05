@@ -1,8 +1,43 @@
 use crate::protocol::{ToolCallView, TranscriptEntryKind};
 
+use super::device::{BrokerPendingMessage, PendingTranscriptDelta, TranscriptDeltaKind};
+use super::transcript::TranscriptMutationMeta;
 use super::RelayState;
 
 impl RelayState {
+    /// Publish a background thread's transcript delta to the surfaces watching it.
+    ///
+    /// Background threads used to mutate their runtime transcript and stop there, so a
+    /// thread that wasn't the single globally-active one could only be read by polling
+    /// a snapshot. Streaming them is affordable because this is gated on an actual
+    /// watcher: a thread nobody has on screen still costs nothing.
+    fn queue_background_transcript_delta(
+        &mut self,
+        thread_id: &str,
+        item_id: &str,
+        delta: &str,
+        turn_id: Option<&str>,
+        kind: TranscriptDeltaKind,
+        mutation: TranscriptMutationMeta,
+    ) {
+        if !self.any_device_watches_thread(thread_id) {
+            return;
+        }
+        self.queue_broker_message(BrokerPendingMessage::TranscriptDelta(
+            PendingTranscriptDelta {
+                thread_id: thread_id.to_string(),
+                base_revision: mutation.base_revision,
+                revision: mutation.revision,
+                entry_seq: mutation.entry_seq,
+                server_time: mutation.server_time,
+                item_id: item_id.to_string(),
+                turn_id: turn_id.map(|id| id.to_string()),
+                delta: delta.to_string(),
+                kind,
+                text_offset: mutation.text_offset,
+            },
+        ));
+    }
     /// A locally-deleted thread must stay dead: late provider events (a turn still
     /// draining on the provider, queued events processed after the delete) route here for
     /// background threads, and every `bg_*` handler below ultimately calls
@@ -43,7 +78,15 @@ impl RelayState {
         if self.drop_bg_event_for_deleted_thread(thread_id) {
             return;
         }
-        self.append_agent_delta_for_thread(thread_id, item_id, delta, turn_id);
+        let mutation = self.append_agent_delta_for_thread(thread_id, item_id, delta, turn_id);
+        self.queue_background_transcript_delta(
+            thread_id,
+            item_id,
+            delta,
+            Some(turn_id),
+            TranscriptDeltaKind::AgentText,
+            mutation,
+        );
         self.touch_bg_progress_at(thread_id, now);
     }
 
@@ -101,7 +144,18 @@ impl RelayState {
         if self.drop_bg_event_for_deleted_thread(thread_id) {
             return;
         }
-        self.append_command_delta_for_thread(thread_id, item_id, delta);
+        let mutation = self.append_command_delta_for_thread(thread_id, item_id, delta);
+        // Publish what the relay ACTUALLY appended: it may have inserted a separating
+        // newline, and a client that appends the raw provider delta would diverge.
+        let wire_delta = mutation.wire_delta(delta);
+        self.queue_background_transcript_delta(
+            thread_id,
+            item_id,
+            &wire_delta,
+            None,
+            TranscriptDeltaKind::CommandOutput,
+            mutation,
+        );
         self.touch_bg_progress_at(thread_id, now);
     }
 

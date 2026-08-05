@@ -19,6 +19,25 @@ pub(crate) struct TranscriptMutationMeta {
     /// `None` for mutations where append offset is undefined (command output
     /// inserts separators server-side, snapshots, completions, etc.).
     pub(crate) text_offset: Option<u64>,
+    /// True when the relay inserted a newline BEFORE this delta to separate it from the
+    /// previous command output.
+    ///
+    /// The delta published to clients must include that separator. Sending the raw
+    /// provider delta while the relay's own copy gained a "\n" makes the two diverge —
+    /// `"npm test"` + `"line 1"` renders as `"npm testline 1"` on every surface that
+    /// appends what it was sent.
+    pub(crate) separator_inserted: bool,
+}
+
+impl TranscriptMutationMeta {
+    /// The delta as the relay actually appended it, which is what clients must apply.
+    pub(crate) fn wire_delta(&self, delta: &str) -> String {
+        if self.separator_inserted {
+            format!("\n{delta}")
+        } else {
+            delta.to_string()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -534,6 +553,7 @@ impl RelayState {
         item_id: &str,
         delta: &str,
     ) -> TranscriptMutationMeta {
+        let mut separator_inserted = false;
         let entry_seq = {
             let runtime = self.ensure_runtime_for_thread(thread_id);
             if let Some(index) = runtime
@@ -546,6 +566,7 @@ impl RelayState {
                 let text = entry.text.get_or_insert_with(String::new);
                 if !text.is_empty() && !text.ends_with('\n') && !delta.starts_with('\n') {
                     text.push('\n');
+                    separator_inserted = true;
                 }
                 text.push_str(delta);
                 if entry.status.trim().is_empty() || entry.status == "completed" {
@@ -570,7 +591,10 @@ impl RelayState {
         if self.active_thread_id.as_deref() == Some(thread_id) {
             self.sync_selected_runtime_to_fields();
         }
-        transcript_mutation_meta(base_revision, revision, entry_seq)
+        TranscriptMutationMeta {
+            separator_inserted,
+            ..transcript_mutation_meta(base_revision, revision, entry_seq)
+        }
     }
 
     fn append_command_delta_legacy(
@@ -813,6 +837,7 @@ fn transcript_mutation_meta(
         entry_seq,
         server_time: super::super::unix_now(),
         text_offset: None,
+        separator_inserted: false,
     }
 }
 
@@ -828,6 +853,7 @@ fn transcript_mutation_meta_with_text_offset(
         entry_seq,
         server_time: super::super::unix_now(),
         text_offset: Some(text_offset),
+        separator_inserted: false,
     }
 }
 

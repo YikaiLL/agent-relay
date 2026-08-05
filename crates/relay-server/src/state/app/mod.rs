@@ -27,8 +27,8 @@ use crate::{
         StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput,
         ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
         ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView, ThreadTranscriptResponse,
-        ThreadsResponse, ToolCallView, UpdateSessionSettingsInput, WorkspaceDiffResponse,
-        WorkspaceRootView,
+        ThreadsResponse, ToolCallView, TranscriptDeltaEvent, UpdateSessionSettingsInput,
+        WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -448,6 +448,21 @@ in thread {thread_id}: {error}"
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.change_tx.subscribe()
+    }
+
+    /// Subscribe to live transcript appends for a local SSE connection.
+    pub async fn subscribe_transcript_deltas(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<TranscriptDeltaEvent> {
+        let relay = self.relay.read().await;
+        relay.subscribe_transcript_deltas()
+    }
+
+    /// Whether a local surface should be sent deltas for `thread_id`. Mirrors the
+    /// broker's per-device filter so both surfaces obey the same declaration.
+    pub async fn device_watches_thread(&self, device_id: &str, thread_id: &str) -> bool {
+        let relay = self.relay.read().await;
+        relay.device_watches_thread(device_id, thread_id)
     }
 
     async fn defaults(&self) -> SessionDefaults {

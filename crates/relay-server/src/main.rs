@@ -48,8 +48,8 @@ use protocol::{
     StartSessionInput, StartWorkflowInput, StartWorkflowReceipt, StopTurnInput,
     SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
     ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadTranscriptResponse, ThreadsQuery,
-    ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput, WorkflowActionReceipt,
-    WorkflowsResponse, WorkspaceDiffResponse,
+    ThreadsResponse, TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput,
+    WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -328,6 +328,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/session/resume", post(resume_session))
         .route("/api/session/settings", post(update_session_settings))
         .route("/api/session/heartbeat", post(session_heartbeat))
+        .route("/api/session/watch-threads", post(session_watch_threads))
         .route("/api/session/take-over", post(take_over_session))
         .route(
             "/api/session/message",
@@ -596,10 +597,29 @@ async fn workspace_diff(
         .map_err(|error| classify_session_error(error))
 }
 
+/// Query for `/api/stream`. `device_id` identifies the surface so its declared thread
+/// watch set can filter the delta stream; without one the connection still gets
+/// snapshots, just no low-latency tail.
+#[derive(Debug, Deserialize)]
+struct SessionStreamQuery {
+    #[serde(default)]
+    device_id: Option<String>,
+    /// Per-TAB id. Two tabs share a device id (it lives in localStorage), so the delta
+    /// filter has to key off the connection or the tab that declared last would silence
+    /// the other.
+    #[serde(default)]
+    surface_id: Option<String>,
+    /// The client's generation for this connection (its connect timestamp). Lets a
+    /// stale page's in-flight declaration be refused after a reload.
+    #[serde(default)]
+    surface_generation: Option<u64>,
+}
+
 async fn session_stream(
     State(context): State<AppContext>,
     headers: HeaderMap,
     uri: Uri,
+    Query(query): Query<SessionStreamQuery>,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
     (StatusCode, Json<ApiError>),
@@ -607,7 +627,14 @@ async fn session_stream(
     authorize_api(&context, &headers, &uri)?;
     let initial_state = context.app.clone();
     let updates_state = context.app.clone();
+    let delta_state = context.app.clone();
     let receiver = context.app.subscribe();
+    let delta_receiver = context.app.subscribe_transcript_deltas().await;
+    let surface_id = query
+        .surface_id
+        .or(query.device_id)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
 
     let initial = stream::once(async move {
         Ok::<Event, Infallible>(snapshot_event(compact_local_snapshot(
@@ -631,11 +658,72 @@ async fn session_stream(
         },
     );
 
-    Ok(Sse::new(initial.chain(updates)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    // The live tail. Snapshots alone made the local surface's in-flight text stop at
+    // the snapshot transcript cap until the turn ended; deltas carry the tail
+    // uncapped, and (via the watch set) for every thread the surface has on screen —
+    // not just the one globally-active thread.
+    // Dropping this guard (client disconnect, tab close, navigation) removes this
+    // surface's watch set. Without it a closed tab keeps its threads in the publish set
+    // forever, and a local-only relay keeps producing deltas nobody reads.
+    let generation = match surface_id.as_deref() {
+        Some(id) => {
+            context
+                .app
+                .open_surface_generation(id, query.surface_generation)
+                .await
+        }
+        None => 0,
+    };
+    let cleanup = SurfaceWatchGuard {
+        app: context.app.clone(),
+        surface_id: surface_id.clone(),
+        generation,
+    };
+
+    let deltas = stream::unfold(
+        (delta_state, delta_receiver, surface_id, cleanup),
+        |(state, mut receiver, surface_id, cleanup)| async move {
+            // No surface id means no watch set to filter against, so this connection
+            // gets snapshots only. End the delta stream rather than waking on every
+            // delta just to discard it.
+            let watcher = surface_id.clone()?;
+            loop {
+                let delta = match receiver.recv().await {
+                    Ok(delta) => delta,
+                    // Lagged: this connection fell behind and frames were DROPPED. The
+                    // next snapshot alone does not repair it — a compacted snapshot is a
+                    // preview, and a longer stale local body beats it in the merge, so
+                    // the client would keep a permanently short tail. Tell the client
+                    // explicitly so it refetches the authoritative transcript.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                        return Some((
+                            Ok::<Event, Infallible>(transcript_lagged_event(dropped)),
+                            (state, receiver, surface_id, cleanup),
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                };
+                if !state
+                    .surface_watches_thread(&watcher, &delta.thread_id)
+                    .await
+                {
+                    continue;
+                }
+                return Some((
+                    Ok::<Event, Infallible>(transcript_delta_event(&delta)),
+                    (state, receiver, surface_id, cleanup),
+                ));
+            }
+        },
+    );
+
+    Ok(
+        Sse::new(initial.chain(stream::select(updates, deltas))).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        ),
+    )
 }
 
 async fn list_threads(
@@ -1113,6 +1201,23 @@ async fn session_heartbeat(
         .map_err(bad_request)
 }
 
+/// Declare which threads this surface has on screen. Returns no snapshot: a watch
+/// declaration changes nothing renderable, and the caller fires it on every navigation.
+async fn session_watch_threads(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<WatchThreadsInput>,
+) -> Result<Json<ApiEnvelope<()>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .set_watched_threads(input)
+        .await
+        .map(|()| Json(ApiEnvelope::ok(())))
+        .map_err(bad_request)
+}
+
 async fn take_over_session(
     State(context): State<AppContext>,
     headers: HeaderMap,
@@ -1443,6 +1548,61 @@ fn snapshot_event(snapshot: SessionSnapshot) -> Event {
             Event::default().event("session").data(format!(
                 "{{\"ok\":false,\"error\":\"failed_to_encode_snapshot:{error}\"}}"
             ))
+        })
+}
+
+/// Removes a surface's thread-watch set when its SSE stream is dropped, however that
+/// happens (clean close, navigation, network loss). Tying cleanup to the stream's
+/// lifetime is the only way to catch all three.
+struct SurfaceWatchGuard {
+    app: AppState,
+    surface_id: Option<String>,
+    /// The generation this connection owns. Teardown only unsubscribes if it is still
+    /// current — a refreshed tab reuses its surface id, and the old stream's drop can
+    /// run after the new stream has already declared.
+    generation: u64,
+}
+
+impl Drop for SurfaceWatchGuard {
+    fn drop(&mut self) {
+        let Some(surface_id) = self.surface_id.clone() else {
+            return;
+        };
+        let app = self.app.clone();
+        let generation = self.generation;
+        tokio::spawn(async move {
+            app.drop_watched_surface_generation(&surface_id, generation)
+                .await;
+        });
+    }
+}
+
+/// Tells the client it missed delta frames, so it must refetch rather than trust its
+/// local tail. Snapshots cannot cover this on their own: they are compacted previews,
+/// and the merge deliberately keeps a longer local body over a shorter preview.
+fn transcript_lagged_event(dropped: u64) -> Event {
+    Event::default()
+        .event("transcript_stream_lagged")
+        .json_data(serde_json::json!({ "dropped": dropped }))
+        .unwrap_or_else(|_| {
+            Event::default()
+                .event("transcript_stream_lagged")
+                .data("{\"dropped\":0}")
+        })
+}
+
+/// SSE frame for a live transcript append. The event name and field names match what
+/// `frontend/local/session/stream.js` already parses.
+fn transcript_delta_event(delta: &TranscriptDeltaEvent) -> Event {
+    Event::default()
+        .event("transcript_entry_delta")
+        .json_data(delta)
+        .unwrap_or_else(|error| {
+            Event::default()
+                .event("transcript_entry_delta")
+                .data(format!(
+                    "{{\"ok\":false,\"error\":\"failed_to_encode_delta:{error}\"}}"
+                ))
         })
 }
 

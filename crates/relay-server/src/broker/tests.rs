@@ -1424,3 +1424,299 @@ fn an_explicit_broker_path_override_still_wins() {
         std::path::Path::new("/tmp/explicit-registration.json"),
     );
 }
+
+/// End-to-end delivery contract for transcript deltas, in BOTH security modes.
+///
+/// Everything above this point tested the state layer (who *should* be a target). These
+/// drive real relay state through `build_transcript_delta_messages` to the actual wire
+/// payloads: which peer each frame is addressed to, and what that peer can read.
+mod transcript_delta_delivery {
+    use super::*;
+    use crate::state::{PairedDevice, RelayState};
+
+    const SECRET_A: &str = "payload-secret-phone-a";
+    const SECRET_B: &str = "payload-secret-phone-b";
+
+    fn delta(thread_id: &str, text: &str) -> PendingTranscriptDelta {
+        PendingTranscriptDelta {
+            thread_id: thread_id.to_string(),
+            base_revision: 4,
+            revision: 5,
+            entry_seq: 2,
+            server_time: 1_700,
+            item_id: "item-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            delta: text.to_string(),
+            kind: TranscriptDeltaKind::AgentText,
+            text_offset: Some(11),
+        }
+    }
+
+    fn relay_with_two_phones() -> RelayState {
+        let (change_tx, _) = watch::channel(0_u64);
+        let mut relay = RelayState::new(
+            "/tmp/project".to_string(),
+            change_tx,
+            SecurityProfile::private(),
+        );
+        for (device_id, peer_id, secret) in [
+            ("phone-a", "peer-a", SECRET_A),
+            ("phone-b", "peer-b", SECRET_B),
+        ] {
+            relay.paired_devices.insert(
+                device_id.to_string(),
+                PairedDevice {
+                    device_id: device_id.to_string(),
+                    label: device_id.to_string(),
+                    payload_secret: secret.to_string(),
+                    device_verify_key: String::new(),
+                    created_at: 0,
+                    last_seen_at: None,
+                    last_peer_id: Some(peer_id.to_string()),
+                    broker_join_ticket_expires_at: None,
+                    path_scope: Vec::new(),
+                },
+            );
+            relay.mark_surface_peer_online(peer_id);
+            relay.bind_surface_peer_to_device(device_id, peer_id);
+            relay.register_broker_surface(peer_id);
+        }
+        relay
+    }
+
+    fn targets_for(relay: &RelayState, thread_id: &str) -> Vec<BrokerTarget> {
+        relay
+            .broker_targets_for_thread(thread_id)
+            .into_iter()
+            .map(|(device_id, peer_id, payload_secret)| BrokerTarget {
+                device_id,
+                peer_id,
+                payload_secret,
+            })
+            .collect()
+    }
+
+    fn addressed_peers(messages: &[TargetedBrokerMessage]) -> Vec<String> {
+        let mut peers: Vec<String> = messages
+            .iter()
+            .map(|message| message.target_peer_id.clone())
+            .collect();
+        peers.sort();
+        peers
+    }
+
+    /// MANAGED: one frame per watching peer, addressed to that peer. The pre-targeting
+    /// behavior was a single un-addressed broadcast the whole room received.
+    #[test]
+    fn managed_mode_addresses_only_the_watching_peer() {
+        let mut relay = relay_with_two_phones();
+        relay.set_watched_threads("peer-a", "phone-a", vec!["thread-x".to_string()]);
+        relay.set_watched_threads("peer-b", "phone-b", vec!["thread-other".to_string()]);
+
+        let messages = build_transcript_delta_messages(
+            targets_for(&relay, "thread-x"),
+            true,
+            &delta("thread-x", "hello"),
+        )
+        .expect("managed delivery should build");
+
+        assert_eq!(addressed_peers(&messages), vec!["peer-a".to_string()]);
+        match &*messages[0].payload {
+            OutboundBrokerPayload::TranscriptDelta {
+                thread_id,
+                delta,
+                delta_kind,
+                text_offset,
+                ..
+            } => {
+                assert_eq!(thread_id, "thread-x");
+                assert_eq!(delta, "hello");
+                assert_eq!(delta_kind, "agent_text");
+                assert_eq!(*text_offset, Some(11));
+            }
+            other => panic!("managed mode must send a plaintext delta, got: {other:?}"),
+        }
+    }
+
+    /// E2EE: one envelope per watching peer, and ONLY that peer's device key opens it.
+    #[test]
+    fn e2ee_mode_encrypts_per_device_and_addresses_only_the_watcher() {
+        let mut relay = relay_with_two_phones();
+        relay.set_watched_threads("peer-a", "phone-a", vec!["thread-x".to_string()]);
+        relay.set_watched_threads("peer-b", "phone-b", vec!["thread-other".to_string()]);
+
+        let messages = build_transcript_delta_messages(
+            targets_for(&relay, "thread-x"),
+            false,
+            &delta("thread-x", "secret text"),
+        )
+        .expect("e2ee delivery should build");
+
+        assert_eq!(addressed_peers(&messages), vec!["peer-a".to_string()]);
+        match &*messages[0].payload {
+            OutboundBrokerPayload::EncryptedTranscriptDelta {
+                target_peer_id,
+                device_id,
+                envelope,
+            } => {
+                assert_eq!(target_peer_id, "peer-a");
+                assert_eq!(device_id, "phone-a");
+                let opened: serde_json::Value =
+                    decrypt_json(SECRET_A, envelope).expect("the addressed device must decrypt");
+                assert_eq!(opened["delta"], "secret text");
+                assert_eq!(opened["thread_id"], "thread-x");
+                assert_eq!(opened["text_offset"], 11);
+                // The other paired device must not be able to read it, even if the frame
+                // reached it: targeting is not the only barrier.
+                assert!(
+                    decrypt_json::<serde_json::Value>(SECRET_B, envelope).is_err(),
+                    "another device's key must not open this envelope"
+                );
+            }
+            other => panic!("private mode must encrypt, got: {other:?}"),
+        }
+    }
+
+    /// Two devices watching the same thread each get their OWN envelope, sealed to their
+    /// own key — not one shared ciphertext.
+    #[test]
+    fn e2ee_mode_seals_a_separate_envelope_per_watching_device() {
+        let mut relay = relay_with_two_phones();
+        relay.set_watched_threads("peer-a", "phone-a", vec!["thread-x".to_string()]);
+        relay.set_watched_threads("peer-b", "phone-b", vec!["thread-x".to_string()]);
+
+        let messages = build_transcript_delta_messages(
+            targets_for(&relay, "thread-x"),
+            false,
+            &delta("thread-x", "shared"),
+        )
+        .expect("e2ee delivery should build");
+
+        assert_eq!(
+            addressed_peers(&messages),
+            vec!["peer-a".to_string(), "peer-b".to_string()]
+        );
+        for message in &messages {
+            let (secret, expected_device) = if message.target_peer_id == "peer-a" {
+                (SECRET_A, "phone-a")
+            } else {
+                (SECRET_B, "phone-b")
+            };
+            match &*message.payload {
+                OutboundBrokerPayload::EncryptedTranscriptDelta {
+                    device_id,
+                    envelope,
+                    ..
+                } => {
+                    assert_eq!(device_id, expected_device);
+                    let opened: serde_json::Value =
+                        decrypt_json(secret, envelope).expect("each device opens its own envelope");
+                    assert_eq!(opened["delta"], "shared");
+                }
+                other => panic!("expected an encrypted delta, got: {other:?}"),
+            }
+        }
+    }
+
+    /// A thread nobody declared produces no frames at all, in either mode. This is the
+    /// whole point of declaring: an unwatched background thread costs nothing.
+    #[test]
+    fn an_unwatched_thread_produces_no_frames_in_either_mode() {
+        let mut relay = relay_with_two_phones();
+        relay.set_watched_threads("peer-a", "phone-a", vec!["thread-other".to_string()]);
+        relay.set_watched_threads("peer-b", "phone-b", vec!["thread-other".to_string()]);
+
+        for broker_can_read_content in [true, false] {
+            let messages = build_transcript_delta_messages(
+                targets_for(&relay, "thread-x"),
+                broker_can_read_content,
+                &delta("thread-x", "hello"),
+            )
+            .expect("building should succeed");
+            assert!(
+                messages.is_empty(),
+                "an unwatched thread must produce no frames (broker_readable={broker_can_read_content})"
+            );
+        }
+    }
+
+    /// Two surfaces of the SAME device viewing different threads each get only their own
+    /// thread — the device-union targeting sent both threads to both peers.
+    #[test]
+    fn two_surfaces_of_one_device_receive_only_their_own_thread() {
+        let (change_tx, _) = watch::channel(0_u64);
+        let mut relay = RelayState::new(
+            "/tmp/project".to_string(),
+            change_tx,
+            SecurityProfile::private(),
+        );
+        relay.paired_devices.insert(
+            "phone".to_string(),
+            PairedDevice {
+                device_id: "phone".to_string(),
+                label: "phone".to_string(),
+                payload_secret: SECRET_A.to_string(),
+                device_verify_key: String::new(),
+                created_at: 0,
+                last_seen_at: None,
+                last_peer_id: Some("peer-2".to_string()),
+                broker_join_ticket_expires_at: None,
+                path_scope: Vec::new(),
+            },
+        );
+        for peer in ["peer-1", "peer-2"] {
+            relay.mark_surface_peer_online(peer);
+            relay.bind_surface_peer_to_device("phone", peer);
+            relay.register_broker_surface(peer);
+        }
+        relay.set_watched_threads("peer-1", "phone", vec!["thread-a".to_string()]);
+        relay.set_watched_threads("peer-2", "phone", vec!["thread-b".to_string()]);
+
+        let a = build_transcript_delta_messages(
+            targets_for(&relay, "thread-a"),
+            true,
+            &delta("thread-a", "A"),
+        )
+        .expect("build");
+        assert_eq!(addressed_peers(&a), vec!["peer-1".to_string()]);
+
+        let b = build_transcript_delta_messages(
+            targets_for(&relay, "thread-b"),
+            true,
+            &delta("thread-b", "B"),
+        )
+        .expect("build");
+        assert_eq!(addressed_peers(&b), vec!["peer-2".to_string()]);
+    }
+
+    /// A device whose path scope excludes the thread gets nothing, even though it
+    /// declared the watch — delivery re-checks, so tightening a scope takes effect.
+    #[test]
+    fn a_scope_that_excludes_the_thread_produces_no_frames() {
+        let mut relay = relay_with_two_phones();
+        relay.ensure_runtime_for_thread("thread-x").current_cwd = "/tmp/project/secret".to_string();
+        relay.set_watched_threads("peer-a", "phone-a", vec!["thread-x".to_string()]);
+        assert_eq!(
+            targets_for(&relay, "thread-x").len(),
+            1,
+            "legal while unscoped"
+        );
+
+        relay
+            .paired_devices
+            .get_mut("phone-a")
+            .expect("paired")
+            .path_scope = vec!["/tmp/project/allowed".to_string()];
+
+        let messages = build_transcript_delta_messages(
+            targets_for(&relay, "thread-x"),
+            false,
+            &delta("thread-x", "nope"),
+        )
+        .expect("build");
+        assert!(
+            messages.is_empty(),
+            "a device whose scope no longer covers the thread must receive nothing"
+        );
+    }
+}

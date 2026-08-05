@@ -14,8 +14,8 @@ use crate::{
         RequestReviewInput, ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot,
         StartSessionInput, StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput,
         TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-        ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WorkflowActionInput,
-        WorkflowsResponse, WorkspaceDiffResponse,
+        ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WatchThreadsInput,
+        WorkflowActionInput, WorkflowsResponse, WorkspaceDiffResponse,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
@@ -72,6 +72,9 @@ pub(super) enum RemoteActionRequest {
     },
     Heartbeat {
         input: HeartbeatInput,
+    },
+    WatchThreads {
+        input: WatchThreadsInput,
     },
     ListProviders,
     ListThreads {
@@ -198,6 +201,7 @@ impl RemoteActionRequest {
             Self::StopTurn { .. } => RemoteActionKind::StopTurn,
             Self::TakeOver { .. } => RemoteActionKind::TakeOver,
             Self::Heartbeat { .. } => RemoteActionKind::Heartbeat,
+            Self::WatchThreads { .. } => RemoteActionKind::WatchThreads,
             Self::ListProviders => RemoteActionKind::ListProviders,
             Self::ListThreads { .. } => RemoteActionKind::ListThreads,
             Self::ListProviderModels { .. } => RemoteActionKind::ListProviderModels,
@@ -266,6 +270,10 @@ impl RemoteActionRequest {
             Self::Heartbeat { mut input } => {
                 input.device_id = Some(device_id);
                 Self::Heartbeat { input }
+            }
+            Self::WatchThreads { mut input } => {
+                input.device_id = Some(device_id);
+                Self::WatchThreads { input }
             }
             Self::ListProviders => Self::ListProviders,
             Self::ListThreads { mut query } => {
@@ -392,6 +400,7 @@ pub(super) enum RemoteActionKind {
     StopTurn,
     TakeOver,
     Heartbeat,
+    WatchThreads,
     ListProviders,
     ListThreads,
     ListProviderModels,
@@ -431,6 +440,7 @@ impl RemoteActionKind {
             Self::StopTurn => "stop_turn",
             Self::TakeOver => "take_over",
             Self::Heartbeat => "heartbeat",
+            Self::WatchThreads => "watch_threads",
             Self::ListProviders => "list_providers",
             Self::ListThreads => "list_threads",
             Self::ListProviderModels => "list_provider_models",
@@ -1140,6 +1150,10 @@ async fn execute_remote_action(
             .heartbeat_session(input)
             .await
             .map(|_| RemoteActionOutcome::default()),
+        RemoteActionRequest::WatchThreads { input } => state
+            .set_watched_threads(input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
         RemoteActionRequest::ListProviders => Ok(RemoteActionOutcome {
             receipt: None,
             providers: Some(state.available_providers()),
@@ -1349,6 +1363,7 @@ fn remote_action_emits_info_log(action: RemoteActionKind) -> bool {
     !matches!(
         action,
         RemoteActionKind::Heartbeat
+            | RemoteActionKind::WatchThreads
             | RemoteActionKind::ListThreads
             | RemoteActionKind::FetchThreadEntries
             | RemoteActionKind::FetchThreadEntryDetail
@@ -1363,7 +1378,12 @@ fn remote_action_emits_info_log(action: RemoteActionKind) -> bool {
 }
 
 fn is_fire_and_forget_action(action: RemoteActionKind) -> bool {
-    matches!(action, RemoteActionKind::Heartbeat)
+    // A watch declaration needs no reply and fires on every navigation, so it skips
+    // the replay/idempotency cache the same way heartbeats do.
+    matches!(
+        action,
+        RemoteActionKind::Heartbeat | RemoteActionKind::WatchThreads
+    )
 }
 
 async fn execute_fire_and_forget_remote_action(
@@ -2496,6 +2516,7 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         RemoteActionKind::ClaimChallenge
         | RemoteActionKind::ClaimDevice
         | RemoteActionKind::Heartbeat
+        | RemoteActionKind::WatchThreads
         | RemoteActionKind::StopTurn
         | RemoteActionKind::TakeOver => RemoteActionResultKind::RemoteControlResult,
         RemoteActionKind::ListProviders

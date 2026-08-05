@@ -848,6 +848,9 @@ async fn handle_notification_for_provider(
                         relay.touch_progress(None, None);
                         let delta_len = delta.len();
                         let mutation = relay.append_command_delta(&item_id, &delta);
+                        // The relay may have inserted a separating newline; clients must
+                        // receive the text as appended, not the raw provider delta.
+                        let wire_delta = mutation.wire_delta(&delta);
                         let thread_id = notification_thread_id
                             .clone()
                             .or_else(|| relay.active_thread_id.clone())
@@ -869,7 +872,7 @@ async fn handle_notification_for_provider(
                                 server_time: mutation.server_time,
                                 item_id,
                                 turn_id: None,
-                                delta: delta.clone(),
+                                delta: wire_delta,
                                 kind: TranscriptDeltaKind::CommandOutput,
                                 text_offset: mutation.text_offset,
                             },

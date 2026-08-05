@@ -208,6 +208,7 @@ import {
   viewOnlyPinNextAction,
   viewOnlySelfHealThreadId,
 } from "./local/view-only-thread.js";
+import { createWatchedThreadsSync } from "./local/watched-threads.js";
 import {
   createViewedThreadRefreshLatch,
   shouldRefreshViewedThread,
@@ -291,6 +292,10 @@ const state = {
   // Latest server (relay) log entries, refreshed from each session snapshot.
   relayLogLines: [],
   deviceId: loadOrCreateDeviceId(),
+  // Identifies this TAB (sessionStorage), where deviceId identifies the browser
+  // (localStorage). The relay filters the live delta stream per surface so two tabs
+  // can watch different threads without silencing each other.
+  surfaceId: loadOrCreateSurfaceId(),
   defaultsSeeded: false,
   selectedCwd: "",
   session: null,
@@ -1198,7 +1203,23 @@ async function loadOlderViewOnlyTranscript() {
 // non-active thread without going through viewThread(), and a rapid-switch race can
 // drop the pin — so re-arm the load here whenever the viewed thread lacks a good pin
 // (viewOnlySelfHealThreadId), with a backoff on failures so a failing fetch can't loop.
+// Tell the relay which threads this surface has on screen, so it streams their deltas
+// here. Deduped internally, so calling it on every render costs one request per actual
+// change of the viewed thread.
+const syncWatchedThreads = createWatchedThreadsSync({
+  apiFetch,
+  deviceId: () => state.deviceId,
+  // Per TAB, not per device: the device id lives in localStorage and is shared by every
+  // tab, so a per-device watch set would let whichever tab declared last silence the
+  // others. sessionStorage is per-tab, which is exactly the scope we want.
+  surfaceId: () => state.surfaceId,
+  surfaceGeneration: () => state.surfaceGeneration ?? null,
+  onError: (error) => logLine(`Failed to declare watched threads: ${error.message}`),
+});
+state.resetWatchedThreadsDeclaration = () => syncWatchedThreads.reset();
+
 function maybeRefreshViewOnly(session) {
+  void syncWatchedThreads(session, state.viewThreadId);
   const pin = state.viewOnlyThread;
   if (pin && session) {
     const action = viewOnlyPinNextAction(session, pin, {
@@ -4072,6 +4093,29 @@ function workspaceBasename(cwd) {
 function shortId(value) {
   return value ? value.slice(0, 8) : "unknown";
 }
+
+// Identifies this page load as a CONNECTION, distinct from the device identity above.
+//
+// Deliberately NOT persisted. sessionStorage looks per-tab, but the browser COPIES it
+// into a tab you duplicate (and into `window.open`/`target=_blank` children), so both
+// tabs would come up claiming the same surface id and the relay — which keys watch sets
+// by surface — would treat them as one. The later one would win and the other's live
+// tail would just stop.
+//
+// A fresh id per page load has no such failure mode and costs nothing: it is stable for
+// the page's lifetime (so an SSE reconnect keeps it, and the connection generation
+// arbitrates old vs new stream), and a reload's orphaned entry is removed when its SSE
+// stream drops.
+let cachedSurfaceId = null;
+
+function loadOrCreateSurfaceId() {
+  cachedSurfaceId ||= window.crypto?.randomUUID?.()
+    ? window.crypto.randomUUID()
+    : `surface-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return cachedSurfaceId;
+}
+
+export { loadOrCreateSurfaceId };
 
 function loadOrCreateDeviceId() {
   const existing = window.localStorage.getItem(DEVICE_STORAGE_KEY);

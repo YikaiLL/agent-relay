@@ -29,6 +29,126 @@ export function viewOnlyEligible(session, threadId) {
   );
 }
 
+/// How much of a delta is genuinely new for a pinned entry, given `text_offset`.
+/// Mirrors `resolveDeltaAppend` in shared/transcript-hydration-store.js — same wire
+/// contract, same reconciliation. Returns null to refuse, "" for a pure duplicate.
+function resolveViewOnlyDeltaAppend(haveText, deltaText, textOffset) {
+  const offset =
+    typeof textOffset === "number" && Number.isSafeInteger(textOffset) && textOffset >= 0
+      ? textOffset
+      : null;
+  if (offset == null) {
+    return deltaText;
+  }
+  const have = haveText.length;
+  if (have < offset) {
+    return null;
+  }
+  const overlapLen = Math.min(have - offset, deltaText.length);
+  if (
+    overlapLen > 0
+    && haveText.slice(offset, offset + overlapLen) !== deltaText.slice(0, overlapLen)
+  ) {
+    return null;
+  }
+  if (have >= offset + deltaText.length) {
+    return "";
+  }
+  return deltaText.slice(have - offset);
+}
+
+/// Normalize a delta's wire kind to the transcript entry kind the renderer uses.
+/// Mirrors `normalizeLocalDeltaKind` in session/stream.js — same wire, same mapping.
+function deltaEntryKind(kind) {
+  return kind === "command_output" ? "command" : kind || "agent_text";
+}
+
+/**
+ * Apply a live transcript delta to a view-only pin.
+ *
+ * A pinned thread used to be a POLLED snapshot: the relay streamed deltas only for
+ * the single globally-active thread, so watching a background thread meant re-fetching
+ * a transcript page and watching text arrive in lumps. Now that the relay streams every
+ * watched thread, a delta for the pinned thread belongs in the pin's own entries.
+ *
+ * Pure: returns a NEW pin when the delta applies, or the SAME pin object when it does
+ * not, so callers can use identity to decide whether to re-render.
+ *
+ * @param {object|null} pin
+ * @param {object} event transcript_entry_delta payload
+ * @returns {object|null}
+ */
+export function applyDeltaToViewOnlyPin(pin, event) {
+  if (!pin || !event?.item_id || !Array.isArray(pin.entries)) {
+    return pin;
+  }
+  // A pin is one specific thread. An unlabeled delta is not assumed to be ours —
+  // guessing would let another thread's text bleed into a read-only view.
+  if (!event.thread_id || event.thread_id !== pin.threadId) {
+    return pin;
+  }
+
+  const index = pin.entries.findIndex((entry) => entry?.item_id === event.item_id);
+  const deltaText = event.delta ?? "";
+  // Re-delivery is normal (the stream can replay a chunk the snapshot already carried),
+  // so reconcile against text_offset rather than blindly appending — a duplicated
+  // append here would corrupt the read-only view with no way to notice.
+  // A FIRST delta for an unknown item must start at offset 0. A non-zero offset means
+  // the message's opening text never arrived, so appending the tail would render a
+  // truncated body as if it were whole.
+  const startsAtZero =
+    event.text_offset == null
+    || (Number.isSafeInteger(event.text_offset) && event.text_offset === 0);
+  const delta =
+    index >= 0
+      ? resolveViewOnlyDeltaAppend(pin.entries[index].text ?? "", deltaText, event.text_offset)
+      : (startsAtZero ? deltaText : null);
+  if (delta == null || delta === "") {
+    // Gap, divergence, or pure duplicate: leave the pin alone so its next authoritative
+    // refresh repairs it.
+    return pin;
+  }
+  const entries =
+    index >= 0
+      ? pin.entries.map((entry, position) =>
+          position === index
+            ? {
+              ...entry,
+              entry_seq:
+                  Number.isSafeInteger(event.entry_seq) && !Number.isSafeInteger(entry.entry_seq)
+                    ? event.entry_seq
+                    : entry.entry_seq,
+              kind: entry.kind || deltaEntryKind(event.delta_kind || event.entry_kind),
+              status: "running",
+              text: `${entry.text ?? ""}${delta}`,
+              turn_id: entry.turn_id || event.turn_id || null,
+            }
+            : entry
+        )
+      : [
+          ...pin.entries,
+          {
+            entry_seq: Number.isSafeInteger(event.entry_seq) ? event.entry_seq : null,
+            item_id: event.item_id,
+            kind: deltaEntryKind(event.delta_kind || event.entry_kind),
+            status: "running",
+            text: delta,
+            tool: null,
+            turn_id: event.turn_id || null,
+          },
+        ];
+
+  return {
+    ...pin,
+    entries,
+    // A pin carrying live deltas is by definition mid-turn. Without this the
+    // projection can report the thread idle while text is still arriving, which is
+    // what made a watched background thread look finished when it wasn't.
+    activeTurnId: pin.activeTurnId || event.turn_id || null,
+    wasWorking: true,
+  };
+}
+
 export function buildViewOnlyPin({
   threadId,
   page = null,

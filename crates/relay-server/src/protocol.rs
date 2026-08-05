@@ -2371,6 +2371,56 @@ pub struct HeartbeatInput {
     pub device_id: Option<String>,
 }
 
+/// A live transcript append, delivered to the LOCAL surface over SSE.
+///
+/// The broker has carried deltas for a while; the local surface only ever received
+/// whole snapshots, which is why its live tail froze at the snapshot's transcript cap
+/// and only caught up when the turn ended. Field names mirror the broker's
+/// `transcript_delta` payload so both surfaces apply deltas the same way.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptDeltaEvent {
+    pub thread_id: String,
+    pub base_revision: u64,
+    pub revision: u64,
+    pub entry_seq: u64,
+    pub server_time: u64,
+    pub item_id: String,
+    pub turn_id: Option<String>,
+    pub delta: String,
+    pub delta_kind: String,
+    pub text_offset: Option<u64>,
+}
+
+/// A surface declaring which threads it currently has on screen, so the relay only
+/// streams transcript deltas that the surface can actually render. An empty list
+/// clears the declaration, which restores the "just the active thread" default rather
+/// than muting the device.
+///
+/// `device_id` is always stamped server-side by `bind_device`; a value sent by the
+/// client is overwritten, never trusted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchThreadsInput {
+    #[serde(default)]
+    pub thread_ids: Vec<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// Identifies the CONNECTION (one browser tab / one broker peer) rather than the
+    /// device, because two tabs of one browser share a device id and must be able to
+    /// watch different threads without silencing each other.
+    ///
+    /// Grants nothing on its own: every permission check keys off `device_id`, which is
+    /// stamped server-side. For broker surfaces the relay overrides this with the peer
+    /// id it already knows, so a phone cannot claim another connection's slot.
+    #[serde(default)]
+    pub surface_id: Option<String>,
+    /// Connection generation this declaration belongs to, from the SSE stream that
+    /// opened it. A stale page's POST can land after its replacement has already
+    /// declared; without this it would overwrite the live watch set, and the new page
+    /// would not re-send because it has already recorded its declaration as delivered.
+    #[serde(default)]
+    pub surface_generation: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestReviewInput {
     /// Thread whose work is being reviewed. Defaults to the active thread; v1

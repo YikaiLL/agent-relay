@@ -606,6 +606,9 @@ impl RelayState {
         // Stop all relay-originated push to a revoked device: drop its stored
         // subscriptions so the dispatcher no longer sends thread names/status to it.
         self.push_subscriptions.remove(device_id);
+        // Same for live transcript deltas — a revoked device must stop being a
+        // publish target immediately, not merely fail to decrypt.
+        self.clear_watched_threads_for_device(device_id);
         self.record_revoked_device(&device, now);
         if self.active_controller_device_id.as_deref() == Some(device_id) {
             self.active_controller_device_id = None;
@@ -736,6 +739,14 @@ impl RelayState {
             .get(device_id)
             .map(|device| device.payload_secret.clone())
             .ok_or_else(|| "device is not paired".to_string())
+    }
+
+    /// Current broker peer for a paired device, bound at join. `None` for a device
+    /// that is not a broker surface (e.g. the local browser).
+    pub fn paired_device_peer_id(&self, device_id: &str) -> Option<String> {
+        self.paired_devices
+            .get(device_id)
+            .and_then(|device| device.last_peer_id.clone())
     }
 
     pub fn device_path_scope(&self, device_id: &str) -> Vec<String> {

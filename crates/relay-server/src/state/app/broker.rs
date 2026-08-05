@@ -74,6 +74,22 @@ impl AppState {
             .collect()
     }
 
+    /// Broker targets narrowed to the surfaces watching `thread_id`. Used for
+    /// transcript deltas so that streaming every thread costs only what the surfaces
+    /// actually have on screen.
+    pub(crate) async fn broker_targets_for_thread(&self, thread_id: &str) -> Vec<BrokerTarget> {
+        let relay = self.relay.read().await;
+        relay
+            .broker_targets_for_thread(thread_id)
+            .into_iter()
+            .map(|(device_id, peer_id, payload_secret)| BrokerTarget {
+                device_id,
+                peer_id,
+                payload_secret,
+            })
+            .collect()
+    }
+
     pub(crate) async fn reserve_remote_action(
         &self,
         device_id: &str,

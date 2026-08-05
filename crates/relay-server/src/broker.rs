@@ -24,7 +24,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::state::{AppState, BrokerPendingMessage, PendingTranscriptDelta, TranscriptDeltaKind};
+use crate::state::{
+    AppState, BrokerPendingMessage, BrokerTarget, PendingTranscriptDelta, TranscriptDeltaKind,
+};
 
 use self::auth::{
     complete_public_relay_enrollment, request_public_relay_enrollment_challenge, BrokerAuthConfig,
@@ -1562,6 +1564,85 @@ fn can_merge_transcript_delta(
         && current.revision == next.base_revision
 }
 
+/// Decide who a transcript delta goes to and in what form.
+///
+/// Split out from the socket write so the delivery contract is testable without a live
+/// websocket: which peers are targeted, and what each one actually receives. Both
+/// delivery modes are TARGETED — managed mode used to broadcast one frame and let each
+/// client discard threads it wasn't showing, which cannot work once every background
+/// thread streams (N open threads would cost every paired surface N streams).
+///
+/// Targets come from the relay's own peer bookkeeping (`online_surface_peer_devices`),
+/// which a broadcast never consulted. A paired surface is bound the moment it joins
+/// (presence/welcome -> mark_remote_device_seen; a device join ticket must carry a
+/// device_id, see relay-broker join_ticket.rs), so the only gap is the few ms before its
+/// presence frame arrives. Snapshots are still broadcast in managed mode, and the client
+/// has not rendered anything yet at that point, so nothing goes blank.
+///
+/// Surfaces that are mid-pairing carry no device_id and no payload_secret; they were
+/// never in `broker_targets()`, before targeting or after.
+fn build_transcript_delta_messages(
+    targets: Vec<BrokerTarget>,
+    broker_can_read_content: bool,
+    delta: &PendingTranscriptDelta,
+) -> Result<Vec<TargetedBrokerMessage>, String> {
+    let kind = match delta.kind {
+        TranscriptDeltaKind::AgentText => "agent_text",
+        TranscriptDeltaKind::CommandOutput => "command_output",
+    };
+
+    if broker_can_read_content {
+        return Ok(targets
+            .into_iter()
+            .map(|target| TargetedBrokerMessage {
+                target_peer_id: target.peer_id,
+                payload: Box::new(OutboundBrokerPayload::TranscriptDelta {
+                    thread_id: delta.thread_id.clone(),
+                    base_revision: delta.base_revision,
+                    revision: delta.revision,
+                    entry_seq: delta.entry_seq,
+                    server_time: delta.server_time,
+                    item_id: delta.item_id.clone(),
+                    turn_id: delta.turn_id.clone(),
+                    delta: delta.delta.clone(),
+                    delta_kind: kind.to_string(),
+                    text_offset: delta.text_offset,
+                }),
+            })
+            .collect());
+    }
+
+    let mut messages = Vec::new();
+    for target in targets {
+        // Encrypted per DEVICE: the payload secret is a device grant, so two surfaces of
+        // one device share it while a different device cannot read either.
+        let envelope = encrypt_json(
+            &target.payload_secret,
+            &serde_json::json!({
+                "thread_id": delta.thread_id,
+                "base_revision": delta.base_revision,
+                "revision": delta.revision,
+                "entry_seq": delta.entry_seq,
+                "server_time": delta.server_time,
+                "item_id": delta.item_id,
+                "turn_id": delta.turn_id,
+                "delta": delta.delta,
+                "delta_kind": kind,
+                "text_offset": delta.text_offset,
+            }),
+        )?;
+        messages.push(TargetedBrokerMessage {
+            target_peer_id: target.peer_id.clone(),
+            payload: Box::new(OutboundBrokerPayload::EncryptedTranscriptDelta {
+                target_peer_id: target.peer_id,
+                device_id: target.device_id,
+                envelope,
+            }),
+        });
+    }
+    Ok(messages)
+}
+
 async fn publish_transcript_delta(
     sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
     state: &AppState,
@@ -1572,94 +1653,42 @@ async fn publish_transcript_delta(
         TranscriptDeltaKind::CommandOutput => "command_output",
     };
 
-    let broker_can_read_content = state.broker_can_read_content().await;
-    if broker_can_read_content {
+    let targets = state.broker_targets_for_thread(&delta.thread_id).await;
+    if targets.is_empty() {
         debug!(
-            scope = "transcript_delta",
             item_id = %delta.item_id,
             thread_id = %delta.thread_id,
             turn_id = delta.turn_id.as_deref().unwrap_or("-"),
             delta_kind = kind,
-            delivery_mode = "broker_readable_broadcast",
-            "publishing broker-readable transcript delta"
+            "no surface is watching this thread; dropping transcript delta"
         );
-        publish_payload(
-            sender,
-            OutboundBrokerPayload::TranscriptDelta {
-                thread_id: delta.thread_id,
-                base_revision: delta.base_revision,
-                revision: delta.revision,
-                entry_seq: delta.entry_seq,
-                server_time: delta.server_time,
-                item_id: delta.item_id,
-                turn_id: delta.turn_id,
-                delta: delta.delta,
-                delta_kind: kind.to_string(),
-                text_offset: delta.text_offset,
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    } else {
-        let targets = state.broker_targets().await;
-        let target_summary = targets
-            .iter()
-            .map(|target| format!("{}:{}", target.device_id, target.peer_id))
-            .collect::<Vec<_>>()
-            .join(",");
-        let target_summary = if target_summary.is_empty() {
-            "-".to_string()
-        } else {
-            target_summary
-        };
-        info!(
-            scope = "transcript_delta",
-            target_count = targets.len(),
-            targets = %target_summary,
-            item_id = %delta.item_id,
-            thread_id = %delta.thread_id,
-            turn_id = delta.turn_id.as_deref().unwrap_or("-"),
-            delta_kind = kind,
-            delivery_mode = "e2ee_targeted",
-            "resolved encrypted broker surface targets"
-        );
-        if targets.is_empty() {
-            debug!(
-                item_id = %delta.item_id,
-                thread_id = %delta.thread_id,
-                turn_id = delta.turn_id.as_deref().unwrap_or("-"),
-                delta_kind = kind,
-                "broker transcript delta has no online surface targets"
-            );
-        }
-        let mut messages = Vec::new();
-        for target in targets {
-            let envelope = encrypt_json(
-                &target.payload_secret,
-                &serde_json::json!({
-                    "thread_id": delta.thread_id,
-                    "base_revision": delta.base_revision,
-                    "revision": delta.revision,
-                    "entry_seq": delta.entry_seq,
-                    "server_time": delta.server_time,
-                    "item_id": delta.item_id,
-                    "turn_id": delta.turn_id,
-                    "delta": delta.delta,
-                    "delta_kind": kind,
-                    "text_offset": delta.text_offset,
-                }),
-            )?;
-            messages.push(TargetedBrokerMessage {
-                target_peer_id: target.peer_id.clone(),
-                payload: Box::new(OutboundBrokerPayload::EncryptedTranscriptDelta {
-                    target_peer_id: target.peer_id,
-                    device_id: target.device_id,
-                    envelope,
-                }),
-            });
-        }
-        publish_targeted_messages(sender, messages).await?;
+        return Ok(());
     }
+
+    let broker_can_read_content = state.broker_can_read_content().await;
+    let target_summary = targets
+        .iter()
+        .map(|target| format!("{}:{}", target.device_id, target.peer_id))
+        .collect::<Vec<_>>()
+        .join(",");
+    info!(
+        scope = "transcript_delta",
+        target_count = targets.len(),
+        targets = %target_summary,
+        item_id = %delta.item_id,
+        thread_id = %delta.thread_id,
+        turn_id = delta.turn_id.as_deref().unwrap_or("-"),
+        delta_kind = kind,
+        delivery_mode = if broker_can_read_content {
+            "broker_readable_targeted"
+        } else {
+            "e2ee_targeted"
+        },
+        "resolved broker surface targets"
+    );
+
+    let messages = build_transcript_delta_messages(targets, broker_can_read_content, &delta)?;
+    publish_targeted_messages(sender, messages).await?;
 
     Ok(())
 }

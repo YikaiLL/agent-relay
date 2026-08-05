@@ -4474,3 +4474,992 @@ mod paged_history_merge_tests {
         );
     }
 }
+
+/// Per-device thread watch sets: the subscription that lets every thread stream live
+/// without fanning every thread's deltas out to every paired surface.
+mod watched_threads {
+    use super::*;
+
+    /// Bring a paired device online as a broker target.
+    fn online_paired_device(relay: &mut RelayState, device_id: &str, peer_id: &str) {
+        relay.paired_devices.insert(
+            device_id.to_string(),
+            PairedDevice {
+                device_id: device_id.to_string(),
+                label: device_id.to_string(),
+                payload_secret: format!("secret-{device_id}"),
+                device_verify_key: TEST_VERIFY_KEY_B64.to_string(),
+                created_at: 0,
+                last_seen_at: None,
+                last_peer_id: Some(peer_id.to_string()),
+                broker_join_ticket_expires_at: None,
+                path_scope: Vec::new(),
+            },
+        );
+        relay.mark_surface_peer_online(peer_id);
+        relay.bind_surface_peer_to_device(device_id, peer_id);
+        relay.register_broker_surface(peer_id);
+    }
+
+    fn activate(relay: &mut RelayState, thread_id: &str, device_id: &str) {
+        relay.activate_thread(
+            test_thread(thread_id, "/tmp/project"),
+            "/tmp/project",
+            DEFAULT_MODEL,
+            DEFAULT_APPROVAL_POLICY,
+            DEFAULT_SANDBOX,
+            DEFAULT_EFFORT,
+            device_id,
+        );
+    }
+
+    /// BACKWARD COMPAT: a client that never learned to declare a watch set must keep
+    /// receiving exactly what it received before subscriptions existed — the active
+    /// thread, and nothing else. If this breaks, an un-upgraded phone goes silent.
+    #[test]
+    fn a_device_with_no_declaration_falls_back_to_the_active_thread() {
+        let mut relay = test_state();
+        activate(&mut relay, "thread-active", "device-a");
+
+        assert!(
+            relay.device_watches_thread("device-a", "thread-active"),
+            "no declaration must mean 'the active thread', preserving pre-subscription behavior"
+        );
+        assert!(
+            !relay.device_watches_thread("device-a", "thread-background"),
+            "no declaration must NOT mean 'everything' — that would fan out every thread"
+        );
+    }
+
+    /// Once a device declares, the declaration is the whole truth: it stops implicitly
+    /// receiving the active thread it did not ask for.
+    #[test]
+    fn a_declaration_replaces_the_active_thread_fallback() {
+        let mut relay = test_state();
+        activate(&mut relay, "thread-active", "device-a");
+
+        assert!(relay.set_watched_threads(
+            "device-a",
+            "device-a",
+            vec!["thread-background".to_string()]
+        ));
+
+        assert!(
+            relay.device_watches_thread("device-a", "thread-background"),
+            "a declared thread must be watched even though it is not active"
+        );
+        assert!(
+            !relay.device_watches_thread("device-a", "thread-active"),
+            "a device looking away from the active thread must not keep streaming it"
+        );
+    }
+
+    /// Declaring the same set twice must not report a change — clients re-declare on
+    /// every navigation, and a spurious `true` would wake a notify()/publish cycle.
+    #[test]
+    fn redeclaring_the_same_set_reports_no_change() {
+        let mut relay = test_state();
+        let set = vec!["thread-a".to_string(), "thread-b".to_string()];
+
+        assert!(relay.set_watched_threads("device-a", "device-a", set.clone()));
+        assert!(
+            !relay.set_watched_threads("device-a", "device-a", set),
+            "an identical re-declaration must be a no-op"
+        );
+        assert!(
+            !relay.set_watched_threads(
+                "device-a",
+                "device-a",
+                vec!["thread-b".into(), "thread-a".into()]
+            ),
+            "order must not matter — the watch set is a set"
+        );
+    }
+
+    /// An explicit empty declaration means "showing nothing" and MUTES the surface.
+    ///
+    /// It must NOT restore the never-declared fallback (the active thread): a scoped
+    /// device whose declaration is entirely filtered out lands here, and falling back
+    /// would hand it exactly the content the filter just refused.
+    #[test]
+    fn an_empty_declaration_mutes_rather_than_falling_back() {
+        let mut relay = test_state();
+        activate(&mut relay, "thread-active", "device-a");
+        relay.set_watched_threads(
+            "device-a",
+            "device-a",
+            vec!["thread-background".to_string()],
+        );
+
+        assert!(relay.set_watched_threads("device-a", "device-a", Vec::new()));
+        assert!(
+            !relay.device_watches_thread("device-a", "thread-active"),
+            "an explicit empty declaration must mute, not fall back to the active thread"
+        );
+        assert!(
+            !relay.surface_watches_thread("device-a", "thread-active"),
+            "the surface must be muted too"
+        );
+    }
+
+    /// The point of the whole feature: one phone watching a background thread must not
+    /// drag that thread's deltas onto every other paired surface.
+    #[test]
+    fn broker_targets_for_thread_excludes_devices_that_are_not_watching() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        online_paired_device(&mut relay, "tablet", "peer-tablet");
+        activate(&mut relay, "thread-active", "phone");
+
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-background".to_string()]);
+        relay.set_watched_threads("peer-tablet", "tablet", vec!["thread-active".to_string()]);
+
+        let background_targets = relay.broker_targets_for_thread("thread-background");
+        assert_eq!(
+            background_targets.len(),
+            1,
+            "only the watching device may be a publish target, got: {background_targets:?}"
+        );
+        assert_eq!(background_targets[0].0, "phone");
+
+        let active_targets = relay.broker_targets_for_thread("thread-active");
+        assert_eq!(active_targets.len(), 1, "got: {active_targets:?}");
+        assert_eq!(active_targets[0].0, "tablet");
+    }
+
+    /// Providers skip queueing entirely for a thread nobody has on screen.
+    #[test]
+    fn any_device_watches_thread_gates_background_threads() {
+        let mut relay = test_state();
+        activate(&mut relay, "thread-active", "device-a");
+
+        assert!(
+            relay.any_device_watches_thread("thread-active"),
+            "the active thread always streams — the local surface needs it"
+        );
+        assert!(
+            !relay.any_device_watches_thread("thread-background"),
+            "a thread nobody is looking at must not queue deltas"
+        );
+
+        relay.set_watched_threads(
+            "device-a",
+            "device-a",
+            vec!["thread-background".to_string()],
+        );
+        assert!(
+            relay.any_device_watches_thread("thread-background"),
+            "one watcher is enough to start streaming a background thread"
+        );
+    }
+
+    /// A watch set describes what an ONLINE surface has on screen. Surviving a broker
+    /// drop would resume streaming to a device that may have navigated away or closed.
+    #[test]
+    fn a_broker_disconnect_clears_every_watch_set() {
+        let mut relay = test_state();
+        relay.register_broker_surface("peer-phone");
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-background".to_string()]);
+
+        relay.set_broker_connection(false);
+
+        assert!(
+            !relay.any_device_watches_thread("thread-background"),
+            "watch sets must not survive a broker disconnect"
+        );
+    }
+
+    /// A phone that closes must stop being a publish target, or its threads stay in
+    /// the fan-out set forever.
+    #[test]
+    fn a_peer_going_offline_prunes_its_watch_set() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-background".to_string()]);
+
+        relay.mark_surface_peer_offline("peer-phone");
+
+        assert!(
+            !relay.any_device_watches_thread("thread-background"),
+            "an offline device's watch set must be pruned"
+        );
+    }
+
+    /// Same for a presence resync that drops the peer.
+    #[test]
+    fn replacing_online_peers_prunes_departed_devices() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        online_paired_device(&mut relay, "tablet", "peer-tablet");
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-x".to_string()]);
+        relay.set_watched_threads("peer-tablet", "tablet", vec!["thread-x".to_string()]);
+
+        relay.replace_online_surface_peers(vec!["peer-tablet".to_string()]);
+
+        let targets = relay.broker_targets_for_thread("thread-x");
+        assert_eq!(
+            targets.len(),
+            1,
+            "the departed peer's device must be pruned, got: {targets:?}"
+        );
+        assert_eq!(targets[0].0, "tablet");
+    }
+
+    fn queued_delta_thread_ids(relay: &RelayState) -> Vec<String> {
+        relay
+            .pending_broker_messages
+            .iter()
+            .filter_map(|message| match message {
+                BrokerPendingMessage::TranscriptDelta(delta) => Some(delta.thread_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE POINT OF THE FEATURE: a background thread that someone is watching now
+    /// streams. Before subscriptions, `bg_append_agent_delta` mutated the runtime
+    /// transcript and stopped there, so a non-active thread could only be read by
+    /// re-polling a snapshot — which is why looking at one felt frozen.
+    #[test]
+    fn a_watched_background_thread_streams_its_deltas() {
+        let mut relay = test_state();
+        relay.broker_configured = true;
+        activate(&mut relay, "thread-active", "device-a");
+        relay.set_watched_threads(
+            "device-a",
+            "device-a",
+            vec!["thread-background".to_string()],
+        );
+
+        relay.bg_append_agent_delta("thread-background", "item-1", "hello", "turn-1", 100);
+
+        assert_eq!(
+            queued_delta_thread_ids(&relay),
+            vec!["thread-background".to_string()],
+            "a watched background thread must queue a broker delta"
+        );
+    }
+
+    /// ...and a thread nobody has on screen still costs nothing. This is what keeps
+    /// "every thread can stream" from meaning "every thread does stream".
+    #[test]
+    fn an_unwatched_background_thread_queues_nothing() {
+        let mut relay = test_state();
+        relay.broker_configured = true;
+        activate(&mut relay, "thread-active", "device-a");
+
+        relay.bg_append_agent_delta("thread-background", "item-1", "hello", "turn-1", 100);
+
+        assert!(
+            queued_delta_thread_ids(&relay).is_empty(),
+            "an unwatched background thread must not queue deltas"
+        );
+    }
+
+    /// The runtime transcript is updated either way — dropping the *publish* must never
+    /// mean dropping the *data*, or switching to the thread later would show a hole.
+    #[test]
+    fn an_unwatched_background_thread_still_records_its_transcript() {
+        let mut relay = test_state();
+        relay.broker_configured = true;
+        activate(&mut relay, "thread-active", "device-a");
+
+        relay.bg_append_agent_delta("thread-background", "item-1", "hello", "turn-1", 100);
+
+        let runtime = relay
+            .runtime_for_thread("thread-background")
+            .expect("the background runtime must still exist");
+        assert!(
+            runtime
+                .transcript
+                .iter()
+                .any(|entry| entry.text.as_deref() == Some("hello")),
+            "not publishing a delta must not stop the relay recording it"
+        );
+    }
+
+    /// Command output streams on the same gate as agent text.
+    #[test]
+    fn a_watched_background_thread_streams_command_output() {
+        let mut relay = test_state();
+        relay.broker_configured = true;
+        activate(&mut relay, "thread-active", "device-a");
+        relay.set_watched_threads(
+            "device-a",
+            "device-a",
+            vec!["thread-background".to_string()],
+        );
+
+        relay.bg_append_command_delta("thread-background", "cmd-1", "line of output", 100);
+
+        assert_eq!(
+            queued_delta_thread_ids(&relay),
+            vec!["thread-background".to_string()],
+            "command output must stream for a watched background thread too"
+        );
+    }
+
+    /// The LOCAL surface gets deltas over its own broadcast channel, not the broker
+    /// queue (the broker publisher drains that with `mem::take`, so sharing it would
+    /// mean whichever consumer ran first stole the frame).
+    /// Enqueue an active-thread delta the way every provider does: mutate the
+    /// transcript, then hand the mutation metadata to `queue_broker_message`.
+    fn provider_enqueues_active_delta(relay: &mut RelayState, item_id: &str, text: &str) {
+        let mutation = relay.append_agent_delta(item_id, text, "turn-1");
+        let thread_id = relay.active_thread_id.clone().unwrap_or_default();
+        relay.queue_broker_message(BrokerPendingMessage::TranscriptDelta(
+            PendingTranscriptDelta {
+                thread_id,
+                base_revision: mutation.base_revision,
+                revision: mutation.revision,
+                entry_seq: mutation.entry_seq,
+                server_time: mutation.server_time,
+                item_id: item_id.to_string(),
+                turn_id: Some("turn-1".to_string()),
+                delta: text.to_string(),
+                kind: TranscriptDeltaKind::AgentText,
+                text_offset: mutation.text_offset,
+            },
+        ));
+    }
+
+    #[test]
+    fn a_local_subscriber_receives_active_thread_deltas() {
+        let mut relay = test_state();
+        activate(&mut relay, "thread-active", "device-a");
+        let mut deltas = relay.subscribe_transcript_deltas();
+
+        provider_enqueues_active_delta(&mut relay, "item-1", "hello");
+
+        let event = deltas.try_recv().expect("a local delta must be broadcast");
+        assert_eq!(event.thread_id, "thread-active");
+        assert_eq!(event.delta, "hello");
+        assert_eq!(event.delta_kind, "agent_text");
+    }
+
+    /// REGRESSION: a relay with no broker still has a local surface, and that surface
+    /// still needs a live tail. Deltas are dropped at the door when no broker is
+    /// configured, so the local tee must happen BEFORE that guard — otherwise the
+    /// local live tail only works when a phone happens to be paired.
+    #[test]
+    fn a_local_subscriber_receives_deltas_with_no_broker_configured() {
+        let mut relay = test_state();
+        assert!(
+            !relay.broker_configured,
+            "this test is about the broker-less path"
+        );
+        activate(&mut relay, "thread-active", "device-a");
+        let mut deltas = relay.subscribe_transcript_deltas();
+
+        provider_enqueues_active_delta(&mut relay, "item-1", "hello");
+
+        let event = deltas
+            .try_recv()
+            .expect("local deltas must not depend on a broker being configured");
+        assert_eq!(event.delta, "hello");
+        assert!(
+            relay.pending_broker_messages.is_empty(),
+            "the broker queue must still stay empty without a broker"
+        );
+    }
+
+    /// A watched BACKGROUND thread reaches local subscribers too — that is what lets
+    /// the local surface watch more than the single globally-active thread live.
+    #[test]
+    fn a_local_subscriber_receives_watched_background_deltas() {
+        let mut relay = test_state();
+        activate(&mut relay, "thread-active", "device-a");
+        relay.set_watched_threads(
+            "device-a",
+            "device-a",
+            vec!["thread-background".to_string()],
+        );
+        let mut deltas = relay.subscribe_transcript_deltas();
+
+        relay.bg_append_agent_delta("thread-background", "item-1", "bg text", "turn-9", 100);
+
+        let event = deltas
+            .try_recv()
+            .expect("a watched background thread must reach local subscribers");
+        assert_eq!(event.thread_id, "thread-background");
+        assert_eq!(event.delta, "bg text");
+    }
+
+    /// REVIEW P1 (security): a watch declaration is a CONTENT grant — the relay streams
+    /// the thread's transcript to whoever declares it. Every other content path checks
+    /// `ensure_path_within_device_scope`, so a subscription must not be the one way
+    /// around a device's path scope. E2EE does not mitigate it: the declaring device
+    /// holds the decryption key.
+    #[test]
+    fn a_scoped_device_cannot_watch_a_thread_outside_its_scope() {
+        let unique = format!(
+            "agent-relay-watch-scope-{}-{}",
+            std::process::id(),
+            unix_now()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let allowed = root.join("project");
+        let in_scope = allowed.join("mine");
+        let out_of_scope = allowed.join("theirs");
+        std::fs::create_dir_all(&in_scope).expect("in-scope dir");
+        std::fs::create_dir_all(&out_of_scope).expect("out-of-scope dir");
+
+        let mut relay = test_state();
+        relay.set_allowed_roots(
+            normalize_allowed_roots(vec![allowed.display().to_string()]).expect("roots"),
+        );
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        relay
+            .paired_devices
+            .get_mut("phone")
+            .expect("paired")
+            .path_scope =
+            normalize_allowed_roots(vec![in_scope.display().to_string()]).expect("scope");
+
+        // Two loaded threads: one inside the device's grant, one outside it.
+        relay.ensure_runtime_for_thread("thread-mine").current_cwd = in_scope.display().to_string();
+        relay.ensure_runtime_for_thread("thread-theirs").current_cwd =
+            out_of_scope.display().to_string();
+
+        relay.set_watched_threads(
+            "peer-phone",
+            "phone",
+            vec!["thread-mine".to_string(), "thread-theirs".to_string()],
+        );
+
+        assert!(
+            relay.device_watches_thread("phone", "thread-mine"),
+            "the in-scope thread must still be watchable"
+        );
+        assert!(
+            !relay.device_watches_thread("phone", "thread-theirs"),
+            "a scoped device must NOT be able to subscribe to an out-of-scope thread"
+        );
+        assert!(
+            relay.broker_targets_for_thread("thread-theirs").is_empty(),
+            "an out-of-scope thread must have no delta targets"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A thread whose runtime is not loaded has no known cwd, so it cannot be PROVEN in
+    /// scope. Fail closed rather than streaming and hoping.
+    #[test]
+    fn a_scoped_device_cannot_watch_a_thread_with_an_unknown_cwd() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        relay
+            .paired_devices
+            .get_mut("phone")
+            .expect("paired")
+            .path_scope = vec!["/tmp/some-scope".to_string()];
+
+        relay.set_watched_threads("peer-phone", "phone", vec!["never-loaded".to_string()]);
+
+        assert!(
+            !relay.device_watches_thread("phone", "never-loaded"),
+            "an unprovable thread must not be watchable by a scoped device"
+        );
+    }
+
+    /// An UNSCOPED device (no path grant) keeps full access — scoping is opt-in and this
+    /// check must not quietly become a general restriction.
+    #[test]
+    fn an_unscoped_device_can_watch_any_thread() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-anything".to_string()]);
+
+        assert!(relay.device_watches_thread("phone", "thread-anything"));
+    }
+
+    /// REVIEW P1: a local browser tab is a surface with NO broker peer. Pruning by peer
+    /// presence used to delete its subscription whenever any phone joined or left,
+    /// silently downgrading the local live tail to polling.
+    #[test]
+    fn remote_peer_churn_does_not_prune_a_local_surface() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        // The local tab declares under its own surface id and is not a broker surface.
+        relay.set_watched_threads("local-tab-1", "local-device", vec!["thread-bg".to_string()]);
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-bg".to_string()]);
+
+        relay.mark_surface_peer_offline("peer-phone");
+
+        assert!(
+            relay.surface_watches_thread("local-tab-1", "thread-bg"),
+            "a phone disconnecting must not cancel a local tab's subscription"
+        );
+        assert!(
+            relay.any_device_watches_thread("thread-bg"),
+            "the thread must keep streaming for the local surface"
+        );
+    }
+
+    /// Same for a broker disconnect: the local surface is still connected over SSE.
+    #[test]
+    fn a_broker_disconnect_does_not_clear_local_surfaces() {
+        let mut relay = test_state();
+        relay.register_broker_surface("peer-phone");
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-bg".to_string()]);
+        relay.set_watched_threads("local-tab-1", "local-device", vec!["thread-bg".to_string()]);
+
+        relay.set_broker_connection(false);
+
+        assert!(
+            relay.surface_watches_thread("local-tab-1", "thread-bg"),
+            "a broker drop must not cancel a local tab's subscription"
+        );
+    }
+
+    /// REVIEW P2: two tabs of one browser share a device id (it lives in localStorage).
+    /// A per-device set let whichever tab declared last silence the other.
+    #[test]
+    fn two_surfaces_on_one_device_watch_independently() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+
+        relay.set_watched_threads("tab-1", "local-device", vec!["thread-a".to_string()]);
+        relay.set_watched_threads("tab-2", "local-device", vec!["thread-b".to_string()]);
+
+        assert!(relay.surface_watches_thread("tab-1", "thread-a"));
+        assert!(
+            !relay.surface_watches_thread("tab-1", "thread-b"),
+            "each tab sees only what it is showing"
+        );
+        assert!(relay.surface_watches_thread("tab-2", "thread-b"));
+        assert!(
+            !relay.surface_watches_thread("tab-2", "thread-a"),
+            "the second tab must not have clobbered the first"
+        );
+        // Broker delivery is per device, so the device is a target for the union.
+        assert!(relay.device_watches_thread("local-device", "thread-a"));
+        assert!(relay.device_watches_thread("local-device", "thread-b"));
+    }
+
+    /// A closed tab must stop being a publish target, or a local-only relay keeps
+    /// producing deltas nobody reads.
+    #[test]
+    fn dropping_a_surface_ends_its_subscription() {
+        let mut relay = test_state();
+        relay.set_watched_threads("tab-1", "local-device", vec!["thread-bg".to_string()]);
+
+        assert!(relay.drop_watched_surface("tab-1"));
+
+        assert!(
+            !relay.any_device_watches_thread("thread-bg"),
+            "a closed surface must not keep a background thread streaming"
+        );
+    }
+
+    /// REVIEW P1: a scoped device whose entire declaration is filtered out must end up
+    /// MUTED, not fall through to the active thread — otherwise the ACL leaks exactly
+    /// the content it just refused.
+    #[test]
+    fn a_fully_filtered_declaration_does_not_fall_back_to_the_active_thread() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        relay
+            .paired_devices
+            .get_mut("phone")
+            .expect("paired")
+            .path_scope = vec!["/tmp/only-here".to_string()];
+        activate(&mut relay, "thread-active", "phone");
+
+        // Every declared thread is out of scope, so nothing survives the filter.
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-elsewhere".to_string()]);
+
+        assert!(
+            !relay.device_watches_thread("phone", "thread-active"),
+            "a filtered-to-empty declaration must not fall back to the active thread"
+        );
+    }
+
+    /// REVIEW P1: an empty device scope means "no EXTRA device restriction" — the relay's
+    /// own allowed_roots still apply. Skipping the check when the device scope was empty
+    /// let any paired device watch a thread outside the relay's roots.
+    #[test]
+    fn an_unscoped_device_is_still_bound_by_relay_allowed_roots() {
+        let unique = format!(
+            "agent-relay-watch-roots-{}-{}",
+            std::process::id(),
+            unix_now()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&allowed).expect("allowed dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+
+        let mut relay = test_state();
+        relay.set_allowed_roots(
+            normalize_allowed_roots(vec![allowed.display().to_string()]).expect("roots"),
+        );
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        assert!(
+            relay.device_path_scope("phone").is_empty(),
+            "this test is about a device with NO scope of its own"
+        );
+
+        relay.ensure_runtime_for_thread("thread-inside").current_cwd =
+            allowed.display().to_string();
+        relay
+            .ensure_runtime_for_thread("thread-outside")
+            .current_cwd = outside.display().to_string();
+
+        relay.set_watched_threads(
+            "peer-phone",
+            "phone",
+            vec!["thread-inside".to_string(), "thread-outside".to_string()],
+        );
+
+        assert!(relay.device_watches_thread("phone", "thread-inside"));
+        assert!(
+            !relay.device_watches_thread("phone", "thread-outside"),
+            "an unscoped device must still be confined to the relay's allowed roots"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REVIEW P1: watches are re-validated on delivery, so tightening a scope revokes a
+    /// subscription that was legal when it was declared.
+    #[test]
+    fn tightening_a_device_scope_revokes_an_existing_watch() {
+        let unique = format!(
+            "agent-relay-watch-tighten-{}-{}",
+            std::process::id(),
+            unix_now()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let project = root.join("project");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&project).expect("project dir");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere dir");
+
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        relay.ensure_runtime_for_thread("thread-x").current_cwd = project.display().to_string();
+
+        // Declared while unscoped: legal.
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-x".to_string()]);
+        assert!(relay.device_watches_thread("phone", "thread-x"));
+
+        // The operator narrows this device to a different directory.
+        relay
+            .paired_devices
+            .get_mut("phone")
+            .expect("paired")
+            .path_scope =
+            normalize_allowed_roots(vec![elsewhere.display().to_string()]).expect("scope");
+
+        assert!(
+            !relay.device_watches_thread("phone", "thread-x"),
+            "an already-declared watch must stop delivering once the scope excludes it"
+        );
+        assert!(
+            relay.broker_targets_for_thread("thread-x").is_empty(),
+            "and it must no longer be a publish target"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REVIEW P1: a surface id is stable across reconnects (it identifies the TAB), so a
+    /// refreshed page reuses it. The OLD connection's teardown must not unsubscribe the
+    /// NEW connection that already declared.
+    #[test]
+    fn a_stale_connection_teardown_cannot_unsubscribe_its_replacement() {
+        let mut relay = test_state();
+        let old_generation = relay.open_surface_generation("tab-1", None);
+        relay.set_watched_threads("tab-1", "local-device", vec!["thread-a".to_string()]);
+
+        // The tab reloads: same surface id, new connection, new declaration.
+        let new_generation = relay.open_surface_generation("tab-1", None);
+        relay.set_watched_threads("tab-1", "local-device", vec!["thread-b".to_string()]);
+        assert_ne!(old_generation, new_generation);
+
+        // The old stream's teardown finally runs.
+        assert!(
+            !relay.drop_watched_surface_generation("tab-1", old_generation),
+            "a superseded connection must not remove the live subscription"
+        );
+        assert!(
+            relay.surface_watches_thread("tab-1", "thread-b"),
+            "the new connection's declaration must survive the old one's teardown"
+        );
+
+        // The current connection's own teardown still works.
+        assert!(relay.drop_watched_surface_generation("tab-1", new_generation));
+        assert!(!relay.surface_watches_thread("tab-1", "thread-b"));
+    }
+
+    /// REVIEW P2: two broker tabs on ONE phone are two peers. Targeting by the device's
+    /// union sent both threads to both peers, which defeats declaring at all.
+    #[test]
+    fn two_broker_surfaces_on_one_device_get_only_their_own_thread() {
+        let mut relay = test_state();
+        relay.paired_devices.insert(
+            "phone".to_string(),
+            PairedDevice {
+                device_id: "phone".to_string(),
+                label: "phone".to_string(),
+                payload_secret: "secret".to_string(),
+                device_verify_key: TEST_VERIFY_KEY_B64.to_string(),
+                created_at: 0,
+                last_seen_at: None,
+                last_peer_id: Some("peer-2".to_string()),
+                broker_join_ticket_expires_at: None,
+                path_scope: Vec::new(),
+            },
+        );
+        for peer in ["peer-1", "peer-2"] {
+            relay.mark_surface_peer_online(peer);
+            relay.bind_surface_peer_to_device("phone", peer);
+            relay.register_broker_surface(peer);
+        }
+        relay.set_watched_threads("peer-1", "phone", vec!["thread-a".to_string()]);
+        relay.set_watched_threads("peer-2", "phone", vec!["thread-b".to_string()]);
+
+        let a_targets = relay.broker_targets_for_thread("thread-a");
+        assert_eq!(a_targets.len(), 1, "got: {a_targets:?}");
+        assert_eq!(a_targets[0].1, "peer-1", "only the tab showing A gets A");
+
+        let b_targets = relay.broker_targets_for_thread("thread-b");
+        assert_eq!(b_targets.len(), 1, "got: {b_targets:?}");
+        assert_eq!(b_targets[0].1, "peer-2", "only the tab showing B gets B");
+    }
+
+    /// REVIEW P2: a phone mints a new peer id on every reconnect, so departed ids must be
+    /// dropped or the set grows for as long as the relay stays connected.
+    #[test]
+    fn departed_broker_surface_ids_are_not_retained() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-old");
+        relay.set_watched_threads("peer-old", "phone", vec!["thread-a".to_string()]);
+
+        relay.mark_surface_peer_offline("peer-old");
+
+        assert!(
+            !relay.broker_surface_id_is_tracked("peer-old"),
+            "a departed peer id must not be retained"
+        );
+    }
+
+    /// REVIEW P2: the relay inserts a separating newline between command chunks, but
+    /// used to publish the RAW provider delta. A client that appends what it was sent
+    /// then renders `npm testline 1` instead of `npm test\nline 1`.
+    ///
+    /// Uses the real Codex shape — an existing `npm test` entry, then a raw `line 1`
+    /// chunk with no leading newline — rather than a fixture that pre-bakes the
+    /// separator and so cannot fail.
+    #[test]
+    fn a_command_delta_publishes_the_separator_the_relay_inserted() {
+        let mut relay = test_state();
+        relay.broker_configured = true;
+        activate(&mut relay, "thread-active", "device-a");
+        relay.set_watched_threads(
+            "device-a",
+            "device-a",
+            vec!["thread-background".to_string()],
+        );
+
+        // The command entry already holds the command line, with no trailing newline.
+        relay.bg_append_command_delta("thread-background", "cmd-1", "npm test", 100);
+        // The provider's next chunk does NOT start with a newline.
+        relay.bg_append_command_delta("thread-background", "cmd-1", "line 1", 101);
+
+        let published: Vec<String> = relay
+            .pending_broker_messages
+            .iter()
+            .filter_map(|message| match message {
+                BrokerPendingMessage::TranscriptDelta(delta) => Some(delta.delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            vec!["npm test".to_string(), "\nline 1".to_string()],
+            "the published delta must carry the separator the relay appended"
+        );
+
+        // And a client that appends the published deltas ends up byte-identical to the
+        // relay's own copy — the property that actually matters.
+        let runtime = relay
+            .runtime_for_thread("thread-background")
+            .expect("runtime");
+        let stored = runtime
+            .transcript
+            .iter()
+            .find(|entry| entry.item_id == "cmd-1")
+            .and_then(|entry| entry.text.clone())
+            .expect("command text");
+        assert_eq!(published.concat(), stored);
+    }
+
+    /// REVIEW P1: local navigation declares a watch BEFORE the transcript fetch loads the
+    /// runtime. Filtering an unloaded thread at declaration time muted it permanently,
+    /// because the client had already recorded the declaration as delivered and dedupes
+    /// the retry. Delivery re-checks, so admitting it is safe.
+    #[test]
+    fn a_thread_declared_before_it_loads_starts_streaming_once_it_loads() {
+        let unique = format!(
+            "agent-relay-watch-late-{}-{}",
+            std::process::id(),
+            unix_now()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).expect("allowed dir");
+
+        let mut relay = test_state();
+        relay.set_allowed_roots(
+            normalize_allowed_roots(vec![allowed.display().to_string()]).expect("roots"),
+        );
+        online_paired_device(&mut relay, "phone", "peer-phone");
+
+        // Declared before the runtime exists — exactly the local navigation ordering.
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-late".to_string()]);
+        assert!(
+            !relay.device_watches_thread("phone", "thread-late"),
+            "an unloaded thread cannot be proven readable yet, so it must not deliver"
+        );
+
+        // The transcript fetch loads the runtime, in scope.
+        relay.ensure_runtime_for_thread("thread-late").current_cwd = allowed.display().to_string();
+
+        assert!(
+            relay.device_watches_thread("phone", "thread-late"),
+            "once the runtime loads in scope, the standing declaration must start delivering"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REVIEW P2: an older client that never declares must keep its own fallback — the
+    /// active thread. Unioning in what a NEWER tab on the same device declared both
+    /// pushed it a thread it does not render AND stopped its live tail.
+    #[test]
+    fn a_legacy_peer_keeps_the_active_thread_when_another_tab_declares() {
+        let mut relay = test_state();
+        relay.paired_devices.insert(
+            "phone".to_string(),
+            PairedDevice {
+                device_id: "phone".to_string(),
+                label: "phone".to_string(),
+                payload_secret: "secret".to_string(),
+                device_verify_key: TEST_VERIFY_KEY_B64.to_string(),
+                created_at: 0,
+                last_seen_at: None,
+                last_peer_id: Some("peer-new".to_string()),
+                broker_join_ticket_expires_at: None,
+                path_scope: Vec::new(),
+            },
+        );
+        for peer in ["peer-legacy", "peer-new"] {
+            relay.mark_surface_peer_online(peer);
+            relay.bind_surface_peer_to_device("phone", peer);
+            relay.register_broker_surface(peer);
+        }
+        activate(&mut relay, "thread-active", "phone");
+
+        // Only the new tab declares; the legacy peer never does.
+        relay.set_watched_threads("peer-new", "phone", vec!["thread-background".to_string()]);
+
+        let active_peers: Vec<String> = relay
+            .broker_targets_for_thread("thread-active")
+            .into_iter()
+            .map(|(_, peer_id, _)| peer_id)
+            .collect();
+        assert_eq!(
+            active_peers,
+            vec!["peer-legacy".to_string()],
+            "the legacy peer must keep receiving the active thread it renders"
+        );
+
+        let background_peers: Vec<String> = relay
+            .broker_targets_for_thread("thread-background")
+            .into_iter()
+            .map(|(_, peer_id, _)| peer_id)
+            .collect();
+        assert_eq!(
+            background_peers,
+            vec!["peer-new".to_string()],
+            "and must NOT be sent the background thread it does not render"
+        );
+    }
+
+    /// REVIEW P2: generation guarded teardown but not declarations. A stale page's POST
+    /// landing after its replacement declared would overwrite the live watch set, and the
+    /// new page would not re-send because it already recorded its declaration.
+    #[test]
+    fn a_late_declaration_from_a_superseded_connection_is_refused() {
+        let mut relay = test_state();
+        let old_generation = relay.open_surface_generation("tab-1", None);
+        relay.set_watched_threads_for_generation(
+            "tab-1",
+            "local-device",
+            vec!["thread-old".to_string()],
+            Some(old_generation),
+        );
+
+        // The page reloads and the new connection declares.
+        let new_generation = relay.open_surface_generation("tab-1", None);
+        relay.set_watched_threads_for_generation(
+            "tab-1",
+            "local-device",
+            vec!["thread-new".to_string()],
+            Some(new_generation),
+        );
+
+        // The OLD page's in-flight POST finally lands.
+        assert!(
+            !relay.set_watched_threads_for_generation(
+                "tab-1",
+                "local-device",
+                vec!["thread-old".to_string()],
+                Some(old_generation),
+            ),
+            "a superseded connection's declaration must be refused"
+        );
+        assert!(
+            relay.surface_watches_thread("tab-1", "thread-new"),
+            "the live declaration must survive"
+        );
+        assert!(!relay.surface_watches_thread("tab-1", "thread-old"));
+    }
+
+    /// A client that sends no generation (older build) is still accepted — the same
+    /// backwards-compatible posture as a missing watch set.
+    #[test]
+    fn a_declaration_without_a_generation_is_still_accepted() {
+        let mut relay = test_state();
+        relay.open_surface_generation("tab-1", None);
+
+        assert!(relay.set_watched_threads_for_generation(
+            "tab-1",
+            "local-device",
+            vec!["thread-a".to_string()],
+            None,
+        ));
+        assert!(relay.surface_watches_thread("tab-1", "thread-a"));
+    }
+
+    /// A revoked device must stop being a publish target immediately, not merely fail
+    /// to decrypt what it still receives.
+    #[test]
+    fn revoking_a_paired_device_prunes_its_watch_set() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        relay.set_watched_threads("peer-phone", "phone", vec!["thread-background".to_string()]);
+
+        assert!(relay.revoke_paired_device("phone", 100));
+
+        assert!(
+            !relay.any_device_watches_thread("thread-background"),
+            "a revoked device must not remain a delta target"
+        );
+    }
+}
