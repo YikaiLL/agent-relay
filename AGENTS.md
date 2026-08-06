@@ -16,6 +16,14 @@ fake) to web/mobile frontends. Rust workspace + Node worker + Vite frontend.
 - Architecture docs live in `markdown/`: `SESSION_MODEL.md`,
   `PROTOCOL_AND_STORAGE_OVERVIEW.md`, `thread-switch-background-buffer.md`,
   `streaming-delta-plan.md`. Read these before touching the core.
+  **`markdown/` is gitignored on purpose** — it is the maintainer's working
+  notes, not shipped with the repo. If you cloned this and the directory is
+  missing, that is expected: nothing in it is required to build, test, or
+  contribute. Some code comments cite these files by path (e.g.
+  `markdown/transcript-perf-freeze-analysis.md`); treat those as maintainer
+  context you may not be able to read, not as missing files. Do **not** add
+  links into `markdown/` from `README.md` or any other tracked doc — they render
+  as dead links on GitHub.
 
 ## Commands (run after changes)
 - Rust: `cargo fmt --check` · `cargo check -p relay-server` · `cargo test -p relay-server`

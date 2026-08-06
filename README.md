@@ -1,240 +1,231 @@
-# sealwire
+<p align="center">
+  <img src="docs/images/logo.svg" width="64" height="64" alt="sealwire logo">
+</p>
 
-**Trust your agent to run on its own for a long time — and stay in control from
-anywhere.**
+<h1 align="center">sealwire</h1>
 
-sealwire runs a long-lived **Codex** or **Claude Code** session on your own
-machine and turns it into something you can walk away from: point two agents at
-each other for a review, then watch and steer the whole thing from any browser
-or phone — over LAN or the public internet — without losing the session.
+<p align="center">
+  <a href="https://www.npmjs.com/package/sealwire">
+    <img src="https://img.shields.io/npm/v/sealwire?style=flat&logo=npm" alt="npm version">
+  </a>
+  <a href="https://github.com/sealwire/sealwire/stargazers">
+    <img src="https://img.shields.io/github/stars/sealwire/sealwire?style=flat&logo=github" alt="GitHub stars">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-Elastic--2.0-555" alt="License">
+  </a>
+</p>
 
-**The headline features:**
+<p align="center">Run Codex and Claude Code on your own machine — and have a second agent review the work.</p>
 
-- 🔍 **Request a review** — ask a *second* agent to review the current work.
-  Claude Code can review Codex, Codex can review Claude, in its own session, and
-  the findings land right back in your thread. Optionally loop reviewer ↔ author
-  for several rounds until the reviewer approves.
-- 📱 **Control from everywhere** — one operator, many surfaces. Move between
-  browser, laptop, and phone without losing the session; approve, take over, or
-  redirect from wherever you are.
+<p align="center">
+  <img src="docs/images/desktop-session.png" alt="sealwire desktop: session list, live transcript, workspace diff" width="100%">
+</p>
 
-The rest still holds: the local machine stays the source of truth, the relay is
-just the control layer around it, and remote devices pair through the **hosted
-public broker** (`wss://agent-relay.up.railway.app`) with no infrastructure to
-deploy. Default `private` mode keeps the broker as blind transport — it relays
-encrypted traffic, it doesn't read your prompts, approvals, or code.
+Start a long-running coding session on the machine that already has your repo,
+your tools, and your logged-in CLI. Point a second agent at it for review.
+Approve, steer, and take over from any browser or phone.
 
-**Rust** backend (`relay-server` + `relay-broker`), Node-based Claude Code
-worker, Vite web UI — install with `npx sealwire` on macOS, or run from source
-([Quick start ↓](#quick-start)).
+- **Cross-agent review:** ask a *different* agent to review the current changes
+  in its own session. Claude Code reviews Codex, Codex reviews Claude. Findings
+  and a verdict land back in your thread — optionally looping reviewer ↔ author
+  until it approves.
+- **Self-hosted:** the relay runs next to your workspace and stays the execution
+  authority. Your code, prompts, and approvals never have to leave the machine.
+- **Follows you across devices:** one session, many surfaces. Move between
+  laptop, browser, and phone — over LAN or the public internet — without losing
+  it. Web push tells you when it needs a decision.
+- **Privacy-first:** `private` mode is the default and treats the broker as
+  blind transport — it relays encrypted traffic, it doesn't read your session.
+- **Two providers, one interface:** Codex via the official `codex app-server`
+  protocol, Claude Code via the official `@anthropic-ai/claude-agent-sdk`.
 
----
+## Getting started
 
-## The vision
+sealwire runs a local **relay-server** next to your workspace. The web UI, your
+phone, and any other browser are clients that connect to it.
 
-The bottleneck with coding agents isn't raw capability anymore — it's *trust*
-and *presence*. You can't fully trust a single agent to run unattended for long,
-and you have to be sitting at the terminal to catch it when it stalls or asks for
-an approval.
+### Prerequisites
 
-sealwire attacks both:
+At least one agent CLI, authenticated:
 
-- **Trust comes from a second agent, not blind faith.** A single model marking
-  its own homework is weak. `sealwire` makes cross-agent review and
-  review/revise loops first-class, so work gets checked by a *different* agent
-  before it reaches you — and can iterate on its own until it's actually good.
-- **Presence comes from the network, not the terminal.** Long-running work is
-  persisted and backgroundable; approvals, takeover, and progress follow you to
-  whatever device you're holding. The session doesn't die when you close the
-  laptop.
+- **[Codex](https://github.com/openai/codex)** — the `codex` CLI installed and
+  logged in.
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — Claude auth
+  only: an `ANTHROPIC_API_KEY` or an existing Claude Code login. The worker (and
+  its bundled Claude Code CLI) ships inside the package, so `claude` does **not**
+  need to be on your PATH.
 
-The local machine stays the execution authority the whole time. The relay is the
-control layer around it — and the broker never has to become the place where your
-code, prompts, and approvals live in plaintext.
-
-`sealwire` supports both Codex and Claude Code today. The relay lets you:
-
-- start and resume a coding session against Codex or Claude Code
-- ask a second agent to review the work
-- see whether it is running, blocked, or waiting
-- handle approvals away from the terminal
-- move control between devices without losing the session
-
-## Quick start
+### npx (recommended)
 
 ```bash
 npx sealwire
 ```
 
-That starts a **localhost-only** relay at <http://localhost:8787> and opens the
-web UI as soon as it is ready. The commands you'll actually use:
-
-```bash
-sealwire cloud       # attach to the hosted public broker so a phone can pair
-sealwire local       # stay offline: never attach to a broker
-sealwire --port 8788 --host 127.0.0.1   # bind address / port
-sealwire --no-open   # don't open a browser
-```
-
-You need agent auth for whichever provider you use:
-
-- **Codex** — the [`codex`](https://github.com/openai/codex) CLI installed and
-  logged in
-- **Claude Code** — Claude auth only: an `ANTHROPIC_API_KEY`, or an existing
-  Claude Code login. The Claude worker (and its bundled Claude Code CLI) ships
-  inside the package, so the `claude` command does **not** need to be on your
-  PATH
+That starts a **localhost-only** relay on <http://localhost:8787> and opens the
+web UI as soon as it's ready.
 
 sealwire treats the directory you launched it from as the default workspace for
-new sessions; its own state (sessions, projects, paired devices) lives in
-`~/.agent-relay/` — one set per machine, so `cd`-ing elsewhere doesn't fork
-your history.
+new sessions. Its own state — sessions, projects, paired devices — lives in
+`~/.agent-relay/`, one set per machine, so `cd`-ing elsewhere doesn't fork your
+history.
+
+### Pair a phone
+
+```bash
+sealwire cloud
+```
+
+Attaches to the hosted public broker (`wss://agent-relay.up.railway.app`) so
+remote devices can pair — no infrastructure to deploy. You can point `--broker`
+at a self-hosted `relay-broker` instead, or use `sealwire local` to guarantee the
+relay never dials out.
+
+### Desktop app (macOS, preview)
+
+A Tauri app that supervises the same `relay-server` as a sidecar and keeps the
+local and remote surfaces in separate native windows, with a control window for
+workspace selection, broker mode, and relay logs.
 
 > **Linux / Windows:** prebuilt binaries are temporarily disabled while those
-> platforms are untested. `npx sealwire` still works there, but it falls back to
-> building `relay-server` from source, which needs the Rust toolchain.
-
-A macOS **desktop app** (Tauri) is also in preview: it supervises the same
-`relay-server` as a sidecar and keeps the local and remote surfaces as separate
-native windows, with a control window for workspace selection, broker mode, and
-relay logs.
+> platforms are untested. `npx sealwire` still works, but falls back to building
+> `relay-server` from source, which needs the Rust toolchain.
 
 Running from source, the full flag list, env vars, and the self-hosted broker
 option live in [`DEPLOYMENT.md`](DEPLOYMENT.md); tests and CI in
 [`TESTING.md`](TESTING.md).
 
-## Current status
+## Cross-agent review
 
-`sealwire` is now usable as a single-owner self-hosted MVP with a
-privacy-first default.
+A single model marking its own homework is weak. sealwire makes review a
+first-class action: pick the reviewer's provider and model, brief it, and let it
+run in its own session against the current workspace diff.
 
-The recommended deployment shape today is:
+<p align="center">
+  <img src="docs/images/desktop-request-review.png" alt="The Request review dialog: reviewer provider, model, effort, reuse an existing reviewer session, instructions, briefing mode, and maximum rounds" width="100%">
+</p>
 
-- keep `relay-server` on the workstation, VM, or jump host that already has the
-  local workspace and a logged-in `codex` CLI and/or Claude auth
-- use the hosted public broker at <https://agent-relay.up.railway.app/> to pair
-  phones and remote browsers without running broker infrastructure yourself, or
-  self-host `relay-broker` if you prefer to keep that hop under your control
-- treat the current product as a trustworthy control plane for one operator and
-  multiple devices, not as a multi-tenant hosted service
+It posts its findings — and a machine-readable `VERDICT:` — straight back into
+the thread you were working in. Set **maximum rounds** above 1 and the reviewer
+and author keep iterating until the reviewer approves or the rounds run out.
 
-## Use cases
+<p align="center">
+  <img src="docs/images/desktop-review.png" alt="A reviewer agent's findings posted back into the author's thread, ending with VERDICT: NEEDS_CHANGES" width="100%">
+</p>
 
-`sealwire` is built for cases where one coding session already exists
-and the problem is control, continuity, and trust rather than raw execution.
+## Control from anywhere
 
-Good fits today:
+Blocked work shouldn't wait for you to walk back to the terminal. Approvals
+surface on whatever surface you're holding, with the command in full and the
+workspace diff a tap away.
 
-- you want a **second agent to review** the first one's work — cross-provider,
-  in its own session — instead of trusting a single model to grade itself
-- you want to start or resume a Codex or Claude Code session from a browser
-  without moving the workspace off the machine that already owns it
-- you want to review approval requests or take over a session from your phone
-  while away from the terminal
-- you want one long-lived agent session to survive device switches instead of
-  creating a fresh session on every surface
-- you want to self-host the control plane and keep the execution authority near
-  your repo, secrets, and logged-in CLI, while still reaching it remotely
-  through a hosted public broker
-- you care about privacy and want the default model to treat the broker as
-  transport, not as the place that gets to read everything
+<p align="center">
+  <img src="docs/images/phone-approval.png" alt="An approval request on a phone, with Approve and Deny inline and a sticky action bar above the composer" width="360">
+</p>
 
-Not the current target:
+The remote surface is an installable PWA, so it lives on your home screen and
+gets **web push** — a notification when a session needs input, finishes, or
+errors. The local machine stays the source of truth the whole time: the relay is
+the control layer around it, and the broker just moves encrypted traffic.
 
-- multi-user hosted collaboration
-- untrusted tenants sharing the same control plane
-- cloud-first remote execution where the local workstation is optional
+## Also in the box
 
-## Design principles
+- **Projects and workspaces** — group sessions by repo, with a per-workspace
+  diff panel and one-click apply for individual file changes.
+- **Session tabs, pinning, and rename** — several live sessions side by side.
+- **Fork a thread** from any message to explore an alternative without losing
+  the original.
+- **Server-side search and an activity bell** across sessions, so a backgrounded
+  agent that needs you doesn't get lost.
+- **Code Flow** — chain execute → review → revise across two agents, looped up to
+  a round limit.
+- **Takeover** — claim a session from another device mid-flight, with the
+  handover made explicit rather than silent.
+- **Permission modes** per session, from bypass to approve-everything.
 
-The design is intentionally opinionated:
+## CLI
 
-- trust through independent review: a second agent checking the first's work
-  (and iterating until it's good) earns more trust than one model grading itself
-- unattended by default: long-running work should persist, background, and
-  survive restart, so you can start it and walk away rather than babysit a terminal
-- local-first authority: the machine with the local workspace and the Codex or
-  Claude Code session remains the source of truth
-- privacy-first defaults: the safe path should be the obvious path for people
-  who do not want their code, prompts, and approvals copied into a hosted
-  middle layer by default
-- one operator, many surfaces: browser, phone, and future native clients are
-  control surfaces for the same session, not separate runtimes
-- approval-first remote UX: remote control must make blocked state, ownership,
-  and approval flow obvious instead of pretending the session is stateless
-- explicit trust boundaries: broker transport, device identity, and session
-  claims are separate concerns; the broker does not become the execution host
-- gradual hardening: start with single-owner self-hosting, then add stronger
-  replay, audit, and policy guarantees without changing the core model
+```bash
+sealwire                    # localhost-only relay, opens the web UI
+sealwire local              # never attach to a broker; remote pairing disabled
+sealwire cloud              # attach to the hosted public broker so a phone can pair
+sealwire --broker https://broker.example.com   # use your own broker
+sealwire --port 8788 --host 127.0.0.1          # bind address / port
+sealwire --no-open          # don't open a browser
+```
 
-## Security model
+`sealwire --help` has the full list, including binary resolution and env vars.
 
-Security is a core part of the product, not a later add-on.
+## Development
 
-- `private` mode is the default security model: broker-mediated remote traffic
-  is end-to-end encrypted and the broker is treated as blind transport rather
-  than a content-reading execution layer
-- privacy follows from that default: your remote control path can stay usable
-  without requiring the broker to see session content in plaintext
-- `managed` mode exists for deployments that explicitly want broker or org
-  services to read content for audit and policy workflows
-- pairing and remote claim flows bind device identity before a remote surface
-  can take control of a session
-- remote devices keep signing keys in browser-managed crypto storage when
-  `WebCrypto` and `IndexedDB` are available, with a compatibility fallback for
-  weaker browser contexts
-- the relay-server remains the execution authority near the local workspace; the
-  broker moves encrypted control traffic rather than hosting the agent itself
+| Package | What it is |
+|---|---|
+| `crates/relay-server` | The core. Relay state machine and provider bridges (`codex.rs`, `claude.rs`, `fake_provider.rs`). |
+| `crates/relay-broker` | The public broker: blind transport for remote pairing. |
+| `crates/relay-http`, `crates/relay-util` | Shared HTTP and utilities. |
+| `claude-worker/` | Node worker wrapping `@anthropic-ai/claude-agent-sdk`, speaking NDJSON with Rust. |
+| `frontend/`, `web/` | Vite web UI — local and remote surfaces. |
+| `src-tauri/` | macOS desktop app (preview). |
+
+```bash
+cargo fmt --check && cargo check -p relay-server && cargo test -p relay-server
+node --check claude-worker/worker.mjs && node --test claude-worker/*.test.mjs
+npm test                       # frontend unit tests + vite build
+npm run test:browser:install   # chromium, once
+```
+
+[`AGENTS.md`](AGENTS.md) has the code map and the commands to run after a
+change; [`docs/testing-matrix.md`](docs/testing-matrix.md) covers what each
+suite actually exercises.
 
 ## Current focus
 
-- **cross-agent review** — one agent reviews another's work, single-shot or as a
-  multi-round reviewer ↔ author loop
-- Codex via the official `codex app-server` JSON-RPC protocol
-- Claude Code via the official `@anthropic-ai/claude-agent-sdk`
-- single owner, multiple devices
-- approval-first remote control that follows you across devices
-- web first, native mobile later
-- local-first runtime with the hosted public broker at
-  <https://agent-relay.up.railway.app/> as the default remote transport, and a
-  self-hosted broker as an option
+**Long, persistent task lists.** Give the agent an ordered list of tasks and let
+it work through them autonomously over hours: each task is one Code Flow (author
+executes, reviewer reviews, author revises), git-committed on approval so the
+next task starts from a clean tree. The data model and the serial driver are in;
+persistence and restart recovery, the git checkpoint after each approved task,
+the HTTP/broker surface, and the UI are the work in progress.
 
-## What is not done yet
+Also in focus:
 
-The project is usable, but it is still early. It does not yet provide:
+- cross-agent review: single-shot and multi-round reviewer ↔ author loops
+- single owner, many devices; approval-first remote control that follows you
+- web first: the remote surface is an installable PWA with push; the macOS
+  desktop app is a preview and there is no native mobile app
+- local-first runtime, with the hosted public broker as the default remote
+  transport and a self-hosted broker as an option
 
-- a formal event log with replay, cursor, and idempotency guarantees
-- push notifications or native mobile apps
-- team roles, org policy, or enterprise audit workflows
-- cloud runners / remote execution targets
+## Roadmap
+
+- a formal append-only event log with replay cursors. Today there are
+  duplicate-safe remote actions and self-healing transcript deltas, which is
+  weaker than real delivery guarantees
+- audit logging for `managed` mode — the mode is selectable, the audit trail
+  behind it is not written yet
 - providers beyond Codex and Claude Code
-- a hardened multi-user product surface for untrusted tenants
+- native mobile, only where the web hits real limits
+- somewhere always-on to run a long task list, so it keeps going with the laptop
+  shut. Only the *broker* is containerised today (`docker/broker.Dockerfile`);
+  what the relay's deployment story should look like is still an open question
+- later: team workflows
 
-## Roadmap direction
+Not on the roadmap today: multi-user hosted collaboration, untrusted tenants
+sharing one control plane, or org policy controls.
 
-Near-term work is focused on going deeper on the trust-and-presence story:
+## Security
 
-- formalize the session and event model
-- define replay, cursor, and idempotency behavior
-- push notifications so long-running work can reach you when it needs a decision
-- make mobile web approval and resume fast and honest
-- strengthen device identity, pairing, and remote broker transport
-- clarify `private` versus `managed` security modes
-
-Longer-term, the plan is to grow from local-first control into:
-
-- hosted relay and remote access
-- stronger audit and policy controls
-- native mobile only where the web hits real limits
-- cloud execution targets and team workflows later
+`private` mode is the default: broker-mediated traffic is end-to-end encrypted
+and the broker is treated as blind transport. `managed` mode exists for
+deployments that explicitly want broker or org services to read content. Details
+in [`docs/security-model.md`](docs/security-model.md).
 
 ## License
 
-This project is source-available under the Elastic License 2.0. See
-[`LICENSE`](LICENSE).
+Source-available under the Elastic License 2.0. See [`LICENSE`](LICENSE).
 
 ## Contributions
 
-By submitting a contribution, you agree to the contribution terms in
+By submitting a contribution you agree to the terms in
 [`CONTRIBUTING.md`](CONTRIBUTING.md), including a broad license that allows the
 maintainer to relicense contributions in the future.
