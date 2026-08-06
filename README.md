@@ -115,12 +115,12 @@ and author keep iterating until the reviewer approves or the rounds run out.
 
 ## Control from anywhere
 
-Blocked work shouldn't wait for you to walk back to the terminal. Approvals
-surface on whatever surface you're holding, with the command in full and the
-workspace diff a tap away.
+Blocked work shouldn't wait for you to walk back to the terminal. Pair a phone
+and the same session shows up there — the approval in full, and a **Take over**
+button that moves control to the device in your hand.
 
 <p align="center">
-  <img src="docs/images/phone-approval.png" alt="An approval request on a phone, with Approve and Deny inline and a sticky action bar above the composer" width="360">
+  <img src="docs/images/phone-approval.png" alt="The remote surface on a phone: an approval request with the full command and inline Approve and Deny, after claiming control of the session from this device" width="330">
 </p>
 
 The remote surface is an installable PWA, so it lives on your home screen and
