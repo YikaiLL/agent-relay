@@ -2,7 +2,7 @@
   <img src="docs/images/logo.png" width="64" height="64" alt="sealwire logo">
 </p>
 
-<h1 align="center">sealwire</h1>
+<h1 align="center">Sealwire</h1>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/sealwire">
@@ -16,7 +16,7 @@
   </a>
 </p>
 
-<p align="center">A software agent team on your own machine. Hand off the work and walk away.</p>
+<p align="center">A software agent team on your own machine. Building and managing from anywhere.</p>
 
 <p align="center">
   <img src="docs/images/desktop-session.png" alt="sealwire desktop: session list, live transcript, workspace diff" width="100%">
@@ -26,15 +26,17 @@
   in its own session. Claude Code reviews Codex, Codex reviews Claude. Findings
   and a verdict land back in your thread — optionally looping reviewer ↔ author
   until it approves.
-- **Self-hosted:** the relay runs next to your workspace and stays the execution
-  authority. Your code, prompts, and approvals never have to leave the machine.
+- **No registration required:** you don't need an account, and everything still
+  stays safe and private.
 - **Follows you across devices:** one session, many surfaces. Move between
-  laptop, browser, and phone — over LAN or the public internet — without losing
-  it. Web push tells you when it needs a decision.
-- **Privacy-first:** `private` mode is the default and treats the broker as
-  blind transport — it relays encrypted traffic, it doesn't read your session.
+  laptop, browser, and phone without losing the flow. Web push tells you when it needs a decision.
+- **Privacy-first:** your code never leaves your machine. `private` mode is the
+  default and treats the broker as blind transport — it relays encrypted
+  traffic, and nobody can read your session or your code.
 - **Two providers, one interface:** Codex via the official `codex app-server`
   protocol, Claude Code via the official `@anthropic-ai/claude-agent-sdk`.
+- **Self-hosted broker:** if you're extra tech-savvy, you can deploy your own
+  broker — as long as it's for your own use.
 
 ## Getting started
 
@@ -82,20 +84,6 @@ remote devices can pair — no infrastructure to deploy. You can point `--broker
 at a self-hosted `relay-broker` instead, or use `sealwire local` to guarantee the
 relay never dials out.
 
-### Desktop app (macOS, preview)
-
-A Tauri app that supervises the same `relay-server` as a sidecar and keeps the
-local and remote surfaces in separate native windows, with a control window for
-workspace selection, broker mode, and relay logs.
-
-> **Linux / Windows:** prebuilt binaries are temporarily disabled while those
-> platforms are untested. `npx sealwire` still works, but falls back to building
-> `relay-server` from source, which needs the Rust toolchain.
-
-Running from source, the full flag list, env vars, and the self-hosted broker
-option live in [`DEPLOYMENT.md`](DEPLOYMENT.md); tests and CI in
-[`TESTING.md`](TESTING.md).
-
 ## Cross-agent review
 
 A single model marking its own homework is weak. sealwire makes review a
@@ -124,10 +112,10 @@ button that moves control to the device in your hand.
   <img src="docs/images/phone-approval.png" alt="The remote surface on a phone: an approval request with the full command and inline Approve and Deny, after claiming control of the session from this device" width="400">
 </p>
 
-The remote surface is an installable PWA, so it lives on your home screen and
-gets **web push** — a notification when a session needs input, finishes, or
-errors. The local machine stays the source of truth the whole time: the relay is
-the control layer around it, and the broker just moves encrypted traffic.
+The remote surface is an installable PWA, so it can live on your home screen and
+get **web push** — a notification when a session needs input, finishes, or
+errors. The relay is the control layer around your agent team, and the broker
+just moves encrypted traffic.
 
 ## Also in the box
 
