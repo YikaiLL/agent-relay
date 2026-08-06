@@ -48,6 +48,16 @@ const APPROVAL_PROMPT = "approval-live";
 // entry — the case where the pin has to do actual work.
 const ASK_USER_PROMPT = "ask-user-live";
 const ASK_USER_TRAILING = "Meanwhile, here is some context.";
+// The turn parks this long before it writes ANYTHING to the transcript (the
+// fake provider sleeps first and publishes the question, its trailing message
+// and the pending request together under one write lock). That makes the window
+// after the send genuinely empty of agent activity — so anything that renders
+// in it came from the send itself, which is what the "own message lands"
+// assertion below depends on.
+const ASK_USER_DELAY_MS = 4000;
+// Comfortably inside the park, so the assertion can never be satisfied by the
+// question arriving instead of by the send.
+const OWN_MESSAGE_VISIBLE_MS = 2500;
 // "Following, no gap": distance-to-bottom must stay under this the whole stream.
 // It is far below 60vh (~408px @ 680, ~444 @ 740, ~840 @ 1400), so it cleanly
 // separates real follow (~0) from either the old 60vh reserve or a frozen
@@ -469,13 +479,16 @@ async function exerciseApprovalVisibility(page, label) {
 // the approval leg above, which exercises the very same `input-required` action;
 // duplicating it here would only re-test shared code.
 //
-// It was attempted here too and hit something unrelated worth its own look: on a
-// deep virtualized thread the browser renders NOTHING between a send and the
-// next transcript change, so with the question held back the reader never sees
-// their own message land. Reproduced with `ask_user_delay_ms` — relay had the
-// user message at 700ms (`/api/session`), DOM still showed the previous turn's
-// last row at 2.8s, scroller pinned at distance 0. Not the hydration ordering
-// (see the deep-window unit test in transcript-hydration-store.test.mjs).
+// The parked window is also where this leg guards a fixed bug: with the turn
+// held back by `ask_user_delay_ms`, the browser used to render NOTHING between
+// the send and the next transcript change — including the user's own message.
+// The relay builds the `/api/session/message` response snapshot BEFORE it
+// appends the user message, so that response reliably resolved a few ms after
+// the SSE frame that carried the message and reverted the render. Fixed by
+// `transcriptIsPreWrite` in frontend/local/session/lifecycle.js (unit-covered in
+// frontend/local/session/send-snapshot-clobber.test.mjs); this is the end-to-end
+// half, and the only layer that would catch the relay ceasing to push the
+// post-append snapshot at all.
 async function exerciseAskUserPin(page, label) {
   await waitTurnFullySettled(page);
   await page.evaluate(scrollToBottomInPage);
@@ -483,6 +496,18 @@ async function exerciseAskUserPin(page, label) {
 
   await page.fill("#message-input", ASK_USER_PROMPT);
   await page.click("#send-button");
+
+  // Nothing agent-side can write to the transcript for ASK_USER_DELAY_MS, so
+  // this can only pass because the send itself rendered.
+  await page.waitForFunction(
+    (text) =>
+      [...document.querySelectorAll(".chat-thread .chat-message-user")].some((node) =>
+        (node.textContent || "").includes(text)
+      ),
+    ASK_USER_PROMPT,
+    { timeout: OWN_MESSAGE_VISIBLE_MS }
+  );
+  console.log(`[${label}] own message rendered while the turn was still parked`);
   // The question and its trailing message become visible together (the relay
   // publishes both under one write lock), so either selector implies both.
   await page.waitForSelector(".chat-message-ask-user-interactive", { timeout: TIMEOUT_MS });
@@ -724,6 +749,10 @@ async function main() {
         chunk_delay_ms: 280,
         ask_user: true,
         ask_user_trailing_text: ASK_USER_TRAILING,
+        // Holds the whole turn back so the leg can assert the user's own
+        // message renders on the strength of the send alone. See
+        // ASK_USER_DELAY_MS.
+        ask_user_delay_ms: ASK_USER_DELAY_MS,
       },
       [APPROVAL_PROMPT]: {
         chunks: STREAM_CHUNKS,

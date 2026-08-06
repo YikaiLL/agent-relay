@@ -509,7 +509,11 @@ export function createLifecycleController(ctx) {
       }
 
       messageInput.value = "";
-      applySessionSnapshot(payload.data);
+      // Depending on the provider, this response's transcript may have been
+      // built before the message we just sent was appended — see
+      // `transcriptMayPredateWrite`. It is still applied in full; it just
+      // cannot remove transcript entries the surface already has.
+      applySessionSnapshot(payload.data, { transcriptMayPredateWrite: true });
       logLine("Prompt accepted by relay");
       return true;
     } catch (error) {
@@ -702,8 +706,53 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  function applySessionSnapshot(snapshot) {
+  /// Render a session snapshot.
+  ///
+  /// `transcriptMayPredateWrite` marks a response whose transcript may have been
+  /// built BEFORE the write that produced it — currently only
+  /// `/api/session/message`, whose snapshot the relay builds without waiting for
+  /// the user message to be appended. Whether it actually predates it is
+  /// PROVIDER-DEPENDENT, so this is never assumed either way:
+  ///
+  ///   * `codex` appends asynchronously on the app-server's `item/completed` +
+  ///     `userMessage`, and `fake` in a task spawned after `start_turn` returns —
+  ///     so their responses omit the message and resolve a few ms AFTER the SSE
+  ///     frame that carried it. Applying such a response un-rendered what the
+  ///     user had just sent, leaving it invisible until the next transcript
+  ///     change — seconds, when the turn parks on an approval or an
+  ///     AskUserQuestion.
+  ///   * `claude` awaits `record_local_user_message` before `start_turn` returns
+  ///     (claude.rs:777), so its response already CONTAINS the message. If the
+  ///     stream has not delivered it yet — not connected, lagging, or down —
+  ///     that response is the only copy there is.
+  ///
+  /// So the rule is additive rather than a pin: the response may ADD entries to
+  /// the transcript, it may never REMOVE them. Both providers come out right
+  /// without the client having to know which one it is talking to, and without
+  /// ordering snapshots across transports — which is an inference the wire
+  /// cannot support (`transcript_revision` is a per-process logical clock that
+  /// `ThreadRuntime::from_sync_data` re-seeds at 0, so ordering by it freezes a
+  /// page on dead state after a relay restart).
+  ///
+  /// Scoped to the thread the surface is already showing: for any OTHER thread —
+  /// notably a deferred-start Claude thread the send itself just promoted — the
+  /// surface holds nothing to preserve and the response is authoritative.
+  ///
+  /// NOTE: this covers the transcript only. The rest of the snapshot is still
+  /// applied wholesale, so a response that lost a race can still roll back
+  /// newer pending-approval / pending-question / turn state. That is unchanged
+  /// from before this guard existed and is not specific to the send — it is the
+  /// generic cross-transport race, and closing it needs the snapshot ordering
+  /// this deliberately avoids.
+  function applySessionSnapshot(snapshot, { transcriptMayPredateWrite = false } = {}) {
     const previousThreadId = state.session?.active_thread_id || null;
+    if (
+      transcriptMayPredateWrite
+      && !!previousThreadId
+      && snapshot?.active_thread_id === previousThreadId
+    ) {
+      snapshot = withRenderedTranscriptEntriesKept(snapshot);
+    }
     if (snapshot?.active_thread_id !== state.transcriptHydrationThreadId) {
       // Thread switch: retain the leaving thread's loaded window and restore the
       // target thread's retained window (if any) instead of clearing — so
@@ -757,9 +806,49 @@ export function createLifecycleController(ctx) {
       logLine(`Session attention update failed: ${error.message}`);
     }
 
+    // Additive: entries present in the snapshot are merged in, none are dropped,
+    // so a snapshot that lost a race cannot un-cache a detail either.
     syncLiveTranscriptEntryDetailsFromSnapshot(state, snapshot);
     const merged = restoreHydratedTranscript(state, snapshot);
     renderSession(merged);
+  }
+
+  /// `snapshot` with the rendered tail it does not carry appended back onto it.
+  ///
+  /// Scoped to the SUFFIX of the rendered transcript that follows the last entry
+  /// the snapshot does carry — i.e. what the surface learned from another
+  /// transport after this response was built, in practice the message just sent.
+  /// Rescuing arbitrary omitted entries instead would have to re-derive where
+  /// each one belongs; a suffix appends in order by construction. Anything the
+  /// snapshot drops from further back it also drops today (a truncated tail is
+  /// shorter on purpose), so this adds no new omission.
+  ///
+  /// Entries the hydration window holds are skipped: the window is the base
+  /// `restoreHydratedTranscript` merges onto, so they survive on their own, and
+  /// re-placing them through the tail could reorder them.
+  function withRenderedTranscriptEntriesKept(snapshot) {
+    const rendered = state.session?.transcript;
+    if (!Array.isArray(rendered) || !rendered.length) {
+      return snapshot;
+    }
+    const carried = new Set(
+      (snapshot.transcript || []).map((candidate) => candidate?.item_id).filter(Boolean)
+    );
+    let suffixStart = rendered.length;
+    while (suffixStart > 0 && !carried.has(rendered[suffixStart - 1]?.item_id)) {
+      suffixStart -= 1;
+    }
+    const windowed =
+      state.transcriptHydrationThreadId === snapshot?.active_thread_id
+        ? state.transcriptHydrationEntries
+        : null;
+    const rescued = rendered
+      .slice(suffixStart)
+      .filter((candidate) => candidate?.item_id && !windowed?.has?.(candidate.item_id));
+    if (!rescued.length) {
+      return snapshot;
+    }
+    return { ...snapshot, transcript: [...(snapshot.transcript || []), ...rescued] };
   }
 
   /**
