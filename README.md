@@ -120,7 +120,7 @@ and the same session shows up there — the approval in full, and a **Take over*
 button that moves control to the device in your hand.
 
 <p align="center">
-  <img src="docs/images/phone-approval.png" alt="The remote surface on a phone: an approval request with the full command and inline Approve and Deny, after claiming control of the session from this device" width="330">
+  <img src="docs/images/phone-approval.png" alt="The remote surface on a phone: an approval request with the full command and inline Approve and Deny, after claiming control of the session from this device" width="400">
 </p>
 
 The remote surface is an installable PWA, so it lives on your home screen and
