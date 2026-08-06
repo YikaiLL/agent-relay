@@ -284,6 +284,15 @@ pub struct FakeProviderBridge {
     // suites (which send turns under various policies) stay unaffected; flipped
     // on via FAKE_PROVIDER_ENFORCE_APPROVALS for the permission-mode e2e.
     enforce_approvals: Arc<AtomicBool>,
+    // The vendor + label the fake model catalog reports. Defaults to
+    // `fake` / `Fake Echo`. `FAKE_PROVIDER_VENDOR` / `FAKE_PROVIDER_MODEL_LABEL`
+    // let the double impersonate a real vendor, so surfaces that key off
+    // `ModelOptionView::provider` (the picker's mark — `providerIconKey` maps
+    // `anthropic`/`openai` onto the shipped icons) exercise their real render
+    // path instead of the no-icon fallback. Nothing branches on "is this the
+    // fake provider"; it just answers the catalog question differently.
+    model_vendor: String,
+    model_label: String,
     approval_gates: Arc<Mutex<HashMap<String, FakeApprovalGate>>>,
     turn_stop_behaviors: Arc<Mutex<HashMap<String, FakeStopBehavior>>>,
     stopped_turns: Arc<Mutex<HashSet<String>>>,
@@ -305,12 +314,18 @@ impl FakeProviderBridge {
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let scenario_harness = FakeScenarioHarness::from_env()?;
+        let model_vendor =
+            non_empty_env("FAKE_PROVIDER_VENDOR").unwrap_or_else(|| "fake".to_string());
+        let model_label =
+            non_empty_env("FAKE_PROVIDER_MODEL_LABEL").unwrap_or_else(|| "Fake Echo".to_string());
 
         Ok(Self {
             state,
             threads,
             next_id: AtomicU64::new(1),
             enforce_approvals: Arc::new(AtomicBool::new(enforce_approvals)),
+            model_vendor,
+            model_label,
             approval_gates: Arc::new(Mutex::new(HashMap::new())),
             turn_stop_behaviors: Arc::new(Mutex::new(HashMap::new())),
             stopped_turns: Arc::new(Mutex::new(HashSet::new())),
@@ -356,8 +371,8 @@ impl ProviderBridge for FakeProviderBridge {
     async fn list_models(&self) -> Result<Vec<ModelOptionView>, String> {
         Ok(vec![ModelOptionView {
             model: "fake-echo".to_string(),
-            display_name: "Fake Echo".to_string(),
-            provider: "fake".to_string(),
+            display_name: self.model_label.clone(),
+            provider: self.model_vendor.clone(),
             supported_reasoning_efforts: vec![
                 "low".to_string(),
                 "medium".to_string(),
@@ -1362,6 +1377,15 @@ fn make_fake_approval(request_id: &str, thread_id: &str, prompt: &str) -> Pendin
         available_decisions: vec!["approve".to_string(), "deny".to_string()],
         supports_session_scope: false,
     }
+}
+
+/// Read an env var, treating "set but blank" as unset so an empty value can't
+/// blank out a display name or a vendor key.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn fake_reply_for_prompt(prompt: &str) -> String {
