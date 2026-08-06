@@ -136,6 +136,69 @@ function stateFor(map, threadId) {
 }
 
 /**
+ * Stable ids for every request currently blocking THIS thread on the reader, in
+ * arrival order — an approval or an AskUser question. Same sources as
+ * `computeThreadStates`' `needsInput`, but identities rather than a boolean,
+ * because the transcript scroller uses them as fire-once keys
+ * (`decideTranscriptScrollAction`): bring an arriving request into view, then
+ * leave the reader alone for as long as those same requests are pending.
+ *
+ * Plural on purpose. Nothing constrains a thread to one pending question — the
+ * relay and the worker both key them by id — so a second request arriving while
+ * the first is still outstanding has to be able to fire its own scroll, and a
+ * single render must be able to claim ALL of them at once.
+ *
+ * Ids are namespaced by source so an approval and a question that happen to
+ * share a request_id stay distinct, and so they can share the per-thread
+ * "already handled" Set with transcript item ids without ever colliding.
+ *
+ * Falls back to the waiting flags for budget-compacted snapshots that dropped
+ * the request arrays; that fallback is keyed by turn so it, too, fires once.
+ *
+ * @param {object} snapshot
+ * @param {string | null} threadId  defaults to the snapshot's active thread
+ * @returns {string[]}
+ */
+export function findPendingInputRequestIds(snapshot, threadId = null) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return [];
+  }
+  const activeThreadId = snapshot.active_thread_id || null;
+  const target = threadId || activeThreadId;
+  if (!target) {
+    return [];
+  }
+
+  const ids = [];
+  for (const source of ["pending_approvals", "pending_ask_user_questions"]) {
+    const requests = Array.isArray(snapshot[source]) ? snapshot[source] : [];
+    for (const request of requests) {
+      // Older snapshots omit thread_id; attribute those to the active thread,
+      // matching the relay's "force the awaited thread active" behavior.
+      if ((request?.thread_id || activeThreadId) !== target) {
+        continue;
+      }
+      if (request?.request_id) {
+        ids.push(`${source}:${request.request_id}`);
+      }
+    }
+  }
+  if (ids.length) {
+    return ids;
+  }
+
+  const flags = Array.isArray(snapshot.active_flags) ? snapshot.active_flags : [];
+  if (
+    target === activeThreadId
+    && (flags.includes("waitingOnApproval") || flags.includes("waitingOnAskUser"))
+  ) {
+    return [`waiting:${target}:${snapshot.active_turn_id || ""}`];
+  }
+
+  return [];
+}
+
+/**
  * @typedef {"needs_input" | "completed"} AttentionKind
  * @typedef {{ threadId: string, kind: AttentionKind, notify: boolean }} AttentionEvent
  */

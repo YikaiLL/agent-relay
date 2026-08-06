@@ -20,7 +20,11 @@ export const RESTICK_AT_BOTTOM_PX = TRANSCRIPT_BOTTOM_FOLLOW_THRESHOLD_PX;
 // NOT following the bottom, so the follower must not reinterpret a nearby
 // pixel offset using the floating button's broader 160px visibility threshold.
 export function classifyTranscriptScrollAction({ kind } = {}) {
-  if (kind === "jump-bottom" || kind === "rejoin-bottom") {
+  // `input-required` sticks like a send does: the agent is blocked on the reader,
+  // the request renders at the very bottom, and the card keeps growing as it
+  // measures (it is a virtual row estimated far shorter than it really is), so we
+  // must FOLLOW it down rather than land once at a stale bottom.
+  if (kind === "jump-bottom" || kind === "rejoin-bottom" || kind === "input-required") {
     return "stick";
   }
   if (kind === "restore-thread") {

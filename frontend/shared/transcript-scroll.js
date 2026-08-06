@@ -212,10 +212,42 @@ export function didPrependOlderTranscript(previousEntries, nextEntries) {
   });
 }
 
-export function decideTranscriptScrollAction({
+export function decideTranscriptScrollAction(options = {}) {
+  const action = decideTranscriptScrollPosition(options);
+  const pendingInputRequestIds = options.pendingInputRequestIds || [];
+  // EVERY action that positioned the viewport for this render claims the pending
+  // request — not just the one that scrolled to it.
+  //
+  // The relay publishes a user message and an approval in the same beat, so a send
+  // and a request routinely land in ONE render. That render's own `jump-bottom`
+  // already put the request on screen; leaving it unclaimed meant the next render
+  // saw a "new" request and yanked back a reader who had since scrolled away —
+  // breaking the fire-once rule on the most common path there is.
+  //
+  // The same holds for actions that deliberately position the reader somewhere
+  // ELSE (`restore-thread`, `anchor-prepend`): whatever this render decided wins,
+  // and must not be undone behind it on the next one. `noop` is the exception —
+  // there was no scroll element, so nothing was positioned and nothing is claimed.
+  //
+  // ALL pending ids are claimed, not just the one that triggered: several
+  // requests can arrive in one beat, and this render showed (or deliberately
+  // positioned away from) every one of them.
+  if (pendingInputRequestIds.length && action.kind !== "noop" && !action.inputRequestIds) {
+    return { ...action, inputRequestIds: [...pendingInputRequestIds] };
+  }
+  return action;
+}
+
+function decideTranscriptScrollPosition({
   alreadyAnchoredUserIds = null,
   nextEntries = [],
   nextThreadId = null,
+  // Ids of every request currently blocking this thread on the reader (an
+  // approval or an AskUser question). Derived by the call site via
+  // `findPendingInputRequestIds` (thread-attention.js) so this stays a pure
+  // decision function. Recorded into `alreadyAnchoredUserIds` once handled —
+  // the ids are namespaced, so they cannot collide with transcript item ids.
+  pendingInputRequestIds = [],
   previousSnapshot = null,
   restoredScrollPosition = null,
   scrollElement,
@@ -238,6 +270,8 @@ export function decideTranscriptScrollAction({
   // render would mistake retained history for a newly-arrived user message and
   // jump to the bottom, undoing a restore-thread action.
   if (!prevThreadId || prevThreadId !== nextThreadId) {
+    // (A pending input request is claimed by the caller wrapper, for every branch
+    // below — the transition owns this render's position either way.)
     const handledUserEntry = nextLatestUserId
       ? { userEntryId: nextLatestUserId }
       : {};
@@ -297,6 +331,29 @@ export function decideTranscriptScrollAction({
     };
   }
 
+  // The agent is blocked on the reader. The request renders at the BOTTOM of the
+  // transcript (the approval card is pushed last, after every entry) but it is
+  // not a transcript entry at all — no item_id, never in the hydration window —
+  // so none of the triggers above can see it. Without this the decision is
+  // `preserve`, the follower re-pins only if it happens to be stuck already, and
+  // the thing the session is waiting on sits below the fold: it looks hung.
+  //
+  // Fire ONCE per request id, exactly like a new user message: a reader who
+  // scrolled up to re-read the command being approved must stay where they put
+  // themselves. A second request in the same thread has a new id, so it fires.
+  // Any request we have not shown yet fires — including a SECOND question that
+  // arrives while the first is still outstanding.
+  const unhandledInputRequest = pendingInputRequestIds.some(
+    (requestId) => !(alreadyAnchoredUserIds && alreadyAnchoredUserIds.has(requestId))
+  );
+  if (unhandledInputRequest) {
+    return {
+      kind: "input-required",
+      scrollTop: Math.max(0, liveScrollHeight - clientHeight),
+      inputRequestIds: [...pendingInputRequestIds],
+    };
+  }
+
   return { kind: "preserve" };
 }
 
@@ -327,6 +384,7 @@ export function applyTranscriptScrollAction(action, scrollElement) {
   if (
     action.kind === "jump-bottom"
     || action.kind === "anchor-prepend"
+    || action.kind === "input-required"
     || action.kind === "restore-thread"
   ) {
     // Position the scroller, then broadcast the intent. For jump-bottom the write
@@ -349,6 +407,7 @@ export function restoreTranscriptScrollPosition({
   alreadyAnchoredUserIds = null,
   nextEntries = [],
   nextThreadId = null,
+  pendingInputRequestIds = [],
   previousSnapshot = null,
   restoredScrollPosition = null,
   scrollElement,
@@ -360,6 +419,7 @@ export function restoreTranscriptScrollPosition({
     alreadyAnchoredUserIds,
     nextEntries,
     nextThreadId,
+    pendingInputRequestIds,
     previousSnapshot,
     restoredScrollPosition,
     scrollElement,

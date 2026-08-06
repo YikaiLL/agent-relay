@@ -2582,3 +2582,188 @@ test("UserEntry and AgentEntry are React.memo'd to skip re-render on prepend", a
   const mb = renderToStaticMarkup(b);
   assert.equal(ma, mb);
 });
+
+// --- a pending question is pinned to the bottom ----------------------------
+//
+// An unanswered question is the one thing the session is waiting on, so it must
+// be the last thing in the transcript no matter where its tool call actually
+// sits. It is MOVED, not copied: rendering it both in place and at the bottom
+// would put two live question dialogs on screen at once. Answering it un-pins
+// it, and it returns to its original position in the conversation.
+
+const PENDING_ASK = {
+  request_id: "req-ask-1",
+  tool_use_id: "askuser-1",
+  questions: [
+    {
+      question: "Which approach should we take?",
+      header: "Approach",
+      multiSelect: false,
+      options: [{ label: "Option A" }, { label: "Option B" }],
+    },
+  ],
+};
+
+function askUserThread(extraTailEntries = []) {
+  return [
+    { item_id: "u1", kind: "user_text", text: "Investigate this bug", status: "completed" },
+    makeAskUserEntry({ status: "running", tool: { result_preview: "" } }),
+    ...extraTailEntries,
+  ];
+}
+
+test("a PENDING question renders at the bottom, below entries that follow its tool call", () => {
+  const markup = renderTranscriptContentMarkup(
+    askUserThread([
+      { item_id: "a1", kind: "agent_text", text: "Meanwhile here is some context", status: "completed" },
+    ]),
+    null,
+    { pendingAskUserQuestions: [PENDING_ASK] }
+  );
+
+  const askIndex = markup.indexOf("message-card-ask-user");
+  const trailingIndex = markup.indexOf("Meanwhile here is some context");
+  assert.ok(askIndex >= 0, "the question must render");
+  assert.ok(trailingIndex >= 0, "the trailing entry must render");
+  assert.ok(
+    askIndex > trailingIndex,
+    "an unanswered question must be pinned BELOW later entries, not left in place"
+  );
+});
+
+test("a pinned question renders exactly ONCE — never in place and at the bottom", () => {
+  const markup = renderTranscriptContentMarkup(
+    askUserThread([
+      { item_id: "a1", kind: "agent_text", text: "trailing", status: "completed" },
+    ]),
+    null,
+    { pendingAskUserQuestions: [PENDING_ASK] }
+  );
+
+  const occurrences = markup.split("message-card-ask-user").length - 1;
+  assert.equal(occurrences, 1, "two live question dialogs must never be on screen at once");
+});
+
+test("an ANSWERED question stays in its original position", () => {
+  // No pending request: nothing is blocked, so the entry is ordinary history and
+  // must sit where the conversation actually put it.
+  const markup = renderTranscriptContentMarkup(
+    askUserThread([
+      { item_id: "a1", kind: "agent_text", text: "trailing", status: "completed" },
+    ]),
+    null,
+    { pendingAskUserQuestions: [] }
+  );
+
+  const askIndex = markup.indexOf("message-card-ask-user");
+  const trailingIndex = markup.indexOf("trailing");
+  assert.ok(askIndex >= 0 && trailingIndex >= 0);
+  assert.ok(
+    askIndex < trailingIndex,
+    "once answered the question returns to its original position"
+  );
+});
+
+test("a pending question already at the tail is left where it is", () => {
+  // The common case: nothing follows the tool call, so pinning is a no-op and
+  // must not reorder anything.
+  const markup = renderTranscriptContentMarkup(
+    askUserThread(),
+    null,
+    { pendingAskUserQuestions: [PENDING_ASK] }
+  );
+  const userIndex = markup.indexOf("Investigate this bug");
+  const askIndex = markup.indexOf("message-card-ask-user");
+  assert.ok(userIndex >= 0 && askIndex > userIndex);
+  assert.equal(markup.split("message-card-ask-user").length - 1, 1);
+});
+
+test("TWO concurrent pending questions are BOTH pinned, in their original order", () => {
+  // Nothing guarantees a single pending question: the relay and the worker both
+  // key them by id, and one turn can issue several AskUserQuestion tool uses in
+  // parallel. Pinning only the newest would leave the other buried in history —
+  // exactly the failure the pin exists to prevent.
+  const second = makeAskUserEntry({
+    item_id: "tool:askuser-2",
+    status: "running",
+    tool: {
+      result_preview: "",
+      input_preview: JSON.stringify({
+        questions: [
+          {
+            question: "And which backend?",
+            header: "Backend",
+            multiSelect: false,
+            options: [{ label: "Postgres" }, { label: "SQLite" }],
+          },
+        ],
+      }),
+    },
+  });
+  const markup = renderTranscriptContentMarkup(
+    [
+      { item_id: "u1", kind: "user_text", text: "Investigate this bug", status: "completed" },
+      makeAskUserEntry({ status: "running", tool: { result_preview: "" } }),
+      second,
+      { item_id: "a1", kind: "agent_text", text: "trailing context", status: "completed" },
+    ],
+    null,
+    {
+      pendingAskUserQuestions: [
+        PENDING_ASK,
+        { request_id: "req-ask-2", tool_use_id: "askuser-2", questions: [] },
+      ],
+    }
+  );
+
+  assert.equal(
+    markup.split("message-card-ask-user").length - 1,
+    2,
+    "both questions must render, once each"
+  );
+  const trailingIndex = markup.indexOf("trailing context");
+  const firstIndex = markup.indexOf("Which approach should we take?");
+  const secondIndex = markup.indexOf("And which backend?");
+  assert.ok(firstIndex > trailingIndex, "both pinned below the trailing entry");
+  assert.ok(
+    firstIndex < secondIndex,
+    "pinned questions keep their original relative order"
+  );
+});
+
+test("answering ONE of two questions un-pins only that one", () => {
+  const second = makeAskUserEntry({
+    item_id: "tool:askuser-2",
+    status: "running",
+    tool: {
+      result_preview: "",
+      input_preview: JSON.stringify({
+        questions: [
+          { question: "And which backend?", header: "Backend", multiSelect: false, options: [] },
+        ],
+      }),
+    },
+  });
+  const markup = renderTranscriptContentMarkup(
+    [
+      makeAskUserEntry({ status: "running", tool: { result_preview: "" } }),
+      second,
+      { item_id: "a1", kind: "agent_text", text: "trailing context", status: "completed" },
+    ],
+    null,
+    // Only the SECOND is still pending.
+    { pendingAskUserQuestions: [{ request_id: "req-ask-2", tool_use_id: "askuser-2", questions: [] }] }
+  );
+
+  const trailingIndex = markup.indexOf("trailing context");
+  const answeredIndex = markup.indexOf("Which approach should we take?");
+  const stillPendingIndex = markup.indexOf("And which backend?");
+  assert.ok(
+    answeredIndex < trailingIndex,
+    "the answered question drops back to its original position"
+  );
+  assert.ok(
+    stillPendingIndex > trailingIndex,
+    "the still-unanswered question stays pinned at the bottom"
+  );
+});

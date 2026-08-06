@@ -2851,6 +2851,7 @@ function RemoteTranscriptPanel({
   useRemoteTranscriptScrollBookkeeping({
     currentState,
     entries,
+    session,
     threadId: session?.active_thread_id || null,
     transcriptRef,
   });

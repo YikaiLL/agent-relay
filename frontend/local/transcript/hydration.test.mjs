@@ -6,6 +6,7 @@ import {
   loadOlderLocalTranscript,
 } from "./hydration.js";
 import {
+  appendTranscriptDelta,
   clearTranscriptHydration,
   restoreHydratedTranscript,
   switchTranscriptHydrationThread,
@@ -890,5 +891,105 @@ test("switching local threads retains the loaded window and restores it on switc
     merged.transcript.map((entry) => entry.item_id),
     ["a1", "a2", "a3", "a4"],
     "the restored older window coexists with the freshly-merged tail"
+  );
+});
+
+test("a DELTA-joined entry must also survive a stale tail-page merge", async () => {
+  // The sibling test above covers the snapshot flavor of this race, and it passes
+  // only because a concurrent SNAPSHOT re-keys `transcriptHydrationSignature`, so
+  // hydrateTranscript's freshness gate catches the stale page and discards it.
+  //
+  // A live SSE delta is invisible to that gate: `applyTranscriptDeltaToWindow`
+  // writes `entries`/`order` IN PLACE and never touches the signature. So the
+  // gate sees nothing changed, the stale tail page merges anyway, the merge
+  // resets `order` to the page's ids, and the delta's entry is orphaned in the
+  // map forever — the reply the user is watching stream simply vanishes.
+  const itemA = {
+    item_id: "item-A",
+    kind: "agent_text",
+    text: null,
+    status: "running",
+    turn_id: "turn-1",
+    tool: null,
+    content_state: "omitted",
+  };
+  const state = createState({
+    session: { active_thread_id: "thread-1", active_turn_id: "turn-1" },
+    transcriptHydrationThreadId: "thread-1",
+    transcriptHydrationEntries: new Map([["item-A", { ...itemA }]]),
+    transcriptHydrationOrder: ["item-A"],
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationSignature: "thread-1|turn-1|1|item-A|agent_text|turn-1||||",
+    transcriptHydrationStatus: "idle",
+    transcriptHydrationTailReady: true,
+    transcriptHydrationFetchedRevision: 10,
+  });
+
+  let releasePage;
+  const pageGate = new Promise((resolve) => {
+    releasePage = resolve;
+  });
+  const hydrationPromise = hydrateLocalTranscript(
+    state,
+    {
+      active_thread_id: "thread-1",
+      active_turn_id: "turn-1",
+      transcript_revision: 11,
+      transcript_truncated: true,
+      transcript: [{ ...itemA, text: "shell..." }],
+    },
+    {
+      async fetchPage() {
+        await pageGate;
+        // Stale: built before item-B existed, so it carries only item-A.
+        return {
+          thread_id: "thread-1",
+          prev_cursor: null,
+          entries: [
+            {
+              item_id: "item-A",
+              kind: "agent_text",
+              text: "A full body",
+              status: "completed",
+              turn_id: "turn-1",
+              tool: null,
+            },
+          ],
+        };
+      },
+      onProgress(next) {
+        state.session = next;
+      },
+    }
+  );
+
+  // While the fetch is in flight the next turn's reply starts streaming over SSE.
+  await new Promise((resolve) => setImmediate(resolve));
+  appendTranscriptDelta(state, {
+    thread_id: "thread-1",
+    item_id: "item-B",
+    delta: "the reply is streaming",
+    delta_kind: "agent_text",
+    text_offset: 0,
+    turn_id: "turn-2",
+  });
+  assert.deepEqual(
+    state.transcriptHydrationOrder,
+    ["item-A", "item-B"],
+    "precondition: the delta joined the order while the fetch was in flight"
+  );
+
+  releasePage();
+  await hydrationPromise;
+
+  assert.deepEqual(
+    state.transcriptHydrationOrder,
+    ["item-A", "item-B"],
+    "a delta-joined entry must survive the tail-page merge, in place"
+  );
+  assert.equal(
+    state.transcriptHydrationEntries.get("item-B")?.text,
+    "the reply is streaming",
+    "and keep the streamed body it had accumulated"
   );
 });

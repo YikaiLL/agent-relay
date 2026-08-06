@@ -138,7 +138,11 @@ import { describeStatusChips } from "../shared/session-status.js";
 import { selectStatusBadge } from "./status-badge.js";
 import { selectHeaderLabels } from "./header-labels.js";
 import { selectStandbyEmptyModel, buildStandbyEmptyActions } from "./standby-empty-state.js";
-import { sessionIsWorking, threadAttention } from "../shared/thread-attention.js";
+import {
+  findPendingInputRequestIds,
+  sessionIsWorking,
+  threadAttention,
+} from "../shared/thread-attention.js";
 import {
   configureThreadNotifications,
   ensureNotificationPermission,
@@ -1435,16 +1439,28 @@ export function createSessionRenderer({
       alreadyAnchoredUserIds: anchorsForThread,
       nextEntries: entries,
       nextThreadId: localThreadId,
+      // An approval / AskUser question is not a transcript entry, so it needs its
+      // own trigger to be brought into view when it arrives (it renders last, at
+      // the bottom). Fire-once, keyed on the request ids — plural because a
+      // second question can arrive while the first is still outstanding.
+      pendingInputRequestIds: findPendingInputRequestIds(session, localThreadId),
       previousSnapshot,
       restoredScrollPosition,
       scrollElement: transcript,
     });
-    // Record the latest user entry handled by this action. New-message actions
-    // use this to avoid re-jumping mid-stream; thread-transition actions use it
-    // to establish the loaded transcript as a baseline so the next snapshot
-    // cannot mistake retained history for a newly-sent message.
-    if (action?.userEntryId) {
-      anchorsForThread.add(action.userEntryId);
+    // Record what this action handled. New-message actions use this to avoid
+    // re-jumping mid-stream; thread-transition actions use it to establish the
+    // loaded transcript as a baseline so the next snapshot cannot mistake
+    // retained history for a newly-sent message. One Set serves both kinds —
+    // request ids are namespaced, so they cannot collide with item ids.
+    const handledScrollIds = [
+      action?.userEntryId,
+      ...(action?.inputRequestIds || []),
+    ].filter(Boolean);
+    if (handledScrollIds.length) {
+      for (const handledId of handledScrollIds) {
+        anchorsForThread.add(handledId);
+      }
       state.localTranscriptScrollAnchors.set(localThreadId, anchorsForThread);
     }
     state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({

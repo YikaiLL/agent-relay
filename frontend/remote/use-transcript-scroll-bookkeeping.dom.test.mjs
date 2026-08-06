@@ -77,7 +77,7 @@ function entriesFor(threadId, count) {
   }));
 }
 
-function Harness({ currentState, entries, threadId }) {
+function Harness({ currentState, entries, session, threadId }) {
   const transcriptRef = React.useRef(null);
   const attach = React.useCallback((element) => {
     transcriptRef.current = element;
@@ -89,6 +89,7 @@ function Harness({ currentState, entries, threadId }) {
   useRemoteTranscriptScrollBookkeeping({
     currentState,
     entries,
+    session,
     threadId,
     transcriptRef,
   });
@@ -109,8 +110,8 @@ function mount() {
   const currentState = { activeRelayId: "relay-1", promotedThreadAlias: null };
   return {
     scroller: () => host.querySelector(".chat-thread"),
-    show(threadId, entries) {
-      act(() => root.render(h(Harness, { currentState, entries, threadId })));
+    show(threadId, entries, session = null) {
+      act(() => root.render(h(Harness, { currentState, entries, session, threadId })));
     },
     // A reader scroll: the browser moves scrollTop, then fires `scroll`.
     scrollTo(scrollTop) {
@@ -175,6 +176,124 @@ test("a reader left at the tail keeps following it after switching back", () => 
       view.scroller().scrollTop,
       12 * ROW_HEIGHT - CLIENT_HEIGHT,
       "switch-back lands at the new bottom"
+    );
+  } finally {
+    view.cleanup();
+  }
+});
+
+test("an arriving ask-user question pulls an escaped reader to the request — once", () => {
+  // The integration the pure-function tests cannot cover: a request that is not a
+  // transcript entry still has to move a REAL scroller. AskUser renders inside the
+  // tool-call entry it belongs to, at the tail of the transcript, so a reader who
+  // scrolled up never sees it and the session just looks hung.
+  const view = mount();
+  try {
+    const entries = entriesFor("thread-a", 20);
+    view.show("thread-a", entries);
+    const bottom = view.scroller().scrollTop;
+
+    // The reader escapes upward while the turn is still running.
+    view.scrollTo(bottom - 120);
+    assert.equal(view.scroller().scrollTop, bottom - 120, "precondition: reader is off the tail");
+
+    const asking = {
+      active_thread_id: "thread-a",
+      pending_ask_user_questions: [{ thread_id: "thread-a", request_id: "q-1" }],
+    };
+    view.show("thread-a", entries, asking);
+    assert.equal(
+      view.scroller().scrollTop,
+      bottom,
+      "the question the agent is blocked on must be brought into view"
+    );
+
+    // Fire-once: the reader may leave again while the SAME question is pending,
+    // and every later render must leave them where they put themselves.
+    view.scrollTo(bottom - 120);
+    view.show("thread-a", entries, asking);
+    view.show("thread-a", entries, asking);
+    assert.equal(
+      view.scroller().scrollTop,
+      bottom - 120,
+      "a still-pending question must not re-yank the reader on every render"
+    );
+  } finally {
+    view.cleanup();
+  }
+});
+
+test("a SECOND request after the first is answered pulls the reader back again", () => {
+  const view = mount();
+  try {
+    const entries = entriesFor("thread-a", 20);
+    view.show("thread-a", entries);
+    const bottom = view.scroller().scrollTop;
+
+    view.scrollTo(bottom - 120);
+    view.show("thread-a", entries, {
+      active_thread_id: "thread-a",
+      pending_approvals: [{ thread_id: "thread-a", request_id: "req-1" }],
+    });
+    assert.equal(view.scroller().scrollTop, bottom, "first request lands");
+
+    // Answered, reader goes back to reading history, then a NEW request arrives.
+    view.show("thread-a", entries, { active_thread_id: "thread-a" });
+    view.scrollTo(bottom - 120);
+    view.show("thread-a", entries, {
+      active_thread_id: "thread-a",
+      pending_approvals: [{ thread_id: "thread-a", request_id: "req-2" }],
+    });
+    assert.equal(
+      view.scroller().scrollTop,
+      bottom,
+      "fire-once is per request id, so a second request fires again"
+    );
+  } finally {
+    view.cleanup();
+  }
+});
+
+test("a send and a request arriving together are BOTH claimed by the one render", () => {
+  // The call-site half of the same-render claim: the hook must record both ids off
+  // a single action. If it only records the user entry, the next render sees a
+  // "new" request and drags the reader back down — on the most common path there
+  // is, because the relay publishes the user message and the approval in one beat.
+  const view = mount();
+  try {
+    const entries = entriesFor("thread-a", 20);
+    view.show("thread-a", entries);
+    const firstBottom = view.scroller().scrollTop;
+
+    // The reader is reading history when they fire off a new message.
+    view.scrollTo(firstBottom - 120);
+    const sent = [
+      ...entries,
+      { item_id: "thread-a-sent", kind: "user_text", text: "please run the tests" },
+    ];
+    const asking = {
+      active_thread_id: "thread-a",
+      pending_approvals: [{ thread_id: "thread-a", request_id: "r1" }],
+    };
+    view.show("thread-a", sent, asking);
+
+    const bottom = view.scroller().scrollTop;
+    const element = view.scroller();
+    assert.equal(
+      bottom,
+      element.scrollHeight - element.clientHeight,
+      "the send lands at the bottom, which also shows the request"
+    );
+
+    // The reader scrolls away again. The request is unchanged and already seen, so
+    // every later render must leave them alone.
+    view.scrollTo(bottom - 120);
+    view.show("thread-a", sent, asking);
+    view.show("thread-a", sent, asking);
+    assert.equal(
+      view.scroller().scrollTop,
+      bottom - 120,
+      "a request already shown by the send's own jump must not re-fire"
     );
   } finally {
     view.cleanup();

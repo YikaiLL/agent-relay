@@ -19,13 +19,13 @@ use tokio::{
 use crate::{
     codex_local::LocalThreadDeleteSummary,
     protocol::{
-        ApprovalDecision, ApprovalDecisionInput, ModelOptionView, ThreadSummaryView, ToolCallView,
-        TranscriptEntryKind, TranscriptEntryView,
+        ApprovalDecision, ApprovalDecisionInput, AskUserOptionView, AskUserQuestionView,
+        ModelOptionView, ThreadSummaryView, ToolCallView, TranscriptEntryKind, TranscriptEntryView,
     },
     provider::{ProviderBridge, ProviderImage, StartThreadResult, ThreadSyncData},
     state::{
-        ApprovalKind, BrokerPendingMessage, PendingApproval, PendingTranscriptDelta, RelayState,
-        TranscriptDeltaKind,
+        ApprovalKind, BrokerPendingMessage, PendingApproval, PendingAskUserQuestion,
+        PendingTranscriptDelta, RelayState, TranscriptDeltaKind,
     },
 };
 
@@ -67,6 +67,26 @@ struct FakeTurnScenario {
     late_chunk_delay_ms: Option<u64>,
     #[serde(default)]
     require_approval: bool,
+    /// Hold the approval request back for this long after the user message
+    /// lands. Real providers ask for approval only once they have started
+    /// working, so the reader has usually scrolled somewhere by then; with the
+    /// request arriving in the same beat as the user message, a test can only
+    /// ever observe the send's own jump-to-bottom. Lets an e2e escape upward
+    /// first and then assert the arriving request is still brought into view.
+    approval_delay_ms: Option<u64>,
+    /// Park the turn on a real AskUserQuestion request: emit the tool-call
+    /// transcript entry, publish a pending question, and block until an answer
+    /// arrives through `respond_to_ask_user_question`.
+    #[serde(default)]
+    ask_user: bool,
+    /// Same purpose as `approval_delay_ms`, for the question.
+    ask_user_delay_ms: Option<u64>,
+    /// Emit this assistant text AFTER the question's tool call but before
+    /// parking, so the pending question is NOT the last entry. Models a turn
+    /// that issued the question alongside other tool uses — the case where the
+    /// transcript has to PIN the unanswered question to the bottom rather than
+    /// leave it buried mid-thread.
+    ask_user_trailing_text: Option<String>,
     #[serde(default)]
     terminal: FakeTerminalBehavior,
     error_message: Option<String>,
@@ -261,6 +281,11 @@ struct FakeApprovalGate {
     sender: oneshot::Sender<ApprovalDecision>,
 }
 
+struct FakeAskUserGate {
+    turn_id: String,
+    sender: oneshot::Sender<serde_json::Map<String, serde_json::Value>>,
+}
+
 fn validate_barrier_name(barrier: &str) -> Result<(), String> {
     if barrier.is_empty()
         || !barrier
@@ -294,6 +319,7 @@ pub struct FakeProviderBridge {
     model_vendor: String,
     model_label: String,
     approval_gates: Arc<Mutex<HashMap<String, FakeApprovalGate>>>,
+    ask_user_gates: Arc<Mutex<HashMap<String, FakeAskUserGate>>>,
     turn_stop_behaviors: Arc<Mutex<HashMap<String, FakeStopBehavior>>>,
     stopped_turns: Arc<Mutex<HashSet<String>>>,
     scenario_harness: Option<FakeScenarioHarness>,
@@ -327,6 +353,7 @@ impl FakeProviderBridge {
             model_vendor,
             model_label,
             approval_gates: Arc::new(Mutex::new(HashMap::new())),
+            ask_user_gates: Arc::new(Mutex::new(HashMap::new())),
             turn_stop_behaviors: Arc::new(Mutex::new(HashMap::new())),
             stopped_turns: Arc::new(Mutex::new(HashSet::new())),
             scenario_harness,
@@ -572,6 +599,22 @@ impl ProviderBridge for FakeProviderBridge {
             .is_some_and(|scenario| scenario.require_approval)
             || (self.enforce_approvals.load(Ordering::Relaxed)
                 && self.approval_policy_for(&thread_id).await != "bypass");
+        let approval_delay = scenario
+            .as_ref()
+            .and_then(|scenario| scenario.approval_delay_ms)
+            .map(Duration::from_millis);
+        let ask_user = scenario.as_ref().is_some_and(|scenario| scenario.ask_user);
+        let ask_user_delay = scenario
+            .as_ref()
+            .and_then(|scenario| scenario.ask_user_delay_ms)
+            .map(Duration::from_millis);
+        let ask_user_trailing_text = scenario
+            .as_ref()
+            .and_then(|scenario| scenario.ask_user_trailing_text.clone());
+        let ask_user_request_id = self.next_token("fake-ask");
+        let ask_user_tool_use_id = self.next_token("fake-ask-tool");
+        let ask_user_trailing_item_id = self.next_token("fake-ask-trailing");
+        let ask_user_gates = self.ask_user_gates.clone();
         let approval_request_id = self.next_token("fake-approval");
         let approval_gates = self.approval_gates.clone();
         let turn_stop_behaviors = self.turn_stop_behaviors.clone();
@@ -639,87 +682,339 @@ impl ProviderBridge for FakeProviderBridge {
 
             // 2. Park on an approval request when the policy requires it. Only
             // foreground (active) turns gate; background fake turns auto-proceed.
-            if needs_approval
-                && state.read().await.active_thread_id.as_deref() == Some(thread_id.as_str())
-            {
+            //
+            // Optional: let the user message settle on screen (and the reader move)
+            // before the request appears. See `approval_delay_ms`.
+            if needs_approval {
+                if let Some(delay) = approval_delay {
+                    sleep(delay).await;
+                }
+
                 let (decision_tx, decision_rx) = oneshot::channel();
-                approval_gates.lock().await.insert(
-                    approval_request_id.clone(),
-                    FakeApprovalGate {
-                        turn_id: turn_id_for_task.clone(),
-                        sender: decision_tx,
-                    },
-                );
-                {
-                    let mut relay = state.write().await;
-                    relay.set_thread_status(
-                        &thread_id,
-                        "active".to_string(),
-                        vec!["waitingOnApproval".to_string()],
-                    );
-                    relay.add_pending_approval(make_fake_approval(
-                        &approval_request_id,
-                        &thread_id,
-                        &prompt,
-                    ));
-                    relay.touch_progress(Some("waiting_approval"), None);
-                    relay.push_log("approval", "Fake provider requests approval for: Bash");
-                    relay.notify();
-                }
-                if let Some(harness) = scenario_harness.as_ref() {
-                    harness
-                        .record_event(
-                            "approval_requested",
-                            &thread_id,
-                            &turn_id_for_task,
-                            Some(serde_json::json!({ "request_id": approval_request_id })),
-                        )
-                        .await;
-                }
-
-                let decision = decision_rx.await.unwrap_or(ApprovalDecision::Cancel);
-                approval_gates.lock().await.remove(&approval_request_id);
-                if let Some(harness) = scenario_harness.as_ref() {
-                    harness
-                        .record_event(
-                            "approval_resolved",
-                            &thread_id,
-                            &turn_id_for_task,
-                            Some(serde_json::json!({ "decision": format!("{decision:?}") })),
-                        )
-                        .await;
-                }
-
-                if !matches!(decision, ApprovalDecision::Approve) {
-                    let mut relay = state.write().await;
-                    relay.remove_pending_approval(&approval_request_id);
-                    relay.set_thread_status(&thread_id, "idle".to_string(), Vec::new());
-                    if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
-                        relay.set_active_turn(None);
+                // Read the stop flag and register the gate under ONE hold of the
+                // gate map. `request_turn_stop` sets the flag and THEN scans this
+                // map, so holding it across both makes the interleavings exclusive:
+                // either we observe the stop and never park, or the stop finds our
+                // gate and cancels it. A plain check-then-insert leaves a window
+                // where NEITHER happens — the stop scans an empty map, we register
+                // afterwards, and the turn waits on a channel nobody will ever fire.
+                // (Lock order is gates -> stopped_turns; `request_turn_stop` never
+                // holds stopped_turns across a gate acquisition, so there is no
+                // cycle. Nothing anywhere holds a gate lock across a state lock.)
+                let registered = {
+                    let mut gates = approval_gates.lock().await;
+                    if stopped_turns.lock().await.contains(&turn_id_for_task) {
+                        false
+                    } else {
+                        gates.insert(
+                            approval_request_id.clone(),
+                            FakeApprovalGate {
+                                turn_id: turn_id_for_task.clone(),
+                                sender: decision_tx,
+                            },
+                        );
+                        true
                     }
-                    relay.push_log("info", "Fake provider turn was denied.");
-                    relay.notify();
-                    if let Some(thread) = threads.lock().await.get_mut(&thread_id) {
-                        thread.summary.status = "idle".to_string();
-                        thread.summary.updated_at = unix_now();
-                        thread.transcript.push(user_entry);
-                    }
+                };
+                if !registered {
+                    settle_fake_turn(&state, &thread_id, &turn_id_for_task, "idle").await;
+                    record_scenario_event(
+                        scenario_harness.as_ref(),
+                        "turn_stopped",
+                        &thread_id,
+                        &turn_id_for_task,
+                        None,
+                    )
+                    .await;
                     turn_stop_behaviors.lock().await.remove(&turn_id_for_task);
                     stopped_turns.lock().await.remove(&turn_id_for_task);
                     return;
                 }
 
-                // Approved: drop the waiting flag before streaming the reply.
-                let mut relay = state.write().await;
-                relay.set_thread_status(&thread_id, "active".to_string(), Vec::new());
-                relay.notify();
+                // Publish while HOLDING the write lock that re-confirms the thread
+                // is still foreground. "Only foreground turns gate" has to hold at
+                // the moment the request becomes visible, not when the turn started
+                // — the reader can switch threads at any await before this.
+                let published = {
+                    let mut relay = state.write().await;
+                    if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
+                        relay.set_thread_status(
+                            &thread_id,
+                            "active".to_string(),
+                            vec!["waitingOnApproval".to_string()],
+                        );
+                        relay.add_pending_approval(make_fake_approval(
+                            &approval_request_id,
+                            &thread_id,
+                            &prompt,
+                        ));
+                        relay.touch_progress(Some("waiting_approval"), None);
+                        relay.push_log("approval", "Fake provider requests approval for: Bash");
+                        relay.notify();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !published {
+                    // Backgrounded while the request was held back: give the gate
+                    // back and stream like any other background turn.
+                    approval_gates.lock().await.remove(&approval_request_id);
+                } else {
+                    if let Some(harness) = scenario_harness.as_ref() {
+                        harness
+                            .record_event(
+                                "approval_requested",
+                                &thread_id,
+                                &turn_id_for_task,
+                                Some(serde_json::json!({ "request_id": approval_request_id })),
+                            )
+                            .await;
+                    }
+
+                    // A stop that raced us here already sent Cancel into this
+                    // channel, so this resolves immediately and unwinds below.
+                    let decision = decision_rx.await.unwrap_or(ApprovalDecision::Cancel);
+                    approval_gates.lock().await.remove(&approval_request_id);
+                    if let Some(harness) = scenario_harness.as_ref() {
+                        harness
+                            .record_event(
+                                "approval_resolved",
+                                &thread_id,
+                                &turn_id_for_task,
+                                Some(serde_json::json!({ "decision": format!("{decision:?}") })),
+                            )
+                            .await;
+                    }
+
+                    if !matches!(decision, ApprovalDecision::Approve) {
+                        let mut relay = state.write().await;
+                        relay.remove_pending_approval(&approval_request_id);
+                        relay.set_thread_status(&thread_id, "idle".to_string(), Vec::new());
+                        if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
+                            relay.set_active_turn(None);
+                        }
+                        relay.push_log("info", "Fake provider turn was denied.");
+                        relay.notify();
+                        drop(relay);
+                        if let Some(thread) = threads.lock().await.get_mut(&thread_id) {
+                            thread.summary.status = "idle".to_string();
+                            thread.summary.updated_at = unix_now();
+                            thread.transcript.push(user_entry);
+                        }
+                        turn_stop_behaviors.lock().await.remove(&turn_id_for_task);
+                        stopped_turns.lock().await.remove(&turn_id_for_task);
+                        return;
+                    }
+
+                    // Approved: drop the waiting flag before streaming the reply.
+                    let mut relay = state.write().await;
+                    relay.set_thread_status(&thread_id, "active".to_string(), Vec::new());
+                    relay.notify();
+                }
+            }
+
+            // 2b. Park on an AskUserQuestion when the scenario asks for one.
+            //
+            // Ordering here is a hard contract, not style: `set_thread_status`
+            // with a SETTLED status runs `drop_pending_requests_for_thread`, so
+            // the thread must be marked active WITH the waiting flag BEFORE the
+            // pending question is added, and the turn must never settle while it
+            // is outstanding.
+            //
+            // NOTHING is written to the transcript until we know we are going to
+            // publish. Emitting the question first and checking afterwards left a
+            // ghost `running` tool card behind whenever a stop landed inside
+            // `ask_user_delay_ms`, or whenever the thread went background.
+            let mut ask_user_entries: Vec<TranscriptEntryView> = Vec::new();
+            if ask_user {
+                if let Some(delay) = ask_user_delay {
+                    sleep(delay).await;
+                }
+
+                let ask_item_id = format!("tool:{ask_user_tool_use_id}");
+                let (answer_tx, answer_rx) = oneshot::channel();
+                // Same stop-safety shape as the approval gate: read the stop flag
+                // and register the gate under ONE hold of the gate map, so a stop
+                // either is seen here or finds this gate to cancel.
+                let registered = {
+                    let mut gates = ask_user_gates.lock().await;
+                    if stopped_turns.lock().await.contains(&turn_id_for_task) {
+                        false
+                    } else {
+                        gates.insert(
+                            ask_user_request_id.clone(),
+                            FakeAskUserGate {
+                                turn_id: turn_id_for_task.clone(),
+                                sender: answer_tx,
+                            },
+                        );
+                        true
+                    }
+                };
+                if !registered {
+                    settle_fake_turn(&state, &thread_id, &turn_id_for_task, "idle").await;
+                    record_scenario_event(
+                        scenario_harness.as_ref(),
+                        "turn_stopped",
+                        &thread_id,
+                        &turn_id_for_task,
+                        None,
+                    )
+                    .await;
+                    turn_stop_behaviors.lock().await.remove(&turn_id_for_task);
+                    stopped_turns.lock().await.remove(&turn_id_for_task);
+                    return;
+                }
+
+                // ONE write-lock section, so the question's tool card, the
+                // trailing message and the pending request all appear together —
+                // and only if the thread is still foreground at that moment.
+                let published = {
+                    let mut relay = state.write().await;
+                    if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
+                        relay.upsert_transcript_item_for_thread(
+                            &thread_id,
+                            ask_item_id.clone(),
+                            TranscriptEntryKind::ToolCall,
+                            None,
+                            "running".to_string(),
+                            Some(turn_id_for_task.clone()),
+                            Some(fake_ask_user_tool_view(None)),
+                        );
+                        // Optional: something AFTER the question, so the
+                        // transcript has to pin it to the bottom instead of
+                        // leaving it buried.
+                        if let Some(text) = ask_user_trailing_text.clone() {
+                            relay.upsert_transcript_item_for_thread(
+                                &thread_id,
+                                ask_user_trailing_item_id.clone(),
+                                TranscriptEntryKind::AgentText,
+                                Some(text),
+                                "completed".to_string(),
+                                Some(turn_id_for_task.clone()),
+                                None,
+                            );
+                        }
+                        relay.set_thread_status(
+                            &thread_id,
+                            "active".to_string(),
+                            vec!["waitingOnAskUser".to_string()],
+                        );
+                        relay.add_pending_ask_user_question(PendingAskUserQuestion {
+                            request_id: ask_user_request_id.clone(),
+                            tool_use_id: ask_user_tool_use_id.clone(),
+                            thread_id: thread_id.clone(),
+                            requested_at: unix_now(),
+                            questions: fake_ask_user_questions(),
+                        });
+                        relay.touch_progress(Some("waiting_user"), None);
+                        relay.push_log("info", "Fake provider asked the user a question.");
+                        relay.notify();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !published {
+                    ask_user_gates.lock().await.remove(&ask_user_request_id);
+                } else {
+                    record_scenario_event(
+                        scenario_harness.as_ref(),
+                        "ask_user_question_requested",
+                        &thread_id,
+                        &turn_id_for_task,
+                        Some(serde_json::json!({ "request_id": ask_user_request_id })),
+                    )
+                    .await;
+
+                    // `Ok(answers)` = a real answer; `Err` = the sender was
+                    // dropped, i.e. the turn was stopped. Never conflate the two:
+                    // recording a cancelled question as answered would put words
+                    // in the user's mouth in the saved history.
+                    let answers = answer_rx.await.ok();
+                    ask_user_gates.lock().await.remove(&ask_user_request_id);
+                    record_scenario_event(
+                        scenario_harness.as_ref(),
+                        "ask_user_question_resolved",
+                        &thread_id,
+                        &turn_id_for_task,
+                        Some(serde_json::json!({ "answered": answers.is_some() })),
+                    )
+                    .await;
+
+                    let Some(answers) = answers else {
+                        // Cancelled. Mark the card terminal WITHOUT a result, so
+                        // it never claims an answer nobody gave.
+                        {
+                            let mut relay = state.write().await;
+                            relay.upsert_transcript_item_for_thread(
+                                &thread_id,
+                                ask_item_id.clone(),
+                                TranscriptEntryKind::ToolCall,
+                                None,
+                                "failed".to_string(),
+                                Some(turn_id_for_task.clone()),
+                                Some(fake_ask_user_tool_view(None)),
+                            );
+                            relay.notify();
+                        }
+                        settle_fake_turn(&state, &thread_id, &turn_id_for_task, "idle").await;
+                        turn_stop_behaviors.lock().await.remove(&turn_id_for_task);
+                        stopped_turns.lock().await.remove(&turn_id_for_task);
+                        return;
+                    };
+
+                    // Answered: echo back what was ACTUALLY chosen. This is also
+                    // what un-pins the card back to its place in the conversation.
+                    let answered_tool = fake_ask_user_tool_view(Some(&answers));
+                    {
+                        let mut relay = state.write().await;
+                        relay.upsert_transcript_item_for_thread(
+                            &thread_id,
+                            ask_item_id.clone(),
+                            TranscriptEntryKind::ToolCall,
+                            None,
+                            "completed".to_string(),
+                            Some(turn_id_for_task.clone()),
+                            Some(answered_tool.clone()),
+                        );
+                        relay.notify();
+                    }
+
+                    // Persist both entries with the turn, so the question and the
+                    // message after it survive a thread re-read / switch-away —
+                    // which is what makes "returns to its original position"
+                    // true beyond the live snapshot.
+                    ask_user_entries.push(TranscriptEntryView {
+                        item_id: Some(ask_item_id.clone()),
+                        kind: TranscriptEntryKind::ToolCall,
+                        text: None,
+                        status: "completed".to_string(),
+                        turn_id: Some(turn_id_for_task.clone()),
+                        tool: Some(answered_tool),
+                        content_state: crate::protocol::TranscriptContentState::Full,
+                    });
+                    if let Some(text) = ask_user_trailing_text.clone() {
+                        ask_user_entries.push(TranscriptEntryView {
+                            item_id: Some(ask_user_trailing_item_id.clone()),
+                            kind: TranscriptEntryKind::AgentText,
+                            text: Some(text),
+                            status: "completed".to_string(),
+                            turn_id: Some(turn_id_for_task.clone()),
+                            tool: None,
+                            content_state: crate::protocol::TranscriptContentState::Full,
+                        });
+                    }
+                }
             }
 
             // 3. Stream tool-call lifecycle entries before the agent reply.
             // This mirrors the Claude worker's `tool_call_requested` /
             // `tool_call_result` sequence closely enough for browser tests to
             // exercise live grouping, virtualization, and scroll following.
-            let mut tool_entries = Vec::with_capacity(tool_item_ids.len());
+            let mut tool_entries = Vec::with_capacity(tool_item_ids.len() + ask_user_entries.len());
+            tool_entries.append(&mut ask_user_entries);
             for (index, tool_item_id) in tool_item_ids.into_iter().enumerate() {
                 if stopped_turns.lock().await.contains(&turn_id_for_task) {
                     settle_fake_turn(&state, &thread_id, &turn_id_for_task, "idle").await;
@@ -1174,6 +1469,19 @@ impl ProviderBridge for FakeProviderBridge {
                     let _ = gate.sender.send(ApprovalDecision::Cancel);
                 }
             }
+            // Same for a parked question: dropping the sender makes the turn's
+            // `answer_rx.await` resolve as cancelled instead of hanging forever.
+            let ask_request_ids = self
+                .ask_user_gates
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, gate)| gate.turn_id == turn_id)
+                .map(|(request_id, _)| request_id.clone())
+                .collect::<Vec<_>>();
+            for request_id in ask_request_ids {
+                self.ask_user_gates.lock().await.remove(&request_id);
+            }
             record_scenario_event(
                 self.scenario_harness.as_ref(),
                 "stop_requested",
@@ -1212,10 +1520,27 @@ impl ProviderBridge for FakeProviderBridge {
 
     async fn respond_to_ask_user_question(
         &self,
-        _request_id: &str,
-        _answers: &serde_json::Map<String, serde_json::Value>,
+        request_id: &str,
+        answers: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {
-        Err("fake provider does not surface AskUserQuestion".to_string())
+        // The fake reply does not depend on WHAT was answered, but an empty
+        // answer map still means the caller skipped the wizard — reject it the
+        // way a real provider would rather than silently unblocking.
+        if answers.is_empty() {
+            return Err("fake provider received no answers".to_string());
+        }
+        match self.ask_user_gates.lock().await.remove(request_id) {
+            // The app layer clears the pending question after this returns.
+            Some(gate) => {
+                // Hand the ACTUAL answers to the parked turn so it can echo them
+                // back, rather than inventing a canned one.
+                let _ = gate.sender.send(answers.clone());
+                Ok(())
+            }
+            None => Err(format!(
+                "fake provider has no pending question for {request_id}"
+            )),
+        }
     }
 
     fn provider_name(&self) -> &'static str {
@@ -1411,6 +1736,97 @@ fn fake_tool_call_view(index: usize, completed: bool) -> ToolCallView {
         command: Some(format!("printf 'fake tool call {index}\\n'")),
         input_preview: Some(format!("{{\"index\":{index}}}")),
         result_preview: completed.then(|| format!("fake tool result {index}")),
+        diff: None,
+        file_changes: Vec::new(),
+        apply_state: None,
+        file_changes_omitted: false,
+        can_apply: None,
+    }
+}
+
+/// The question fixture the fake provider asks. One single-select question, so
+/// an e2e can answer it with a single option click (the wizard's quick path).
+fn fake_ask_user_questions() -> Vec<AskUserQuestionView> {
+    vec![AskUserQuestionView {
+        question: "Which approach should we take?".to_string(),
+        header: "Approach".to_string(),
+        multi_select: false,
+        options: vec![
+            AskUserOptionView {
+                label: "Option A".to_string(),
+                description: "Take the direct route".to_string(),
+            },
+            AskUserOptionView {
+                label: "Option B".to_string(),
+                description: "Take the careful route".to_string(),
+            },
+        ],
+    }]
+}
+
+fn fake_ask_user_input_preview() -> String {
+    serde_json::json!({
+        "questions": fake_ask_user_questions()
+            .into_iter()
+            .map(|question| serde_json::json!({
+                "question": question.question,
+                "header": question.header,
+                "multiSelect": question.multi_select,
+                "options": question.options
+                    .into_iter()
+                    .map(|option| serde_json::json!({
+                        "label": option.label,
+                        "description": option.description,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// Render one answer value the way a provider would echo it back:
+/// `string` verbatim, `[a, b]` joined. Anything else falls back to its JSON.
+fn render_ask_user_answer(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(render_ask_user_answer)
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
+/// The question's tool card. `answers` is `None` while it is unanswered (or when
+/// it was cancelled) and `Some(..)` once a real answer arrived — the result
+/// preview is built FROM that answer, never hardcoded, so picking Option B or
+/// typing free text is not later reported back as Option A.
+fn fake_ask_user_tool_view(
+    answers: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> ToolCallView {
+    let result_preview = answers.map(|answers| {
+        let rendered = answers
+            .iter()
+            .map(|(question, value)| {
+                format!("\"{question}\"=\"{}\"", render_ask_user_answer(value))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Your questions have been answered: {rendered}. You can now continue.")
+    });
+    ToolCallView {
+        item_type: "toolCall".to_string(),
+        name: "AskUserQuestion".to_string(),
+        title: "AskUserQuestion".to_string(),
+        detail: None,
+        query: None,
+        path: None,
+        url: None,
+        command: None,
+        input_preview: Some(fake_ask_user_input_preview()),
+        result_preview,
         diff: None,
         file_changes: Vec::new(),
         apply_state: None,
@@ -2027,6 +2443,669 @@ mod tests {
             .await
             .is_err());
         assert!(wait_for_scenario_event(&harness, "stop_rejected").await);
+    }
+
+    #[tokio::test]
+    async fn stopping_during_an_approval_delay_does_not_resurrect_the_request() {
+        // `approval_delay_ms` holds the request back so a browser test can scroll
+        // away before it lands. The stop path can only cancel an approval gate that
+        // ALREADY EXISTS, so a stop arriving inside that window has nothing to
+        // cancel: if the delayed turn then went ahead and parked, it would re-arm
+        // `waitingOnApproval` over an idle thread and wait for a decision forever.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = test_scenario_harness(
+            &temp,
+            HashMap::from([(
+                "delayed-approval".to_string(),
+                FakeTurnScenario {
+                    reply: Some("approved".to_string()),
+                    chunks: Some(vec!["approved".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    require_approval: true,
+                    approval_delay_ms: Some(200),
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        );
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        let turn_id = bridge
+            .start_turn(
+                ACTIVE_THREAD,
+                "delayed-approval",
+                "fake-echo",
+                "medium",
+                &[],
+            )
+            .await
+            .expect("turn")
+            .expect("turn id");
+        // Inside the delay: no request has been published yet.
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            state.read().await.pending_approvals.is_empty(),
+            "precondition: the request must still be held back by the delay"
+        );
+
+        bridge
+            .request_turn_stop(ACTIVE_THREAD, Some(&turn_id))
+            .await
+            .expect("stop");
+
+        // Well past the delay: the turn must have given up, not parked.
+        sleep(Duration::from_millis(400)).await;
+        let snapshot = state.read().await;
+        assert!(
+            snapshot.pending_approvals.is_empty(),
+            "a stopped turn must not publish its delayed approval request"
+        );
+        assert!(
+            snapshot.active_turn_id.is_none(),
+            "the stopped turn must stay settled, not re-arm itself"
+        );
+        assert!(
+            !snapshot
+                .active_flags
+                .iter()
+                .any(|flag| flag == "waitingOnApproval"),
+            "the thread must not be left waiting on an approval nobody can answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_racing_the_approval_publish_never_leaves_a_gateless_request() {
+        // The nastier half of the delayed-approval race, and the one a timed stop
+        // cannot reach: `request_turn_stop` sets the stop flag and THEN scans the
+        // gate map, so a stop that scans while the turn sits BETWEEN its stop-flag
+        // check and its gate registration finds nothing to cancel — and the turn
+        // then parks on a channel nobody will ever fire.
+        //
+        // Forced deterministically rather than with a lucky sleep: holding the
+        // state write lock parks the turn exactly in that gap (it has to read state
+        // to decide whether it is still foreground), so the stop is guaranteed to
+        // scan an empty gate map. Whatever order the two then resume in, the thread
+        // must converge to idle with no pending request.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = test_scenario_harness(
+            &temp,
+            HashMap::from([(
+                "delayed-approval".to_string(),
+                FakeTurnScenario {
+                    reply: Some("approved".to_string()),
+                    chunks: Some(vec!["approved".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    require_approval: true,
+                    approval_delay_ms: Some(200),
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        );
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        let turn_id = bridge
+            .start_turn(
+                ACTIVE_THREAD,
+                "delayed-approval",
+                "fake-echo",
+                "medium",
+                &[],
+            )
+            .await
+            .expect("turn")
+            .expect("turn id");
+
+        // Let the turn publish its user message first (that needs the write lock),
+        // then take the lock so the turn parks the moment its delay elapses.
+        sleep(Duration::from_millis(50)).await;
+        let guard = state.write().await;
+
+        let stopper = async {
+            // t≈250ms: past the 200ms delay, so the turn is parked in the gap.
+            sleep(Duration::from_millis(200)).await;
+            bridge
+                .request_turn_stop(ACTIVE_THREAD, Some(&turn_id))
+                .await
+        };
+        let releaser = async {
+            // t≈300ms: the stop has already scanned the (empty) gate map.
+            sleep(Duration::from_millis(250)).await;
+            drop(guard);
+        };
+        let (stop_result, ()) = tokio::join!(stopper, releaser);
+        stop_result.expect("stop");
+
+        sleep(Duration::from_millis(400)).await;
+        let snapshot = state.read().await;
+        assert!(
+            snapshot.pending_approvals.is_empty(),
+            "a stop that raced the publish must not leave a request parked with no gate"
+        );
+        assert!(
+            snapshot.active_turn_id.is_none(),
+            "the stopped turn must settle, not hang on an uncancellable channel"
+        );
+        assert!(
+            !snapshot
+                .active_flags
+                .iter()
+                .any(|flag| flag == "waitingOnApproval"),
+            "the thread must not be left waiting on an approval nobody can answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_threads_during_an_approval_delay_does_not_gate_a_background_turn() {
+        // "Only foreground turns gate" has to hold when the request is PUBLISHED,
+        // not when the turn started. The delay makes that gap wide enough to walk
+        // through: switch the active thread while the request is held back.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = test_scenario_harness(
+            &temp,
+            HashMap::from([(
+                "delayed-approval".to_string(),
+                FakeTurnScenario {
+                    reply: Some("approved".to_string()),
+                    chunks: Some(vec!["approved".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    require_approval: true,
+                    approval_delay_ms: Some(200),
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        );
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(
+                ACTIVE_THREAD,
+                "delayed-approval",
+                "fake-echo",
+                "medium",
+                &[],
+            )
+            .await
+            .expect("turn")
+            .expect("turn id");
+
+        // Inside the delay: the reader moves to another thread.
+        sleep(Duration::from_millis(50)).await;
+        {
+            let mut relay = state.write().await;
+            relay.activate_thread(
+                test_thread("fake-thread-other", "/tmp/project"),
+                "/tmp/project",
+                "fake-echo",
+                "bypass",
+                "workspace-write",
+                "medium",
+                "device-1",
+            );
+        }
+
+        sleep(Duration::from_millis(400)).await;
+        let snapshot = state.read().await;
+        assert!(
+            snapshot.pending_approvals.is_empty(),
+            "a backgrounded turn must not publish an approval request"
+        );
+        assert!(
+            !snapshot
+                .active_flags
+                .iter()
+                .any(|flag| flag == "waitingOnApproval"),
+            "the newly-active thread must not inherit a waiting flag"
+        );
+    }
+
+    async fn wait_for_pending_ask_user(
+        state: &Arc<RwLock<RelayState>>,
+    ) -> Option<PendingAskUserQuestion> {
+        for _ in 0..100 {
+            if let Some(pending) = state
+                .read()
+                .await
+                .pending_ask_user_questions
+                .values()
+                .next()
+                .cloned()
+            {
+                return Some(pending);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    fn ask_user_scenario(temp: &tempfile::TempDir, extra_trailing: bool) -> FakeScenarioHarness {
+        test_scenario_harness(
+            temp,
+            HashMap::from([(
+                "ask".to_string(),
+                FakeTurnScenario {
+                    reply: Some("done".to_string()),
+                    chunks: Some(vec!["done".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    ask_user: true,
+                    ask_user_trailing_text: extra_trailing
+                        .then(|| "Meanwhile, here is some context.".to_string()),
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_scenario_can_park_the_turn_on_a_real_ask_user_question() {
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = ask_user_scenario(&temp, true);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn");
+
+        let pending = wait_for_pending_ask_user(&state)
+            .await
+            .expect("scenario question");
+        assert_eq!(pending.thread_id, ACTIVE_THREAD);
+        assert_eq!(pending.questions.len(), 1);
+        assert_eq!(pending.questions[0].options.len(), 2);
+
+        let snapshot = state.read().await.snapshot();
+        assert!(
+            snapshot
+                .active_flags
+                .iter()
+                .any(|flag| flag == "waitingOnAskUser"),
+            "a parked question must raise the waiting flag"
+        );
+        assert!(
+            snapshot.active_turn_id.is_some(),
+            "the turn stays in flight while the question is outstanding"
+        );
+
+        // The tool entry the frontend matches on, by `tool:<tool_use_id>`.
+        let ask_item_id = format!("tool:{}", pending.tool_use_id);
+        let ask_index = snapshot
+            .transcript
+            .iter()
+            .position(|entry| entry.item_id.as_deref() == Some(ask_item_id.as_str()))
+            .expect("ask-user tool entry");
+        let trailing_index = snapshot
+            .transcript
+            .iter()
+            .position(|entry| {
+                entry
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Meanwhile"))
+            })
+            .expect("trailing entry");
+        // The SERVER keeps natural conversation order — pinning the unanswered
+        // question to the bottom is purely a render-time decision, so that the
+        // entry can drop back into place the moment it is answered.
+        assert!(
+            ask_index < trailing_index,
+            "the server must not reorder the transcript; the pin is a frontend concern"
+        );
+
+        // Answering releases the turn.
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "Which approach should we take?".to_string(),
+            serde_json::json!("Option A"),
+        );
+        bridge
+            .respond_to_ask_user_question(&pending.request_id, &answers)
+            .await
+            .expect("answer accepted");
+
+        for _ in 0..100 {
+            if state.read().await.active_turn_id.is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.read().await.active_turn_id.is_none(),
+            "answering the question must let the turn finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_map_is_rejected_rather_than_silently_unblocking() {
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = ask_user_scenario(&temp, false);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn");
+        let pending = wait_for_pending_ask_user(&state)
+            .await
+            .expect("scenario question");
+
+        assert!(
+            bridge
+                .respond_to_ask_user_question(&pending.request_id, &serde_json::Map::new())
+                .await
+                .is_err(),
+            "an empty answer map means the wizard was skipped"
+        );
+        assert!(
+            !state.read().await.pending_ask_user_questions.is_empty(),
+            "the question stays outstanding after a rejected answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_turn_parked_on_a_question_settles_it() {
+        // Same hazard as the approval gate: a parked question must be cancellable,
+        // or `stop` leaves the turn waiting on a channel nobody will ever fire.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = ask_user_scenario(&temp, false);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        let turn_id = bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn")
+            .expect("turn id");
+        wait_for_pending_ask_user(&state)
+            .await
+            .expect("scenario question");
+
+        bridge
+            .request_turn_stop(ACTIVE_THREAD, Some(&turn_id))
+            .await
+            .expect("stop");
+
+        for _ in 0..100 {
+            if state.read().await.active_turn_id.is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = state.read().await;
+        assert!(
+            snapshot.active_turn_id.is_none(),
+            "a stopped turn must not hang on an unanswerable question"
+        );
+        assert!(
+            !snapshot
+                .active_flags
+                .iter()
+                .any(|flag| flag == "waitingOnAskUser"),
+            "the waiting flag must be cleared by the stop"
+        );
+    }
+
+    fn delayed_ask_user_scenario(temp: &tempfile::TempDir) -> FakeScenarioHarness {
+        test_scenario_harness(
+            temp,
+            HashMap::from([(
+                "ask".to_string(),
+                FakeTurnScenario {
+                    reply: Some("done".to_string()),
+                    chunks: Some(vec!["done".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    ask_user: true,
+                    ask_user_delay_ms: Some(200),
+                    ask_user_trailing_text: Some("Meanwhile, here is some context.".to_string()),
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        )
+    }
+
+    #[tokio::test]
+    async fn stopping_inside_the_ask_user_delay_leaves_no_ghost_question_card() {
+        // Writing the question's tool card before checking the stop flag left a
+        // `running` card (and its trailing message) behind on a turn that had
+        // already been told to stop — content resurrected after cancellation.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = delayed_ask_user_scenario(&temp);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        let turn_id = bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn")
+            .expect("turn id");
+        sleep(Duration::from_millis(50)).await;
+        bridge
+            .request_turn_stop(ACTIVE_THREAD, Some(&turn_id))
+            .await
+            .expect("stop");
+
+        sleep(Duration::from_millis(400)).await;
+        let snapshot = state.read().await.snapshot();
+        assert!(
+            snapshot.pending_ask_user_questions.is_empty(),
+            "a stopped turn must not publish its delayed question"
+        );
+        assert!(
+            !snapshot.transcript.iter().any(|entry| entry
+                .tool
+                .as_ref()
+                .is_some_and(|tool| tool.name == "AskUserQuestion")),
+            "no ghost question card may be left in the transcript"
+        );
+        assert!(
+            !snapshot.transcript.iter().any(|entry| entry
+                .text
+                .as_deref()
+                .is_some_and(|t| t.contains("Meanwhile"))),
+            "the trailing message must not appear either"
+        );
+        assert!(snapshot.active_turn_id.is_none(), "the turn must settle");
+    }
+
+    #[tokio::test]
+    async fn switching_threads_inside_the_ask_user_delay_publishes_nothing() {
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = delayed_ask_user_scenario(&temp);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn");
+        sleep(Duration::from_millis(50)).await;
+        {
+            let mut relay = state.write().await;
+            relay.activate_thread(
+                test_thread("fake-thread-other", "/tmp/project"),
+                "/tmp/project",
+                "fake-echo",
+                "bypass",
+                "workspace-write",
+                "medium",
+                "device-1",
+            );
+        }
+
+        sleep(Duration::from_millis(400)).await;
+        let snapshot = state.read().await.snapshot();
+        assert!(
+            snapshot.pending_ask_user_questions.is_empty(),
+            "a backgrounded turn must not publish a question"
+        );
+        assert!(
+            !snapshot.transcript.iter().any(|entry| entry
+                .tool
+                .as_ref()
+                .is_some_and(|tool| tool.name == "AskUserQuestion")),
+            "and must not leave a question card stuck on `running`"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_that_was_actually_given_is_what_gets_recorded() {
+        // The result preview used to be hardcoded to Option A, so choosing
+        // anything else was misreported in the saved history.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = ask_user_scenario(&temp, false);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn");
+        let pending = wait_for_pending_ask_user(&state)
+            .await
+            .expect("scenario question");
+
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "Which approach should we take?".to_string(),
+            serde_json::json!("Option B — actually, let us reconsider"),
+        );
+        bridge
+            .respond_to_ask_user_question(&pending.request_id, &answers)
+            .await
+            .expect("answer accepted");
+
+        for _ in 0..100 {
+            if state.read().await.active_turn_id.is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = state.read().await.snapshot();
+        let ask_entry = snapshot
+            .transcript
+            .iter()
+            .find(|entry| {
+                entry
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "AskUserQuestion")
+            })
+            .expect("ask-user entry");
+        let preview = ask_entry
+            .tool
+            .as_ref()
+            .and_then(|tool| tool.result_preview.as_deref())
+            .unwrap_or_default();
+        assert!(
+            preview.contains("Option B — actually, let us reconsider"),
+            "the recorded answer must be the one that was given, got: {preview}"
+        );
+        assert!(
+            !preview.contains("Option A"),
+            "an answer that was never chosen must not be recorded, got: {preview}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_question_is_never_recorded_as_answered() {
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = ask_user_scenario(&temp, false);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        let turn_id = bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn")
+            .expect("turn id");
+        wait_for_pending_ask_user(&state)
+            .await
+            .expect("scenario question");
+        bridge
+            .request_turn_stop(ACTIVE_THREAD, Some(&turn_id))
+            .await
+            .expect("stop");
+
+        sleep(Duration::from_millis(300)).await;
+        let snapshot = state.read().await.snapshot();
+        let ask_entry = snapshot
+            .transcript
+            .iter()
+            .find(|entry| {
+                entry
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "AskUserQuestion")
+            })
+            .expect("ask-user entry");
+        assert_eq!(
+            ask_entry
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.result_preview.clone()),
+            None,
+            "a cancelled question must carry no answer at all"
+        );
+        assert_eq!(
+            ask_entry.status, "failed",
+            "and must be terminal rather than stuck on running"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answered_question_and_its_trailing_message_persist_with_the_turn() {
+        // They were only written to the live RelayState, so a thread re-read (or
+        // switching away and back) dropped both — which is exactly the history
+        // that "an answered question returns to its original position" relies on.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = ask_user_scenario(&temp, true);
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        bridge
+            .start_turn(ACTIVE_THREAD, "ask", "fake-echo", "medium", &[])
+            .await
+            .expect("turn");
+        let pending = wait_for_pending_ask_user(&state)
+            .await
+            .expect("scenario question");
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "Which approach should we take?".to_string(),
+            serde_json::json!("Option A"),
+        );
+        bridge
+            .respond_to_ask_user_question(&pending.request_id, &answers)
+            .await
+            .expect("answer accepted");
+
+        for _ in 0..100 {
+            if state.read().await.active_turn_id.is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let stored = bridge
+            .read_thread(ACTIVE_THREAD)
+            .await
+            .expect("read thread");
+        let ask_index = stored
+            .transcript
+            .iter()
+            .position(|entry| {
+                entry
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "AskUserQuestion")
+            })
+            .expect("the answered question must persist");
+        let trailing_index = stored
+            .transcript
+            .iter()
+            .position(|entry| {
+                entry
+                    .text
+                    .as_deref()
+                    .is_some_and(|t| t.contains("Meanwhile"))
+            })
+            .expect("the trailing message must persist");
+        assert!(
+            ask_index < trailing_index,
+            "persisted history keeps natural conversation order (the pin is render-only)"
+        );
     }
 
     #[tokio::test]
