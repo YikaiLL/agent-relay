@@ -46,7 +46,6 @@ async function main() {
     indexFile: "remote.html",
     pathAliases: {
       "/manifest.webmanifest": "remote-manifest.webmanifest",
-      "/static/icon.svg": "icon.svg",
       "/static/remote-sw.js": "remote-sw.js",
     },
     stripStaticPrefix: true,

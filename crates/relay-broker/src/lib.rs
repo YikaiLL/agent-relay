@@ -896,7 +896,6 @@ fn app_with_web_root_and_verifier_and_hardening_and_licenses(
             ServeFile::new(web_root.join("remote-manifest.webmanifest")),
         )
         .route_service("/sw.js", ServeFile::new(web_root.join("remote-sw.js")))
-        .route_service("/icon.svg", ServeFile::new(web_root.join("icon.svg")))
         .route_service(
             "/apple-touch-icon.png",
             ServeFile::new(web_root.join("apple-touch-icon.png")),

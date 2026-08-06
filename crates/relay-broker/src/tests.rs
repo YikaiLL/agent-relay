@@ -359,11 +359,6 @@ fn test_web_root() -> PathBuf {
         r#"self.addEventListener("install", () => {}); const CACHE = "agent-relay-remote-v1";"#,
     )
     .expect("service worker should write");
-    fs::write(
-        root.join("icon.svg"),
-        r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
-    )
-    .expect("icon should write");
     fs::write(assets.join("remote-test.js"), "console.log('remote');").expect("asset should write");
     // A non-hashed static file served from the web root (not /static/assets/):
     // the frontend fetches this at runtime to detect new builds, so it must
