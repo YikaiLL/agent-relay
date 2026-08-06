@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/logo.svg" width="64" height="64" alt="sealwire logo">
+  <img src="docs/images/logo.png" width="64" height="64" alt="sealwire logo">
 </p>
 
 <h1 align="center">sealwire</h1>
