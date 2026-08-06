@@ -1,5 +1,6 @@
 import React from "react";
 
+import { providerMarkSlot } from "./provider-mark.js";
 import { clampReviewRounds } from "./review-panel.js";
 import { selectReviewerCatalogState } from "./review-state.js";
 import {
@@ -150,18 +151,23 @@ export function CodeFlowPanel({
       }),
       h("label", { className: "sidebar-label", htmlFor: `${id}-provider` }, "Reviewer provider"),
       h(
-        "select",
-        {
-          id: `${id}-provider`,
-          className: "control-input",
-          value: reviewerProvider,
-          onChange: (event) => {
-            setReviewerProvider(event.target.value);
-            setReviewerModel("");
+        "div",
+        { className: "select-with-mark" },
+        providerMarkSlot(reviewerProvider, { className: "select-mark" }),
+        h(
+          "select",
+          {
+            id: `${id}-provider`,
+            className: "control-input",
+            value: reviewerProvider,
+            onChange: (event) => {
+              setReviewerProvider(event.target.value);
+              setReviewerModel("");
+            },
           },
-        },
-        h("option", { value: "" }, "Select a provider…"),
-        ...providerSelectOptions
+          h("option", { value: "" }, "Select a provider…"),
+          ...providerSelectOptions
+        )
       ),
       providerModels.length
         ? h(

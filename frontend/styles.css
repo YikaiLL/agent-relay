@@ -3375,6 +3375,44 @@ input:focus, textarea:focus, select:focus {
   gap: 6px;
   min-width: 0;
 }
+/* The vendor's logo rides inside the chip's own pill rather than beside it, so
+   the control still reads as one object. The slot is always in the DOM (empty
+   for a vendor we ship no mark for) and the leading padding is keyed off
+   [data-provider], which only appears when a logo actually rendered — an empty
+   slot therefore costs no indent. */
+.composer-model-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+.composer-model-mark {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  color: var(--text-tertiary);
+  /* Clicks belong to the select underneath, whose hit area the mark overlaps. */
+  pointer-events: none;
+}
+.composer-model-mark svg {
+  width: 14px;
+  height: 14px;
+}
+.composer-model-mark[data-provider="claude_code"] {
+  color: var(--provider-claude-mark);
+}
+/* Adjacent-sibling, not :has() — the slot is always the element right before the
+   select, so the cheap combinator does the job and works everywhere. This is
+   load-bearing rather than cosmetic: the mark is absolutely positioned, so a
+   browser that failed to apply the indent would paint the logo ON TOP of the
+   model name, not merely un-indented. */
+.composer-model-mark[data-provider] + .composer-model-chip {
+  padding-left: 30px;
+}
 .composer-model-chip {
   appearance: none;
   -webkit-appearance: none;
@@ -5400,6 +5438,38 @@ body.is-resizing-panel {
 .provider-mark svg {
   width: 14px;
   height: 14px;
+}
+
+/* A native <select> with the chosen provider's logo tucked into its leading
+   padding. Same construction as the composer's model chip: an always-present
+   slot, indent applied only when a mark actually rendered, and no pointer
+   events so the whole control stays one click target. */
+.select-with-mark {
+  position: relative;
+  display: block;
+}
+.select-with-mark .select-mark {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+.select-with-mark .select-mark svg {
+  width: 14px;
+  height: 14px;
+}
+.select-with-mark .select-mark[data-provider="claude_code"] {
+  color: var(--provider-claude-mark);
+}
+/* See the composer chip's twin rule: adjacent-sibling rather than :has(), because
+   an unapplied indent would put the logo on top of the provider name. */
+.select-with-mark .select-mark[data-provider] + select {
+  padding-left: 32px;
 }
 
 .session-tab-pin,

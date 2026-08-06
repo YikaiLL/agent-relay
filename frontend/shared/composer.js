@@ -6,6 +6,7 @@ import {
   defaultEnterSubmits,
   defaultRemapHomeEnd,
 } from "./composer-keys.js";
+import { providerMarkSlot } from "./provider-mark.js";
 
 const h = React.createElement;
 
@@ -96,6 +97,11 @@ export function ConversationComposer({
     "aria-label": "Model",
   };
   const modelOptions = buildModelOptions(models, currentModelValue);
+  // The vendor behind the *selected* model, which is what the chip's mark shows.
+  // Undefined on the local surface, whose catalog arrives after render — it
+  // fills the slot by id instead (see syncComposerModelMark in app.js).
+  const selectedModelVendor =
+    modelOptions.find((model) => model.model === currentModelValue)?.provider || "";
 
   if (currentDraft !== undefined) {
     textareaProps.value = currentDraft;
@@ -141,14 +147,36 @@ export function ConversationComposer({
       "div",
       { className: "composer-actions" },
       actionsBeforeSend,
+      // The chip's leading slot carries the vendor's logo, so the option text
+      // no longer prefixes it ("anthropic · Sonnet 4.6" beside an Anthropic
+      // mark was both redundant and, under the chip's 18ch cap, the first thing
+      // to be ellipsed away). The local surface never showed the prefix, so
+      // dropping it also settles a long-standing local/remote disagreement.
       modelOptions.length
         ? h(
-            "select",
-            modelSelectProps,
-            ...modelOptions.map((model) => {
-              const tag = model.provider ? `${model.provider} · ` : "";
-              return h("option", { key: model.model, value: model.model }, `${tag}${model.display_name || model.model}`);
-            })
+            "span",
+            { className: "composer-model-picker" },
+            providerMarkSlot(selectedModelVendor, {
+              className: "composer-model-mark",
+              id: `${modelId}-mark`,
+            }),
+            h(
+              "select",
+              modelSelectProps,
+              ...modelOptions.map((model) =>
+                h(
+                  "option",
+                  {
+                    key: model.model,
+                    value: model.model,
+                    // Read back by the local surface's change handler, which has
+                    // no React state to consult when refreshing the mark.
+                    "data-provider": model.provider || undefined,
+                  },
+                  model.display_name || model.model
+                )
+              )
+            )
           )
         : null,
       h(

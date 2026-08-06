@@ -182,6 +182,7 @@ import {
 } from "./shared/context-menu-position.js";
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
+import { applyProviderMark } from "./shared/provider-mark.js";
 import { ForkSessionDialog } from "./shared/fork-session-dialog.js";
 import { forkCompletionEffect } from "./local/fork-submit-ownership.js";
 import {
@@ -2589,6 +2590,10 @@ modelInput?.addEventListener("change", () => {
 });
 
 messageModel?.addEventListener("change", () => {
+  // Keep the chip's logo on the model the user just picked. Unconditional and
+  // first, because the effort bookkeeping below bails out when there's no
+  // session provider — the mark must not be left showing the previous vendor.
+  syncComposerModelMark();
   // Effort is no longer in the composer; the popover owns it. Just react
   // to model changes so an effort default can still be persisted for this
   // provider+model pair.
@@ -2987,6 +2992,9 @@ function seedDefaults(session) {
     }
     state.defaultsSeeded = true;
   }
+  // After both the option refresh and the seed assignment above — a direct
+  // `.value =` fires no change event, so the mark would otherwise lag a render.
+  syncComposerModelMark();
 
   // Effort is no longer rendered in the composer (it lives in the settings
   // popover and persists via localStorage). If a stale messageEffort element
@@ -3073,6 +3081,9 @@ function syncModelSuggestions(
 
   const renderedOptions = options.map((model) => ({
     label: model.display_name || model.model,
+    // Carried onto the <option> so a picker's logo slot can resolve the vendor
+    // from the DOM alone (this surface renders options outside React).
+    provider: model.provider || "",
     value: model.model,
   }));
   if (replaceExisting) {
@@ -3080,6 +3091,21 @@ function syncModelSuggestions(
   } else {
     renderSelectOptions(select, renderedOptions, currentValue);
   }
+}
+
+// The composer chip's logo, for the surface that renders its options outside
+// React. Reads the vendor off the selected <option> rather than re-deriving it
+// from state, so it stays correct whether the change came from the user or from
+// a snapshot reasserting the session's model.
+function syncComposerModelMark() {
+  if (!messageModel) {
+    return;
+  }
+  const selected = messageModel.selectedOptions?.[0];
+  applyProviderMark(
+    document.getElementById("message-model-mark"),
+    selected?.dataset?.provider || ""
+  );
 }
 
 function syncComposerModelForRenderedSession(session) {
@@ -3104,6 +3130,7 @@ function syncComposerModelForRenderedSession(session) {
     !session.view_only,
     true
   );
+  syncComposerModelMark();
 }
 
 function syncProviderSuggestions(select, providers, selectedProvider) {

@@ -1,5 +1,6 @@
 import React from "react";
 
+import { providerMarkSlot } from "./provider-mark.js";
 import { selectReviewerCatalogState } from "./review-state.js";
 
 export {
@@ -284,17 +285,22 @@ export function ReviewPanel({
       ),
       h("label", { className: "sidebar-label", htmlFor: `${id}-provider` }, "Reviewer provider"),
       h(
-        "select",
-        {
-          id: `${id}-provider`,
-          className: "control-input",
-          value: reviewerProvider,
-          // Always changeable: switching the provider off a reused session falls back to a
-          // clean reviewer of the new provider (highlighted on the reviewer-session field).
-          onChange: (event) => selectProvider(event.target.value),
-        },
-        h("option", { value: "" }, "Select a provider…"),
-        ...providerSelectOptions
+        "div",
+        { className: "select-with-mark" },
+        providerMarkSlot(reviewerProvider, { className: "select-mark" }),
+        h(
+          "select",
+          {
+            id: `${id}-provider`,
+            className: "control-input",
+            value: reviewerProvider,
+            // Always changeable: switching the provider off a reused session falls back to a
+            // clean reviewer of the new provider (highlighted on the reviewer-session field).
+            onChange: (event) => selectProvider(event.target.value),
+          },
+          h("option", { value: "" }, "Select a provider…"),
+          ...providerSelectOptions
+        )
       ),
       // Model + effort are selectable for clean AND reused reviewers. On reuse the
       // empty option keeps the reviewer thread's own model/effort; picking a value
