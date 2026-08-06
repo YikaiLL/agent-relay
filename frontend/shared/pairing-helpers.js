@@ -3,10 +3,13 @@ export function pairingNowSeconds() {
 }
 
 // Fallback used when a snapshot doesn't carry `expires_at` (e.g. an older
-// relay-server binary that pre-dates the field). Matches the current backend
-// default so behavior is consistent against the matching backend, and at worst
-// slightly aggressive against a 90s-default legacy backend.
-const FALLBACK_PAIRING_TTL_SECS = 30;
+// relay-server binary that pre-dates the field). Mirrors DEFAULT_PAIRING_TTL_SECS
+// in crates/relay-server/src/state/relay/device.rs — keep the two in sync.
+// Against a legacy 30s-default backend this errs generous rather than
+// aggressive: a dead request may linger in the UI until the backend drops it
+// from the snapshot, which is the safer failure direction (we never hide a
+// request the user could still approve).
+const FALLBACK_PAIRING_TTL_SECS = 180;
 
 // Compute the effective expiry timestamp for a request, falling back to
 // requested_at + FALLBACK_PAIRING_TTL_SECS if expires_at isn't available.

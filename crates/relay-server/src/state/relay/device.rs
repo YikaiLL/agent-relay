@@ -17,7 +17,10 @@ use crate::protocol::{
 
 use super::RelayState;
 
-const DEFAULT_PAIRING_TTL_SECS: u64 = 30;
+// The pairing TTL is the *whole* approval budget, not just QR-scan time: the
+// ticket has to stay valid while the human scans on the phone and then walks
+// over to the laptop to hit Approve. 3 minutes covers that comfortably.
+const DEFAULT_PAIRING_TTL_SECS: u64 = 180;
 const MAX_PAIRING_TTL_SECS: u64 = 600;
 const CLAIM_CHALLENGE_TTL_SECS: u64 = 60;
 #[derive(Clone, Debug, Serialize, Deserialize)]

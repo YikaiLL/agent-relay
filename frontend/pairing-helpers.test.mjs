@@ -28,19 +28,19 @@ test("filterActivePairings keeps entries with no expires_at AND no requested_at 
   assert.deepEqual(result, [{ pairing_id: "p1" }]);
 });
 
-test("filterActivePairings: missing expires_at falls back to requested_at + 30s (old backend safety net)", () => {
+test("filterActivePairings: missing expires_at falls back to requested_at + 180s (old backend safety net)", () => {
   // Simulates a relay-server build that pre-dates the expires_at field.
-  // requested_at=1000, fallback TTL=30 → effective expiry = 1030.
+  // requested_at=1000, fallback TTL=180 → effective expiry = 1180.
   const legacy = [{ pairing_id: "p1", requested_at: 1_000 }];
-  assert.equal(filterActivePairings(legacy, 1_020).length, 1, "still active at +20s");
-  assert.equal(filterActivePairings(legacy, 1_030).length, 0, "filtered at +30s (boundary)");
-  assert.equal(filterActivePairings(legacy, 1_100).length, 0, "filtered well past fallback expiry");
+  assert.equal(filterActivePairings(legacy, 1_170).length, 1, "still active at +170s");
+  assert.equal(filterActivePairings(legacy, 1_180).length, 0, "filtered at +180s (boundary)");
+  assert.equal(filterActivePairings(legacy, 1_500).length, 0, "filtered well past fallback expiry");
 });
 
-test("earliestPairingExpiry: uses requested_at + 30s fallback when expires_at missing", () => {
+test("earliestPairingExpiry: uses requested_at + 180s fallback when expires_at missing", () => {
   assert.equal(
     earliestPairingExpiry([{ pairing_id: "p1", requested_at: 1_000 }]),
-    1_030
+    1_180
   );
   // expires_at, when present, takes precedence over the fallback.
   assert.equal(

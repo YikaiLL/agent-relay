@@ -4042,6 +4042,24 @@ fn ensure_path_within_device_scope_passes_when_device_scope_empty() {
 }
 
 #[test]
+fn prepare_pairing_ticket_defaults_to_a_three_minute_approval_window() {
+    // The default TTL is the whole approval budget: it has to cover the human
+    // walking from phone to laptop and hitting Approve. 30s was not enough.
+    let mut relay = test_state();
+    let before = unix_now();
+    let prepared = relay
+        .prepare_pairing_ticket(None, Vec::new())
+        .expect("pairing ticket should prepare");
+    let after = unix_now();
+
+    assert!(
+        prepared.expires_at >= before + 180 && prepared.expires_at <= after + 180,
+        "default pairing TTL should be 180s (3 minutes); got expires_at={} with now in {before}..={after}",
+        prepared.expires_at
+    );
+}
+
+#[test]
 fn prepare_pairing_ticket_carries_path_scope() {
     let mut relay = test_state();
     let scope = vec![
