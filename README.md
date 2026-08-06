@@ -70,6 +70,12 @@ new sessions. Its own state — sessions, projects, paired devices — lives in
 `~/.agent-relay/`, one set per machine, so `cd`-ing elsewhere doesn't fork your
 history.
 
+Run that same command on whatever machine is already always-on — a desktop, a
+home server, the VM that holds the repo — and long work keeps going with your
+laptop shut, reachable from anywhere you've paired. There is nothing to deploy:
+the relay wants to sit next to the workspace and the logged-in CLI, so a box you
+already own beats a container.
+
 ### Pair a phone
 
 ```bash
@@ -205,9 +211,6 @@ Also in focus:
   behind it is not written yet
 - providers beyond Codex and Claude Code
 - native mobile, only where the web hits real limits
-- somewhere always-on to run a long task list, so it keeps going with the laptop
-  shut. Only the *broker* is containerised today (`docker/broker.Dockerfile`);
-  what the relay's deployment story should look like is still an open question
 - later: team workflows
 
 Not on the roadmap today: multi-user hosted collaboration, untrusted tenants
