@@ -10,8 +10,12 @@
 //! restore side reconciles a stranded run to the terminal `Interrupted` state
 //! (deterministic fail-and-re-run from the last completed task, not resume).
 //!
-//! This module is the DATA MODEL only (brick 1). The serial driver, protocol
-//! view, git checkpointing, and UI land in later bricks. See
+//! This module is the DATA MODEL (brick 1). The serial driver that consumes it
+//! landed in brick 2 — see `state/app/task_list.rs`. Still to come: persistence +
+//! protocol view + HTTP/broker routes (brick 3), git checkpointing after each
+//! `Done` task (brick 4), and the UI (brick 5). Until brick 3 lands a run is
+//! IN-MEMORY ONLY and does not survive a restart, so `TaskListRun`'s persistence
+//! comments above describe the intended contract, not current behaviour. See
 //! `markdown/task-list-runner-design.md`.
 
 // Later bricks (driver / protocol view / UI) consume these; keep the model ahead
