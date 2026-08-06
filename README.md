@@ -16,7 +16,7 @@
   </a>
 </p>
 
-<p align="center">A software agent team on your own machine. Hand it work and walk away.</p>
+<p align="center">A software agent team on your own machine. Hand off the work and walk away.</p>
 
 <p align="center">
   <img src="docs/images/desktop-session.png" alt="sealwire desktop: session list, live transcript, workspace diff" width="100%">
