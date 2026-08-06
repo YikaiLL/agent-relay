@@ -101,8 +101,8 @@ fn require_live_test_cwd(
 #[cfg(test)]
 mod workspace_diff_tests {
     use super::super::{
-        apply_unified_diff, collect_workspace_diff, synthesize_untracked_diff,
-        truncate_to_char_boundary,
+        apply_unified_diff, collect_workspace_diff, collect_workspace_diff_against,
+        merge_base_with, synthesize_untracked_diff, truncate_to_char_boundary, LiveWorkspace,
     };
     use crate::protocol::FileChangeApplyDirection;
     use tempfile::TempDir;
@@ -142,6 +142,121 @@ mod workspace_diff_tests {
             .current_dir(&path))
         .await;
         dir
+    }
+
+    #[tokio::test]
+    async fn the_mr_diff_uses_the_merge_base_so_target_only_commits_are_excluded() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+
+        // Fork a task branch and land a commit on it.
+        let task_dir = root.join("task-wt");
+        run(Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--no-track",
+                "-b",
+                "task/x",
+                task_dir.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&root))
+        .await;
+        std::fs::write(task_dir.join("task.txt"), "task work\n").unwrap();
+        run(Command::new("git")
+            .args(["add", "task.txt"])
+            .current_dir(&task_dir))
+        .await;
+        run(Command::new("git")
+            .args(["commit", "-q", "-m", "task work"])
+            .current_dir(&task_dir))
+        .await;
+
+        // Meanwhile the target moves on. THIS is the commit a two-dot
+        // `git diff main` would report reversed, as if the task had deleted it.
+        std::fs::write(root.join("main-only.txt"), "landed on main\n").unwrap();
+        run(Command::new("git")
+            .args(["add", "main-only.txt"])
+            .current_dir(&root))
+        .await;
+        run(Command::new("git")
+            .args(["commit", "-q", "-m", "main moves on"])
+            .current_dir(&root))
+        .await;
+
+        // And the team still has work in flight.
+        std::fs::write(task_dir.join("wip.txt"), "not committed yet\n").unwrap();
+
+        let workspace = LiveWorkspace::from_path(task_dir.to_str().unwrap()).expect("workspace");
+        let base = merge_base_with(&workspace, "main")
+            .await
+            .expect("merge base should resolve");
+        let diff = collect_workspace_diff_against(&workspace, Some(&base))
+            .await
+            .expect("diff");
+
+        let paths: Vec<&str> = diff
+            .file_changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"task.txt"),
+            "committed task work belongs in the MR view, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"wip.txt"),
+            "a mid-run MR view must be honest about uncommitted work, got {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"main-only.txt"),
+            "a commit that landed on the target AFTER the fork is not this task's change, got {paths:?}"
+        );
+        assert_eq!(diff.base_commit.as_deref(), Some(base.as_str()));
+    }
+
+    #[tokio::test]
+    async fn omitting_a_base_keeps_the_existing_head_behaviour() {
+        // Regression guard for the refactor: the default path must still be
+        // "working tree vs HEAD", byte for byte.
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("seed.txt"), "line1\nline2\nline3\n").unwrap();
+
+        let workspace = LiveWorkspace::from_path(root.to_str().unwrap()).expect("workspace");
+        let against_head = collect_workspace_diff_against(&workspace, None)
+            .await
+            .expect("diff");
+        let legacy = collect_workspace_diff(root.to_str().unwrap())
+            .await
+            .expect("diff");
+
+        assert_eq!(against_head.diff, legacy.diff);
+        assert_eq!(
+            against_head.file_changes.len(),
+            legacy.file_changes.len(),
+            "the default path must be unchanged"
+        );
+        assert!(
+            against_head.base_commit.is_none(),
+            "no base means the plain working-tree-vs-HEAD view, with nothing to label"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_merge_base_is_none_rather_than_an_error() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let workspace = LiveWorkspace::from_path(root.to_str().unwrap()).expect("workspace");
+
+        assert!(
+            merge_base_with(&workspace, "no-such-branch")
+                .await
+                .is_none(),
+            "a missing target degrades to None so the caller can fall back to HEAD"
+        );
     }
 
     #[test]

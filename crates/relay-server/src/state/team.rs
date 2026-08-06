@@ -1,0 +1,1106 @@
+//! Task team runner model.
+//!
+//! A `TeamRun` is one execution of the fixed three-role team — TL, dev, reviewer
+//! — against a user-written `TaskSpec`, inside a dedicated git worktree. It holds
+//! only orchestration metadata: every agent's real output lives in the background
+//! thread it names, and the TL's plan/design/report live as files in the worktree.
+//!
+//! Two things here differ from `WorkflowRun` on purpose, and both are load-bearing:
+//!
+//! 1. **`TeamRunStatus` is its own enum, not `RunStatus`.** It has to carry
+//!    `Paused`/`PausePending`/`AwaitingUser`, and adding a variant to the shared
+//!    `RunStatus` would be a persistence trap: an unknown status string is a hard
+//!    serde error, `PersistenceStore::load` turns that into `Err`, and `AppState::new`
+//!    responds by discarding the ENTIRE `session.json` — paired devices, projects,
+//!    allowed roots and all. So this enum decodes leniently (unknown -> `Failed`),
+//!    which is the property `RunStatus` is missing.
+//!
+//! 2. **`Paused` is durable and survives restore.** Every other non-terminal run in
+//!    this codebase reconciles to `Interrupted` when its driver is lost, because a
+//!    run persisted `Running` with no driver would strand its locks. A paused run is
+//!    the deliberate case of exactly that, so the exemption lives inside
+//!    `mark_interrupted_if_stranded` rather than in its callers — neither the restore
+//!    path nor the lifeguard can then forget it.
+//!
+//! Resumability contract: `(phase, each sub-task's status + digested flag, the round
+//! counters, the verdicts)` is sufficient to decide the next action, and
+//! `next_team_action` is a pure function of the record that proves it. The driver
+//! advances `phase` in the SAME write that records a step's result, so a crash
+//! re-runs at most the last turn. See `markdown/task-team-design.md` §5.
+
+// The driver (brick 4) and the HTTP surface (brick 11) consume these; keep the
+// model ahead of its wiring without dead-code warnings, mirroring
+// `state/workflow.rs` and `state/task_list.rs`.
+#![allow(dead_code)]
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use super::unix_now;
+use super::workflow::WorkflowVerdict;
+
+/// Hard ceiling on review rounds per sub-task. The product rule is "at most two
+/// rounds, one is fine"; this clamps whatever a caller asks for.
+pub(crate) const MAX_SUBTASK_REVIEW_ROUNDS: u32 = 2;
+/// Same ceiling for the final MR gate.
+pub(crate) const MAX_MR_ROUNDS: u32 = 2;
+/// How many times the TL may be re-seeded before the run gives up. A re-seed loop
+/// would otherwise burn tokens forever on a task the TL cannot hold.
+pub(crate) const MAX_TL_GENERATIONS: usize = 8;
+
+/// Lifecycle of a team run.
+///
+/// Terminal: `Done`, `Escalated`, `Failed`, `Interrupted`, `Cancelled`.
+/// Non-terminal with a live driver: `Queued`, `Running`, `PausePending`,
+/// `AwaitingUser`, `Resolving`.
+/// Non-terminal WITHOUT a driver: `Paused` (durable, re-spawnable) and `Blocked`
+/// (a stop could not be confirmed; keeps owning its threads until recovery).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TeamRunStatus {
+    /// Recorded, driver not yet started.
+    Queued,
+    /// The driver is working through actions.
+    Running,
+    /// A pause was requested. The driver is alive and finishing the in-flight
+    /// turn; it settles to `Paused` at the next step boundary.
+    PausePending,
+    /// Settled at a boundary with no driver alive. Survives restart verbatim and
+    /// can be resumed from the record. THIS is the state the interrupt
+    /// reconciliation must not touch.
+    Paused,
+    /// A dev or TL thread is parked on an `AskUserQuestion`. The turn is NOT
+    /// stopped — it is blocked inside the provider's tool callback and continues
+    /// the moment the answer lands.
+    AwaitingUser,
+    /// The MR gate approved and every sub-task landed. TERMINAL.
+    Done,
+    /// A round budget ran out somewhere; unresolved items are written out.
+    /// TERMINAL.
+    Escalated,
+    /// A stop path could not confirm a file-mutating turn actually stopped.
+    /// Non-terminal on purpose: the run keeps owning its threads and worktree
+    /// until an explicit recovery.
+    Blocked,
+    /// An explicit recovery action is draining owned turns. Non-terminal so
+    /// duplicate recoveries cannot drain the same threads twice.
+    Resolving,
+    /// The safe fallback: also what an unknown or missing persisted status
+    /// decodes to, so a forward-compat state file can never strand a lock.
+    /// TERMINAL.
+    #[default]
+    Failed,
+    /// The driver was lost while non-terminal and the run was not paused.
+    /// TERMINAL — the card offers a re-run.
+    Interrupted,
+    /// The user stopped the run. TERMINAL.
+    Cancelled,
+}
+
+impl TeamRunStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::PausePending => "pause_pending",
+            Self::Paused => "paused",
+            Self::AwaitingUser => "awaiting_user",
+            Self::Done => "done",
+            Self::Escalated => "escalated",
+            Self::Blocked => "blocked",
+            Self::Resolving => "resolving",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Decode a persisted status, treating anything unrecognized as the safe
+    /// terminal `Failed`. Unlike `RunStatus`, an unknown value here must never
+    /// become a serde error — see the module docs for what that would cost.
+    pub(crate) fn from_wire(raw: &str) -> Self {
+        match raw {
+            "queued" => Self::Queued,
+            "running" => Self::Running,
+            "pause_pending" => Self::PausePending,
+            "paused" => Self::Paused,
+            "awaiting_user" => Self::AwaitingUser,
+            "done" => Self::Done,
+            "escalated" => Self::Escalated,
+            "blocked" => Self::Blocked,
+            "resolving" => Self::Resolving,
+            "interrupted" => Self::Interrupted,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Failed,
+        }
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Done | Self::Escalated | Self::Failed | Self::Interrupted | Self::Cancelled
+        )
+    }
+
+    /// Whether a driver can be spawned for this run as-is.
+    pub(crate) fn is_resumable(self) -> bool {
+        matches!(self, Self::Paused)
+    }
+
+    /// Whether the run holds its threads and worktree without a driver to move
+    /// them. `Blocked` waits for an explicit recovery; `Paused` waits for the user.
+    fn is_sticky(self) -> bool {
+        matches!(self, Self::Blocked | Self::Resolving)
+    }
+}
+
+impl<'de> Deserialize<'de> for TeamRunStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // `Option<String>` rather than `String` so an explicit `null` degrades to
+        // the safe default instead of failing the whole state file.
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(raw.as_deref().map(Self::from_wire).unwrap_or_default())
+    }
+}
+
+/// The user's Task, verbatim.
+///
+/// IMMUTABLE by construction: only `TeamRun::new` sets it and there is no `&mut`
+/// accessor. The TL owns the plan file and may rewrite it freely, but it must not
+/// be able to edit the thing it is being measured against — `agreed_scope` and
+/// `quality_rules` are the MR gate's yardstick.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TaskSpec {
+    pub(crate) title: String,
+    pub(crate) context: String,
+    pub(crate) acceptance_criteria: String,
+    pub(crate) agreed_scope: String,
+    pub(crate) quality_rules: String,
+}
+
+/// Where the run is in the fixed pipeline.
+///
+/// Decodes leniently for the same reason `TeamRunStatus` does — a strict derive
+/// here would make one unknown value from a newer build fail the whole
+/// `PersistedRelayState` decode, which `AppState::new` answers by discarding the
+/// entire session file. Unknown maps to `Finished`, the one variant that yields
+/// no action at all: a record we cannot interpret must not be acted on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TeamPhase {
+    /// TL reads the spec, writes the plan file, and judges complexity.
+    #[default]
+    Intake,
+    /// TL writes a design (complex tasks only).
+    Design,
+    /// The reviewer reviews the design.
+    DesignReview,
+    /// TL splits the work into sub-tasks.
+    Planning,
+    /// The dev/review loop, one sub-task at a time.
+    SubTasks,
+    /// Whole-diff review against the agreed scope and quality rules.
+    MrGate,
+    /// Final commit + report.
+    Wrapping,
+    Finished,
+}
+
+impl TeamPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Intake => "intake",
+            Self::Design => "design",
+            Self::DesignReview => "design_review",
+            Self::Planning => "planning",
+            Self::SubTasks => "sub_tasks",
+            Self::MrGate => "mr_gate",
+            Self::Wrapping => "wrapping",
+            Self::Finished => "finished",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Self {
+        match raw {
+            "intake" => Self::Intake,
+            "design" => Self::Design,
+            "design_review" => Self::DesignReview,
+            "planning" => Self::Planning,
+            "sub_tasks" => Self::SubTasks,
+            "mr_gate" => Self::MrGate,
+            "wrapping" => Self::Wrapping,
+            _ => Self::Finished,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TeamPhase {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(raw.as_deref().map(Self::from_wire).unwrap_or_default())
+    }
+}
+
+/// Per-sub-task lifecycle. Terminal: `Done`, `Escalated`, `Failed`, `Skipped`.
+///
+/// Decodes leniently, same rationale as `TeamPhase`. Unknown maps to the terminal
+/// `Failed`: a sub-task we cannot interpret is never re-run, and still gets
+/// reported to the TL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SubTaskStatus {
+    /// Needs a dev turn (round 1, or a further round after findings).
+    #[default]
+    Pending,
+    /// The dev turn landed; needs a review turn.
+    Implementing,
+    /// The reviewer approved. TERMINAL.
+    Done,
+    /// The round budget ran out without approval. TERMINAL.
+    Escalated,
+    /// The step errored. TERMINAL.
+    Failed,
+    /// Never run because the run settled first. TERMINAL.
+    Skipped,
+}
+
+impl SubTaskStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Implementing => "implementing",
+            Self::Done => "done",
+            Self::Escalated => "escalated",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Self {
+        match raw {
+            "pending" => Self::Pending,
+            "implementing" => Self::Implementing,
+            "done" => Self::Done,
+            "escalated" => Self::Escalated,
+            "skipped" => Self::Skipped,
+            _ => Self::Failed,
+        }
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Done | Self::Escalated | Self::Failed | Self::Skipped
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for SubTaskStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        // A missing value means "not started", which is what `Pending` is; only an
+        // UNKNOWN value is the untrustworthy case that must settle terminal.
+        Ok(raw.as_deref().map_or(Self::Pending, Self::from_wire))
+    }
+}
+
+/// One TL-authored unit of work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct SubTask {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    /// TL-authored and SELF-CONTAINED: the dev gets a fresh session per sub-task,
+    /// so anything not in here (or in the plan file) does not exist to it.
+    pub(crate) brief: String,
+    pub(crate) status: SubTaskStatus,
+    pub(crate) rounds_used: u32,
+    /// Checkpoint commit taken when this sub-task started; scopes its review diff
+    /// to its OWN changes rather than everything since the run began.
+    pub(crate) base_commit: String,
+    pub(crate) dev_thread_id: Option<String>,
+    pub(crate) reviewer_thread_id: Option<String>,
+    /// Every thread this sub-task has ever owned — the set the lifeguard drains
+    /// and the lock predicate consults. Never pruned while the run is live.
+    pub(crate) owned_thread_ids: Vec<String>,
+    pub(crate) last_verdict: Option<WorkflowVerdict>,
+    /// The ONLY thing that reaches the TL. Never a transcript.
+    pub(crate) result_summary: Option<String>,
+    /// Whether the TL has been told this sub-task's outcome. Separate from
+    /// `status` because settling and reporting are two different steps, and a
+    /// crash between them must not lose the report.
+    pub(crate) digested: bool,
+    pub(crate) error: Option<String>,
+}
+
+/// One TL session in the succession chain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TlGeneration {
+    pub(crate) thread_id: String,
+    pub(crate) reason: String,
+    pub(crate) retired_at: u64,
+}
+
+/// A parked question waiting on the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct AwaitingUser {
+    pub(crate) thread_id: String,
+    pub(crate) request_id: String,
+    /// `tl` or `dev` — the reviewer never asks.
+    pub(crate) role: String,
+    pub(crate) asked_at: u64,
+}
+
+/// The next thing the driver should do. Derived, never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TeamAction {
+    TlIntake,
+    TlDesign,
+    ReviewDesign,
+    TlPlan,
+    DevImplement { index: usize },
+    ReviewSubTask { index: usize },
+    TlDigestSubTask { index: usize },
+    MrReview,
+    TlAddressMr,
+    Wrap,
+}
+
+/// One execution of the team pipeline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TeamRun {
+    pub(crate) id: String,
+    pub(crate) status: TeamRunStatus,
+    pub(crate) phase: TeamPhase,
+    pub(crate) spec: TaskSpec,
+    pub(crate) sub_tasks: Vec<SubTask>,
+
+    /// Whether the TL judged the task complex enough to need a design phase.
+    /// `None` until intake answers it.
+    pub(crate) complex: Option<bool>,
+
+    pub(crate) slug: String,
+    pub(crate) branch: String,
+    pub(crate) target_branch: String,
+    pub(crate) base_commit: String,
+    pub(crate) repo_main_worktree: String,
+    /// The worktree. Every team thread starts here, with this exact string.
+    pub(crate) cwd: String,
+    pub(crate) source_dirty: bool,
+
+    pub(crate) plan_rel_path: String,
+    pub(crate) design_rel_path: String,
+    pub(crate) report_rel_path: String,
+
+    pub(crate) tl_thread_id: String,
+    pub(crate) tl_provider: String,
+    pub(crate) tl_model: String,
+    pub(crate) tl_succession: Vec<TlGeneration>,
+    pub(crate) tl_turns_this_generation: u32,
+
+    /// Threads owned by the RUN rather than by a sub-task: the design reviewer,
+    /// each MR-gate reviewer, and the dev thread that addresses MR findings.
+    ///
+    /// Without this they would have nowhere to live, and `owned_thread_ids` — the
+    /// set the lifeguards drain and the lock predicate consults — would silently
+    /// omit them. A cancel during the MR gate would then leave an orphaned turn,
+    /// and for the MR-revision dev that turn keeps WRITING the worktree after the
+    /// run's locks are released. Persisted, appended, never pruned while live.
+    pub(crate) run_owned_thread_ids: Vec<String>,
+
+    pub(crate) dev_provider: String,
+    pub(crate) dev_model: String,
+    pub(crate) reviewer_provider: String,
+    pub(crate) reviewer_model: String,
+
+    pub(crate) max_review_rounds: u32,
+    pub(crate) max_mr_rounds: u32,
+    pub(crate) design_review_rounds: u32,
+    pub(crate) mr_rounds_used: u32,
+
+    pub(crate) pause_requested: bool,
+    pub(crate) pause_requested_by: String,
+    pub(crate) pause_reason: Option<String>,
+    pub(crate) awaiting: Option<AwaitingUser>,
+
+    pub(crate) design_verdict: Option<WorkflowVerdict>,
+    pub(crate) mr_verdict: Option<WorkflowVerdict>,
+    pub(crate) unresolved: Vec<String>,
+    pub(crate) head_commit: Option<String>,
+
+    pub(crate) requested_by_device_id: String,
+    pub(crate) requested_at: u64,
+    pub(crate) updated_at: u64,
+    pub(crate) error: Option<String>,
+}
+
+impl TeamRun {
+    pub(crate) fn new(
+        id: String,
+        spec: TaskSpec,
+        cwd: String,
+        requested_by_device_id: String,
+    ) -> Self {
+        let now = unix_now();
+        Self {
+            id,
+            status: TeamRunStatus::Queued,
+            phase: TeamPhase::Intake,
+            spec,
+            cwd,
+            max_review_rounds: MAX_SUBTASK_REVIEW_ROUNDS,
+            max_mr_rounds: MAX_MR_ROUNDS,
+            requested_by_device_id,
+            requested_at: now,
+            updated_at: now,
+            ..Self::default()
+        }
+    }
+
+    /// Advance the status. Terminal is final, and `Blocked`/`Resolving` are sticky
+    /// so a cancel that won a race can never be clobbered by the driver's next
+    /// between-step write. Same guard `WorkflowRun` uses.
+    pub(crate) fn set_status(&mut self, status: TeamRunStatus) {
+        if self.status.is_terminal() || self.status.is_sticky() {
+            return;
+        }
+        self.status = status;
+        self.updated_at = unix_now();
+    }
+
+    pub(crate) fn fail(&mut self, error: impl Into<String>) {
+        if self.status.is_terminal() || self.status.is_sticky() {
+            return;
+        }
+        self.error = Some(error.into());
+        self.set_status(TeamRunStatus::Failed);
+    }
+
+    pub(crate) fn block(&mut self, error: impl Into<String>) {
+        if self.status.is_terminal() {
+            return;
+        }
+        self.error = Some(error.into());
+        self.status = TeamRunStatus::Blocked;
+        self.updated_at = unix_now();
+    }
+
+    /// Record a pause request. Does not stop anything: the driver settles at the
+    /// next boundary.
+    pub(crate) fn request_pause(&mut self, device_id: impl Into<String>) {
+        if self.status.is_terminal()
+            || self.status.is_sticky()
+            || matches!(self.status, TeamRunStatus::Paused)
+        {
+            return;
+        }
+        self.pause_requested = true;
+        self.pause_requested_by = device_id.into();
+        self.set_status(TeamRunStatus::PausePending);
+    }
+
+    /// Settle a requested pause. Returns whether it took.
+    pub(crate) fn settle_paused(&mut self, reason: impl Into<String>) -> bool {
+        if self.status.is_terminal() || self.status.is_sticky() {
+            return false;
+        }
+        self.pause_requested = false;
+        self.pause_reason = Some(reason.into());
+        self.status = TeamRunStatus::Paused;
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// Reconcile a run whose driver is gone. Returns whether it changed.
+    ///
+    /// A `Paused` run is exempt: it has no driver ON PURPOSE and must survive a
+    /// restart verbatim so `resume_team_run` can pick it up. The exemption lives
+    /// here rather than in the restore path and the lifeguard so neither can
+    /// forget it.
+    pub(crate) fn mark_interrupted_if_stranded(&mut self) -> bool {
+        if self.status.is_terminal() || self.status.is_resumable() {
+            return false;
+        }
+        self.error.get_or_insert_with(|| {
+            "the task team's driver was lost; re-run to continue from the last completed step"
+                .to_string()
+        });
+        self.status = TeamRunStatus::Interrupted;
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// Snapshot this run as unresumable because its TL thread never materialized.
+    ///
+    /// Applied by the persistence writer, not to the live run: the in-memory run
+    /// keeps going, and the next write (after the provider promotes the id)
+    /// records the real state. What this protects is the RESTORE — a synthetic
+    /// `claude-pending-*` id names nothing after a restart, so the run must come
+    /// back terminal rather than as something the user can press Resume on. The
+    /// spec, worktree path and branch are deliberately kept: a tree and a branch
+    /// exist on disk, and a card that says so beats a card that vanished.
+    pub(crate) fn detach_unresumable_tl(&mut self) {
+        self.tl_thread_id = String::new();
+        self.pause_requested = false;
+        self.awaiting = None;
+        if !self.status.is_terminal() {
+            self.error.get_or_insert_with(|| {
+                "the team lead's session had not started when the relay restarted; re-run this task"
+                    .to_string()
+            });
+            self.status = TeamRunStatus::Interrupted;
+            self.updated_at = unix_now();
+        }
+    }
+
+    /// Roll the sub-task in flight back to the start of its current round.
+    ///
+    /// Used when a parked question can no longer be answered — pending questions
+    /// live only in memory and the provider worker dies with the relay, so on
+    /// restore there is nobody left to answer and nobody left to receive it.
+    /// `rounds_used` is deliberately untouched: the round never completed, so
+    /// charging it against the budget would silently shorten the team's runway.
+    pub(crate) fn rollback_current_round(&mut self) {
+        self.awaiting = None;
+        let Some(index) = self.current_sub_task() else {
+            return;
+        };
+        if let Some(task) = self.sub_tasks.get_mut(index) {
+            if !task.status.is_terminal() {
+                task.status = SubTaskStatus::Pending;
+            }
+        }
+    }
+
+    /// The sub-task the run is currently working, for display. Derived, so it can
+    /// never drift from the sub-task statuses the way a stored cursor would.
+    pub(crate) fn current_sub_task(&self) -> Option<usize> {
+        self.sub_tasks
+            .iter()
+            .position(|task| !task.status.is_terminal() || !task.digested)
+    }
+
+    /// Record a thread the RUN owns (design reviewer, MR reviewer, MR-revision
+    /// dev). Idempotent, so a retry cannot double-register.
+    pub(crate) fn record_run_thread(&mut self, thread_id: impl Into<String>) {
+        let thread_id = thread_id.into();
+        if thread_id.is_empty() || self.run_owned_thread_ids.contains(&thread_id) {
+            return;
+        }
+        self.run_owned_thread_ids.push(thread_id);
+        self.updated_at = unix_now();
+    }
+
+    /// Every thread this run owns right now, deduplicated and in a stable order.
+    ///
+    /// Retired TL generations stay in the set: they should already be idle, but a
+    /// drain that skipped them would be exactly the hole a re-seed opens. Same for
+    /// run-level threads — the MR-revision dev writes files, so a drain that
+    /// missed it would let the worktree keep changing after the locks are gone.
+    pub(crate) fn owned_thread_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        let candidates = std::iter::once(self.tl_thread_id.as_str())
+            .chain(
+                self.tl_succession
+                    .iter()
+                    .map(|generation| generation.thread_id.as_str()),
+            )
+            .chain(self.run_owned_thread_ids.iter().map(String::as_str))
+            .chain(self.sub_tasks.iter().flat_map(|task| {
+                task.owned_thread_ids
+                    .iter()
+                    .map(String::as_str)
+                    .chain(task.dev_thread_id.as_deref())
+                    .chain(task.reviewer_thread_id.as_deref())
+            }));
+        for id in candidates {
+            if !id.is_empty() && !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_string());
+            }
+        }
+        ids
+    }
+}
+
+/// The next action, as a pure function of the record.
+///
+/// This is what makes resume real rather than aspirational: cold start and
+/// restart-resume call it identically, so there is no second code path that can
+/// disagree about where the run left off.
+pub(crate) fn next_team_action(run: &TeamRun) -> Option<TeamAction> {
+    if run.status.is_terminal() {
+        return None;
+    }
+    match run.phase {
+        TeamPhase::Intake => Some(TeamAction::TlIntake),
+        TeamPhase::Design => Some(TeamAction::TlDesign),
+        TeamPhase::DesignReview => Some(TeamAction::ReviewDesign),
+        TeamPhase::Planning => Some(TeamAction::TlPlan),
+        TeamPhase::SubTasks => {
+            // Strictly index-ordered: a sub-task is implemented, reviewed, and
+            // reported to the TL before the next one starts, so the TL can adapt
+            // the plan while it still matters.
+            for (index, task) in run.sub_tasks.iter().enumerate() {
+                if !task.status.is_terminal() {
+                    return Some(match task.status {
+                        SubTaskStatus::Implementing => TeamAction::ReviewSubTask { index },
+                        // `Pending` covers both round 1 and a further round after
+                        // findings — the reviewer sends work back by resetting here.
+                        _ => TeamAction::DevImplement { index },
+                    });
+                }
+                if !task.digested {
+                    return Some(TeamAction::TlDigestSubTask { index });
+                }
+            }
+            Some(TeamAction::MrReview)
+        }
+        TeamPhase::MrGate => Some(match &run.mr_verdict {
+            None => TeamAction::MrReview,
+            Some(verdict) if verdict.approved => TeamAction::Wrap,
+            // Out of budget: wrap and write the leftovers into the report rather
+            // than looping on a gate that is not converging.
+            Some(_) if run.mr_rounds_used >= run.max_mr_rounds => TeamAction::Wrap,
+            Some(_) => TeamAction::TlAddressMr,
+        }),
+        TeamPhase::Wrapping => Some(TeamAction::Wrap),
+        TeamPhase::Finished => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_with(phase: TeamPhase, sub_tasks: Vec<SubTask>) -> TeamRun {
+        let mut run = TeamRun::new(
+            "run-1".to_string(),
+            TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device-1".to_string(),
+        );
+        run.status = TeamRunStatus::Running;
+        run.phase = phase;
+        run.sub_tasks = sub_tasks;
+        run
+    }
+
+    fn sub_task(status: SubTaskStatus, digested: bool) -> SubTask {
+        SubTask {
+            id: "st".to_string(),
+            status,
+            digested,
+            ..SubTask::default()
+        }
+    }
+
+    #[test]
+    fn unknown_status_decodes_to_failed_not_an_error() {
+        // The whole reason this enum exists instead of reusing `RunStatus`: a
+        // serde error here would make `PersistenceStore::load` fail, which makes
+        // `AppState::new` discard the entire session file.
+        let decoded: TeamRunStatus =
+            serde_json::from_str("\"a_status_from_a_future_build\"").expect("must not error");
+        assert_eq!(decoded, TeamRunStatus::Failed);
+
+        let null: TeamRunStatus = serde_json::from_str("null").expect("null must not error");
+        assert_eq!(null, TeamRunStatus::Failed);
+    }
+
+    #[test]
+    fn known_statuses_round_trip() {
+        for status in [
+            TeamRunStatus::Queued,
+            TeamRunStatus::Running,
+            TeamRunStatus::PausePending,
+            TeamRunStatus::Paused,
+            TeamRunStatus::AwaitingUser,
+            TeamRunStatus::Done,
+            TeamRunStatus::Escalated,
+            TeamRunStatus::Blocked,
+            TeamRunStatus::Resolving,
+            TeamRunStatus::Failed,
+            TeamRunStatus::Interrupted,
+            TeamRunStatus::Cancelled,
+        ] {
+            let encoded = serde_json::to_string(&status).expect("serialize");
+            let decoded: TeamRunStatus = serde_json::from_str(&encoded).expect("deserialize");
+            assert_eq!(decoded, status, "round trip failed for {}", status.as_str());
+            assert_eq!(encoded, format!("\"{}\"", status.as_str()));
+        }
+    }
+
+    #[test]
+    fn a_run_missing_its_status_decodes_to_failed() {
+        let decoded: TeamRun = serde_json::from_str("{\"id\":\"r\"}").expect("decode");
+        assert_eq!(decoded.status, TeamRunStatus::Failed);
+        assert!(decoded.status.is_terminal());
+    }
+
+    #[test]
+    fn paused_is_non_terminal_and_exempt_from_interrupt() {
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.status = TeamRunStatus::Paused;
+        assert!(!run.status.is_terminal(), "paused must stay non-terminal");
+        assert!(run.status.is_resumable());
+
+        assert!(
+            !run.mark_interrupted_if_stranded(),
+            "a deliberate pause has no driver ON PURPOSE and must not be reconciled"
+        );
+        assert_eq!(run.status, TeamRunStatus::Paused);
+    }
+
+    #[test]
+    fn a_stranded_running_run_is_reconciled_to_interrupted() {
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        assert!(run.mark_interrupted_if_stranded());
+        assert_eq!(run.status, TeamRunStatus::Interrupted);
+        assert!(run.error.is_some(), "the reason must be recorded");
+
+        // Idempotent: a second reconciliation is a no-op.
+        assert!(!run.mark_interrupted_if_stranded());
+    }
+
+    #[test]
+    fn terminal_and_blocked_states_are_sticky() {
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.set_status(TeamRunStatus::Cancelled);
+        run.set_status(TeamRunStatus::Running);
+        assert_eq!(
+            run.status,
+            TeamRunStatus::Cancelled,
+            "a cancel that won the race must not be clobbered"
+        );
+
+        let mut blocked = run_with(TeamPhase::SubTasks, vec![]);
+        blocked.block("drain unconfirmed");
+        blocked.set_status(TeamRunStatus::Running);
+        assert_eq!(blocked.status, TeamRunStatus::Blocked);
+        assert!(
+            !blocked.status.is_terminal(),
+            "blocked still owns its locks"
+        );
+    }
+
+    #[test]
+    fn pausing_is_a_request_then_a_boundary_settlement() {
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.request_pause("device-9");
+        assert_eq!(
+            run.status,
+            TeamRunStatus::PausePending,
+            "requesting a pause must not claim the run is already paused"
+        );
+        assert!(run.pause_requested);
+
+        assert!(run.settle_paused("boundary reached"));
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        assert!(!run.pause_requested, "the request is consumed by settling");
+        assert_eq!(run.pause_reason.as_deref(), Some("boundary reached"));
+    }
+
+    #[test]
+    fn settling_a_pause_cannot_resurrect_a_terminal_run() {
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.request_pause("device-9");
+        run.set_status(TeamRunStatus::Cancelled);
+        assert!(!run.settle_paused("too late"));
+        assert_eq!(run.status, TeamRunStatus::Cancelled);
+    }
+
+    #[test]
+    fn next_team_action_walks_the_pipeline_in_order() {
+        let mut run = run_with(TeamPhase::Intake, vec![]);
+        assert_eq!(next_team_action(&run), Some(TeamAction::TlIntake));
+
+        run.phase = TeamPhase::Design;
+        assert_eq!(next_team_action(&run), Some(TeamAction::TlDesign));
+
+        run.phase = TeamPhase::DesignReview;
+        assert_eq!(next_team_action(&run), Some(TeamAction::ReviewDesign));
+
+        run.phase = TeamPhase::Planning;
+        assert_eq!(next_team_action(&run), Some(TeamAction::TlPlan));
+
+        run.phase = TeamPhase::Wrapping;
+        assert_eq!(next_team_action(&run), Some(TeamAction::Wrap));
+
+        run.phase = TeamPhase::Finished;
+        assert_eq!(next_team_action(&run), None);
+    }
+
+    #[test]
+    fn a_terminal_run_has_no_next_action() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![sub_task(SubTaskStatus::Pending, false)],
+        );
+        run.status = TeamRunStatus::Cancelled;
+        assert_eq!(next_team_action(&run), None);
+    }
+
+    #[test]
+    fn sub_tasks_run_dev_then_review_then_digest_in_index_order() {
+        let run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                sub_task(SubTaskStatus::Pending, false),
+                sub_task(SubTaskStatus::Pending, false),
+            ],
+        );
+        assert_eq!(
+            next_team_action(&run),
+            Some(TeamAction::DevImplement { index: 0 })
+        );
+
+        let mut run = run;
+        run.sub_tasks[0].status = SubTaskStatus::Implementing;
+        assert_eq!(
+            next_team_action(&run),
+            Some(TeamAction::ReviewSubTask { index: 0 })
+        );
+
+        run.sub_tasks[0].status = SubTaskStatus::Done;
+        assert_eq!(
+            next_team_action(&run),
+            Some(TeamAction::TlDigestSubTask { index: 0 }),
+            "a settled sub-task must be reported to the TL before the next one starts"
+        );
+
+        run.sub_tasks[0].digested = true;
+        assert_eq!(
+            next_team_action(&run),
+            Some(TeamAction::DevImplement { index: 1 }),
+            "only then does sub-task 1 begin"
+        );
+    }
+
+    #[test]
+    fn an_escalated_sub_task_is_still_digested() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![sub_task(SubTaskStatus::Escalated, false)],
+        );
+        assert_eq!(
+            next_team_action(&run),
+            Some(TeamAction::TlDigestSubTask { index: 0 }),
+            "the TL has to learn about failures too — that is how the plan adapts"
+        );
+
+        run.sub_tasks[0].digested = true;
+        assert_eq!(
+            next_team_action(&run),
+            Some(TeamAction::MrReview),
+            "with every sub-task settled and reported, the gate is next"
+        );
+    }
+
+    #[test]
+    fn the_mr_gate_reviews_then_revises_up_to_its_budget() {
+        let mut run = run_with(TeamPhase::MrGate, vec![]);
+        assert_eq!(next_team_action(&run), Some(TeamAction::MrReview));
+
+        // A rejected first round sends work back to the team.
+        run.mr_verdict = Some(WorkflowVerdict::needs_changes(vec![
+            "scope creep".to_string()
+        ]));
+        run.mr_rounds_used = 1;
+        assert_eq!(next_team_action(&run), Some(TeamAction::TlAddressMr));
+
+        // Approval ends the gate regardless of remaining budget.
+        run.mr_verdict = Some(WorkflowVerdict::approved());
+        assert_eq!(next_team_action(&run), Some(TeamAction::Wrap));
+    }
+
+    #[test]
+    fn the_mr_gate_wraps_when_its_budget_runs_out() {
+        let mut run = run_with(TeamPhase::MrGate, vec![]);
+        run.mr_verdict = Some(WorkflowVerdict::needs_changes(vec![
+            "still wrong".to_string()
+        ]));
+        run.mr_rounds_used = MAX_MR_ROUNDS;
+        assert_eq!(
+            next_team_action(&run),
+            Some(TeamAction::Wrap),
+            "an exhausted budget wraps and writes the leftovers out; it does not loop"
+        );
+    }
+
+    #[test]
+    fn next_team_action_is_a_pure_function_of_the_record() {
+        let run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                sub_task(SubTaskStatus::Done, true),
+                sub_task(SubTaskStatus::Implementing, false),
+            ],
+        );
+        // Round-tripping through persistence must not change the decision — that
+        // is exactly what a restart does before resuming.
+        let encoded = serde_json::to_string(&run).expect("serialize");
+        let restored: TeamRun = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(next_team_action(&run), next_team_action(&restored));
+        assert_eq!(
+            next_team_action(&restored),
+            Some(TeamAction::ReviewSubTask { index: 1 })
+        );
+    }
+
+    #[test]
+    fn the_current_sub_task_is_derived_not_stored() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                sub_task(SubTaskStatus::Done, true),
+                sub_task(SubTaskStatus::Pending, false),
+            ],
+        );
+        assert_eq!(run.current_sub_task(), Some(1));
+
+        run.sub_tasks[1].status = SubTaskStatus::Done;
+        run.sub_tasks[1].digested = true;
+        assert_eq!(run.current_sub_task(), None, "everything settled");
+    }
+
+    #[test]
+    fn unknown_phase_and_subtask_status_decode_leniently() {
+        // `TeamRunStatus` was never the only enum in this record. A strict derive
+        // on either of these has exactly the same blast radius: the whole
+        // `PersistedRelayState` decode fails and startup discards the state file.
+        let phase: TeamPhase =
+            serde_json::from_str("\"a_phase_from_a_future_build\"").expect("must not error");
+        assert_eq!(
+            phase,
+            TeamPhase::Finished,
+            "an uninterpretable phase must yield no action rather than a guessed one"
+        );
+        assert_eq!(next_team_action(&run_with(phase, vec![])), None);
+
+        let status: SubTaskStatus =
+            serde_json::from_str("\"a_status_from_a_future_build\"").expect("must not error");
+        assert_eq!(status, SubTaskStatus::Failed);
+        assert!(status.is_terminal(), "so it is never silently re-run");
+
+        // A whole run carrying both still decodes.
+        let raw = "{\"id\":\"r\",\"phase\":\"warp_drive\",\
+\"sub_tasks\":[{\"id\":\"s\",\"status\":\"quantum\"}]}";
+        let run: TeamRun = serde_json::from_str(raw).expect("must not error");
+        assert_eq!(run.phase, TeamPhase::Finished);
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Failed);
+    }
+
+    #[test]
+    fn known_phases_and_subtask_statuses_round_trip() {
+        for phase in [
+            TeamPhase::Intake,
+            TeamPhase::Design,
+            TeamPhase::DesignReview,
+            TeamPhase::Planning,
+            TeamPhase::SubTasks,
+            TeamPhase::MrGate,
+            TeamPhase::Wrapping,
+            TeamPhase::Finished,
+        ] {
+            let encoded = serde_json::to_string(&phase).expect("serialize");
+            assert_eq!(encoded, format!("\"{}\"", phase.as_str()));
+            let decoded: TeamPhase = serde_json::from_str(&encoded).expect("deserialize");
+            assert_eq!(decoded, phase);
+        }
+        for status in [
+            SubTaskStatus::Pending,
+            SubTaskStatus::Implementing,
+            SubTaskStatus::Done,
+            SubTaskStatus::Escalated,
+            SubTaskStatus::Failed,
+            SubTaskStatus::Skipped,
+        ] {
+            let encoded = serde_json::to_string(&status).expect("serialize");
+            assert_eq!(encoded, format!("\"{}\"", status.as_str()));
+            let decoded: SubTaskStatus = serde_json::from_str(&encoded).expect("deserialize");
+            assert_eq!(decoded, status);
+        }
+        // A sub-task with no recorded status has simply not started.
+        let task: SubTask = serde_json::from_str("{\"id\":\"s\"}").expect("decode");
+        assert_eq!(task.status, SubTaskStatus::Pending);
+    }
+
+    #[test]
+    fn run_level_threads_are_owned_and_drainable() {
+        // The design reviewer, the MR reviewers and the MR-revision dev belong to
+        // no sub-task. Before this they had nowhere to live, so a cancel during
+        // the MR gate would leave an orphaned turn — and the MR-revision dev keeps
+        // WRITING the worktree after the run's locks are released.
+        let mut run = run_with(TeamPhase::MrGate, vec![]);
+        run.tl_thread_id = "tl-1".to_string();
+        run.record_run_thread("design-reviewer-1");
+        run.record_run_thread("mr-reviewer-1");
+        run.record_run_thread("mr-dev-1");
+        run.record_run_thread("mr-reviewer-1");
+
+        let owned = run.owned_thread_ids();
+        for expected in ["tl-1", "design-reviewer-1", "mr-reviewer-1", "mr-dev-1"] {
+            assert!(
+                owned.contains(&expected.to_string()),
+                "missing {expected} in {owned:?}"
+            );
+        }
+        assert_eq!(
+            owned.len(),
+            4,
+            "recording twice must not duplicate: {owned:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_with_an_unresumable_tl_settles_terminal_but_keeps_its_worktree() {
+        let mut run = run_with(TeamPhase::Intake, vec![]);
+        run.status = TeamRunStatus::Paused;
+        run.tl_thread_id = "claude-pending-3".to_string();
+        run.branch = "task/x".to_string();
+        run.cwd = "/repo/.sealwire/worktrees/x".to_string();
+
+        run.detach_unresumable_tl();
+
+        assert_eq!(
+            run.status,
+            TeamRunStatus::Interrupted,
+            "a run naming a thread that cannot come back must not offer Resume"
+        );
+        assert!(run.tl_thread_id.is_empty());
+        assert!(run.error.is_some());
+        assert_eq!(
+            run.cwd, "/repo/.sealwire/worktrees/x",
+            "the worktree is still on disk, so the record of it must survive"
+        );
+        assert_eq!(run.branch, "task/x");
+    }
+
+    #[test]
+    fn owned_threads_span_the_tl_and_every_sub_task() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![sub_task(SubTaskStatus::Pending, false)],
+        );
+        run.tl_thread_id = "tl-1".to_string();
+        run.sub_tasks[0].owned_thread_ids = vec!["dev-1".to_string(), "rev-1".to_string()];
+
+        let owned = run.owned_thread_ids();
+        assert!(owned.contains(&"tl-1".to_string()));
+        assert!(owned.contains(&"dev-1".to_string()));
+        assert!(owned.contains(&"rev-1".to_string()));
+        assert_eq!(owned.len(), 3, "no duplicates: {owned:?}");
+    }
+}

@@ -156,6 +156,7 @@ mod tests;
 mod threads;
 mod transcript;
 mod workflow;
+mod worktree;
 
 /// Fork capability is a property of WHICH BRIDGES EXIST, not of any session,
 /// so it is derived once at construction. Every constructor must seed it: a
@@ -1528,8 +1529,49 @@ pub(crate) fn paths_equivalent(a: &str, b: &str) -> bool {
 async fn collect_workspace_diff_in(
     workspace: &LiveWorkspace,
 ) -> Result<WorkspaceDiffResponse, String> {
+    collect_workspace_diff_against(workspace, None).await
+}
+
+/// The merge base of `target` and the workspace's HEAD.
+///
+/// `None` when git cannot answer — an unknown ref, or histories with no common
+/// ancestor. Callers fall back to `HEAD` rather than failing: a task whose MR base
+/// cannot be computed should still show its own uncommitted work.
+pub(crate) async fn merge_base_with(workspace: &LiveWorkspace, target: &str) -> Option<String> {
+    let output = run_git_capture(workspace, &["merge-base", target, "HEAD"])
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!base.is_empty()).then_some(base)
+}
+
+/// Collect a diff for `workspace` against `base`, defaulting to `HEAD`.
+///
+/// The `base` parameter is what makes an MR view possible without a second diff
+/// pipeline: pass a merge base and you get "everything this branch changed
+/// relative to the target"; pass `None` and you get today's "everything
+/// uncommitted". Either way the result is the same `WorkspaceDiffResponse` the
+/// Changes panel already renders.
+///
+/// Two things NOT to do here, both of which look right:
+/// - `git diff <target>` (two-dot) also reports commits that landed on the target
+///   AFTER the fork, reversed, as though this branch had deleted them.
+/// - `git diff <target>...HEAD` omits uncommitted work, so a mid-run MR view
+///   would quietly under-report what the team has actually touched.
+///
+/// Omitting the second operand — `git diff <merge-base>` — is the form that means
+/// "base .. WORKING TREE", which is what both callers actually want.
+pub(crate) async fn collect_workspace_diff_against(
+    workspace: &LiveWorkspace,
+    base: Option<&str>,
+) -> Result<WorkspaceDiffResponse, String> {
     let cwd = workspace.as_str();
     let generated_at = unix_now();
+    let base_commit = base.map(str::to_string);
+    let diff_base = base.unwrap_or("HEAD");
     let inside = run_git_capture(workspace, &["rev-parse", "--is-inside-work-tree"]).await?;
     if !inside.status.success() {
         return Ok(WorkspaceDiffResponse {
@@ -1545,17 +1587,20 @@ async fn collect_workspace_diff_in(
             unavailable: false,
             // Attached by the caller, which owns the fallback decision.
             fallback_from: None,
+            // Attached by the caller, which knows the branch's display name.
+            base_ref: None,
+            base_commit,
             generated_at,
         });
     }
 
-    let tracked = run_git_capture(workspace, &["diff", "--no-color", "HEAD"]).await?;
+    let tracked = run_git_capture(workspace, &["diff", "--no-color", diff_base]).await?;
     if !tracked.status.success() {
         let stderr = String::from_utf8_lossy(&tracked.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            "git diff HEAD failed".to_string()
+            format!("git diff {diff_base} failed")
         } else {
-            format!("git diff HEAD failed: {stderr}")
+            format!("git diff {diff_base} failed: {stderr}")
         });
     }
     let (tracked_diff, tracked_truncated) =
@@ -1612,6 +1657,9 @@ async fn collect_workspace_diff_in(
         unavailable: false,
         // Attached by the caller, which owns the fallback decision.
         fallback_from: None,
+        // Attached by the caller, which knows the branch's display name.
+        base_ref: None,
+        base_commit,
         generated_at,
     })
 }

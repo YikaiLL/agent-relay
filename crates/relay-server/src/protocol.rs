@@ -1541,6 +1541,17 @@ pub struct WorkspaceDiffResponse {
     /// tree's changes. `None` = `cwd` is the thread's own workspace.
     #[serde(default)]
     pub fallback_from: Option<String>,
+    /// The human-facing name of what this diff is measured against — a branch like
+    /// `main` for a task's MR view. `None` means the default "working tree vs
+    /// HEAD" view, which needs no label.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// The commit the diff was actually taken against. For an MR view this is the
+    /// MERGE BASE of `base_ref` and the branch, not `base_ref`'s tip — so commits
+    /// that landed on the target after the fork are excluded rather than showing
+    /// up reversed. Pairs with `base_ref` to render "vs main (merge-base abc1234)".
+    #[serde(default)]
+    pub base_commit: Option<String>,
     pub generated_at: u64,
 }
 
@@ -1561,6 +1572,8 @@ impl WorkspaceDiffResponse {
             suggested_root_known: false,
             unavailable: true,
             fallback_from: None,
+            base_ref: None,
+            base_commit: None,
             generated_at: 0,
         }
     }

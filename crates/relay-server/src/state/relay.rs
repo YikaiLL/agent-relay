@@ -22,8 +22,8 @@ use crate::{
 
 use super::{
     ensure_path_within_device_scope, persistence::PersistedRelayState, unix_now, ReviewJob,
-    RunStatus, SecurityProfile, TaskListRun, WorkflowRun, CONTROLLER_LEASE_SECS,
-    DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
+    RunStatus, SecurityProfile, TaskListRun, TeamRun, TeamRunStatus, WorkflowRun,
+    CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
     STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
 
@@ -415,6 +415,14 @@ pub struct RelayState {
     /// stranded list to `Interrupted` and offer re-run from the last completed task.
     /// `pub(super)` so the persistence writer reads it.
     pub(super) task_list_jobs: HashMap<String, TaskListRun>,
+    /// Relay-owned task team runs, keyed by run id. Like `workflow_jobs`,
+    /// NON-terminal runs persist. Unlike every other run map, one non-terminal
+    /// status — `Paused` — is restored VERBATIM instead of being reconciled to
+    /// `Interrupted`: a paused run has no driver on purpose, and its whole point
+    /// is that the user can come back and resume it. The exemption is enforced
+    /// inside `TeamRun::mark_interrupted_if_stranded`, not here.
+    /// `pub(super)` so the persistence writer reads it.
+    pub(super) team_runs: HashMap<String, TeamRun>,
     /// Web Push subscriptions for remote devices, keyed by `device_id` (a device
     /// can have several browser subscriptions; deduped by endpoint). Persisted so
     /// a closed/locked phone keeps receiving pushes across a relay restart.
@@ -510,6 +518,7 @@ impl RelayState {
             reviewer_thread_seq: 0,
             workflow_jobs: HashMap::new(),
             task_list_jobs: HashMap::new(),
+            team_runs: HashMap::new(),
             push_subscriptions: HashMap::new(),
             push_tx: None,
             push_vapid_public_key: None,
@@ -1750,6 +1759,93 @@ impl RelayState {
         }
     }
 
+    pub(crate) fn insert_team_run(&mut self, run: TeamRun) {
+        self.prune_team_runs();
+        self.team_runs.insert(run.id.clone(), run);
+    }
+
+    pub(crate) fn team_run(&self, id: &str) -> Option<&TeamRun> {
+        self.team_runs.get(id)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update_team_run<F: FnOnce(&mut TeamRun)>(&mut self, id: &str, update: F) -> bool {
+        match self.team_runs.get_mut(id) {
+            Some(run) => {
+                update(run);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn remove_team_run(&mut self, id: &str) -> Option<TeamRun> {
+        self.team_runs.remove(id)
+    }
+
+    /// Whether any team run is still live. M1 allows one at a time globally, so
+    /// this gates starting another. A `Paused` run counts: it still owns its
+    /// worktree and threads and expects to be resumed.
+    #[allow(dead_code)]
+    pub(crate) fn has_active_team_run(&self) -> bool {
+        self.team_runs.values().any(|run| !run.status.is_terminal())
+    }
+
+    fn prune_team_runs(&mut self) {
+        if self.team_runs.len() < MAX_WORKFLOW_RUNS {
+            return;
+        }
+        let mut terminal: Vec<(String, u64)> = self
+            .team_runs
+            .iter()
+            .filter(|(_, run)| run.status.is_terminal())
+            .map(|(id, run)| (id.clone(), run.updated_at))
+            .collect();
+        terminal.sort_by_key(|(_, updated_at)| *updated_at);
+        for (id, _) in terminal {
+            if self.team_runs.len() < MAX_WORKFLOW_RUNS {
+                break;
+            }
+            self.team_runs.remove(&id);
+        }
+    }
+
+    /// Clone persisted team runs for restore.
+    ///
+    /// Three cases, and only the first is unlike every other run map here:
+    /// - `Paused` restores VERBATIM. It has no driver on purpose; resuming it is
+    ///   the whole feature. `mark_interrupted_if_stranded` enforces the exemption.
+    /// - `PausePending` / `AwaitingUser` settle to `Paused`. Both had a live
+    ///   driver that is now gone, but both are a boundary away from a legitimate
+    ///   pause, so degrading beats discarding. `AwaitingUser` additionally rolls
+    ///   its round back, because the pending question lived only in memory (and
+    ///   the Claude worker died with the relay), so nobody can answer it now.
+    /// - everything else non-terminal reconciles to `Interrupted`, as usual.
+    fn restored_team_runs(persisted: &HashMap<String, TeamRun>) -> HashMap<String, TeamRun> {
+        persisted
+            .iter()
+            .map(|(id, run)| {
+                let mut run = run.clone();
+                match run.status {
+                    TeamRunStatus::PausePending => {
+                        run.settle_paused("the relay restarted while the team was pausing");
+                    }
+                    TeamRunStatus::AwaitingUser => {
+                        run.rollback_current_round();
+                        run.settle_paused(
+                            "the relay restarted while the team was waiting on your answer; that step will be re-run",
+                        );
+                    }
+                    _ => {
+                        run.mark_interrupted_if_stranded();
+                    }
+                }
+                (id.clone(), run)
+            })
+            .collect()
+    }
+
     /// Clone persisted workflow runs for restore, reconciling any NON-terminal run
     /// to the terminal `Interrupted` state: after a restart there is no orchestrator
     /// to drive it, so it must never come back `Running` (the failure
@@ -2857,6 +2953,9 @@ impl RelayState {
         // terminal `Interrupted` here — no orchestrator survives a restart (see
         // workflow.rs / `restored_workflow_jobs`).
         self.workflow_jobs = Self::restored_workflow_jobs(&persisted.workflow_jobs);
+        // Team runs persist non-terminal too, and `Paused` survives verbatim —
+        // see `restored_team_runs` for why that one is not reconciled.
+        self.team_runs = Self::restored_team_runs(&persisted.team_runs);
         self.recompute_reviewer_thread_seq();
         self.online_surface_peer_ids.clear();
         self.online_surface_peer_devices.clear();
@@ -3907,6 +4006,9 @@ impl RelayState {
         // terminal `Interrupted` here — no orchestrator survives a restart (see
         // workflow.rs / `restored_workflow_jobs`).
         self.workflow_jobs = Self::restored_workflow_jobs(&persisted.workflow_jobs);
+        // Team runs persist non-terminal too, and `Paused` survives verbatim —
+        // see `restored_team_runs` for why that one is not reconciled.
+        self.team_runs = Self::restored_team_runs(&persisted.team_runs);
         self.recompute_reviewer_thread_seq();
         self.online_surface_peer_ids.clear();
         self.online_surface_peer_devices.clear();
@@ -4185,8 +4287,8 @@ fn remote_action_cache_key(device_id: &str, action_id: &str) -> String {
 mod tests {
     use super::{
         BrokerPendingMessage, PendingPairingResult, PendingTranscriptDelta, PersistedRelayState,
-        RelayState, ReviewJob, SecurityProfile, TranscriptDeltaKind, WorkflowRun,
-        MAX_WORKFLOW_RUNS,
+        RelayState, ReviewJob, SecurityProfile, TeamRun, TeamRunStatus, TranscriptDeltaKind,
+        WorkflowRun, MAX_WORKFLOW_RUNS,
     };
     use crate::protocol::ThreadSummaryView;
     use crate::state::{ReviewMode, RunStatus};
@@ -4564,6 +4666,202 @@ mod tests {
         );
         assert!(restored.workflow_run("r1").unwrap().error.is_some());
         assert_eq!(restored.workflow_run("r2").unwrap().status, RunStatus::Done);
+    }
+
+    fn team_run_with_status(id: &str, status: TeamRunStatus) -> TeamRun {
+        let mut run = TeamRun::new(
+            id.to_string(),
+            crate::state::TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device".to_string(),
+        );
+        run.tl_thread_id = "tl-1".to_string();
+        run.status = status;
+        run
+    }
+
+    #[test]
+    fn a_paused_team_run_survives_a_restore_without_being_interrupted() {
+        // The one non-terminal status in this codebase that must NOT be reconciled.
+        // A paused run has no driver on purpose; interrupting it would turn "come
+        // back to this later" into "your work is gone, re-run it".
+        let mut relay = test_relay();
+        let mut paused = team_run_with_status("t1", TeamRunStatus::Paused);
+        paused.phase = crate::state::TeamPhase::SubTasks;
+        paused.pause_reason = Some("you paused it".to_string());
+        relay.insert_team_run(paused);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+
+        let run = restored
+            .team_run("t1")
+            .expect("the paused run must survive");
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        assert_eq!(run.phase, crate::state::TeamPhase::SubTasks);
+        assert_eq!(run.pause_reason.as_deref(), Some("you paused it"));
+        assert!(run.status.is_resumable());
+    }
+
+    #[test]
+    fn a_stranded_running_team_run_is_reconciled_to_interrupted() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        relay.insert_team_run(team_run_with_status("t2", TeamRunStatus::Done));
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        assert_eq!(
+            persisted.team_runs.len(),
+            2,
+            "non-terminal runs persist too"
+        );
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        assert_eq!(
+            restored.team_run("t1").unwrap().status,
+            TeamRunStatus::Interrupted,
+            "a run whose driver died must not come back Running",
+        );
+        assert!(restored.team_run("t1").unwrap().error.is_some());
+        assert_eq!(restored.team_run("t2").unwrap().status, TeamRunStatus::Done);
+    }
+
+    #[test]
+    fn a_pausing_or_parked_team_run_degrades_to_paused_on_restore() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::PausePending));
+
+        // A run parked on a question: the question itself lived only in memory, so
+        // after a restart nobody can answer it and its round must be re-run.
+        let mut parked = team_run_with_status("t2", TeamRunStatus::AwaitingUser);
+        parked.phase = crate::state::TeamPhase::SubTasks;
+        parked.sub_tasks = vec![crate::state::SubTask {
+            id: "s1".to_string(),
+            status: crate::state::SubTaskStatus::Implementing,
+            rounds_used: 1,
+            ..crate::state::SubTask::default()
+        }];
+        parked.awaiting = Some(crate::state::AwaitingUser {
+            thread_id: "dev-1".to_string(),
+            request_id: "ask:1".to_string(),
+            role: "dev".to_string(),
+            asked_at: 0,
+        });
+        relay.insert_team_run(parked);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+
+        assert_eq!(
+            restored.team_run("t1").unwrap().status,
+            TeamRunStatus::Paused,
+            "a pause that was already in flight lands as a pause, not an interrupt",
+        );
+
+        let parked = restored.team_run("t2").unwrap();
+        assert_eq!(parked.status, TeamRunStatus::Paused);
+        assert!(
+            parked.awaiting.is_none(),
+            "the unanswerable question is dropped"
+        );
+        assert_eq!(
+            parked.sub_tasks[0].status,
+            crate::state::SubTaskStatus::Pending,
+            "the round rolls back so resuming re-runs it",
+        );
+        assert_eq!(
+            parked.sub_tasks[0].rounds_used, 1,
+            "an incomplete round must not be charged against the budget",
+        );
+    }
+
+    #[test]
+    fn a_team_run_whose_tl_thread_never_materialized_restores_interrupted_not_missing() {
+        // Claude mints a synthetic `claude-pending-*` id until the first turn
+        // promotes it. Such a run cannot be resumed — that thread will not exist
+        // after a restart — but dropping it would also erase the record of a
+        // worktree and branch still sitting on disk with nothing pointing at them.
+        let mut relay = test_relay();
+        let mut pending = team_run_with_status("t1", TeamRunStatus::Paused);
+        pending.tl_thread_id = "claude-pending-7".to_string();
+        pending.branch = "task/orphan".to_string();
+        pending.cwd = "/repo/.sealwire/worktrees/orphan".to_string();
+        relay.insert_team_run(pending);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+
+        let run = restored
+            .team_run("t1")
+            .expect("the run must survive so its worktree is still accounted for");
+        assert_eq!(run.status, TeamRunStatus::Interrupted);
+        assert!(
+            !run.status.is_resumable(),
+            "Resume would drive a dead thread"
+        );
+        assert!(run.tl_thread_id.is_empty());
+        assert_eq!(run.branch, "task/orphan");
+        assert_eq!(run.cwd, "/repo/.sealwire/worktrees/orphan");
+
+        // The live run is untouched: it is still mid-promotion in memory.
+        assert_eq!(
+            relay.team_run("t1").unwrap().tl_thread_id,
+            "claude-pending-7"
+        );
+    }
+
+    #[test]
+    fn an_unknown_team_phase_does_not_destroy_the_state_file() {
+        // `TeamRunStatus` was not the only strict enum in this record; a phase or
+        // sub-task status from a newer build has the same blast radius.
+        let mut relay = test_relay();
+        let mut run = team_run_with_status("t1", TeamRunStatus::Paused);
+        run.sub_tasks = vec![crate::state::SubTask {
+            id: "s1".to_string(),
+            ..crate::state::SubTask::default()
+        }];
+        relay.insert_team_run(run);
+        let persisted = PersistedRelayState::from_relay(&relay);
+
+        let mut encoded: serde_json::Value =
+            serde_json::to_value(&persisted).expect("serialize state");
+        encoded["team_runs"]["t1"]["phase"] = serde_json::Value::String("warp_drive".to_string());
+        encoded["team_runs"]["t1"]["sub_tasks"][0]["status"] =
+            serde_json::Value::String("quantum".to_string());
+
+        let decoded: PersistedRelayState = serde_json::from_value(encoded)
+            .expect("an unknown phase must not fail the whole state file");
+        assert_eq!(
+            decoded.team_runs["t1"].phase,
+            crate::state::TeamPhase::Finished
+        );
+        assert_eq!(
+            decoded.team_runs["t1"].sub_tasks[0].status,
+            crate::state::SubTaskStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_team_run_with_an_unknown_persisted_status_does_not_destroy_the_state_file() {
+        // The whole reason `TeamRunStatus` is its own enum: `PersistenceStore::load`
+        // turns any decode error into `Err`, and `AppState::new` answers that by
+        // throwing away the ENTIRE session file — devices, projects, allowed roots.
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        let persisted = PersistedRelayState::from_relay(&relay);
+
+        let mut encoded: serde_json::Value =
+            serde_json::to_value(&persisted).expect("serialize state");
+        encoded["team_runs"]["t1"]["status"] =
+            serde_json::Value::String("invented_by_a_newer_build".to_string());
+
+        let decoded: PersistedRelayState = serde_json::from_value(encoded)
+            .expect("an unknown status must not fail the whole file");
+        assert_eq!(decoded.team_runs["t1"].status, TeamRunStatus::Failed);
     }
 
     #[test]

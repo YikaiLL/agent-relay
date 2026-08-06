@@ -82,6 +82,7 @@ fn test_persisted_state() -> PersistedRelayState {
         reviewer_threads: std::collections::HashMap::new(),
         review_jobs: std::collections::HashMap::new(),
         workflow_jobs: std::collections::HashMap::new(),
+        team_runs: std::collections::HashMap::new(),
         thread_forked_from: Default::default(),
         thread_promoted_from: Default::default(),
         push_subscriptions: std::collections::HashMap::new(),
