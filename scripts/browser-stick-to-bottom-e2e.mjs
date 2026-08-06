@@ -39,6 +39,15 @@ import {
 
 const TIMEOUT_MS = 45000;
 const STREAM_PROMPT = "stream-live";
+// A turn that parks on an approval request before it streams. Scoped to this one
+// prompt via the scenario (not FAKE_PROVIDER_ENFORCE_APPROVALS), so the other
+// legs keep running approval-free.
+const APPROVAL_PROMPT = "approval-live";
+// A turn that parks on a real AskUserQuestion, with an assistant message emitted
+// AFTER the question's tool call so the question is NOT the last transcript
+// entry — the case where the pin has to do actual work.
+const ASK_USER_PROMPT = "ask-user-live";
+const ASK_USER_TRAILING = "Meanwhile, here is some context.";
 // "Following, no gap": distance-to-bottom must stay under this the whole stream.
 // It is far below 60vh (~408px @ 680, ~444 @ 740, ~840 @ 1400), so it cleanly
 // separates real follow (~0) from either the old 60vh reserve or a frozen
@@ -173,6 +182,22 @@ async function waitTurnSettled(page) {
   );
 }
 
+// The stop button briefly hides during the approval -> streaming handover, so a
+// DOM-based settle can return while a turn is still in flight — and the next
+// send then QUEUES behind it, landing seconds later. Ask the relay instead.
+async function waitTurnFullySettled(page) {
+  await page.waitForFunction(
+    async () => {
+      const payload = await fetch("/api/session", { credentials: "same-origin" })
+        .then((response) => response.json())
+        .catch(() => null);
+      return Boolean(payload?.data) && !payload.data.active_turn_id;
+    },
+    null,
+    { timeout: TIMEOUT_MS }
+  );
+}
+
 async function sendStreamPrompt(page) {
   const preText = await page.evaluate(() => {
     const replies = document.querySelectorAll(".chat-thread .chat-message-assistant");
@@ -293,6 +318,278 @@ async function exercise(page, label) {
     `${label} D: turn end must land at the true bottom (distance ${final.distance})`
   );
   return { final };
+}
+
+// When the agent blocks on the reader, the request must be ON SCREEN — and then
+// the reader must still be free to leave it.
+//
+// The approval card is pushed LAST in the transcript but is not a transcript
+// entry (no item_id, never in the hydration window), so before
+// `decideTranscriptScrollAction` learned about pending requests, nothing brought
+// it into view: the session looked hung with the approval below the fold. The
+// fix emits a fire-once `input-required` action.
+//
+// The leg drives the ordering that actually reproduces the bug: send, let the
+// send's own jump-bottom settle, scroll UP, and only THEN let the request arrive
+// (the scenario delays it). Without the trigger the reader stays parked in
+// history and never sees it.
+//
+// Then the converse, which matters just as much: firing on EVERY render rather
+// than once per request_id would make it impossible to scroll up and re-read the
+// command you are being asked to approve — the exact class of regression this
+// whole architecture exists to prevent.
+//
+// Runs against the virtualized thread on purpose: the card is the last virtual
+// row and `estimateTranscriptRowSize` guesses 140/180px for a card that is much
+// taller, so a bottom computed from `getTotalSize()` lands short until the row
+// is measured.
+async function exerciseApprovalVisibility(page, label) {
+  await waitTurnFullySettled(page);
+  await page.evaluate(scrollToBottomInPage);
+  await delay(200);
+
+  await page.fill("#message-input", APPROVAL_PROMPT);
+  await page.click("#send-button");
+  // Wait for the SEND to land and settle first: that fires jump-bottom and leaves
+  // the follower stuck at the bottom. Only then escape upward. The scenario holds
+  // the approval back (`approval_delay_ms`) so this ordering is deterministic —
+  // otherwise the request arrives in the same beat as the user message and the
+  // send's own jump-bottom would satisfy the assertion below on its own.
+  await page.waitForFunction(
+    (text) =>
+      [...document.querySelectorAll(".chat-thread .chat-message-user")].some((node) =>
+        (node.textContent || "").includes(text)
+      ),
+    APPROVAL_PROMPT,
+    { timeout: TIMEOUT_MS }
+  );
+  await delay(300);
+
+  let leftBottom = false;
+  let preTop = 0;
+  let postTop = 0;
+  for (let attempt = 0; attempt < 3 && !leftBottom; attempt += 1) {
+    preTop = (await page.evaluate(readMetricsInPage)).scrollTop;
+    await realWheelUp(page, 900);
+    await delay(300);
+    postTop = (await page.evaluate(readMetricsInPage)).scrollTop;
+    leftBottom = postTop < preTop - 40;
+  }
+  assert.ok(
+    leftBottom,
+    `${label}: precondition — the reader must be scrolled UP before the request `
+    + `arrives (before ${preTop}, after ${postTop})`
+  );
+  assert.ok(
+    !(await page.$("[data-approval-id]")),
+    `${label}: precondition — the approval must not have arrived yet`
+  );
+
+  await page.waitForSelector("[data-approval-id]", { timeout: TIMEOUT_MS });
+  await delay(700); // let the card measure + the follow settle on its real height
+
+  const placement = await page.evaluate(() => {
+    const card = document.querySelector("[data-approval-id]");
+    const scroller = document.querySelector(".chat-thread");
+    if (!card || !scroller) return null;
+    const c = card.getBoundingClientRect();
+    const s = scroller.getBoundingClientRect();
+    return {
+      cardTop: Math.round(c.top),
+      cardBottom: Math.round(c.bottom),
+      viewTop: Math.round(s.top),
+      viewBottom: Math.round(s.bottom),
+      distance: Math.round(
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
+      ),
+    };
+  });
+  assert.ok(placement, `${label}: approval card and scroller must both exist`);
+  console.log(`[${label}] approval placement ${JSON.stringify(placement)}`);
+  // Geometry, never DOM child index: past the virtualization threshold rows are
+  // absolutely positioned, so DOM order and visual order are different things.
+  assert.ok(
+    placement.cardTop < placement.viewBottom && placement.cardBottom > placement.viewTop,
+    `${label}: the approval card must be within the transcript viewport `
+    + `(card ${placement.cardTop}-${placement.cardBottom}, view ${placement.viewTop}-${placement.viewBottom})`
+  );
+  assert.ok(
+    placement.distance <= FOLLOW_MAX_DISTANCE_PX,
+    `${label}: an arriving approval must bring the transcript to the bottom `
+    + `(distance ${placement.distance})`
+  );
+
+  // The reader escapes upward while the SAME approval stays pending. The relay
+  // keeps notifying throughout, so this samples many renders — every one of them
+  // a chance for a mis-scoped trigger to yank the reader back down.
+  let escaped = false;
+  let beforeTop = 0;
+  let afterTop = 0;
+  for (let attempt = 0; attempt < 3 && !escaped; attempt += 1) {
+    beforeTop = (await page.evaluate(readMetricsInPage)).scrollTop;
+    await realWheelUp(page, 800);
+    await delay(400);
+    afterTop = (await page.evaluate(readMetricsInPage)).scrollTop;
+    escaped = afterTop < beforeTop - 40;
+  }
+  assert.ok(
+    escaped,
+    `${label}: the reader must be able to scroll up while an approval is pending `
+    + `(before ${beforeTop}, after ${afterTop})`
+  );
+  const samples = await sample(page, 10, 200);
+  const minDist = minOf(samples, "distance");
+  console.log(`[${label}] escaped distances: ${samples.map((s) => s.distance).join(", ")}; min ${minDist}`);
+  assert.ok(
+    minDist > ESCAPE_MIN_DISTANCE_PX,
+    `${label}: input-required must fire ONCE per request — a pending approval must `
+    + `not re-yank a reader who scrolled up (distances: ${samples.map((s) => s.distance).join(", ")})`
+  );
+
+  // Release the turn so the leg leaves the thread idle for cleanup.
+  await page.evaluate(() => {
+    document.querySelector('[data-approval-decision="approve"]')?.click();
+  });
+  await waitTurnSettled(page);
+  return "pass";
+}
+
+// An UNANSWERED question must be the last thing in the transcript, exactly once,
+// and must drop back into place once answered.
+//
+// The scenario emits an assistant message AFTER the question's tool call, so the
+// question's natural position is NOT the bottom — a real shape, because a turn
+// can issue AskUserQuestion alongside other tool uses. Without the pin the
+// question renders buried above that message; with it, it is moved (not copied)
+// to the bottom while pending, and returns to its original position on answer.
+//
+// Scroll coverage here is deliberately the SECOND half only — the reader escapes
+// AFTER the question lands, and must then be left alone (fire-once). The first
+// half ("escaped reader, request arrives, gets brought into view") is covered by
+// the approval leg above, which exercises the very same `input-required` action;
+// duplicating it here would only re-test shared code.
+//
+// It was attempted here too and hit something unrelated worth its own look: on a
+// deep virtualized thread the browser renders NOTHING between a send and the
+// next transcript change, so with the question held back the reader never sees
+// their own message land. Reproduced with `ask_user_delay_ms` — relay had the
+// user message at 700ms (`/api/session`), DOM still showed the previous turn's
+// last row at 2.8s, scroller pinned at distance 0. Not the hydration ordering
+// (see the deep-window unit test in transcript-hydration-store.test.mjs).
+async function exerciseAskUserPin(page, label) {
+  await waitTurnFullySettled(page);
+  await page.evaluate(scrollToBottomInPage);
+  await delay(200);
+
+  await page.fill("#message-input", ASK_USER_PROMPT);
+  await page.click("#send-button");
+  // The question and its trailing message become visible together (the relay
+  // publishes both under one write lock), so either selector implies both.
+  await page.waitForSelector(".chat-message-ask-user-interactive", { timeout: TIMEOUT_MS });
+  await page.waitForFunction(
+    (needle) => (document.querySelector(".chat-thread")?.textContent || "").includes(needle),
+    ASK_USER_TRAILING,
+    { timeout: TIMEOUT_MS }
+  );
+  await delay(700);
+
+  const pinned = await page.evaluate((needle) => {
+    const scroller = document.querySelector(".chat-thread");
+    const card = document.querySelector(".chat-message-ask-user");
+    const trailing = [...document.querySelectorAll(".chat-thread .chat-message")].find((node) =>
+      (node.textContent || "").includes(needle)
+    );
+    if (!scroller || !card || !trailing) return null;
+    const c = card.getBoundingClientRect();
+    const t = trailing.getBoundingClientRect();
+    const s = scroller.getBoundingClientRect();
+    return {
+      cards: document.querySelectorAll(".chat-message-ask-user").length,
+      cardTop: Math.round(c.top),
+      cardBottom: Math.round(c.bottom),
+      trailingTop: Math.round(t.top),
+      viewTop: Math.round(s.top),
+      viewBottom: Math.round(s.bottom),
+      distance: Math.round(
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
+      ),
+    };
+  }, ASK_USER_TRAILING);
+  assert.ok(pinned, `${label}: question card, trailing message and scroller must all exist`);
+  console.log(`[${label}] pinned ${JSON.stringify(pinned)}`);
+
+  // MOVED, not copied: two live question dialogs must never be on screen.
+  assert.equal(pinned.cards, 1, `${label}: the question must render exactly once`);
+  // Geometry, never DOM index — above the virtualization threshold rows are
+  // absolutely positioned, so DOM order and visual order are different things.
+  assert.ok(
+    pinned.cardTop > pinned.trailingTop,
+    `${label}: an unanswered question must be pinned BELOW the message that follows `
+    + `its tool call (card ${pinned.cardTop}, trailing ${pinned.trailingTop})`
+  );
+  assert.ok(
+    pinned.cardTop < pinned.viewBottom && pinned.cardBottom > pinned.viewTop,
+    `${label}: the pinned question must be within the viewport `
+    + `(card ${pinned.cardTop}-${pinned.cardBottom}, view ${pinned.viewTop}-${pinned.viewBottom})`
+  );
+
+  // The reader may still leave, and must be left alone while it stays pending.
+  let escaped = false;
+  let beforeTop = 0;
+  let afterTop = 0;
+  for (let attempt = 0; attempt < 3 && !escaped; attempt += 1) {
+    beforeTop = (await page.evaluate(readMetricsInPage)).scrollTop;
+    await realWheelUp(page, 800);
+    await delay(400);
+    afterTop = (await page.evaluate(readMetricsInPage)).scrollTop;
+    escaped = afterTop < beforeTop - 40;
+  }
+  assert.ok(
+    escaped,
+    `${label}: the reader must be able to scroll up while a question is pending `
+    + `(before ${beforeTop}, after ${afterTop})`
+  );
+  const samples = await sample(page, 8, 200);
+  const minDist = minOf(samples, "distance");
+  console.log(`[${label}] escaped distances: ${samples.map((s) => s.distance).join(", ")}; min ${minDist}`);
+  assert.ok(
+    minDist > ESCAPE_MIN_DISTANCE_PX,
+    `${label}: a pending question must fire once, not re-yank the reader `
+    + `(distances: ${samples.map((s) => s.distance).join(", ")})`
+  );
+
+  // Answer it (single-select quick path: one option click submits).
+  await page.click(".chat-message-ask-user-interactive .ask-user-option-button");
+  await page.waitForFunction(
+    () => !document.querySelector(".chat-message-ask-user-interactive"),
+    null,
+    { timeout: TIMEOUT_MS }
+  );
+  await waitTurnSettled(page);
+  await page.evaluate(scrollToBottomInPage);
+  await delay(600);
+
+  const unpinned = await page.evaluate((needle) => {
+    const card = document.querySelector(".chat-message-ask-user");
+    const trailing = [...document.querySelectorAll(".chat-thread .chat-message")].find((node) =>
+      (node.textContent || "").includes(needle)
+    );
+    if (!card || !trailing) return null;
+    return {
+      cards: document.querySelectorAll(".chat-message-ask-user").length,
+      cardTop: Math.round(card.getBoundingClientRect().top),
+      trailingTop: Math.round(trailing.getBoundingClientRect().top),
+    };
+  }, ASK_USER_TRAILING);
+  assert.ok(unpinned, `${label}: the answered question must still be in the transcript`);
+  console.log(`[${label}] unpinned ${JSON.stringify(unpinned)}`);
+  assert.equal(unpinned.cards, 1, `${label}: still exactly one question card after answering`);
+  assert.ok(
+    unpinned.cardTop < unpinned.trailingTop,
+    `${label}: an answered question returns to its ORIGINAL position, above the `
+    + `message that followed it (card ${unpinned.cardTop}, trailing ${unpinned.trailingTop})`
+  );
+  return "pass";
 }
 
 // A SLOW touch drag (real trusted touch input, many 3px moves) must escape the
@@ -422,6 +719,20 @@ async function main() {
         chunks: STREAM_CHUNKS,
         chunk_delay_ms: 280,
       },
+      [ASK_USER_PROMPT]: {
+        chunks: STREAM_CHUNKS,
+        chunk_delay_ms: 280,
+        ask_user: true,
+        ask_user_trailing_text: ASK_USER_TRAILING,
+      },
+      [APPROVAL_PROMPT]: {
+        chunks: STREAM_CHUNKS,
+        chunk_delay_ms: 280,
+        require_approval: true,
+        // Long enough for the leg to observe the send settle and then scroll up
+        // before the request appears — the ordering the assertion depends on.
+        approval_delay_ms: 3500,
+      },
     },
   });
 
@@ -502,6 +813,11 @@ async function main() {
       { timeout: TIMEOUT_MS }
     );
     results.desktopVirtualized = await exercise(desktop, "desktop-virtualized");
+    results.approvalVisibility = await exerciseApprovalVisibility(
+      desktop,
+      "desktop-virtualized-approval"
+    );
+    results.askUserPin = await exerciseAskUserPin(desktop, "desktop-virtualized-ask-user");
     await desktop.close();
     desktop = null;
 
