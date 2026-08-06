@@ -615,3 +615,276 @@ test("retargetRemoteTranscriptScroll is a safe no-op when nothing matches", () =
   );
   assert.equal(retargetRemoteTranscriptScroll(null), false);
 });
+
+// --- input required (Bug B) -------------------------------------------------
+//
+// When the agent blocks on the reader (an approval, or an AskUser question) the
+// request renders at the BOTTOM of the transcript — the approval card is pushed
+// last, after every entry. It is NOT a transcript entry: it has no `item_id` and
+// never enters the hydration window, so none of the triggers above can see it.
+// Without a trigger of its own the decision is `preserve`, the follower only
+// re-pins when it is already stuck, and the request lands below the fold: the
+// session looks hung. These tests pin the once-per-request trigger.
+
+test("a pending input request pulls the transcript to the bottom", () => {
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["approval:req-1"],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1")],
+      latestUserEntryId: "u1",
+      scrollHeight: 2600,
+      scrollTop: 800,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "input-required");
+  assert.equal(action.scrollTop, 2600);
+  assert.deepEqual(
+    action.inputRequestIds,
+    ["approval:req-1"],
+    "the action reports the request it handled so the call site can record it"
+  );
+});
+
+test("an input request fires ONCE — a reader who scrolled up is not yanked back", () => {
+  // Same fire-once discipline as a new user message. Re-firing on every render
+  // while the approval is still pending would make it impossible to scroll up and
+  // re-read the command you are being asked to approve.
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1", "approval:req-1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["approval:req-1"],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1")],
+      latestUserEntryId: "u1",
+      scrollHeight: 2600,
+      scrollTop: 800,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "preserve");
+});
+
+test("a SECOND input request in the same thread fires again", () => {
+  // Fire-once is keyed on the request id, not on "we already did this once".
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1", "approval:req-1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["approval:req-2"],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1")],
+      latestUserEntryId: "u1",
+      scrollHeight: 2600,
+      scrollTop: 800,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "input-required");
+  assert.deepEqual(action.inputRequestIds, ["approval:req-2"]);
+});
+
+test("no pending input request: still leave the user alone", () => {
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1"), agentEntry("a2")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: [],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1")],
+      latestUserEntryId: "u1",
+      scrollHeight: 2200,
+      scrollTop: 800,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "preserve");
+});
+
+test("switching INTO a thread that already needs input does not override restore-thread", () => {
+  // The reader left this thread mid-history, so the switch restores that offset.
+  // The pending request must be seeded as handled by the transition, otherwise the
+  // very next render fires input-required and undoes the restore.
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 0, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-2",
+    pendingInputRequestIds: ["approval:req-1"],
+    previousSnapshot: { activeThreadId: "thread-1", entries: [], scrollHeight: 0, scrollTop: 0 },
+    restoredScrollPosition: { followBottom: false, scrollTop: 640 },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "restore-thread");
+  assert.equal(action.scrollTop, 640);
+  assert.deepEqual(
+    action.inputRequestIds,
+    ["approval:req-1"],
+    "the transition must claim the pending request so it cannot re-fire behind the restore"
+  );
+});
+
+test("a send and a request in the SAME render: one action claims both", () => {
+  // The relay publishes the user message and the approval in one beat, so this is
+  // the COMMON path, not a corner case. That render's own jump-bottom already put
+  // the request on screen — but if the action only reports `userEntryId`, the call
+  // site never records the request, and the next render treats it as brand new and
+  // yanks a reader who has since scrolled up.
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1"), userEntry("u2")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["pending_approvals:r1"],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1")],
+      latestUserEntryId: "u1",
+      scrollHeight: 2600,
+      scrollTop: 800,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "jump-bottom");
+  assert.equal(action.userEntryId, "u2");
+  assert.deepEqual(
+    action.inputRequestIds,
+    ["pending_approvals:r1"],
+    "a jump to the bottom SHOWS the request, so it must claim it too"
+  );
+});
+
+test("after a same-render send+request, a reader who scrolls up is left alone", () => {
+  // The end-to-end consequence of the claim above: with both ids recorded, every
+  // later render while that request is still pending is a no-op.
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1", "u2", "pending_approvals:r1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1"), userEntry("u2")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["pending_approvals:r1"],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1"), userEntry("u2")],
+      latestUserEntryId: "u2",
+      scrollHeight: 3000,
+      scrollTop: 800,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "preserve");
+});
+
+test("older history prepended in the same render as a request: keep the reader's place, claim it", () => {
+  // Priority, made explicit. A reader who triggered a prepend is at the top of the
+  // thread, unambiguously reading history. Anchoring and THEN teleporting them to
+  // the bottom on the next render is the worst of both, so the prepend wins — and
+  // it claims the request for the same reason `restore-thread` does: whatever this
+  // render decided about position must not be undone behind it. The pending-action
+  // banner above the composer still surfaces the request meanwhile.
+  const { target } = makeScrollElement({ scrollHeight: 3500, scrollTop: 500, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1"]),
+    nextEntries: [agentEntry("older-1"), agentEntry("older-2"), userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["pending_approvals:r1"],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1")],
+      latestUserEntryId: "u1",
+      scrollHeight: 2000,
+      scrollTop: 500,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "anchor-prepend");
+  assert.equal(action.scrollTop, 3500 - 2000 + 500);
+  assert.deepEqual(
+    action.inputRequestIds,
+    ["pending_approvals:r1"],
+    "the prepend owns this render's position, so it claims the request rather than being undone next render"
+  );
+});
+
+test("noop (no scroll element) claims nothing — nothing was positioned", () => {
+  const action = decideTranscriptScrollAction({
+    nextEntries: [userEntry("u1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: ["pending_approvals:r1"],
+    scrollElement: null,
+  });
+  assert.equal(action.kind, "noop");
+  assert.equal(action.inputRequestIds, undefined);
+});
+
+test("a SECOND request arriving while the first is still pending fires again", () => {
+  // Nothing constrains a thread to one pending question, so a request that
+  // arrives behind an already-claimed one must still be brought into view —
+  // otherwise it is pinned at the bottom where an escaped reader never sees it.
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const action = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1", "pending_ask_user_questions:q1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: [
+      "pending_ask_user_questions:q1",
+      "pending_ask_user_questions:q2",
+    ],
+    previousSnapshot: {
+      activeThreadId: "thread-1",
+      entries: [userEntry("u1"), agentEntry("a1")],
+      latestUserEntryId: "u1",
+      scrollHeight: 2600,
+      scrollTop: 800,
+    },
+    scrollElement: target,
+  });
+  assert.equal(action.kind, "input-required");
+  assert.deepEqual(
+    action.inputRequestIds,
+    ["pending_ask_user_questions:q1", "pending_ask_user_questions:q2"],
+    "one render claims ALL pending requests, so neither fires twice"
+  );
+});
+
+test("two requests arriving in one beat fire once, then leave the reader alone", () => {
+  const { target } = makeScrollElement({ scrollHeight: 3000, scrollTop: 800, clientHeight: 400 });
+  const both = ["pending_ask_user_questions:q1", "pending_ask_user_questions:q2"];
+  const previousSnapshot = {
+    activeThreadId: "thread-1",
+    entries: [userEntry("u1"), agentEntry("a1")],
+    latestUserEntryId: "u1",
+    scrollHeight: 2600,
+    scrollTop: 800,
+  };
+  const first = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1"]),
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: both,
+    previousSnapshot,
+    scrollElement: target,
+  });
+  assert.equal(first.kind, "input-required");
+
+  const second = decideTranscriptScrollAction({
+    alreadyAnchoredUserIds: new Set(["u1", ...first.inputRequestIds]),
+    nextEntries: [userEntry("u1"), agentEntry("a1")],
+    nextThreadId: "thread-1",
+    pendingInputRequestIds: both,
+    previousSnapshot,
+    scrollElement: target,
+  });
+  assert.equal(second.kind, "preserve");
+});

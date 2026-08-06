@@ -154,3 +154,24 @@ test("apply still works against scroll elements without dispatchEvent (pure fake
   applyTranscriptScrollAction({ kind: "jump-bottom", scrollTop: 1600 }, element);
   assert.equal(element.scrollTop, 1600);
 });
+
+test("input-required sticks: an arriving approval must land at the bottom and follow", () => {
+  assert.equal(classifyTranscriptScrollAction({ kind: "input-required" }), "stick");
+  // Distance is irrelevant — the intent is explicit, exactly like jump-bottom.
+  for (const distance of [0, 40, 160, 4000]) {
+    assert.equal(
+      classifyTranscriptScrollAction({ distance, kind: "input-required" }),
+      "stick",
+      `${distance}px from bottom must still stick for an input request`
+    );
+  }
+});
+
+test("applyTranscriptScrollAction dispatches intent for input-required", () => {
+  const { element, events } = makeDispatchingScrollElement();
+  applyTranscriptScrollAction({ kind: "input-required", scrollTop: 1600 }, element);
+  assert.equal(element.scrollTop, 1600);
+  assert.deepEqual(events, [
+    { type: "transcript-scroll-action", kind: "input-required" },
+  ]);
+});

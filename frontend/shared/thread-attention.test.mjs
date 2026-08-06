@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   ThreadAttentionTracker,
   computeThreadStates,
+  findPendingInputRequestIds,
   sessionIsWorking,
   statusIsWorking,
 } from "./thread-attention.js";
@@ -330,4 +331,76 @@ test("sessionIsWorking is false for a saved Codex thread with no turn", () => {
     sessionIsWorking(snapshot({ current_status: "notLoaded", active_turn_id: "turn-1" })),
     true
   );
+});
+
+// --- findPendingInputRequestId ----------------------------------------------
+//
+// The transcript scroller uses this as a fire-once key: bring an arriving
+// approval / AskUser question into view, then leave the reader alone for as long
+// as that same request is pending (transcript-scroll.js `input-required`).
+
+test("findPendingInputRequestId identifies an approval on the viewed thread", () => {
+  const snap = snapshot({
+    active_thread_id: "thread-1",
+    pending_approvals: [{ thread_id: "thread-1", request_id: "req-1" }],
+  });
+  assert.deepEqual(findPendingInputRequestIds(snap, "thread-1"), ["pending_approvals:req-1"]);
+  assert.deepEqual(findPendingInputRequestIds(snap), ["pending_approvals:req-1"], "defaults to the active thread");
+});
+
+test("findPendingInputRequestId ignores a request belonging to another thread", () => {
+  // A backgrounded thread's approval must not scroll the thread you are reading.
+  const snap = snapshot({
+    active_thread_id: "thread-1",
+    pending_approvals: [{ thread_id: "thread-2", request_id: "req-1" }],
+  });
+  assert.deepEqual(findPendingInputRequestIds(snap, "thread-1"), []);
+  assert.deepEqual(findPendingInputRequestIds(snap, "thread-2"), ["pending_approvals:req-1"]);
+});
+
+test("findPendingInputRequestId covers ask-user questions too", () => {
+  const snap = snapshot({
+    active_thread_id: "thread-1",
+    pending_ask_user_questions: [{ thread_id: "thread-1", request_id: "q-7" }],
+  });
+  assert.deepEqual(
+    findPendingInputRequestIds(snap, "thread-1"),
+    ["pending_ask_user_questions:q-7"]
+  );
+});
+
+test("findPendingInputRequestId namespaces by source so ids cannot collide", () => {
+  // An approval and a question that happen to share a request_id are distinct
+  // events; keying both as "same" would swallow the second one's scroll.
+  const approvalOnly = snapshot({
+    active_thread_id: "thread-1",
+    pending_approvals: [{ thread_id: "thread-1", request_id: "shared" }],
+  });
+  const questionOnly = snapshot({
+    active_thread_id: "thread-1",
+    pending_ask_user_questions: [{ thread_id: "thread-1", request_id: "shared" }],
+  });
+  assert.notDeepEqual(
+    findPendingInputRequestIds(approvalOnly, "thread-1"),
+    findPendingInputRequestIds(questionOnly, "thread-1")
+  );
+});
+
+test("findPendingInputRequestId falls back to the waiting flags, keyed per turn", () => {
+  // A budget-compacted snapshot can drop the request arrays; the flags still say
+  // the thread is blocked. Key that fallback by turn so it stays fire-once.
+  const snap = snapshot({
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-9",
+    active_flags: ["waitingOnApproval"],
+  });
+  assert.deepEqual(findPendingInputRequestIds(snap, "thread-1"), ["waiting:thread-1:turn-9"]);
+  // The flag fallback is only ever about the ACTIVE thread.
+  assert.deepEqual(findPendingInputRequestIds(snap, "thread-2"), []);
+});
+
+test("findPendingInputRequestId returns null when nothing is blocked", () => {
+  assert.deepEqual(findPendingInputRequestIds(snapshot({ active_thread_id: "thread-1" })), []);
+  assert.deepEqual(findPendingInputRequestIds(null), []);
+  assert.deepEqual(findPendingInputRequestIds(snapshot()), [], "no active thread, no request");
 });
