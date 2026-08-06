@@ -16,15 +16,11 @@
   </a>
 </p>
 
-<p align="center">Run Codex and Claude Code on your own machine — and have a second agent review the work.</p>
+<p align="center">A software team on your own machine — one agent writes, another reviews, and you approve from anywhere.</p>
 
 <p align="center">
   <img src="docs/images/desktop-session.png" alt="sealwire desktop: session list, live transcript, workspace diff" width="100%">
 </p>
-
-Start a long-running coding session on the machine that already has your repo,
-your tools, and your logged-in CLI. Point a second agent at it for review.
-Approve, steer, and take over from any browser or phone.
 
 - **Cross-agent review:** ask a *different* agent to review the current changes
   in its own session. Claude Code reviews Codex, Codex reviews Claude. Findings
@@ -66,9 +62,8 @@ That starts a **localhost-only** relay on <http://localhost:8787> and opens the
 web UI as soon as it's ready.
 
 sealwire treats the directory you launched it from as the default workspace for
-new sessions. Its own state — sessions, projects, paired devices — lives in
-`~/.agent-relay/`, one set per machine, so `cd`-ing elsewhere doesn't fork your
-history.
+new sessions. Its own state, including sessions, projects and paired devices, lives in
+`~/.agent-relay/`, one set per machine.
 
 Run that same command on whatever machine is already always-on — a desktop, a
 home server, the VM that holds the repo — and long work keeps going with your
