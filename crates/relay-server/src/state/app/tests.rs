@@ -8959,6 +8959,9 @@ mod review_tests {
         // guard that must refuse to reuse a thread's PRIOR review as this turn's
         // result. Recap/other turns still reply normally.
         suppress_reviewer_reply: Arc<AtomicBool>,
+        // Replies to emit, one popped per turn (FIFO), overriding every other
+        // reply rule. Lets a test script a whole multi-role pipeline in order.
+        scripted_replies: Arc<Mutex<std::collections::VecDeque<String>>>,
         // Verdicts the reviewer should emit, one popped per reviewer turn (FIFO).
         // Empty → default NEEDS_CHANGES. Drives the iterative loop in tests.
         reviewer_verdicts: Arc<Mutex<std::collections::VecDeque<String>>>,
@@ -9037,6 +9040,7 @@ mod review_tests {
                 fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
+                scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 raise_approval_on_fix_turn: Arc::new(AtomicBool::new(false)),
                 suppress_fix_reply: Arc::new(AtomicBool::new(false)),
@@ -9381,7 +9385,10 @@ mod review_tests {
                 && !(is_reviewer_diff_turn && self.suppress_reviewer_reply.load(Ordering::Relaxed))
                 && !(is_fix_turn && self.suppress_fix_reply.load(Ordering::Relaxed));
             // A reviewer turn ends with the verdict the test queued (default needs-changes).
-            let reply_text = if is_reviewer_diff_turn {
+            let scripted = self.scripted_replies.lock().await.pop_front();
+            let reply_text = if let Some(scripted) = scripted {
+                scripted
+            } else if is_reviewer_diff_turn {
                 let verdict = self
                     .reviewer_verdicts
                     .lock()
@@ -16290,6 +16297,247 @@ turn) must allow a review: {error:?}"
         assert!(
             app.relay.read().await.pending_ask_user_questions.is_empty(),
             "pending questions must be cleared"
+        );
+    }
+
+    // ---- Task team driver -------------------------------------------------
+
+    /// A real git repo with one commit; team runs provision a worktree from it.
+    async fn init_team_repo() -> (TempDir, String) {
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().canonicalize().expect("canonicalize");
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let out = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&path)
+                .output()
+                .await
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        std::fs::write(path.join("seed.txt"), "line1\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "seed"]] {
+            let out = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&path)
+                .output()
+                .await
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let display = path.to_string_lossy().into_owned();
+        (dir, display)
+    }
+
+    async fn script_replies(provider: &ReviewTestProvider, replies: &[&str]) {
+        let mut queue = provider.scripted_replies.lock().await;
+        for reply in replies {
+            queue.push_back((*reply).to_string());
+        }
+    }
+
+    fn team_input(cwd: &str) -> crate::state::app::team::StartTeamInput {
+        crate::state::app::team::StartTeamInput {
+            spec: crate::state::TaskSpec {
+                title: "Add a parser".to_string(),
+                context: "The loader needs one.".to_string(),
+                acceptance_criteria: "Parses all three encodings.".to_string(),
+                agreed_scope: "Parser only; no loader refactor.".to_string(),
+                quality_rules: "No unwrap in library code.".to_string(),
+            },
+            origin_cwd: cwd.to_string(),
+            target_branch: None,
+            device_id: "device-1".to_string(),
+            tl_provider: "codex".to_string(),
+            dev_provider: "codex".to_string(),
+            reviewer_provider: "codex".to_string(),
+        }
+    }
+
+    async fn wait_for_team_run(app: &AppState, run_id: &str) -> crate::state::TeamRun {
+        for _ in 0..800 {
+            if let Some(run) = app.relay.read().await.team_run(run_id).cloned() {
+                if run.status.is_terminal() || run.status == crate::state::TeamRunStatus::Paused {
+                    return run;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("team run {run_id} never settled");
+    }
+
+    #[tokio::test]
+    async fn a_task_team_splits_implements_reviews_and_passes_the_mr_gate() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect("the team should start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "run error: {:?}",
+            run.error
+        );
+        assert_eq!(run.phase, crate::state::TeamPhase::Finished);
+        assert_eq!(
+            run.complex,
+            Some(false),
+            "a simple task skips the design phase"
+        );
+        assert_eq!(run.sub_tasks.len(), 1);
+        let task = &run.sub_tasks[0];
+        assert_eq!(task.title, "Add the parser");
+        assert_eq!(task.status, crate::state::SubTaskStatus::Done);
+        assert_eq!(task.rounds_used, 1, "one round is enough when approved");
+        assert!(task.digested, "the TL must be told how it went");
+
+        // The worktree is real, on its own branch, and the work is committed.
+        assert!(std::path::Path::new(&run.cwd).is_dir());
+        assert!(run.cwd.contains(".sealwire/worktrees/"));
+        assert_eq!(run.branch, "task/add-a-parser");
+        assert_eq!(run.target_ref, "refs/heads/main");
+        assert!(run.head_commit.is_some(), "wrap-up must leave a commit");
+
+        // Dev and reviewer are DIFFERENT threads, and neither is the TL: each seat
+        // gets its own session so nobody inherits another's context.
+        let dev = task.dev_thread_id.clone().expect("dev thread");
+        let reviewer = task.reviewer_thread_id.clone().expect("reviewer thread");
+        assert_ne!(dev, reviewer);
+        assert_ne!(dev, run.tl_thread_id);
+        assert_ne!(reviewer, run.tl_thread_id);
+
+        // Every thread the run touched is drainable from the record.
+        let owned = run.owned_thread_ids();
+        for id in [&run.tl_thread_id, &dev, &reviewer] {
+            assert!(owned.contains(id), "{id} missing from {owned:?}");
+        }
+
+        // The TL only ever learned the verdict + summary, never a transcript.
+        let turns = provider.turns.lock().await.clone();
+        let tl_turns: Vec<&String> = turns
+            .iter()
+            .filter(|(thread, _)| thread == &run.tl_thread_id)
+            .map(|(_, text)| text)
+            .collect();
+        let digest = tl_turns
+            .iter()
+            .find(|text| text.contains("was approved by the reviewer"))
+            .expect("the TL should have been told the outcome");
+        assert!(
+            !digest.contains("Implemented the parser."),
+            "the dev's transcript must never reach the TL: {digest}"
+        );
+
+        // The dev's prompt stands alone: it names the sub-task and the plan file.
+        let dev_turn = turns
+            .iter()
+            .find(|(thread, _)| thread == &dev)
+            .map(|(_, text)| text.clone())
+            .expect("dev turn");
+        assert!(dev_turn.contains("Add the parser"));
+        assert!(dev_turn.contains(".sealwire/PLAN.md"));
+        assert!(dev_turn.contains("No unwrap in library code."));
+    }
+
+    #[tokio::test]
+    async fn a_sub_task_escalates_after_two_review_rounds_without_approval() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_replies(
+            provider,
+            &[
+                "COMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "First attempt.",
+                "Not yet.\nVERDICT: NEEDS_CHANGES\n- missing the empty case",
+                "Second attempt.",
+                "Still not.\nVERDICT: NEEDS_CHANGES\n- still missing the empty case",
+                "Noted.",
+                "Out of scope drift.\nVERDICT: NEEDS_CHANGES\n- parser is incomplete",
+                "Addressed.",
+                "Fine now.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect("the team should start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        let task = &run.sub_tasks[0];
+        assert_eq!(
+            task.status,
+            crate::state::SubTaskStatus::Escalated,
+            "two rounds is the ceiling, not a suggestion"
+        );
+        assert_eq!(task.rounds_used, 2);
+        assert!(
+            task.result_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still missing the empty case"),
+            "the TL must learn WHY it escalated: {:?}",
+            task.result_summary
+        );
+        assert!(task.digested);
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Escalated,
+            "a run with an unapproved sub-task cannot report Done"
+        );
+
+        // Round 2 reused the SAME dev (it should see its own prior work) but a
+        // FRESH reviewer (so round 2 judges the work, not its own opinion).
+        assert_eq!(task.owned_thread_ids.len(), 3, "1 dev + 2 reviewers");
+    }
+
+    #[tokio::test]
+    async fn a_second_task_is_refused_while_one_is_live() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+
+        app.start_team_run(team_input(&root))
+            .await
+            .expect("the first task should start");
+        let error = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect_err("M1 runs one task at a time");
+        assert!(
+            error.contains("already running"),
+            "error should say why: {error}"
         );
     }
 

@@ -919,7 +919,7 @@ the workflow remains locked"
     /// turn must not keep running after the run reports failure. Re-issues the stop
     /// while waiting; bounded by `WORKFLOW_DRAIN_MAX_SECS`. Returns false when the
     /// stop cannot be confirmed; callers must leave the workflow non-terminal.
-    async fn stop_and_drain(&self, thread_id: &str) -> bool {
+    pub(super) async fn stop_and_drain(&self, thread_id: &str) -> bool {
         self.deny_thread_approvals_best_effort(thread_id).await;
         let drain_ms = self
             .workflow_drain_max_ms

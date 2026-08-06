@@ -393,7 +393,10 @@ pub(crate) struct TeamRun {
 
     pub(crate) slug: String,
     pub(crate) branch: String,
-    pub(crate) target_branch: String,
+    /// FULLY QUALIFIED (`refs/heads/main`). It is evaluated by `merge_base_with`
+    /// inside the task worktree, where a relative expression like `HEAD` would
+    /// resolve to the task's own tip and hide every commit from the MR diff.
+    pub(crate) target_ref: String,
     pub(crate) base_commit: String,
     pub(crate) repo_main_worktree: String,
     /// The worktree. Every team thread starts here, with this exact string.
@@ -677,6 +680,262 @@ pub(crate) fn next_team_action(run: &TeamRun) -> Option<TeamAction> {
         }),
         TeamPhase::Wrapping => Some(TeamAction::Wrap),
         TeamPhase::Finished => None,
+    }
+}
+
+/// Marker the TL uses to declare whether the task needs a design phase.
+const COMPLEXITY_MARKER: &str = "COMPLEXITY:";
+/// Markers the TL uses to emit the sub-task list.
+const SUBTASK_OPEN: &str = "SUBTASK:";
+const SUBTASK_CLOSE: &str = "END SUBTASK";
+/// A brief the TL never bounded; long enough for real instructions, short enough
+/// that a runaway reply cannot bloat the persisted record.
+const MAX_BRIEF_BYTES: usize = 4_000;
+const MAX_SUB_TASKS: usize = 24;
+
+/// Whether the TL judged the task complex enough to need a design phase.
+///
+/// Provisional text convention, the same shape (and the same open question) as
+/// `parse_verdict`'s `VERDICT:` line in `state/review.rs`: how a provider is made
+/// to emit structure directly — a required tool call versus parsing the last
+/// message — is not settled. `None` means the TL did not answer, which the caller
+/// treats as "not complex" rather than guessing.
+pub(crate) fn parse_complexity(text: &str) -> Option<bool> {
+    text.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix(COMPLEXITY_MARKER)?;
+        match rest.trim().to_ascii_lowercase().as_str() {
+            "complex" => Some(true),
+            "simple" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+/// Parse the TL's sub-task list.
+///
+/// Block form rather than one line per task, because a brief is prose and has to
+/// survive containing punctuation:
+///
+/// ```text
+/// SUBTASK: Add the parser
+/// Handle the three encodings, and keep the existing error text.
+/// END SUBTASK
+/// ```
+///
+/// An unterminated final block is still accepted — a truncated reply should cost
+/// the run its last sub-task, not all of them.
+pub(crate) fn parse_sub_tasks(text: &str) -> Vec<SubTask> {
+    let mut tasks: Vec<SubTask> = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+
+    let finish = |tasks: &mut Vec<SubTask>, title: String, body: Vec<String>| {
+        if tasks.len() >= MAX_SUB_TASKS {
+            return;
+        }
+        let mut brief = body.join("\n").trim().to_string();
+        brief.truncate(
+            (0..=MAX_BRIEF_BYTES.min(brief.len()))
+                .rev()
+                .find(|index| brief.is_char_boundary(*index))
+                .unwrap_or(0),
+        );
+        tasks.push(SubTask {
+            id: format!("st-{}", tasks.len() + 1),
+            title,
+            brief,
+            ..SubTask::default()
+        });
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(title) = trimmed.strip_prefix(SUBTASK_OPEN) {
+            if let Some((title, body)) = current.take() {
+                finish(&mut tasks, title, body);
+            }
+            current = Some((title.trim().to_string(), Vec::new()));
+        } else if trimmed == SUBTASK_CLOSE {
+            if let Some((title, body)) = current.take() {
+                finish(&mut tasks, title, body);
+            }
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push(line.to_string());
+        }
+    }
+    if let Some((title, body)) = current.take() {
+        finish(&mut tasks, title, body);
+    }
+    tasks.retain(|task| !task.title.is_empty());
+    tasks
+}
+
+/// Prompts the driver sends. Kept beside the model (as `state/review.rs` does)
+/// so the wording and the record that shapes it stay in one file.
+pub(crate) mod prompts {
+    use super::{TaskSpec, SUBTASK_CLOSE, SUBTASK_OPEN};
+
+    fn spec_block(spec: &TaskSpec) -> String {
+        format!(
+            "# Task\n{}\n\n## Context\n{}\n\n## Acceptance criteria\n{}\n\n\
+## Agreed scope\n{}\n\n## Code quality rules\n{}",
+            spec.title,
+            spec.context,
+            spec.acceptance_criteria,
+            spec.agreed_scope,
+            spec.quality_rules
+        )
+    }
+
+    /// First TL turn: absorb the task, write the plan file, judge complexity.
+    pub(crate) fn intake(spec: &TaskSpec, plan_path: &str, source_dirty: bool) -> String {
+        let dirty = if source_dirty {
+            "\n\nNote: the repository had uncommitted changes when this task forked. \
+They are NOT present in your worktree — you are working from a clean checkout of \
+the target branch."
+        } else {
+            ""
+        };
+        format!(
+            "You are the team lead. You own scope and planning for this task; two \
+other agents (a developer and a reviewer) will do the work, each in a fresh \
+session per sub-task, and they can only see what you write down.\n\n\
+{}\n\n\
+Do two things now.\n\n\
+1. Write a short plan to `{plan_path}`. Keep it tight — it is re-read on every \
+sub-task, and a long file constrains an agent less than a short one, not more. \
+Cover only: what we are building, the shape of the approach, and anything a \
+developer would otherwise get wrong.\n\n\
+2. End your reply with exactly one line:\n\
+   COMPLEXITY: complex   (the approach needs designing and reviewing first)\n\
+   COMPLEXITY: simple    (go straight to sub-tasks)\n\n\
+Do not start implementing.{dirty}",
+            spec_block(spec)
+        )
+    }
+
+    /// TL writes the design (complex tasks only).
+    pub(crate) fn design(spec: &TaskSpec, design_path: &str, plan_path: &str) -> String {
+        format!(
+            "Write the design for this task to `{design_path}`. Your plan is at \
+`{plan_path}`.\n\n{}\n\nA reviewer will read the design next and can send it \
+back once. Favour naming the decisions and their trade-offs over exhaustive \
+detail — the developers read the plan, not the design.",
+            spec_block(spec)
+        )
+    }
+
+    /// TL splits the work.
+    pub(crate) fn plan(spec: &TaskSpec, plan_path: &str) -> String {
+        format!(
+            "Split this task into sub-tasks and update `{plan_path}` to match.\n\n{}\n\n\
+Each sub-task gets a developer with a FRESH session and a reviewer with a fresh \
+session, and at most two review rounds. So size them to be reviewable in one \
+pass, and write each brief to stand ALONE — the developer sees the brief and the \
+plan file, nothing else, and none of this conversation.\n\n\
+Emit the list in exactly this form, and nothing else after it:\n\n\
+{SUBTASK_OPEN} <short title>\n<what to build, and how it should be verified>\n{SUBTASK_CLOSE}",
+            spec_block(spec)
+        )
+    }
+
+    /// Dev implements a sub-task.
+    pub(crate) fn dev(
+        spec: &TaskSpec,
+        title: &str,
+        brief: &str,
+        plan_path: &str,
+        prior_findings: &[String],
+    ) -> String {
+        let findings = if prior_findings.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nA reviewer looked at your previous attempt and asked for these \
+changes. Address them:\n{}",
+                prior_findings
+                    .iter()
+                    .map(|finding| format!("- {finding}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        format!(
+            "You are the developer on one sub-task of a larger task. The team \
+lead's plan is at `{plan_path}` — read it first.\n\n\
+## Sub-task: {title}\n{brief}\n\n\
+## Code quality rules you will be reviewed against\n{}\n\n\
+Implement only this sub-task. Staying inside it matters more than finishing \
+everything you can see that needs doing — the other sub-tasks have their own \
+developers. If the brief is ambiguous in a way you cannot resolve from the plan \
+or the code, ask the user rather than guessing.{findings}",
+            spec.quality_rules
+        )
+    }
+
+    /// TL is told how a sub-task went. Verdict + summary only, never a transcript.
+    pub(crate) fn sub_task_result(title: &str, approved: bool, summary: &str) -> String {
+        let outcome = if approved {
+            "was approved by the reviewer"
+        } else {
+            "ran out of review rounds without approval"
+        };
+        format!(
+            "Sub-task \"{title}\" {outcome}.\n\n{summary}\n\nUpdate your plan file if \
+this changes anything for the remaining sub-tasks. Reply briefly; do not \
+implement anything."
+        )
+    }
+
+    /// The final gate: the whole diff against the agreed scope.
+    pub(crate) fn mr_gate(spec: &TaskSpec, diff: &str, workspace: &str) -> String {
+        format!(
+            "Review this task's complete diff before it is handed back to the user.\n\n\
+## Agreed scope\n{}\n\n## Acceptance criteria\n{}\n\n## Code quality rules\n{}\n\n\
+Judge two things and nothing else: whether the change stays inside the agreed \
+scope, and whether it meets the quality rules. Work you would have done \
+differently is not a finding.\n\n\
+Working tree under review: {workspace}\n\n```diff\n{diff}\n```\n\n\
+End with `VERDICT: APPROVED` or `VERDICT: NEEDS_CHANGES` followed by one \
+finding per line.",
+            spec.agreed_scope, spec.acceptance_criteria, spec.quality_rules
+        )
+    }
+
+    /// The team addresses MR-gate findings.
+    pub(crate) fn address_mr(findings: &[String], plan_path: &str) -> String {
+        format!(
+            "The final review of this task's whole diff asked for these changes \
+before it can be handed back:\n{}\n\nAddress them. The plan is at `{plan_path}`. \
+Change only what these findings call for.",
+            findings
+                .iter()
+                .map(|finding| format!("- {finding}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    /// TL writes the closing report.
+    pub(crate) fn wrap(spec: &TaskSpec, report_path: &str, unresolved: &[String]) -> String {
+        let leftovers = if unresolved.is_empty() {
+            "Nothing was left unresolved.".to_string()
+        } else {
+            format!(
+                "These were NOT resolved and must be written out plainly:\n{}",
+                unresolved
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        format!(
+            "The work is finished. Write a short report to `{report_path}` for the \
+user.\n\nCover: what changed and why, how it maps onto the acceptance criteria, \
+and anything you would flag before this is merged.\n\n{leftovers}\n\n\
+## Acceptance criteria\n{}",
+            spec.acceptance_criteria
+        )
     }
 }
 
@@ -1086,6 +1345,119 @@ mod tests {
             "the worktree is still on disk, so the record of it must survive"
         );
         assert_eq!(run.branch, "task/x");
+    }
+
+    #[test]
+    fn complexity_is_read_from_the_tls_last_declaration() {
+        assert_eq!(parse_complexity("blah\nCOMPLEXITY: complex"), Some(true));
+        assert_eq!(parse_complexity("COMPLEXITY: simple\n"), Some(false));
+        assert_eq!(
+            parse_complexity("COMPLEXITY: complex\nsecond thoughts\nCOMPLEXITY: simple"),
+            Some(false),
+            "the last declaration wins, like parse_verdict"
+        );
+        assert_eq!(
+            parse_complexity("I think this is complex."),
+            None,
+            "prose is not a declaration; the caller decides what silence means"
+        );
+    }
+
+    #[test]
+    fn sub_tasks_parse_as_blocks_so_briefs_can_be_prose() {
+        let text = "Here is the split.\n\
+SUBTASK: Add the parser\n\
+Handle all three encodings.\n\
+Keep the existing error text: it is asserted on.\n\
+END SUBTASK\n\
+SUBTASK: Wire it up\n\
+Call it from the loader.\n\
+END SUBTASK\n";
+        let tasks = parse_sub_tasks(text);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].title, "Add the parser");
+        assert!(
+            tasks[0].brief.contains("error text: it is asserted on"),
+            "punctuation in a brief must survive, got {:?}",
+            tasks[0].brief
+        );
+        assert_eq!(tasks[1].title, "Wire it up");
+        assert_eq!(tasks[0].id, "st-1");
+        assert_eq!(tasks[1].id, "st-2");
+        assert!(tasks.iter().all(|t| t.status == SubTaskStatus::Pending));
+    }
+
+    #[test]
+    fn an_unterminated_final_sub_task_block_is_still_kept() {
+        // A truncated reply should cost the run its last sub-task, not all of them.
+        let tasks = parse_sub_tasks("SUBTASK: One\nfirst\nEND SUBTASK\nSUBTASK: Two\nsecond");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].title, "Two");
+        assert_eq!(tasks[1].brief, "second");
+    }
+
+    #[test]
+    fn sub_task_parsing_ignores_prose_and_titleless_blocks() {
+        assert!(parse_sub_tasks("I'll split this into three parts.").is_empty());
+        assert!(parse_sub_tasks("SUBTASK:\nno title\nEND SUBTASK").is_empty());
+    }
+
+    #[test]
+    fn sub_task_briefs_are_bounded_and_truncated_on_a_char_boundary() {
+        let long = "壁".repeat(4_000);
+        let tasks = parse_sub_tasks(&format!("SUBTASK: t\n{long}\nEND SUBTASK"));
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0].brief.len() <= MAX_BRIEF_BYTES,
+            "got {} bytes",
+            tasks[0].brief.len()
+        );
+        // The real assertion: it is still valid UTF-8 that round-trips.
+        let encoded = serde_json::to_string(&tasks[0]).expect("serialize");
+        let _: SubTask = serde_json::from_str(&encoded).expect("deserialize");
+    }
+
+    #[test]
+    fn the_tl_only_ever_learns_a_sub_tasks_verdict_and_summary() {
+        // The whole reason the TL can hold one session across a long task.
+        let message = prompts::sub_task_result("Add the parser", true, "Added, tests pass.");
+        assert!(message.contains("Add the parser"));
+        assert!(message.contains("approved"));
+        assert!(message.contains("Added, tests pass."));
+        assert!(
+            !message.to_lowercase().contains("transcript"),
+            "no transcript is ever forwarded: {message}"
+        );
+    }
+
+    #[test]
+    fn the_dev_prompt_is_self_contained_because_its_session_is_fresh() {
+        let spec = TaskSpec {
+            quality_rules: "no unwrap in library code".to_string(),
+            ..TaskSpec::default()
+        };
+        let message = prompts::dev(
+            &spec,
+            "Add the parser",
+            "Handle three encodings.",
+            ".sealwire/PLAN.md",
+            &["missing test for the empty case".to_string()],
+        );
+        assert!(message.contains("Add the parser"));
+        assert!(message.contains("Handle three encodings."));
+        assert!(
+            message.contains(".sealwire/PLAN.md"),
+            "it must be told where the plan is"
+        );
+        assert!(message.contains("no unwrap in library code"));
+        assert!(
+            message.contains("missing test for the empty case"),
+            "round 2 must carry the reviewer's findings"
+        );
+        assert!(
+            message.contains("ask the user"),
+            "a dev that cannot resolve an ambiguity must know it may ask"
+        );
     }
 
     #[test]
