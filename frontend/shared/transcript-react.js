@@ -714,6 +714,31 @@ function findPendingAskUserRequest(itemId, pendingList) {
   return pendingList.find((pending) => pending?.tool_use_id === toolUseId) || null;
 }
 
+// Item ids of EVERY question the session is currently blocked on. Nothing
+// guarantees there is only one: the relay and the worker both key pending
+// questions by id, and a turn can issue several AskUserQuestion tool uses in
+// parallel. All of them get pinned, in their original relative order, so a
+// second question can never end up buried in history behind the first.
+// Already-answered ask-user entries are not in the pending list and stay put.
+const EMPTY_PINNED_ASK_USER_IDS = new Set();
+
+function findPinnedAskUserItemIds(entries, pendingList) {
+  if (!Array.isArray(pendingList) || !pendingList.length || !Array.isArray(entries)) {
+    return EMPTY_PINNED_ASK_USER_IDS;
+  }
+  let pinned = null;
+  for (const entry of entries) {
+    if (!isAskUserQuestionTool(entry?.tool)) {
+      continue;
+    }
+    const itemId = entry.item_id || "";
+    if (itemId && findPendingAskUserRequest(itemId, pendingList)) {
+      (pinned ||= new Set()).add(itemId);
+    }
+  }
+  return pinned || EMPTY_PINNED_ASK_USER_IDS;
+}
+
 // Build the answer value the SDK should see for a single question. We support
 // three shapes (the SDK accepts string | string[] | free-text):
 //   - label only          → "<label>"
@@ -2137,6 +2162,20 @@ export function TranscriptContent({
     return { ...options, lastTurnDiffItemId, forkableItemIds };
   }, [options, lastTurnDiffItemId, forkableItemIds]);
   const justPrependedItemIds = useJustPrependedItemIds(entries);
+  // An UNANSWERED question is the one thing the session is waiting on, so it
+  // belongs at the bottom of the transcript wherever its tool call actually
+  // sits. It is MOVED, not copied — rendering it in place as well would put two
+  // live question dialogs on screen at once. Answering it clears the pending
+  // request, which un-pins it back to its original position in the
+  // conversation. (Ask-user tool calls are never folded into a group —
+  // `isGroupableCompletedTool` excludes them — so the pinned entry is always a
+  // plain item in `groupedItems`; if that ever changed, the id simply would not
+  // match and it would render in place, which is the safe degradation.)
+  const pinnedAskUserItemIds = React.useMemo(
+    () => findPinnedAskUserItemIds(entries, options?.pendingAskUserQuestions),
+    [entries, options?.pendingAskUserQuestions]
+  );
+  const pinnedAskUserNodes = [];
   const nodes = [];
 
   // Top sentinel: the IntersectionObserver in render-session.js / react-app.js
@@ -2246,20 +2285,34 @@ export function TranscriptContent({
     }
 
     const entryId = item.item_id || item.id || "";
-    nodes.push(
-      h(TranscriptEntry, {
-        entry: item,
-        isJustPrepended: Boolean(entryId && justPrependedItemIds.has(entryId)),
-        isLatestUser:
-          item.kind === "user_text" && entryId && entryId === latestUserEntryId,
-        key: entryId || `${item.kind || "entry"}:${index}`,
-        options: effectiveOptions,
-      })
-    );
+    const node = h(TranscriptEntry, {
+      entry: item,
+      isJustPrepended: Boolean(entryId && justPrependedItemIds.has(entryId)),
+      isLatestUser:
+        item.kind === "user_text" && entryId && entryId === latestUserEntryId,
+      key: entryId || `${item.kind || "entry"}:${index}`,
+      options: effectiveOptions,
+    });
+    if (entryId && pinnedAskUserItemIds.has(entryId)) {
+      // Hold it back — it is re-emitted at the bottom below. Skipping the push
+      // here is what keeps it a MOVE rather than a duplicate. Collected in
+      // iteration order, so several pending questions keep their relative order.
+      pinnedAskUserNodes.push(node);
+      return;
+    }
+    nodes.push(node);
   });
 
   if (approval) {
     nodes.push(h(ApprovalCard, { approval, key: "approval", options: effectiveOptions }));
+  }
+
+  // Last of all: every question the agent is blocked on. (An approval and a
+  // question can in principle both be pending; the questions sit below the
+  // approval card. Nothing enforces mutual exclusion — a turn blocks on one
+  // thing in practice — and this ordering is the deliberate default.)
+  for (const pinnedNode of pinnedAskUserNodes) {
+    nodes.push(pinnedNode);
   }
 
   // Bottom-follow: no top-anchor, so there is no bottom spacer and no
