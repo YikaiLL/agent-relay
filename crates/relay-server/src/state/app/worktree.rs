@@ -87,10 +87,17 @@ pub(crate) struct TaskWorktree {
 /// Create a task worktree for `slug_seed`, branching from `target_branch`
 /// (default: the main worktree's current branch).
 ///
-/// `path_guard` is called with the final absolute path immediately before the
-/// git command, and is where device/allowed-root scope is enforced. It is a
-/// parameter rather than an internal check so this module never has to reach
-/// into `RelayState`, while the security decision still happens inside the
+/// `path_guard` is where device/allowed-root scope is enforced. It is called on
+/// EVERY tree this function is about to touch — the resolved main worktree, the
+/// git common directory, and the planned worktree path — and all of those calls
+/// happen BEFORE the first mutation. Checking only the destination is not enough:
+/// provisioning creates a branch in the main worktree and writes `info/exclude`
+/// in the common dir, and with `--separate-git-dir` the latter is not even under
+/// the former. Checking afterwards is worse than not checking, because the
+/// refusal then leaves an orphaned branch and worktree behind.
+///
+/// The guard is a parameter rather than an internal check so this module never
+/// has to reach into `RelayState`, while the decision still happens inside the
 /// provisioning boundary rather than being left to each caller to remember.
 pub(crate) async fn provision_task_worktree(
     origin: &LiveWorkspace,
@@ -111,6 +118,10 @@ pub(crate) async fn provision_task_worktree(
     // Branch and worktree bookkeeping belong to the repository, so they must run
     // in the MAIN worktree even when the request arrived from a linked one.
     let main = repo_main_worktree(origin).await?;
+    path_guard(main.as_str())?;
+    if let Some(common) = git_common_dir(&main).await {
+        path_guard(&common)?;
+    }
 
     if !git_ok(&main, &["rev-parse", "--verify", "HEAD"]).await {
         return Err(format!(
@@ -131,7 +142,11 @@ pub(crate) async fn provision_task_worktree(
 
     // Uncommitted work in the source tree is absent from the fresh checkout. That
     // is worth telling the TL about, but it is never a reason to refuse.
-    let source_dirty = !git_line(&main, &["status", "--porcelain"])
+    //
+    // Asked of the ORIGIN, not the main worktree: the user started from a
+    // particular tree, and it is THEIR uncommitted edits that will be missing.
+    // A dirty linked worktree with a clean main would otherwise be reported clean.
+    let source_dirty = !git_line(origin, &["status", "--porcelain"])
         .await
         .unwrap_or_default()
         .is_empty();
@@ -262,6 +277,22 @@ async fn resolve_target_ref(
     Err(format!(
         "{requested} is not a branch (it resolves to {resolved}); a task must fork from a branch"
     ))
+}
+
+/// The repository's git common directory, absolute. This is where refs and
+/// `info/exclude` actually live, and with `--separate-git-dir` it can sit outside
+/// the worktree entirely — which is why it needs its own scope check.
+async fn git_common_dir(main: &LiveWorkspace) -> Option<String> {
+    let common = git_line(main, &["rev-parse", "--git-common-dir"]).await?;
+    if common.is_empty() {
+        return None;
+    }
+    let path = if Path::new(&common).is_absolute() {
+        PathBuf::from(&common)
+    } else {
+        Path::new(main.as_str()).join(&common)
+    };
+    Some(normalize_cwd(&path.to_string_lossy()))
 }
 
 /// The repository's main worktree. `list_worktree_records` already handles both
@@ -455,11 +486,21 @@ async fn ensure_sealwire_excluded(main: &LiveWorkspace) {
     }
     updated.extend_from_slice(entry.as_bytes());
     updated.push(b'\n');
-    // Residual race: the path could be swapped between the check and this write.
-    // It stays best-effort because the alternative (O_NOFOLLOW + rename dance) is
-    // a lot of machinery for a cosmetic `git status` nicety, and the check already
-    // removes the pre-planted case this is actually exposed to.
-    let _ = tokio::fs::write(&exclude_path, updated).await;
+
+    // Write a fresh file and rename it into place rather than writing to
+    // `exclude_path` directly. `write` FOLLOWS a symlink, so a path swapped
+    // between the checks above and this call would redirect the bytes; `rename`
+    // replaces the directory entry itself and can never follow one. This is the
+    // same shape `persistence.rs` uses for the state file.
+    let staging = info_dir.join(".sealwire-exclude.tmp");
+    let _ = tokio::fs::remove_file(&staging).await;
+    if tokio::fs::write(&staging, updated).await.is_err() {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return;
+    }
+    if tokio::fs::rename(&staging, &exclude_path).await.is_err() {
+        let _ = tokio::fs::remove_file(&staging).await;
+    }
 }
 
 /// ASCII-trim a raw line. Hand-rolled rather than `[u8]::trim_ascii` to avoid
@@ -712,6 +753,138 @@ mod tests {
         assert!(
             !Path::new(&root).join(SEALWIRE_DIR).exists(),
             "no directory should be created when the guard refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scope_guard_sees_every_tree_before_anything_is_mutated() {
+        // Provisioning creates a branch in the MAIN worktree and writes
+        // info/exclude in the COMMON dir, so a guard that only saw the
+        // destination would wave those through — and checking afterwards is worse
+        // than not checking, because the refusal leaves an orphaned branch and
+        // worktree behind.
+        let (_repo, root) = init_repo().await;
+        let main = workspace(&root);
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = seen.clone();
+        let guard = move |path: &str| {
+            recorder.lock().unwrap().push(path.to_string());
+            Ok(())
+        };
+        provision_task_worktree(&main, "guarded", None, &guard)
+            .await
+            .expect("provisioning");
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|path| path == &root),
+            "the main worktree must be guarded, saw {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|path| path.contains(".git")),
+            "the git common dir must be guarded, saw {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|path| path.contains("worktrees/guarded")),
+            "the destination must be guarded, saw {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusing_the_main_worktree_leaves_no_branch_or_directory_behind() {
+        let (_repo, root) = init_repo().await;
+        let main = workspace(&root);
+
+        // Reject only the main worktree; the destination would have passed.
+        let root_for_guard = root.clone();
+        let guard = move |path: &str| {
+            if path == root_for_guard {
+                Err("main worktree is out of scope".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let error = provision_task_worktree(&main, "orphan", None, &guard)
+            .await
+            .expect_err("an out-of-scope main worktree must be refused");
+        assert!(error.contains("out of scope"), "got: {error}");
+
+        let branches = run_in(Path::new(&root), &["branch", "--list"]).await;
+        assert!(
+            !String::from_utf8_lossy(&branches.stdout).contains("task/orphan"),
+            "a refusal must not leave an orphaned branch"
+        );
+        assert!(
+            !Path::new(&root).join(SEALWIRE_DIR).exists(),
+            "a refusal must not leave an orphaned worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dirty_linked_origin_is_reported_even_when_the_main_tree_is_clean() {
+        // Dirtiness is a property of the tree the USER started from: those are
+        // THEIR uncommitted edits, and they are absent from the new task tree.
+        let (_repo, root) = init_repo().await;
+        let elsewhere = TempDir::new().expect("tmpdir");
+        let linked = elsewhere.path().canonicalize().unwrap().join("linked");
+        run_in(
+            Path::new(&root),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--no-track",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .await;
+        // The linked tree is dirty; the main tree is not.
+        std::fs::write(linked.join("seed.txt"), "uncommitted\n").unwrap();
+
+        let created = provision_task_worktree(
+            &workspace(&linked.to_string_lossy()),
+            "from dirty linked",
+            None,
+            &allow_all(),
+        )
+        .await
+        .expect("provisioning");
+
+        assert!(
+            created.source_dirty,
+            "the TL must be told the user's uncommitted work is not coming along"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_exclude_write_leaves_a_regular_file_and_no_staging_debris() {
+        // The write goes through a temp file and a rename so it can never follow a
+        // symlink swapped in after the checks. Assert the observable consequences.
+        let (_repo, root) = init_repo().await;
+        provision_task_worktree(&workspace(&root), "renamed", None, &allow_all())
+            .await
+            .expect("provisioning");
+
+        let info = Path::new(&root).join(".git").join("info");
+        let exclude = info.join("exclude");
+        let metadata = std::fs::symlink_metadata(&exclude).expect("exclude should exist");
+        assert!(
+            metadata.file_type().is_file(),
+            "the result is a regular file"
+        );
+        assert!(
+            std::fs::read_to_string(&exclude)
+                .unwrap()
+                .contains("/.sealwire/"),
+            "and carries the entry"
+        );
+        assert!(
+            !info.join(".sealwire-exclude.tmp").exists(),
+            "the staging file must not be left behind"
         );
     }
 

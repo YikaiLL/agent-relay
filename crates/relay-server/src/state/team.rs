@@ -448,6 +448,16 @@ pub(crate) struct TeamRun {
     pub(crate) design_review_rounds: u32,
     pub(crate) mr_rounds_used: u32,
 
+    /// The thread a turn is being started on RIGHT NOW, set before the provider
+    /// call and cleared once the turn resolves.
+    ///
+    /// Exists because a provider marks a thread working only AFTER `start_turn`
+    /// returns: in between, the provider may already be running while relay state
+    /// still reads idle. A driver lost in that window would look drained, the run
+    /// would go terminal, its locks would release, and the real session would keep
+    /// writing the worktree. This marker makes that window visible to cleanup.
+    pub(crate) in_flight_thread: Option<String>,
+
     pub(crate) pause_requested: bool,
     pub(crate) pause_requested_by: String,
     pub(crate) pause_reason: Option<String>,
@@ -645,6 +655,12 @@ impl TeamRun {
             }
             for thread_id in task.owned_thread_ids.iter_mut() {
                 swap(thread_id);
+            }
+        }
+        if let Some(in_flight) = self.in_flight_thread.as_mut() {
+            if in_flight == pending_id {
+                *in_flight = real_id.to_string();
+                changed = true;
             }
         }
         if let Some(awaiting) = self.awaiting.as_mut() {

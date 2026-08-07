@@ -44,6 +44,14 @@ use super::*;
 /// completes; this only trips on a turn that makes no progress at all.
 const TEAM_STEP_STALL_SECS: u64 = 600;
 
+/// Ceiling on a rendered review diff.
+///
+/// The per-file caps upstream do not bound the TOTAL: tracked output is capped
+/// globally, but each untracked file contributes up to 64 KiB and nothing limits
+/// how many there are. One generated directory would otherwise build a prompt
+/// large enough to exhaust the model's context.
+const REVIEW_DIFF_MAX_BYTES: usize = 256 * 1024;
+
 /// Relative paths inside the task worktree. Excluded from git by the same
 /// `/.sealwire/` entry that hides the worktrees themselves, which is what keeps
 /// the team's own scaffolding out of the branch the user is asked to merge.
@@ -161,14 +169,6 @@ impl AppState {
             &|planned| ensure_path_within_device_scope(planned, &device_scope, &allowed_roots),
         )
         .await?;
-        // The repository the branch was actually created in may be a different
-        // directory than the one asked for (a linked worktree resolves to its
-        // main), so re-check the tree that was really touched.
-        ensure_path_within_device_scope(
-            &worktree.repo_main_worktree,
-            &device_scope,
-            &allowed_roots,
-        )?;
 
         let run_id = format!("team_{}", random_suffix());
         let mut run = TeamRun::new(
@@ -364,6 +364,26 @@ impl AppState {
         for thread_id in self.team_owned_threads(run_id).await {
             drained &= self.stop_and_drain(&thread_id).await;
         }
+        // A turn caught mid-start is the dangerous case: the provider marks a
+        // thread working only AFTER `start_turn` returns, so a thread with no
+        // runtime at all may still be executing. "No runtime" therefore means
+        // UNKNOWN here, not idle — confirming it would release the locks while an
+        // agent keeps writing.
+        if let Some(in_flight) = self
+            .team_run_snapshot(run_id)
+            .await
+            .and_then(|run| run.in_flight_thread)
+        {
+            let observable = self
+                .relay
+                .read()
+                .await
+                .runtime_for_thread(&in_flight)
+                .is_some();
+            if !observable {
+                drained = false;
+            }
+        }
         if !drained {
             self.block_team_run(
                 run_id,
@@ -513,6 +533,8 @@ impl AppState {
             .latest_assistant_entry(&thread_id)
             .await
             .map(|(id, _)| id);
+        self.set_in_flight_thread(run_id, Some(thread_id.clone()))
+            .await;
 
         let model = self
             .relay
@@ -530,7 +552,9 @@ impl AppState {
             // provider can begin work before returning `Err`. Drain either way, or
             // a started turn keeps mutating the worktree after the run settles.
             Ok(None) | Err(_) => {
-                if !self.stop_and_drain(&thread_id).await {
+                let drained = self.stop_and_drain(&thread_id).await;
+                self.set_in_flight_thread(run_id, None).await;
+                if !drained {
                     return TeamStepOutcome::Failed(format!(
                         "thread {thread_id}'s turn did not confirm stopping after an uncertain start"
                     ));
@@ -549,7 +573,9 @@ impl AppState {
             thread_id = promoted;
         }
         if let Some(error) = outcome {
-            if !self.stop_and_drain(&thread_id).await {
+            let drained = self.stop_and_drain(&thread_id).await;
+            self.set_in_flight_thread(run_id, None).await;
+            if !drained {
                 return TeamStepOutcome::Failed(format!(
                     "{error}; and thread {thread_id} did not confirm stopping"
                 ));
@@ -557,12 +583,18 @@ impl AppState {
             return TeamStepOutcome::Failed(error);
         }
 
+        self.set_in_flight_thread(run_id, None).await;
         match self.latest_assistant_entry(&thread_id).await {
             Some((id, text)) if baseline.as_deref() != Some(id.as_str()) => {
                 TeamStepOutcome::Replied(text)
             }
             _ => TeamStepOutcome::Silent,
         }
+    }
+
+    async fn set_in_flight_thread(&self, run_id: &str, thread_id: Option<String>) {
+        let mut relay = self.relay.write().await;
+        relay.update_team_run(run_id, |run| run.in_flight_thread = thread_id.clone());
     }
 
     /// Record a run-owned thread and return the slot that now names it.
@@ -1126,8 +1158,40 @@ finding per line.",
             return false;
         }
 
-        let base = merge_base_with(&workspace, &run.target_ref).await;
-        let diff = match collect_workspace_diff_against(&workspace, base.as_deref()).await {
+        // A missing merge base must never fall through to `HEAD`. The tree was
+        // just committed, so diffing against HEAD yields NOTHING — the gate would
+        // approve an empty change and the run would report Done. Deleting the
+        // target branch, or force-pushing it to unrelated history, is enough to
+        // reach this. Fall back to the fork point recorded at provisioning time,
+        // and refuse outright if even that is gone.
+        let base = match merge_base_with(&workspace, &run.target_ref).await {
+            Some(base) => base,
+            None if !run.base_commit.is_empty() => {
+                self.push_runtime_log(
+                    "warn",
+                    format!(
+                        "Task {run_id}: {} has no merge base with this task; \
+diffing against the recorded fork point instead.",
+                        run.target_ref
+                    ),
+                )
+                .await;
+                run.base_commit.clone()
+            }
+            None => {
+                self.fail_team_run(
+                    run_id,
+                    format!(
+                        "cannot determine what to diff this task against: {} has no common \
+history with it and no fork point was recorded",
+                        run.target_ref
+                    ),
+                )
+                .await;
+                return false;
+            }
+        };
+        let diff = match collect_workspace_diff_against(&workspace, Some(&base)).await {
             Ok(response) => render_review_diff(&response),
             Err(error) => {
                 self.fail_team_run(run_id, format!("could not collect the MR diff: {error}"))
@@ -1413,23 +1477,35 @@ fn findings_from(text: &str) -> Vec<String> {
 /// `file_changes`. Agents create files constantly, so reading the tracked-only
 /// field would hand a reviewer a diff with the new code missing and ask it to
 /// approve.
-fn render_review_diff(response: &crate::protocol::WorkspaceDiffResponse) -> String {
+pub(super) fn render_review_diff(response: &crate::protocol::WorkspaceDiffResponse) -> String {
     if response.file_changes.is_empty() {
         return String::new();
     }
-    response
-        .file_changes
-        .iter()
-        .map(|change| {
-            if change.diff.trim().is_empty() {
-                format!(
-                    "--- {} ({}, no textual diff)",
-                    change.path, change.change_type
-                )
-            } else {
-                change.diff.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut rendered = String::new();
+    let mut dropped = 0usize;
+    for change in &response.file_changes {
+        let piece = if change.diff.trim().is_empty() {
+            format!(
+                "--- {} ({}, no textual diff)\n",
+                change.path, change.change_type
+            )
+        } else {
+            format!("{}\n", change.diff)
+        };
+        if rendered.len() + piece.len() > REVIEW_DIFF_MAX_BYTES {
+            dropped += 1;
+            continue;
+        }
+        rendered.push_str(&piece);
+    }
+    if dropped > 0 {
+        // Say so rather than truncating silently: a reviewer that could not see a
+        // file must not be left believing it saw everything.
+        rendered.push_str(&format!(
+            "\n[{dropped} more changed file(s) omitted: this diff exceeded {} KiB. \
+Treat anything you were not shown as unreviewed.]\n",
+            REVIEW_DIFF_MAX_BYTES / 1024
+        ));
+    }
+    rendered
 }

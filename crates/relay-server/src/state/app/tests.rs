@@ -16849,6 +16849,155 @@ turn) must allow a review: {error:?}"
     }
 
     #[tokio::test]
+    async fn a_target_with_no_common_history_fails_instead_of_reviewing_nothing() {
+        // The trap: run_mr_round commits the tree first, so falling back to `HEAD`
+        // when the merge base is missing produces an EMPTY diff. The gate would
+        // approve nothing at all and the run would report Done.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        script_replies(
+            providers.get("codex").unwrap(),
+            &[
+                "COMPLEXITY: simple",
+                "SUBTASK: Do the thing\nDo it.\nEND SUBTASK",
+                "Done.",
+                "Fine.\nVERDICT: APPROVED",
+                "Noted.",
+                "Nothing to object to.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Remove every way of resolving a base, so nothing is left to diff against.
+        {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                for _ in 0..600 {
+                    let ready = app
+                        .relay
+                        .read()
+                        .await
+                        .team_run(&run_id)
+                        .map(|run| !run.sub_tasks.is_empty())
+                        .unwrap_or(false);
+                    if ready {
+                        // `git branch -D main` cannot delete a checked-out branch,
+                        // so point the run at a ref that genuinely does not
+                        // resolve — the same state a deleted or force-pushed
+                        // target leaves behind — and drop the fork point too.
+                        app.relay.write().await.update_team_run(&run_id, |run| {
+                            run.target_ref = "refs/heads/deleted-target".to_string();
+                            run.base_commit = String::new();
+                        });
+                        return;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Failed,
+            "an unresolvable base must stop the run, not approve an empty diff"
+        );
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no common"),
+            "the error should say why: {:?}",
+            run.error
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_will_not_confirm_a_drain_for_a_turn_it_cannot_observe() {
+        // A provider marks a thread working only AFTER start_turn returns. A driver
+        // lost inside that window leaves a thread that is genuinely executing but
+        // has no runtime to inspect. Treating "no runtime" as idle would confirm
+        // the drain, settle the run, release its locks, and let the real session
+        // keep writing the worktree.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // Model the window: a seat is mid-start on a thread with no runtime yet.
+        for _ in 0..400 {
+            let started = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| !run.tl_thread_id.is_empty())
+                .unwrap_or(false);
+            if started {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.in_flight_thread = Some("claude-pending-mid-start".to_string());
+        });
+
+        app.interrupt_team_run_if_stranded(&run_id).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "an unobservable in-flight turn must not be confirmed drained: {:?}",
+            run.error
+        );
+        assert!(!run.status.is_terminal(), "Blocked keeps the locks held");
+    }
+
+    #[tokio::test]
+    async fn an_enormous_change_set_is_bounded_and_says_what_it_dropped() {
+        // Tracked output is capped globally, but each untracked file adds up to
+        // 64 KiB and nothing bounds the file COUNT. One generated directory would
+        // otherwise build a prompt big enough to exhaust the model's context.
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        let path = std::path::Path::new(&root);
+        let blob = "x".repeat(40 * 1024);
+        for index in 0..40 {
+            std::fs::write(path.join(format!("generated_{index}.txt")), &blob).unwrap();
+        }
+
+        let workspace = LiveWorkspace::from_path(&root).expect("workspace");
+        let response = collect_workspace_diff_against(&workspace, None)
+            .await
+            .expect("diff");
+        let rendered = super::super::team::render_review_diff(&response);
+
+        assert!(
+            rendered.len() < 400 * 1024,
+            "the rendered prompt must stay bounded, got {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("omitted"),
+            "a reviewer must be told it was not shown everything"
+        );
+        assert!(
+            rendered.contains("unreviewed"),
+            "and told what that means: {}",
+            &rendered[rendered.len().saturating_sub(200)..]
+        );
+    }
+
+    #[tokio::test]
     async fn a_second_task_is_refused_while_one_is_live() {
         let (_repo, root) = init_team_repo().await;
         let (app, providers) = build_review_app(&root, &["codex"]).await;
