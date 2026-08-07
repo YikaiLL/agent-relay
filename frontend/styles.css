@@ -496,6 +496,34 @@ body.sidebar-collapsed .icon-rail {
   color: var(--text-primary);
 }
 
+/* The collapsed twin of `.sidebar-nav-row`'s selected state, and lit the same
+   way: a flat neutral fill, never the raised pill that means "button". Driven
+   from `body[data-view]` because the rail sits outside `.app-shell` — see the
+   note in render-session.js where that attribute is written. */
+body:not([data-view="tasks"]) .icon-rail-sessions,
+body[data-view="tasks"] .icon-rail-tasks {
+  background: var(--surface-3);
+  color: var(--text-1);
+}
+
+/* "Something is waiting", with the count dropped — a 44px square has no room for
+   a number, and the number is not the part that has to survive collapsing. */
+.icon-rail-dot {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: var(--warn-fg);
+  /* Rings against the rail's own background so the dot reads as attached to the
+     glyph rather than floating over whatever is behind it. */
+  box-shadow: 0 0 0 2px var(--bg-surface);
+}
+.icon-rail-dot[hidden] {
+  display: none;
+}
+
 .icon-rail-spacer {
   flex: 1;
 }
@@ -6428,64 +6456,99 @@ body.is-resizing-panel {
 }
 
 /* ===== Sidebar view switch — Sessions | Tasks =====
-   A segmented control, not two stacked rows: they are mutually exclusive views of
-   the same column, and a segmented control is the only shape that says so at a
-   glance. The moving indicator is one pseudo-element on the track rather than a
-   background per tab, so the two can never both look selected. */
+   A row stack, not a segmented control. A segment strip is sized by its member
+   count: two destinations exactly fill it, and a third re-slices every segment
+   AND invalidates the rule that positions the indicator. A row just joins the
+   stack. (This is what SidebarNav's own doc-comment has always said; the CSS
+   spent a while disagreeing with it.)
+
+   No track and no travelling indicator — the only chrome is a flat fill on the
+   row you are on. That keeps three meanings on three treatments, and none of
+   them doubles up:
+     accent  = an action you can take       (New session)
+     neutral = the place you are            (the selected row)
+     amber   = something is waiting for you (the Tasks badge)
+   Navigation position is not an action, so it does not get the accent — and the
+   selected row must not reuse the raised/shadowed pill, which is the app's
+   button treatment. */
 .sidebar-nav {
-  position: relative;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  /* No gap, deliberately: the indicator is one pseudo-element that travels by
-     `translateX(100%)` — its own width — so its width has to be exactly half the
-     track's inner width. A gap breaks that identity and the pill lands short. */
-  gap: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   margin: 2px 10px 10px;
-  padding: 3px;
-  border-radius: var(--r-md);
-  background: var(--surface-0);
-  box-shadow: inset 0 0 0 1px var(--border-faint);
-}
-.sidebar-nav::before {
-  content: "";
-  position: absolute;
-  inset: 3px auto 3px 3px;
-  width: calc(50% - 3px);
-  border-radius: calc(var(--r-md) - 3px);
-  background: var(--surface-3);
-  box-shadow: var(--shadow-1);
-  transition: transform 0.16s cubic-bezier(0.32, 0.72, 0, 1);
-}
-.app-shell[data-view="tasks"] .sidebar-nav::before {
-  transform: translateX(100%);
-}
-@media (prefers-reduced-motion: reduce) {
-  .sidebar-nav::before { transition: none; }
 }
 .sidebar-nav-row {
-  position: relative;
-  z-index: 1;
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 7px;
-  padding: 7px 8px;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 9px;
   border: none;
-  border-radius: calc(var(--r-md) - 3px);
+  border-radius: var(--r-md);
   background: transparent;
-  color: var(--text-3);
+  color: var(--text-2);
   font-family: inherit;
   font-size: var(--text-ui);
   font-weight: var(--weight-medium);
+  line-height: var(--leading-normal);
+  text-align: left;
   cursor: pointer;
-  transition: color 0.12s ease;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
-.sidebar-nav-row:hover { color: var(--text-2); }
-/* The selected tab is decided by the view, so exactly one can ever be lit. */
+.sidebar-nav-row:hover {
+  background: var(--surface-2);
+  color: var(--text-1);
+}
+/* The selected row is decided by the view, so exactly one can ever be lit.
+   `aria-current="page"` is kept in step by renderSidebarNav(); this selector
+   stays on `data-view` so the paint never waits on that write.
+
+   `--surface-4`, deliberately skipping the step hover uses. Hover is transient
+   and selection is persistent, but on screen they are both just a filled row —
+   at one step apart (`-2` vs `-3`) hovering Sessions while on Tasks lit two rows
+   that read the same, and the light theme has the least room of the two. Two
+   steps is what makes "the one I am pointing at" and "the one I am on" separate
+   at a glance. `.conversation-item` solves the same collision the other way, by
+   letting hover and selected share a fill and marking selection with an accent
+   bar; a two-row nav has no list to scan, so the fill can just carry it. */
 .app-shell:not([data-view="tasks"]) #sidebar-nav-sessions,
 .app-shell[data-view="tasks"] #sidebar-nav-tasks {
+  background: var(--surface-4);
   color: var(--text-1);
   font-weight: var(--weight-strong);
+}
+/* The glyph sits one step under its label until the row is live, so a column of
+   icons never competes with the words beside them. */
+.sidebar-nav-glyph {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-3);
+  transition: color 0.12s ease;
+}
+.sidebar-nav-glyph svg {
+  width: 16px;
+  height: 16px;
+}
+.sidebar-nav-row:hover .sidebar-nav-glyph,
+.app-shell:not([data-view="tasks"]) #sidebar-nav-sessions .sidebar-nav-glyph,
+.app-shell[data-view="tasks"] #sidebar-nav-tasks .sidebar-nav-glyph {
+  color: currentColor;
+}
+.sidebar-nav-label {
+  flex: 1 1 auto;
+}
+/* Counts tasks WAITING ON A PERSON, so it has to stay legible from the Sessions
+   row too — walking away from a task is the whole point of starting one. */
+.sidebar-nav-badge {
+  flex: none;
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-strong);
+  text-align: center;
 }
 
 /* ===== Sidebar body switch =====
@@ -6620,25 +6683,3 @@ body.is-resizing-panel {
 }
 .task-welcome-steps li { margin-bottom: 5px; }
 .task-welcome-steps b { color: var(--text-2); font-weight: var(--weight-strong); }
-.sidebar-nav-glyph {
-  display: inline-flex;
-  flex: none;
-}
-.sidebar-nav-glyph svg {
-  width: 16px;
-  height: 16px;
-}
-.sidebar-nav-label {
-  flex: 1 1 auto;
-}
-.sidebar-nav-badge {
-  flex: none;
-  min-width: 18px;
-  padding: 1px 6px;
-  border-radius: var(--r-pill);
-  background: var(--warn-bg);
-  color: var(--warn-fg);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-strong);
-  text-align: center;
-}

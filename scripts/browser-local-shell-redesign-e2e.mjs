@@ -122,11 +122,19 @@ async function run() {
     await page.waitForTimeout(500);
 
     // --- Icon rail: mounted, but only SHOWN while the sidebar is collapsed ---
-    // The rail's Projects folder was retired: it duplicated the sidebar's own
-    // Sessions/Projects toggle, and the one job only it did — bringing a collapsed
-    // nav panel back — belongs to #toggle-left-panel (asserted below).
-    // Its remaining two occupants (seal logo, gear) now live in the sidebar while
-    // it is open, so an expanded rail would render both of them twice.
+    // The rail's Projects folder was retired: the one job only it did — bringing a
+    // collapsed nav panel back — belongs to #toggle-left-panel (asserted below).
+    // The seal logo and the gear also live in the sidebar while it is open, so an
+    // expanded rail would render both of them twice.
+    //
+    // What the rail DOES carry is the sidebar's navigation, because while the panel
+    // is collapsed the rail is the only navigation on screen. Both destinations, or
+    // a collapsed user cannot reach one of them at all.
+    //
+    // This assertion counted 1 (gear only) for a while after Tasks was added to the
+    // rail, so it was red on main before Sessions joined it. Naming each occupant
+    // rather than only counting them is what keeps a miscount from reading as an
+    // arbitrary number to bump.
     const rail = await page.evaluate(() => {
       const r = document.querySelector(".icon-rail");
       return {
@@ -134,13 +142,19 @@ async function run() {
         visible: r ? getComputedStyle(r).display !== "none" : false,
         hasLogo: !!r?.querySelector(".icon-rail-logo"),
         hasHome: !!r?.querySelector("#icon-rail-home"),
+        hasSessions: !!r?.querySelector("#icon-rail-sessions"),
+        hasTasks: !!r?.querySelector("#icon-rail-tasks"),
         hasGear: !!r?.querySelector("#icon-rail-settings"),
         buttons: r ? r.querySelectorAll("button").length : 0,
       };
     });
     assert.ok(rail.present && rail.hasLogo && rail.hasGear, `icon rail: ${JSON.stringify(rail)}`);
     assert.equal(rail.hasHome, false, `the rail's Projects folder is retired: ${JSON.stringify(rail)}`);
-    assert.equal(rail.buttons, 1, "icon rail is the gear only (no home, no bell)");
+    assert.ok(
+      rail.hasSessions && rail.hasTasks,
+      `collapsed, the rail is the whole nav — it needs both destinations: ${JSON.stringify(rail)}`
+    );
+    assert.equal(rail.buttons, 3, `icon rail is Sessions + Tasks + gear: ${JSON.stringify(rail)}`);
     assert.equal(rail.visible, false, `an expanded sidebar hides the rail: ${JSON.stringify(rail)}`);
 
     // The brand and Settings the rail used to carry are on the open sidebar.

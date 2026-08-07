@@ -18,6 +18,7 @@ import {
   closeSessionDetailsModalButton,
   closeSettingsModalButton,
   settingsModal,
+  iconRailSessionsButton,
   iconRailSettingsButton,
   iconRailTasksButton,
   sidebarNavSessionsButton,
@@ -2266,8 +2267,9 @@ function openSessionsScreen() {
 
 sidebarNavSessionsButton?.addEventListener("click", openSessionsScreen);
 sidebarNavTasksButton?.addEventListener("click", openTaskScreen);
-// Also on the icon rail, which is the only nav visible while the sidebar is
-// collapsed.
+// Also on the icon rail, which is the ONLY nav visible while the sidebar is
+// collapsed — so it has to offer both destinations, not just Tasks.
+iconRailSessionsButton?.addEventListener("click", openSessionsScreen);
 iconRailTasksButton?.addEventListener("click", openTaskScreen);
 
 // "New agent" in the header — the header only shows it while it is naming a

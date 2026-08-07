@@ -31,6 +31,7 @@ const styles = readFileSync(fileURLToPath(new URL("../styles.css", import.meta.u
 );
 const shell = readFileSync(fileURLToPath(new URL("./react-shell.js", import.meta.url)), "utf8");
 const appJs = readFileSync(fileURLToPath(new URL("../app.js", import.meta.url)), "utf8");
+const renderSession = readFileSync(fileURLToPath(new URL("./render-session.js", import.meta.url)), "utf8");
 
 // Pull the body of the first rule whose selector list contains an exact match,
 // searching only within `scope` (so a media-query block can be searched on its
@@ -106,6 +107,103 @@ test("the mobile kill-switch still beats the collapsed rule", () => {
     /display:\s*none/,
     "≤960px must hide the rail even when the sidebar is collapsed"
   );
+});
+
+// --- collapsed, the rail IS the navigation -----------------------------------
+//
+// While `body.sidebar-collapsed` is set the sidebar is `visibility: hidden`, so
+// every row in `SidebarNav` is unreachable and the rail is the only navigation on
+// screen. It shipped with a Tasks button and NO Sessions button — a user who
+// collapsed the panel while on the Task screen had no way back to their sessions
+// short of re-opening the panel. That gap was a consequence of the nav being a
+// segmented control, which has no icon-only form to collapse into; a row is
+// already a glyph plus a label, so the rail is just the same rows with the labels
+// dropped. Both destinations, or the rail is not a nav.
+
+// `assert.match` prints the ENTIRE haystack when it fails, and app.js is ~156 KB —
+// one failed match scrolls the real message off the screen. These files are big
+// enough that the regex plus a sentence is the more useful failure.
+function assertSource(source, pattern, message) {
+  assert.ok(pattern.test(source), `${message} (no match for ${pattern})`);
+}
+
+test("the collapsed rail offers both destinations, not just Tasks", () => {
+  for (const id of ["icon-rail-sessions", "icon-rail-tasks"]) {
+    assertSource(shell, new RegExp(`id:\\s*"${id}"`), `the rail is the whole nav while collapsed; it must render #${id}`);
+  }
+});
+
+test("both rail destinations go to the same screens as their sidebar rows", () => {
+  assertSource(
+    appJs,
+    /iconRailSessionsButton\?\.addEventListener\("click",\s*openSessionsScreen\)/,
+    "the rail's Sessions button must open the Sessions screen"
+  );
+  assertSource(
+    appJs,
+    /iconRailTasksButton\?\.addEventListener\("click",\s*openTaskScreen\)/,
+    "the rail's Tasks button must open the Task screen"
+  );
+});
+
+// The rail lives outside `.app-shell`, so `[data-view]` on the shell cannot select
+// into it. render-session mirrors the view onto `<body>`; drop that write and the
+// rail silently stops saying where you are, with no other symptom.
+test("the rail lights its current destination from body[data-view]", () => {
+  assertSource(
+    renderSession,
+    /document\.body\.dataset\.view\s*=/,
+    "the rail's selected state has no other source"
+  );
+  for (const selector of [
+    'body:not([data-view="tasks"]) .icon-rail-sessions',
+    'body[data-view="tasks"] .icon-rail-tasks',
+  ]) {
+    assert.match(ruleBody(selector), /background:\s*var\(/, `${selector} must fill, not merely recolour`);
+  }
+});
+
+// One fact, two renderings: the sidebar shows a count, the rail shows a dot. Both
+// are driven off the same `waiting` value inside renderTasksBadge, so they cannot
+// disagree about whether anything is waiting. A rail that stayed quiet would go
+// silent in exactly the state where the user has the least on screen to notice.
+test("the waiting-task signal survives collapsing the sidebar", () => {
+  assertSource(shell, /id:\s*"icon-rail-tasks-dot"/, "the badge needs a collapsed form");
+  const start = renderSession.indexOf("function renderTasksBadge");
+  assert.ok(start >= 0, "expected renderTasksBadge to still exist");
+  const body = renderSession.slice(start, renderSession.indexOf("\n  }", start));
+  assert.match(body, /sidebarTasksBadge\.hidden = waiting === 0/);
+  assert.match(body, /iconRailTasksDot\.hidden = waiting === 0/, "both surfaces must read the same count");
+});
+
+// --- the sidebar nav is a row stack ------------------------------------------
+//
+// There is no track and no travelling indicator behind these rows, so the
+// selected row has to carry a FILL of its own — colour alone leaves nothing
+// marking where you are. And it must not be the raised/shadowed pill, which is
+// this app's button treatment: "where you are" and "do this" have to stay apart.
+test("the selected sidebar nav row is filled, not just recoloured", () => {
+  const selected = ruleBody('.app-shell:not([data-view="tasks"]) #sidebar-nav-sessions');
+  assert.match(selected, /background:\s*var\(--surface-\d\)/);
+  assert.doesNotMatch(selected, /box-shadow/, "a shadow would make the current view look like a button");
+});
+
+// Hover and selection are both "a filled row", so if they land on adjacent
+// surface steps they read as the same thing — hovering Sessions while on Tasks
+// lit two rows that looked alike, worst in the light theme where the steps are
+// closest. The exact tokens are free to move; sharing one is the bug.
+test("hover and selection do not share a fill", () => {
+  const fill = (body) => body.match(/background:\s*(var\(--surface-\d\))/)?.[1];
+  const hover = fill(ruleBody(".sidebar-nav-row:hover"));
+  const selected = fill(ruleBody('.app-shell:not([data-view="tasks"]) #sidebar-nav-sessions'));
+  assert.ok(hover, "the hovered row must fill — it is the only affordance a row has");
+  assert.ok(selected, "the selected row must fill");
+  assert.notEqual(selected, hover, `hover and selected both use ${hover}; the row you are on becomes unreadable`);
+});
+
+test("exactly one nav row is marked aria-current", () => {
+  assertSource(renderSession, /setAttribute\("aria-current", "page"\)/, "the current row must announce itself");
+  assertSource(renderSession, /removeAttribute\("aria-current"\)/, "the row you left has to give it up");
 });
 
 // --- the brand lockup --------------------------------------------------------

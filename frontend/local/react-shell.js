@@ -17,9 +17,16 @@ import {
 
 const h = React.createElement;
 
-// Far-left 64px icon rail: brand logo (top) and a Settings gear (bottom). The
-// rail lives OUTSIDE the .app-shell grid (in .local-frame) so the grid math is
-// untouched. The gear is wired imperatively in app.js by id (#icon-rail-settings).
+// Far-left 64px icon rail: brand logo (top), the same two destinations SidebarNav
+// offers, and a Settings gear (bottom). The rail lives OUTSIDE the .app-shell grid
+// (in .local-frame) so the grid math is untouched — which is also why its current
+// destination is lit from `body[data-view]` rather than the shell's own attribute.
+// Buttons are wired imperatively in app.js by id.
+//
+// Sessions is here because the rail is the WHOLE nav while the sidebar is
+// collapsed. It was missing for as long as the nav was a segmented control, which
+// has no icon-only form to collapse into; a row is already an icon plus a label,
+// so dropping the label is the entire adaptation.
 function IconRail() {
   return h(
     "nav",
@@ -34,13 +41,27 @@ function IconRail() {
     h(
       "button",
       {
+        className: "icon-rail-button icon-rail-sessions",
+        id: "icon-rail-sessions",
+        type: "button",
+        title: "Sessions",
+        "aria-label": "Sessions",
+      },
+      h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: SESSIONS_SVG } })
+    ),
+    h(
+      "button",
+      {
         className: "icon-rail-button icon-rail-tasks",
         id: "icon-rail-tasks",
         type: "button",
         title: "Tasks",
         "aria-label": "Tasks",
       },
-      h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: TASKS_SVG } })
+      h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: TASKS_SVG } }),
+      // The collapsed form of the sidebar badge: a count has nowhere to sit on a
+      // 44px square, but "something is waiting" is the part that has to survive.
+      h("span", { className: "icon-rail-dot", id: "icon-rail-tasks-dot", hidden: true, "aria-hidden": "true" })
     ),
     h("div", { className: "icon-rail-spacer" }),
     h(

@@ -31,6 +31,9 @@ import {
   projectOverviewMount,
   taskTeamMount,
   sidebarTaskListMount,
+  iconRailTasksDot,
+  sidebarNavSessionsButton,
+  sidebarNavTasksButton,
   sidebarTasksBadge,
   transcript,
   workspaceSubtitle,
@@ -453,6 +456,24 @@ export function createSessionRenderer({
     }
     if (appShell) {
       appShell.dataset.view = mainView;
+    }
+    // The icon rail lives OUTSIDE `.app-shell` (in `.local-frame`), so nothing it
+    // contains can be selected from `appShell`'s attribute. Mirroring the view onto
+    // `<body>` — beside the existing `body.sidebar-collapsed` — lets the rail light
+    // its current destination without a `:has()` reaching back up the tree.
+    document.body.dataset.view = mainView;
+    // The row stack carries the state in the DOM as well as in paint: the CSS
+    // selector is on `data-view` so nothing flashes, and `aria-current` is what a
+    // screen reader actually reads. Keep both, and keep exactly one of them set.
+    if (sidebarNavSessionsButton && sidebarNavTasksButton) {
+      const currentNavRow = onTaskScreen ? sidebarNavTasksButton : sidebarNavSessionsButton;
+      for (const row of [sidebarNavSessionsButton, sidebarNavTasksButton]) {
+        if (row === currentNavRow) {
+          row.setAttribute("aria-current", "page");
+        } else {
+          row.removeAttribute("aria-current");
+        }
+      }
     }
     if (sessionHistoryDrawer) {
       // A pinned project keeps the drawer open: picking one is a request to see its
@@ -1750,7 +1771,7 @@ export function createSessionRenderer({
   // never go away — a terminal run stays in the list forever — so the badge
   // would stop meaning anything the first time one finished.
   function renderTasksBadge() {
-    if (!sidebarTasksBadge) {
+    if (!sidebarTasksBadge && !iconRailTasksDot) {
       return;
     }
     // `loadSeenTasks()` is a localStorage read per render. It is a single small
@@ -1758,8 +1779,16 @@ export function createSessionRenderer({
     // for a value the user changes by clicking, which is the more expensive kind
     // of wrong.
     const waiting = teamsNeedingYou(teamsCache.current().teams, loadSeenTasks());
-    sidebarTasksBadge.hidden = waiting === 0;
-    sidebarTasksBadge.textContent = waiting ? String(waiting) : "";
+    if (sidebarTasksBadge) {
+      sidebarTasksBadge.hidden = waiting === 0;
+      sidebarTasksBadge.textContent = waiting ? String(waiting) : "";
+    }
+    // Same fact, collapsed form. The rail is the only nav on screen while the
+    // sidebar is folded, so a badge that lived only in the sidebar would go quiet
+    // in exactly the state where the user has the least on screen to notice it.
+    if (iconRailTasksDot) {
+      iconRailTasksDot.hidden = waiting === 0;
+    }
   }
 
   // The task list in the sidebar — the Tasks tab's body, opposite the session
