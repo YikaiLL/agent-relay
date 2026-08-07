@@ -496,12 +496,24 @@ body.sidebar-collapsed .icon-rail {
   color: var(--text-primary);
 }
 
+/* `display: contents` so the rail's two destination buttons — rendered here from
+   the shared SidebarNavRail — stay direct flex children of `.icon-rail`. The
+   rail's `gap`, its `align-items: center` and the spacer's `flex: 1` all measure
+   flex children, so a wrapper that participated in layout would collapse the
+   gear to the top. */
+.icon-rail-nav-mount {
+  display: contents;
+}
+
 /* The collapsed twin of `.sidebar-nav-row`'s selected state, and lit the same
-   way: a flat neutral fill, never the raised pill that means "button". Driven
-   from `body[data-view]` because the rail sits outside `.app-shell` — see the
-   note in render-session.js where that attribute is written. */
-body:not([data-view="tasks"]) .icon-rail-sessions,
-body[data-view="tasks"] .icon-rail-tasks {
+   way: a flat neutral fill, never the raised pill that means "button".
+
+   `.is-current` comes from the component, which takes the destination as a prop.
+   This used to select on `body[data-view]` — the view mirrored onto `<body>`
+   because the rail sits outside `.app-shell` and could not be reached from the
+   shell's own attribute. That mirror existed ONLY for these two selectors and is
+   gone with them. */
+.icon-rail-button.is-current {
   background: var(--surface-3);
   color: var(--text-1);
 }
@@ -520,9 +532,8 @@ body[data-view="tasks"] .icon-rail-tasks {
      glyph rather than floating over whatever is behind it. */
   box-shadow: 0 0 0 2px var(--bg-surface);
 }
-.icon-rail-dot[hidden] {
-  display: none;
-}
+/* No `[hidden]` rule: the dot is now rendered only when something is actually
+   waiting, rather than always mounted and toggled. */
 
 .icon-rail-spacer {
   flex: 1;
@@ -4868,6 +4879,12 @@ input:focus, textarea:focus, select:focus {
   background: var(--bg-hover);
 }
 
+/* `display: contents` so `.sidebar-search` stays a direct child of the sidebar column
+   and keeps its own margins, rather than nesting inside a wrapper box. */
+.sidebar-search-mount {
+  display: contents;
+}
+
 /* Session title search. Sits directly under the top bar so the field is adjacent to
    the icon that opened it, and above the list it narrows. */
 .sidebar-search {
@@ -4879,9 +4896,9 @@ input:focus, textarea:focus, select:focus {
   border-radius: 8px;
   background: var(--bg-elevated);
 }
-.sidebar-search[hidden] {
-  display: none;
-}
+/* No `[hidden]` rule: a closed field is not rendered at all now. That is the whole
+   difference this change turns on — local used to keep the node mounted and hidden
+   because app.js reached three ids inside it. */
 /* One focus treatment, promoted to the wrapper. The global `input:focus-visible` rule
    draws its ring with `box-shadow`, which would otherwise sit as a second, tighter
    rectangle INSIDE this border. Moving it out keeps the a11y ring while the field reads
@@ -6505,9 +6522,19 @@ body.is-resizing-panel {
   background: var(--surface-2);
   color: var(--text-1);
 }
-/* The selected row is decided by the view, so exactly one can ever be lit.
-   `aria-current="page"` is kept in step by renderSidebarNav(); this selector
-   stays on `data-view` so the paint never waits on that write.
+/* `display: contents` so `.sidebar-nav` stays a direct flex child of the sidebar
+   column and keeps its own margins, rather than nesting inside a wrapper box. */
+.sidebar-nav-mount {
+  display: contents;
+}
+
+/* The selected row is decided by the view, so exactly one can ever be lit — the
+   component sets `.is-current` and `aria-current="page"` from the same comparison,
+   so the paint and the screen reader cannot disagree.
+
+   This used to be a pair of `[data-view]` selectors with `aria-current` written
+   separately from render-session, because the nav was static markup and could not
+   take a prop. Two sources of truth for one fact; the prop is now the only one.
 
    `--surface-4`, deliberately skipping the step hover uses. Hover is transient
    and selection is persistent, but on screen they are both just a filled row —
@@ -6517,8 +6544,7 @@ body.is-resizing-panel {
    at a glance. `.conversation-item` solves the same collision the other way, by
    letting hover and selected share a fill and marking selection with an accent
    bar; a two-row nav has no list to scan, so the fill can just carry it. */
-.app-shell:not([data-view="tasks"]) #sidebar-nav-sessions,
-.app-shell[data-view="tasks"] #sidebar-nav-tasks {
+.sidebar-nav-row.is-current {
   background: var(--surface-4);
   color: var(--text-1);
   font-weight: var(--weight-strong);
@@ -6536,8 +6562,7 @@ body.is-resizing-panel {
   height: 16px;
 }
 .sidebar-nav-row:hover .sidebar-nav-glyph,
-.app-shell:not([data-view="tasks"]) #sidebar-nav-sessions .sidebar-nav-glyph,
-.app-shell[data-view="tasks"] #sidebar-nav-tasks .sidebar-nav-glyph {
+.sidebar-nav-row.is-current .sidebar-nav-glyph {
   color: currentColor;
 }
 .sidebar-nav-label {

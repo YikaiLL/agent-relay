@@ -10,10 +10,16 @@
 // its CSS wholesale — `.settings-modal`, `.settings-tabs`, `.settings-tab`,
 // `.settings-panel` — so the two shells cannot drift apart visually.
 //
-// The one deliberate difference is how a tab is selected. Local's panels are
-// always mounted and toggled with `hidden`, because every id inside has to
-// resolve at `dom.js` import time; remote has no such constraint, so the
-// inactive panel is simply not rendered.
+// The one deliberate difference is how a tab is selected. Local's SETTINGS PANELS
+// are always mounted and toggled with `hidden`, because every id inside them has to
+// resolve at `dom.js` import time; remote has no such constraint, so the inactive
+// panel is simply not rendered.
+//
+// Read that as a fact about these panels, not as a rule about local. It used to be
+// both — but the sidebar's search field was migrated out of exactly this pattern
+// (see `shared/sidebar-chrome.js`): its ids were retired, and local now renders it
+// conditionally, like remote. The panels are simply next in line rather than
+// permanently exempt.
 //
 // Device pairing is NOT here. It stays behind its own modal off the sidebar's
 // "Manage" row: pairing is a task you perform, not a preference you set, and it

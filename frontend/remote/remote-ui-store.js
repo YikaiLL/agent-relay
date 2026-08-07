@@ -53,27 +53,13 @@ export function createRemoteUiStore(initialState = {}) {
     pushPermission: notificationPermission(),
     pushSubscribed: false,
     sendPending: false,
-    // The bell. Same shape and rules as local's `state.threadFilter` — see
-    // shared/thread-filter.js — but held here because remote has no imperative `state`
-    // object. `retained` is a Map on purpose: thread ids are arbitrary strings.
-    threadFilter: { on: false, retained: new Map() },
+    // The bell used to live here as a byte-identical port of local's
+    // `state.threadFilter`. It now lives once, in shared/thread-list-store.js — both
+    // shells already own one of those stores, so neither shell has to declare the field.
     sessionDraft: createDefaultSessionDraft(),
     sessionPanelOpen: false,
     sessionStartPending: false,
     ...initialState,
-    // Turning the bell on, or changing which states it covers, RESETS retention:
-    // carrying it across a deliberate change of selection would show rows the user just
-    // excluded.
-    setThreadFilter(next) {
-      set((state) => ({
-        threadFilter: { ...state.threadFilter, ...next, retained: new Map() },
-      }));
-    },
-    // The retention map is a monotonic accumulator recomputed each render, not a user
-    // action — kept off `setThreadFilter` so it cannot reset what it is accumulating.
-    setThreadFilterRetained(retained) {
-      set((state) => ({ threadFilter: { ...state.threadFilter, retained } }));
-    },
     clearComposerDraft() {
       set({
         composerDraft: "",

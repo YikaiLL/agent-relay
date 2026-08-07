@@ -436,7 +436,7 @@ async function main() {
     const bellOn = () =>
       page.evaluate(() =>
         Boolean(
-          document.querySelector("#remote-sidebar-bell-toggle")?.classList.contains("is-active")
+          document.querySelector(".sidebar-bell-toggle")?.classList.contains("is-active")
         )
       );
     // Never blind-toggle: read the control, then act. A tap that assumed the wrong
@@ -444,12 +444,12 @@ async function main() {
     // several assertions later, pointing at the wrong thing.
     const setBell = async (want) => {
       if ((await bellOn()) !== want) {
-        await page.tap("#remote-sidebar-bell-toggle");
+        await page.tap(".sidebar-bell-toggle");
         await page.waitForFunction(
           (expected) =>
             Boolean(
               document
-                .querySelector("#remote-sidebar-bell-toggle")
+                .querySelector(".sidebar-bell-toggle")
                 ?.classList.contains("is-active")
             ) === expected,
           want,
@@ -513,7 +513,7 @@ async function main() {
     // 960px and only re-shown for `.remote-app-shell` — a CSS edit could remove the only
     // entry point on a phone while every other test still passed.
     const bellBox = await page.evaluate(() => {
-      const button = document.querySelector("#remote-sidebar-bell-toggle");
+      const button = document.querySelector(".sidebar-bell-toggle");
       if (!button) return null;
       const rect = button.getBoundingClientRect();
       const style = getComputedStyle(button);
@@ -547,7 +547,7 @@ async function main() {
     // 2. Turning it on buckets by state and drops the idle row.
     await setBell(true);
     console.error("after click:", JSON.stringify(await page.evaluate(() => ({
-      active: document.querySelector("#remote-sidebar-bell-toggle")?.classList.contains("is-active"),
+      active: document.querySelector(".sidebar-bell-toggle")?.classList.contains("is-active"),
       groups: [...document.querySelectorAll("#remote-threads-list .thread-group-name")].map((n) => n.textContent.trim()),
       rows: [...document.querySelectorAll("#remote-threads-list .conversation-item")].map((n) => n.dataset.threadId),
     }))));
@@ -834,8 +834,8 @@ async function main() {
     // list is truncated before it ever reaches the device, so a client-side filter could
     // only ever search the page already on screen.
     await setBell(false);
-    await page.tap("#remote-sidebar-search-toggle");
-    await page.waitForSelector("#remote-sidebar-search-input", {
+    await page.tap(".sidebar-search-toggle");
+    await page.waitForSelector(".sidebar-search-input", {
       state: "visible",
       timeout: TIMEOUT_MS,
     });
@@ -843,14 +843,14 @@ async function main() {
     // which is exactly what hid a controlled input bound to the debounced query — real
     // typing had React restore the old value after every keystroke, so a word ended up
     // searching for its last letter.
-    await page.locator("#remote-sidebar-search-input").pressSequentially("Quiet", { delay: 60 });
+    await page.locator(".sidebar-search-input").pressSequentially("Quiet", { delay: 60 });
     await page.waitForFunction(
-      () => document.querySelector("#remote-sidebar-search-input")?.value === "Quiet",
+      () => document.querySelector(".sidebar-search-input")?.value === "Quiet",
       undefined,
       { timeout: TIMEOUT_MS }
     ).catch(async () => {
       throw new Error(
-        `the field lost characters while typing: ${await page.inputValue("#remote-sidebar-search-input")}`
+        `the field lost characters while typing: ${await page.inputValue(".sidebar-search-input")}`
       );
     });
     await page.waitForFunction(
@@ -877,7 +877,7 @@ async function main() {
     // hide a search that had overwritten it. Counting requests pins the mechanism —
     // the list must come back from state, not from a refetch.
     const queriesBeforeClose = (await page.evaluate(() => window.__listThreadQueries)).length;
-    await page.tap("#remote-sidebar-search-toggle");
+    await page.tap(".sidebar-search-toggle");
     await page.waitForFunction((n) =>
       document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
       3,
@@ -894,12 +894,12 @@ async function main() {
     );
 
     // Reopen for the remaining search assertions.
-    await page.tap("#remote-sidebar-search-toggle");
-    await page.waitForSelector("#remote-sidebar-search-input", {
+    await page.tap(".sidebar-search-toggle");
+    await page.waitForSelector(".sidebar-search-input", {
       state: "visible",
       timeout: TIMEOUT_MS,
     });
-    await page.locator("#remote-sidebar-search-input").pressSequentially("Quiet", { delay: 40 });
+    await page.locator(".sidebar-search-input").pressSequentially("Quiet", { delay: 40 });
     await page.waitForFunction(
       (id) => {
         const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
@@ -937,7 +937,7 @@ async function main() {
     });
     await setBell(false);
 
-    await page.tap("#remote-sidebar-search-toggle");
+    await page.tap(".sidebar-search-toggle");
     await page.waitForFunction((n) =>
       document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
       3,

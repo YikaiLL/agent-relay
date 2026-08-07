@@ -150,15 +150,15 @@ const countLine = (page) =>
 // passing log look like proof of the opposite behaviour.
 const bellIsOn = (page) =>
   page.evaluate(() =>
-    Boolean(document.querySelector("#sidebar-bell-toggle")?.classList.contains("is-active"))
+    Boolean(document.querySelector(".sidebar-bell-toggle")?.classList.contains("is-active"))
   );
 
 async function setBell(page, want) {
   if ((await bellIsOn(page)) !== want) {
-    await page.click("#sidebar-bell-toggle");
+    await page.click(".sidebar-bell-toggle");
     await page.waitForFunction(
       (expected) =>
-        Boolean(document.querySelector("#sidebar-bell-toggle")?.classList.contains("is-active"))
+        Boolean(document.querySelector(".sidebar-bell-toggle")?.classList.contains("is-active"))
         === expected,
       want,
       { timeout: TIMEOUT_MS }
@@ -168,14 +168,41 @@ async function setBell(page, want) {
 }
 
 async function setSearch(page, query) {
-  const open = await page.evaluate(
-    () => !document.querySelector("#sidebar-search")?.hidden
-  );
+  // "Is the field open?" is now "does the field EXIST?". It used to be permanently
+  // mounted and toggled with `hidden`, because app.js reached three ids inside it; it is
+  // a shared component now and simply is not rendered when closed. Probing `hidden` here
+  // would read `undefined` on a missing node and report every closed field as OPEN.
+  const open = await page.evaluate(() => Boolean(document.querySelector(".sidebar-search")));
   if (!open) {
-    await page.click("#sidebar-search-toggle");
-    await page.waitForSelector("#sidebar-search-input", { state: "visible", timeout: TIMEOUT_MS });
+    await page.click(".sidebar-search-toggle");
+    await page.waitForSelector(".sidebar-search-input", { state: "visible", timeout: TIMEOUT_MS });
   }
-  await page.fill("#sidebar-search-input", query);
+  // Clear first: `pressSequentially` types at the CARET rather than replacing the value, so
+  // consecutive calls would otherwise concatenate ("auth" + "zzz-no-such-session"). A
+  // one-shot `fill("")` is fine for the clear — the risk being guarded below is in typing a
+  // word, not in emptying the field.
+  await page.fill(".sidebar-search-input", "");
+
+  // pressSequentially, NOT fill. Local's field is a CONTROLLED input now — its value comes
+  // from `threadListStore.searchUi.draft` — and `fill` sets the whole value in one shot with
+  // a single event, which is precisely the shape that hides a controlled-input bug: bind the
+  // value to the debounced query instead of the draft and real key-by-key typing has React
+  // restore the previous value after every keystroke, so a word ends up searching for its
+  // last letter. `fill` passes cleanly through that bug. Remote's suite already types for
+  // this reason; local acquired the same risk when the field stopped being imperative.
+  await page.locator(".sidebar-search-input").pressSequentially(query, { delay: 25 });
+  await page
+    .waitForFunction(
+      (expected) => document.querySelector(".sidebar-search-input")?.value === expected,
+      query,
+      { timeout: TIMEOUT_MS }
+    )
+    .catch(async () => {
+      throw new Error(
+        `the field lost characters while typing ${JSON.stringify(query)}: `
+          + `${JSON.stringify(await page.inputValue(".sidebar-search-input"))}`
+      );
+    });
 }
 
 // Close any open thread menu without touching the search box.
@@ -322,7 +349,7 @@ async function main() {
       `the empty state names the query so a typo is visible: ${emptyNote}`
     );
 
-    await page.click("#sidebar-search-clear");
+    await page.click(".sidebar-search-clear");
     await waitForRowCount(page, 4, "clearing the query restores the authoritative list");
 
     step("3. a search result stays actionable: right-click keeps its menu open");
@@ -357,8 +384,8 @@ async function main() {
       "the archived row must leave the SEARCH slice, not just state.threads"
     );
 
-    await page.click("#sidebar-search-clear");
-    await page.click("#sidebar-search-toggle");
+    await page.click(".sidebar-search-clear");
+    await page.click(".sidebar-search-toggle");
     await waitForRowCount(page, 3, "the archived session is gone from the resting list too");
 
     step("5. put both busy threads in the background, then let one finish");

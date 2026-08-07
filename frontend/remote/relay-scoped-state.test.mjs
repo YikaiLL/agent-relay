@@ -9,19 +9,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { resetRelayScopedState } from "./relay-scoped-state.js";
-import { createThreadListStore, readActiveProjectId } from "../shared/thread-list-store.js";
-
-function fakeRemoteUiStore() {
-  const calls = [];
-  return {
-    calls,
-    getState: () => ({
-      setThreadFilterRetained(next) {
-        calls.push(next);
-      },
-    }),
-  };
-}
+import {
+  createThreadListStore,
+  readActiveProjectId,
+  readThreadFilter,
+} from "../shared/thread-list-store.js";
 
 test("switching relays forgets the pinned project", () => {
   const threadListStore = createThreadListStore();
@@ -30,7 +22,7 @@ test("switching relays forgets the pinned project", () => {
   // that never held one.
   assert.equal(readActiveProjectId(threadListStore), "proj_from_relay_a");
 
-  resetRelayScopedState({ remoteUiStore: fakeRemoteUiStore(), threadListStore });
+  resetRelayScopedState({ threadListStore });
 
   assert.equal(
     readActiveProjectId(threadListStore),
@@ -39,14 +31,29 @@ test("switching relays forgets the pinned project", () => {
   );
 });
 
+// The bell used to be spied on through a fake `remoteUiStore`; it now lives on the same
+// store as the pinned project, so this asserts the real thing instead of a call log.
 test("switching relays forgets the bell's retained states", () => {
-  const remoteUiStore = fakeRemoteUiStore();
+  const threadListStore = createThreadListStore();
+  threadListStore.getState().setThreadFilter({ on: true });
+  threadListStore
+    .getState()
+    .setThreadFilterRetained(new Map([["thread_from_relay_a", "needs_input"]]));
+  // Positive control, as above: an empty map afterwards must mean it was CLEARED.
+  assert.equal(readThreadFilter(threadListStore).retained.size, 1);
 
-  resetRelayScopedState({ remoteUiStore, threadListStore: createThreadListStore() });
+  resetRelayScopedState({ threadListStore });
 
-  assert.equal(remoteUiStore.calls.length, 1, "the retention map is replaced");
-  assert.equal(remoteUiStore.calls[0] instanceof Map, true);
-  assert.equal(remoteUiStore.calls[0].size, 0, "and replaced with an EMPTY one");
+  const filter = readThreadFilter(threadListStore);
+  assert.equal(filter.retained instanceof Map, true);
+  assert.equal(
+    filter.retained.size,
+    0,
+    "one relay's remembered states must not decide what another's bell keeps listed"
+  );
+  // Deliberately NOT reset: the bell being on is a preference about how you want to read
+  // a list, not an id that belongs to one relay.
+  assert.equal(filter.on, true, "switching relays does not silently turn the bell off");
 });
 
 // Called from an effect whose deps include stores that are null on the first renders of

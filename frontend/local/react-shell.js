@@ -4,29 +4,36 @@ import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
+import { SidebarBrand, SidebarCollapseToggle, SidebarResizeHandle } from "../shared/sidebar-chrome.js";
+// Panel/header glyphs. These four were byte-for-byte identical to remote's copies, which
+// differed only by a `Remote` prefix on the function name — see shared/panel-icons.js.
 import {
-  BELL_SVG,
+  BackArrowIcon,
+  ComposeIcon,
+  ToggleLeftPanelIcon,
+  ToggleRightPanelIcon,
+} from "../shared/panel-icons.js";
+import {
   PLUS_SVG,
   CHEVRON_RIGHT_SVG,
-  SEARCH_SVG,
-  SESSIONS_SVG,
   SETTINGS_SVG,
-  TASKS_SVG,
-  X_SVG,
 } from "../svg.js";
 
 const h = React.createElement;
 
 // Far-left 64px icon rail: brand logo (top), the same two destinations SidebarNav
 // offers, and a Settings gear (bottom). The rail lives OUTSIDE the .app-shell grid
-// (in .local-frame) so the grid math is untouched — which is also why its current
-// destination is lit from `body[data-view]` rather than the shell's own attribute.
-// Buttons are wired imperatively in app.js by id.
+// (in .local-frame) so the grid math is untouched.
 //
-// Sessions is here because the rail is the WHOLE nav while the sidebar is
-// collapsed. It was missing for as long as the nav was a segmented control, which
-// has no icon-only form to collapse into; a row is already an icon plus a label,
-// so dropping the label is the entire adaptation.
+// The two destinations are no longer written out here. They are the SAME list the
+// sidebar rows render, mounted from `shared/sidebar-nav.js` as `SidebarNavRail` —
+// which is what stops the rail and the rows drifting. It shipped with a Tasks
+// button and no Sessions button for exactly as long as the two were separate
+// pieces of markup, so a user who collapsed the panel on the Task screen had no
+// way back to their sessions.
+//
+// The gear stays imperative (wired in app.js by id): it is not a destination, it
+// opens a modal.
 function IconRail() {
   return h(
     "nav",
@@ -38,31 +45,10 @@ function IconRail() {
       width: 30,
       height: 30,
     }),
-    h(
-      "button",
-      {
-        className: "icon-rail-button icon-rail-sessions",
-        id: "icon-rail-sessions",
-        type: "button",
-        title: "Sessions",
-        "aria-label": "Sessions",
-      },
-      h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: SESSIONS_SVG } })
-    ),
-    h(
-      "button",
-      {
-        className: "icon-rail-button icon-rail-tasks",
-        id: "icon-rail-tasks",
-        type: "button",
-        title: "Tasks",
-        "aria-label": "Tasks",
-      },
-      h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: TASKS_SVG } }),
-      // The collapsed form of the sidebar badge: a count has nowhere to sit on a
-      // 44px square, but "something is waiting" is the part that has to survive.
-      h("span", { className: "icon-rail-dot", id: "icon-rail-tasks-dot", hidden: true, "aria-hidden": "true" })
-    ),
+    // `display: contents`, so the two buttons rendered in here stay flex children
+    // of `.icon-rail` itself — the rail's `gap`, `align-items` and the spacer's
+    // `flex: 1` all depend on that.
+    h("div", { className: "icon-rail-nav-mount", id: "icon-rail-nav" }),
     h("div", { className: "icon-rail-spacer" }),
     h(
       "button",
@@ -96,76 +82,41 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
     h(
       "div",
       { className: "sidebar-top-bar" },
-      h(
-        "button",
-        {
-          "aria-label": "Hide navigation panel",
-          className: "header-button header-panel-toggle sidebar-top-toggle",
-          id: "sidebar-top-toggle",
-          title: "Hide navigation panel (⌘B)",
-          type: "button",
-        },
-        h(ToggleLeftPanelIcon)
-      ),
-      // The seal sits in the lockup, not in the icon rail. The rail is only up
-      // while the sidebar is collapsed, so leaving the brand there would mean the
-      // app has no mark at all in its normal, expanded state. Matches how the
-      // remote shell has always built this row. `alt` is empty because the
-      // wordmark beside it already names the app.
-      h(
-        "div",
-        { className: "sidebar-brand" },
-        h("img", {
-          className: "sidebar-brand-logo",
-          src: "/static/sealwire_logo.png",
-          alt: "",
-          width: 24,
-          height: 24,
-        }),
-        h("span", { className: "sidebar-brand-name" }, "Sealwire")
-      ),
-      // Trailing actions. Search is a RELAY query, not a filter over the loaded rows —
-      // the list is truncated to the newest 120, so the session worth searching for is
-      // usually not in it. Wired imperatively in app.js by id.
-      h(
-        "div",
-        { className: "sidebar-top-actions" },
-        h(
-          "button",
-          {
-            className: "header-button sidebar-search-toggle",
-            id: "sidebar-search-toggle",
-            type: "button",
-            title: "Search sessions (⌘F)",
-            "aria-label": "Search sessions",
-            "aria-expanded": "false",
-          },
-          iconNode(SEARCH_SVG)
-        ),
-        h(
-          "button",
-          {
-            className: "header-button sidebar-bell-toggle",
-            id: "sidebar-bell-toggle",
-            type: "button",
-            title: "Filter by activity",
-            "aria-label": "Filter by activity",
-            // A toggle, not a disclosure: it re-groups the list in place and there is
-            // no popover under it to expand.
-            "aria-pressed": "false",
-          },
-          iconNode(BELL_SVG)
-        )
-      )
+      h(SidebarCollapseToggle, { id: "sidebar-top-toggle" }),
+      // Byte-for-byte identical to remote's, so it is now literally the same
+      // component. It takes no props, which is why it can render HERE rather than
+      // into a mount: this file renders exactly once, and a propless component has
+      // nothing to miss out on.
+      h(SidebarBrand),
+      // Trailing actions — the search and bell toggles. A mount rather than markup,
+      // because both of them report state (`is-active`, `aria-expanded`,
+      // `aria-pressed`) that app.js used to write onto them by hand.
+      //
+      // The div IS the mount: local's action row holds nothing but these two, so
+      // there is no wrapper to make layout-transparent. Remote's row also carries the
+      // Project switcher, which is why the row itself is not the shared thing.
+      h("div", { className: "sidebar-top-actions", id: "sidebar-top-actions" })
     ),
-    h(SessionSearch),
+    // The search field. Search is a RELAY query, not a filter over the loaded rows —
+    // the list is truncated to the newest 120, so the session worth searching for is
+    // usually not in it.
+    //
+    // This mount is the point of the whole exercise. The field used to be static
+    // markup here, permanently mounted and toggled with `hidden`, because app.js
+    // reached three ids inside it. It is now ABSENT when closed, which is what
+    // remote always did — the two implementations of one control have become one.
+    h("div", { className: "sidebar-search-mount", id: "sidebar-search-mount" }),
     // No state pills under the bell: turning it on re-groups the list by state, and
     // those bucket headers already say everything a pill row could.
     h(AuthForm),
     // No Sessions/Projects toggle: selecting a project PINS it to the top of a list
     // that stays complete, so there was never a second mode to be in. The Project
     // switcher in the header is the whole control.
-    h(SidebarNav),
+    // Mount point, not markup: the rows come from `shared/sidebar-nav.js` and are
+    // rendered by render-session with the current destination and the waiting-task
+    // count as props. `display: contents`, so `.sidebar-nav` stays a direct flex
+    // child of the sidebar column and keeps its own margins.
+    h("div", { className: "sidebar-nav-mount", id: "sidebar-nav" }),
     h(LaunchPanel, { launchModel, onLaunchFieldChange, onLaunchStart }),
     // The Task list, in the sidebar. Filled by renderSidebarTaskList(); CSS-gated
     // to the Tasks view, which also hides the launch panel and the thread drawer
@@ -197,46 +148,22 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
         iconNode(SETTINGS_SVG)
       )
     ),
-    h("div", {
-      className: "sidebar-resize",
-      id: "sidebar-resize",
-      role: "separator",
-      "aria-orientation": "vertical",
-      "aria-label": "Resize navigation panel",
-      tabIndex: 0,
-    })
+    // Same handle remote renders. The id stays local's, because app.js finds it by id
+    // to attach the drag maths.
+    h(SidebarResizeHandle, { id: "sidebar-resize" })
   );
 }
 
-// The search field. Always mounted and toggled with `hidden`, per the shell's rule that
-// nothing holding a `dom.js` handle may be conditionally rendered away.
-function SessionSearch() {
-  return h(
-    "div",
-    { className: "sidebar-search", id: "sidebar-search", hidden: true },
-    iconNode(SEARCH_SVG, "sidebar-search-glyph"),
-    h("input", {
-      autoComplete: "off",
-      className: "sidebar-search-input",
-      id: "sidebar-search-input",
-      placeholder: "Search session titles",
-      spellCheck: false,
-      type: "search",
-      "aria-label": "Search session titles",
-    }),
-    h(
-      "button",
-      {
-        className: "sidebar-search-clear",
-        id: "sidebar-search-clear",
-        type: "button",
-        title: "Clear search",
-        "aria-label": "Clear search",
-      },
-      iconNode(X_SVG)
-    )
-  );
-}
+/*
+ * `SessionSearch` used to be here: the search field as static markup, always
+ * mounted, `hidden: true`.
+ *
+ * It is now `SidebarSearchField` in `shared/sidebar-chrome.js`, rendered into
+ * `#sidebar-search-mount` and ABSENT when closed. This was the one control in the
+ * repo whose two implementations were incompatible in kind rather than in detail —
+ * remote rendered it conditionally, local could not, because three ids inside it had
+ * to resolve for app.js. Retiring those ids is what made one component possible.
+ */
 
 function AuthForm() {
   return h(
@@ -311,49 +238,28 @@ function LaunchStartSessionDialog({ launchModel, onLaunchFieldChange }) {
   });
 }
 
-/**
- * The sidebar's two destinations, as peers.
+/*
+ * The sidebar's two destinations used to be written out here, as `SidebarNav`.
  *
- * Sessions used to be the implicit background state and Tasks a lone button
- * below the launch panel, which made them read as different kinds of thing —
- * one a place, one an action. They are both places. Naming both, at the same
- * level, is the whole change.
+ * They now live in `shared/sidebar-nav.js`, rendered into `#sidebar-nav` (and
+ * `#icon-rail-nav`) by render-session, with `current` and the waiting-task count
+ * passed as props. The reasoning that shaped them is preserved there; the two
+ * points worth keeping in view from the shell side:
  *
- * Rows rather than a two-up segmented control because a segment strip is sized
- * by its member count: a third destination would force a redesign, where a row
- * just joins the stack. Wired imperatively in app.js by id, like search and bell.
+ *   Sessions used to be the implicit background state and Tasks a lone button
+ *   below the launch panel, which made them read as different kinds of thing —
+ *   one a place, one an action. They are both places, named at the same level.
+ *
+ *   Rows rather than a two-up segmented control, because a segment strip is sized
+ *   by its member count: a third destination would force a redesign, where a row
+ *   just joins the stack.
+ *
+ * Why they left the shell: this file renders EXACTLY ONCE (see local-app.js), so
+ * anything living here can never take a prop that changes. A nav has to know which
+ * destination you are on, and that was previously smuggled in through CSS on
+ * `[data-view]` plus an imperative `aria-current` write — two sources of truth for
+ * one fact. A mount point plus a prop is one.
  */
-function SidebarNav() {
-  return h(
-    "nav",
-    { className: "sidebar-nav", "aria-label": "Views" },
-    h(
-      "button",
-      {
-        className: "sidebar-nav-row",
-        id: "sidebar-nav-sessions",
-        type: "button",
-        title: "Sessions — conversations with one agent",
-      },
-      iconNode(SESSIONS_SVG, "sidebar-nav-glyph"),
-      h("span", { className: "sidebar-nav-label" }, "Sessions")
-    ),
-    h(
-      "button",
-      {
-        className: "sidebar-nav-row",
-        id: "sidebar-nav-tasks",
-        type: "button",
-        title: "Tasks — long-running work a team does on its own branch",
-      },
-      iconNode(TASKS_SVG, "sidebar-nav-glyph"),
-      h("span", { className: "sidebar-nav-label" }, "Tasks"),
-      // Counts tasks WAITING ON A PERSON, not tasks that exist — see
-      // renderTasksBadge(). A badge that never cleared would stop being read.
-      h("span", { className: "sidebar-nav-badge", id: "sidebar-tasks-badge", hidden: true }, "")
-    )
-  );
-}
 
 function ThreadDrawer() {
   return h(
@@ -471,60 +377,9 @@ function InfoIcon() {
   );
 }
 
-function BackArrowIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "14",
-      viewBox: "0 0 16 16",
-      width: "14",
-      stroke: "currentColor",
-      strokeWidth: "1.6",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M10 3.5L5.5 8L10 12.5" })
-  );
-}
 
-function ToggleLeftPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "6", y1: "2.5", x2: "6", y2: "13.5" })
-  );
-}
 
-function ToggleRightPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "10", y1: "2.5", x2: "10", y2: "13.5" })
-  );
-}
 
-function ComposeIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "16",
-      viewBox: "0 0 16 16",
-      width: "16",
-      stroke: "currentColor",
-      strokeWidth: "1.4",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M2.5 13.5h4l6.5-6.5a1.8 1.8 0 0 0-2.5-2.5L4 11v2.5z" }),
-    h("path", { d: "M10 5.5l2 2" })
-  );
-}
 
 function ChatHeader() {
   return h(

@@ -127,7 +127,9 @@ import {
   isReviewInProgressForThread,
   selectReviewLaunchModel,
 } from "../shared/review-state.js";
-import { BELL_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
+// BELL_SVG / SEARCH_SVG / X_SVG left with the controls that used them — they are drawn by
+// `shared/sidebar-chrome.js` now, on both surfaces.
+import { SETTINGS_SVG } from "../svg.js";
 import { selectThreadState } from "../shared/thread-dot.js";
 import {
   composeListChrome,
@@ -190,8 +192,25 @@ const getThreadAttentionVersion = () => threadAttention.getVersion();
 import {
   createThreadListStore,
   readActiveProjectId,
+  readSearchUi,
+  readThreadFilter,
 } from "../shared/thread-list-store.js";
 import { ProjectSwitcher } from "../shared/project-switcher.js";
+import {
+  SidebarBellToggle,
+  SidebarBrand,
+  SidebarCollapseToggle,
+  SidebarResizeHandle,
+  SidebarSearchField,
+  SidebarSearchToggle,
+} from "../shared/sidebar-chrome.js";
+// The `Remote`-prefixed copies of these were byte-for-byte identical to local's.
+import {
+  BackArrowIcon,
+  ComposeIcon,
+  ToggleLeftPanelIcon,
+  ToggleRightPanelIcon,
+} from "../shared/panel-icons.js";
 import { resetRelayScopedState } from "./relay-scoped-state.js";
 import { selectPinnedProjectId } from "../shared/thread-groups.js";
 import {
@@ -245,6 +264,27 @@ function useActiveProjectId(store) {
     store.subscribe,
     () => readActiveProjectId(store),
     () => readActiveProjectId(store)
+  );
+}
+
+// The bell, also a SIBLING of `threadList`, so it needs its own snapshot for the same
+// reason `activeProjectId` does. `readThreadFilter` returns the stored object rather than
+// a normalized copy precisely so this stays identity-stable between changes.
+function useThreadFilter(store) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => readThreadFilter(store),
+    () => readThreadFilter(store)
+  );
+}
+
+// The search field's open/draft state, snapshotted for the same reason: it is a sibling of
+// `threadList`, so `useThreadListStoreState` never sees it change.
+function useSearchUi(store) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => readSearchUi(store),
+    () => readSearchUi(store)
   );
 }
 
@@ -329,6 +369,7 @@ function RemoteApp() {
   // as it loads/errors.
   const remoteProjects = useRemoteProjects();
   const activeProjectId = useActiveProjectId(threadListStore);
+  const threadFilter = useThreadFilter(threadListStore);
   // Which session the actions sheet is open for (null = closed). Held by id, not by
   // object, so the sheet keeps tracking the thread across list refreshes.
   const [actionsSheetThreadId, setActionsSheetThreadId] = useState(null);
@@ -560,7 +601,7 @@ function RemoteApp() {
     // to lift out of.
     pinnedProjectId: selectPinnedProjectId({
       activeProjectId,
-      filtering: Boolean(remoteUi.threadFilter?.on),
+      filtering: Boolean(threadFilter.on),
       searching: isThreadSearchActive(currentState.threadSearch),
     }),
     projects: remoteProjects.projects,
@@ -577,9 +618,9 @@ function RemoteApp() {
     normalizeProjectName(window.prompt("Project name", current));
   const setActiveProject = (projectId) =>
     threadListStore.getState().setActiveProject(projectId);
-  const setThreadFilter = (next) => remoteUiStore.getState().setThreadFilter(next);
+  const setThreadFilter = (next) => threadListStore.getState().setThreadFilter(next);
   const setThreadFilterRetained = (retained) =>
-    remoteUiStore.getState().setThreadFilterRetained(retained);
+    threadListStore.getState().setThreadFilterRetained(retained);
 
   // Every thread the user can currently SEE: the authoritative list plus anything a
   // search surfaced from beyond it. LOOKUPS only — iteration stays on
@@ -590,39 +631,43 @@ function RemoteApp() {
       threadId
     );
 
-  const [searchOpen, setSearchOpen] = useState(false);
-  // The field is controlled by a LOCAL draft, never by the executed query. Binding it to
+  // Whether the field is open, and what has been typed into it, both live in
+  // `threadListStore` — the same place local reads them from. They were a pair of
+  // `useState` hooks here and DOM properties over there, which is two definitions of one
+  // control's state.
+  //
+  // The field is controlled by that DRAFT, never by the executed query. Binding it to
   // `threadSearch.query` — which only advances after the debounce fires — makes React
   // restore the previous value after every keystroke, so typing a word char by char
   // ends up searching for its last letter. `page.fill()` sets the value in one shot and
   // hides this completely; only real key-by-key input shows it.
-  const [searchDraft, setSearchDraft] = useState("");
+  const searchUi = useSearchUi(threadListStore);
+  const searchOpen = searchUi.open;
+  const searchDraft = searchUi.draft;
   // The DEBOUNCE is not held here. A timer owned by the component is invisible to the
   // surface reset, so a keystroke typed just before a re-pair would fire against
   // whatever connection replaced the one it was typed into. `session-ops` owns it, next
   // to the request it triggers, and cancels both together.
   const onSearchInput = (value) => {
-    setSearchDraft(value);
+    threadListStore.getState().setSearchDraft(value);
     queueRemoteThreadSearch(value);
   };
   const onSetSearchOpen = (open) => {
-    setSearchOpen(open);
-    // Closing must also clear: a hidden field still narrowing the list is a sidebar that
-    // looks like it lost sessions, with the reason off screen.
+    // "Closing also clears the draft" is enforced by the store, so what is left here is
+    // the half that is remote's: telling the relay the query is gone.
+    threadListStore.getState().setSearchOpen(open);
     if (!open) {
-      setSearchDraft("");
       queueRemoteThreadSearch("");
     }
   };
 
   // Every teardown path — relay switch, re-pair, forget device — cancels the search
-  // through the reset transaction and bumps this token. The draft is the one piece of
-  // the search that lives in React, so this is how a reset reaches it.
+  // through the reset transaction and bumps this token. `setSearchOpen(false)` clears the
+  // draft with it, which is the whole reset.
   const searchCancelToken = currentState.threadSearchCancelToken || 0;
   useEffect(() => {
-    setSearchDraft("");
-    setSearchOpen(false);
-  }, [searchCancelToken]);
+    threadListStore.getState().setSearchOpen(false);
+  }, [searchCancelToken, threadListStore]);
 
   // Retention is keyed by thread id alone, and thread ids are only unique WITHIN a
   // relay. Switching relays would otherwise let one relay's remembered states decide
@@ -631,8 +676,8 @@ function RemoteApp() {
   // advertise an equal projects_revision"); this is that hazard for the filter.
   const activeRelayId = currentState.remoteAuth?.relayId || null;
   useEffect(() => {
-    resetRelayScopedState({ remoteUiStore, threadListStore });
-  }, [activeRelayId, remoteUiStore, threadListStore]);
+    resetRelayScopedState({ threadListStore });
+  }, [activeRelayId, threadListStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
   const createRemoteProjectFromToolbar = async () => {
@@ -1727,7 +1772,7 @@ function RemoteApp() {
         // on touch, where `contextmenu` never fires.
         onContextThread: handleOpenForkDialog,
         onThreadActions: openActionsSheet,
-        threadFilter: remoteUi.threadFilter,
+        threadFilter,
         onSetThreadFilter: setThreadFilter,
         onSetThreadFilterRetained: setThreadFilterRetained,
         threadSearch: currentState.threadSearch,
@@ -2132,29 +2177,8 @@ function RemoteSidebar({
     h(
       "div",
       { className: "sidebar-top-bar" },
-      h(
-        "button",
-        {
-          "aria-label": "Hide navigation panel",
-          className: "header-button header-panel-toggle sidebar-top-toggle",
-          id: "remote-sidebar-top-toggle",
-          title: "Hide navigation panel (⌘B)",
-          type: "button",
-        },
-        h(RemoteToggleLeftPanelIcon)
-      ),
-      h(
-        "div",
-        { className: "sidebar-brand" },
-        h("img", {
-          className: "sidebar-brand-logo",
-          src: "/static/sealwire_logo.png",
-          alt: "",
-          width: 24,
-          height: 24,
-        }),
-        h("span", { className: "sidebar-brand-name" }, "Sealwire")
-      ),
+      h(SidebarCollapseToggle, { id: "remote-sidebar-top-toggle" }),
+      h(SidebarBrand),
       h(
         "div",
         { className: "sidebar-top-actions" },
@@ -2174,90 +2198,23 @@ function RemoteSidebar({
           renderHeading: false,
           triggerIcon: h(RemoteProjectIcon),
         }),
-        h(
-          "button",
-          {
-            className:
-              "header-button sidebar-search-toggle" + (searchOpen ? " is-active" : ""),
-            id: "remote-sidebar-search-toggle",
-            type: "button",
-            title: "Search sessions",
-            "aria-label": "Search sessions",
-            "aria-expanded": String(searchOpen),
-            onClick: () => onSetSearchOpen(!searchOpen),
-          },
-          h("span", {
-            className: "inline-icon",
-            "aria-hidden": "true",
-            dangerouslySetInnerHTML: { __html: SEARCH_SVG },
-          })
-        ),
-        h(
-          "button",
-          {
-            className:
-              "header-button sidebar-bell-toggle" + (threadFilter.on ? " is-active" : ""),
-            id: "remote-sidebar-bell-toggle",
-            type: "button",
-            title: "Filter by activity",
-            "aria-label": "Filter by activity",
-            // A toggle, not a disclosure: it re-groups the list in place and there is
-            // no popover under it to expand.
-            "aria-pressed": String(threadFilter.on),
-            onClick: () => onSetThreadFilter({ on: !threadFilter.on }),
-          },
-          h("span", {
-            className: "inline-icon",
-            "aria-hidden": "true",
-            dangerouslySetInnerHTML: { __html: BELL_SVG },
-          })
-        )
+        // No `shortcutHint`: remote is a phone surface with no ⌘F to promise.
+        h(SidebarSearchToggle, { open: searchOpen, onToggle: onSetSearchOpen }),
+        h(SidebarBellToggle, {
+          on: threadFilter.on,
+          onToggle: (on) => onSetThreadFilter({ on }),
+        })
       )
     ),
-    searchOpen
-      ? h(
-          "div",
-          { className: "sidebar-search", id: "remote-sidebar-search" },
-          h("span", {
-            className: "inline-icon sidebar-search-glyph",
-            "aria-hidden": "true",
-            dangerouslySetInnerHTML: { __html: SEARCH_SVG },
-          }),
-          h("input", {
-            autoComplete: "off",
-            className: "sidebar-search-input",
-            id: "remote-sidebar-search-input",
-            placeholder: "Search session titles",
-            spellCheck: false,
-            type: "search",
-            value: searchQuery,
-            "aria-label": "Search session titles",
-            onChange: (event) => onSearchInput(event.target.value),
-            onKeyDown: (event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                onSetSearchOpen(false);
-              }
-            },
-          }),
-          h(
-            "button",
-            {
-              className: "sidebar-search-clear",
-              id: "remote-sidebar-search-clear",
-              type: "button",
-              title: "Clear search",
-              "aria-label": "Clear search",
-              onClick: () => onSearchInput(""),
-            },
-            h("span", {
-              className: "inline-icon",
-              "aria-hidden": "true",
-              dangerouslySetInnerHTML: { __html: X_SVG },
-            })
-          )
-        )
-      : null,
+    h(SidebarSearchField, {
+      open: searchOpen,
+      query: searchQuery,
+      onInput: onSearchInput,
+      onClose: () => onSetSearchOpen(false),
+      // No `focusOnOpen`, deliberately: on a phone, focusing pops the on-screen keyboard
+      // over the very list the user just asked to search. `focusSignal` is therefore
+      // irrelevant here — the component ignores it without the policy flag.
+    }),
     h(
       "div",
       { className: "sidebar-row" },
@@ -2439,14 +2396,7 @@ function RemoteSidebar({
         })
       )
     ),
-    h("div", {
-      className: "sidebar-resize",
-      id: "remote-sidebar-resize",
-      role: "separator",
-      "aria-orientation": "vertical",
-      "aria-label": "Resize navigation panel",
-      tabIndex: 0,
-    })
+    h(SidebarResizeHandle, { id: "remote-sidebar-resize" })
   );
 }
 
@@ -2510,60 +2460,9 @@ function PinnedProjectChip({ name, onClear, summary }) {
   );
 }
 
-function RemoteToggleLeftPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "6", y1: "2.5", x2: "6", y2: "13.5" })
-  );
-}
 
-function RemoteToggleRightPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "10", y1: "2.5", x2: "10", y2: "13.5" })
-  );
-}
 
-function RemoteComposeIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "16",
-      viewBox: "0 0 16 16",
-      width: "16",
-      stroke: "currentColor",
-      strokeWidth: "1.4",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M2.5 13.5h4l6.5-6.5a1.8 1.8 0 0 0-2.5-2.5L4 11v2.5z" }),
-    h("path", { d: "M10 5.5l2 2" })
-  );
-}
 
-function RemoteBackArrowIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "14",
-      viewBox: "0 0 16 16",
-      width: "14",
-      stroke: "currentColor",
-      strokeWidth: "1.6",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M10 3.5L5.5 8L10 12.5" })
-  );
-}
 
 function RemoteHeader({
   currentState,
@@ -2619,7 +2518,7 @@ function RemoteHeader({
             title: "Show navigation panel (⌘B)",
             type: "button",
           },
-          h(RemoteToggleLeftPanelIcon)
+          h(ToggleLeftPanelIcon)
         ),
         h(
           "button",
@@ -2631,7 +2530,7 @@ function RemoteHeader({
             title: "Start new session",
             onClick: onOpenStartSession,
           },
-          h(RemoteComposeIcon)
+          h(ComposeIcon)
         )
       ),
       h(
@@ -2645,7 +2544,7 @@ function RemoteHeader({
           "aria-label": "All relays",
           type: "button",
         },
-        h(RemoteBackArrowIcon)
+        h(BackArrowIcon)
       ),
       h(
         "div",
@@ -2669,7 +2568,7 @@ function RemoteHeader({
           title: "Toggle side panel (⌥⌘B)",
           type: "button",
         },
-        h(RemoteToggleRightPanelIcon)
+        h(ToggleRightPanelIcon)
       )
     )
   );

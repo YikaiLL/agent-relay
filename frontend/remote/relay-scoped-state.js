@@ -18,7 +18,14 @@
 //
 // Anything else added here should meet the same test: is it keyed by something only one
 // relay issues?
-export function resetRelayScopedState({ remoteUiStore, threadListStore } = {}) {
-  remoteUiStore?.getState?.().setThreadFilterRetained?.(new Map());
+// Both entries now live on the SAME store: the bell moved off `remoteUiStore` when it was
+// unified with local's copy, so this takes only `threadListStore`.
+//
+// If you add a relay-scoped field that lives on a different store, ADD THAT STORE TO THE
+// SIGNATURE. Destructuring silently ignores anything it does not name, so a caller passing
+// a store this function no longer accepts gets a no-op with no error — which is the exact
+// class of "the reset forgot a field" bug this module exists to prevent.
+export function resetRelayScopedState({ threadListStore } = {}) {
+  threadListStore?.getState?.().setThreadFilterRetained?.(new Map());
   threadListStore?.getState?.().setActiveProject?.(null);
 }

@@ -59,13 +59,21 @@ export const threadsList = document.querySelector("#threads-list");
 export const threadsCount = document.querySelector("#threads-count");
 export const projectOverviewMount = document.querySelector("#project-overview");
 export const taskTeamMount = document.querySelector("#task-team");
-export const iconRailSessionsButton = document.querySelector("#icon-rail-sessions");
-export const iconRailTasksButton = document.querySelector("#icon-rail-tasks");
-export const iconRailTasksDot = document.querySelector("#icon-rail-tasks-dot");
-export const sidebarNavSessionsButton = document.querySelector("#sidebar-nav-sessions");
-export const sidebarNavTasksButton = document.querySelector("#sidebar-nav-tasks");
+// The sidebar's destinations, in both forms, are one shared prop-driven component
+// (shared/sidebar-nav.js) rendered into these two mounts. That replaced SIX handles —
+// a Sessions button, a Tasks button and a count badge in the sidebar, plus a Sessions
+// button, a Tasks button and a dot on the rail — with two, and took the "you are here"
+// state off `[data-view]` CSS and an imperative `aria-current` write at the same time.
+export const sidebarNavMount = document.querySelector("#sidebar-nav");
+export const iconRailNavMount = document.querySelector("#icon-rail-nav");
+// The search + bell toggles, and the search FIELD. Two mounts in place of five
+// `getElementById` calls in app.js — and, more to the point, in place of the rule that
+// made the field always-mounted-and-hidden. A mount is a container the shell always
+// renders; the CONTROL inside it is free to be absent, which is what a hidden node could
+// never be.
+export const sidebarTopActionsMount = document.querySelector("#sidebar-top-actions");
+export const sidebarSearchMount = document.querySelector("#sidebar-search-mount");
 export const sidebarTaskListMount = document.querySelector("#sidebar-task-list");
-export const sidebarTasksBadge = document.querySelector("#sidebar-tasks-badge");
 export const startTaskDialogMount = document.querySelector("#start-task-dialog-mount");
 export const threadContextMenu = document.querySelector("#thread-context-menu");
 export const forkThreadButton = document.querySelector("#fork-thread-button");

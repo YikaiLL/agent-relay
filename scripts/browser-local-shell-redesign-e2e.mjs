@@ -117,6 +117,86 @@ async function run() {
       await d.accept(d.type() === "prompt" ? promptValue : undefined);
     });
 
+    // --- The sidebar has chrome BEFORE the relay answers ---
+    // The nav, search toggle and bell are rendered into mounts by render-session, and
+    // `boot()` does not reach its first render until `refreshAuthSession` and `loadSession`
+    // have both returned. The shell's own synchronous render paints only empty mounts, so
+    // without an explicit paint at module scope the sidebar is chromeless for the whole
+    // round trip — unbounded if the relay is slow or down.
+    //
+    // A separate page with `/api/session` held open makes that window wide enough to
+    // observe. It has to be its own page: stalling the shared one would poison every
+    // assertion below it.
+    const slowPage = await launched.context.newPage();
+    const SESSION_STALL_MS = 4000;
+    await slowPage.route("**/api/session**", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, SESSION_STALL_MS));
+      // The handler outlives the page: the assertions below finish long before the stall
+      // does, and closing the page makes the pending route unroutable. An uncaught throw
+      // here becomes an UNHANDLED REJECTION that kills the whole suite with
+      // "Route is already handled!" — a failure that looks nothing like the thing being
+      // tested, and which masked this assertion entirely the first time round.
+      try {
+        await route.continue();
+      } catch {
+        // The page went away while this request was parked. Nothing to continue.
+      }
+    });
+    await slowPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
+    await slowPage.waitForSelector(".local-frame", { timeout: TIMEOUT_MS });
+
+    // `.local-frame` is NOT a signal that the chrome has had a chance to render. It comes
+    // from the 18 KB ENTRY chunk, which runs to completion before DOMContentLoaded; the
+    // paint lives in `app.js`, a ~194 KB chunk pulled in afterwards by
+    // `void import("./app.js")` and absent from index.html's modulepreload list. So
+    // asserting immediately after `waitForSelector` races a 194 KB fetch+parse against two
+    // CDP round trips — it wins on a warm cache and loses cold, and its failure looks
+    // EXACTLY like the bug it guards ("the sidebar has no destinations"). That is the worst
+    // kind of guard: when it goes red you cannot tell product from test.
+    //
+    // Waiting for the chrome itself costs nothing in the passing case and does not weaken
+    // the assertion, because the wait must expire well inside the stall — see below.
+    const BOOT_CHROME_WAIT_MS = 3000;
+    assert.ok(
+      BOOT_CHROME_WAIT_MS < SESSION_STALL_MS,
+      `the wait (${BOOT_CHROME_WAIT_MS}ms) must expire while /api/session is still stalled `
+        + `(${SESSION_STALL_MS}ms), or "the chrome arrived before the relay answered" proves nothing`
+    );
+    await slowPage
+      .waitForSelector('.sidebar-nav [data-destination="sessions"]', {
+        timeout: BOOT_CHROME_WAIT_MS,
+      })
+      // Swallowed on purpose: the snapshot below names every missing piece, which is a far
+      // better failure message than a bare selector timeout.
+      .catch(() => {});
+
+    const bootChrome = await slowPage.evaluate(() => ({
+      // Named individually: counting would let "one destination" pass as "has a nav".
+      sessions: !!document.querySelector('.sidebar-nav [data-destination="sessions"]'),
+      tasks: !!document.querySelector('.sidebar-nav [data-destination="tasks"]'),
+      railSessions: !!document.querySelector('.icon-rail [data-destination="sessions"]'),
+      railTasks: !!document.querySelector('.icon-rail [data-destination="tasks"]'),
+      searchToggle: !!document.querySelector(".sidebar-search-toggle"),
+      bellToggle: !!document.querySelector(".sidebar-bell-toggle"),
+    }));
+    // Closed without unrouting: the stalled handler is left to time out on its own and
+    // swallow its own error (see the try/catch above). Unrouting here would resolve the
+    // pending route and race the same "already handled" throw.
+    await slowPage.close();
+    assert.ok(
+      bootChrome.sessions && bootChrome.tasks,
+      `the sidebar needs both destinations before the relay answers: ${JSON.stringify(bootChrome)}`
+    );
+    assert.ok(
+      bootChrome.railSessions && bootChrome.railTasks,
+      "the collapsed rail is the whole nav, and boots collapsed for anyone who quit that "
+        + `way — it cannot wait for the network: ${JSON.stringify(bootChrome)}`
+    );
+    assert.ok(
+      bootChrome.searchToggle && bootChrome.bellToggle,
+      `the top-bar controls must exist before the relay answers: ${JSON.stringify(bootChrome)}`
+    );
+
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector(".local-frame", { timeout: TIMEOUT_MS });
     await page.waitForTimeout(500);
@@ -142,8 +222,11 @@ async function run() {
         visible: r ? getComputedStyle(r).display !== "none" : false,
         hasLogo: !!r?.querySelector(".icon-rail-logo"),
         hasHome: !!r?.querySelector("#icon-rail-home"),
-        hasSessions: !!r?.querySelector("#icon-rail-sessions"),
-        hasTasks: !!r?.querySelector("#icon-rail-tasks"),
+        // Addressed by `data-destination`, not by id: the rail's two buttons come
+        // from the shared SidebarNavRail now, and a shared component cannot carry
+        // ids that would collide the moment remote mounts it too.
+        hasSessions: !!r?.querySelector('[data-destination="sessions"]'),
+        hasTasks: !!r?.querySelector('[data-destination="tasks"]'),
         hasGear: !!r?.querySelector("#icon-rail-settings"),
         buttons: r ? r.querySelectorAll("button").length : 0,
       };
@@ -461,20 +544,72 @@ async function run() {
     // Block the stream so the client falls back to /api/session polling (footer
     // "Polling"), then restore it so the stream reconnects (footer "Live").
     const streamPage = await launched.context.newPage();
-    await streamPage.route("**/api/stream", (route) => route.abort());
+    // Watch this page's errors too. They were collected only for `page`, so anything that
+    // threw HERE was invisible: the footer assertion below would time out with no
+    // indication that a render had died on the way to writing it. That is a bad failure to
+    // debug, because a stalled footer looks like a stream-reconnect timing problem.
+    const streamPageErrors = [];
+    streamPage.on("pageerror", (err) => streamPageErrors.push(String(err)));
+    streamPage.on("console", (msg) => {
+      if (msg.type() === "error") streamPageErrors.push(`console: ${msg.text()}`);
+    });
+    const withStreamPageErrors = (message) =>
+      streamPageErrors.length ? `${message} — page errors: ${streamPageErrors.join(" | ")}` : message;
+
+    // `**/api/stream**`, NOT `**/api/stream`. The trailing `**` is load-bearing: the
+    // client appends `surface_id`, `surface_generation` and `device_id` as query
+    // parameters, each only when it has one (`frontend/session-stream.js`). Playwright
+    // matches a glob against the FULL url, so the bare pattern misses
+    // `/api/stream?surface_id=…` — and whether those params exist yet depends on how far
+    // device-identity adoption has got, which made this test fail ~25% of the time with a
+    // footer that correctly read "Live" because the stream had never actually been
+    // blocked. `browser-local-view-only-models-e2e.mjs` already had this right.
+    const STREAM_ROUTE = "**/api/stream**";
+    let abortedStreamRequests = 0;
+    await streamPage.route(STREAM_ROUTE, (route) => {
+      abortedStreamRequests += 1;
+      return route.abort();
+    });
     await streamPage.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await streamPage.waitForSelector(".local-frame", { timeout: TIMEOUT_MS });
-    await streamPage.waitForFunction(
-      () => {
-        const el = document.querySelector("#sidebar-host-status");
-        return (
-          el?.classList.contains("is-degraded") &&
-          /Polling/.test(document.querySelector("#sidebar-host-label")?.textContent || "")
-        );
-      },
-      { timeout: TIMEOUT_MS }
+    // Assert the BLOCK happened before asserting what it caused. Without this, the glob
+    // bug surfaced as a 30-second timeout on an unrelated-looking footer assertion; a
+    // route that matches nothing should fail saying exactly that.
+    for (let waited = 0; abortedStreamRequests === 0 && waited < TIMEOUT_MS; waited += 100) {
+      await streamPage.waitForTimeout(100);
+    }
+    assert.ok(
+      abortedStreamRequests > 0,
+      "the stream route matched nothing, so the stream was never blocked — the client "
+        + "appends surface_id/device_id query params, so the glob needs a trailing **"
     );
-    await streamPage.unroute("**/api/stream");
+    await streamPage
+      .waitForFunction(
+        () => {
+          const el = document.querySelector("#sidebar-host-status");
+          return (
+            el?.classList.contains("is-degraded") &&
+            /Polling/.test(document.querySelector("#sidebar-host-label")?.textContent || "")
+          );
+        },
+        { timeout: TIMEOUT_MS }
+      )
+      .catch(async (error) => {
+        // Say what the footer ACTUALLY held. "Timeout exceeded" alone cannot distinguish
+        // "the stream never dropped" from "it dropped and nothing repainted the footer".
+        const actual = await streamPage
+          .evaluate(() => ({
+            classes: document.querySelector("#sidebar-host-status")?.className ?? null,
+            label: document.querySelector("#sidebar-host-label")?.textContent ?? null,
+          }))
+          .catch(() => null);
+        throw new Error(
+          withStreamPageErrors(
+            `footer never went to Polling: ${JSON.stringify(actual)} (${error.message})`
+          )
+        );
+      });
+    await streamPage.unroute(STREAM_ROUTE);
     await streamPage.waitForFunction(
       () => {
         const el = document.querySelector("#sidebar-host-status");

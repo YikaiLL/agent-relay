@@ -127,53 +127,128 @@ function assertSource(source, pattern, message) {
   assert.ok(pattern.test(source), `${message} (no match for ${pattern})`);
 }
 
-test("the collapsed rail offers both destinations, not just Tasks", () => {
-  for (const id of ["icon-rail-sessions", "icon-rail-tasks"]) {
-    assertSource(shell, new RegExp(`id:\\s*"${id}"`), `the rail is the whole nav while collapsed; it must render #${id}`);
-  }
-});
-
-test("both rail destinations go to the same screens as their sidebar rows", () => {
+// The rail and the rows are now ONE component (shared/sidebar-nav.js) in two forms,
+// so "both offer the same destinations" is proved once, structurally, over there —
+// see sidebar-nav.test.mjs, "both forms offer exactly the same destinations". What
+// is still local's business, and what these guards cover, is that the rail actually
+// MOUNTS it: a rail that rendered nothing would be a nav-less collapsed state, which
+// is the original bug in a new shape.
+test("the collapsed rail mounts the shared nav", () => {
   assertSource(
-    appJs,
-    /iconRailSessionsButton\?\.addEventListener\("click",\s*openSessionsScreen\)/,
-    "the rail's Sessions button must open the Sessions screen"
+    shell,
+    /id:\s*"icon-rail-nav"/,
+    "the rail is the whole nav while collapsed; it needs the mount to render into"
   );
-  assertSource(
-    appJs,
-    /iconRailTasksButton\?\.addEventListener\("click",\s*openTaskScreen\)/,
-    "the rail's Tasks button must open the Task screen"
-  );
-});
-
-// The rail lives outside `.app-shell`, so `[data-view]` on the shell cannot select
-// into it. render-session mirrors the view onto `<body>`; drop that write and the
-// rail silently stops saying where you are, with no other symptom.
-test("the rail lights its current destination from body[data-view]", () => {
   assertSource(
     renderSession,
-    /document\.body\.dataset\.view\s*=/,
-    "the rail's selected state has no other source"
+    /renderReactContent\(iconRailNavMount,\s*h\(SidebarNavRail,/,
+    "the mount has to be filled with the rail form of the shared nav"
   );
-  for (const selector of [
-    'body:not([data-view="tasks"]) .icon-rail-sessions',
-    'body[data-view="tasks"] .icon-rail-tasks',
+});
+
+// The strongest form this guard can take. Both mounts are handed the SAME props
+// object — not two objects built alike — so the rail and the rows cannot disagree
+// about where you are, what is waiting, or where a click goes. Four id-addressed
+// listeners in app.js used to carry this, and nothing stopped them drifting apart.
+test("the rail and the rows are driven by one props object", () => {
+  const start = renderSession.indexOf("function renderSidebarNav");
+  assert.ok(start >= 0, "expected renderSidebarNav to exist");
+  const body = renderSession.slice(start, renderSession.indexOf("\n  }", start));
+
+  assertSource(body, /renderReactContent\(sidebarNavMount,\s*h\(SidebarNav,\s*props\)\)/, "the rows read `props`");
+  assertSource(
+    body,
+    /renderReactContent\(iconRailNavMount,\s*h\(SidebarNavRail,\s*props\)\)/,
+    "the rail reads the SAME `props`, or the two forms can drift again"
+  );
+  // One fact, two renderings: the sidebar shows a count, the rail reduces it to a
+  // dot. Both come off this single value, so they cannot disagree about whether
+  // anything is waiting — and a rail that stayed quiet would go silent in exactly
+  // the state where the user has the least on screen to notice.
+  assertSource(
+    body,
+    /tasksWaitingCount:\s*teamsNeedingYou\(/,
+    "the badge counts tasks waiting on a PERSON, not tasks that exist"
+  );
+  assertSource(body, /onOpenSessions:|onOpenTasks:/, "both destinations must be reachable");
+});
+
+// The nav is CHROME, not session content, and moving it into a mount made that
+// distinction load-bearing for the first time. As static markup in the shell it
+// could not go missing; rendered into `#sidebar-nav` it appears only when something
+// calls renderSidebarNav(), and the shell has three top-level states that each
+// repaint independently. Two of them are exactly the states where a user most needs
+// to be able to navigate:
+//
+//   renderAuthRequiredState  — runs at BOOT when there is no API token, so this
+//                              gap meant a signed-out user saw no nav at all;
+//   renderSessionUnavailable — the relay is offline.
+//
+// Named individually rather than counted, because the failure is silent: the
+// sidebar renders, the rows simply are not in it.
+test("every shell state renders the nav, including the ones with no session", () => {
+  for (const entry of [
+    "renderSession",
+    "renderSessionUnavailable",
+    "renderAuthRequiredState",
   ]) {
-    assert.match(ruleBody(selector), /background:\s*var\(/, `${selector} must fill, not merely recolour`);
+    const start = renderSession.indexOf(`function ${entry}(`);
+    assert.ok(start >= 0, `expected ${entry} to exist`);
+    const body = renderSession.slice(start, renderSession.indexOf("\n  }", start));
+    assertSource(
+      body,
+      /renderSidebarNav\(\)/,
+      `${entry} must render the nav — it is chrome, and used to be markup that could not go missing`
+    );
   }
 });
 
-// One fact, two renderings: the sidebar shows a count, the rail shows a dot. Both
-// are driven off the same `waiting` value inside renderTasksBadge, so they cannot
-// disagree about whether anything is waiting. A rail that stayed quiet would go
-// silent in exactly the state where the user has the least on screen to notice.
-test("the waiting-task signal survives collapsing the sidebar", () => {
-  assertSource(shell, /id:\s*"icon-rail-tasks-dot"/, "the badge needs a collapsed form");
-  const start = renderSession.indexOf("function renderTasksBadge");
-  assert.ok(start >= 0, "expected renderTasksBadge to still exist");
-  const body = renderSession.slice(start, renderSession.indexOf("\n  }", start));
-  assert.match(body, /sidebarTasksBadge\.hidden = waiting === 0/);
-  assert.match(body, /iconRailTasksDot\.hidden = waiting === 0/, "both surfaces must read the same count");
+// The FOURTH state, and the one the three-state guard above cannot see: "boot has not
+// reached any terminal state yet".
+//
+// `renderLocalShell()` is synchronous and paints only the empty mounts. `boot()` then
+// awaits TWO network round trips (`refreshAuthSession`, then `loadSession`) before the
+// first `renderSession`. So between first paint and boot settling, the sidebar has no
+// search or bell buttons and no Sessions/Tasks rows.
+//
+// The worst case is the collapsed one, and it is not hypothetical: `createPanelControl`
+// restores the collapsed state from localStorage at MODULE level, before those awaits. A
+// user who quit with the sidebar collapsed therefore boots into a rail holding a logo and
+// a gear and NO destinations — which is exactly the bug the shared nav was written to make
+// impossible, returning through the boot window. On a slow or unreachable relay that
+// window is not milliseconds.
+test("the sidebar chrome is painted before boot awaits anything", () => {
+  const bootAt = appJs.indexOf("void boot();");
+  assert.ok(bootAt > 0, "expected a `void boot();` call to anchor against");
+  const paintAt = appJs.indexOf("paintInitialSidebarChrome();");
+  assert.ok(
+    paintAt > 0 && paintAt < bootAt,
+    "the chrome must be painted at module scope BEFORE boot's first await, or a collapsed "
+      + "user sees a rail with no destinations until the network answers"
+  );
+});
+
+// The `[data-view]` mirror is gone, and must stay gone. It existed only because the
+// nav was static markup that could not take a prop: the view was mirrored onto
+// `<body>` so CSS could reach the rail (which sits outside `.app-shell`), while
+// `aria-current` was written separately from render-session because CSS cannot set
+// it. Two writes for one fact. Re-adding either would restore the drift.
+test("the nav's selected state has exactly one source: the prop", () => {
+  assert.doesNotMatch(
+    renderSession,
+    /document\.body\.dataset\.view\s*=/,
+    "the body[data-view] mirror is the component's prop now; a second source can disagree with it"
+  );
+  assert.doesNotMatch(
+    renderSession,
+    /setAttribute\("aria-current"/,
+    "aria-current comes from the same comparison as the class, inside the component"
+  );
+  assert.match(
+    ruleBody(".icon-rail-button.is-current"),
+    /background:\s*var\(/,
+    "the rail's current destination must fill, not merely recolour"
+  );
 });
 
 // --- the sidebar nav is a row stack ------------------------------------------
@@ -183,7 +258,7 @@ test("the waiting-task signal survives collapsing the sidebar", () => {
 // marking where you are. And it must not be the raised/shadowed pill, which is
 // this app's button treatment: "where you are" and "do this" have to stay apart.
 test("the selected sidebar nav row is filled, not just recoloured", () => {
-  const selected = ruleBody('.app-shell:not([data-view="tasks"]) #sidebar-nav-sessions');
+  const selected = ruleBody(".sidebar-nav-row.is-current");
   assert.match(selected, /background:\s*var\(--surface-\d\)/);
   assert.doesNotMatch(selected, /box-shadow/, "a shadow would make the current view look like a button");
 });
@@ -195,22 +270,90 @@ test("the selected sidebar nav row is filled, not just recoloured", () => {
 test("hover and selection do not share a fill", () => {
   const fill = (body) => body.match(/background:\s*(var\(--surface-\d\))/)?.[1];
   const hover = fill(ruleBody(".sidebar-nav-row:hover"));
-  const selected = fill(ruleBody('.app-shell:not([data-view="tasks"]) #sidebar-nav-sessions'));
+  const selected = fill(ruleBody(".sidebar-nav-row.is-current"));
   assert.ok(hover, "the hovered row must fill — it is the only affordance a row has");
   assert.ok(selected, "the selected row must fill");
   assert.notEqual(selected, hover, `hover and selected both use ${hover}; the row you are on becomes unreadable`);
 });
 
-test("exactly one nav row is marked aria-current", () => {
-  assertSource(renderSession, /setAttribute\("aria-current", "page"\)/, "the current row must announce itself");
-  assertSource(renderSession, /removeAttribute\("aria-current"\)/, "the row you left has to give it up");
+// "Exactly one row is aria-current" moved into the component with the rest of the
+// selected state, and is asserted against a real render in
+// sidebar-nav.test.mjs ("the current destination is marked, and only ever one of
+// them") rather than against a pair of imperative writes here. What is left for this
+// file is that local passes a destination at all — a nav rendered without `current`
+// lights nothing, which looks like "no view is selected" rather than like a bug.
+test("local tells the nav which destination it is on", () => {
+  const start = renderSession.indexOf("function renderSidebarNav");
+  const body = renderSession.slice(start, renderSession.indexOf("\n  }", start));
+  assertSource(
+    body,
+    /current:\s*context\.kind === "tasks" \? "tasks" : "sessions"/,
+    "the view context is the canonical answer to which screen you are on"
+  );
 });
 
 // --- the brand lockup --------------------------------------------------------
 
-test("the local sidebar brand renders the seal logo beside the wordmark", () => {
-  assert.match(shell, /className:\s*"sidebar-brand-logo"/);
-  assert.match(shell, /src:\s*"\/static\/sealwire_logo\.png"/);
+// The lockup's markup was byte-for-byte identical to remote's, so it is now literally the
+// same component and its contents are asserted once, in
+// `shared/sidebar-chrome.test.mjs`. What is local's business is that it still renders one.
+//
+// Note it is used DIRECTLY here, not through a mount: it takes no props, so a file that
+// renders exactly once loses nothing by holding it.
+test("the local sidebar brand is the shared lockup", () => {
+  assertSource(shell, /h\(SidebarBrand\)/, "the brand must render, or the app has no mark");
+  assert.doesNotMatch(
+    shell,
+    /className:\s*"sidebar-brand-logo"/,
+    "hand-written brand markup here is the duplicate that was just removed"
+  );
+});
+
+// Same hazard as the nav, and the same three states. The search field and the two toggles
+// were static markup before; a mount only shows what something renders into it, and
+// `renderAuthRequiredState` runs at BOOT when there is no API token.
+test("every shell state renders the sidebar chrome", () => {
+  for (const entry of [
+    "renderSession",
+    "renderSessionUnavailable",
+    "renderAuthRequiredState",
+  ]) {
+    const start = renderSession.indexOf(`function ${entry}(`);
+    assert.ok(start >= 0, `expected ${entry} to exist`);
+    const body = renderSession.slice(start, renderSession.indexOf("\n  }", start));
+    assertSource(
+      body,
+      /renderSidebarChrome\(\)/,
+      `${entry} must render the search + bell toggles; they used to be markup that could not go missing`
+    );
+  }
+});
+
+// The point of the whole exercise: local no longer keeps the field mounted-and-hidden.
+// If `hidden` comes back, so does the constraint that made two implementations necessary.
+test("the search field is absent when closed, not hidden", () => {
+  assertSource(shell, /id:\s*"sidebar-search-mount"/, "the field needs a mount to render into");
+  assert.doesNotMatch(
+    shell,
+    /className:\s*"sidebar-search"[^)]*hidden/,
+    "an always-mounted hidden field is the contract this replaced"
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.sidebar-search\[hidden\]/,
+    "nothing sets `hidden` on the field any more; the rule would be dead and misleading"
+  );
+});
+
+// The state moved OUT of the DOM. `open` used to be read back off `sidebarSearch.hidden`
+// and the draft off `sidebarSearchInput.value` — using the rendered nodes as the model is
+// exactly what made conditional rendering impossible, so a regression here would quietly
+// re-impose it.
+test("the search field's own state is not read back out of the DOM", () => {
+  assert.doesNotMatch(appJs, /getElementById\("sidebar-search/, "no id handles for the field");
+  assert.doesNotMatch(appJs, /getElementById\("sidebar-bell-toggle"\)/, "nor for the bell");
+  assertSource(appJs, /setSearchDraft\(/, "the draft lives in the shared store");
+  assertSource(appJs, /setSearchOpen\(/, "and so does whether the field is open");
 });
 
 // --- Settings is reachable in every state -----------------------------------

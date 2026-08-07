@@ -31,10 +31,10 @@ import {
   projectOverviewMount,
   taskTeamMount,
   sidebarTaskListMount,
-  iconRailTasksDot,
-  sidebarNavSessionsButton,
-  sidebarNavTasksButton,
-  sidebarTasksBadge,
+  sidebarNavMount,
+  iconRailNavMount,
+  sidebarTopActionsMount,
+  sidebarSearchMount,
   transcript,
   workspaceSubtitle,
   headerNewAgentButton,
@@ -68,6 +68,8 @@ import { selectThreadState } from "../shared/thread-dot.js";
 import { canForkInSession } from "../shared/fork-fields.js";
 import {
   readActiveProjectId,
+  readSearchUi,
+  readThreadFilter,
   readThreadListContextMenu,
   readThreadListUi,
 } from "../shared/thread-list-store.js";
@@ -121,6 +123,12 @@ import {
 } from "../shared/task-team-model.js";
 import { loadSeenTasks } from "./task-seen-prefs.js";
 import { TaskSidebarList, TaskTeamScreen } from "../shared/task-team-react.js";
+import { SidebarNav, SidebarNavRail } from "../shared/sidebar-nav.js";
+import {
+  SidebarBellToggle,
+  SidebarSearchField,
+  SidebarSearchToggle,
+} from "../shared/sidebar-chrome.js";
 import {
   buildReviewingThreadSet,
   canRequestReview,
@@ -281,6 +289,18 @@ export function createSessionRenderer({
   teamsCache = createTeamsCache(),
   fetchTeams,
   getViewContext = () => ({ kind: "sessions" }),
+  // The sidebar nav's two destinations. Injected, not imported: the shared component
+  // takes `current` in and emits these out, which is the entire seam that keeps it from
+  // learning about local's `session-view-state.js` — a real state machine with
+  // invariants that remote has no equivalent of.
+  onOpenSessionsScreen = () => {},
+  onOpenTasksScreen = () => {},
+  // The sidebar's narrowing controls. Injected because each carries a TRANSPORT: the
+  // search field's debounce plus its HTTP query, and the bell's re-render of the list.
+  // The components see neither — only these callbacks.
+  onSetSearchOpen = () => {},
+  onSearchInput = () => {},
+  onToggleActivityFilter = () => {},
   onOpenTask,
   onBackToTasks,
   onTeamAction,
@@ -457,24 +477,19 @@ export function createSessionRenderer({
     if (appShell) {
       appShell.dataset.view = mainView;
     }
-    // The icon rail lives OUTSIDE `.app-shell` (in `.local-frame`), so nothing it
-    // contains can be selected from `appShell`'s attribute. Mirroring the view onto
-    // `<body>` — beside the existing `body.sidebar-collapsed` — lets the rail light
-    // its current destination without a `:has()` reaching back up the tree.
-    document.body.dataset.view = mainView;
-    // The row stack carries the state in the DOM as well as in paint: the CSS
-    // selector is on `data-view` so nothing flashes, and `aria-current` is what a
-    // screen reader actually reads. Keep both, and keep exactly one of them set.
-    if (sidebarNavSessionsButton && sidebarNavTasksButton) {
-      const currentNavRow = onTaskScreen ? sidebarNavTasksButton : sidebarNavSessionsButton;
-      for (const row of [sidebarNavSessionsButton, sidebarNavTasksButton]) {
-        if (row === currentNavRow) {
-          row.setAttribute("aria-current", "page");
-        } else {
-          row.removeAttribute("aria-current");
-        }
-      }
-    }
+    // No `document.body.dataset.view` mirror any more, and no `aria-current` sweep over
+    // the nav rows. Both existed to solve the same problem in two places: the nav was
+    // static markup, so "which destination am I on" had to reach it from outside — as a
+    // CSS selector on an ancestor attribute (`body[data-view]` for the rail,
+    // `.app-shell[data-view]` for the rows) AND as an imperative accessibility write
+    // here, because CSS cannot set `aria-current`. Two writes, one fact, free to
+    // disagree.
+    //
+    // `renderSidebarNav()` below now passes the destination in as a prop, and the shared
+    // component sets the class and `aria-current` from the same comparison. `appShell`
+    // and `chatShell` keep their `data-view` because other rules genuinely switch on it
+    // (which sidebar BODY shows, whether the transcript is mounted) — that is a layout
+    // switch, not a duplicate of the nav's state.
     if (sessionHistoryDrawer) {
       // A pinned project keeps the drawer open: picking one is a request to see its
       // sessions, and the old rule (open only while viewing a conversation) left the
@@ -539,7 +554,8 @@ export function createSessionRenderer({
         }
       );
     }
-    renderTasksBadge();
+    renderSidebarNav();
+    renderSidebarChrome();
     renderSidebarTaskList();
     if (onTaskScreen) {
       renderTaskTeam(session);
@@ -651,6 +667,12 @@ export function createSessionRenderer({
   }
 
   function renderSessionUnavailable(message) {
+    // The nav is chrome, not session content: an offline relay is still a moment where
+    // the user needs to be able to move between Sessions and Tasks. It used to be static
+    // markup in the shell and could not go missing; mounted, it has to be rendered by
+    // every top-level state or it silently is not there.
+    renderSidebarNav();
+    renderSidebarChrome();
     renderOverviewState(null, message);
     renderWorkspaceSuggestions(null);
     renderHeaderModelBadge(null);
@@ -677,6 +699,12 @@ export function createSessionRenderer({
     state.session = null;
     state.threads = [];
     state.threadGroups = [];
+    // This path runs at BOOT whenever there is no API token, so it is the first thing a
+    // signed-out user sees. Without this the sidebar rendered with no destinations in it
+    // at all — the nav was static markup before it was a mount, so nothing had to think
+    // about which states repaint it.
+    renderSidebarNav();
+    renderSidebarChrome();
     cancelControllerHeartbeat();
     cancelControllerLeaseRefresh();
     // Clear the independently-mounted Reviewer tab so it does not retain job
@@ -1582,7 +1610,7 @@ export function createSessionRenderer({
     // the group structure with state buckets rather than narrowing within it, so a
     // pinned group cannot survive it. Standing the pin down beats rendering a control
     // that visibly does nothing.
-    const filtering = isThreadFilterActive(state.threadFilter);
+    const filtering = isThreadFilterActive(readThreadFilter(state.threadListStore));
     // Gated on the selection alone. It used to require `viewMode === "projects"` as
     // well, which was the toggle's last hold on the list: with the toggle gone that
     // condition is permanently false, so the pin would simply never apply.
@@ -1635,15 +1663,24 @@ export function createSessionRenderer({
       });
     // Monotonic accumulator, not derived state: it only ever grows while the filter is
     // on, so computing it here cannot cause a re-render loop.
-    state.threadFilter.retained = nextRetainedStates(
-      state.threadFilter.retained,
+    //
+    // Written through the store's setter rather than by mutating `retained` in place.
+    // Nothing on local SUBSCRIBES to this store — it is read with `getState()` from
+    // imperative code — so a write during a render pass notifies nobody and cannot loop.
+    // Remote, which does subscribe, keeps the same write in an effect for that reason.
+    const threadFilter = readThreadFilter(state.threadListStore);
+    const retainedNext = nextRetainedStates(
+      threadFilter.retained,
       listView.groups,
-      state.threadFilter,
+      threadFilter,
       stateOf
     );
+    if (retainedNext !== threadFilter.retained) {
+      state.threadListStore.getState().setThreadFilterRetained(retainedNext);
+    }
     const filterView = selectThreadFilterView({
       groups: listView.groups,
-      filter: state.threadFilter,
+      filter: { ...threadFilter, retained: retainedNext },
       stateOf,
     });
     // The pinned group's header carries the same activity roll-up ("2 working" /
@@ -1765,30 +1802,84 @@ export function createSessionRenderer({
     });
   }
 
-  // The sidebar's Tasks badge: how many tasks are waiting on a person.
+  // The sidebar's destination nav, in both of its forms.
   //
-  // Counts attention, not runs. A number that meant "tasks that exist" would
-  // never go away — a terminal run stays in the list forever — so the badge
+  // This is local's HOST for `shared/sidebar-nav.js`: it binds a surface-agnostic
+  // component to local's routing (`onOpenSessionsScreen` / `onOpenTasksScreen`, injected
+  // rather than imported, so the nav never learns what `session-view-state.js` is) and to
+  // local's notion of a waiting task. It replaced four id-addressed click listeners in
+  // app.js, an `aria-current` sweep, and two hand-written copies of the same two buttons.
+  //
+  // Both mounts get the SAME props. The rail is not a second nav — it is the same nav
+  // with the labels dropped, and it is the only one on screen while the sidebar is
+  // collapsed, so a count that lived only in the sidebar would go quiet in exactly the
+  // state where the user has the least on screen to notice it.
+  //
+  // The badge counts tasks WAITING ON A PERSON, not tasks that exist: a number meaning
+  // "runs in the list" would never go away — a terminal run stays forever — so the badge
   // would stop meaning anything the first time one finished.
-  function renderTasksBadge() {
-    if (!sidebarTasksBadge && !iconRailTasksDot) {
-      return;
-    }
-    // `loadSeenTasks()` is a localStorage read per render. It is a single small
-    // JSON parse and the alternative — caching it — needs an invalidation path
-    // for a value the user changes by clicking, which is the more expensive kind
-    // of wrong.
-    const waiting = teamsNeedingYou(teamsCache.current().teams, loadSeenTasks());
-    if (sidebarTasksBadge) {
-      sidebarTasksBadge.hidden = waiting === 0;
-      sidebarTasksBadge.textContent = waiting ? String(waiting) : "";
-    }
-    // Same fact, collapsed form. The rail is the only nav on screen while the
-    // sidebar is folded, so a badge that lived only in the sidebar would go quiet
-    // in exactly the state where the user has the least on screen to notice it.
-    if (iconRailTasksDot) {
-      iconRailTasksDot.hidden = waiting === 0;
-    }
+  // The sidebar's top-bar controls and the search field.
+  //
+  // Local's host for `shared/sidebar-chrome.js`. Three things used to carry this between
+  // them: static markup in react-shell.js, five `getElementById` handles in app.js, and a
+  // `syncActivityFilterChrome()` whose whole job was keeping `is-active`/`aria-pressed` in
+  // step with the store. All of it collapses into "read the state, pass it as props".
+  //
+  // The field is ABSENT when closed rather than hidden — the change that let one component
+  // serve both surfaces. Everything inside it lost its id in the process, which is what
+  // makes it safe for remote to mount the same component without colliding.
+  function renderSidebarChrome() {
+    const searchUi = readSearchUi(state.threadListStore);
+    const filter = readThreadFilter(state.threadListStore);
+    renderReactContent(
+      sidebarTopActionsMount,
+      h(
+        React.Fragment,
+        null,
+        h(SidebarSearchToggle, {
+          open: searchUi.open,
+          onToggle: onSetSearchOpen,
+          // Local binds ⌘F (app.js); remote has no such key, so the hint is a prop rather
+          // than baked into the label.
+          shortcutHint: "⌘F",
+        }),
+        h(SidebarBellToggle, {
+          on: filter.on,
+          onToggle: (on) => onToggleActivityFilter({ on }),
+        })
+      )
+    );
+    renderReactContent(
+      sidebarSearchMount,
+      h(SidebarSearchField, {
+        open: searchUi.open,
+        query: searchUi.draft,
+        onInput: onSearchInput,
+        onClose: () => onSetSearchOpen(false),
+        // Local reveals the field from a keyboard shortcut (⌘F), so focusing it is the
+        // point. Remote leaves this off: on a phone, focusing pops the on-screen keyboard
+        // over the list the user just asked to see.
+        focusOnOpen: true,
+        // The counter, so ⌘F focuses an ALREADY-OPEN field too. `open` does not change in
+        // that case, so a mount-only `autoFocus` made the shortcut look dead.
+        focusSignal: searchUi.focusSignal,
+      })
+    );
+  }
+
+  function renderSidebarNav() {
+    const context = getViewContext() || {};
+    // `loadSeenTasks()` is a localStorage read per render. It is a single small JSON
+    // parse, and the alternative — caching it — needs an invalidation path for a value
+    // the user changes by clicking, which is the more expensive kind of wrong.
+    const props = {
+      current: context.kind === "tasks" ? "tasks" : "sessions",
+      tasksWaitingCount: teamsNeedingYou(teamsCache.current().teams, loadSeenTasks()),
+      onOpenSessions: onOpenSessionsScreen,
+      onOpenTasks: onOpenTasksScreen,
+    };
+    renderReactContent(sidebarNavMount, h(SidebarNav, props));
+    renderReactContent(iconRailNavMount, h(SidebarNavRail, props));
   }
 
   // The task list in the sidebar — the Tasks tab's body, opposite the session
@@ -2127,6 +2218,8 @@ export function createSessionRenderer({
     renderAuthRequiredState,
     renderOverviewState,
     renderSession,
+    renderSidebarChrome,
+    renderSidebarNav,
     renderSessionMeta,
     renderSessionUnavailable,
     renderThreadListMessage,

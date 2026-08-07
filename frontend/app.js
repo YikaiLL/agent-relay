@@ -18,11 +18,7 @@ import {
   closeSessionDetailsModalButton,
   closeSettingsModalButton,
   settingsModal,
-  iconRailSessionsButton,
   iconRailSettingsButton,
-  iconRailTasksButton,
-  sidebarNavSessionsButton,
-  sidebarNavTasksButton,
   sidebarTaskListMount,
   startTaskDialogMount,
   composerAttachments,
@@ -152,6 +148,7 @@ import { findThreadInSearchResults, findVisibleThread } from "./shared/thread-se
 import {
   createThreadListStore,
   readActiveProjectId,
+  readThreadFilter,
   readThreadListContextMenu,
   readThreadListUi,
 } from "./shared/thread-list-store.js";
@@ -401,11 +398,9 @@ const state = {
   // fallbacks and the context-menu liveness check read them); a narrowed copy in there
   // would make every non-matching session look deleted. See shared/thread-search.js.
   threadSearch: { query: "", groups: [], loading: false, error: null, unavailableProviders: [] },
-  // The bell. `retained` is the monotonic retention map (thread id → the state it was
-  // last seen in): while the filter is on, a thread that has matched stays listed even
-  // after its state moves on, so a row cannot vanish from under the pointer because the
-  // agent answered. See shared/thread-filter.js.
-  threadFilter: { on: false, retained: new Map() },
+  // The bell used to be a field right here. It now lives on `threadListStore` — see
+  // shared/thread-list-store.js — because remote held a byte-identical copy of it and the
+  // two were free to drift. Read it with `readThreadFilter(state.threadListStore)`.
   projects: [],
   threadProjectId: {},
   projectsLoading: false,
@@ -980,6 +975,17 @@ const renderer = createSessionRenderer({
     return getTeams(apiFetch);
   },
   getViewContext: () => sessionViewStore.getState().location.context,
+  // The sidebar nav's two destinations. Both go through `showOverview` so both are real
+  // history entries — the back button has to be able to leave the Task screen the same
+  // way it leaves a project. Declared as functions further down the file, so these
+  // wrappers keep the hoisting honest.
+  onOpenSessionsScreen: () => openSessionsScreen(),
+  onOpenTasksScreen: () => openTaskScreen(),
+  // The narrowing controls. Each wraps a transport the shared components must not see:
+  // the search field's debounce + HTTP query, and the bell's list re-render.
+  onSetSearchOpen: (open) => setSearchOpen(open),
+  onSearchInput: (value) => onSearchInput(value),
+  onToggleActivityFilter: (next) => setActivityFilter(next),
   onOpenTask(teamRunId) {
     // Clear the action error on the way out. It belongs to the task that produced
     // it; carrying it across would render "this task is blocked" attributed to a
@@ -1393,6 +1399,13 @@ const {
   renderAuthRequiredState,
   renderSession,
   renderSessionMeta,
+  // The search + bell toggles and the search field. Repainted on its own rather than
+  // through a whole `renderSession` pass, because a keystroke has to reach a CONTROLLED
+  // input immediately — the field would otherwise appear to swallow characters until the
+  // search debounce fired and something else triggered a render.
+  renderSidebarChrome,
+  // Also called once at module scope, before boot's awaits — see paintInitialSidebarChrome.
+  renderSidebarNav,
   renderThreads,
   runViewTransition,
   syncThreadHistoryScroll,
@@ -1558,10 +1571,15 @@ async function dropStaleProjectSelection() {
 // Session title search
 // ---------------------------------------------------------------------------
 
-const sidebarSearchToggle = document.getElementById("sidebar-search-toggle");
-const sidebarSearch = document.getElementById("sidebar-search");
-const sidebarSearchInput = document.getElementById("sidebar-search-input");
-const sidebarSearchClear = document.getElementById("sidebar-search-clear");
+// No handles here any more. The toggle, the field, its input and its clear button were
+// four `getElementById` calls, and the field's own OPEN/DRAFT state was kept in the DOM —
+// `open` read back off `sidebarSearch.hidden`, the draft off `sidebarSearchInput.value`.
+// Using the DOM as the state is precisely why local could not conditionally render the
+// field: the nodes had to exist for the state to be readable.
+//
+// Both now live in `threadListStore` (see shared/thread-list-store.js `searchUi`), which
+// remote reads too, and the field itself is `SidebarSearchField`. What stays here is the
+// part that is genuinely local: the debounce and the HTTP query it triggers.
 
 // Each keystroke is a relay round trip, so coalesce a burst of typing into one. Short
 // enough to feel live, long enough that a word costs one request rather than five.
@@ -1585,49 +1603,25 @@ function queueSearch(query) {
   searchDebounceTimer = window.setTimeout(() => runSearch(query), SEARCH_DEBOUNCE_MS);
 }
 
-function setSearchOpen(open, { focus = true } = {}) {
-  if (!sidebarSearch || !sidebarSearchInput) {
-    return;
+// Opening and closing the field. The store enforces "closing clears the draft" — the rule
+// both shells used to state in prose and could each have lost — so all that is left here
+// is the half that is local's: telling the relay the query is gone.
+function setSearchOpen(open) {
+  state.threadListStore.getState().setSearchOpen(open);
+  if (!open) {
+    runSearch("");
   }
-  sidebarSearch.hidden = !open;
-  sidebarSearchToggle?.setAttribute("aria-expanded", String(open));
-  sidebarSearchToggle?.classList.toggle("is-active", open);
-  if (open) {
-    if (focus) {
-      sidebarSearchInput.focus();
-      sidebarSearchInput.select();
-    }
-    return;
-  }
-  // Closing must also clear: a hidden field still filtering the list is a sidebar that
-  // looks like it lost sessions, with the reason off screen.
-  sidebarSearchInput.value = "";
-  runSearch("");
+  renderSidebarChrome();
 }
 
-sidebarSearchToggle?.addEventListener("click", () => {
-  setSearchOpen(Boolean(sidebarSearch?.hidden));
-});
-
-sidebarSearchInput?.addEventListener("input", (event) => {
-  queueSearch(event.target.value);
-});
-
-sidebarSearchInput?.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    event.preventDefault();
-    setSearchOpen(false);
-  }
-});
-
-sidebarSearchClear?.addEventListener("click", () => {
-  if (!sidebarSearchInput) {
-    return;
-  }
-  sidebarSearchInput.value = "";
-  runSearch("");
-  sidebarSearchInput.focus();
-});
+// A keystroke has to repaint immediately: the input is CONTROLLED by the draft, so a
+// re-render that waited for the search results to land would make the field appear to
+// swallow every character until the debounce fired.
+function onSearchInput(value) {
+  state.threadListStore.getState().setSearchDraft(value);
+  renderSidebarChrome();
+  queueSearch(value);
+}
 
 window.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
@@ -1640,26 +1634,18 @@ window.addEventListener("keydown", (event) => {
 // Activity filter (the bell)
 // ---------------------------------------------------------------------------
 
-const sidebarBellToggle = document.getElementById("sidebar-bell-toggle");
-
-function syncActivityFilterChrome() {
-  const { on } = state.threadFilter;
-  sidebarBellToggle?.classList.toggle("is-active", on);
-  sidebarBellToggle?.setAttribute("aria-pressed", String(on));
-}
-
-// Toggling the filter RESETS retention. The retention set exists so a row cannot
-// vanish mid-reach; carrying it across a deliberate off/on would instead re-list
-// rows that stopped being interesting long ago.
+// No handle and no chrome sync. `is-active` and `aria-pressed` used to be written onto
+// the button here, from a function whose only job was to keep the DOM in step with the
+// store; `SidebarBellToggle` now derives both from the `on` prop in the same render.
+//
+// Toggling the filter RESETS retention. The retention set exists so a row cannot vanish
+// mid-reach; carrying it across a deliberate off/on would instead re-list rows that
+// stopped being interesting long ago.
 function setActivityFilter(next) {
-  state.threadFilter = { ...state.threadFilter, ...next, retained: new Map() };
-  syncActivityFilterChrome();
+  state.threadListStore.getState().setThreadFilter(next);
+  renderSidebarChrome();
   renderThreads();
 }
-
-sidebarBellToggle?.addEventListener("click", () => {
-  setActivityFilter({ on: !state.threadFilter.on });
-});
 
 // Prompt for a Project name (trimmed; null aborts). Native prompt mirrors the
 // window.confirm flow the archive/delete affordances already use.
@@ -2265,12 +2251,11 @@ function openSessionsScreen() {
   void sessionViewController.showOverview({ kind: "sessions" });
 }
 
-sidebarNavSessionsButton?.addEventListener("click", openSessionsScreen);
-sidebarNavTasksButton?.addEventListener("click", openTaskScreen);
-// Also on the icon rail, which is the ONLY nav visible while the sidebar is
-// collapsed — so it has to offer both destinations, not just Tasks.
-iconRailSessionsButton?.addEventListener("click", openSessionsScreen);
-iconRailTasksButton?.addEventListener("click", openTaskScreen);
+// No listeners here for either of them, and none for the icon rail's copies. Both
+// forms of the nav are one shared component (shared/sidebar-nav.js) taking these two
+// functions as props — see the `onOpenSessionsScreen` / `onOpenTasksScreen` injections
+// into createSessionRenderer below. Four id-addressed listeners became two props, and
+// the rail can no longer offer a different set of destinations than the rows.
 
 // "New agent" in the header — the header only shows it while it is naming a
 // project (header-labels.js), and render-session stamps that project's id onto the
@@ -2959,6 +2944,25 @@ pendingPairingsList.addEventListener("click", (event) => {
     decisionButton.dataset.pairingDecision
   );
 });
+
+// Paint the sidebar's chrome BEFORE boot awaits anything.
+//
+// `renderLocalShell()` is synchronous but paints only the empty mounts; the nav, the search
+// toggle and the bell are rendered by render-session, and `boot()` below does not reach its
+// first `renderSession` until two network round trips have completed. Without this the
+// sidebar sits chromeless until the relay answers — and because `createPanelControl` has
+// already restored the collapsed state from localStorage at module scope, a user who quit
+// collapsed boots into an icon rail holding a logo, a gear, and no way to go anywhere.
+// That is the exact bug the shared nav exists to prevent, and on an unreachable relay the
+// window is unbounded rather than brief.
+//
+// Safe here: `sessionViewStore` (which `getViewContext` reads) is created at module scope
+// well above, and `teamsCache` answers `{ teams: [] }` before its first sync.
+function paintInitialSidebarChrome() {
+  renderSidebarNav();
+  renderSidebarChrome();
+}
+paintInitialSidebarChrome();
 
 void boot();
 
