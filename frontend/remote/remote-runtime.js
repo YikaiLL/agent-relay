@@ -5,6 +5,7 @@ import { applyPairingQuery, beginPairing, forgetCurrentDevice, handleEncryptedPa
 import { mountIosInstallHint } from "./ios-install.js";
 import { registerRemotePwa } from "./pwa.js";
 import { renderLog } from "./session-surface.js";
+import { sidebarGestureDebugEnabled } from "./sidebar-debug-flag.js";
 import { applyFileChange, applySessionSnapshot, applyTranscriptDelta, applyTranscriptEvent, cancelRemoteThreadSearch, cancelRemoteThreadsPoll, clearSessionRuntime, deleteRemoteReview, fetchAskUserQuestionDetail, fetchRemoteProviderModels, fetchRemoteProviders, fetchRemoteThreadTranscript, fetchTranscriptEntryDetail, forkRemoteSession, refreshRemoteThreads, requestRemoteReview, resolveRemoteReview, resolveRemoteWorkflow, resumeRemoteSession, sendMessage, startRemoteSession, startRemoteWorkflow, stopActiveTurn, submitAskUserAnswer, submitDecision, syncRemoteSnapshot, takeOverControl, updateRemoteSessionSettings, viewRemoteThread } from "./session-ops.js";
 import { clearActiveRelaySelection, ensureDeviceIdentity, hydrateStoredRemoteSecrets, selectRelayProfile, state } from "./state.js";
 import { applyRemoteSurfacePatch, createResetRemoteSurfaceStatePatch } from "./surface-state.js";
@@ -242,7 +243,36 @@ export function createRemoteAppHandlers() {
   };
 }
 
+/**
+ * Trace every sidebar gesture into the console AND the client log panel.
+ *
+ * OPT-IN: `?sidebarDebug=1`, or `localStorage["sealwire:sidebar-debug"] = "1"` to survive
+ * a reload. Off by default, and off means this returns before attaching anything.
+ *
+ * That matters because the tracer is not a passive observer of the region it watches. It
+ * calls `renderLog()` — `patchRemoteState`, a re-render — on pointerdown, touchstart,
+ * wheel and scroll. A re-render between mousedown and mouseup replaces the
+ * `dangerouslySetInnerHTML` glyph inside a button, and the browser then fires NO click:
+ * the button hovers, depresses, and does nothing. `.inline-icon { pointer-events: none }`
+ * protects the buttons carrying that class, but `.project-switcher-trigger`'s svg does
+ * not, and an e2e run shows this tracer firing with that svg as the pointerdown target.
+ *
+ * It ran unconditionally for ~590 commits behind a "remove after scroll bugs are fixed"
+ * TODO. Gating beats deleting: on a phone there is usually no console to read, which is
+ * why it renders into the log panel, and that is precisely where the next sidebar scroll
+ * report will come from.
+ */
 export function installSidebarGestureDebug() {
+  if (
+    !sidebarGestureDebugEnabled({
+      search: typeof window !== "undefined" ? window.location?.search || "" : "",
+      storage: typeof window !== "undefined" ? window.localStorage : null,
+    })
+  ) {
+    // A no-op cleanup, so the caller's teardown does not have to know it never ran.
+    return () => {};
+  }
+
   const sidebar = document.querySelector(".sidebar");
   const remoteRelaysList = document.querySelector("#remote-relays-list");
   const remoteThreadsList = document.querySelector("#remote-threads-list");
@@ -282,14 +312,15 @@ export function installSidebarGestureDebug() {
     const relaysTop = remoteRelaysList?.scrollTop ?? -1;
     const threadsTop = remoteThreadsList?.scrollTop ?? -1;
     const message = `[sidebar-debug] ${scope} type=${event.type} target=${target} current=${current} sidebarTop=${sidebarTop} relaysTop=${relaysTop} threadsTop=${threadsTop}`;
-    // TODO(remote-monitor-debug): Remove this sidebar gesture console trace after scroll bugs are fixed.
+    // Opt-in only (see the gate at the top of this function): reaching here means the
+    // tracer was explicitly armed, so the re-render below is asked for.
     console.log(message);
     renderLog(message);
   };
 
   const logScrollEvent = (scope, element) => {
     const message = `[sidebar-debug] ${scope} type=scroll current=${describeNode(element)} top=${element.scrollTop} height=${element.scrollHeight} client=${element.clientHeight}`;
-    // TODO(remote-monitor-debug): Remove this sidebar scroll console trace after scroll bugs are fixed.
+    // Opt-in only, as above.
     console.log(message);
     renderLog(message);
   };
