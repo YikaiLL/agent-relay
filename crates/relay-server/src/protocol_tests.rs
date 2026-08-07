@@ -154,6 +154,7 @@ fn make_snapshot() -> SessionSnapshot {
         push_vapid_public_key: None,
         projects_revision: 0,
         threads_revision: 0,
+        teams_revision: 0,
     }
 }
 
@@ -498,6 +499,61 @@ fn compact_for_broker_drops_legacy_workflow_card_before_conversation_content() {
         compacted.transcript.len(),
         3,
         "legacy workflow metadata must be reclaimed before conversation entries"
+    );
+}
+
+#[test]
+fn compact_for_broker_keeps_the_teams_cache_key_under_maximum_pressure() {
+    // The Teams channel ships a revision and NOTHING else, so the whole feature
+    // rests on that scalar surviving. The drain loop reclaims lists — reviewer
+    // threads, workflow cards, review jobs, devices, then conversation — and a
+    // client that loses the key stops refetching without ever knowing it went
+    // stale. Pressure this snapshot past every list it can drop and assert the
+    // key is still there.
+    let mut snapshot = workflow_budget_snapshot("escalated", 50_000);
+    snapshot.teams_revision = 4242;
+    snapshot.current_cwd = "/tmp/".to_string() + &"超长路径".repeat(3_000);
+    snapshot.transcript = (0..3)
+        .map(|index| TranscriptEntryView {
+            item_id: Some(format!("item-{index}")),
+            kind: TranscriptEntryKind::AgentText,
+            text: Some(format!("visible conversation tail {index}")),
+            status: "completed".to_string(),
+            turn_id: Some(format!("turn-{index}")),
+            tool: None,
+            content_state: TranscriptContentState::Full,
+        })
+        .collect();
+
+    let compacted = snapshot.compact_for(SessionSnapshotCompactProfile::RemoteSurface);
+    let bytes = serde_json::to_vec(&compacted).unwrap().len();
+
+    assert!(
+        bytes <= SESSION_SNAPSHOT_TARGET_BYTES,
+        "compacted snapshot stayed over budget: {bytes}"
+    );
+    assert!(
+        compacted.active_workflow_runs.is_empty(),
+        "this snapshot has to be under real pressure for the assertion below to mean anything"
+    );
+    assert_eq!(
+        compacted.teams_revision, 4242,
+        "the Teams cache key must outlive every list the budget can reclaim"
+    );
+}
+
+#[test]
+fn a_zero_teams_revision_stays_off_the_wire() {
+    // Every relay that has never run a task carries 0 here. Serialising it would
+    // add a field to every snapshot on every surface to say "no tasks", which is
+    // what `skip_serializing_if` is for — and what keeps this addition free for
+    // the surfaces that will never use it.
+    let snapshot = workflow_budget_snapshot("running", 10);
+    assert_eq!(snapshot.teams_revision, 0);
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(
+        !json.contains("teams_revision"),
+        "the no-tasks wire shape must stay byte-identical"
     );
 }
 

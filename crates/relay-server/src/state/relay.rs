@@ -2248,6 +2248,28 @@ impl RelayState {
         acc
     }
 
+    /// Cache key for the Teams channel.
+    ///
+    /// Hashes the VIEW, so the key moves for exactly what a client can see — a
+    /// sub-task advancing included, which a hash over the run's own fields would
+    /// miss. XOR-accumulated per run because `team_runs_snapshot` yields
+    /// `HashMap::values()`: a single hasher fed in iteration order would produce a
+    /// different key each snapshot and refetch forever.
+    ///
+    /// A content hash rather than a bumped counter, for the reason
+    /// `workflows_revision` is one: team runs mutate from a dozen places in the
+    /// driver, and a hash has no bump site to forget.
+    pub(crate) fn teams_revision(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut acc: u64 = 0;
+        for run in self.team_runs_snapshot() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            crate::state::app::team::team_run_view(run).hash(&mut h);
+            acc ^= h.finish();
+        }
+        acc
+    }
+
     /// Minimal, non-terminal workflow state retained in SessionSnapshot.
     pub(crate) fn workflow_activity_view(&self) -> Vec<crate::protocol::WorkflowActivityView> {
         let mut runs = self
@@ -2756,6 +2778,7 @@ impl RelayState {
             push_vapid_public_key: self.push_vapid_public_key.clone(),
             projects_revision: self.projects_revision,
             threads_revision: self.threads_revision,
+            teams_revision: self.teams_revision(),
         }
     }
 
@@ -4833,6 +4856,70 @@ mod tests {
         run.tl_thread_id = "tl-1".to_string();
         run.status = status;
         run
+    }
+
+    #[test]
+    fn teams_revision_moves_for_any_change_a_client_can_see() {
+        // The cache key for the Teams channel. A content hash rather than a bumped
+        // counter for the same reason `workflows_revision` is one: team runs mutate
+        // from a dozen places in the driver, and a hash cannot be forgotten.
+        let mut relay = test_relay();
+        assert_eq!(relay.teams_revision(), 0, "no runs, nothing to key on");
+
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        let running = relay.teams_revision();
+        assert_ne!(running, 0);
+        assert_eq!(
+            running,
+            relay.teams_revision(),
+            "an unchanged run set must not force a refetch"
+        );
+
+        relay.update_team_run("t1", |run| run.status = TeamRunStatus::Paused);
+        let paused = relay.teams_revision();
+        assert_ne!(running, paused, "a status change is the whole point");
+
+        // The discriminating case: sub-task progress with the run's own fields
+        // untouched. A hash over only the top-level fields passes every assertion
+        // above and still leaves the sub-task list stale on screen.
+        relay.update_team_run("t1", |run| {
+            run.sub_tasks = vec![crate::state::SubTask {
+                id: "s1".to_string(),
+                title: "Write the parser".to_string(),
+                ..Default::default()
+            }];
+        });
+        let with_sub_task = relay.teams_revision();
+        assert_ne!(
+            paused, with_sub_task,
+            "a sub-task appearing must move the key, or the list never refreshes"
+        );
+
+        relay.update_team_run("t1", |run| {
+            run.sub_tasks[0].status = crate::state::SubTaskStatus::Done;
+        });
+        assert_ne!(
+            with_sub_task,
+            relay.teams_revision(),
+            "nor may a sub-task's own status change go unnoticed"
+        );
+    }
+
+    #[test]
+    fn teams_revision_does_not_depend_on_map_iteration_order() {
+        // `team_runs_snapshot` yields `HashMap::values()`, whose order is arbitrary
+        // and varies per process. Accumulating with XOR is what makes the key
+        // stable; a single hasher fed in iteration order would flap between
+        // snapshots and refetch forever.
+        let mut forwards = test_relay();
+        forwards.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        forwards.insert_team_run(team_run_with_status("t2", TeamRunStatus::Paused));
+
+        let mut backwards = test_relay();
+        backwards.insert_team_run(team_run_with_status("t2", TeamRunStatus::Paused));
+        backwards.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+
+        assert_eq!(forwards.teams_revision(), backwards.teams_revision());
     }
 
     #[test]

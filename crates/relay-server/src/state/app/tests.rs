@@ -17870,6 +17870,168 @@ report headed \"Nothing was left unresolved\": {:?}",
     }
 
     #[tokio::test]
+    async fn a_task_naming_a_provider_that_does_not_exist_leaves_nothing_behind() {
+        // The other half of the same defect. Defaulting an ABSENT provider was
+        // fixed; an explicitly named one that the relay never spawned still
+        // provisioned a worktree and a branch, then died on its first turn with
+        // "agent provider 'gpt5' is not available" — leaving both on disk for a
+        // run that never ran. A refused start must leave nothing.
+        use crate::protocol::StartTeamInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let error = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                cwd: Some(root.clone()),
+                device_id: Some("device-1".to_string()),
+                dev_provider: Some("gpt5".to_string()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect_err("a provider the relay never spawned cannot run a seat");
+        assert!(error.contains("gpt5"), "{error}");
+
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "a refused start must leave no run behind"
+        );
+        // The worktree directory is the thing that actually costs the user: it
+        // survives a restart and nothing points at it.
+        let worktrees = std::path::Path::new(&root).join(".sealwire/worktrees");
+        let provisioned = std::fs::read_dir(&worktrees)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            provisioned, 0,
+            "a refused start must not provision a worktree"
+        );
+
+        let branches = tokio::process::Command::new("git")
+            .args(["branch", "--list", "task/*"])
+            .current_dir(&root)
+            .output()
+            .await
+            .expect("git");
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "a refused start must not leave a branch: {}",
+            String::from_utf8_lossy(&branches.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_started_without_a_provider_picks_one_instead_of_failing() {
+        // The three provider fields are OPTIONAL on `StartTeamInput`, so a client
+        // may leave them out — and the obvious client, a form, does. Defaulting
+        // them to an empty string means the run provisions a worktree AND a
+        // branch, then dies on its first turn with "agent provider '' is not
+        // available", leaving both behind. A refused start must leave nothing;
+        // an accepted one must be runnable.
+        use crate::protocol::StartTeamInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let receipt = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                cwd: Some(root.clone()),
+                device_id: Some("device-1".to_string()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect("a task with no provider named should still start");
+
+        let providers = app
+            .relay
+            .read()
+            .await
+            .team_run(&receipt.team_run_id)
+            .map(|run| {
+                (
+                    run.tl_provider.clone(),
+                    run.dev_provider.clone(),
+                    run.reviewer_provider.clone(),
+                )
+            })
+            .expect("the run should exist");
+        assert_eq!(
+            providers,
+            (
+                "codex".to_string(),
+                "codex".to_string(),
+                "codex".to_string()
+            ),
+            "every seat needs a provider that actually exists"
+        );
+
+        app.cancel_team_run(
+            Some(receipt.team_run_id.clone()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("cancel");
+    }
+
+    #[tokio::test]
+    async fn the_sub_task_view_names_its_developer_and_reviewer_threads() {
+        // A team diagram whose Dev and Reviewer nodes open a transcript needs
+        // those thread ids, and only the team lead's is on the run view. They are
+        // identity rather than TL-authored instruction, so exposing them leaves
+        // the "briefs are deliberately absent" decision intact.
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let mut run = crate::state::TeamRun::new(
+            "team-view-1".to_string(),
+            crate::state::TaskSpec::default(),
+            root.clone(),
+            "device-1".to_string(),
+        );
+        run.tl_thread_id = "tl-1".to_string();
+        run.sub_tasks = vec![
+            crate::state::SubTask {
+                id: "s1".to_string(),
+                title: "Write the parser".to_string(),
+                brief: "Never leaves the backend.".to_string(),
+                dev_thread_id: Some("dev-1".to_string()),
+                reviewer_thread_id: Some("rev-1".to_string()),
+                ..Default::default()
+            },
+            // Not yet started: nobody is seated, and the view must say so rather
+            // than inventing an id the UI would then try to open.
+            crate::state::SubTask {
+                id: "s2".to_string(),
+                title: "Wire the loader".to_string(),
+                ..Default::default()
+            },
+        ];
+        app.relay.write().await.insert_team_run(run);
+
+        let teams = app.teams().await;
+        let view = teams
+            .teams
+            .iter()
+            .find(|team| team.team_run_id == "team-view-1")
+            .expect("the task should be listed");
+
+        assert_eq!(
+            view.sub_tasks[0].dev_thread_id.as_deref(),
+            Some("dev-1"),
+            "the Dev node has nothing to open without this"
+        );
+        assert_eq!(
+            view.sub_tasks[0].reviewer_thread_id.as_deref(),
+            Some("rev-1"),
+            "nor does the Reviewer node"
+        );
+        assert_eq!(view.sub_tasks[1].dev_thread_id, None);
+        assert_eq!(view.sub_tasks[1].reviewer_thread_id, None);
+    }
+
+    #[tokio::test]
     async fn a_pause_whose_turn_then_fails_never_strands_the_run() {
         // A graceful pause stops nothing, so the turn it is waiting on can fail on
         // its own. If that failure is suppressed as "the stop caused it", the

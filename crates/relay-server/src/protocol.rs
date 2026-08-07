@@ -215,6 +215,18 @@ pub struct SessionSnapshot {
     /// Skipped when 0 so the pre-rename wire shape stays byte-identical.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub threads_revision: u64,
+    /// Cache key for the dedicated Teams channel.
+    ///
+    /// Revision ONLY — no team run view rides the snapshot. That is deliberate: a
+    /// run view carries a sub-task list and an unresolved list, both unbounded, so
+    /// embedding one would need the whole `active_workflow_runs` compaction budget
+    /// to earn its place. A scalar the drain loop can never reclaim is enough to
+    /// tell a client to refetch `GET /api/session/teams`.
+    ///
+    /// Skipped when 0 so every relay that never runs a task keeps a byte-identical
+    /// wire shape.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub teams_revision: u64,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -2583,7 +2595,7 @@ pub struct StartTeamReceipt {
 
 /// One sub-task, as a client sees it. The brief is deliberately absent: it is
 /// TL-authored instruction for a developer, not status.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Hash)]
 pub struct TeamSubTaskView {
     pub id: String,
     pub title: String,
@@ -2591,10 +2603,16 @@ pub struct TeamSubTaskView {
     pub rounds_used: u32,
     pub digested: bool,
     pub result_summary: Option<String>,
+    /// Who is seated in the Dev and Reviewer chairs for this sub-task, so a team
+    /// diagram can open their transcripts. Identity, not instruction — which is
+    /// why these are here and `brief` is not. `None` until the seat is filled;
+    /// the UI must render an unopenable node rather than invent an id.
+    pub dev_thread_id: Option<String>,
+    pub reviewer_thread_id: Option<String>,
 }
 
 /// A parked question, so a client knows who is waiting and on what.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Hash)]
 pub struct TeamAwaitingView {
     pub thread_id: String,
     pub request_id: String,
@@ -2602,7 +2620,10 @@ pub struct TeamAwaitingView {
     pub asked_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `Hash` is load-bearing, not incidental: `RelayState::teams_revision` hashes the
+/// WHOLE view, so any field added here automatically joins the Teams cache key. A
+/// hand-written field list would have to be remembered instead.
+#[derive(Debug, Clone, Serialize, Hash)]
 pub struct TeamRunView {
     pub team_run_id: String,
     pub title: String,
@@ -2626,6 +2647,11 @@ pub struct TeamRunView {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TeamsResponse {
+    /// Echoed so a client can confirm which revision it just fetched. The cache
+    /// must still gate on the SNAPSHOT's revision, not this one — see
+    /// `frontend/shared/reviews-cache.js` for why gating on the response's own
+    /// revision loops when the relay moves mid-fetch.
+    pub teams_revision: u64,
     pub teams: Vec<TeamRunView>,
 }
 

@@ -559,6 +559,40 @@ over on resume"
             Some(cwd) => cwd,
             None => self.defaults().await.current_cwd,
         };
+        // Resolve and VALIDATE all three seats before anything is provisioned.
+        //
+        // `start_team_run` creates a branch in the main worktree and a worktree on
+        // disk; a name the relay never spawned is only discovered on the seat's
+        // first turn, long after both exist. The run then dies and nothing points
+        // at either — so the check has to happen here, before the first mutation,
+        // not where the name is finally used. (Same shape as the provisioning
+        // scope check: "guard every tree before mutating any of them".)
+        //
+        // `available_providers` is already ordered with codex first, so the
+        // fallback is the relay's own preference rather than a name hardcoded
+        // here.
+        let available = self.available_providers();
+        let default = available.first().cloned().unwrap_or_default();
+        let resolve_provider = |named: Option<String>, seat: &str| -> Result<String, String> {
+            let Some(named) = non_empty(named) else {
+                return Ok(default.clone());
+            };
+            if !available.iter().any(|provider| provider == &named) {
+                return Err(format!(
+                    "the {seat} asked for agent provider '{named}', which is not available (have: {})",
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ));
+            }
+            Ok(named)
+        };
+        let tl_provider = resolve_provider(input.tl_provider, "team lead")?;
+        let dev_provider = resolve_provider(input.dev_provider, "developer")?;
+        let reviewer_provider = resolve_provider(input.reviewer_provider, "reviewer")?;
+
         let run_id = self
             .start_team_run(TeamStartRequest {
                 spec: TaskSpec {
@@ -571,9 +605,9 @@ over on resume"
                 origin_cwd,
                 target_branch: non_empty(input.target_branch),
                 device_id,
-                tl_provider: non_empty(input.tl_provider).unwrap_or_default(),
-                dev_provider: non_empty(input.dev_provider).unwrap_or_default(),
-                reviewer_provider: non_empty(input.reviewer_provider).unwrap_or_default(),
+                tl_provider,
+                dev_provider,
+                reviewer_provider,
             })
             .await?;
         let run = self
@@ -632,7 +666,10 @@ over on resume"
                 .cmp(&left.requested_at)
                 .then_with(|| right.team_run_id.cmp(&left.team_run_id))
         });
-        TeamsResponse { teams }
+        TeamsResponse {
+            teams_revision: relay.teams_revision(),
+            teams,
+        }
     }
 
     /// Ask the run to pause at its next step boundary.
@@ -2765,7 +2802,10 @@ impl TeamAction2 {
     }
 }
 
-fn team_run_view(run: &TeamRun) -> TeamRunView {
+/// `pub(crate)` because `RelayState::teams_revision` hashes the view rather than
+/// the model: the cache key must move for exactly the changes a client can see,
+/// no more and no less, and only the view knows which those are.
+pub(crate) fn team_run_view(run: &TeamRun) -> TeamRunView {
     TeamRunView {
         team_run_id: run.id.clone(),
         title: run.spec.title.clone(),
@@ -2786,6 +2826,8 @@ fn team_run_view(run: &TeamRun) -> TeamRunView {
                 rounds_used: task.rounds_used,
                 digested: task.digested,
                 result_summary: task.result_summary.clone(),
+                dev_thread_id: task.dev_thread_id.clone(),
+                reviewer_thread_id: task.reviewer_thread_id.clone(),
             })
             .collect(),
         awaiting: run.awaiting.as_ref().map(|awaiting| TeamAwaitingView {

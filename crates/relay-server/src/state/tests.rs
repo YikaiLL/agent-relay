@@ -310,6 +310,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             push_vapid_public_key: None,
             projects_revision: 0,
             threads_revision: 0,
+            teams_revision: 0,
         }),
         receipt: Some(ApprovalReceipt {
             request_id: "req-1".to_string(),

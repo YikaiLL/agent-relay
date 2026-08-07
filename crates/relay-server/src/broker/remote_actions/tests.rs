@@ -73,6 +73,7 @@ fn make_snapshot() -> SessionSnapshot {
         push_vapid_public_key: None,
         projects_revision: 0,
         threads_revision: 0,
+        teams_revision: 0,
     }
 }
 
