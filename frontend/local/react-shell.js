@@ -4,7 +4,16 @@ import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
-import { BELL_SVG, PLUS_SVG, CHEVRON_RIGHT_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
+import {
+  BELL_SVG,
+  PLUS_SVG,
+  CHEVRON_RIGHT_SVG,
+  SEARCH_SVG,
+  SESSIONS_SVG,
+  SETTINGS_SVG,
+  TASKS_SVG,
+  X_SVG,
+} from "../svg.js";
 
 const h = React.createElement;
 
@@ -22,6 +31,17 @@ function IconRail() {
       width: 30,
       height: 30,
     }),
+    h(
+      "button",
+      {
+        className: "icon-rail-button icon-rail-tasks",
+        id: "icon-rail-tasks",
+        type: "button",
+        title: "Tasks",
+        "aria-label": "Tasks",
+      },
+      h("span", { className: "inline-icon", "aria-hidden": "true", dangerouslySetInnerHTML: { __html: TASKS_SVG } })
+    ),
     h("div", { className: "icon-rail-spacer" }),
     h(
       "button",
@@ -124,7 +144,12 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
     // No Sessions/Projects toggle: selecting a project PINS it to the top of a list
     // that stays complete, so there was never a second mode to be in. The Project
     // switcher in the header is the whole control.
+    h(SidebarNav),
     h(LaunchPanel, { launchModel, onLaunchFieldChange, onLaunchStart }),
+    // The Task list, in the sidebar. Filled by renderSidebarTaskList(); CSS-gated
+    // to the Tasks view, which also hides the launch panel and the thread drawer
+    // below — one sidebar, two mutually exclusive bodies.
+    h("div", { className: "sidebar-task-list", id: "sidebar-task-list" }),
     h(ThreadDrawer),
     h(ThreadContextMenu),
     h(ProjectContextMenu),
@@ -265,6 +290,50 @@ function LaunchStartSessionDialog({ launchModel, onLaunchFieldChange }) {
   });
 }
 
+/**
+ * The sidebar's two destinations, as peers.
+ *
+ * Sessions used to be the implicit background state and Tasks a lone button
+ * below the launch panel, which made them read as different kinds of thing —
+ * one a place, one an action. They are both places. Naming both, at the same
+ * level, is the whole change.
+ *
+ * Rows rather than a two-up segmented control because a segment strip is sized
+ * by its member count: a third destination would force a redesign, where a row
+ * just joins the stack. Wired imperatively in app.js by id, like search and bell.
+ */
+function SidebarNav() {
+  return h(
+    "nav",
+    { className: "sidebar-nav", "aria-label": "Views" },
+    h(
+      "button",
+      {
+        className: "sidebar-nav-row",
+        id: "sidebar-nav-sessions",
+        type: "button",
+        title: "Sessions — conversations with one agent",
+      },
+      iconNode(SESSIONS_SVG, "sidebar-nav-glyph"),
+      h("span", { className: "sidebar-nav-label" }, "Sessions")
+    ),
+    h(
+      "button",
+      {
+        className: "sidebar-nav-row",
+        id: "sidebar-nav-tasks",
+        type: "button",
+        title: "Tasks — long-running work a team does on its own branch",
+      },
+      iconNode(TASKS_SVG, "sidebar-nav-glyph"),
+      h("span", { className: "sidebar-nav-label" }, "Tasks"),
+      // Counts tasks WAITING ON A PERSON, not tasks that exist — see
+      // renderTasksBadge(). A badge that never cleared would stop being read.
+      h("span", { className: "sidebar-nav-badge", id: "sidebar-tasks-badge", hidden: true }, "")
+    )
+  );
+}
+
 function ThreadDrawer() {
   return h(
     "details",
@@ -275,8 +344,10 @@ function ThreadDrawer() {
       h(
         "div",
         null,
-        h("p", { className: "sidebar-caption" }, "Sessions"),
-        h("p", { className: "sidebar-hint", id: "threads-count" }, "Loading workspace groups...")
+        // No "Sessions" caption here any more — the nav row directly above names
+        // this view, and saying it twice was the clearest symptom of the old
+        // arrangement. The count carries the label's job now.
+        h("p", { className: "sidebar-caption", id: "threads-count" }, "Loading workspace groups...")
       ),
       h(RefreshButton, { id: "threads-refresh-button", label: "Refresh sessions" })
     ),
@@ -719,6 +790,9 @@ function ChatShell() {
     // Projects "card overview" main-area view. Filled by renderProjectOverview();
     // shown only when data-view="project-overview" (CSS-gated like console/conversation).
     h("section", { className: "project-overview-mount", id: "project-overview" }),
+    // The Task screen. Filled by renderTaskTeam(); shown only when
+    // data-view="tasks", which hides every sibling above and below it.
+    h("section", { className: "task-team-mount", id: "task-team" }),
     h(ConsoleGrid),
     h("div", { className: "pending-action-banner", id: "pending-action-banner", hidden: true }),
     h(
@@ -1037,6 +1111,9 @@ export function LocalShell({ launchModel = null, onLaunchFieldChange = null, onL
       )
     ),
     h(LaunchStartSessionDialog, { launchModel, onLaunchFieldChange }),
+    // Filled by renderStartTaskDialog() through its own React sub-root — the shell
+    // renders once, so anything data-driven needs one.
+    h("div", { className: "start-task-dialog-mount", id: "start-task-dialog-mount" }),
     h(SessionDetailsModal),
     h(WorkspaceDiffModal),
     h(SettingsModal),

@@ -188,6 +188,52 @@ export async function getWorkflows(apiFetch, deviceId) {
   return payload.data;
 }
 
+export async function getTeams(apiFetch) {
+  // No `device_id` suffix: `list_teams` takes none. Local is the operator surface
+  // with full access, and a task is scoped by its worktree, not by a device.
+  const response = await apiFetch("/api/session/teams", { method: "GET" });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to load tasks");
+  }
+  return payload.data;
+}
+
+export async function startTeam(apiFetch, input) {
+  // Flat by design: a client filling this in is filling in a form, not assembling
+  // a domain object.
+  const response = await apiFetch("/api/session/team", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to start the task");
+  }
+  return payload.data;
+}
+
+// The five whole-run actions share one body and one receipt, so they share one
+// client. `team_run_id` is optional only while one task runs at a time — send it.
+export const TEAM_ACTIONS = Object.freeze(["pause", "stop", "cancel", "resume", "resolve"]);
+
+export async function teamAction(apiFetch, action, { teamRunId, deviceId } = {}) {
+  if (!TEAM_ACTIONS.includes(action)) {
+    throw new Error(`Unknown task action: ${action}`);
+  }
+  const response = await apiFetch(`/api/session/team/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ team_run_id: teamRunId || null, device_id: deviceId || null }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || `Failed to ${action} the task`);
+  }
+  return payload.data;
+}
+
 export async function getDevices(apiFetch) {
   const response = await apiFetch("/api/devices", { method: "GET" });
   const payload = await response.json();

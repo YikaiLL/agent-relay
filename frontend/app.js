@@ -19,6 +19,11 @@ import {
   closeSettingsModalButton,
   settingsModal,
   iconRailSettingsButton,
+  iconRailTasksButton,
+  sidebarNavSessionsButton,
+  sidebarNavTasksButton,
+  sidebarTaskListMount,
+  startTaskDialogMount,
   composerAttachments,
   connectionForm,
   controlBanner,
@@ -105,6 +110,9 @@ import {
   getDevices,
   getReviews,
   getWorkflows,
+  getTeams,
+  startTeam,
+  teamAction,
 } from "./local/api.js";
 import {
   createWorkspaceDiffStore,
@@ -150,6 +158,9 @@ import { createProjectsStore } from "./shared/projects-store.js";
 import { createDevicesCache } from "./shared/devices-cache.js";
 import { createReviewsCache } from "./shared/reviews-cache.js";
 import { createWorkflowsCache } from "./shared/workflows-cache.js";
+import { createTeamsCache } from "./shared/teams-cache.js";
+import { markTaskSeen } from "./local/task-seen-prefs.js";
+import { StartTaskDialog } from "./shared/start-task-dialog.js";
 import {
   fetchProjectsPayload,
   createProject,
@@ -398,6 +409,13 @@ const state = {
   projectsLoading: false,
   projectsError: null,
   projectsLoaded: false,
+  // Task screen. `teamActionPending` holds the verb in flight so the buttons can
+  // disable together — five whole-run actions on one run must not overlap, and the
+  // backend's own gate would refuse the second with an error the user never asked
+  // to see.
+  teamsError: null,
+  teamActionPending: null,
+  teamActionError: null,
   // When a session is started via a project overview's "New agent" button, this holds
   // that project's id so the freshly-created thread can be auto-assigned to it. Set at
   // "New agent" time, consumed once by the next start, and cleared by any plain
@@ -509,6 +527,7 @@ const apiFetch = createApiFetch({
 const devicesCache = createDevicesCache();
 const reviewsCache = createReviewsCache();
 const workflowsCache = createWorkflowsCache();
+const teamsCache = createTeamsCache();
 
 const viewedThreadId = () => state.viewThreadId || state.session?.active_thread_id || null;
 const workspaceDiffStore = createWorkspaceDiffStore({
@@ -954,6 +973,34 @@ const renderer = createSessionRenderer({
   fetchWorkflows() {
     return getWorkflows(apiFetch);
   },
+  teamsCache,
+  fetchTeams() {
+    return getTeams(apiFetch);
+  },
+  getViewContext: () => sessionViewStore.getState().location.context,
+  onOpenTask(teamRunId) {
+    // Clear the action error on the way out. It belongs to the task that produced
+    // it; carrying it across would render "this task is blocked" attributed to a
+    // task that is not.
+    state.teamActionError = null;
+    // Opening a FINISHED task is how its badge is discharged — there is no action
+    // left to take on one, so reading it is the only thing that can. A task still
+    // asking for something is unaffected; `teamNeedsYouNow` refuses to let a
+    // glance clear a request.
+    const opened = (teamsCache.current().teams || []).find(
+      (run) => run?.team_run_id === teamRunId
+    );
+    if (opened) {
+      markTaskSeen(opened.team_run_id, opened.updated_at);
+    }
+    void sessionViewController.showOverview({ kind: "tasks", teamRunId });
+  },
+  onBackToTasks() {
+    state.teamActionError = null;
+    void sessionViewController.showOverview({ kind: "tasks", teamRunId: null });
+  },
+  onTeamAction: runTeamAction,
+  onStartTask: openStartTaskDialog,
   // Hoisted module-level declarations below. `viewThread` is shared rather than a
   // method here because several call sites (sidebar rows, tab strip) need the one
   // implementation — they used to each inline a copy of its body.
@@ -2091,6 +2138,136 @@ function startProjectAgent(projectId) {
   state.pendingProjectAssignment = projectId || null;
   document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
 }
+
+/**
+ * Run one of the five whole-run task actions.
+ *
+ * All five share a body and a receipt, so they share this. The run id is sent
+ * explicitly even though the backend accepts it as optional: that shortcut only
+ * holds while one task runs at a time, and a UI that relied on it would break
+ * silently the day that relaxes.
+ */
+async function runTeamAction(action, teamRunId) {
+  if (!teamRunId || state.teamActionPending) {
+    return;
+  }
+  state.teamActionPending = action;
+  state.teamActionError = null;
+  renderer.renderSession(state.session);
+  try {
+    const receipt = await teamAction(apiFetch, action, {
+      teamRunId,
+      deviceId: state.deviceId,
+    });
+    logLine(`Task ${teamRunId}: ${receipt.message}`);
+  } catch (error) {
+    // Surface the relay's own words. It refuses with the reason ("this task is
+    // blocked; resolve it first"), and paraphrasing loses the instruction.
+    state.teamActionError = error?.message || String(error);
+  } finally {
+    state.teamActionPending = null;
+    renderer.renderSession(state.session);
+  }
+}
+
+// ── New task dialog ─────────────────────────────────────────────────────────
+// Its own React sub-root, for the same reason the tab strip has one: the shell is
+// rendered once, so anything data-driven needs one.
+let startTaskRootHandle = null;
+let startTaskFields = {};
+let startTaskPending = false;
+let startTaskError = null;
+
+function renderStartTaskDialog() {
+  if (!startTaskDialogMount) {
+    return;
+  }
+  if (!startTaskRootHandle) {
+    startTaskRootHandle = createRoot(startTaskDialogMount);
+  }
+  flushSync(() => {
+    startTaskRootHandle.render(
+      React.createElement(StartTaskDialog, {
+        fields: startTaskFields,
+        pending: startTaskPending,
+        error: startTaskError,
+        defaultCwd: state.session?.current_cwd || "",
+        onFieldChange(key, value) {
+          startTaskFields = { ...startTaskFields, [key]: value };
+          renderStartTaskDialog();
+        },
+        onRequestClose() {
+          startTaskError = null;
+        },
+        onStart: submitStartTask,
+      })
+    );
+  });
+}
+
+function openStartTaskDialog() {
+  startTaskError = null;
+  renderStartTaskDialog();
+  document.getElementById("start-task-dialog")?.setAttribute("open", "");
+}
+
+async function submitStartTask() {
+  if (startTaskPending) {
+    return;
+  }
+  startTaskPending = true;
+  startTaskError = null;
+  renderStartTaskDialog();
+  try {
+    const receipt = await startTeam(apiFetch, {
+      title: startTaskFields.title || "",
+      context: startTaskFields.context || "",
+      acceptance_criteria: startTaskFields.acceptance_criteria || "",
+      agreed_scope: startTaskFields.agreed_scope || "",
+      quality_rules: startTaskFields.quality_rules || "",
+      // Omitted rather than blank: the relay reads absent as "the current
+      // workspace" and "the workspace's own branch", and an empty string is a
+      // path/ref that resolves to nothing.
+      cwd: startTaskFields.cwd?.trim() || null,
+      target_branch: startTaskFields.target_branch?.trim() || null,
+      device_id: state.deviceId,
+    });
+    logLine(`Task ${receipt.team_run_id}: ${receipt.message}`);
+    // The relay's teams_revision will move, but not before the next render — and
+    // the next render is the one that shows the new task's detail. Without this
+    // the screen looks the task up in a pre-create list and reports it gone.
+    teamsCache.invalidate();
+    // Clear only on success — a rejected form must keep what the user typed.
+    startTaskFields = {};
+    document.getElementById("start-task-dialog")?.close();
+    void sessionViewController.showOverview({
+      kind: "tasks",
+      teamRunId: receipt.team_run_id,
+    });
+  } catch (error) {
+    startTaskError = error?.message || String(error);
+  } finally {
+    startTaskPending = false;
+    renderStartTaskDialog();
+  }
+}
+
+// The sidebar's two destinations. Both go through `showOverview` so both are real
+// history entries — the back button has to be able to leave the Task screen the
+// same way it leaves a project.
+function openTaskScreen() {
+  void sessionViewController.showOverview({ kind: "tasks", teamRunId: null });
+}
+
+function openSessionsScreen() {
+  void sessionViewController.showOverview({ kind: "sessions" });
+}
+
+sidebarNavSessionsButton?.addEventListener("click", openSessionsScreen);
+sidebarNavTasksButton?.addEventListener("click", openTaskScreen);
+// Also on the icon rail, which is the only nav visible while the sidebar is
+// collapsed.
+iconRailTasksButton?.addEventListener("click", openTaskScreen);
 
 // "New agent" in the header — the header only shows it while it is naming a
 // project (header-labels.js), and render-session stamps that project's id onto the

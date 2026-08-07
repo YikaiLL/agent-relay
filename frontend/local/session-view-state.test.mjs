@@ -11,6 +11,7 @@ import {
   sessionViewContextKey,
   sessionViewHistoryEntry,
   sessionViewInvariantErrors,
+  normalizeSessionViewContext,
 } from "./session-view-state.js";
 
 const sessions = () => ({ kind: "sessions" });
@@ -689,5 +690,204 @@ test("a context that moved on while the delete was in flight is left alone", () 
     selectContextAfterProjectDelete({ context: whenCompleted, deletedProjectId: "proj_deleted" }),
     null,
     "the completion-time context must not"
+  );
+});
+
+// ---- Task screen (context.kind === "tasks") --------------------------------
+
+const tasks = (teamRunId = null) => ({ kind: "tasks", teamRunId });
+
+test("a tasks context survives normalization instead of collapsing to sessions", () => {
+  // `normalizeSessionViewContext` is a TOTAL function whose default branch is
+  // `sessions`. Every consumer funnels through it, so a kind it does not know
+  // about does not fail loudly — it silently becomes the sessions home, in about
+  // twenty places at once.
+  assert.deepEqual(normalizeSessionViewContext({ kind: "tasks" }), {
+    kind: "tasks",
+    teamRunId: null,
+  });
+  assert.deepEqual(normalizeSessionViewContext({ kind: "tasks", teamRunId: "team-1" }), {
+    kind: "tasks",
+    teamRunId: "team-1",
+  });
+  // An empty id is the list, not a detail view of a task called "".
+  assert.deepEqual(normalizeSessionViewContext({ kind: "tasks", teamRunId: "" }), {
+    kind: "tasks",
+    teamRunId: null,
+  });
+});
+
+test("the task list and one task's detail are different history entries", () => {
+  // `sameLocation` compares by context KEY, and `defaultHistoryMode` only pushes
+  // when the location changed. Sharing one key between the list and a detail view
+  // would make opening a task invisible to the back button.
+  const listKey = sessionViewContextKey(tasks());
+  const detailKey = sessionViewContextKey(tasks("team-1"));
+  assert.notEqual(listKey, detailKey);
+  assert.notEqual(listKey, SESSIONS_KEY, "tasks must not alias the sessions workspace");
+  assert.notEqual(detailKey, SESSIONS_KEY);
+  assert.equal(sessionViewContextKey(tasks("team-1")), detailKey, "the key must be stable");
+});
+
+test("SHOW_OVERVIEW into tasks shows no thread but keeps each workspace's memory", () => {
+  let state = createSessionViewState();
+  state = transition(state, {
+    type: "OPEN_THREAD",
+    threadId: "thread-a",
+    context: sessions(),
+  });
+  assert.equal(state.location.threadId, "thread-a");
+
+  state = transition(state, { type: "SHOW_OVERVIEW", context: tasks() });
+  assert.deepEqual(state.location.context, { kind: "tasks", teamRunId: null });
+  assert.equal(state.location.threadId, null, "a full-area screen shows no conversation");
+
+  // Going back to sessions must restore the thread that was there.
+  state = transition(state, { type: "SWITCH_CONTEXT", context: sessions() });
+  assert.equal(state.location.threadId, "thread-a");
+});
+
+test("a persisted tasks context round-trips through history", () => {
+  let state = createSessionViewState();
+  state = transition(state, { type: "SHOW_OVERVIEW", context: tasks("team-7") });
+  const entry = sessionViewHistoryEntry(state);
+
+  let restored = createSessionViewState();
+  restored = transition(
+    restored,
+    { type: "RESTORE_HISTORY", entry },
+    { projectIds: ["project-1"], projectIdsComplete: true }
+  );
+  assert.deepEqual(restored.location.context, { kind: "tasks", teamRunId: "team-7" });
+});
+
+test("a tasks context is not validated against the project list", () => {
+  // A project id that no longer exists must fall back to sessions, because the
+  // sidebar scopes itself to it. A task id that no longer exists is different:
+  // the screen can say so, and the run's branch is still on disk. Dropping the
+  // user back at the sessions home would hide the fact that the task is gone.
+  let state = createSessionViewState();
+  state = transition(
+    state,
+    {
+      type: "RESTORE_HISTORY",
+      entry: { version: 1, context: { kind: "tasks", teamRunId: "team-vanished" } },
+    },
+    { projectIds: [], projectIdsComplete: true }
+  );
+  assert.deepEqual(state.location.context, { kind: "tasks", teamRunId: "team-vanished" });
+});
+
+test("opening a thread from the Task screen files it under the thread's own context", () => {
+  // The trap: OPEN_THREAD with no explicit context inherits the current one. A
+  // team node clicked on the Task screen would then get a tab in the TASKS
+  // workspace — a bucket that screen never shows, so the tab is invisible and the
+  // session appears not to have opened at all.
+  let state = createSessionViewState();
+  state = transition(state, { type: "SHOW_OVERVIEW", context: tasks("team-1") });
+  state = transition(state, {
+    type: "OPEN_THREAD",
+    threadId: "dev-thread",
+    context: selectOwningContext({ threadId: "dev-thread", threadProjectId: {} }),
+  });
+
+  assert.deepEqual(state.location.context, { kind: "sessions" });
+  assert.deepEqual(
+    layoutThreadIds(state.workspaces[SESSIONS_KEY].tabs[0].layout),
+    ["dev-thread"]
+  );
+  // A bucket is created lazily by `workspaceFor` and never written to disk while
+  // it stays empty, so its existence is harmless. What must never happen is a TAB
+  // landing in it: that tab is unreachable, because the Task screen renders no tab
+  // strip, so the session would read as having failed to open.
+  assert.deepEqual(
+    state.workspaces[sessionViewContextKey(tasks("team-1"))]?.tabs ?? [],
+    [],
+    "the Task screen must never accumulate tabs"
+  );
+});
+
+test("OPEN_THREAD can never file a tab into the Task screen's workspace", () => {
+  // The Task screen renders no tab strip, so a tab filed there is unreachable —
+  // and because `mainView` is derived from the context, the screen keeps
+  // rendering and the thread never appears. Clicking a seat does nothing.
+  //
+  // The call site is supposed to pass the thread's OWNING context, but this is
+  // the layer that can guarantee it: a tasks context cannot hold tabs, so
+  // OPEN_THREAD into one resolves to the sessions home rather than a workspace
+  // no UI can show. Defence in depth for every future call site, not just the
+  // three that exist today.
+  let state = createSessionViewState();
+  state = transition(state, { type: "SHOW_OVERVIEW", context: tasks("team-1") });
+  state = transition(state, { type: "OPEN_THREAD", threadId: "dev-thread" });
+
+  assert.notEqual(
+    state.location.context.kind,
+    "tasks",
+    "a thread must never be opened into the Task screen"
+  );
+  assert.equal(state.location.threadId, "dev-thread");
+  assert.deepEqual(
+    layoutThreadIds(state.workspaces[SESSIONS_KEY].tabs[0].layout),
+    ["dev-thread"]
+  );
+  assert.deepEqual(state.workspaces[sessionViewContextKey(tasks("team-1"))]?.tabs ?? [], []);
+});
+
+test("an explicit context still wins when opening a thread from the Task screen", () => {
+  // The guard above is a floor, not a replacement for the call site knowing where
+  // the thread belongs: a session inside a project must still land in that
+  // project's tab set.
+  let state = createSessionViewState();
+  state = transition(state, { type: "SHOW_OVERVIEW", context: tasks("team-1") });
+  state = transition(state, {
+    type: "OPEN_THREAD",
+    threadId: "dev-thread",
+    context: project("project-1"),
+  });
+
+  assert.deepEqual(state.location.context, { kind: "project", projectId: "project-1" });
+  assert.deepEqual(
+    layoutThreadIds(state.workspaces["project-1"].tabs[0].layout),
+    ["dev-thread"]
+  );
+});
+
+test("RESTORE_HISTORY cannot file a tab into the Task screen's workspace either", () => {
+  // The same hole, in the other branch that creates tabs. `OPEN_THREAD` was
+  // guarded; `RESTORE_HISTORY` opens a tab too, from a persisted context plus a
+  // thread id off the URL. Latent today — the history adapter drops `?thread=`
+  // when no thread is routed, so the pair is unwritable — but the guard's whole
+  // claim is that it holds for call sites that do not exist yet.
+  let state = createSessionViewState();
+  state = transition(
+    state,
+    {
+      type: "RESTORE_HISTORY",
+      entry: { version: 1, context: { kind: "tasks", teamRunId: "team-1" } },
+      urlThreadId: "dev-thread",
+    },
+    { projectIds: [], projectIdsComplete: true }
+  );
+
+  assert.notEqual(state.location.context.kind, "tasks");
+  assert.deepEqual(
+    layoutThreadIds(state.workspaces[SESSIONS_KEY].tabs[0].layout),
+    ["dev-thread"]
+  );
+  assert.deepEqual(state.workspaces[sessionViewContextKey(tasks("team-1"))]?.tabs ?? [], []);
+});
+
+test("the invariant checker refuses a thread routed into a tab-less context", () => {
+  // Belt to the reducer's braces: whatever produced it, a state that routes a
+  // thread under a tasks context is invalid, and saying so here means a future
+  // mutation path cannot introduce it quietly.
+  const errors = sessionViewInvariantErrors({
+    location: { context: { kind: "tasks", teamRunId: "team-1" }, threadId: "dev-thread" },
+    workspaces: {},
+  });
+  assert.ok(
+    errors.some((message) => message.includes("cannot hold a thread tab")),
+    `expected the tasks-context complaint, got ${JSON.stringify(errors)}`
   );
 });

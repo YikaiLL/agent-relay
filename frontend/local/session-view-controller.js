@@ -12,6 +12,7 @@ import {
 } from "../shared/tab-layout.js";
 import {
   createSessionViewState,
+  isTasksWorkspaceKey,
   normalizeSessionViewContext,
   reduceSessionView,
   sessionViewContextKey,
@@ -103,8 +104,15 @@ function validHistoryWorkspaces(workspaces, action, facts) {
     sessionViewContextKey({ kind: "sessions" }),
     ...(facts?.projectIds || []),
   ]);
+  // The Task screen's keys are not enumerable from any fact the controller has —
+  // there is no `taskIds` the way there is a `projectIds`. They are recognised by
+  // shape instead. Without this every stored tasks workspace would be DELETED from
+  // IndexedDB on the next restore, silently: this filter's output is diffed against
+  // what is on disk, and anything missing is a delete.
   return Object.fromEntries(
-    Object.entries(workspaces).filter(([key]) => validKeys.has(key))
+    Object.entries(workspaces).filter(
+      ([key]) => validKeys.has(key) || isTasksWorkspaceKey(key)
+    )
   );
 }
 

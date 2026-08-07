@@ -29,6 +29,9 @@ import {
   threadsCount,
   threadsList,
   projectOverviewMount,
+  taskTeamMount,
+  sidebarTaskListMount,
+  sidebarTasksBadge,
   transcript,
   workspaceSubtitle,
   headerNewAgentButton,
@@ -107,6 +110,14 @@ import {
   reusableReviewersFromReviews,
 } from "../shared/reviews-cache.js";
 import { createWorkflowsCache } from "../shared/workflows-cache.js";
+import { createTeamsCache } from "../shared/teams-cache.js";
+import {
+  sortTeamRuns,
+  teamsNeedingYou,
+  teamsRevisionOf,
+} from "../shared/task-team-model.js";
+import { loadSeenTasks } from "./task-seen-prefs.js";
+import { TaskSidebarList, TaskTeamScreen } from "../shared/task-team-react.js";
 import {
   buildReviewingThreadSet,
   canRequestReview,
@@ -256,6 +267,17 @@ export function createSessionRenderer({
   enterProjectOverview,
   startProjectAgent,
   openProjectContextMenu,
+  // ---- Task screen ----
+  // `getViewContext` rather than a derived boolean: the context is the canonical
+  // answer to "what is on screen", and the Task screen needs both halves of it
+  // (which screen, and which task).
+  teamsCache = createTeamsCache(),
+  fetchTeams,
+  getViewContext = () => ({ kind: "sessions" }),
+  onOpenTask,
+  onBackToTasks,
+  onTeamAction,
+  onStartTask,
 }) {
   // Look a thread up across everything the user can currently see — the authoritative
   // list plus any search result from beyond it. Lookups only; see `findVisibleThread`.
@@ -409,11 +431,19 @@ export function createSessionRenderer({
     // `projectsViewMode` half of that condition went with the Sessions/Projects toggle.
     const showProjectOverview = false;
     void activeProjectId;
-    const mainView = viewingConversation
-      ? "conversation"
-      : showProjectOverview
-        ? "project-overview"
-        : "console";
+    // The Task screen is decided by the CONTEXT, not by what is or is not open.
+    // Its context routes no thread (SHOW_OVERVIEW sets threadId null), so
+    // `viewingConversation` is already false whenever it is showing — but reading
+    // the context first keeps the two from ever disagreeing about what is on
+    // screen, which is the whole reason `location` is canonical.
+    const onTaskScreen = getViewContext()?.kind === "tasks";
+    const mainView = onTaskScreen
+      ? "tasks"
+      : viewingConversation
+        ? "conversation"
+        : showProjectOverview
+          ? "project-overview"
+          : "console";
     if (chatShell) {
       chatShell.dataset.view = mainView;
     }
@@ -462,6 +492,32 @@ export function createSessionRenderer({
     renderAuditTimeline(session.logs || []);
     if (showProjectOverview) {
       renderProjectOverview();
+    }
+    // Sync the Teams channel on EVERY render, not only while the Task screen is
+    // open. It is revision-gated, so an unchanged run set costs nothing — and the
+    // sidebar badge has to be able to say "a task is waiting on you" from wherever
+    // the user happens to be, which is the whole point of walking away from one.
+    if (typeof fetchTeams === "function") {
+      void teamsCache.sync(
+        teamsRevisionOf(session),
+        () => fetchTeams(),
+        () => renderSession(state.session || session),
+        (error) => {
+          // Reported, not swallowed: a relay answering 500 forever otherwise looks
+          // exactly like a slow one. Re-render only on a CHANGE, or a failing
+          // endpoint would drive a render per frame.
+          const next = error ? error.message || String(error) : null;
+          if (state.teamsError !== next) {
+            state.teamsError = next;
+            renderSession(state.session || session);
+          }
+        }
+      );
+    }
+    renderTasksBadge();
+    renderSidebarTaskList();
+    if (onTaskScreen) {
+      renderTaskTeam(session);
     }
     if (!viewingConversation || viewingSessionDetails) {
       renderSessionMeta(session);
@@ -1670,6 +1726,96 @@ export function createSessionRenderer({
         state.threadHistoryScrollTop = threadsList.scrollTop;
       }
     });
+  }
+
+  // The sidebar's Tasks badge: how many tasks are waiting on a person.
+  //
+  // Counts attention, not runs. A number that meant "tasks that exist" would
+  // never go away — a terminal run stays in the list forever — so the badge
+  // would stop meaning anything the first time one finished.
+  function renderTasksBadge() {
+    if (!sidebarTasksBadge) {
+      return;
+    }
+    // `loadSeenTasks()` is a localStorage read per render. It is a single small
+    // JSON parse and the alternative — caching it — needs an invalidation path
+    // for a value the user changes by clicking, which is the more expensive kind
+    // of wrong.
+    const waiting = teamsNeedingYou(teamsCache.current().teams, loadSeenTasks());
+    sidebarTasksBadge.hidden = waiting === 0;
+    sidebarTasksBadge.textContent = waiting ? String(waiting) : "";
+  }
+
+  // The task list in the sidebar — the Tasks tab's body, opposite the session
+  // list. Rendered on every pass, not only while the Tasks view is showing: the
+  // sidebar is CSS-gated, so keeping it current costs nothing and means switching
+  // tabs never shows a stale or empty column for a frame.
+  function renderSidebarTaskList() {
+    if (!sidebarTaskListMount) {
+      return;
+    }
+    const context = getViewContext() || {};
+    const loaded = teamsCache.hasData();
+    renderReactContent(
+      sidebarTaskListMount,
+      h(TaskSidebarList, {
+        runs: loaded ? sortTeamRuns(teamsCache.current().teams) : null,
+        loading: !loaded,
+        // Without this the sidebar reads "Loading…" forever on a persistent
+        // failure while the main area correctly says the relay is unreachable —
+        // two surfaces disagreeing about the same fetch.
+        error: state.teamsError || null,
+        selectedRunId: context.kind === "tasks" ? context.teamRunId || null : null,
+        onOpenTask: (teamRunId) => onOpenTask?.(teamRunId),
+        onStartTask: () => onStartTask?.(),
+      })
+    );
+  }
+
+  // Fill the Task screen. Callers gate this on mainView === "tasks".
+  //
+  // Reads the teams sidecar, which is keyed on the snapshot's `teams_revision` —
+  // a content hash, so an unchanged run set costs no request and a sub-task
+  // advancing costs exactly one.
+  function renderTaskTeam(session) {
+    if (!taskTeamMount) {
+      return;
+    }
+    const context = getViewContext() || {};
+    const loaded = teamsCache.hasData();
+    renderReactContent(
+      taskTeamMount,
+      h(TaskTeamScreen, {
+        // `null` until the first successful load is what lets the screen tell
+        // "still loading" apart from "there are no tasks".
+        runs: loaded ? sortTeamRuns(teamsCache.current().teams) : null,
+        selectedRunId: context.teamRunId || null,
+        loading: !loaded,
+        syncing: teamsCache.isSyncing(),
+        error: state.teamsError || null,
+        actionPending: state.teamActionPending || null,
+        actionError: state.teamActionError || null,
+        onOpenTask: (teamRunId) => onOpenTask?.(teamRunId),
+        onBack: () => onBackToTasks?.(),
+        onOpenThread: (threadId) => {
+          if (!threadId || typeof viewThread !== "function") {
+            return;
+          }
+          // Pass the thread's OWNING context. The reducer's floor stops a tasks
+          // context from swallowing the tab, but "not invisible" is not the same
+          // as "right": a seat thread that belongs to a project must land in that
+          // project's tab set, not in the sessions bucket.
+          viewThread(threadId, {
+            context: selectOwningContext({
+              threadId,
+              threadProjectId: state.threadProjectId || {},
+            }),
+          });
+        },
+        onAction: (action) => onTeamAction?.(action, context.teamRunId || null),
+        onStartTask: () => onStartTask?.(),
+      })
+    );
   }
 
   // Fill the main-area card overview for the active project. Callers gate this on
