@@ -892,3 +892,36 @@ test("whenIdle keeps waiting for work queued while it is already waiting", async
   );
   await Promise.all([first, second]);
 });
+
+test("restoring history keeps a Task screen workspace that no project list can vouch for", async () => {
+  // `validHistoryWorkspaces` is an ALLOWLIST, and its output is diffed against
+  // what is on disk — every key it omits becomes a delete. A project id can be
+  // vouched for by `getProjectIds`; a task key cannot, because the controller has
+  // no equivalent fact. Recognising it by shape is what stops every restore from
+  // silently dropping the Task screen's stored state.
+  const persistence = fakePersistence({
+    "__tasks__:team-1": openThreadTab(createTabWorkspace(), "kept-thread"),
+    "deleted-project": openThreadTab(createTabWorkspace(), "stale-thread"),
+  });
+  const store = createSessionViewStore({
+    initialLocation: { context: sessions(), threadId: null },
+    persistence,
+  });
+  const controller = createSessionViewController({
+    store,
+    getProjectIds: () => [],
+  });
+
+  await controller.restoreHistory({ version: 1, context: sessions() }, null);
+
+  assert.deepEqual(
+    persistence.deletes,
+    ["deleted-project"],
+    "a project the list disowns is still collected"
+  );
+  assert.ok(
+    persistence.values.has("__tasks__:team-1"),
+    "a task workspace must survive a restore it cannot be vouched for"
+  );
+  assert.ok(store.getState().workspaces["__tasks__:team-1"]);
+});

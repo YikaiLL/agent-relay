@@ -101,8 +101,8 @@ fn require_live_test_cwd(
 #[cfg(test)]
 mod workspace_diff_tests {
     use super::super::{
-        apply_unified_diff, collect_workspace_diff, synthesize_untracked_diff,
-        truncate_to_char_boundary,
+        apply_unified_diff, collect_workspace_diff, collect_workspace_diff_against,
+        merge_base_with, synthesize_untracked_diff, truncate_to_char_boundary, LiveWorkspace,
     };
     use crate::protocol::FileChangeApplyDirection;
     use tempfile::TempDir;
@@ -142,6 +142,121 @@ mod workspace_diff_tests {
             .current_dir(&path))
         .await;
         dir
+    }
+
+    #[tokio::test]
+    async fn the_mr_diff_uses_the_merge_base_so_target_only_commits_are_excluded() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+
+        // Fork a task branch and land a commit on it.
+        let task_dir = root.join("task-wt");
+        run(Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--no-track",
+                "-b",
+                "task/x",
+                task_dir.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&root))
+        .await;
+        std::fs::write(task_dir.join("task.txt"), "task work\n").unwrap();
+        run(Command::new("git")
+            .args(["add", "task.txt"])
+            .current_dir(&task_dir))
+        .await;
+        run(Command::new("git")
+            .args(["commit", "-q", "-m", "task work"])
+            .current_dir(&task_dir))
+        .await;
+
+        // Meanwhile the target moves on. THIS is the commit a two-dot
+        // `git diff main` would report reversed, as if the task had deleted it.
+        std::fs::write(root.join("main-only.txt"), "landed on main\n").unwrap();
+        run(Command::new("git")
+            .args(["add", "main-only.txt"])
+            .current_dir(&root))
+        .await;
+        run(Command::new("git")
+            .args(["commit", "-q", "-m", "main moves on"])
+            .current_dir(&root))
+        .await;
+
+        // And the team still has work in flight.
+        std::fs::write(task_dir.join("wip.txt"), "not committed yet\n").unwrap();
+
+        let workspace = LiveWorkspace::from_path(task_dir.to_str().unwrap()).expect("workspace");
+        let base = merge_base_with(&workspace, "main")
+            .await
+            .expect("merge base should resolve");
+        let diff = collect_workspace_diff_against(&workspace, Some(&base))
+            .await
+            .expect("diff");
+
+        let paths: Vec<&str> = diff
+            .file_changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"task.txt"),
+            "committed task work belongs in the MR view, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"wip.txt"),
+            "a mid-run MR view must be honest about uncommitted work, got {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"main-only.txt"),
+            "a commit that landed on the target AFTER the fork is not this task's change, got {paths:?}"
+        );
+        assert_eq!(diff.base_commit.as_deref(), Some(base.as_str()));
+    }
+
+    #[tokio::test]
+    async fn omitting_a_base_keeps_the_existing_head_behaviour() {
+        // Regression guard for the refactor: the default path must still be
+        // "working tree vs HEAD", byte for byte.
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("seed.txt"), "line1\nline2\nline3\n").unwrap();
+
+        let workspace = LiveWorkspace::from_path(root.to_str().unwrap()).expect("workspace");
+        let against_head = collect_workspace_diff_against(&workspace, None)
+            .await
+            .expect("diff");
+        let legacy = collect_workspace_diff(root.to_str().unwrap())
+            .await
+            .expect("diff");
+
+        assert_eq!(against_head.diff, legacy.diff);
+        assert_eq!(
+            against_head.file_changes.len(),
+            legacy.file_changes.len(),
+            "the default path must be unchanged"
+        );
+        assert!(
+            against_head.base_commit.is_none(),
+            "no base means the plain working-tree-vs-HEAD view, with nothing to label"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_merge_base_is_none_rather_than_an_error() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let workspace = LiveWorkspace::from_path(root.to_str().unwrap()).expect("workspace");
+
+        assert!(
+            merge_base_with(&workspace, "no-such-branch")
+                .await
+                .is_none(),
+            "a missing target degrades to None so the caller can fall back to HEAD"
+        );
     }
 
     #[test]
@@ -8844,6 +8959,34 @@ mod review_tests {
         // guard that must refuse to reuse a thread's PRIOR review as this turn's
         // result. Recap/other turns still reply normally.
         suppress_reviewer_reply: Arc<AtomicBool>,
+        // Replies to emit, one popped per turn (FIFO), overriding every other
+        // reply rule. Lets a test script a whole multi-role pipeline in order.
+        scripted_replies: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // Errors `start_turn` should return, one popped per turn (FIFO). Models a
+        // provider refusing a turn — a full context window is the case that
+        // matters, since it is the only honest re-seed trigger.
+        fail_next_turn_with: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // When true, a turn that fails via `fail_next_turn_with` first publishes
+        // liveness. That is the DANGEROUS shape of a failed start: the provider
+        // began work and only the response was lost, so the turn may still be
+        // running and a drain cannot confirm otherwise. Without this the thread is
+        // idle when the error arrives, the drain confirms trivially, and the path
+        // worth testing is never reached.
+        fail_next_turn_live: Arc<AtomicBool>,
+        // Milliseconds AFTER the error before liveness appears. The real
+        // response-lost shape: `start_turn` returns an error and the turn it
+        // started announces itself a beat later. A stop issued before that beat
+        // looks at an idle thread and answers "stopped" for a turn that is running.
+        fail_next_turn_live_delay_ms: Arc<AtomicU64>,
+        // When set, every turn EXCEPT a team-lead handover fails with this error.
+        // Models a lead that can always be briefed but always dies on real work,
+        // which is what drives the succession chain to its cap.
+        fail_work_turns_with: Arc<Mutex<Option<String>>>,
+        // AskUserQuestion request ids that were actually ANSWERED through the
+        // bridge. A parked turn watches this rather than the pending map, because
+        // cleanup also empties that map — and a turn that was drained must not
+        // then behave as though someone had answered it.
+        answered_asks: Arc<Mutex<std::collections::HashSet<String>>>,
         // Verdicts the reviewer should emit, one popped per reviewer turn (FIFO).
         // Empty → default NEEDS_CHANGES. Drives the iterative loop in tests.
         reviewer_verdicts: Arc<Mutex<std::collections::VecDeque<String>>>,
@@ -8922,6 +9065,12 @@ mod review_tests {
                 fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
+                scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                fail_next_turn_with: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                fail_next_turn_live: Arc::new(AtomicBool::new(false)),
+                fail_next_turn_live_delay_ms: Arc::new(AtomicU64::new(0)),
+                fail_work_turns_with: Arc::new(Mutex::new(None)),
+                answered_asks: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 raise_approval_on_fix_turn: Arc::new(AtomicBool::new(false)),
                 suppress_fix_reply: Arc::new(AtomicBool::new(false)),
@@ -9145,6 +9294,33 @@ mod review_tests {
                 }
             }
             self.require_live_cwd(thread_id, "start a turn for").await?;
+            if let Some(error) = self.fail_next_turn_with.lock().await.pop_front() {
+                if self.fail_next_turn_live.load(Ordering::Relaxed) {
+                    let delay = self.fail_next_turn_live_delay_ms.load(Ordering::Relaxed);
+                    let state = self.state.clone();
+                    let thread_id = thread_id.to_string();
+                    let turn = self.next_token("turn");
+                    tokio::spawn(async move {
+                        sleep(Duration::from_millis(delay)).await;
+                        let mut relay = state.write().await;
+                        let now = unix_now();
+                        relay.bg_set_active_turn(&thread_id, Some(turn), now);
+                        relay.bg_set_thread_status(
+                            &thread_id,
+                            "active".to_string(),
+                            Vec::new(),
+                            now,
+                        );
+                        relay.notify();
+                    });
+                }
+                return Err(error);
+            }
+            if !text.contains("taking over as team lead") {
+                if let Some(error) = self.fail_work_turns_with.lock().await.clone() {
+                    return Err(error);
+                }
+            }
             self.turns
                 .lock()
                 .await
@@ -9266,7 +9442,10 @@ mod review_tests {
                 && !(is_reviewer_diff_turn && self.suppress_reviewer_reply.load(Ordering::Relaxed))
                 && !(is_fix_turn && self.suppress_fix_reply.load(Ordering::Relaxed));
             // A reviewer turn ends with the verdict the test queued (default needs-changes).
-            let reply_text = if is_reviewer_diff_turn {
+            let scripted = self.scripted_replies.lock().await.pop_front();
+            let reply_text = if let Some(scripted) = scripted {
+                scripted
+            } else if is_reviewer_diff_turn {
                 let verdict = self
                     .reviewer_verdicts
                     .lock()
@@ -9292,6 +9471,7 @@ mod review_tests {
             let raise_ask_user = self.raise_ask_user.load(Ordering::Relaxed)
                 || (is_reviewer_turn && self.ask_user_on_reviewer_turn.load(Ordering::Relaxed));
             let complete_delay_ms = self.complete_delay_ms.load(Ordering::Relaxed);
+            let answered_asks = self.answered_asks.clone();
             let approval_id = self.next_token("approval");
             let ask_id = self.next_token("ask");
             let unrelated_approval_id = self.next_token("unrelated-approval");
@@ -9321,7 +9501,25 @@ mod review_tests {
                         },
                     );
                     relay.notify();
-                    return;
+                    drop(relay);
+                    // A parked turn is NOT stopped: a real provider is blocked
+                    // inside `canUseTool` and the SAME turn carries on the moment
+                    // the answer lands. Nothing "resumes" it, so this waits for a
+                    // real answer and then falls through to the ordinary
+                    // completion. Watching `answered_asks` rather than the pending
+                    // map matters — cleanup empties that map too, and a drained
+                    // turn must not behave as though it had been answered.
+                    let mut answered = false;
+                    for _ in 0..2_000 {
+                        if answered_asks.lock().await.contains(&ask_id) {
+                            answered = true;
+                            break;
+                        }
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                    if !answered {
+                        return;
+                    }
                 }
                 if inject_unrelated {
                     // An unrelated background thread parks on its own approval. The
@@ -9479,9 +9677,13 @@ mod review_tests {
 
         async fn respond_to_ask_user_question(
             &self,
-            _request_id: &str,
+            request_id: &str,
             _answers: &serde_json::Map<String, serde_json::Value>,
         ) -> Result<(), String> {
+            self.answered_asks
+                .lock()
+                .await
+                .insert(request_id.to_string());
             Ok(())
         }
 
@@ -16176,6 +16378,3244 @@ turn) must allow a review: {error:?}"
             app.relay.read().await.pending_ask_user_questions.is_empty(),
             "pending questions must be cleared"
         );
+    }
+
+    // ---- Task team driver -------------------------------------------------
+
+    /// A real git repo with one commit; team runs provision a worktree from it.
+    async fn init_team_repo() -> (TempDir, String) {
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().canonicalize().expect("canonicalize");
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let out = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&path)
+                .output()
+                .await
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        std::fs::write(path.join("seed.txt"), "line1\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "seed"]] {
+            let out = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&path)
+                .output()
+                .await
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let display = path.to_string_lossy().into_owned();
+        (dir, display)
+    }
+
+    async fn script_replies(provider: &ReviewTestProvider, replies: &[&str]) {
+        let mut queue = provider.scripted_replies.lock().await;
+        for reply in replies {
+            queue.push_back((*reply).to_string());
+        }
+    }
+
+    fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
+        crate::state::app::team::TeamStartRequest {
+            spec: crate::state::TaskSpec {
+                title: "Add a parser".to_string(),
+                context: "The loader needs one.".to_string(),
+                acceptance_criteria: "Parses all three encodings.".to_string(),
+                agreed_scope: "Parser only; no loader refactor.".to_string(),
+                quality_rules: "No unwrap in library code.".to_string(),
+            },
+            origin_cwd: cwd.to_string(),
+            target_branch: None,
+            device_id: "device-1".to_string(),
+            tl_provider: "codex".to_string(),
+            dev_provider: "codex".to_string(),
+            reviewer_provider: "codex".to_string(),
+        }
+    }
+
+    async fn wait_for_team_run(app: &AppState, run_id: &str) -> crate::state::TeamRun {
+        for _ in 0..800 {
+            if let Some(run) = app.relay.read().await.team_run(run_id).cloned() {
+                if run.status.is_terminal() || run.status == crate::state::TeamRunStatus::Paused {
+                    return run;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("team run {run_id} never settled");
+    }
+
+    #[tokio::test]
+    async fn a_task_team_splits_implements_reviews_and_passes_the_mr_gate() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect("the team should start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "run error: {:?}",
+            run.error
+        );
+        assert_eq!(run.phase, crate::state::TeamPhase::Finished);
+        assert_eq!(
+            run.complex,
+            Some(false),
+            "a simple task skips the design phase"
+        );
+        assert_eq!(run.sub_tasks.len(), 1);
+        let task = &run.sub_tasks[0];
+        assert_eq!(task.title, "Add the parser");
+        assert_eq!(task.status, crate::state::SubTaskStatus::Done);
+        assert_eq!(task.rounds_used, 1, "one round is enough when approved");
+        assert!(task.digested, "the TL must be told how it went");
+
+        // The worktree is real, on its own branch, and the work is committed.
+        assert!(std::path::Path::new(&run.cwd).is_dir());
+        assert!(run.cwd.contains(".sealwire/worktrees/"));
+        assert_eq!(run.branch, "task/add-a-parser");
+        assert_eq!(run.target_ref, "refs/heads/main");
+        assert!(run.head_commit.is_some(), "wrap-up must leave a commit");
+
+        // Dev and reviewer are DIFFERENT threads, and neither is the TL: each seat
+        // gets its own session so nobody inherits another's context.
+        let dev = task.dev_thread_id.clone().expect("dev thread");
+        let reviewer = task.reviewer_thread_id.clone().expect("reviewer thread");
+        assert_ne!(dev, reviewer);
+        assert_ne!(dev, run.tl_thread_id);
+        assert_ne!(reviewer, run.tl_thread_id);
+
+        // Every thread the run touched is drainable from the record.
+        let owned = run.owned_thread_ids();
+        for id in [&run.tl_thread_id, &dev, &reviewer] {
+            assert!(owned.contains(id), "{id} missing from {owned:?}");
+        }
+
+        // The TL only ever learned the verdict + summary, never a transcript.
+        let turns = provider.turns.lock().await.clone();
+        let tl_turns: Vec<&String> = turns
+            .iter()
+            .filter(|(thread, _)| thread == &run.tl_thread_id)
+            .map(|(_, text)| text)
+            .collect();
+        let digest = tl_turns
+            .iter()
+            .find(|text| text.contains("was approved by the reviewer"))
+            .expect("the TL should have been told the outcome");
+        assert!(
+            !digest.contains("Implemented the parser."),
+            "the dev's transcript must never reach the TL: {digest}"
+        );
+
+        // The dev's prompt stands alone: it names the sub-task and the plan file.
+        let dev_turn = turns
+            .iter()
+            .find(|(thread, _)| thread == &dev)
+            .map(|(_, text)| text.clone())
+            .expect("dev turn");
+        assert!(dev_turn.contains("Add the parser"));
+        assert!(dev_turn.contains(".sealwire/PLAN.md"));
+        assert!(dev_turn.contains("No unwrap in library code."));
+    }
+
+    #[tokio::test]
+    async fn a_sub_task_escalates_after_two_review_rounds_without_approval() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_replies(
+            provider,
+            &[
+                "COMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "First attempt.",
+                "Not yet.\nVERDICT: NEEDS_CHANGES\n- missing the empty case",
+                "Second attempt.",
+                "Still not.\nVERDICT: NEEDS_CHANGES\n- still missing the empty case",
+                "Noted.",
+                "Out of scope drift.\nVERDICT: NEEDS_CHANGES\n- parser is incomplete",
+                "Addressed.",
+                "Fine now.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect("the team should start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        let task = &run.sub_tasks[0];
+        assert_eq!(
+            task.status,
+            crate::state::SubTaskStatus::Escalated,
+            "two rounds is the ceiling, not a suggestion"
+        );
+        assert_eq!(task.rounds_used, 2);
+        assert!(
+            task.result_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still missing the empty case"),
+            "the TL must learn WHY it escalated: {:?}",
+            task.result_summary
+        );
+        assert!(task.digested);
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Escalated,
+            "a run with an unapproved sub-task cannot report Done"
+        );
+        assert!(
+            run.unresolved
+                .iter()
+                .any(|entry| entry.contains("Add the parser") && entry.contains("not approved")),
+            "an escalated sub-task must reach the run's leftovers — `unresolved` is \
+what the report enumerates, so without it a run that escalated hands the user a \
+report headed \"Nothing was left unresolved\": {:?}",
+            run.unresolved
+        );
+
+        // Round 2 reused the SAME dev (it should see its own prior work) but a
+        // FRESH reviewer (so round 2 judges the work, not its own opinion).
+        assert_eq!(task.owned_thread_ids.len(), 3, "1 dev + 2 reviewers");
+    }
+
+    #[tokio::test]
+    async fn a_claude_style_pending_promotion_keeps_every_team_seat_addressable() {
+        // The failure this pins: Claude mints a synthetic `claude-pending-*` id and
+        // only swaps in the real session id once the first turn starts. Every team
+        // seat is background-started, so any of them can be promoted mid-turn. A
+        // driver still holding the pending id finds no runtime, reads that as "not
+        // working", and treats a running turn as finished — losing that agent's
+        // output entirely. No fake provider models this, so it has to be asserted
+        // on the record directly.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        let run_id = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect("the team should start");
+
+        // Put a pending id in every seat the driver can address.
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.tl_thread_id = "claude-pending-1".to_string();
+                run.run_owned_thread_ids = vec!["claude-pending-1".to_string()];
+                run.sub_tasks = vec![crate::state::SubTask {
+                    id: "s1".to_string(),
+                    dev_thread_id: Some("claude-pending-1".to_string()),
+                    reviewer_thread_id: Some("claude-pending-1".to_string()),
+                    owned_thread_ids: vec!["claude-pending-1".to_string()],
+                    ..crate::state::SubTask::default()
+                }];
+            });
+            relay.promote_background_thread("claude-pending-1", "sess-real");
+        }
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.tl_thread_id, "sess-real",
+            "the TL seat must follow the promotion"
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::Tl)
+                .as_deref(),
+            Some("sess-real")
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::SubTaskDev(0))
+                .as_deref(),
+            Some("sess-real"),
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::SubTaskReviewer(0))
+                .as_deref(),
+            Some("sess-real"),
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::RunOwned(0))
+                .as_deref(),
+            Some("sess-real"),
+            "design/MR reviewers live here and were previously unreachable",
+        );
+        assert!(
+            !run.owned_thread_ids()
+                .iter()
+                .any(|id| id.starts_with("claude-pending-")),
+            "no seat may still name a dead pending id: {:?}",
+            run.owned_thread_ids()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reviewer_sees_files_the_dev_created_not_just_tracked_edits() {
+        // `WorkspaceDiffResponse::diff` carries only TRACKED changes; untracked
+        // files are synthesized separately into `file_changes`. Agents create
+        // files constantly, so reading the tracked-only field hands the reviewer a
+        // diff with the new code missing and asks it to approve.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+
+        let created = Arc::new(Mutex::new(false));
+        script_replies(
+            provider,
+            &[
+                "COMPLEXITY: simple",
+                "SUBTASK: Add a new file\nCreate it.\nEND SUBTASK",
+                "Created brand_new.rs.",
+                "Fine.\nVERDICT: APPROVED",
+                "Noted.",
+                "In scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Model the dev creating an untracked file, once, as soon as the worktree
+        // exists.
+        {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            let created = created.clone();
+            tokio::spawn(async move {
+                for _ in 0..400 {
+                    let cwd = app
+                        .relay
+                        .read()
+                        .await
+                        .team_run(&run_id)
+                        .map(|run| run.cwd.clone());
+                    if let Some(cwd) = cwd {
+                        if std::path::Path::new(&cwd).is_dir() && !*created.lock().await {
+                            std::fs::write(
+                                std::path::Path::new(&cwd).join("brand_new.rs"),
+                                "fn added() {}\n",
+                            )
+                            .unwrap();
+                            *created.lock().await = true;
+                            return;
+                        }
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert!(*created.lock().await, "the test never created its file");
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "{:?}",
+            run.error
+        );
+
+        let turns = provider.turns.lock().await.clone();
+        let review_prompt = turns
+            .iter()
+            .map(|(_, text)| text)
+            .find(|text| text.contains("Review this sub-task's changes"))
+            .expect("a sub-task review turn");
+        assert!(
+            review_prompt.contains("brand_new.rs"),
+            "a file the dev created must reach the reviewer: {review_prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_failures_propagate_instead_of_being_swallowed() {
+        // The shape being pinned: "nothing to commit" is success, but a git
+        // failure must NOT be mistaken for it. Swallowing one means the MR gate
+        // reviews an uncommitted tree, head_commit points at the old HEAD, and the
+        // run reports Done with the work still sitting in the working tree.
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        let workspace = LiveWorkspace::from_path(&root).expect("workspace");
+        let path = std::path::Path::new(&root);
+
+        assert_eq!(
+            app.commit_worktree(&workspace, "noop").await,
+            Ok(false),
+            "a clean tree is a no-op, not a failure"
+        );
+
+        std::fs::write(path.join("work.txt"), "first\n").unwrap();
+        assert_eq!(
+            app.commit_worktree(&workspace, "work").await,
+            Ok(true),
+            "a real change commits"
+        );
+
+        // A locked index is the deterministic stand-in for any git failure: the
+        // old code turned a non-zero exit here into "nothing staged" and carried on.
+        std::fs::write(path.join(".git").join("index.lock"), "").unwrap();
+        std::fs::write(path.join("work2.txt"), "second\n").unwrap();
+        let error = app
+            .commit_worktree(&workspace, "blocked")
+            .await
+            .expect_err("a git failure must surface");
+        assert!(
+            error.contains("git add") || error.contains("git commit"),
+            "the error should name the failing command: {error}"
+        );
+        std::fs::remove_file(path.join(".git").join("index.lock")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_driver_drains_owned_turns_and_blocks_when_it_cannot() {
+        // Marking a run terminal releases its locks. If the driver died while a dev
+        // turn was still mutating the worktree, doing that without draining first
+        // leaves an agent writing files nobody is watching. An unconfirmed drain
+        // must therefore leave the run BLOCKED — non-terminal, still owning its
+        // threads — rather than Interrupted.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // Turns never settle, and the provider refuses the stop, so the drain can
+        // never confirm quiescence. (The fake's normal `request_turn_stop` settles
+        // the turn itself, which would confirm the drain and hide this path.)
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Wait until the TL actually has a live turn to drain.
+        let mut tl = String::new();
+        for _ in 0..400 {
+            if let Some(run) = app.relay.read().await.team_run(&run_id).cloned() {
+                if !run.tl_thread_id.is_empty() {
+                    tl = run.tl_thread_id.clone();
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!tl.is_empty(), "the TL thread should have started");
+
+        app.interrupt_team_run_if_stranded(&run_id).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "an unconfirmed drain must not settle the run: {:?}",
+            run.error
+        );
+        assert!(!run.status.is_terminal(), "Blocked keeps the locks held");
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not confirm stopping"),
+            "the error should say why: {:?}",
+            run.error
+        );
+        // The stop was actually attempted, not skipped.
+        let interrupts: Vec<String> = provider.interrupts.lock().await.clone();
+        assert!(
+            interrupts.iter().any(|id| id == &tl),
+            "the owned turn must have been asked to stop, got {interrupts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn committing_never_executes_repository_hooks() {
+        // `--no-verify` is NOT enough: it skips `pre-commit` and `commit-msg`, but
+        // `prepare-commit-msg` and `post-commit` still run, which would reopen the
+        // arbitrary-code surface provisioning already closes.
+        let (_repo, root) = init_team_repo().await;
+        let path = std::path::Path::new(&root);
+        let hooks = path.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for name in ["post-commit", "prepare-commit-msg"] {
+            let sentinel = path.join(format!("{name}-RAN"));
+            let hook = hooks.join(name);
+            std::fs::write(
+                &hook,
+                format!("#!/bin/sh\ntouch {}\n", sentinel.to_string_lossy()),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        let workspace = LiveWorkspace::from_path(&root).expect("workspace");
+        std::fs::write(path.join("work.txt"), "x\n").unwrap();
+        assert_eq!(app.commit_worktree(&workspace, "work").await, Ok(true));
+
+        for name in ["post-commit", "prepare-commit-msg"] {
+            assert!(
+                !path.join(format!("{name}-RAN")).exists(),
+                "{name} must not run for an agent-authored commit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_cannot_fork_from_a_worktree_outside_the_allowed_roots() {
+        // Guarding only the DESTINATION is not enough. Provisioning reads and
+        // MUTATES the origin's repository — it writes info/exclude in the common
+        // git dir and creates a branch there.
+        //
+        // The two checks only come apart when the destination is in scope while
+        // the origin is not, which is exactly what a linked worktree outside the
+        // allowed roots produces: the task worktree still lands under the MAIN
+        // worktree (in scope), so a destination-only guard would wave it through.
+        let (_repo, root) = init_team_repo().await;
+        let outside = TempDir::new().expect("tmpdir");
+        let linked = outside.path().canonicalize().unwrap().join("linked");
+        let out = tokio::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--no-track",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&root)
+            .output()
+            .await
+            .expect("git");
+        assert!(out.status.success(), "worktree add failed");
+
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        // Only the main repository is in scope; the linked worktree is not.
+        app.relay.write().await.allowed_roots = vec![root.clone()];
+
+        let mut input = team_input(&root);
+        input.origin_cwd = linked.to_string_lossy().into_owned();
+        let error = app
+            .start_team_run(input)
+            .await
+            .expect_err("an out-of-scope origin must be refused even when the destination is fine");
+        assert!(
+            error.contains("allowed roots"),
+            "the error should name the scope: {error}"
+        );
+        assert!(
+            !std::path::Path::new(&root).join(".sealwire").exists(),
+            "nothing may be created from a repository we refused to touch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_with_no_common_history_fails_instead_of_reviewing_nothing() {
+        // The trap: run_mr_round commits the tree first, so falling back to `HEAD`
+        // when the merge base is missing produces an EMPTY diff. The gate would
+        // approve nothing at all and the run would report Done.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        script_replies(
+            providers.get("codex").unwrap(),
+            &[
+                "COMPLEXITY: simple",
+                "SUBTASK: Do the thing\nDo it.\nEND SUBTASK",
+                "Done.",
+                "Fine.\nVERDICT: APPROVED",
+                "Noted.",
+                "Nothing to object to.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Remove every way of resolving a base, so nothing is left to diff against.
+        {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                for _ in 0..600 {
+                    let ready = app
+                        .relay
+                        .read()
+                        .await
+                        .team_run(&run_id)
+                        .map(|run| !run.sub_tasks.is_empty())
+                        .unwrap_or(false);
+                    if ready {
+                        // `git branch -D main` cannot delete a checked-out branch,
+                        // so point the run at a ref that genuinely does not
+                        // resolve — the same state a deleted or force-pushed
+                        // target leaves behind — and drop the fork point too.
+                        app.relay.write().await.update_team_run(&run_id, |run| {
+                            run.target_ref = "refs/heads/deleted-target".to_string();
+                            run.base_commit = String::new();
+                        });
+                        return;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Failed,
+            "an unresolvable base must stop the run, not approve an empty diff"
+        );
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no common"),
+            "the error should say why: {:?}",
+            run.error
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_will_not_confirm_a_drain_for_a_turn_it_cannot_observe() {
+        // A provider marks a thread working only AFTER start_turn returns. A driver
+        // lost inside that window leaves a thread that is genuinely executing but
+        // has no runtime to inspect. Treating "no runtime" as idle would confirm
+        // the drain, settle the run, release its locks, and let the real session
+        // keep writing the worktree.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // Model the window: a seat is mid-start on a thread with no runtime yet.
+        for _ in 0..400 {
+            let started = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| !run.tl_thread_id.is_empty())
+                .unwrap_or(false);
+            if started {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.in_flight_thread = Some("claude-pending-mid-start".to_string());
+        });
+
+        app.interrupt_team_run_if_stranded(&run_id).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "an unobservable in-flight turn must not be confirmed drained: {:?}",
+            run.error
+        );
+        assert!(!run.status.is_terminal(), "Blocked keeps the locks held");
+    }
+
+    #[tokio::test]
+    async fn an_enormous_change_set_is_bounded_and_says_what_it_dropped() {
+        // Tracked output is capped globally, but each untracked file adds up to
+        // 64 KiB and nothing bounds the file COUNT. One generated directory would
+        // otherwise build a prompt big enough to exhaust the model's context.
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        let path = std::path::Path::new(&root);
+        let blob = "x".repeat(40 * 1024);
+        for index in 0..40 {
+            std::fs::write(path.join(format!("generated_{index}.txt")), &blob).unwrap();
+        }
+
+        let workspace = LiveWorkspace::from_path(&root).expect("workspace");
+        let response = collect_workspace_diff_against(&workspace, None)
+            .await
+            .expect("diff");
+        let rendered = super::super::team::render_review_diff(&response);
+
+        assert!(
+            rendered.len() < 400 * 1024,
+            "the rendered prompt must stay bounded, got {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("omitted"),
+            "a reviewer must be told it was not shown everything"
+        );
+        assert!(
+            rendered.contains("unreviewed"),
+            "and told what that means: {}",
+            &rendered[rendered.len().saturating_sub(200)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_task_keeps_every_other_writer_out_of_its_worktree() {
+        // The reciprocal lock, and the one that is easy to forget: a team run does
+        // NOT trip `has_active_workflow` or `has_active_review` — those scan their
+        // own maps. It also has to hold for a SUBDIRECTORY: `<worktree>/src` is the
+        // same git worktree, so exact-string cwd matching would let in precisely
+        // the concurrent writer this lock exists to exclude.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .expect("cwd");
+        let subdir = std::path::Path::new(&cwd).join("src");
+        std::fs::create_dir_all(&subdir).expect("subdir");
+        let subdir = subdir.to_string_lossy().into_owned();
+
+        // Starting a session in the worktree is the worst door: a provider that
+        // consumes an initial prompt during `start_thread` launches a writer with
+        // no thread for any thread-scoped lock to catch. So the refusal has to
+        // happen BEFORE the provider is asked to create anything — an error
+        // returned after `start_thread` would be a writer already in the tree.
+        let threads_before = providers
+            .get("codex")
+            .unwrap()
+            .start_thread_cwds
+            .lock()
+            .await
+            .len();
+        for target in [&cwd, &subdir] {
+            let error = app
+                .start_session(StartSessionInput {
+                    device_id: Some("device-1".to_string()),
+                    cwd: Some(target.clone()),
+                    model: None,
+                    effort: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    provider: Some("codex".to_string()),
+                    initial_prompt: Some("go rewrite everything".to_string()),
+                })
+                .await
+                .expect_err("no new session may be started inside a running task");
+            assert!(
+                error.contains("belongs to a running task"),
+                "{target}: {error}"
+            );
+        }
+        assert_eq!(
+            providers
+                .get("codex")
+                .unwrap()
+                .start_thread_cwds
+                .lock()
+                .await
+                .len(),
+            threads_before,
+            "the provider must never have been asked to create a thread there"
+        );
+
+        // A thread that already lives in the worktree's subdirectory — the shape a
+        // string-equality lock waves through.
+        let outsider = start_parent(&app, &root, "codex").await;
+        app.relay
+            .write()
+            .await
+            .ensure_runtime_for_thread(&outsider.id)
+            .current_cwd = subdir.clone();
+        assert!(
+            app.relay.read().await.is_cwd_team_locked(&subdir),
+            "a subdirectory of the task worktree is the same worktree"
+        );
+
+        let error = app
+            .request_review(RequestReviewInput {
+                parent_thread_id: Some(outsider.id.clone()),
+                ..review_input("codex")
+            })
+            .await
+            .expect_err("a review must not walk into a running task's worktree");
+        assert!(
+            error.contains("a task is running"),
+            "the refusal should name the task: {error}"
+        );
+
+        let error = app
+            .authorize_and_resolve_workflow_parent("device-1", Some(outsider.id.clone()))
+            .await
+            .expect_err("nor may a workflow");
+        assert!(error.contains("a task is running"), "{error}");
+
+        // Once the task is over, the workspace is ordinary again.
+        app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        let relay = app.relay.read().await;
+        assert!(!relay.is_cwd_team_locked(&cwd));
+        assert!(!relay.is_cwd_team_locked(&subdir));
+    }
+
+    /// Resume once the stopped driver has actually let go of its ticket. A driver
+    /// that has settled still has a moment of unwinding left, and that is not the
+    /// "another driver is live" case Resume is refusing.
+    async fn resume_team_run_when_free(app: &AppState, run_id: &str) {
+        for _ in 0..400 {
+            match app
+                .resume_team_run(Some(run_id.to_string()), Some("device-1".to_string()))
+                .await
+            {
+                Ok(_) => return,
+                Err(error)
+                    if error.contains("already has a driver")
+                        || error.contains("finishing a turn") =>
+                {
+                    sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("resume: {error}"),
+            }
+        }
+        panic!("task {run_id} never became resumable");
+    }
+
+    #[tokio::test]
+    async fn a_stop_and_a_turn_start_can_never_interleave() {
+        // The boundary check that let a step run is many awaits behind the moment
+        // it actually calls `start_turn` — a worktree probe, a git checkpoint, a
+        // thread start. A stop landing in that window drains an idle runtime,
+        // records the run stopped, and then the driver starts a turn anyway. For a
+        // cancel that is not merely a lie: terminal releases the workspace lock
+        // while an agent writes into it.
+        //
+        // Driven deterministically by holding the drive gate — the same gate a
+        // stop takes — across the moment the driver wants to start its turn.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        let turns_when_stopped = provider.turns.lock().await.len();
+
+        // Latch the driver in the window itself: past its boundary check, not yet
+        // holding the drive gate. Settling as PAUSED is the case that matters —
+        // `Cancelled` is terminal and was already refused, `Paused` is not.
+        let barrier = app.hold_team_turn_barrier().await;
+        let arrivals_before = app.team_turn_arrivals();
+        resume_team_run_when_free(&app, &run_id).await;
+        for _ in 0..400 {
+            if app.team_turn_arrivals() > arrivals_before {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_turn_arrivals() > arrivals_before,
+            "the resumed driver never reached the turn-start window"
+        );
+
+        // The driver is now committed to starting a turn and is one step away from
+        // doing it. Stop the run out from under it.
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        let settled_at = provider.turns.lock().await.len();
+        drop(barrier);
+
+        sleep(Duration::from_millis(400)).await;
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "a settled run must stay settled: {:?}",
+            run.error
+        );
+        assert_eq!(
+            provider.turns.lock().await.len(),
+            settled_at,
+            "no turn may start on a run already recorded as stopped"
+        );
+        assert!(
+            settled_at >= turns_when_stopped,
+            "sanity: the turn count never goes backwards"
+        );
+
+        // Cancel closes it out, and the workspace is released with nothing running.
+        app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        let cancelled_at = provider.turns.lock().await.len();
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status),
+            Some(crate::state::TeamRunStatus::Cancelled)
+        );
+        assert_eq!(provider.turns.lock().await.len(), cancelled_at);
+        // And nothing is left running in the worktree the cancel just released.
+        assert!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.owned_thread_ids())
+                .unwrap_or_default()
+                .iter()
+                .all(|id| !app
+                    .relay
+                    .try_read()
+                    .map(|relay| relay
+                        .runtime_for_thread(id)
+                        .is_some_and(|runtime| runtime.is_working()))
+                    .unwrap_or(false)),
+            "a cancelled run released the workspace, so nothing may still be working"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_waits_for_a_turn_that_is_already_starting() {
+        // The second half of the same guarantee, and the half a status check
+        // cannot cover: preflight has already passed and `start_turn` has not
+        // fired yet. A stop that drained the idle runtime here would settle the
+        // run — releasing the workspace on a cancel — and then the provider call
+        // would land anyway. The drive gate is what makes that impossible, so the
+        // proof is that the stop CANNOT COMPLETE while the driver holds it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let barrier = app.hold_team_gated_barrier().await;
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        for _ in 0..600 {
+            if app.team_gated_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_gated_arrivals() > 0,
+            "the driver never reached the in-gate window"
+        );
+
+        let stopper = {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
+                    .await
+            })
+        };
+        let raced = tokio::time::timeout(Duration::from_millis(250), stopper).await;
+        assert!(
+            raced.is_err(),
+            "a stop must not be able to settle a run whose turn is already starting"
+        );
+
+        drop(barrier);
+        // And once the turn has actually started, the stop completes normally by
+        // draining it rather than by pretending it was never there.
+        for _ in 0..600 {
+            let settled = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status == crate::state::TeamRunStatus::Paused);
+            if settled == Some(true) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "the stop should land once the turn it was waiting on exists: {:?}",
+            run.error
+        );
+        assert!(
+            !provider.interrupts.lock().await.is_empty(),
+            "and it should have stopped a real turn, not an imaginary one"
+        );
+    }
+
+    #[tokio::test]
+    async fn talking_to_a_paused_team_lead_cannot_race_a_resume() {
+        // While paused the user may redirect the team lead. That send does slow
+        // provider work before `start_turn`, so without the drive gate a resume
+        // landing in between puts the driver's turn on top of the user's — two
+        // turns on one thread — and a cancel can mark the run terminal moments
+        // before the user's turn actually starts.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        let tl = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.tl_thread_id.clone())
+            .expect("tl");
+
+        // A resume in flight holds the drive gate; the send must refuse rather
+        // than proceed on a stale "the run is paused" reading.
+        {
+            let _gate = app
+                .try_hold_team_drive_gate()
+                .expect("the gate should be free");
+            let error = app
+                .send_message(SendMessageInput {
+                    device_id: Some("device-1".to_string()),
+                    thread_id: tl.clone(),
+                    text: "do it differently".to_string(),
+                    model: None,
+                    effort: None,
+                })
+                .await
+                .expect_err("a send must not proceed while the task is mid-transition");
+            assert!(error.contains("try again in a moment"), "{error}");
+        }
+
+        // And once the run is actually resumed, the team lead is no longer the
+        // user's to talk to.
+        resume_team_run_when_free(&app, &run_id).await;
+        let error = app
+            .send_message(SendMessageInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                text: "do it differently".to_string(),
+                model: None,
+                effort: None,
+            })
+            .await
+            .expect_err("a resumed run drives its own team lead");
+        assert!(error.contains("belongs to a running task"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn answering_a_team_question_is_authorized_against_the_tasks_worktree() {
+        // Skipping `ensure_device_can_approve` for a team thread was necessary —
+        // every seat is background, so it would close the run's only channel to a
+        // person. Skipping it and checking NOTHING is a different mistake: an
+        // answer steers an agent that writes files, so any paired device holding a
+        // request id could direct work in a worktree outside its own path scope.
+        use crate::protocol::SubmitAskUserAnswerInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_ask_user.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let mut request_id = String::new();
+        for _ in 0..600 {
+            let awaiting = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .and_then(|run| run.awaiting.clone());
+            if let Some(awaiting) = awaiting {
+                request_id = awaiting.request_id;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!request_id.is_empty(), "the run never parked");
+
+        // Put the task's worktree outside this device's reach.
+        let elsewhere = TempDir::new().expect("tmpdir");
+        app.relay.write().await.allowed_roots =
+            vec![elsewhere.path().to_string_lossy().into_owned()];
+
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "Which approach?".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        let error = app
+            .submit_ask_user_answer(
+                &request_id,
+                SubmitAskUserAnswerInput {
+                    answers: answers.clone(),
+                    device_id: Some("device-1".to_string()),
+                },
+            )
+            .await
+            .expect_err("an out-of-scope device must not steer the task");
+        assert!(
+            format!("{error:?}").contains("allowed roots"),
+            "the refusal should name the scope: {error:?}"
+        );
+
+        // Reading the question is the same authority — a remote snapshot
+        // externalizes any body over 4 KB, so the two must agree.
+        let error = app
+            .read_ask_user_question_detail(&request_id, Some("device-1".to_string()))
+            .await
+            .expect_err("nor may it read the question");
+        assert!(error.contains("allowed roots"), "{error}");
+
+        // Back in scope, both work — with no foreground session anywhere.
+        app.relay.write().await.allowed_roots = vec![root.clone()];
+        assert!(
+            app.relay.read().await.active_thread_id.is_none(),
+            "this is the unattended case the exception exists for"
+        );
+        app.read_ask_user_question_detail(&request_id, Some("device-1".to_string()))
+            .await
+            .expect("an in-scope device can read the question");
+        app.submit_ask_user_answer(
+            &request_id,
+            SubmitAskUserAnswerInput {
+                answers,
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("and answer it");
+    }
+
+    #[tokio::test]
+    async fn a_task_thread_refuses_every_other_session_action() {
+        // The design's contract is that a task's threads are driven, not operated:
+        // no per-agent stop, no resume that makes one active, no settings edit that
+        // rewrites the sandbox its ROLE chose for it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let tl = wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let error = app
+            .stop_active_turn(StopTurnInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+            })
+            .await
+            .expect_err("a task has no per-agent stop; the only stop is the run's");
+        assert!(error.contains("belongs to a running task"), "{error}");
+
+        let error = app
+            .resume_session(ResumeSessionInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                provider: None,
+            })
+            .await
+            .expect_err("nor may a seat be made the active thread");
+        assert!(error.contains("belongs to a running task"), "{error}");
+
+        let error = app
+            .update_session_settings(UpdateSessionSettingsInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                model: None,
+                effort: None,
+                approval_policy: Some("never".to_string()),
+                sandbox: Some("danger-full-access".to_string()),
+            })
+            .await
+            .expect_err("nor may its sandbox be rewritten mid-run");
+        assert!(error.contains("belongs to a running task"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_that_runs_out_of_room_is_replaced_and_the_work_continues() {
+        // There is no token or context-window signal anywhere in `ThreadRuntime`,
+        // so the only HONEST trigger is the provider saying so. The successor
+        // inherits the PLAN FILE, never the retired lead's transcript — which is
+        // exactly why a lead that hits its limit is recoverable instead of fatal.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // The first TL turn fails the way a full session fails; everything after
+        // it succeeds.
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        script_replies(
+            provider,
+            &[
+                "Taking over; the plan is current.",
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "a replaced team lead must not end the run: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "the retired lead is recorded, not forgotten"
+        );
+        let retired = &run.tl_succession[0];
+        assert!(
+            retired.reason.contains("too long"),
+            "the succession should say WHY: {}",
+            retired.reason
+        );
+        assert_ne!(
+            run.tl_thread_id, retired.thread_id,
+            "the successor is a different session"
+        );
+        assert!(
+            run.owned_thread_ids().contains(&retired.thread_id),
+            "the retired lead stays drainable and auditable"
+        );
+        assert!(run.tl_reseed_reason.is_none(), "the request was consumed");
+
+        // The successor was briefed from the spec and the plan file, and was NOT
+        // handed the retired lead's conversation.
+        let turns = provider.turns.lock().await.clone();
+        let handover = turns
+            .iter()
+            .filter(|(thread, _)| thread == &run.tl_thread_id)
+            .map(|(_, text)| text)
+            .find(|text| text.contains("taking over as team lead"))
+            .expect("the successor should have been briefed");
+        assert!(handover.contains(".sealwire/PLAN.md"));
+        assert!(handover.contains("Add a parser"), "the spec comes across");
+        assert!(
+            !handover.contains("Implemented the parser"),
+            "but never the previous conversation: {handover}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_that_dies_on_real_work_fails_the_run_after_one_replacement() {
+        // The retry budget, not the succession cap, is what bounds this: one
+        // action may trigger at most one re-seed. A lead that can be briefed but
+        // always dies on the actual work must therefore end the run promptly
+        // rather than being replaced over and over. (The cap itself is a model
+        // invariant — `the_team_lead_succession_chain_is_capped`.)
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_work_turns_with
+            .lock()
+            .await
+            .replace("context length exceeded".to_string());
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        assert!(
+            run.status.is_terminal(),
+            "the run must settle rather than loop"
+        );
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "exactly one replacement was tried before giving up, not a cascade"
+        );
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("context length"),
+            "and the provider's own words survive into the failure: {:?}",
+            run.error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paused_task_whose_team_lead_session_is_gone_gets_a_new_one_on_resume() {
+        // The case brick 7 deliberately left as a hole: a recorded lead that no
+        // longer routes to any provider. The plan file is the durable state, so
+        // this is recoverable — but it has to be NOTICED at boot, while a probe is
+        // cheap, rather than blowing up on the first turn after Resume.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+
+        // A team lead id that names nothing — what a restart leaves behind.
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.tl_thread_id = "codex-thread-from-a-previous-relay".to_string();
+        });
+
+        app.validate_paused_team_runs().await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "an unroutable lead is recoverable, not a reason to block"
+        );
+        assert!(
+            run.tl_reseed_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not survive"),
+            "the run should carry why: {:?}",
+            run.tl_reseed_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn the_http_surface_starts_a_task_and_drives_its_whole_lifecycle() {
+        // The wire types are the only place a client meets this feature, so the
+        // shape matters as much as the behaviour: a flat form in, a run id and a
+        // branch back, and every lifecycle verb reachable by name.
+        use crate::protocol::{StartTeamInput, TeamActionInput};
+        use crate::state::TeamAction2;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let receipt = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                context: "The loader needs one.".to_string(),
+                acceptance_criteria: "Parses all three encodings.".to_string(),
+                agreed_scope: "Parser only.".to_string(),
+                quality_rules: "No unwrap in library code.".to_string(),
+                cwd: Some(root.clone()),
+                target_branch: None,
+                tl_provider: Some("codex".to_string()),
+                dev_provider: Some("codex".to_string()),
+                reviewer_provider: Some("codex".to_string()),
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("the task should start");
+        assert_eq!(receipt.branch, "task/add-a-parser");
+        assert!(receipt.cwd.contains(".sealwire/worktrees/"));
+        assert!(receipt.message.contains("task/add-a-parser"));
+
+        // The listing shows it, without leaking a sub-task brief.
+        let teams = app.teams().await;
+        let view = teams
+            .teams
+            .iter()
+            .find(|team| team.team_run_id == receipt.team_run_id)
+            .expect("the task should be listed");
+        assert_eq!(view.title, "Add a parser");
+        assert_eq!(view.branch, "task/add-a-parser");
+        assert_eq!(view.tl_generations, 1);
+
+        wait_for_team_turn_in_flight(&app, &receipt.team_run_id).await;
+        let action = |id: &str| TeamActionInput {
+            team_run_id: Some(id.to_string()),
+            device_id: Some("device-1".to_string()),
+        };
+
+        let paused = app
+            .team_action(TeamAction2::Stop, action(&receipt.team_run_id))
+            .await
+            .expect("stop");
+        assert_eq!(paused.status, "paused");
+        assert_eq!(paused.team_run_id, receipt.team_run_id);
+        assert!(paused.message.contains("paused"), "{}", paused.message);
+
+        resume_team_run_when_free(&app, &receipt.team_run_id).await;
+        // Cancel with the id OMITTED — the shape a client uses while one task runs
+        // at a time. The receipt must still name the run it acted on, which means
+        // resolving it BEFORE the action makes it terminal and unresolvable.
+        let cancelled = app
+            .team_action(
+                TeamAction2::Cancel,
+                TeamActionInput {
+                    team_run_id: None,
+                    device_id: Some("device-1".to_string()),
+                },
+            )
+            .await
+            .expect("cancel");
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            cancelled.team_run_id, receipt.team_run_id,
+            "the receipt must name the task it cancelled, not an empty string"
+        );
+
+        // A cancelled task stays listed — the branch it left behind is the point.
+        let teams = app.teams().await;
+        let view = teams
+            .teams
+            .iter()
+            .find(|team| team.team_run_id == receipt.team_run_id)
+            .expect("a finished task is still listed");
+        assert_eq!(view.status, "cancelled");
+        assert_eq!(view.branch, "task/add-a-parser");
+    }
+
+    #[tokio::test]
+    async fn starting_a_task_over_http_requires_a_title_and_a_device() {
+        use crate::protocol::StartTeamInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let error = app
+            .start_team(StartTeamInput {
+                title: "   ".to_string(),
+                cwd: Some(root.clone()),
+                device_id: Some("device-1".to_string()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect_err("a task with no title has no spec to be measured against");
+        assert!(error.contains("title is required"), "{error}");
+
+        let error = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                cwd: Some(root.clone()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect_err("an unidentified caller cannot start a task");
+        assert!(error.contains("device_id"), "{error}");
+
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "a refused start must leave nothing behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_naming_a_provider_that_does_not_exist_leaves_nothing_behind() {
+        // The other half of the same defect. Defaulting an ABSENT provider was
+        // fixed; an explicitly named one that the relay never spawned still
+        // provisioned a worktree and a branch, then died on its first turn with
+        // "agent provider 'gpt5' is not available" — leaving both on disk for a
+        // run that never ran. A refused start must leave nothing.
+        use crate::protocol::StartTeamInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let error = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                cwd: Some(root.clone()),
+                device_id: Some("device-1".to_string()),
+                dev_provider: Some("gpt5".to_string()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect_err("a provider the relay never spawned cannot run a seat");
+        assert!(error.contains("gpt5"), "{error}");
+
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "a refused start must leave no run behind"
+        );
+        // The worktree directory is the thing that actually costs the user: it
+        // survives a restart and nothing points at it.
+        let worktrees = std::path::Path::new(&root).join(".sealwire/worktrees");
+        let provisioned = std::fs::read_dir(&worktrees)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            provisioned, 0,
+            "a refused start must not provision a worktree"
+        );
+
+        let branches = tokio::process::Command::new("git")
+            .args(["branch", "--list", "task/*"])
+            .current_dir(&root)
+            .output()
+            .await
+            .expect("git");
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "a refused start must not leave a branch: {}",
+            String::from_utf8_lossy(&branches.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_started_without_a_provider_picks_one_instead_of_failing() {
+        // The three provider fields are OPTIONAL on `StartTeamInput`, so a client
+        // may leave them out — and the obvious client, a form, does. Defaulting
+        // them to an empty string means the run provisions a worktree AND a
+        // branch, then dies on its first turn with "agent provider '' is not
+        // available", leaving both behind. A refused start must leave nothing;
+        // an accepted one must be runnable.
+        use crate::protocol::StartTeamInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let receipt = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                cwd: Some(root.clone()),
+                device_id: Some("device-1".to_string()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect("a task with no provider named should still start");
+
+        let providers = app
+            .relay
+            .read()
+            .await
+            .team_run(&receipt.team_run_id)
+            .map(|run| {
+                (
+                    run.tl_provider.clone(),
+                    run.dev_provider.clone(),
+                    run.reviewer_provider.clone(),
+                )
+            })
+            .expect("the run should exist");
+        assert_eq!(
+            providers,
+            (
+                "codex".to_string(),
+                "codex".to_string(),
+                "codex".to_string()
+            ),
+            "every seat needs a provider that actually exists"
+        );
+
+        app.cancel_team_run(
+            Some(receipt.team_run_id.clone()),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("cancel");
+    }
+
+    #[tokio::test]
+    async fn the_sub_task_view_names_its_developer_and_reviewer_threads() {
+        // A team diagram whose Dev and Reviewer nodes open a transcript needs
+        // those thread ids, and only the team lead's is on the run view. They are
+        // identity rather than TL-authored instruction, so exposing them leaves
+        // the "briefs are deliberately absent" decision intact.
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let mut run = crate::state::TeamRun::new(
+            "team-view-1".to_string(),
+            crate::state::TaskSpec::default(),
+            root.clone(),
+            "device-1".to_string(),
+        );
+        run.tl_thread_id = "tl-1".to_string();
+        run.sub_tasks = vec![
+            crate::state::SubTask {
+                id: "s1".to_string(),
+                title: "Write the parser".to_string(),
+                brief: "Never leaves the backend.".to_string(),
+                dev_thread_id: Some("dev-1".to_string()),
+                reviewer_thread_id: Some("rev-1".to_string()),
+                ..Default::default()
+            },
+            // Not yet started: nobody is seated, and the view must say so rather
+            // than inventing an id the UI would then try to open.
+            crate::state::SubTask {
+                id: "s2".to_string(),
+                title: "Wire the loader".to_string(),
+                ..Default::default()
+            },
+        ];
+        app.relay.write().await.insert_team_run(run);
+
+        let teams = app.teams().await;
+        let view = teams
+            .teams
+            .iter()
+            .find(|team| team.team_run_id == "team-view-1")
+            .expect("the task should be listed");
+
+        assert_eq!(
+            view.sub_tasks[0].dev_thread_id.as_deref(),
+            Some("dev-1"),
+            "the Dev node has nothing to open without this"
+        );
+        assert_eq!(
+            view.sub_tasks[0].reviewer_thread_id.as_deref(),
+            Some("rev-1"),
+            "nor does the Reviewer node"
+        );
+        assert_eq!(view.sub_tasks[1].dev_thread_id, None);
+        assert_eq!(view.sub_tasks[1].reviewer_thread_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_pause_whose_turn_then_fails_never_strands_the_run() {
+        // A graceful pause stops nothing, so the turn it is waiting on can fail on
+        // its own. If that failure is suppressed as "the stop caused it", the
+        // driver returns with the run still `PausePending` — non-terminal, so it
+        // blocks every future task, and Resume refuses it for not being `Paused`.
+        // Nothing is left alive to settle it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // The turn will fail on its own, unrelated to any stop.
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("the provider fell over".to_string());
+        // Hold the driver just before it starts that turn, so the pause is
+        // guaranteed to be pending while the failure happens.
+        let barrier = app.hold_team_turn_barrier().await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        for _ in 0..600 {
+            if app.team_turn_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_turn_arrivals() > 0,
+            "the driver never reached a turn"
+        );
+
+        app.pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("pause");
+        drop(barrier);
+
+        // Whatever it settles as, it must not sit in `pause_pending` with nobody
+        // driving it.
+        let mut settled = None;
+        for _ in 0..600 {
+            let run = app.relay.read().await.team_run(&run_id).cloned();
+            if let Some(run) = run {
+                if run.status != crate::state::TeamRunStatus::PausePending
+                    && run.status != crate::state::TeamRunStatus::Queued
+                    && run.status != crate::state::TeamRunStatus::Running
+                {
+                    settled = Some(run);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let run = settled.expect("the run never settled — it is stranded in pause_pending");
+        assert!(
+            matches!(
+                run.status,
+                crate::state::TeamRunStatus::Paused
+                    | crate::state::TeamRunStatus::Failed
+                    | crate::state::TeamRunStatus::Blocked
+            ),
+            "a paused-then-failed run must reach a state someone can act on, got {:?}",
+            run.status
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_turn_start_blocks_and_never_gets_a_successor() {
+        // The worst shape: `start_turn` errors AND the stop cannot be confirmed,
+        // so the provider may be running a turn nobody can see. Failing the run
+        // would release the worktree to it; re-seeding — which the error text
+        // invites, because it looks like a context window — would put a SECOND
+        // team lead in the same tree alongside it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        provider.fail_next_turn_live.store(true, Ordering::Relaxed);
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run_blocked(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "an unconfirmed start must not settle the run: {:?}",
+            run.error
+        );
+        assert!(
+            !run.status.is_terminal(),
+            "Blocked keeps the workspace held"
+        );
+        assert!(
+            run.in_flight_thread.is_some(),
+            "the marker must survive, or cleanup will confirm quiescence for a turn nobody can observe"
+        );
+        assert!(
+            run.tl_succession.is_empty(),
+            "no successor team lead may be started alongside a turn that may still be running"
+        );
+    }
+
+    async fn wait_for_team_run_blocked(app: &AppState, run_id: &str) -> crate::state::TeamRun {
+        for _ in 0..800 {
+            if let Some(run) = app.relay.read().await.team_run(run_id).cloned() {
+                if run.status.is_terminal() || run.status == crate::state::TeamRunStatus::Blocked {
+                    return run;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("task {run_id} never settled");
+    }
+
+    #[tokio::test]
+    async fn a_stop_waits_for_the_relays_own_git_mutation() {
+        // The gate covers turns. The driver ALSO mutates the worktree itself —
+        // `git add`, `git commit` at each checkpoint, the merge gate and wrap-up —
+        // and those are not turns, so the turn latches miss them entirely. A stop
+        // returning here releases the tree to a new session while the relay is
+        // still staging into it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        app.set_workflow_drain_max_ms(500);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+            ],
+        )
+        .await;
+
+        let barrier = app.hold_team_commit_barrier().await;
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        for _ in 0..800 {
+            if app.team_commit_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_commit_arrivals() > 0,
+            "the driver never reached a git mutation"
+        );
+
+        let stopper = {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                app.cancel_team_run(Some(run_id), Some("device-1".to_string()))
+                    .await
+            })
+        };
+        let raced = tokio::time::timeout(Duration::from_millis(250), stopper).await;
+        assert!(
+            raced.is_err(),
+            "a cancel must not release the workspace while the relay is staging into it"
+        );
+        drop(barrier);
+    }
+
+    #[tokio::test]
+    async fn a_session_already_living_in_the_worktree_cannot_be_resumed_into_it() {
+        // The outer guard only knows a thread's id, so a session the team does not
+        // own — restored, or created before the task started — slipped through and
+        // became the active thread inside a worktree three agents are editing.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+
+        let outsider = start_parent(&app, &root, "codex").await;
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .expect("cwd");
+
+        // Point the outsider at a subdirectory of the task worktree, the way a
+        // restored session rooted there would look.
+        let subdir = std::path::Path::new(&cwd).join("src");
+        std::fs::create_dir_all(&subdir).expect("subdir");
+        let subdir = subdir.to_string_lossy().into_owned();
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread(&outsider.id).current_cwd = subdir.clone();
+            if let Some(thread) = relay.threads.iter_mut().find(|item| item.id == outsider.id) {
+                thread.cwd = subdir.clone();
+            }
+        }
+        // The guard reads the cwd the PROVIDER reports, which is the one the thread
+        // will actually run in — so the double has to report it too, or the test
+        // would be checking relay bookkeeping rather than where work lands.
+        {
+            let mut threads = providers.get("codex").unwrap().threads.lock().await;
+            if let Some(thread) = threads.get_mut(&outsider.id) {
+                thread.cwd = subdir.clone();
+            }
+        }
+
+        let error = app
+            .resume_session(ResumeSessionInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: outsider.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                provider: None,
+            })
+            .await
+            .expect_err("a session living in the task's worktree must not be resumed into it");
+        assert!(error.contains("belongs to a running task"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_start_whose_response_was_lost_is_watched_before_it_is_believed() {
+        // The dangerous shape: `start_turn` returns an error and the turn it
+        // actually started announces itself a beat LATER. Draining immediately
+        // proves nothing — the runtime reads idle, and codex cannot even issue a
+        // stop without a turn id it never gave us, so `stop_and_drain` answers
+        // "stopped" about a turn it never looked at.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        provider.fail_next_turn_live.store(true, Ordering::Relaxed);
+        // The beat. Short, but strictly after the error returns.
+        provider
+            .fail_next_turn_live_delay_ms
+            .store(60, Ordering::Relaxed);
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_team_liveness_window_ms(600);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run_blocked(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "a turn that announced itself after the error must not be declared stopped: {:?}",
+            run.error
+        );
+        assert!(run.in_flight_thread.is_some(), "the marker must survive");
+        assert!(
+            run.tl_succession.is_empty(),
+            "and the context-window wording must not buy a successor while that turn runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_that_never_began_is_not_treated_as_a_live_turn() {
+        // The other side of the same coin, and the reason the window exists rather
+        // than a blanket refusal: a provider that rejects a request outright never
+        // started anything. Treating that as unknown would make every transient
+        // provider error block the run — and would kill the reactive re-seed, whose
+        // whole trigger is a rejected start.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        // No liveness ever — the request was refused before any work.
+        app.set_team_liveness_window_ms(80);
+        script_replies(
+            provider,
+            &[
+                "Taking over; the plan is current.",
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nDo it.\nEND SUBTASK",
+                "Implemented.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted.",
+                "In scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "a refused start is recoverable: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "the re-seed still happens when nothing was ever running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_queued_behind_a_stop_never_lands() {
+        // The ordering the gate alone does not cover. A stop that gets the gate
+        // FIRST settles, releases, and returns — and the driver, queued behind it,
+        // would take the gate and commit into a workspace already handed back.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        app.set_workflow_drain_max_ms(500);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Something for the commit to actually contain — otherwise `git add -A`
+        // stages nothing and the assertion below cannot tell the two paths apart.
+        {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                for _ in 0..600 {
+                    let cwd = app
+                        .relay
+                        .read()
+                        .await
+                        .team_run(&run_id)
+                        .map(|run| run.cwd.clone());
+                    if let Some(cwd) = cwd {
+                        let path = std::path::Path::new(&cwd);
+                        if path.is_dir() {
+                            let _ = std::fs::write(path.join("landed.txt"), "work\n");
+                            return;
+                        }
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+
+        // The latch fires inside `team_git_gate`, and every arrival there is now a
+        // real commit — `checkpoint_commit` is ungated because it only reads HEAD.
+        let barrier = app.hold_team_commit_barrier().await;
+        for _ in 0..1200 {
+            if app.team_commit_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_commit_arrivals() > 0,
+            "the driver never reached a commit"
+        );
+        let commits_before = git_commit_count(&app, &run_id).await;
+
+        // Settle the run out from under it, exactly as a stop that won the gate
+        // would have left things, then let the driver proceed.
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.cancel("the task was cancelled by the user");
+        });
+        drop(barrier);
+        sleep(Duration::from_millis(400)).await;
+
+        assert_eq!(
+            git_commit_count(&app, &run_id).await,
+            commits_before,
+            "a driver queued behind a stop must not commit into a released workspace"
+        );
+    }
+
+    async fn git_commit_count(app: &AppState, run_id: &str) -> usize {
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(run_id)
+            .map(|run| run.cwd.clone())
+            .unwrap_or_default();
+        let out = tokio::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(&cwd)
+            .output()
+            .await
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_stop_cannot_leave_the_run_driverless() {
+        // `stop_team_run` marks the run `stopping` and then awaits. An axum handler
+        // future is dropped when the client disconnects, so that await is a real
+        // abort point — and a `stopping` marker left behind suppresses the next
+        // natural failure, after which the driver exits and the run sits driverless
+        // in `PausePending`, blocking every future task.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        // Long enough that the stop is certain to still be inside its drain.
+        app.set_workflow_drain_max_ms(10_000);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let stopper = {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
+                    .await
+            })
+        };
+        for _ in 0..400 {
+            let stopping = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.stopping)
+                .unwrap_or(false);
+            if stopping {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.stopping)
+                .unwrap_or(false),
+            "the stop never marked the run"
+        );
+
+        // The client hangs up.
+        stopper.abort();
+
+        let mut cleared = false;
+        for _ in 0..400 {
+            cleared = !app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.stopping)
+                .unwrap_or(true);
+            if cleared {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "an abandoned stop must not leave `stopping` set, or the next failure is \
+swallowed and the run strands"
+        );
+
+        // The pause request survives, so the run is still on its way to a state
+        // somebody can act on rather than stuck claiming a drain that ended.
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(run.pause_requested, "the user did ask for it to stop");
+    }
+
+    /// Block until the team lead's thread exists — the window in which a
+    /// proactive re-seed trigger can be armed.
+    async fn wait_for_team_lead(app: &AppState, run_id: &str) -> String {
+        for _ in 0..800 {
+            let tl = app
+                .relay
+                .read()
+                .await
+                .team_run(run_id)
+                .map(|run| run.tl_thread_id.clone())
+                .unwrap_or_default();
+            if !tl.is_empty() {
+                return tl;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the team lead thread never started");
+    }
+
+    /// A full simple pipeline with one extra reply at the front for the
+    /// successor's handover turn.
+    async fn script_reseeding_pipeline(provider: &ReviewTestProvider) {
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "Taking over; the plan is current.",
+                "SUBTASK: Add the parser\nDo it.\nEND SUBTASK",
+                "Implemented.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted.",
+                "In scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_is_replaced_once_it_has_taken_too_many_turns() {
+        // One of the two PROXY triggers. There is no token or context-window
+        // signal anywhere in `ThreadRuntime`, so this threshold is a guess by
+        // construction — which is exactly why it needs a test. Nothing else would
+        // notice if the counter stopped being read, and it WAS counted for a whole
+        // milestone before anything looked at it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_reseeding_pipeline(provider).await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let first_tl = wait_for_team_lead(&app, &run_id).await;
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.tl_turns_this_generation = crate::state::app::team::TL_MAX_TURNS_PER_GENERATION;
+        });
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "the turn budget must retire the lead that spent it: {:?}",
+            run.error
+        );
+        assert_eq!(run.tl_succession[0].thread_id, first_tl);
+        assert!(
+            run.tl_succession[0].reason.contains("turns"),
+            "the succession should say WHICH budget ran out: {}",
+            run.tl_succession[0].reason
+        );
+        assert_ne!(run.tl_thread_id, first_tl, "the successor is a new session");
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_is_replaced_once_its_transcript_is_too_large() {
+        // The other proxy, and the one that actually stands in for context: turns
+        // are cheap to count but say nothing about how much a lead is carrying.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_reseeding_pipeline(provider).await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let first_tl = wait_for_team_lead(&app, &run_id).await;
+        {
+            let mut relay = app.relay.write().await;
+            let runtime = relay.ensure_runtime_for_thread(&first_tl);
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: "bulk".to_string(),
+                    kind: crate::protocol::TranscriptEntryKind::AgentText,
+                    text: Some("x".repeat(crate::state::app::team::TL_MAX_TRANSCRIPT_BYTES + 1)),
+                    status: "completed".to_string(),
+                    turn_id: None,
+                    tool: None,
+                });
+            relay.notify();
+        }
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "a lead carrying too much must be retired: {:?}",
+            run.error
+        );
+        assert!(
+            run.tl_succession[0].reason.contains("bytes"),
+            "the succession should name the budget: {}",
+            run.tl_succession[0].reason
+        );
+        assert_ne!(run.tl_thread_id, first_tl);
+    }
+
+    #[tokio::test]
+    async fn a_second_task_is_refused_while_one_is_live() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+
+        app.start_team_run(team_input(&root))
+            .await
+            .expect("the first task should start");
+        let error = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect_err("M1 runs one task at a time");
+        assert!(
+            error.contains("already running"),
+            "error should say why: {error}"
+        );
+    }
+
+    /// Block until the run has a turn in flight, so a stop is guaranteed to
+    /// arrive mid-turn rather than in a gap between two of them.
+    async fn wait_for_team_turn_in_flight(app: &AppState, run_id: &str) -> String {
+        for _ in 0..600 {
+            let in_flight = app
+                .relay
+                .read()
+                .await
+                .team_run(run_id)
+                .and_then(|run| run.in_flight_thread.clone());
+            if let Some(thread_id) = in_flight {
+                return thread_id;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("task {run_id} never started a turn");
+    }
+
+    #[tokio::test]
+    async fn a_pause_lands_at_the_next_step_boundary_not_mid_turn() {
+        // A pause that cut a turn short would leave the worktree in whatever state
+        // a half-finished edit left it, and lose the work of the turn it killed.
+        // So Pause sets a flag and stops NOTHING: the in-flight turn runs to
+        // completion, its result is recorded, and only then does the run settle.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // A slow turn, so the pause is certain to land while one is in flight.
+        provider.complete_delay_ms.store(200, Ordering::Relaxed);
+        script_replies(provider, &["Plan written.\nCOMPLEXITY: simple"]).await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let status = app
+            .pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("a pause on a live task should be accepted");
+        assert_eq!(
+            status,
+            crate::state::TeamRunStatus::PausePending,
+            "a pause is a request, not an instant stop"
+        );
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "{:?}",
+            run.error
+        );
+        assert!(
+            !run.status.is_terminal(),
+            "a paused task is not a finished one"
+        );
+        assert!(!run.pause_requested, "settling consumes the request");
+        assert_eq!(
+            run.complex,
+            Some(false),
+            "the turn that was in flight when the pause arrived must have run to \
+completion and had its result recorded"
+        );
+        assert!(
+            run.in_flight_thread.is_none(),
+            "a settled pause leaves nothing in flight"
+        );
+        assert!(
+            provider.interrupts.lock().await.is_empty(),
+            "a boundary pause must not stop a single turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_rechecks_its_right_to_continue_at_every_boundary() {
+        // A user action can settle the run while the driver is inside a turn. The
+        // driver never learns that from the turn itself, so it has to re-read its
+        // own right to continue at the boundary rather than only look for the
+        // pause flag it knows about — a settled stop CLEARS that flag. Miss this
+        // and a stopped task quietly starts its next turn.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_delay_ms.store(250, Ordering::Relaxed);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        assert_eq!(provider.turns.lock().await.len(), 1, "one turn in flight");
+
+        // Settle the run out from under the driver, exactly as a force stop does:
+        // status Paused, and the pause REQUEST consumed.
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.settle_paused("settled by the user mid-turn");
+        });
+
+        // Long enough for the in-flight turn to finish (250 ms) and for the driver
+        // to have dispatched the next action if it were going to.
+        sleep(Duration::from_millis(600)).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "{:?}",
+            run.error
+        );
+        assert_eq!(
+            provider.turns.lock().await.len(),
+            1,
+            "the driver must not start another turn on a run that was settled \
+underneath it"
+        );
+        assert_eq!(
+            run.phase,
+            crate::state::TeamPhase::Planning,
+            "the turn that WAS in flight still had its result recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_force_stop_settles_paused_and_the_driver_cannot_overwrite_it() {
+        // The race this pins: a force stop drains the very turn the driver is
+        // waiting on, so moments later that driver observes its turn end with no
+        // reply and tries to record "the team lead replied with nothing". If a
+        // driver could still write status, every successful force stop would land
+        // as Failed — the user asks for a pause and gets a dead run.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // The turn never ends on its own, so only the stop can end it.
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let in_flight = wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let status = app
+            .force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("a confirmed drain should settle the run");
+        assert_eq!(status, crate::state::TeamRunStatus::Paused);
+        assert!(
+            provider
+                .interrupts
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == &in_flight),
+            "the in-flight turn must actually have been stopped"
+        );
+
+        // Give the driver time to notice its turn ended and try to fail the run.
+        sleep(Duration::from_millis(200)).await;
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "a driver that lost the run must not write over the user's decision: {:?}",
+            run.error
+        );
+        assert!(!run.status.is_terminal(), "the task stays resumable");
+        assert!(
+            run.in_flight_thread.is_none(),
+            "a settled stop leaves nothing in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_force_stop_that_cannot_confirm_the_drain_blocks_instead_of_lying() {
+        // Reporting "stopped" when a turn is still running is the one outcome that
+        // is worse than failing: the run goes quiet, its locks look free, and an
+        // agent keeps writing the worktree nobody is watching any more.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let error = app
+            .force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("an unconfirmed drain must not be reported as a stop");
+        assert!(
+            error.contains("did not confirm stopping"),
+            "the error should say why: {error}"
+        );
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+        assert!(
+            !run.status.is_terminal(),
+            "Blocked keeps the task's locks held"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_a_blocked_task_drains_it_and_leaves_it_resumable() {
+        // A task that took two attempts to stop has not lost its work: the
+        // worktree, the branch and every finished sub-task are still on disk, and
+        // the next action is a pure function of the record. So the recovery lands
+        // on Paused, not on a terminal state that would throw all of that away.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("the first stop cannot confirm the drain");
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status),
+            Some(crate::state::TeamRunStatus::Blocked)
+        );
+
+        // The provider now cooperates with the stop.
+        provider.interrupt_fails.store(false, Ordering::Relaxed);
+        let status = app
+            .resolve_blocked_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("the recovery should land");
+        assert_eq!(
+            status,
+            crate::state::TeamRunStatus::Paused,
+            "a drained task keeps its work and stays resumable"
+        );
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(
+            run.in_flight_thread.is_none(),
+            "a stale in-flight marker would make the next cleanup pass block it again"
+        );
+        assert_eq!(
+            run.branch, "task/add-a-parser",
+            "the recovery never throws the branch away"
+        );
+        assert!(std::path::Path::new(&run.cwd).is_dir());
+
+        let error = app
+            .resolve_blocked_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("a second recovery has nothing to resolve");
+        assert!(error.contains("not blocked"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn whole_run_stops_refuse_a_device_outside_the_tasks_path_scope() {
+        // Stops are authorized by the task's WORKTREE path scope, the same way
+        // starting one is. A device that could never have started this task must
+        // not be able to reach into its worktree and drain its turns.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        let elsewhere = TempDir::new().expect("tmpdir");
+        app.relay.write().await.allowed_roots =
+            vec![elsewhere.path().to_string_lossy().into_owned()];
+
+        for error in [
+            app.pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("pause must be authorized"),
+            app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("force stop must be authorized"),
+            app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("cancel must be authorized"),
+        ] {
+            assert!(
+                error.contains("allowed roots"),
+                "the refusal should name the scope: {error}"
+            );
+        }
+
+        let error = app
+            .pause_team_run(Some(run_id.clone()), None)
+            .await
+            .expect_err("an unidentified caller cannot stop a task");
+        assert!(error.contains("device_id"), "{error}");
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(
+            !run.pause_requested && run.status != crate::state::TeamRunStatus::Blocked,
+            "a refused stop must leave the run untouched: {:?}",
+            run.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_parks_the_task_and_the_answer_carries_the_same_turn_on() {
+        // The insight the whole brick rests on: a parked turn is NOT stopped. It is
+        // blocked inside the provider's tool callback and continues the instant the
+        // answer lands, so there is no "resume the turn" machinery — the driver
+        // only has to keep waiting instead of treating a parked turn as finished.
+        use crate::protocol::SubmitAskUserAnswerInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_ask_user.store(true, Ordering::Relaxed);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // The run parks, and says so on the record rather than only in a log.
+        let mut request_id = String::new();
+        for _ in 0..600 {
+            let run = app.relay.read().await.team_run(&run_id).cloned();
+            if let Some(run) = run {
+                if run.status == crate::state::TeamRunStatus::AwaitingUser {
+                    let awaiting = run.awaiting.clone().expect("the parked question");
+                    assert_eq!(awaiting.role, "tl", "the intake turn is the TL's");
+                    assert_eq!(awaiting.thread_id, run.tl_thread_id);
+                    request_id = awaiting.request_id;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !request_id.is_empty(),
+            "the run never parked on the question"
+        );
+        // Only the FIRST turn asks; the parked one already captured the flag, so
+        // clearing it now lets the rest of the pipeline run.
+        provider.raise_ask_user.store(false, Ordering::Relaxed);
+
+        // The team lock must NOT close the channel it exists to keep open.
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "Which approach?".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        app.submit_ask_user_answer(
+            &request_id,
+            SubmitAskUserAnswerInput {
+                answers,
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("a team thread's question must stay answerable");
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.complex,
+            Some(false),
+            "the SAME turn carried on and its reply was recorded: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "and the pipeline ran to the end from there: {:?}",
+            run.error
+        );
+        assert!(
+            run.awaiting.is_none(),
+            "the parked question must be cleared once answered"
+        );
+        assert_ne!(
+            run.status,
+            crate::state::TeamRunStatus::AwaitingUser,
+            "and the run must not still claim to be waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_team_thread_takes_no_typed_messages_but_the_team_lead_takes_them_once_paused() {
+        // The asymmetry the product needs: a person watching a dev can read its
+        // transcript and answer its question card, but has no composer on it —
+        // typing there would interleave with the driver's own turn on that thread.
+        // The team lead is the exception, and only while the run is PAUSED, because
+        // redirecting the task before resuming is the reason pause exists.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        let tl = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.tl_thread_id.clone())
+            .expect("tl thread");
+
+        let error = app
+            .send_message(SendMessageInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                text: "actually, do it differently".to_string(),
+                model: None,
+                effort: None,
+            })
+            .await
+            .expect_err("a running task's threads take no typed messages");
+        assert!(
+            error.contains("pause the task"),
+            "the refusal should say what to do about it: {error}"
+        );
+        assert_eq!(
+            app.relay.read().await.team_thread_gate(&tl),
+            crate::state::TeamThreadGate::Locked
+        );
+
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        assert_eq!(
+            app.relay.read().await.team_thread_gate(&tl),
+            crate::state::TeamThreadGate::TlWhilePaused,
+            "a paused run's team lead is exactly who the user talks to"
+        );
+
+        // A dev thread stays shut even while paused: the run still owns its next
+        // turn on it, and it is not the seat that takes direction.
+        let dev = "some-dev-thread";
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.sub_tasks = vec![crate::state::SubTask {
+                id: "s1".to_string(),
+                dev_thread_id: Some(dev.to_string()),
+                owned_thread_ids: vec![dev.to_string()],
+                ..crate::state::SubTask::default()
+            }];
+        });
+        assert_eq!(
+            app.relay.read().await.team_thread_gate(dev),
+            crate::state::TeamThreadGate::Locked
+        );
+
+        // And once the run is over, everything unlocks.
+        app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay.team_thread_gate(&tl),
+            crate::state::TeamThreadGate::Free
+        );
+        assert_eq!(
+            relay.team_thread_gate(dev),
+            crate::state::TeamThreadGate::Free
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_question_freezes_the_stall_clock_rather_than_racing_it() {
+        // A user thinking about a question is not a stalled agent. If the parked
+        // time counted against the step's stall budget, a slow reader would kill a
+        // turn that was doing exactly what it was asked to.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_ask_user.store(true, Ordering::Relaxed);
+        // A stall budget far shorter than the time the user is about to take. The
+        // turn parks at ~15 ms, well inside it; everything after that is thinking
+        // time, and a clock that kept running would kill the turn at 120 ms.
+        app.set_team_step_stall_ms(120);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let mut parked = false;
+        for _ in 0..600 {
+            parked = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status == crate::state::TeamRunStatus::AwaitingUser)
+                .unwrap_or(false);
+            if parked {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(parked, "the run never parked on the question");
+
+        // Several stall windows' worth of the user reading the question.
+        sleep(Duration::from_millis(600)).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::AwaitingUser,
+            "a parked turn must outlive the stall budget many times over: {:?}",
+            run.error
+        );
+        assert!(run.awaiting.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_tool_approval_on_a_team_thread_is_denied_and_never_reaches_the_user() {
+        // Nobody is watching a background turn. The worktree is sandboxed, which is
+        // what makes non-prompting correct — so an approval that appears anyway is
+        // denied and the turn carries on. It is still recorded, because a denial
+        // means the agent was stopped from doing something.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_approval.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // The approval is dealt with without anyone answering it.
+        let mut denied = false;
+        for _ in 0..600 {
+            let noted = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| {
+                    run.unresolved
+                        .iter()
+                        .any(|entry| entry.contains("denied automatically"))
+                })
+                .unwrap_or(false);
+            if noted {
+                denied = true;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(denied, "the approval was never auto-handled");
+
+        let relay = app.relay.read().await;
+        assert!(
+            relay.pending_approvals.is_empty(),
+            "a team thread's approval must never be left sitting in front of the user"
+        );
+        assert_ne!(
+            relay.team_run(&run_id).map(|run| run.status),
+            Some(crate::state::TeamRunStatus::AwaitingUser),
+            "an approval is the run's to answer, not the user's"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_denying_an_approval_never_eats_the_users_question() {
+        // The obvious implementation of "deny it and move on" is
+        // `deny_thread_approvals_best_effort` + `clear_thread_interactions`, and
+        // it is wrong twice over. Best-effort denial swallows provider errors, so
+        // clearing unconditionally deletes the only signal that the turn is still
+        // blocked; and clearing a thread's INTERACTIONS also deletes an
+        // AskUserQuestion that belongs to the user, not to the run.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_approval.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let tl = wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        // The question goes in FIRST, before the provider raises its approval at
+        // ~15 ms, so the two provably coexist on the thread when the run denies.
+        // Trying to observe the approval as a transient does not work: the wait
+        // loop denies it within microseconds of it appearing.
+        app.relay.write().await.pending_ask_user_questions.insert(
+            "ask:user-owned".to_string(),
+            crate::state::PendingAskUserQuestion {
+                request_id: "ask:user-owned".to_string(),
+                tool_use_id: "toolu-user-owned".to_string(),
+                thread_id: tl.clone(),
+                requested_at: crate::state::unix_now(),
+                questions: Vec::new(),
+            },
+        );
+
+        // The note on `unresolved` is written only by the denial path, so it is a
+        // positive signal that the denial actually ran.
+        let mut denied = false;
+        for _ in 0..600 {
+            denied = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| {
+                    run.unresolved
+                        .iter()
+                        .any(|entry| entry.contains("denied automatically"))
+                })
+                .unwrap_or(false);
+            if denied {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(denied, "the approval was never auto-denied");
+
+        let relay = app.relay.read().await;
+        assert!(
+            relay
+                .pending_approvals
+                .values()
+                .all(|approval| approval.thread_id != tl),
+            "the approval is the run's and must be denied"
+        );
+        assert!(
+            relay
+                .pending_ask_user_questions
+                .contains_key("ask:user-owned"),
+            "the question is the USER's and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_continues_from_the_record_without_redoing_finished_sub_tasks() {
+        // Resume is only real if the record is genuinely sufficient. What proves it
+        // is what does NOT happen: a sub-task that already finished must not get a
+        // second dev thread or a second round charged against its budget, because
+        // `next_team_action` reads the record rather than any cursor the lost
+        // driver was holding.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_delay_ms.store(60, Ordering::Relaxed);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: One\nDo the first.\nEND SUBTASK\n\
+SUBTASK: Two\nDo the second.\nEND SUBTASK",
+                "Implemented one.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted one.",
+                "Implemented two.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted two.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // Pause as soon as the first sub-task has been reported to the TL.
+        let mut paused_after_first = false;
+        for _ in 0..800 {
+            let done = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| {
+                    run.sub_tasks
+                        .first()
+                        .is_some_and(|task| task.status == crate::state::SubTaskStatus::Done)
+                })
+                .unwrap_or(false);
+            if done {
+                app.pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                    .await
+                    .expect("pause");
+                paused_after_first = true;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(paused_after_first, "the first sub-task never finished");
+
+        let paused = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            paused.status,
+            crate::state::TeamRunStatus::Paused,
+            "{:?}",
+            paused.error
+        );
+        assert_eq!(
+            paused.phase,
+            crate::state::TeamPhase::SubTasks,
+            "the pause has to land mid-pipeline for this test to mean anything"
+        );
+        let first_dev = paused.sub_tasks[0].dev_thread_id.clone().expect("dev");
+        let first_reviewer = paused.sub_tasks[0]
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer");
+        assert_ne!(
+            paused.sub_tasks[1].status,
+            crate::state::SubTaskStatus::Done,
+            "the second sub-task must still be outstanding"
+        );
+
+        let status = app
+            .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("a paused task should resume");
+        assert_eq!(status, crate::state::TeamRunStatus::Running);
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "the resumed run should finish the pipeline: {:?}",
+            run.error
+        );
+        assert!(
+            run.pause_reason.is_none() && !run.pause_requested,
+            "a resumed run must not still look paused"
+        );
+        assert_eq!(
+            run.sub_tasks[0].dev_thread_id.as_deref(),
+            Some(first_dev.as_str()),
+            "the finished sub-task must not be handed to a new developer"
+        );
+        assert_eq!(
+            run.sub_tasks[0].reviewer_thread_id.as_deref(),
+            Some(first_reviewer.as_str()),
+            "nor reviewed a second time"
+        );
+        assert_eq!(
+            run.sub_tasks[0].rounds_used, 1,
+            "a resume must not charge the finished sub-task another round"
+        );
+        assert_eq!(run.sub_tasks[1].status, crate::state::SubTaskStatus::Done);
+        assert_ne!(
+            run.sub_tasks[1].dev_thread_id, run.sub_tasks[0].dev_thread_id,
+            "the second sub-task still gets its own fresh developer"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_one_driver_may_ever_hold_a_task() {
+        // Two Resumes landing together both read `Paused`, both pass the status
+        // guard, and both spawn a driver onto the same worktree — two agents
+        // editing the same files. The record cannot express "a driver exists", so
+        // an in-process ticket has to.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // The turn never completes, so this driver is parked and unambiguously
+        // alive: its ticket must be unavailable to anyone else.
+        assert!(
+            app.claim_team_drive(&run_id).is_none(),
+            "a task's own driver holds its ticket from the moment it starts"
+        );
+
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+
+        // Stand in for the Resume that got there first. Claiming it doubles as the
+        // wait for the original driver to let go.
+        let mut ticket = None;
+        for _ in 0..400 {
+            ticket = app.claim_team_drive(&run_id);
+            if ticket.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let ticket = ticket.expect("the stopped driver should have released the run");
+        let error = app
+            .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("a second driver must be refused");
+        assert!(error.contains("already has a driver"), "{error}");
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status),
+            Some(crate::state::TeamRunStatus::Paused),
+            "a refused resume must not have moved the run"
+        );
+
+        // Once the first driver lets go, Resume works again.
+        drop(ticket);
+        app.resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("the run should be drivable once its ticket is free");
+    }
+
+    #[tokio::test]
+    async fn only_a_paused_task_can_be_resumed() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        for status in [
+            crate::state::TeamRunStatus::Running,
+            crate::state::TeamRunStatus::Blocked,
+            crate::state::TeamRunStatus::Cancelled,
+        ] {
+            app.relay.write().await.update_team_run(&run_id, |run| {
+                // Reach past the guards: this is about what Resume refuses, not
+                // about how a run got there.
+                run.status = status;
+            });
+            let error = app
+                .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("only a paused task is resumable");
+            assert!(
+                error.contains("only a paused task can be resumed"),
+                "{status:?}: {error}"
+            );
+            assert_eq!(
+                app.relay
+                    .read()
+                    .await
+                    .team_run(&run_id)
+                    .map(|run| run.status),
+                Some(status),
+                "a refused resume must leave the status alone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_task_whose_worktree_vanished_is_blocked_rather_than_offered_a_resume() {
+        // The ordinary case after a restart: the user cleaned up their worktrees
+        // between relay runs. Provider threads re-send their cwd every turn and
+        // cannot be relocated, so a Resume would die at its first turn with a
+        // provider error. Say so up front instead — the branch is untouched.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .expect("cwd");
+        std::fs::remove_dir_all(&cwd).expect("remove the worktree");
+
+        app.validate_paused_team_runs().await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+        assert!(
+            !run.status.is_terminal(),
+            "the record is kept, not discarded"
+        );
+        assert!(
+            run.error.as_deref().unwrap_or_default().contains(&cwd),
+            "the reason should name the missing tree: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.branch, "task/add-a-parser",
+            "the branch survives; only the checkout is gone"
+        );
+
+        let error = app
+            .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("a blocked task is not resumable");
+        assert!(
+            error.contains("only a paused task can be resumed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_task_frees_the_slot_and_keeps_the_work_on_disk() {
+        // Pausing deliberately does NOT free the slot — a paused task still owns
+        // its worktree and expects a resume. Cancel is the action that ends it,
+        // and it still never deletes the branch or the tree: that is the user's
+        // work, and throwing it away is not this action's call.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        assert!(
+            app.start_team_run(team_input(&root)).await.is_err(),
+            "a paused task still holds the one-at-a-time slot"
+        );
+
+        let status = app
+            .cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+        assert!(status.is_terminal());
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(
+            std::path::Path::new(&run.cwd).is_dir(),
+            "cancelling never deletes the user's work"
+        );
+        app.start_team_run(team_input(&root))
+            .await
+            .expect("a cancelled task must not hold the slot forever");
     }
 
     #[tokio::test]

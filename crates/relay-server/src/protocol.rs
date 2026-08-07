@@ -215,6 +215,18 @@ pub struct SessionSnapshot {
     /// Skipped when 0 so the pre-rename wire shape stays byte-identical.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub threads_revision: u64,
+    /// Cache key for the dedicated Teams channel.
+    ///
+    /// Revision ONLY — no team run view rides the snapshot. That is deliberate: a
+    /// run view carries a sub-task list and an unresolved list, both unbounded, so
+    /// embedding one would need the whole `active_workflow_runs` compaction budget
+    /// to earn its place. A scalar the drain loop can never reclaim is enough to
+    /// tell a client to refetch `GET /api/session/teams`.
+    ///
+    /// Skipped when 0 so every relay that never runs a task keeps a byte-identical
+    /// wire shape.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub teams_revision: u64,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -1541,6 +1553,17 @@ pub struct WorkspaceDiffResponse {
     /// tree's changes. `None` = `cwd` is the thread's own workspace.
     #[serde(default)]
     pub fallback_from: Option<String>,
+    /// The human-facing name of what this diff is measured against — a branch like
+    /// `main` for a task's MR view. `None` means the default "working tree vs
+    /// HEAD" view, which needs no label.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// The commit the diff was actually taken against. For an MR view this is the
+    /// MERGE BASE of `base_ref` and the branch, not `base_ref`'s tip — so commits
+    /// that landed on the target after the fork are excluded rather than showing
+    /// up reversed. Pairs with `base_ref` to render "vs main (merge-base abc1234)".
+    #[serde(default)]
+    pub base_commit: Option<String>,
     pub generated_at: u64,
 }
 
@@ -1561,6 +1584,8 @@ impl WorkspaceDiffResponse {
             suggested_root_known: false,
             unavailable: true,
             fallback_from: None,
+            base_ref: None,
+            base_commit: None,
             generated_at: 0,
         }
     }
@@ -2508,6 +2533,126 @@ pub struct StartWorkflowReceipt {
     pub parent_thread_id: String,
     pub status: WorkflowRunStatusView,
     pub message: String,
+}
+
+/// Start a Task team run. Flat rather than nesting the spec, because a client
+/// filling this in is filling in a form, not assembling a domain object.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StartTeamInput {
+    pub title: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub acceptance_criteria: String,
+    /// The MR gate's yardstick, along with `quality_rules`. Immutable once the run
+    /// starts: the team must not be able to edit what it is measured against.
+    #[serde(default)]
+    pub agreed_scope: String,
+    #[serde(default)]
+    pub quality_rules: String,
+    /// Any directory inside the repository to fork from. Defaults to the relay's
+    /// current workspace.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Branch to fork from; defaults to the main worktree's current branch.
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    #[serde(default)]
+    pub tl_provider: Option<String>,
+    #[serde(default)]
+    pub dev_provider: Option<String>,
+    #[serde(default)]
+    pub reviewer_provider: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+/// Every whole-run action takes the same shape: which run, and who is asking.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TeamActionInput {
+    /// Optional while one task runs at a time; required once that relaxes.
+    #[serde(default)]
+    pub team_run_id: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamActionReceipt {
+    pub team_run_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartTeamReceipt {
+    pub team_run_id: String,
+    pub cwd: String,
+    pub branch: String,
+    pub status: String,
+    pub message: String,
+}
+
+/// One sub-task, as a client sees it. The brief is deliberately absent: it is
+/// TL-authored instruction for a developer, not status.
+#[derive(Debug, Clone, Serialize, Hash)]
+pub struct TeamSubTaskView {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub rounds_used: u32,
+    pub digested: bool,
+    pub result_summary: Option<String>,
+    /// Who is seated in the Dev and Reviewer chairs for this sub-task, so a team
+    /// diagram can open their transcripts. Identity, not instruction — which is
+    /// why these are here and `brief` is not. `None` until the seat is filled;
+    /// the UI must render an unopenable node rather than invent an id.
+    pub dev_thread_id: Option<String>,
+    pub reviewer_thread_id: Option<String>,
+}
+
+/// A parked question, so a client knows who is waiting and on what.
+#[derive(Debug, Clone, Serialize, Hash)]
+pub struct TeamAwaitingView {
+    pub thread_id: String,
+    pub request_id: String,
+    pub role: String,
+    pub asked_at: u64,
+}
+
+/// `Hash` is load-bearing, not incidental: `RelayState::teams_revision` hashes the
+/// WHOLE view, so any field added here automatically joins the Teams cache key. A
+/// hand-written field list would have to be remembered instead.
+#[derive(Debug, Clone, Serialize, Hash)]
+pub struct TeamRunView {
+    pub team_run_id: String,
+    pub title: String,
+    pub status: String,
+    pub phase: String,
+    pub cwd: String,
+    pub branch: String,
+    pub target_ref: String,
+    pub tl_thread_id: String,
+    /// How many team leads this run has had. Anything above 1 means a re-seed.
+    pub tl_generations: usize,
+    pub sub_tasks: Vec<TeamSubTaskView>,
+    pub awaiting: Option<TeamAwaitingView>,
+    pub unresolved: Vec<String>,
+    pub head_commit: Option<String>,
+    pub pause_reason: Option<String>,
+    pub error: Option<String>,
+    pub requested_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamsResponse {
+    /// Echoed so a client can confirm which revision it just fetched. The cache
+    /// must still gate on the SNAPSHOT's revision, not this one — see
+    /// `frontend/shared/reviews-cache.js` for why gating on the response's own
+    /// revision loops when the relay moves mid-fetch.
+    pub teams_revision: u64,
+    pub teams: Vec<TeamRunView>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

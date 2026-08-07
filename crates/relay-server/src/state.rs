@@ -4,6 +4,7 @@ mod relay;
 mod review;
 mod security;
 mod task_list;
+mod team;
 #[cfg(test)]
 mod tests;
 mod workflow;
@@ -40,11 +41,19 @@ pub(crate) use self::review::{
 // a live path isn't wired up yet, so keep the re-export without an unused-import
 // warning in non-test builds.
 #[allow(unused_imports)]
+pub(crate) use self::app::team::TeamAction2;
+#[allow(unused_imports)]
 pub(crate) use self::review::Verdict;
 pub(crate) use self::security::SecurityProfile;
 #[allow(unused_imports)]
 pub(crate) use self::task_list::{
     CheckpointMode, EscalatePolicy, TaskItem, TaskListRun, TaskStatus,
+};
+#[allow(unused_imports)]
+pub(crate) use self::team::{
+    next_team_action, parse_complexity, parse_sub_tasks, prompts, AwaitingUser, SubTask,
+    SubTaskStatus, TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus, TeamThreadGate,
+    TeamThreadSlot, TlGeneration, MAX_MR_ROUNDS, MAX_SUBTASK_REVIEW_ROUNDS, MAX_TL_GENERATIONS,
 };
 #[allow(unused_imports)]
 pub(crate) use self::workflow::{

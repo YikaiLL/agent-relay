@@ -82,6 +82,11 @@ pub(crate) const REVIEW_LOCKED_THREAD_MSG: &str =
     "this thread is being reviewed; switch to another thread or wait for the review to finish";
 pub(crate) const WORKFLOW_LOCKED_THREAD_MSG: &str =
     "a workflow is running in this workspace; wait for it to finish before changing threads or files";
+/// A team thread is driven by the run, not talked to. A message typed into one
+/// would interleave with the driver's own turn on the same thread. The question
+/// card stays answerable — that channel is deliberately NOT closed by this lock.
+pub(crate) const TEAM_LOCKED_THREAD_MSG: &str =
+    "this thread belongs to a running task; pause the task to talk to its team lead";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -116,6 +121,59 @@ pub struct AppState {
     /// Review job ids whose orchestrators must stop before starting another turn.
     /// A set is required because unrelated parent threads may be reviewed concurrently.
     cancel_requested_jobs: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Stall window (ms) for one team turn. A backstop, not a cap: it resets on
+    /// every scrap of progress and FREEZES entirely while a turn is parked on a
+    /// user's question. Overridable in tests.
+    team_step_stall_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes the two things that must never interleave for a task team:
+    /// STARTING a turn on one of its threads, and CHANGING whether the run may be
+    /// driven at all.
+    ///
+    /// Without it the driver's boundary check and its `start_turn` are separated
+    /// by provider and git work, so a stop landing in between drains an idle
+    /// runtime, records the run stopped, and then watches the driver start a turn
+    /// into a worktree it just told the user was quiet. For a cancel that is worse
+    /// than a lie: terminal releases the workspace lock while an agent writes.
+    ///
+    /// One gate rather than one per run because M1 allows a single run at a time;
+    /// key it by run id when that relaxes.
+    team_drive_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only latch held across the exact window a stop must not be able to
+    /// exploit: after the driver's boundary check, before it takes the drive gate.
+    /// A test holds it, settles the run, and releases — which is the only way to
+    /// drive that interleaving deterministically rather than hoping for it.
+    #[cfg(test)]
+    team_turn_barrier: Arc<tokio::sync::Mutex<()>>,
+    /// Counts drivers that have REACHED that latch, so a test can wait for the
+    /// driver to be genuinely past its boundary check instead of sleeping.
+    #[cfg(test)]
+    team_turn_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// The second window, INSIDE the drive gate: preflight has passed and
+    /// `start_turn` has not been called. A stop reaching the worktree here is the
+    /// failure the gate exists to make impossible, so a test proves it by holding
+    /// this and showing the stop cannot complete.
+    #[cfg(test)]
+    team_gated_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    team_gated_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// The third window: the driver's OWN git mutation of the worktree. Not a
+    /// turn, so the turn latches miss it entirely — and a stop that returned here
+    /// would release the tree while the relay was still staging into it.
+    #[cfg(test)]
+    team_commit_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    team_commit_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// How long (ms) to watch a thread for signs of a turn after a start request
+    /// failed, before concluding the provider never began one. Overridable in
+    /// tests.
+    team_liveness_window_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Task team run ids that currently have a driver. The ONE piece of team run
+    /// state that cannot live on the record: two concurrent Resumes both read
+    /// `Paused`, both pass their guard, and both spawn a driver onto the same
+    /// worktree. A `std` mutex rather than a `tokio` one on purpose — the ticket
+    /// releases from `Drop`, which cannot await, and every critical section here
+    /// is one set operation with no await inside it.
+    driving_team_runs: Arc<std::sync::Mutex<HashSet<String>>>,
     /// The compacted, pre-serialized local snapshot for one change version, shared by
     /// every SSE surface that wakes on it.
     ///
@@ -151,11 +209,13 @@ mod providers;
 mod review;
 mod sessions;
 mod task_list;
+pub(crate) mod team;
 #[cfg(test)]
 mod tests;
 mod threads;
 mod transcript;
 mod workflow;
+mod worktree;
 
 /// Fork capability is a property of WHICH BRIDGES EXIST, not of any session,
 /// so it is derived once at construction. Every constructor must seed it: a
@@ -234,6 +294,22 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            team_liveness_window_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_000)),
+            #[cfg(test)]
+            team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -333,6 +409,22 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            team_liveness_window_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_000)),
+            #[cfg(test)]
+            team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -351,6 +443,10 @@ impl AppState {
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
         }
+
+        // After restore AND after `spawn_providers`: a restored task's threads can
+        // only be routed once the providers that own them exist.
+        state.validate_paused_team_runs().await;
 
         crate::broker::spawn_broker_task(state.clone()).await?;
 
@@ -1528,8 +1624,49 @@ pub(crate) fn paths_equivalent(a: &str, b: &str) -> bool {
 async fn collect_workspace_diff_in(
     workspace: &LiveWorkspace,
 ) -> Result<WorkspaceDiffResponse, String> {
+    collect_workspace_diff_against(workspace, None).await
+}
+
+/// The merge base of `target` and the workspace's HEAD.
+///
+/// `None` when git cannot answer — an unknown ref, or histories with no common
+/// ancestor. Callers fall back to `HEAD` rather than failing: a task whose MR base
+/// cannot be computed should still show its own uncommitted work.
+pub(crate) async fn merge_base_with(workspace: &LiveWorkspace, target: &str) -> Option<String> {
+    let output = run_git_capture(workspace, &["merge-base", target, "HEAD"])
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!base.is_empty()).then_some(base)
+}
+
+/// Collect a diff for `workspace` against `base`, defaulting to `HEAD`.
+///
+/// The `base` parameter is what makes an MR view possible without a second diff
+/// pipeline: pass a merge base and you get "everything this branch changed
+/// relative to the target"; pass `None` and you get today's "everything
+/// uncommitted". Either way the result is the same `WorkspaceDiffResponse` the
+/// Changes panel already renders.
+///
+/// Two things NOT to do here, both of which look right:
+/// - `git diff <target>` (two-dot) also reports commits that landed on the target
+///   AFTER the fork, reversed, as though this branch had deleted them.
+/// - `git diff <target>...HEAD` omits uncommitted work, so a mid-run MR view
+///   would quietly under-report what the team has actually touched.
+///
+/// Omitting the second operand — `git diff <merge-base>` — is the form that means
+/// "base .. WORKING TREE", which is what both callers actually want.
+pub(crate) async fn collect_workspace_diff_against(
+    workspace: &LiveWorkspace,
+    base: Option<&str>,
+) -> Result<WorkspaceDiffResponse, String> {
     let cwd = workspace.as_str();
     let generated_at = unix_now();
+    let base_commit = base.map(str::to_string);
+    let diff_base = base.unwrap_or("HEAD");
     let inside = run_git_capture(workspace, &["rev-parse", "--is-inside-work-tree"]).await?;
     if !inside.status.success() {
         return Ok(WorkspaceDiffResponse {
@@ -1545,17 +1682,20 @@ async fn collect_workspace_diff_in(
             unavailable: false,
             // Attached by the caller, which owns the fallback decision.
             fallback_from: None,
+            // Attached by the caller, which knows the branch's display name.
+            base_ref: None,
+            base_commit,
             generated_at,
         });
     }
 
-    let tracked = run_git_capture(workspace, &["diff", "--no-color", "HEAD"]).await?;
+    let tracked = run_git_capture(workspace, &["diff", "--no-color", diff_base]).await?;
     if !tracked.status.success() {
         let stderr = String::from_utf8_lossy(&tracked.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            "git diff HEAD failed".to_string()
+            format!("git diff {diff_base} failed")
         } else {
-            format!("git diff HEAD failed: {stderr}")
+            format!("git diff {diff_base} failed: {stderr}")
         });
     }
     let (tracked_diff, tracked_truncated) =
@@ -1612,6 +1752,9 @@ async fn collect_workspace_diff_in(
         unavailable: false,
         // Attached by the caller, which owns the fallback decision.
         fallback_from: None,
+        // Attached by the caller, which knows the branch's display name.
+        base_ref: None,
+        base_commit,
         generated_at,
     })
 }

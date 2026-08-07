@@ -23,6 +23,12 @@ impl AppState {
             if relay.is_cwd_workflow_locked(&cwd) {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
             }
+            // The worst of the unguarded doors: providers that consume an initial
+            // prompt during `start_thread` would launch a WRITER into the task's
+            // worktree with no thread for any thread-scoped lock to catch.
+            if relay.is_cwd_team_locked(&cwd) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
+            }
         }
         let requested_model = non_empty(input.model);
         let approval_policy = non_empty(input.approval_policy).unwrap_or(defaults.approval_policy);
@@ -165,6 +171,11 @@ impl AppState {
             if relay.is_thread_workflow_locked(&input.thread_id) {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
             }
+            // Same for a task team's seats: resuming one rebuilds its runtime and
+            // makes it the active thread, out from under the driver holding it.
+            if relay.is_thread_team_locked(&input.thread_id) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
+            }
         }
         self.resume_session_inner(input).await
     }
@@ -224,6 +235,13 @@ impl AppState {
                 || relay.is_cwd_workflow_locked(&preview.thread.cwd)
             {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
+            }
+            // The outer guard only knew this thread's id. A session the team does
+            // not own but which LIVES in its worktree — restored, or created
+            // before the task started — is still a writer in that tree, and the
+            // cwd is only knowable here, after the provider was asked.
+            if relay.is_cwd_team_locked(&preview.thread.cwd) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
             }
         }
 
@@ -301,6 +319,12 @@ impl AppState {
             let runtime = relay
                 .runtime_for_thread(&thread_id)
                 .ok_or_else(|| format!("thread `{thread_id}` is not loaded"))?;
+            // A seat's sandbox and approval policy are chosen by its ROLE — a
+            // reviewer is read-only precisely so it cannot write. Letting these be
+            // edited mid-run would rewrite that decision under the driver.
+            if relay.is_thread_or_cwd_team_locked(&thread_id) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
+            }
             if runtime.has_live_turn() {
                 return Err(
                     "cannot change session settings while a turn is in progress".to_string()
@@ -456,6 +480,21 @@ impl AppState {
             if relay.is_thread_or_cwd_workflow_locked(&target_thread) {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
             }
+            // A task team drives its own threads, so a message typed into one would
+            // interleave with the driver's turn. The single exception is the team
+            // lead of a PAUSED run: nothing is driving it, and redirecting the task
+            // before resuming is the whole point of being able to pause.
+            //
+            // Checked again under the drive gate below, immediately before
+            // `start_turn`. This early copy only saves the slow provider work in
+            // the obvious case; it is NOT the guard, because a resume can land in
+            // between and this answer would be stale by the time the turn starts.
+            if matches!(
+                relay.team_thread_gate(&target_thread),
+                crate::state::TeamThreadGate::Locked
+            ) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
+            }
             // A thread with a turn ALREADY IN FLIGHT must not receive a second
             // prompt: taking it over and calling start_turn again would double-start
             // (the provider rejects/queues it, and the relay loses track of the
@@ -571,6 +610,37 @@ impl AppState {
             }
         }
 
+        // Hold the team drive gate across the rest of the send when the target
+        // belongs to a task. Only under it is "the team lead of a paused run" a
+        // stable answer: a resume or a cancel takes this same gate, so one of the
+        // two happens entirely first. Without it, a message to a paused team lead
+        // can start its turn after a cancel has already drained the thread, marked
+        // the run terminal, and released the workspace.
+        let _team_gate = {
+            let team_owned = {
+                let relay = self.relay.read().await;
+                !matches!(
+                    relay.team_thread_gate(&target_thread),
+                    crate::state::TeamThreadGate::Free
+                )
+            };
+            if team_owned {
+                let gate = self.try_hold_team_drive_gate().ok_or_else(|| {
+                    "this task is settling right now; try again in a moment".to_string()
+                })?;
+                let relay = self.relay.read().await;
+                if !matches!(
+                    relay.team_thread_gate(&target_thread),
+                    crate::state::TeamThreadGate::TlWhilePaused
+                ) {
+                    return Err(TEAM_LOCKED_THREAD_MSG.to_string());
+                }
+                Some(gate)
+            } else {
+                None
+            }
+        };
+
         let turn_revision = {
             let relay = self.relay.read().await;
             let target_has_live_turn = relay
@@ -642,6 +712,13 @@ impl AppState {
             }
             if relay.is_thread_or_cwd_workflow_locked(&thread_id) {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
+            }
+            // A task team has no per-agent stop, by design: the only stop is the
+            // run's, which drains every owned thread and settles the record.
+            // Stopping one seat here would leave the driver waiting on a turn
+            // nobody told it about, and its own next write would contradict it.
+            if relay.is_thread_or_cwd_team_locked(&thread_id) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
             }
             (thread_id, runtime.active_turn_id.clone())
         };

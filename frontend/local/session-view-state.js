@@ -52,10 +52,21 @@ function stringSet(values) {
 //
 // Everything that used to produce it now produces `sessions`, including a persisted
 // entry naming a project that no longer exists.
+// A third kind DID arrive, and it is not a project: the Task screen. It is a
+// full-area non-chat view, so it never routes a thread and never owns tabs — but
+// it must be a real context rather than a `data-view`, because it participates in
+// history and must not inherit whichever project workspace was last open.
+//
+// `teamRunId` null is the task LIST; a value is one task's detail. Both are the
+// same kind because they are the same screen; they differ in key so the back
+// button can tell them apart.
 export function normalizeSessionViewContext(context) {
   if (context?.kind === "project") {
     const projectId = stringId(context.projectId);
     return projectId ? { kind: "project", projectId } : { kind: "sessions" };
+  }
+  if (context?.kind === "tasks") {
+    return { kind: "tasks", teamRunId: stringId(context.teamRunId) };
   }
   return { kind: "sessions" };
 }
@@ -118,12 +129,42 @@ export function selectContextAfterProjectDelete({ context = null, deletedProject
   return { kind: "sessions" };
 }
 
+// Sentinel prefix for the Task screen's keys. Distinct from a project id (which is
+// a bare uuid) and from SESSIONS_KEY, so no context can ever alias another's tab
+// workspace.
+export const TASKS_KEY = "__tasks__";
+
+export function isTasksWorkspaceKey(key) {
+  return key === TASKS_KEY || (typeof key === "string" && key.startsWith(`${TASKS_KEY}:`));
+}
+
 export function sessionViewContextKey(context) {
   const normalized = normalizeSessionViewContext(context);
   if (normalized.kind === "sessions") {
     return SESSIONS_KEY;
   }
+  if (normalized.kind === "tasks") {
+    return normalized.teamRunId ? `${TASKS_KEY}:${normalized.teamRunId}` : TASKS_KEY;
+  }
   return normalized.projectId;
+}
+
+/**
+ * Where a thread tab may actually live.
+ *
+ * The Task screen is a full-area view with no tab strip, so a tab filed under its
+ * context is unreachable — and because `mainView` is derived from the context, the
+ * screen keeps rendering and the thread never appears at all. The user sees a
+ * click that does nothing.
+ *
+ * `OPEN_THREAD` inherits the current context when the caller supplies none, which
+ * is the right default for every context that CAN hold tabs and silently wrong for
+ * the one that cannot. Callers should still pass the thread's owning context so a
+ * project session lands in its project; this is the floor that stops a missing one
+ * from becoming invisible, for every future call site as well as today's.
+ */
+function contextThatCanHoldTabs(context) {
+  return context?.kind === "tasks" ? { kind: "sessions" } : context;
 }
 
 function sameContext(left, right) {
@@ -236,6 +277,11 @@ function contextFromHistory(
     ) {
       return { kind: "sessions" };
     }
+    // A tasks context is deliberately NOT validated the same way. A project that
+    // no longer exists must fall back, because the sidebar scopes itself to it and
+    // would show an empty list with a name attached. A task that no longer exists
+    // is information: its branch is still on disk, and the screen saying so is
+    // more useful than being dropped at the sessions home with no explanation.
     return context;
   }
 
@@ -281,9 +327,9 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
       if (stringSet(facts.unavailableThreadIds).has(threadId)) {
         return removeThread(state, threadId);
       }
-      const context = action.context
-        ? normalizeSessionViewContext(action.context)
-        : state.location.context;
+      const context = contextThatCanHoldTabs(
+        action.context ? normalizeSessionViewContext(action.context) : state.location.context
+      );
       // Three intents, and the difference matters:
       //   preview: true   browse — reuse the one preview slot
       //   preview: false  deliberate open — keep it, promoting an existing peek
@@ -461,6 +507,13 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
           workspaces: state.workspaces,
         });
       }
+      // The SECOND place a tab gets created, and it needs the same floor as
+      // `OPEN_THREAD`. A persisted tasks context plus a `?thread=` off the URL
+      // would otherwise file the tab where no strip renders it and no view shows
+      // it. Not reachable through today's history writer — it drops `?thread=`
+      // when nothing is routed — but the guard's claim is that it holds for the
+      // call sites that do not exist yet, and one branch is not "every".
+      const tabContext = contextThatCanHoldTabs(context);
 
       // Back/Forward retraces a browse, so it reuses the preview slot exactly as
       // the clicks it is replaying did — otherwise walking back through a browse
@@ -480,12 +533,12 @@ export function reduceSessionView(snapshot, action = {}, facts = {}) {
       //
       // Both fall out of one rule — `openThreadTab` only ever flags a NEW tab —
       // which is why this passes no flag rather than choosing between them here.
-      const opened = openThreadTab(workspaceFor(state, context), urlThreadId, {
+      const opened = openThreadTab(workspaceFor(state, tabContext), urlThreadId, {
         preview: action.preview === true,
       });
       return createSessionViewState({
-        location: { context, threadId: urlThreadId },
-        workspaces: withWorkspace(state, context, opened).workspaces,
+        location: { context: tabContext, threadId: urlThreadId },
+        workspaces: withWorkspace(state, tabContext, opened).workspaces,
       });
     }
 
@@ -516,7 +569,14 @@ export function sessionViewInvariantErrors(snapshot) {
     workspaces[sessionViewContextKey(context)] || {}
   );
 
-  if (threadId) {
+  if (threadId && context.kind === "tasks") {
+    // Stated separately from "not open in <key>", which this would also trip. The
+    // generic message names the workspace key and reads like a missing tab; this
+    // one names the actual fault, which is that the context can never hold one.
+    // A thread routed here is invisible: the Task screen renders no tab strip,
+    // and `mainView` keeps showing the Task screen because it reads the context.
+    errors.push(`context ${sessionViewContextKey(context)} cannot hold a thread tab`);
+  } else if (threadId) {
     const owning = findTabByThread(current, threadId);
     if (!owning) {
       errors.push(`visible thread ${threadId} is not open in ${sessionViewContextKey(context)}`);

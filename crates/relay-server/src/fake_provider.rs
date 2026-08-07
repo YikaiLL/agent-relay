@@ -39,6 +39,64 @@ struct FakeThread {
 struct FakeScenarioConfig {
     #[serde(default)]
     prompts: HashMap<String, FakeTurnScenario>,
+    /// Ordered fallbacks for prompts that CANNOT be matched exactly.
+    ///
+    /// Exact keying works only while a caller controls the whole prompt. Anything
+    /// the relay composes — a workspace diff, a provisioned worktree path, a
+    /// generated sub-task id — makes the prompt unknowable in advance, and those
+    /// are exactly the flows worth driving end to end. First matcher whose every
+    /// `contains` substring is present wins, so order them most specific first.
+    #[serde(default)]
+    matchers: Vec<FakeScenarioMatcher>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FakeScenarioMatcher {
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    scenario: FakeTurnScenario,
+}
+
+/// Either shape a scenario may use for `ask_user`.
+///
+/// Untagged so the two e2e suites that arrived at this feature independently keep
+/// their own wire spelling: `true` for "just ask something", an object when the
+/// test asserts on the question itself.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum FakeAskUserSpec {
+    Enabled(bool),
+    Detailed(FakeAskUser),
+}
+
+impl FakeAskUserSpec {
+    fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Enabled(false))
+    }
+
+    fn detail(&self) -> Option<&FakeAskUser> {
+        match self {
+            Self::Detailed(detail) => Some(detail),
+            Self::Enabled(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FakeAskUser {
+    question: String,
+    #[serde(default)]
+    header: String,
+    #[serde(default)]
+    options: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FakeFileWrite {
+    path: String,
+    #[serde(default)]
+    contents: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -60,6 +118,12 @@ struct FakeTurnScenario {
     tool_kind: FakeToolKind,
     pause_after_chunks: Option<usize>,
     barrier: Option<String>,
+    /// Files to write into the thread's OWN cwd before the reply is emitted,
+    /// relative paths only. Without this the fake can talk about work but never
+    /// do any, so every flow whose next step reads a workspace diff — a review, a
+    /// merge gate, a commit — is unreachable end to end.
+    #[serde(default)]
+    write_files: Vec<FakeFileWrite>,
     #[serde(default)]
     duplicate_chunk_indices: Vec<usize>,
     #[serde(default)]
@@ -75,10 +139,17 @@ struct FakeTurnScenario {
     /// first and then assert the arriving request is still brought into view.
     approval_delay_ms: Option<u64>,
     /// Park the turn on a real AskUserQuestion request: emit the tool-call
-    /// transcript entry, publish a pending question, and block until an answer
-    /// arrives through `respond_to_ask_user_question`.
+    /// transcript entry, publish a pending question, block until an answer
+    /// arrives through `respond_to_ask_user_question`, and then CONTINUE the same
+    /// turn. The continuation is the point: a parked turn is not stopped, it is
+    /// blocked inside the provider's tool callback, and a double that ended the
+    /// turn would make the feature look like it needs machinery it does not have.
+    ///
+    /// `true` asks the canned question; an object supplies the text. A scenario
+    /// driving a whole pipeline needs to assert on what was asked, while a
+    /// scroll/pinning test only needs A question to exist.
     #[serde(default)]
-    ask_user: bool,
+    ask_user: Option<FakeAskUserSpec>,
     /// Same purpose as `approval_delay_ms`, for the question.
     ask_user_delay_ms: Option<u64>,
     /// Emit this assistant text AFTER the question's tool call but before
@@ -132,6 +203,13 @@ struct FakeProviderEvent<'a> {
     detail: Option<serde_json::Value>,
 }
 
+/// Ask-user request ids answered through the bridge.
+///
+/// A parked turn watches THIS rather than the pending map: cleanup empties that
+/// map too, and a turn that was drained must not behave as though someone had
+/// answered it.
+type AnsweredAsks = Arc<Mutex<std::collections::HashSet<String>>>;
+
 #[derive(Clone)]
 struct FakeScenarioHarness {
     config: FakeScenarioConfig,
@@ -157,12 +235,34 @@ impl FakeScenarioHarness {
         })?;
         let config: FakeScenarioConfig = serde_json::from_slice(&contents)
             .map_err(|error| format!("failed to decode fake-provider scenario: {error}"))?;
-        for scenario in config.prompts.values() {
+        for matcher in &config.matchers {
+            // An empty matcher matches every prompt, which is never what anyone
+            // meant and would silently swallow the whole run.
+            if matcher.contains.iter().all(|needle| needle.is_empty()) {
+                return Err(
+                    "fake-provider scenario matcher needs at least one non-empty `contains`"
+                        .to_string(),
+                );
+            }
+            for path in &matcher.scenario.write_files {
+                validate_relative_write_path(&path.path)?;
+            }
+        }
+        for scenario in config
+            .prompts
+            .values()
+            .chain(config.matchers.iter().map(|matcher| &matcher.scenario))
+        {
             if scenario.pause_after_chunks.is_some() {
                 let barrier = scenario.barrier.as_deref().ok_or_else(|| {
                     "fake-provider scenario pause_after_chunks requires barrier".to_string()
                 })?;
                 validate_barrier_name(barrier)?;
+            }
+        }
+        for scenario in config.prompts.values() {
+            for path in &scenario.write_files {
+                validate_relative_write_path(&path.path)?;
             }
         }
         let barrier_timeout = std::env::var("FAKE_PROVIDER_BARRIER_TIMEOUT_MS")
@@ -180,7 +280,19 @@ impl FakeScenarioHarness {
     }
 
     fn scenario_for_prompt(&self, prompt: &str) -> Option<FakeTurnScenario> {
-        self.config.prompts.get(prompt).cloned()
+        if let Some(scenario) = self.config.prompts.get(prompt) {
+            return Some(scenario.clone());
+        }
+        self.config
+            .matchers
+            .iter()
+            .find(|matcher| {
+                matcher
+                    .contains
+                    .iter()
+                    .all(|needle| prompt.contains(needle))
+            })
+            .map(|matcher| matcher.scenario.clone())
     }
 
     async fn record_event(
@@ -284,6 +396,26 @@ struct FakeApprovalGate {
 struct FakeAskUserGate {
     turn_id: String,
     sender: oneshot::Sender<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// A scenario write must stay inside the thread's own workspace.
+///
+/// The fake provider is only ever a test double, but it is handed paths from a
+/// JSON file and runs as the relay user; an absolute path or a `..` segment here
+/// would let a scenario write anywhere on the machine.
+fn validate_relative_write_path(path: &str) -> Result<(), String> {
+    let candidate = Path::new(path);
+    if path.is_empty()
+        || candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "fake-provider scenario write_files paths must be relative and free of '..': {path:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_barrier_name(barrier: &str) -> Result<(), String> {
@@ -582,6 +714,31 @@ impl ProviderBridge for FakeProviderBridge {
             .as_ref()
             .map(|scenario| scenario.stop)
             .unwrap_or_default();
+        let write_files = scenario
+            .as_ref()
+            .map(|scenario| scenario.write_files.clone())
+            .unwrap_or_default();
+        if !write_files.is_empty() {
+            let cwd = self
+                .threads
+                .lock()
+                .await
+                .get(&thread_id)
+                .map(|thread| thread.summary.cwd.clone())
+                .unwrap_or_default();
+            for file in &write_files {
+                // Validated at load time; re-checked here because the cwd is only
+                // known now and a join is where a bad path would actually escape.
+                if validate_relative_write_path(&file.path).is_err() || cwd.is_empty() {
+                    continue;
+                }
+                let target = Path::new(&cwd).join(&file.path);
+                if let Some(parent) = target.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let _ = tokio::fs::write(&target, file.contents.as_bytes()).await;
+            }
+        }
         let scenario_harness = self.scenario_harness.clone();
         let turn_id = self.next_token("fake-turn");
         let user_item_id = self.next_token("fake-user");
@@ -603,7 +760,25 @@ impl ProviderBridge for FakeProviderBridge {
             .as_ref()
             .and_then(|scenario| scenario.approval_delay_ms)
             .map(Duration::from_millis);
-        let ask_user = scenario.as_ref().is_some_and(|scenario| scenario.ask_user);
+        let ask_user_spec = scenario
+            .as_ref()
+            .and_then(|scenario| scenario.ask_user.clone())
+            .filter(FakeAskUserSpec::is_enabled);
+        let ask_user_detail = ask_user_spec
+            .as_ref()
+            .and_then(FakeAskUserSpec::detail)
+            .cloned();
+        let ask_user = ask_user_spec.is_some();
+        // Was anyone LOOKING at this thread when the turn began?
+        //
+        // The publish rule below is "don't publish if the reader walked away",
+        // not "don't publish to a background thread" — and the difference is the
+        // whole Task team feature. Every team seat is background-started and must
+        // still be able to ask; a foreground thread the user switched away from
+        // mid-delay must not leave a question behind. Both fall out of comparing
+        // against the state at turn start rather than against `active` alone.
+        let ask_user_started_foreground =
+            self.state.read().await.active_thread_id.as_deref() == Some(thread_id.as_str());
         let ask_user_delay = scenario
             .as_ref()
             .and_then(|scenario| scenario.ask_user_delay_ms)
@@ -868,11 +1043,23 @@ impl ProviderBridge for FakeProviderBridge {
                 }
 
                 // ONE write-lock section, so the question's tool card, the
-                // trailing message and the pending request all appear together —
-                // and only if the thread is still foreground at that moment.
+                // trailing message and the pending request all appear together.
+                //
+                // Deliberately NOT gated on the thread being foreground. It was,
+                // to avoid leaving a `running` tool card behind when a thread went
+                // background mid-delay — but a background thread asking is the
+                // whole point for a Task team: every seat is background-started,
+                // and `submit_ask_user_answer` skips its active-thread check
+                // precisely so a parked dev can still be answered. The card is not
+                // a ghost while the question is genuinely pending; the answer path
+                // and the cancel path below both settle it.
                 let published = {
                     let mut relay = state.write().await;
-                    if relay.active_thread_id.as_deref() == Some(thread_id.as_str()) {
+                    let reader_left = ask_user_started_foreground
+                        && relay.active_thread_id.as_deref() != Some(thread_id.as_str());
+                    if reader_left {
+                        false
+                    } else {
                         relay.upsert_transcript_item_for_thread(
                             &thread_id,
                             ask_item_id.clone(),
@@ -880,7 +1067,7 @@ impl ProviderBridge for FakeProviderBridge {
                             None,
                             "running".to_string(),
                             Some(turn_id_for_task.clone()),
-                            Some(fake_ask_user_tool_view(None)),
+                            Some(fake_ask_user_tool_view(None, ask_user_detail.as_ref())),
                         );
                         // Optional: something AFTER the question, so the
                         // transcript has to pin it to the bottom instead of
@@ -906,14 +1093,12 @@ impl ProviderBridge for FakeProviderBridge {
                             tool_use_id: ask_user_tool_use_id.clone(),
                             thread_id: thread_id.clone(),
                             requested_at: unix_now(),
-                            questions: fake_ask_user_questions(),
+                            questions: fake_ask_user_questions(ask_user_detail.as_ref()),
                         });
                         relay.touch_progress(Some("waiting_user"), None);
                         relay.push_log("info", "Fake provider asked the user a question.");
                         relay.notify();
                         true
-                    } else {
-                        false
                     }
                 };
                 if !published {
@@ -955,7 +1140,7 @@ impl ProviderBridge for FakeProviderBridge {
                                 None,
                                 "failed".to_string(),
                                 Some(turn_id_for_task.clone()),
-                                Some(fake_ask_user_tool_view(None)),
+                                Some(fake_ask_user_tool_view(None, ask_user_detail.as_ref())),
                             );
                             relay.notify();
                         }
@@ -967,7 +1152,8 @@ impl ProviderBridge for FakeProviderBridge {
 
                     // Answered: echo back what was ACTUALLY chosen. This is also
                     // what un-pins the card back to its place in the conversation.
-                    let answered_tool = fake_ask_user_tool_view(Some(&answers));
+                    let answered_tool =
+                        fake_ask_user_tool_view(Some(&answers), ask_user_detail.as_ref());
                     {
                         let mut relay = state.write().await;
                         relay.upsert_transcript_item_for_thread(
@@ -1746,27 +1932,49 @@ fn fake_tool_call_view(index: usize, completed: bool) -> ToolCallView {
 
 /// The question fixture the fake provider asks. One single-select question, so
 /// an e2e can answer it with a single option click (the wizard's quick path).
-fn fake_ask_user_questions() -> Vec<AskUserQuestionView> {
+/// The question the fake asks. `None` gives the canned one, which is all a
+/// scroll/pinning test needs; a scenario that asserts on what was asked supplies
+/// its own.
+fn fake_ask_user_questions(detail: Option<&FakeAskUser>) -> Vec<AskUserQuestionView> {
+    let Some(detail) = detail else {
+        return vec![AskUserQuestionView {
+            question: "Which approach should we take?".to_string(),
+            header: "Approach".to_string(),
+            multi_select: false,
+            options: vec![
+                AskUserOptionView {
+                    label: "Option A".to_string(),
+                    description: "Take the direct route".to_string(),
+                },
+                AskUserOptionView {
+                    label: "Option B".to_string(),
+                    description: "Take the careful route".to_string(),
+                },
+            ],
+        }];
+    };
     vec![AskUserQuestionView {
-        question: "Which approach should we take?".to_string(),
-        header: "Approach".to_string(),
+        question: detail.question.clone(),
+        header: if detail.header.is_empty() {
+            "Question".to_string()
+        } else {
+            detail.header.clone()
+        },
         multi_select: false,
-        options: vec![
-            AskUserOptionView {
-                label: "Option A".to_string(),
-                description: "Take the direct route".to_string(),
-            },
-            AskUserOptionView {
-                label: "Option B".to_string(),
-                description: "Take the careful route".to_string(),
-            },
-        ],
+        options: detail
+            .options
+            .iter()
+            .map(|label| AskUserOptionView {
+                label: label.clone(),
+                description: String::new(),
+            })
+            .collect(),
     }]
 }
 
-fn fake_ask_user_input_preview() -> String {
+fn fake_ask_user_input_preview(detail: Option<&FakeAskUser>) -> String {
     serde_json::json!({
-        "questions": fake_ask_user_questions()
+        "questions": fake_ask_user_questions(detail)
             .into_iter()
             .map(|question| serde_json::json!({
                 "question": question.question,
@@ -1805,6 +2013,7 @@ fn render_ask_user_answer(value: &serde_json::Value) -> String {
 /// typing free text is not later reported back as Option A.
 fn fake_ask_user_tool_view(
     answers: Option<&serde_json::Map<String, serde_json::Value>>,
+    detail: Option<&FakeAskUser>,
 ) -> ToolCallView {
     let result_preview = answers.map(|answers| {
         let rendered = answers
@@ -1825,7 +2034,7 @@ fn fake_ask_user_tool_view(
         path: None,
         url: None,
         command: None,
-        input_preview: Some(fake_ask_user_input_preview()),
+        input_preview: Some(fake_ask_user_input_preview(detail)),
         result_preview,
         diff: None,
         file_changes: Vec::new(),
@@ -2066,6 +2275,7 @@ mod tests {
         let harness = FakeScenarioHarness {
             config: FakeScenarioConfig {
                 prompts: HashMap::new(),
+                ..Default::default()
             },
             control_dir: temp.path().to_path_buf(),
             barrier_timeout: Duration::from_secs(2),
@@ -2118,7 +2328,10 @@ mod tests {
         prompts: HashMap<String, FakeTurnScenario>,
     ) -> FakeScenarioHarness {
         FakeScenarioHarness {
-            config: FakeScenarioConfig { prompts },
+            config: FakeScenarioConfig {
+                prompts,
+                ..Default::default()
+            },
             control_dir: temp.path().to_path_buf(),
             barrier_timeout: Duration::from_secs(2),
             event_seq: Arc::new(AtomicU64::new(1)),
@@ -2685,7 +2898,7 @@ mod tests {
                     reply: Some("done".to_string()),
                     chunks: Some(vec!["done".to_string()]),
                     chunk_delay_ms: Some(0),
-                    ask_user: true,
+                    ask_user: Some(FakeAskUserSpec::Enabled(true)),
                     ask_user_trailing_text: extra_trailing
                         .then(|| "Meanwhile, here is some context.".to_string()),
                     ..FakeTurnScenario::default()
@@ -2851,7 +3064,7 @@ mod tests {
                     reply: Some("done".to_string()),
                     chunks: Some(vec!["done".to_string()]),
                     chunk_delay_ms: Some(0),
-                    ask_user: true,
+                    ask_user: Some(FakeAskUserSpec::Enabled(true)),
                     ask_user_delay_ms: Some(200),
                     ask_user_trailing_text: Some("Meanwhile, here is some context.".to_string()),
                     ..FakeTurnScenario::default()

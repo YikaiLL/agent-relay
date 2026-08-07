@@ -4,11 +4,15 @@ import assert from "node:assert/strict";
 import {
   deleteReview,
   getReviews,
+  getTeams,
   requestReview,
   resolveReview,
   resolveWorkflow,
   startWorkflow,
   submitAskUserAnswer,
+  startTeam,
+  teamAction,
+  TEAM_ACTIONS,
 } from "./api.js";
 
 function makeFetchStub(response) {
@@ -204,4 +208,94 @@ test("getReviews GETs the reviews endpoint with the device id and returns the li
   assert.deepEqual(result, jobs);
   assert.equal(calls[0].input, "/api/session/reviews?device_id=device-a");
   assert.equal(calls[0].init.method, "GET");
+});
+
+test("getTeams GETs the teams endpoint with no device id", async () => {
+  // `list_teams` takes no device_id; appending one would 400 on an unknown query
+  // field or, worse, be silently ignored and read as scoping that is not there.
+  const payload = { teams_revision: 9, teams: [{ team_run_id: "team-1" }] };
+  const { apiFetch, calls } = makeFetchStub(jsonResponse({ ok: true, data: payload }));
+
+  const result = await getTeams(apiFetch);
+  assert.deepEqual(result, payload);
+  assert.equal(calls[0].input, "/api/session/teams");
+  assert.equal(calls[0].init.method, "GET");
+});
+
+test("every task action POSTs the shared body to its own route", async () => {
+  for (const action of TEAM_ACTIONS) {
+    const receipt = { team_run_id: "team-1", status: "paused", message: "ok" };
+    const { apiFetch, calls } = makeFetchStub(jsonResponse({ ok: true, data: receipt }));
+
+    const result = await teamAction(apiFetch, action, {
+      teamRunId: "team-1",
+      deviceId: "device-a",
+    });
+    assert.deepEqual(result, receipt);
+    assert.equal(calls[0].input, `/api/session/team/${action}`);
+    assert.equal(calls[0].init.method, "POST");
+    // Without this the relay answers 415 and the client's `response.json()`
+    // throws on the plain-text body — surfacing as "Unexpected token 'E'"
+    // rather than anything a user or a developer can act on.
+    assert.equal(calls[0].init.headers?.["Content-Type"], "application/json");
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+      team_run_id: "team-1",
+      device_id: "device-a",
+    });
+  }
+});
+
+test("an unknown task action never reaches the network", async () => {
+  // The five verbs are a closed set on the backend. A typo'd action would
+  // otherwise POST to a route that 404s, which reads to a user as "the relay is
+  // broken" rather than "that button is wired wrong".
+  const { apiFetch, calls } = makeFetchStub(jsonResponse({ ok: true, data: {} }));
+  await assert.rejects(() => teamAction(apiFetch, "delete", { teamRunId: "team-1" }), /Unknown task action/);
+  assert.equal(calls.length, 0);
+});
+
+test("a refused task action surfaces the relay's reason", async () => {
+  // The backend refuses resume on anything but a paused run, and the message it
+  // returns names the current status. Swallowing it would leave a dead button.
+  const { apiFetch } = makeFetchStub(
+    jsonResponse(
+      { ok: false, error: { message: "the task is running; it cannot be resumed" } },
+      { status: 409 }
+    )
+  );
+  await assert.rejects(
+    () => teamAction(apiFetch, "resume", { teamRunId: "team-1" }),
+    /cannot be resumed/
+  );
+});
+
+test("startTeam POSTs the flat spec as JSON and returns the receipt", async () => {
+  const receipt = {
+    team_run_id: "team-1",
+    cwd: "/tmp/wt",
+    branch: "task/add-a-parser",
+    status: "queued",
+    message: "Task started on task/add-a-parser.",
+  };
+  const { apiFetch, calls } = makeFetchStub(jsonResponse({ ok: true, data: receipt }));
+
+  const result = await startTeam(apiFetch, {
+    title: "Add a parser",
+    context: "The loader needs one.",
+    acceptance_criteria: "Parses all three encodings.",
+    agreed_scope: "Parser only.",
+    quality_rules: "No unwrap in library code.",
+    cwd: "/tmp/repo",
+    target_branch: null,
+    device_id: "device-a",
+  });
+
+  assert.deepEqual(result, receipt);
+  assert.equal(calls[0].input, "/api/session/team");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers?.["Content-Type"], "application/json");
+  const body = JSON.parse(calls[0].init.body);
+  assert.equal(body.title, "Add a parser");
+  assert.equal(body.agreed_scope, "Parser only.");
+  assert.equal(body.device_id, "device-a");
 });

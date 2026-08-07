@@ -9,8 +9,8 @@ use tokio::sync::{watch, RwLock};
 use tracing::warn;
 
 use super::{
-    DeviceRecord, PairedDevice, RelayState, ReviewJob, ReviewerThread, ThreadSessionSettings,
-    WorkflowRun, PERSISTED_STATE_VERSION,
+    DeviceRecord, PairedDevice, RelayState, ReviewJob, ReviewerThread, TeamRun,
+    ThreadSessionSettings, WorkflowRun, PERSISTED_STATE_VERSION,
 };
 
 const PERSISTENCE_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -82,6 +82,15 @@ pub(super) struct PersistedRelayState {
     /// orchestrator. `#[serde(default)]` keeps old state files loadable (empty map).
     #[serde(default)]
     pub(super) workflow_jobs: std::collections::HashMap<String, WorkflowRun>,
+    /// Task team runs (orchestration metadata only — the agents' transcripts are
+    /// rebuilt from the provider, and the TL's plan/design/report live as files in
+    /// the task worktree). Non-terminal runs persist, and a `Paused` run restores
+    /// verbatim so the user can resume it — see `RelayState::restored_team_runs`.
+    /// `#[serde(default)]` keeps old state files loadable (empty map), which is
+    /// why adding this map needs no `PERSISTED_STATE_VERSION` bump — a bump is a
+    /// hard load error, not a migration.
+    #[serde(default)]
+    pub(super) team_runs: std::collections::HashMap<String, TeamRun>,
     /// Web Push subscriptions for remote devices, keyed by device_id. Persisted
     /// so a closed/locked phone keeps receiving pushes across a relay restart.
     /// `#[serde(default)]` keeps old state files loadable (empty map).
@@ -163,6 +172,29 @@ impl PersistedRelayState {
             // non-terminal run must survive so the restore side can reconcile it to
             // `Interrupted` and offer a re-run, rather than vanishing on restart.
             workflow_jobs: relay.workflow_jobs.clone(),
+            // Persist ALL team runs, terminal and not — a `Paused` run in
+            // particular exists precisely to be picked up after a restart.
+            //
+            // A run whose TL thread is still a synthetic `claude-pending-*` id
+            // (the SDK only mints a real session id on the first turn) cannot be
+            // resumed: that thread will not exist after a restart. But DROPPING
+            // the run would lose the spec, the card, and — worse — the record of a
+            // worktree and branch that are still sitting on disk with nothing
+            // pointing at them. So the id is cleared and the run is recorded
+            // terminal-Interrupted instead: the user still sees what was attempted
+            // and where its worktree is. Same treatment `active_thread_id` and
+            // `reviewer_threads` give their pending ids, minus the deletion.
+            team_runs: relay
+                .team_runs
+                .iter()
+                .map(|(id, run)| {
+                    let mut run = run.clone();
+                    if run.tl_thread_id.starts_with("claude-pending-") {
+                        run.detach_unresumable_tl();
+                    }
+                    (id.clone(), run)
+                })
+                .collect(),
             push_subscriptions: relay.push_subscriptions.clone(),
             projects: relay.projects.clone(),
             thread_project_id: relay.thread_project_id.clone(),

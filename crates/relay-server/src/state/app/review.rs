@@ -251,6 +251,18 @@ starting a review"
             let parent_cwd = relay
                 .thread_cwd(&parent_thread_id)
                 .ok_or_else(|| "cannot resolve the thread to review".to_string())?;
+            // The reciprocal of the task team's cwd lock, and the one place the
+            // "a review only needs its own thread to be idle" rule does not hold:
+            // a review reads the whole working tree, and a task team has three
+            // agents writing that tree continuously. The snapshot would not just
+            // be a moving target, it would be someone else's half-finished edit.
+            if relay.is_cwd_team_locked(&parent_cwd) {
+                return Err(
+                    "a task is running in this workspace; wait for it to finish before \
+starting a review"
+                        .to_string(),
+                );
+            }
             // Liveness is checked on the NAMED parent, not the active thread.
             if relay
                 .runtime_for_thread(&parent_thread_id)

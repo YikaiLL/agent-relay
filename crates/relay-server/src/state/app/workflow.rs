@@ -317,6 +317,18 @@ starting a workflow"
             let parent_cwd = relay
                 .thread_cwd(&parent_thread_id)
                 .ok_or_else(|| "cannot resolve the thread to run a workflow on".to_string())?;
+            // The reciprocal of the task team's own cwd lock. `has_active_workflow`
+            // scans `workflow_jobs` only, so a team run does not trip it — without
+            // this check a workflow would launch file-mutating turns straight into
+            // a worktree three agents are already editing under an orchestrator
+            // that knows nothing about it.
+            if relay.is_cwd_team_locked(&parent_cwd) {
+                return Err(
+                    "a task is running in this workspace; wait for it to finish before \
+starting a workflow"
+                        .to_string(),
+                );
+            }
             // The device must be allowed to act in the parent thread's workspace — the
             // run launches file-mutating turns there.
             let device_scope = relay.device_path_scope(device_id);
@@ -919,7 +931,7 @@ the workflow remains locked"
     /// turn must not keep running after the run reports failure. Re-issues the stop
     /// while waiting; bounded by `WORKFLOW_DRAIN_MAX_SECS`. Returns false when the
     /// stop cannot be confirmed; callers must leave the workflow non-terminal.
-    async fn stop_and_drain(&self, thread_id: &str) -> bool {
+    pub(super) async fn stop_and_drain(&self, thread_id: &str) -> bool {
         self.deny_thread_approvals_best_effort(thread_id).await;
         let drain_ms = self
             .workflow_drain_max_ms
