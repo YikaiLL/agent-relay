@@ -548,6 +548,16 @@ impl TeamRun {
             return;
         }
         self.error = Some(error.into());
+        // A stop already asked for outranks the failure it almost certainly
+        // caused. Draining a turn makes the driver see it end with no reply, and
+        // between `request_pause` and the settlement the run is `PausePending` —
+        // neither terminal nor settled-without-driver — so the driver would win
+        // that race and the user would get `failed` for pressing Cancel. The
+        // reason is still recorded above; it is just not the run's verdict.
+        if self.pause_requested {
+            self.updated_at = unix_now();
+            return;
+        }
         self.set_status(TeamRunStatus::Failed);
     }
 
@@ -1428,6 +1438,41 @@ mod tests {
             run.tl_reseed_reason.is_none(),
             "acting on the request consumes it, or the next loop re-seeds forever"
         );
+    }
+
+    #[test]
+    fn a_step_failure_cannot_beat_a_stop_the_user_already_asked_for() {
+        // A stop drains the very turn the driver is waiting on, so the driver
+        // observes that turn end with no reply and calls `fail`. Between
+        // `request_pause` and the settlement the run is `PausePending`, which is
+        // neither terminal nor settled-without-driver — so the driver used to win
+        // that race and the user got `failed` instead of `cancelled`. Found by the
+        // end-to-end run, where the timing is real.
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.request_pause("device-1");
+        assert_eq!(run.status, TeamRunStatus::PausePending);
+
+        run.fail("the team lead replied with nothing");
+        assert_eq!(
+            run.status,
+            TeamRunStatus::PausePending,
+            "a stop in progress outranks the failure it caused"
+        );
+        assert_eq!(
+            run.error.as_deref(),
+            Some("the team lead replied with nothing"),
+            "the reason is still recorded — it is just not the run's verdict"
+        );
+
+        // And the stop still lands as itself.
+        assert!(run.settle_paused("stopped by the user"));
+        assert_eq!(run.status, TeamRunStatus::Paused);
+
+        let mut cancelling = run_with(TeamPhase::SubTasks, vec![]);
+        cancelling.request_pause("device-1");
+        cancelling.fail("the team lead replied with nothing");
+        assert!(cancelling.cancel("the task was cancelled by the user"));
+        assert_eq!(cancelling.status, TeamRunStatus::Cancelled);
     }
 
     #[test]

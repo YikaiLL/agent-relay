@@ -39,6 +39,30 @@ struct FakeThread {
 struct FakeScenarioConfig {
     #[serde(default)]
     prompts: HashMap<String, FakeTurnScenario>,
+    /// Ordered fallbacks for prompts that CANNOT be matched exactly.
+    ///
+    /// Exact keying works only while a caller controls the whole prompt. Anything
+    /// the relay composes — a workspace diff, a provisioned worktree path, a
+    /// generated sub-task id — makes the prompt unknowable in advance, and those
+    /// are exactly the flows worth driving end to end. First matcher whose every
+    /// `contains` substring is present wins, so order them most specific first.
+    #[serde(default)]
+    matchers: Vec<FakeScenarioMatcher>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct FakeScenarioMatcher {
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    scenario: FakeTurnScenario,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FakeFileWrite {
+    path: String,
+    #[serde(default)]
+    contents: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -60,6 +84,12 @@ struct FakeTurnScenario {
     tool_kind: FakeToolKind,
     pause_after_chunks: Option<usize>,
     barrier: Option<String>,
+    /// Files to write into the thread's OWN cwd before the reply is emitted,
+    /// relative paths only. Without this the fake can talk about work but never
+    /// do any, so every flow whose next step reads a workspace diff — a review, a
+    /// merge gate, a commit — is unreachable end to end.
+    #[serde(default)]
+    write_files: Vec<FakeFileWrite>,
     #[serde(default)]
     duplicate_chunk_indices: Vec<usize>,
     #[serde(default)]
@@ -137,12 +167,34 @@ impl FakeScenarioHarness {
         })?;
         let config: FakeScenarioConfig = serde_json::from_slice(&contents)
             .map_err(|error| format!("failed to decode fake-provider scenario: {error}"))?;
-        for scenario in config.prompts.values() {
+        for matcher in &config.matchers {
+            // An empty matcher matches every prompt, which is never what anyone
+            // meant and would silently swallow the whole run.
+            if matcher.contains.iter().all(|needle| needle.is_empty()) {
+                return Err(
+                    "fake-provider scenario matcher needs at least one non-empty `contains`"
+                        .to_string(),
+                );
+            }
+            for path in &matcher.scenario.write_files {
+                validate_relative_write_path(&path.path)?;
+            }
+        }
+        for scenario in config
+            .prompts
+            .values()
+            .chain(config.matchers.iter().map(|matcher| &matcher.scenario))
+        {
             if scenario.pause_after_chunks.is_some() {
                 let barrier = scenario.barrier.as_deref().ok_or_else(|| {
                     "fake-provider scenario pause_after_chunks requires barrier".to_string()
                 })?;
                 validate_barrier_name(barrier)?;
+            }
+        }
+        for scenario in config.prompts.values() {
+            for path in &scenario.write_files {
+                validate_relative_write_path(&path.path)?;
             }
         }
         let barrier_timeout = std::env::var("FAKE_PROVIDER_BARRIER_TIMEOUT_MS")
@@ -160,7 +212,19 @@ impl FakeScenarioHarness {
     }
 
     fn scenario_for_prompt(&self, prompt: &str) -> Option<FakeTurnScenario> {
-        self.config.prompts.get(prompt).cloned()
+        if let Some(scenario) = self.config.prompts.get(prompt) {
+            return Some(scenario.clone());
+        }
+        self.config
+            .matchers
+            .iter()
+            .find(|matcher| {
+                matcher
+                    .contains
+                    .iter()
+                    .all(|needle| prompt.contains(needle))
+            })
+            .map(|matcher| matcher.scenario.clone())
     }
 
     async fn record_event(
@@ -259,6 +323,26 @@ impl FakeScenarioHarness {
 struct FakeApprovalGate {
     turn_id: String,
     sender: oneshot::Sender<ApprovalDecision>,
+}
+
+/// A scenario write must stay inside the thread's own workspace.
+///
+/// The fake provider is only ever a test double, but it is handed paths from a
+/// JSON file and runs as the relay user; an absolute path or a `..` segment here
+/// would let a scenario write anywhere on the machine.
+fn validate_relative_write_path(path: &str) -> Result<(), String> {
+    let candidate = Path::new(path);
+    if path.is_empty()
+        || candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "fake-provider scenario write_files paths must be relative and free of '..': {path:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_barrier_name(barrier: &str) -> Result<(), String> {
@@ -540,6 +624,31 @@ impl ProviderBridge for FakeProviderBridge {
             .as_ref()
             .map(|scenario| scenario.stop)
             .unwrap_or_default();
+        let write_files = scenario
+            .as_ref()
+            .map(|scenario| scenario.write_files.clone())
+            .unwrap_or_default();
+        if !write_files.is_empty() {
+            let cwd = self
+                .threads
+                .lock()
+                .await
+                .get(&thread_id)
+                .map(|thread| thread.summary.cwd.clone())
+                .unwrap_or_default();
+            for file in &write_files {
+                // Validated at load time; re-checked here because the cwd is only
+                // known now and a join is where a bad path would actually escape.
+                if validate_relative_write_path(&file.path).is_err() || cwd.is_empty() {
+                    continue;
+                }
+                let target = Path::new(&cwd).join(&file.path);
+                if let Some(parent) = target.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let _ = tokio::fs::write(&target, file.contents.as_bytes()).await;
+            }
+        }
         let scenario_harness = self.scenario_harness.clone();
         let turn_id = self.next_token("fake-turn");
         let user_item_id = self.next_token("fake-user");
@@ -1626,6 +1735,7 @@ mod tests {
         let harness = FakeScenarioHarness {
             config: FakeScenarioConfig {
                 prompts: HashMap::new(),
+                ..Default::default()
             },
             control_dir: temp.path().to_path_buf(),
             barrier_timeout: Duration::from_secs(2),
@@ -1678,7 +1788,10 @@ mod tests {
         prompts: HashMap<String, FakeTurnScenario>,
     ) -> FakeScenarioHarness {
         FakeScenarioHarness {
-            config: FakeScenarioConfig { prompts },
+            config: FakeScenarioConfig {
+                prompts,
+                ..Default::default()
+            },
             control_dir: temp.path().to_path_buf(),
             barrier_timeout: Duration::from_secs(2),
             event_seq: Arc::new(AtomicU64::new(1)),
