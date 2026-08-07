@@ -456,6 +456,16 @@ impl AppState {
             if relay.is_thread_or_cwd_workflow_locked(&target_thread) {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
             }
+            // A task team drives its own threads, so a message typed into one would
+            // interleave with the driver's turn. The single exception is the team
+            // lead of a PAUSED run: nothing is driving it, and redirecting the task
+            // before resuming is the whole point of being able to pause.
+            if matches!(
+                relay.team_thread_gate(&target_thread),
+                crate::state::TeamThreadGate::Locked
+            ) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
+            }
             // A thread with a turn ALREADY IN FLIGHT must not receive a second
             // prompt: taking it over and calling start_turn again would double-start
             // (the provider rejects/queues it, and the relay loses track of the

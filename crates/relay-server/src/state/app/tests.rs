@@ -8962,6 +8962,11 @@ mod review_tests {
         // Replies to emit, one popped per turn (FIFO), overriding every other
         // reply rule. Lets a test script a whole multi-role pipeline in order.
         scripted_replies: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // AskUserQuestion request ids that were actually ANSWERED through the
+        // bridge. A parked turn watches this rather than the pending map, because
+        // cleanup also empties that map — and a turn that was drained must not
+        // then behave as though someone had answered it.
+        answered_asks: Arc<Mutex<std::collections::HashSet<String>>>,
         // Verdicts the reviewer should emit, one popped per reviewer turn (FIFO).
         // Empty → default NEEDS_CHANGES. Drives the iterative loop in tests.
         reviewer_verdicts: Arc<Mutex<std::collections::VecDeque<String>>>,
@@ -9041,6 +9046,7 @@ mod review_tests {
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
                 scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                answered_asks: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 raise_approval_on_fix_turn: Arc::new(AtomicBool::new(false)),
                 suppress_fix_reply: Arc::new(AtomicBool::new(false)),
@@ -9414,6 +9420,7 @@ mod review_tests {
             let raise_ask_user = self.raise_ask_user.load(Ordering::Relaxed)
                 || (is_reviewer_turn && self.ask_user_on_reviewer_turn.load(Ordering::Relaxed));
             let complete_delay_ms = self.complete_delay_ms.load(Ordering::Relaxed);
+            let answered_asks = self.answered_asks.clone();
             let approval_id = self.next_token("approval");
             let ask_id = self.next_token("ask");
             let unrelated_approval_id = self.next_token("unrelated-approval");
@@ -9443,7 +9450,25 @@ mod review_tests {
                         },
                     );
                     relay.notify();
-                    return;
+                    drop(relay);
+                    // A parked turn is NOT stopped: a real provider is blocked
+                    // inside `canUseTool` and the SAME turn carries on the moment
+                    // the answer lands. Nothing "resumes" it, so this waits for a
+                    // real answer and then falls through to the ordinary
+                    // completion. Watching `answered_asks` rather than the pending
+                    // map matters — cleanup empties that map too, and a drained
+                    // turn must not behave as though it had been answered.
+                    let mut answered = false;
+                    for _ in 0..2_000 {
+                        if answered_asks.lock().await.contains(&ask_id) {
+                            answered = true;
+                            break;
+                        }
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                    if !answered {
+                        return;
+                    }
                 }
                 if inject_unrelated {
                     // An unrelated background thread parks on its own approval. The
@@ -9601,9 +9626,13 @@ mod review_tests {
 
         async fn respond_to_ask_user_question(
             &self,
-            _request_id: &str,
+            request_id: &str,
             _answers: &serde_json::Map<String, serde_json::Value>,
         ) -> Result<(), String> {
+            self.answered_asks
+                .lock()
+                .await
+                .insert(request_id.to_string());
             Ok(())
         }
 
@@ -17329,6 +17358,270 @@ underneath it"
             !run.pause_requested && run.status != crate::state::TeamRunStatus::Blocked,
             "a refused stop must leave the run untouched: {:?}",
             run.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_parks_the_task_and_the_answer_carries_the_same_turn_on() {
+        // The insight the whole brick rests on: a parked turn is NOT stopped. It is
+        // blocked inside the provider's tool callback and continues the instant the
+        // answer lands, so there is no "resume the turn" machinery — the driver
+        // only has to keep waiting instead of treating a parked turn as finished.
+        use crate::protocol::SubmitAskUserAnswerInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_ask_user.store(true, Ordering::Relaxed);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // The run parks, and says so on the record rather than only in a log.
+        let mut request_id = String::new();
+        for _ in 0..600 {
+            let run = app.relay.read().await.team_run(&run_id).cloned();
+            if let Some(run) = run {
+                if run.status == crate::state::TeamRunStatus::AwaitingUser {
+                    let awaiting = run.awaiting.clone().expect("the parked question");
+                    assert_eq!(awaiting.role, "tl", "the intake turn is the TL's");
+                    assert_eq!(awaiting.thread_id, run.tl_thread_id);
+                    request_id = awaiting.request_id;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !request_id.is_empty(),
+            "the run never parked on the question"
+        );
+        // Only the FIRST turn asks; the parked one already captured the flag, so
+        // clearing it now lets the rest of the pipeline run.
+        provider.raise_ask_user.store(false, Ordering::Relaxed);
+
+        // The team lock must NOT close the channel it exists to keep open.
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "Which approach?".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        app.submit_ask_user_answer(
+            &request_id,
+            SubmitAskUserAnswerInput {
+                answers,
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("a team thread's question must stay answerable");
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.complex,
+            Some(false),
+            "the SAME turn carried on and its reply was recorded: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "and the pipeline ran to the end from there: {:?}",
+            run.error
+        );
+        assert!(
+            run.awaiting.is_none(),
+            "the parked question must be cleared once answered"
+        );
+        assert_ne!(
+            run.status,
+            crate::state::TeamRunStatus::AwaitingUser,
+            "and the run must not still claim to be waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_team_thread_takes_no_typed_messages_but_the_team_lead_takes_them_once_paused() {
+        // The asymmetry the product needs: a person watching a dev can read its
+        // transcript and answer its question card, but has no composer on it —
+        // typing there would interleave with the driver's own turn on that thread.
+        // The team lead is the exception, and only while the run is PAUSED, because
+        // redirecting the task before resuming is the reason pause exists.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        let tl = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.tl_thread_id.clone())
+            .expect("tl thread");
+
+        let error = app
+            .send_message(SendMessageInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                text: "actually, do it differently".to_string(),
+                model: None,
+                effort: None,
+            })
+            .await
+            .expect_err("a running task's threads take no typed messages");
+        assert!(
+            error.contains("pause the task"),
+            "the refusal should say what to do about it: {error}"
+        );
+        assert_eq!(
+            app.relay.read().await.team_thread_gate(&tl),
+            crate::state::TeamThreadGate::Locked
+        );
+
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        assert_eq!(
+            app.relay.read().await.team_thread_gate(&tl),
+            crate::state::TeamThreadGate::TlWhilePaused,
+            "a paused run's team lead is exactly who the user talks to"
+        );
+
+        // A dev thread stays shut even while paused: the run still owns its next
+        // turn on it, and it is not the seat that takes direction.
+        let dev = "some-dev-thread";
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.sub_tasks = vec![crate::state::SubTask {
+                id: "s1".to_string(),
+                dev_thread_id: Some(dev.to_string()),
+                owned_thread_ids: vec![dev.to_string()],
+                ..crate::state::SubTask::default()
+            }];
+        });
+        assert_eq!(
+            app.relay.read().await.team_thread_gate(dev),
+            crate::state::TeamThreadGate::Locked
+        );
+
+        // And once the run is over, everything unlocks.
+        app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay.team_thread_gate(&tl),
+            crate::state::TeamThreadGate::Free
+        );
+        assert_eq!(
+            relay.team_thread_gate(dev),
+            crate::state::TeamThreadGate::Free
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_question_freezes_the_stall_clock_rather_than_racing_it() {
+        // A user thinking about a question is not a stalled agent. If the parked
+        // time counted against the step's stall budget, a slow reader would kill a
+        // turn that was doing exactly what it was asked to.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_ask_user.store(true, Ordering::Relaxed);
+        // A stall budget far shorter than the time the user is about to take. The
+        // turn parks at ~15 ms, well inside it; everything after that is thinking
+        // time, and a clock that kept running would kill the turn at 120 ms.
+        app.set_team_step_stall_ms(120);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let mut parked = false;
+        for _ in 0..600 {
+            parked = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status == crate::state::TeamRunStatus::AwaitingUser)
+                .unwrap_or(false);
+            if parked {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(parked, "the run never parked on the question");
+
+        // Several stall windows' worth of the user reading the question.
+        sleep(Duration::from_millis(600)).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::AwaitingUser,
+            "a parked turn must outlive the stall budget many times over: {:?}",
+            run.error
+        );
+        assert!(run.awaiting.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_tool_approval_on_a_team_thread_is_denied_and_never_reaches_the_user() {
+        // Nobody is watching a background turn. The worktree is sandboxed, which is
+        // what makes non-prompting correct — so an approval that appears anyway is
+        // denied and the turn carries on. It is still recorded, because a denial
+        // means the agent was stopped from doing something.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_approval.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // The approval is dealt with without anyone answering it.
+        let mut denied = false;
+        for _ in 0..600 {
+            let noted = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| {
+                    run.unresolved
+                        .iter()
+                        .any(|entry| entry.contains("denied automatically"))
+                })
+                .unwrap_or(false);
+            if noted {
+                denied = true;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(denied, "the approval was never auto-handled");
+
+        let relay = app.relay.read().await;
+        assert!(
+            relay.pending_approvals.is_empty(),
+            "a team thread's approval must never be left sitting in front of the user"
+        );
+        assert_ne!(
+            relay.team_run(&run_id).map(|run| run.status),
+            Some(crate::state::TeamRunStatus::AwaitingUser),
+            "an approval is the run's to answer, not the user's"
         );
     }
 

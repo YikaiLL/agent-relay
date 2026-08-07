@@ -172,6 +172,23 @@ impl<'de> Deserialize<'de> for TeamRunStatus {
     }
 }
 
+/// What a user may do with a thread a task team owns.
+///
+/// One answer for every lock call site, rather than each guard inventing its own
+/// notion of "busy". The asymmetry is the requirement: a person watching a parked
+/// dev can read its transcript and answer its question card, but has no composer
+/// on it and no per-agent stop — the only stop is the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamThreadGate {
+    /// Not a team thread at all.
+    Free,
+    /// The team lead of a paused run: conversable, because that is where a user
+    /// redirects the task before resuming it.
+    TlWhilePaused,
+    /// The run owns the next turn on this thread.
+    Locked,
+}
+
 /// The user's Task, verbatim.
 ///
 /// IMMUTABLE by construction: only `TeamRun::new` sets it and there is no `&mut`
@@ -556,6 +573,10 @@ impl TeamRun {
         // turn is quiescent before getting here. Leaving a stale marker would make
         // the next cleanup pass read an unobservable turn and block the run.
         self.in_flight_thread = None;
+        // Nor is anyone still being asked. Proving quiescence means the turn that
+        // raised the question was stopped and its pending entry cleared, so a
+        // surviving `awaiting` would render a card for a question that is gone.
+        self.awaiting = None;
         self.status = TeamRunStatus::Paused;
         self.updated_at = unix_now();
         true

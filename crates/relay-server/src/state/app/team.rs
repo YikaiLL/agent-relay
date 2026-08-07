@@ -41,8 +41,14 @@ use super::worktree::{provision_task_worktree, TaskWorktree, NO_HOOKS};
 use super::*;
 
 /// Backstop stall timeout for one team turn. The wait returns as soon as the turn
-/// completes; this only trips on a turn that makes no progress at all.
-const TEAM_STEP_STALL_SECS: u64 = 600;
+/// completes; this only trips on a turn that makes no progress at all. Lives on
+/// `AppState` as `team_step_stall_ms` so a test can shrink it.
+
+/// How long a turn may stay parked on an `AskUserQuestion` before the run gives
+/// up on it. Deliberately enormous: the person being asked may be asleep, and the
+/// only cost of waiting is a worktree nobody else wants. It exists so an
+/// unanswered question cannot hold the run's locks forever.
+const TEAM_ASK_USER_MAX_SECS: u64 = 24 * 60 * 60;
 
 /// Ceiling on a rendered review diff.
 ///
@@ -400,6 +406,12 @@ resumed; its branch is untouched"
             app: self.clone(),
             run_id: run_id.to_string(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_team_step_stall_ms(&self, ms: u64) {
+        self.team_step_stall_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn release_team_drive(&self, run_id: &str) {
@@ -981,7 +993,13 @@ resumed; its branch is untouched"
     /// `claude-pending-*` id and `promote_background_thread` re-keys it on the
     /// first turn. Re-reading after send and after wait is what keeps the driver
     /// from talking to a thread that no longer exists.
-    async fn team_turn(&self, run_id: &str, slot: TeamThreadSlot, prompt: &str) -> TeamStepOutcome {
+    async fn team_turn(
+        &self,
+        run_id: &str,
+        slot: TeamThreadSlot,
+        role: TeamRole,
+        prompt: &str,
+    ) -> TeamStepOutcome {
         let Some(mut thread_id) = self.resolve_team_slot(run_id, slot).await else {
             return TeamStepOutcome::Failed(format!("task run {run_id} has no thread in {slot:?}"));
         };
@@ -1027,7 +1045,7 @@ resumed; its branch is untouched"
             thread_id = promoted;
         }
 
-        let outcome = self.wait_for_team_step(&thread_id).await;
+        let outcome = self.wait_for_team_step(run_id, &thread_id, role).await;
         if let Some(promoted) = self.resolve_team_slot(run_id, slot).await {
             thread_id = promoted;
         }
@@ -1122,8 +1140,34 @@ resumed; its branch is untouched"
     /// or the cwd: TL, dev and reviewer share one worktree, and the Claude SDK can
     /// start an unrequested turn of its own (the `task-notification` path), so any
     /// cwd-wide notion of "busy" would deadlock the run against itself.
-    async fn wait_for_team_step(&self, thread_id: &str) -> Option<String> {
-        let timeout = Duration::from_secs(TEAM_STEP_STALL_SECS);
+    ///
+    /// Three things happen here that `wait_for_step_idle` does not do, and each is
+    /// a consequence of a team turn being long-lived and unattended:
+    ///
+    /// 1. **A tool approval is RUN-owned.** The worktree is isolated so dev and TL
+    ///    run non-prompting; an approval that appears anyway is denied and the SAME
+    ///    turn carries on. Denying rather than approving matches the fail-closed
+    ///    posture everywhere else here, and it never reaches the user — nobody is
+    ///    watching a background turn at 3am.
+    /// 2. **An `AskUserQuestion` is USER-owned.** A parked turn is NOT stopped: it
+    ///    is blocked inside the provider's tool callback and resumes the instant an
+    ///    answer lands. So the wait simply keeps waiting — there is no "resume the
+    ///    turn" step to build, which is the single reason this brick is small. A
+    ///    parked thread also still reports itself working; see the loop body.
+    /// 3. **The stall deadline FREEZES while parked.** Otherwise a user who thinks
+    ///    about the question for eleven minutes trips a 600 s timeout that was
+    ///    measuring their reading speed rather than the agent's progress. A parked
+    ///    turn is bounded by `TEAM_ASK_USER_MAX_SECS` instead.
+    async fn wait_for_team_step(
+        &self,
+        run_id: &str,
+        thread_id: &str,
+        role: TeamRole,
+    ) -> Option<String> {
+        let timeout = Duration::from_millis(
+            self.team_step_stall_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         let mut deadline = Instant::now() + timeout;
         let mut last_revision = self
             .relay
@@ -1132,32 +1176,173 @@ resumed; its branch is untouched"
             .runtime_for_thread(thread_id)
             .map(|runtime| runtime.transcript_revision)
             .unwrap_or(0);
+        let mut parked_since: Option<Instant> = None;
         let mut rx = self.subscribe();
         loop {
+            let question;
+            let has_approval;
             {
                 let relay = self.relay.read().await;
+                // Only THIS thread's interactions matter. Another thread parking on
+                // its own approval is none of this run's business, and denying it
+                // would answer a question the user was asked.
+                has_approval = relay
+                    .pending_approvals
+                    .values()
+                    .any(|approval| approval.thread_id == thread_id);
+                question = relay
+                    .pending_ask_user_questions
+                    .values()
+                    .find(|pending| pending.thread_id == thread_id)
+                    .cloned();
                 let (working, revision) = match relay.runtime_for_thread(thread_id) {
                     Some(runtime) => (runtime.is_working(), runtime.transcript_revision),
                     None => (false, last_revision),
                 };
+                // No extra guard for a pending question here, and that is load
+                // bearing rather than an omission: `RelayState::set_thread_status`
+                // drops a thread's pending requests the moment its status settles,
+                // under an explicit contract that every provider marks a thread
+                // working BEFORE recording one. So "not working" and "has a parked
+                // question" cannot both be true, and a guard for it would be code
+                // no test could ever reach.
                 if !working {
-                    return None;
+                    break;
                 }
                 if revision != last_revision {
                     last_revision = revision;
+                    // Progress un-freezes the clock even if a question is still
+                    // recorded: the agent is demonstrably moving.
                     deadline = Instant::now() + timeout;
                 }
             }
+
+            // Outside the read lock: both of these take locks of their own.
+            if has_approval {
+                self.auto_handle_team_approval(run_id, thread_id).await;
+                continue;
+            }
+
+            match (&question, parked_since) {
+                (Some(pending), None) => {
+                    parked_since = Some(Instant::now());
+                    self.park_team_run_on_question(run_id, thread_id, role, pending)
+                        .await;
+                }
+                (None, Some(_)) => {
+                    parked_since = None;
+                    self.unpark_team_run(run_id).await;
+                    // A fresh stall window: the agent starts working again from
+                    // here, and none of the time the user spent counts against it.
+                    deadline = Instant::now() + timeout;
+                }
+                _ => {}
+            }
+
+            // While parked the stall deadline is frozen and a far longer bound
+            // applies, so an unanswered question eventually fails rather than
+            // holding the run's worktree forever.
+            let wake = match parked_since {
+                Some(since) => since + Duration::from_secs(TEAM_ASK_USER_MAX_SECS),
+                None => deadline,
+            };
             tokio::select! {
                 changed = rx.changed() => {
                     if changed.is_err() {
-                        return None;
+                        break;
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Some(format!("thread {thread_id} made no progress for {TEAM_STEP_STALL_SECS}s"));
+                _ = tokio::time::sleep_until(wake) => {
+                    if parked_since.is_some() {
+                        self.unpark_team_run(run_id).await;
+                        return Some(format!(
+                            "thread {thread_id} asked a question that went unanswered for \
+            {TEAM_ASK_USER_MAX_SECS}s"
+                        ));
+                    }
+                    return Some(format!(
+                        "thread {thread_id} made no progress for {}s",
+                        timeout.as_secs()
+                    ));
                 }
             }
+        }
+        if parked_since.is_some() {
+            self.unpark_team_run(run_id).await;
+        }
+        None
+    }
+
+    /// Deny a tool approval raised by a team thread and let the turn continue.
+    ///
+    /// The user never sees it: they are not watching, and the isolated worktree is
+    /// what makes non-prompting correct in the first place. It IS recorded on the
+    /// run, because a denial means the agent was stopped from doing something and
+    /// the final report is where the user finds that out.
+    async fn auto_handle_team_approval(&self, run_id: &str, thread_id: &str) {
+        self.deny_thread_approvals_best_effort(thread_id).await;
+        self.clear_thread_interactions(thread_id).await;
+        let note = format!(
+            "a tool approval on thread {thread_id} was denied automatically; the task \
+worktree is sandboxed and nobody is watching a background turn"
+        );
+        let mut relay = self.relay.write().await;
+        relay.update_team_run(run_id, |run| {
+            // Deduplicated: a thread that keeps asking must not fill the report with
+            // the same line.
+            if !run.unresolved.iter().any(|entry| entry == &note) {
+                run.unresolved.push(note.clone());
+            }
+        });
+        relay.push_log("warn", format!("Task {run_id}: {note}"));
+        relay.notify();
+    }
+
+    async fn park_team_run_on_question(
+        &self,
+        run_id: &str,
+        thread_id: &str,
+        role: TeamRole,
+        pending: &crate::state::PendingAskUserQuestion,
+    ) {
+        let awaiting = crate::state::AwaitingUser {
+            thread_id: thread_id.to_string(),
+            request_id: pending.request_id.clone(),
+            role: role.as_str().to_string(),
+            asked_at: pending.requested_at,
+        };
+        let mut relay = self.relay.write().await;
+        relay.update_team_run(run_id, |run| {
+            run.awaiting = Some(awaiting.clone());
+            run.set_status(TeamRunStatus::AwaitingUser);
+        });
+        relay.push_log(
+            "info",
+            format!(
+                "Task {run_id}: the {} is waiting on your answer",
+                role.as_str()
+            ),
+        );
+        // Exactly once per park: this is what wakes the surfaces that render the
+        // question card.
+        relay.notify();
+    }
+
+    async fn unpark_team_run(&self, run_id: &str) {
+        let mut relay = self.relay.write().await;
+        let mut changed = false;
+        relay.update_team_run(run_id, |run| {
+            if run.awaiting.take().is_some() {
+                changed = true;
+            }
+            // Only back to Running if the run is still ours to move: a stop that
+            // landed while the question was parked settled it already.
+            if matches!(run.status, TeamRunStatus::AwaitingUser) {
+                run.set_status(TeamRunStatus::Running);
+            }
+        });
+        if changed {
+            relay.notify();
         }
     }
 
@@ -1222,7 +1407,9 @@ resumed; its branch is untouched"
     /// Run one TL turn, counting it against the generation's turn budget.
     async fn tl_turn(&self, run_id: &str, prompt: String) -> Option<String> {
         self.ensure_tl_thread(run_id).await.ok()?;
-        let outcome = self.team_turn(run_id, TeamThreadSlot::Tl, &prompt).await;
+        let outcome = self
+            .team_turn(run_id, TeamThreadSlot::Tl, TeamRole::Tl, &prompt)
+            .await;
         {
             let mut relay = self.relay.write().await;
             relay.update_team_run(run_id, |run| run.tl_turns_this_generation += 1);
@@ -1308,7 +1495,10 @@ resumed; its branch is untouched"
 `VERDICT: NEEDS_CHANGES` followed by one finding per line.",
             run.design_rel_path, run.spec.agreed_scope, run.spec.acceptance_criteria
         );
-        let text = match self.team_turn(run_id, slot, &prompt).await {
+        let text = match self
+            .team_turn(run_id, slot, TeamRole::Reviewer, &prompt)
+            .await
+        {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
             TeamStepOutcome::Failed(error) => {
@@ -1429,7 +1619,12 @@ resumed; its branch is untouched"
             &prior_findings,
         );
         let outcome = self
-            .team_turn(run_id, TeamThreadSlot::SubTaskDev(index), &prompt)
+            .team_turn(
+                run_id,
+                TeamThreadSlot::SubTaskDev(index),
+                TeamRole::Dev,
+                &prompt,
+            )
             .await;
         if let TeamStepOutcome::Failed(error) = outcome {
             self.fail_team_run(run_id, error).await;
@@ -1505,7 +1700,12 @@ finding per line.",
         );
 
         let text = match self
-            .team_turn(run_id, TeamThreadSlot::SubTaskReviewer(index), &prompt)
+            .team_turn(
+                run_id,
+                TeamThreadSlot::SubTaskReviewer(index),
+                TeamRole::Reviewer,
+                &prompt,
+            )
             .await
         {
             TeamStepOutcome::Replied(text) => text,
@@ -1681,7 +1881,10 @@ history with it and no fork point was recorded",
         let slot = self.record_run_thread(run_id, &thread_id).await;
 
         let prompt = prompts::mr_gate(&run.spec, &diff, workspace.as_str());
-        let text = match self.team_turn(run_id, slot, &prompt).await {
+        let text = match self
+            .team_turn(run_id, slot, TeamRole::Reviewer, &prompt)
+            .await
+        {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
             TeamStepOutcome::Failed(error) => {
@@ -1733,7 +1936,9 @@ history with it and no fork point was recorded",
         let slot = self.record_run_thread(run_id, &thread_id).await;
 
         let prompt = prompts::address_mr(&findings, &run.plan_rel_path);
-        if let TeamStepOutcome::Failed(error) = self.team_turn(run_id, slot, &prompt).await {
+        if let TeamStepOutcome::Failed(error) =
+            self.team_turn(run_id, slot, TeamRole::Dev, &prompt).await
+        {
             self.fail_team_run(run_id, error).await;
             return false;
         }

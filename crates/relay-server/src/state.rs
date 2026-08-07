@@ -50,8 +50,8 @@ pub(crate) use self::task_list::{
 #[allow(unused_imports)]
 pub(crate) use self::team::{
     next_team_action, parse_complexity, parse_sub_tasks, prompts, AwaitingUser, SubTask,
-    SubTaskStatus, TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus, TeamThreadSlot,
-    TlGeneration, MAX_MR_ROUNDS, MAX_SUBTASK_REVIEW_ROUNDS, MAX_TL_GENERATIONS,
+    SubTaskStatus, TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus, TeamThreadGate,
+    TeamThreadSlot, TlGeneration, MAX_MR_ROUNDS, MAX_SUBTASK_REVIEW_ROUNDS, MAX_TL_GENERATIONS,
 };
 #[allow(unused_imports)]
 pub(crate) use self::workflow::{

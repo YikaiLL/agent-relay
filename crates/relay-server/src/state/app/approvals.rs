@@ -50,6 +50,12 @@ impl AppState {
                     WORKFLOW_LOCKED_THREAD_MSG.to_string(),
                 ));
             }
+            // Same for a task team: its wait loop denies its own approvals and
+            // carries the turn on, so a user decision here would race that and
+            // could approve a write the run had already refused.
+            if relay.is_thread_or_cwd_team_locked(&pending.thread_id) {
+                return Err(ApprovalError::Bridge(TEAM_LOCKED_THREAD_MSG.to_string()));
+            }
             pending
         };
 
@@ -110,10 +116,21 @@ impl AppState {
         }
         let pending = {
             let relay = self.relay.read().await;
-            relay
-                .ensure_device_can_approve(&device_id)
-                .map_err(AskUserAnswerError::Bridge)?;
-            relay.pending_ask_user_questions.get(request_id).cloned()
+            let pending = relay.pending_ask_user_questions.get(request_id).cloned();
+            // A task team's question comes from a BACKGROUND thread, so there is no
+            // active session to "approve for" — and requiring one would close the
+            // run's only channel to a person exactly when a relay has no foreground
+            // session open, which is the normal state while a task runs unattended.
+            // The run itself is the context that authorizes the answer.
+            let team_owned = pending
+                .as_ref()
+                .is_some_and(|pending| relay.is_thread_team_locked(&pending.thread_id));
+            if !team_owned {
+                relay
+                    .ensure_device_can_approve(&device_id)
+                    .map_err(AskUserAnswerError::Bridge)?;
+            }
+            pending
         };
         let pending = pending.ok_or(AskUserAnswerError::NoPendingRequest)?;
         // A reviewer thread's questions belong to the review — block answering them.
@@ -356,6 +373,11 @@ impl AppState {
             }
             if relay.is_thread_or_cwd_workflow_locked(&thread_id) {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
+            }
+            // Rolling a file change back rewrites the working tree, and a task
+            // team's worktree has three agents in it.
+            if relay.is_thread_or_cwd_team_locked(&thread_id) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
             }
             let runtime = relay
                 .runtime_for_thread(&thread_id)

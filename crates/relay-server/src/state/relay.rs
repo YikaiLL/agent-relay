@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
     ensure_path_within_device_scope, persistence::PersistedRelayState, unix_now, ReviewJob,
-    RunStatus, SecurityProfile, TaskListRun, TeamRun, TeamRunStatus, WorkflowRun,
+    RunStatus, SecurityProfile, TaskListRun, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
     CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
     STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
@@ -1550,6 +1550,75 @@ impl RelayState {
             || self
                 .thread_cwd(thread_id)
                 .is_some_and(|cwd| self.is_cwd_workflow_locked(&cwd))
+    }
+
+    /// Whether a non-terminal team run owns `thread_id` — any seat, including
+    /// retired TL generations and run-level threads.
+    ///
+    /// A team thread is not a thread the user talks to. The run drives it, and a
+    /// message typed into one would interleave with the driver's own turn. The one
+    /// deliberate exception is the AskUserQuestion channel, which is the run's only
+    /// way to ask a person something — see `team_thread_gate`.
+    pub(crate) fn is_thread_team_locked(&self, thread_id: &str) -> bool {
+        self.team_runs.values().any(|run| {
+            !run.status.is_terminal()
+                && run
+                    .owned_thread_ids()
+                    .iter()
+                    .any(|owned| owned == thread_id)
+        })
+    }
+
+    /// Whether a non-terminal team run owns the workspace at `cwd`.
+    ///
+    /// The reciprocal of the run's own isolation: a review or workflow started
+    /// against the task worktree would walk into a tree three agents are already
+    /// editing under an orchestrator that knows nothing about it.
+    pub(crate) fn is_cwd_team_locked(&self, cwd: &str) -> bool {
+        self.team_runs
+            .values()
+            .any(|run| !run.status.is_terminal() && run.cwd == cwd)
+    }
+
+    pub(crate) fn is_thread_or_cwd_team_locked(&self, thread_id: &str) -> bool {
+        self.is_thread_team_locked(thread_id)
+            || self
+                .thread_cwd(thread_id)
+                .is_some_and(|cwd| self.is_cwd_team_locked(&cwd))
+    }
+
+    /// What the user may do with a thread a team run owns.
+    ///
+    /// One function so every lock call site gets ONE consistent answer, rather
+    /// than each guard inventing its own notion of "is this thread busy".
+    pub(crate) fn team_thread_gate(&self, thread_id: &str) -> TeamThreadGate {
+        for run in self.team_runs.values() {
+            if run.status.is_terminal() {
+                continue;
+            }
+            if !run.owned_thread_ids().iter().any(|id| id == thread_id) {
+                continue;
+            }
+            // The team lead is conversable while the run is parked — that is where
+            // a user redirects the task. Only while `Paused`, though: at any other
+            // moment the driver owns the next turn on that thread. This runs BEFORE
+            // the workspace rule below, which would otherwise swallow it: the team
+            // lead lives in the very worktree that rule locks.
+            if run.tl_thread_id == thread_id && matches!(run.status, TeamRunStatus::Paused) {
+                return TeamThreadGate::TlWhilePaused;
+            }
+            return TeamThreadGate::Locked;
+        }
+        // A thread the run does not own but which sits in its worktree is locked
+        // all the same. The isolation a task run buys is a property of the
+        // WORKSPACE — three agents are editing those files — not of a thread list.
+        if self
+            .thread_cwd(thread_id)
+            .is_some_and(|cwd| self.is_cwd_team_locked(&cwd))
+        {
+            return TeamThreadGate::Locked;
+        }
+        TeamThreadGate::Free
     }
 
     /// Hard-cap the total retained review jobs (evicting the oldest terminal jobs

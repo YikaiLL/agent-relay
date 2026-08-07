@@ -82,6 +82,11 @@ pub(crate) const REVIEW_LOCKED_THREAD_MSG: &str =
     "this thread is being reviewed; switch to another thread or wait for the review to finish";
 pub(crate) const WORKFLOW_LOCKED_THREAD_MSG: &str =
     "a workflow is running in this workspace; wait for it to finish before changing threads or files";
+/// A team thread is driven by the run, not talked to. A message typed into one
+/// would interleave with the driver's own turn on the same thread. The question
+/// card stays answerable — that channel is deliberately NOT closed by this lock.
+pub(crate) const TEAM_LOCKED_THREAD_MSG: &str =
+    "this thread belongs to a running task; pause the task to talk to its team lead";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -116,6 +121,10 @@ pub struct AppState {
     /// Review job ids whose orchestrators must stop before starting another turn.
     /// A set is required because unrelated parent threads may be reviewed concurrently.
     cancel_requested_jobs: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Stall window (ms) for one team turn. A backstop, not a cap: it resets on
+    /// every scrap of progress and FREEZES entirely while a turn is parked on a
+    /// user's question. Overridable in tests.
+    team_step_stall_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Task team run ids that currently have a driver. The ONE piece of team run
     /// state that cannot live on the record: two concurrent Resumes both read
     /// `Paused`, both pass their guard, and both spawn a driver onto the same
@@ -243,6 +252,7 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -343,6 +353,7 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
