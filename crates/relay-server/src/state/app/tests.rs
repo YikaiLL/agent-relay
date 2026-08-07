@@ -17027,6 +17027,62 @@ turn) must allow a review: {error:?}"
     }
 
     #[tokio::test]
+    async fn a_running_task_keeps_reviews_and_workflows_out_of_its_worktree() {
+        // The reciprocal lock, and the one that is easy to forget: a team run does
+        // NOT trip `has_active_workflow` or `has_active_review` — those scan their
+        // own maps. Without an explicit check, an ad-hoc review would snapshot a
+        // tree three agents are mid-edit in, and a workflow would launch its own
+        // file-mutating author into it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .expect("cwd");
+
+        // A user thread living in the task's worktree — the only way in.
+        let outsider = start_parent(&app, &cwd, "codex").await;
+        let error = app
+            .request_review(RequestReviewInput {
+                parent_thread_id: Some(outsider.id.clone()),
+                ..review_input("codex")
+            })
+            .await
+            .expect_err("a review must not walk into a running task's worktree");
+        assert!(
+            error.contains("a task is running"),
+            "the refusal should name the task: {error}"
+        );
+
+        let error = app
+            .authorize_and_resolve_workflow_parent("device-1", Some(outsider.id.clone()))
+            .await
+            .expect_err("nor may a workflow");
+        assert!(error.contains("a task is running"), "{error}");
+
+        // Once the task is over, the workspace is ordinary again.
+        app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        assert!(
+            !app.relay.read().await.is_cwd_team_locked(&cwd),
+            "a finished task holds nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn a_second_task_is_refused_while_one_is_live() {
         let (_repo, root) = init_team_repo().await;
         let (app, providers) = build_review_app(&root, &["codex"]).await;
