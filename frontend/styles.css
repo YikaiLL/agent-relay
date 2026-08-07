@@ -736,6 +736,16 @@ button:disabled {
   height: 14px;
   flex: 0 0 auto;
   color: currentColor;
+  /* An icon inside a button must never be the hit target.
+     A `click` only fires if mousedown and mouseup resolve to the same node, and
+     these icons are injected with `dangerouslySetInnerHTML` — so any re-render
+     between the two swaps the <svg> out and the browser fires NO click at all.
+     The button then looks dead: it highlights on hover, depresses on press, and
+     does nothing. Remote's sidebar reproduces it on demand, because its
+     `[sidebar-debug]` tracer calls renderLog() on pointerdown and that re-render
+     lands squarely between mousedown and mouseup.
+     Routing hit-testing to the button makes the icon's identity irrelevant. */
+  pointer-events: none;
 }
 .send-button-icon svg,
 .inline-icon svg {

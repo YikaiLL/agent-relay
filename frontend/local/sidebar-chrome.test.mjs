@@ -133,6 +133,23 @@ test("all three Settings gears are wired to the modal", () => {
   assert.match(appJs, /iconRailSettingsButton\?\.addEventListener\([\s\S]{0,60}?openSettingsModal\(\)/);
 });
 
+// Every one of those gears is a bare glyph in a button, and the glyph is injected
+// with `dangerouslySetInnerHTML`. A `click` only fires when mousedown and mouseup
+// resolve to the SAME node, so if anything re-renders between the two the <svg> is
+// replaced and the browser fires no click at all — the button hovers, depresses,
+// and does nothing. Remote reproduces this on demand (its `[sidebar-debug]` tracer
+// calls renderLog() on pointerdown, landing a re-render mid-gesture); local is one
+// stray re-render away from the same thing. Making the icon transparent to hit
+// testing means the button is always the target and the glyph's identity stops
+// mattering.
+test("an icon inside a button is never the click target", () => {
+  assert.match(
+    ruleBody(".inline-icon"),
+    /pointer-events:\s*none/,
+    "a re-render between mousedown and mouseup would otherwise swallow the click entirely"
+  );
+});
+
 // The footer bar is `display: none` on local mobile, so the footer gear cannot be
 // the only entry — the chat-header gear is what covers that case, and the ≤960px
 // block has to un-hide it against the base `display: none`.
