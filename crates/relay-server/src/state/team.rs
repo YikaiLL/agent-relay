@@ -362,6 +362,21 @@ pub(crate) struct AwaitingUser {
     pub(crate) asked_at: u64,
 }
 
+/// WHERE in the record a thread id lives.
+///
+/// The driver addresses seats by slot rather than by value so it can re-resolve
+/// after a mid-turn promotion. Holding the id itself is exactly the bug: the
+/// value it captured before sending can be dead by the time the turn ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeamThreadSlot {
+    Tl,
+    SubTaskDev(usize),
+    SubTaskReviewer(usize),
+    /// Index into `run_owned_thread_ids` — the design reviewer, an MR reviewer,
+    /// or the MR-revision dev.
+    RunOwned(usize),
+}
+
 /// The next thing the driver should do. Derived, never stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TeamAction {
@@ -593,6 +608,71 @@ impl TeamRun {
         self.sub_tasks
             .iter()
             .position(|task| !task.status.is_terminal() || !task.digested)
+    }
+
+    /// Rewrite every reference to `pending_id` as `real_id`.
+    ///
+    /// Claude mints a synthetic `claude-pending-*` id and only replaces it with a
+    /// real session id once the first turn starts, at which point
+    /// `promote_background_thread` re-keys the runtime map. EVERY seat here is
+    /// background-started, so every one of them can be promoted mid-turn — and a
+    /// driver still holding the pending id would find no runtime, read that as
+    /// "not working", and treat a turn that is very much running as finished.
+    pub(crate) fn rekey_thread(&mut self, pending_id: &str, real_id: &str) -> bool {
+        if pending_id.is_empty() || pending_id == real_id {
+            return false;
+        }
+        let mut changed = false;
+        let mut swap = |slot: &mut String| {
+            if slot == pending_id {
+                *slot = real_id.to_string();
+                changed = true;
+            }
+        };
+        swap(&mut self.tl_thread_id);
+        for generation in self.tl_succession.iter_mut() {
+            swap(&mut generation.thread_id);
+        }
+        for thread_id in self.run_owned_thread_ids.iter_mut() {
+            swap(thread_id);
+        }
+        for task in self.sub_tasks.iter_mut() {
+            if let Some(dev) = task.dev_thread_id.as_mut() {
+                swap(dev);
+            }
+            if let Some(reviewer) = task.reviewer_thread_id.as_mut() {
+                swap(reviewer);
+            }
+            for thread_id in task.owned_thread_ids.iter_mut() {
+                swap(thread_id);
+            }
+        }
+        if let Some(awaiting) = self.awaiting.as_mut() {
+            if awaiting.thread_id == pending_id {
+                awaiting.thread_id = real_id.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            self.updated_at = unix_now();
+        }
+        changed
+    }
+
+    /// Read the CURRENT id in a seat, so a caller can re-resolve after a promotion
+    /// instead of holding one it captured before the turn started.
+    pub(crate) fn thread_in_slot(&self, slot: TeamThreadSlot) -> Option<String> {
+        let id = match slot {
+            TeamThreadSlot::Tl => self.tl_thread_id.clone(),
+            TeamThreadSlot::SubTaskDev(index) => {
+                self.sub_tasks.get(index)?.dev_thread_id.clone()?
+            }
+            TeamThreadSlot::SubTaskReviewer(index) => {
+                self.sub_tasks.get(index)?.reviewer_thread_id.clone()?
+            }
+            TeamThreadSlot::RunOwned(index) => self.run_owned_thread_ids.get(index)?.clone(),
+        };
+        (!id.is_empty()).then_some(id)
     }
 
     /// Record a thread the RUN owns (design reviewer, MR reviewer, MR-revision

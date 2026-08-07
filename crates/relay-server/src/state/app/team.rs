@@ -30,14 +30,14 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::state::{
-    next_team_action, parse_complexity, parse_sub_tasks, parse_verdict, prompts, SubTask,
-    SubTaskStatus, TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus, WorkflowVerdict,
+    next_team_action, parse_complexity, parse_sub_tasks, parse_verdict, prompts, SubTaskStatus,
+    TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus, TeamThreadSlot, WorkflowVerdict,
 };
 
 use super::review::{
     classify_workspace_result, random_suffix, reviewer_thread_settings, ThreadDriveError,
 };
-use super::worktree::{provision_task_worktree, TaskWorktree};
+use super::worktree::{provision_task_worktree, TaskWorktree, NO_HOOKS};
 use super::*;
 
 /// Backstop stall timeout for one team turn. The wait returns as soon as the turn
@@ -138,11 +138,7 @@ impl AppState {
             return Err("another task is already running; pause or finish it first".to_string());
         }
 
-        let origin = LiveWorkspace::from_path(&normalize_cwd(&input.origin_cwd))
-            .ok_or_else(|| format!("workspace {} does not exist", input.origin_cwd))?;
-
-        // Scope is enforced on the FINAL path, inside provisioning, before any git
-        // mutation — so a refusal leaves the repository untouched.
+        let origin_cwd = normalize_cwd(&input.origin_cwd);
         let (allowed_roots, device_scope) = {
             let relay = self.relay.read().await;
             (
@@ -150,6 +146,14 @@ impl AppState {
                 relay.device_path_scope(&input.device_id),
             )
         };
+        // The ORIGIN must be in scope too, not only the destination. Provisioning
+        // reads and MUTATES the origin's repository — it writes `info/exclude` in
+        // the common git dir and creates a branch — so a scope check that only
+        // covered the new worktree path would let a device with a configured
+        // worktree root reach into a repository it was never granted.
+        ensure_path_within_device_scope(&origin_cwd, &device_scope, &allowed_roots)?;
+        let origin = LiveWorkspace::from_path(&origin_cwd)
+            .ok_or_else(|| format!("workspace {origin_cwd} does not exist"))?;
         let worktree: TaskWorktree = provision_task_worktree(
             &origin,
             &input.spec.title,
@@ -157,6 +161,14 @@ impl AppState {
             &|planned| ensure_path_within_device_scope(planned, &device_scope, &allowed_roots),
         )
         .await?;
+        // The repository the branch was actually created in may be a different
+        // directory than the one asked for (a linked worktree resolves to its
+        // main), so re-check the tree that was really touched.
+        ensure_path_within_device_scope(
+            &worktree.repo_main_worktree,
+            &device_scope,
+            &allowed_roots,
+        )?;
 
         let run_id = format!("team_{}", random_suffix());
         let mut run = TeamRun::new(
@@ -331,12 +343,48 @@ impl AppState {
         relay.notify();
     }
 
+    /// Reconcile a run whose driver is gone.
+    ///
+    /// Draining FIRST is the whole point: a dev or TL turn can still be writing
+    /// the worktree, and marking the run terminal releases its locks. An
+    /// unconfirmed drain therefore leaves the run `Blocked` (non-terminal, still
+    /// owning its threads) rather than Interrupted — the same contract
+    /// `interrupt_workflow_if_stranded` follows.
     pub(super) async fn interrupt_team_run_if_stranded(&self, run_id: &str) {
+        let resumable = self
+            .team_run_snapshot(run_id)
+            .await
+            .map(|run| run.status.is_terminal() || run.status.is_resumable());
+        // A paused run has no driver ON PURPOSE; it is not stranded.
+        if resumable.unwrap_or(true) {
+            return;
+        }
+
+        let mut drained = true;
+        for thread_id in self.team_owned_threads(run_id).await {
+            drained &= self.stop_and_drain(&thread_id).await;
+        }
+        if !drained {
+            self.block_team_run(
+                run_id,
+                "the task's driver ended unexpectedly and at least one owned turn did not confirm stopping",
+            )
+            .await;
+            return;
+        }
+
         let mut relay = self.relay.write().await;
-        let changed = relay.update_team_run(run_id, |run| {
-            run.mark_interrupted_if_stranded();
+        let mut interrupted = false;
+        relay.update_team_run(run_id, |run| {
+            run.error
+                .get_or_insert_with(|| "the task's driver ended unexpectedly".to_string());
+            interrupted = run.mark_interrupted_if_stranded();
         });
-        if changed {
+        if interrupted {
+            relay.push_log(
+                "warn",
+                format!("Task {run_id}: driver lost; marked interrupted"),
+            );
             relay.notify();
         }
     }
@@ -454,14 +502,13 @@ impl AppState {
     /// `claude-pending-*` id and `promote_background_thread` re-keys it on the
     /// first turn. Re-reading after send and after wait is what keeps the driver
     /// from talking to a thread that no longer exists.
-    async fn team_turn(
-        &self,
-        run_id: &str,
-        thread_id: &str,
-        prompt: &str,
-        reread: impl Fn(&TeamRun) -> Option<String>,
-    ) -> TeamStepOutcome {
-        let mut thread_id = thread_id.to_string();
+    async fn team_turn(&self, run_id: &str, slot: TeamThreadSlot, prompt: &str) -> TeamStepOutcome {
+        let Some(mut thread_id) = self.resolve_team_slot(run_id, slot).await else {
+            return TeamStepOutcome::Failed(format!("task run {run_id} has no thread in {slot:?}"));
+        };
+        if let Err(error) = self.team_turn_preflight(run_id, &thread_id).await {
+            return TeamStepOutcome::Failed(error);
+        }
         let baseline = self
             .latest_assistant_entry(&thread_id)
             .await
@@ -493,12 +540,12 @@ impl AppState {
                 ));
             }
         }
-        if let Some(promoted) = self.reread_thread_id(run_id, &reread).await {
+        if let Some(promoted) = self.resolve_team_slot(run_id, slot).await {
             thread_id = promoted;
         }
 
         let outcome = self.wait_for_team_step(&thread_id).await;
-        if let Some(promoted) = self.reread_thread_id(run_id, &reread).await {
+        if let Some(promoted) = self.resolve_team_slot(run_id, slot).await {
             thread_id = promoted;
         }
         if let Some(error) = outcome {
@@ -518,13 +565,64 @@ impl AppState {
         }
     }
 
-    async fn reread_thread_id(
-        &self,
-        run_id: &str,
-        reread: &impl Fn(&TeamRun) -> Option<String>,
-    ) -> Option<String> {
+    /// Record a run-owned thread and return the slot that now names it.
+    async fn record_run_thread(&self, run_id: &str, thread_id: &str) -> TeamThreadSlot {
+        let mut relay = self.relay.write().await;
+        relay.update_team_run(run_id, |run| run.record_run_thread(thread_id.to_string()));
+        let index = relay
+            .team_run(run_id)
+            .and_then(|run| {
+                run.run_owned_thread_ids
+                    .iter()
+                    .position(|id| id == thread_id)
+            })
+            .unwrap_or(0);
+        relay.notify();
+        TeamThreadSlot::RunOwned(index)
+    }
+
+    /// The live id in a seat. Re-read rather than remembered, because
+    /// `promote_background_thread` can replace it mid-turn.
+    async fn resolve_team_slot(&self, run_id: &str, slot: TeamThreadSlot) -> Option<String> {
+        self.relay
+            .read()
+            .await
+            .team_run(run_id)?
+            .thread_in_slot(slot)
+    }
+
+    /// Refuse to send when sending would be wrong.
+    ///
+    /// Deliberately does NOT include `has_working_thread_in_cwd` the way
+    /// `workflow_turn_preflight` does: TL, dev and reviewer share one worktree,
+    /// and the Claude SDK can start an unrequested turn of its own, so a
+    /// cwd-wide notion of "busy" would deadlock the run against itself. The
+    /// per-thread live-turn check below is the part that actually protects us.
+    async fn team_turn_preflight(&self, run_id: &str, thread_id: &str) -> Result<(), String> {
         let relay = self.relay.read().await;
-        reread(relay.team_run(run_id)?).filter(|id| !id.is_empty())
+        let run = relay
+            .team_run(run_id)
+            .ok_or_else(|| format!("task run {run_id} is gone"))?;
+        if run.status.is_terminal() {
+            return Err(format!(
+                "task run {run_id} settled as {} before this turn started",
+                run.status.as_str()
+            ));
+        }
+        if !run.owned_thread_ids().iter().any(|id| id == thread_id) {
+            return Err(format!(
+                "thread {thread_id} is not owned by task run {run_id}"
+            ));
+        }
+        if relay
+            .runtime_for_thread(thread_id)
+            .is_some_and(|runtime| runtime.has_live_turn())
+        {
+            return Err(format!(
+                "thread {thread_id} already has a turn in flight; refusing to overlap it"
+            ));
+        }
+        Ok(())
     }
 
     /// Wait for a team turn to settle. `None` means it completed.
@@ -632,12 +730,8 @@ impl AppState {
 
     /// Run one TL turn, counting it against the generation's turn budget.
     async fn tl_turn(&self, run_id: &str, prompt: String) -> Option<String> {
-        let thread_id = self.ensure_tl_thread(run_id).await.ok()?;
-        let outcome = self
-            .team_turn(run_id, &thread_id, &prompt, |run| {
-                Some(run.tl_thread_id.clone())
-            })
-            .await;
+        self.ensure_tl_thread(run_id).await.ok()?;
+        let outcome = self.team_turn(run_id, TeamThreadSlot::Tl, &prompt).await;
         {
             let mut relay = self.relay.write().await;
             relay.update_team_run(run_id, |run| run.tl_turns_this_generation += 1);
@@ -715,11 +809,7 @@ impl AppState {
                 return false;
             }
         };
-        {
-            let mut relay = self.relay.write().await;
-            relay.update_team_run(run_id, |run| run.record_run_thread(thread_id.clone()));
-            relay.notify();
-        }
+        let slot = self.record_run_thread(run_id, &thread_id).await;
 
         let prompt = format!(
             "Review the design at `{}` against this task.\n\n## Agreed scope\n{}\n\n\
@@ -727,7 +817,7 @@ impl AppState {
 `VERDICT: NEEDS_CHANGES` followed by one finding per line.",
             run.design_rel_path, run.spec.agreed_scope, run.spec.acceptance_criteria
         );
-        let text = match self.team_turn(run_id, &thread_id, &prompt, |_| None).await {
+        let text = match self.team_turn(run_id, slot, &prompt).await {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
             TeamStepOutcome::Failed(error) => {
@@ -746,7 +836,16 @@ impl AppState {
                 run.phase = TeamPhase::Design;
             } else {
                 if !verdict.approved {
-                    run.unresolved.extend(verdict.findings.iter().cloned());
+                    // Record something even when the reviewer produced no parsed
+                    // findings, or a silent rejection would leave `unresolved`
+                    // empty and the run could still finish Done.
+                    if verdict.findings.is_empty() {
+                        run.unresolved.push(
+                            "the design was not approved within its review budget".to_string(),
+                        );
+                    } else {
+                        run.unresolved.extend(verdict.findings.iter().cloned());
+                    }
                 }
                 run.phase = TeamPhase::Planning;
             }
@@ -796,7 +895,7 @@ impl AppState {
         // Round 1 gets a FRESH dev; a later round reuses it so it can see its own
         // prior work. The checkpoint taken here is what scopes the review diff to
         // this sub-task rather than everything since the run began.
-        let thread_id = match task.dev_thread_id.clone() {
+        let _seat = match task.dev_thread_id.clone() {
             Some(existing) if task.rounds_used > 0 => existing,
             _ => {
                 let base = self.checkpoint_commit(&workspace).await;
@@ -839,11 +938,7 @@ impl AppState {
             &prior_findings,
         );
         let outcome = self
-            .team_turn(run_id, &thread_id, &prompt, move |run| {
-                run.sub_tasks
-                    .get(index)
-                    .and_then(|t| t.dev_thread_id.clone())
-            })
+            .team_turn(run_id, TeamThreadSlot::SubTaskDev(index), &prompt)
             .await;
         if let TeamStepOutcome::Failed(error) = outcome {
             self.fail_team_run(run_id, error).await;
@@ -896,10 +991,17 @@ impl AppState {
         }
 
         let base = non_empty(Some(task.base_commit.clone()));
-        let diff = collect_workspace_diff_against(&workspace, base.as_deref())
-            .await
-            .map(|response| response.diff)
-            .unwrap_or_default();
+        let diff = match collect_workspace_diff_against(&workspace, base.as_deref()).await {
+            Ok(response) => render_review_diff(&response),
+            Err(error) => {
+                self.fail_team_run(
+                    run_id,
+                    format!("could not collect the review diff: {error}"),
+                )
+                .await;
+                return false;
+            }
+        };
         let prompt = format!(
             "Review this sub-task's changes.\n\n## Sub-task: {}\n{}\n\n\
 ## Code quality rules\n{}\n\nWorking tree: {}\n\n```diff\n{diff}\n```\n\n\
@@ -911,7 +1013,10 @@ finding per line.",
             workspace.as_str()
         );
 
-        let text = match self.team_turn(run_id, &thread_id, &prompt, |_| None).await {
+        let text = match self
+            .team_turn(run_id, TeamThreadSlot::SubTaskReviewer(index), &prompt)
+            .await
+        {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
             TeamStepOutcome::Failed(error) => {
@@ -973,6 +1078,22 @@ finding per line.",
                 return false;
             }
         }
+        // Checkpoint the sub-task before moving on. Without this HEAD never
+        // advances, so the NEXT sub-task's base is the same commit and its
+        // reviewer is handed every earlier sub-task's changes as though they
+        // were its own.
+        if let Ok(workspace) = self.require_team_workspace(run_id).await {
+            if let Err(error) = self
+                .commit_worktree(&workspace, &format!("task: {}", task.title))
+                .await
+            {
+                self.fail_team_run(run_id, error).await;
+                return false;
+            }
+        } else {
+            return false;
+        }
+
         let mut relay = self.relay.write().await;
         relay.update_team_run(run_id, |run| {
             if let Some(task) = run.sub_tasks.get_mut(index) {
@@ -994,15 +1115,26 @@ finding per line.",
             return false;
         };
         // Commit first so the gate reviews a settled tree, and so the branch
-        // carries the work even if the gate then escalates.
-        self.commit_worktree(&workspace, "task: work in progress")
-            .await;
+        // carries the work even if the gate then escalates. A failure here must
+        // stop the run: reviewing an uncommitted tree and then reporting Done is
+        // exactly how work goes missing.
+        if let Err(error) = self
+            .commit_worktree(&workspace, "task: work in progress")
+            .await
+        {
+            self.fail_team_run(run_id, error).await;
+            return false;
+        }
 
         let base = merge_base_with(&workspace, &run.target_ref).await;
-        let diff = collect_workspace_diff_against(&workspace, base.as_deref())
-            .await
-            .map(|response| response.diff)
-            .unwrap_or_default();
+        let diff = match collect_workspace_diff_against(&workspace, base.as_deref()).await {
+            Ok(response) => render_review_diff(&response),
+            Err(error) => {
+                self.fail_team_run(run_id, format!("could not collect the MR diff: {error}"))
+                    .await;
+                return false;
+            }
+        };
 
         let thread_id = match self
             .start_team_thread(run_id, TeamRole::Reviewer, &workspace)
@@ -1023,9 +1155,10 @@ finding per line.",
             relay.update_team_run(run_id, |run| run.record_run_thread(thread_id.clone()));
             relay.notify();
         }
+        let slot = self.record_run_thread(run_id, &thread_id).await;
 
         let prompt = prompts::mr_gate(&run.spec, &diff, workspace.as_str());
-        let text = match self.team_turn(run_id, &thread_id, &prompt, |_| None).await {
+        let text = match self.team_turn(run_id, slot, &prompt).await {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
             TeamStepOutcome::Failed(error) => {
@@ -1074,16 +1207,10 @@ finding per line.",
                 return false;
             }
         };
-        {
-            let mut relay = self.relay.write().await;
-            relay.update_team_run(run_id, |run| run.record_run_thread(thread_id.clone()));
-            relay.notify();
-        }
+        let slot = self.record_run_thread(run_id, &thread_id).await;
 
         let prompt = prompts::address_mr(&findings, &run.plan_rel_path);
-        if let TeamStepOutcome::Failed(error) =
-            self.team_turn(run_id, &thread_id, &prompt, |_| None).await
-        {
+        if let TeamStepOutcome::Failed(error) = self.team_turn(run_id, slot, &prompt).await {
             self.fail_team_run(run_id, error).await;
             return false;
         }
@@ -1105,7 +1232,10 @@ finding per line.",
         if self.tl_turn(run_id, prompt).await.is_none() {
             return false;
         }
-        self.commit_worktree(&workspace, "task: final").await;
+        if let Err(error) = self.commit_worktree(&workspace, "task: final").await {
+            self.fail_team_run(run_id, error).await;
+            return false;
+        }
         let head = self.checkpoint_commit(&workspace).await;
 
         let mut relay = self.relay.write().await;
@@ -1130,7 +1260,12 @@ finding per line.",
             .sub_tasks
             .iter()
             .all(|task| task.status == SubTaskStatus::Done);
-        let status = if approved && all_done && run.unresolved.is_empty() {
+        let design_ok = run
+            .design_verdict
+            .as_ref()
+            .map(|verdict| verdict.approved)
+            .unwrap_or(true);
+        let status = if approved && all_done && design_ok && run.unresolved.is_empty() {
             TeamRunStatus::Done
         } else {
             TeamRunStatus::Escalated
@@ -1138,32 +1273,62 @@ finding per line.",
         self.update_team_status(run_id, status).await;
     }
 
-    /// `git add -A` + commit, tolerating "nothing to commit".
+    /// `git add -A` + commit. Returns whether a commit was created.
     ///
-    /// `--no-verify` is not a convenience: agent-authored commits must not be able
-    /// to fire arbitrary repository hooks, which would be an execution surface for
-    /// a repository the user has not audited.
-    async fn commit_worktree(&self, workspace: &LiveWorkspace, message: &str) {
-        let _ = run_git_capture(workspace, &["add", "-A"]).await;
-        let staged = run_git_capture(workspace, &["diff", "--cached", "--quiet"]).await;
-        // Exit 0 means no staged changes: a no-op, not a failure.
-        if staged.map(|output| output.status.success()).unwrap_or(true) {
-            return;
+    /// Errors propagate. A silently-failed commit is the worst outcome available
+    /// here: the MR gate would review an uncommitted tree, `head_commit` would
+    /// point at the pre-existing HEAD, and the run would report Done with the
+    /// work still sitting in the working tree. A missing `user.email` is enough
+    /// to trigger exactly that.
+    ///
+    /// Hooks are suppressed the same way provisioning suppresses them.
+    /// `--no-verify` alone is NOT sufficient: it skips `pre-commit` and
+    /// `commit-msg`, but `prepare-commit-msg` and `post-commit` still run, which
+    /// would reopen the arbitrary-code surface on an unaudited repository.
+    pub(super) async fn commit_worktree(
+        &self,
+        workspace: &LiveWorkspace,
+        message: &str,
+    ) -> Result<bool, String> {
+        let staged = run_git_capture(workspace, &["add", "-A"]).await?;
+        if !staged.status.success() {
+            return Err(format!(
+                "git add failed in {}: {}",
+                workspace.as_str(),
+                String::from_utf8_lossy(&staged.stderr).trim()
+            ));
         }
-        let committed = run_git_capture(workspace, &["commit", "--no-verify", "-m", message]).await;
-        if let Ok(output) = committed {
-            if !output.status.success() {
-                self.push_runtime_log(
-                    "warn",
-                    format!(
-                        "Task: could not commit in {}: {}",
-                        workspace.as_str(),
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ),
-                )
-                .await;
+
+        let pending = run_git_capture(workspace, &["diff", "--cached", "--quiet"]).await?;
+        // Exit 0 means nothing is staged. Any OTHER non-zero code than 1 is a real
+        // git failure, and treating it as "nothing to commit" is how work goes
+        // missing, so only code 1 (differences found) proceeds.
+        match pending.status.code() {
+            Some(0) => return Ok(false),
+            Some(1) => {}
+            other => {
+                return Err(format!(
+                    "git diff --cached failed in {} (exit {:?}): {}",
+                    workspace.as_str(),
+                    other,
+                    String::from_utf8_lossy(&pending.stderr).trim()
+                ))
             }
         }
+
+        let committed = run_git_capture(
+            workspace,
+            &["-c", NO_HOOKS, "commit", "--no-verify", "-m", message],
+        )
+        .await?;
+        if !committed.status.success() {
+            return Err(format!(
+                "git commit failed in {}: {}",
+                workspace.as_str(),
+                String::from_utf8_lossy(&committed.stderr).trim()
+            ));
+        }
+        Ok(true)
     }
 
     async fn checkpoint_commit(&self, workspace: &LiveWorkspace) -> Option<String> {
@@ -1239,4 +1404,32 @@ fn findings_from(text: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .take(20)
         .collect()
+}
+
+/// Render a diff for a reviewer.
+///
+/// Uses `file_changes` rather than `WorkspaceDiffResponse::diff`, because `diff`
+/// carries only TRACKED changes — untracked files are synthesized separately into
+/// `file_changes`. Agents create files constantly, so reading the tracked-only
+/// field would hand a reviewer a diff with the new code missing and ask it to
+/// approve.
+fn render_review_diff(response: &crate::protocol::WorkspaceDiffResponse) -> String {
+    if response.file_changes.is_empty() {
+        return String::new();
+    }
+    response
+        .file_changes
+        .iter()
+        .map(|change| {
+            if change.diff.trim().is_empty() {
+                format!(
+                    "--- {} ({}, no textual diff)",
+                    change.path, change.change_type
+                )
+            } else {
+                change.diff.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

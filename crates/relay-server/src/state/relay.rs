@@ -1449,6 +1449,14 @@ impl RelayState {
                 }
             }
         }
+        // Same for every team seat. This is not optional plumbing: EVERY team
+        // thread is background-started, so a TL, a dev, or any reviewer can be
+        // promoted mid-turn, and a driver left holding the pending id would find
+        // no runtime, read that as "not working", and treat a running turn as
+        // finished — silently losing that agent's output.
+        for run in self.team_runs.values_mut() {
+            run.rekey_thread(pending_id, real_id);
+        }
         // Move the durable nav-hiding entry from the pending id to the real id
         // (carrying its parent + created_at, so FIFO order is preserved).
         if let Some(record) = self.reviewer_threads.remove(pending_id) {

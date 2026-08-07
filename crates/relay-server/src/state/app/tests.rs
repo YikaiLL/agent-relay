@@ -16519,6 +16519,336 @@ turn) must allow a review: {error:?}"
     }
 
     #[tokio::test]
+    async fn a_claude_style_pending_promotion_keeps_every_team_seat_addressable() {
+        // The failure this pins: Claude mints a synthetic `claude-pending-*` id and
+        // only swaps in the real session id once the first turn starts. Every team
+        // seat is background-started, so any of them can be promoted mid-turn. A
+        // driver still holding the pending id finds no runtime, reads that as "not
+        // working", and treats a running turn as finished — losing that agent's
+        // output entirely. No fake provider models this, so it has to be asserted
+        // on the record directly.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        let run_id = app
+            .start_team_run(team_input(&root))
+            .await
+            .expect("the team should start");
+
+        // Put a pending id in every seat the driver can address.
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.tl_thread_id = "claude-pending-1".to_string();
+                run.run_owned_thread_ids = vec!["claude-pending-1".to_string()];
+                run.sub_tasks = vec![crate::state::SubTask {
+                    id: "s1".to_string(),
+                    dev_thread_id: Some("claude-pending-1".to_string()),
+                    reviewer_thread_id: Some("claude-pending-1".to_string()),
+                    owned_thread_ids: vec!["claude-pending-1".to_string()],
+                    ..crate::state::SubTask::default()
+                }];
+            });
+            relay.promote_background_thread("claude-pending-1", "sess-real");
+        }
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.tl_thread_id, "sess-real",
+            "the TL seat must follow the promotion"
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::Tl)
+                .as_deref(),
+            Some("sess-real")
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::SubTaskDev(0))
+                .as_deref(),
+            Some("sess-real"),
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::SubTaskReviewer(0))
+                .as_deref(),
+            Some("sess-real"),
+        );
+        assert_eq!(
+            run.thread_in_slot(crate::state::TeamThreadSlot::RunOwned(0))
+                .as_deref(),
+            Some("sess-real"),
+            "design/MR reviewers live here and were previously unreachable",
+        );
+        assert!(
+            !run.owned_thread_ids()
+                .iter()
+                .any(|id| id.starts_with("claude-pending-")),
+            "no seat may still name a dead pending id: {:?}",
+            run.owned_thread_ids()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reviewer_sees_files_the_dev_created_not_just_tracked_edits() {
+        // `WorkspaceDiffResponse::diff` carries only TRACKED changes; untracked
+        // files are synthesized separately into `file_changes`. Agents create
+        // files constantly, so reading the tracked-only field hands the reviewer a
+        // diff with the new code missing and asks it to approve.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+
+        let created = Arc::new(Mutex::new(false));
+        script_replies(
+            provider,
+            &[
+                "COMPLEXITY: simple",
+                "SUBTASK: Add a new file\nCreate it.\nEND SUBTASK",
+                "Created brand_new.rs.",
+                "Fine.\nVERDICT: APPROVED",
+                "Noted.",
+                "In scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Model the dev creating an untracked file, once, as soon as the worktree
+        // exists.
+        {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            let created = created.clone();
+            tokio::spawn(async move {
+                for _ in 0..400 {
+                    let cwd = app
+                        .relay
+                        .read()
+                        .await
+                        .team_run(&run_id)
+                        .map(|run| run.cwd.clone());
+                    if let Some(cwd) = cwd {
+                        if std::path::Path::new(&cwd).is_dir() && !*created.lock().await {
+                            std::fs::write(
+                                std::path::Path::new(&cwd).join("brand_new.rs"),
+                                "fn added() {}\n",
+                            )
+                            .unwrap();
+                            *created.lock().await = true;
+                            return;
+                        }
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert!(*created.lock().await, "the test never created its file");
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "{:?}",
+            run.error
+        );
+
+        let turns = provider.turns.lock().await.clone();
+        let review_prompt = turns
+            .iter()
+            .map(|(_, text)| text)
+            .find(|text| text.contains("Review this sub-task's changes"))
+            .expect("a sub-task review turn");
+        assert!(
+            review_prompt.contains("brand_new.rs"),
+            "a file the dev created must reach the reviewer: {review_prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_failures_propagate_instead_of_being_swallowed() {
+        // The shape being pinned: "nothing to commit" is success, but a git
+        // failure must NOT be mistaken for it. Swallowing one means the MR gate
+        // reviews an uncommitted tree, head_commit points at the old HEAD, and the
+        // run reports Done with the work still sitting in the working tree.
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        let workspace = LiveWorkspace::from_path(&root).expect("workspace");
+        let path = std::path::Path::new(&root);
+
+        assert_eq!(
+            app.commit_worktree(&workspace, "noop").await,
+            Ok(false),
+            "a clean tree is a no-op, not a failure"
+        );
+
+        std::fs::write(path.join("work.txt"), "first\n").unwrap();
+        assert_eq!(
+            app.commit_worktree(&workspace, "work").await,
+            Ok(true),
+            "a real change commits"
+        );
+
+        // A locked index is the deterministic stand-in for any git failure: the
+        // old code turned a non-zero exit here into "nothing staged" and carried on.
+        std::fs::write(path.join(".git").join("index.lock"), "").unwrap();
+        std::fs::write(path.join("work2.txt"), "second\n").unwrap();
+        let error = app
+            .commit_worktree(&workspace, "blocked")
+            .await
+            .expect_err("a git failure must surface");
+        assert!(
+            error.contains("git add") || error.contains("git commit"),
+            "the error should name the failing command: {error}"
+        );
+        std::fs::remove_file(path.join(".git").join("index.lock")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_driver_drains_owned_turns_and_blocks_when_it_cannot() {
+        // Marking a run terminal releases its locks. If the driver died while a dev
+        // turn was still mutating the worktree, doing that without draining first
+        // leaves an agent writing files nobody is watching. An unconfirmed drain
+        // must therefore leave the run BLOCKED — non-terminal, still owning its
+        // threads — rather than Interrupted.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // Turns never settle, and the provider refuses the stop, so the drain can
+        // never confirm quiescence. (The fake's normal `request_turn_stop` settles
+        // the turn itself, which would confirm the drain and hide this path.)
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Wait until the TL actually has a live turn to drain.
+        let mut tl = String::new();
+        for _ in 0..400 {
+            if let Some(run) = app.relay.read().await.team_run(&run_id).cloned() {
+                if !run.tl_thread_id.is_empty() {
+                    tl = run.tl_thread_id.clone();
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!tl.is_empty(), "the TL thread should have started");
+
+        app.interrupt_team_run_if_stranded(&run_id).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "an unconfirmed drain must not settle the run: {:?}",
+            run.error
+        );
+        assert!(!run.status.is_terminal(), "Blocked keeps the locks held");
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not confirm stopping"),
+            "the error should say why: {:?}",
+            run.error
+        );
+        // The stop was actually attempted, not skipped.
+        let interrupts: Vec<String> = provider.interrupts.lock().await.clone();
+        assert!(
+            interrupts.iter().any(|id| id == &tl),
+            "the owned turn must have been asked to stop, got {interrupts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn committing_never_executes_repository_hooks() {
+        // `--no-verify` is NOT enough: it skips `pre-commit` and `commit-msg`, but
+        // `prepare-commit-msg` and `post-commit` still run, which would reopen the
+        // arbitrary-code surface provisioning already closes.
+        let (_repo, root) = init_team_repo().await;
+        let path = std::path::Path::new(&root);
+        let hooks = path.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for name in ["post-commit", "prepare-commit-msg"] {
+            let sentinel = path.join(format!("{name}-RAN"));
+            let hook = hooks.join(name);
+            std::fs::write(
+                &hook,
+                format!("#!/bin/sh\ntouch {}\n", sentinel.to_string_lossy()),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        let workspace = LiveWorkspace::from_path(&root).expect("workspace");
+        std::fs::write(path.join("work.txt"), "x\n").unwrap();
+        assert_eq!(app.commit_worktree(&workspace, "work").await, Ok(true));
+
+        for name in ["post-commit", "prepare-commit-msg"] {
+            assert!(
+                !path.join(format!("{name}-RAN")).exists(),
+                "{name} must not run for an agent-authored commit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_cannot_fork_from_a_worktree_outside_the_allowed_roots() {
+        // Guarding only the DESTINATION is not enough. Provisioning reads and
+        // MUTATES the origin's repository — it writes info/exclude in the common
+        // git dir and creates a branch there.
+        //
+        // The two checks only come apart when the destination is in scope while
+        // the origin is not, which is exactly what a linked worktree outside the
+        // allowed roots produces: the task worktree still lands under the MAIN
+        // worktree (in scope), so a destination-only guard would wave it through.
+        let (_repo, root) = init_team_repo().await;
+        let outside = TempDir::new().expect("tmpdir");
+        let linked = outside.path().canonicalize().unwrap().join("linked");
+        let out = tokio::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--no-track",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&root)
+            .output()
+            .await
+            .expect("git");
+        assert!(out.status.success(), "worktree add failed");
+
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+        // Only the main repository is in scope; the linked worktree is not.
+        app.relay.write().await.allowed_roots = vec![root.clone()];
+
+        let mut input = team_input(&root);
+        input.origin_cwd = linked.to_string_lossy().into_owned();
+        let error = app
+            .start_team_run(input)
+            .await
+            .expect_err("an out-of-scope origin must be refused even when the destination is fine");
+        assert!(
+            error.contains("allowed roots"),
+            "the error should name the scope: {error}"
+        );
+        assert!(
+            !std::path::Path::new(&root).join(".sealwire").exists(),
+            "nothing may be created from a repository we refused to touch"
+        );
+    }
+
+    #[tokio::test]
     async fn a_second_task_is_refused_while_one_is_live() {
         let (_repo, root) = init_team_repo().await;
         let (app, providers) = build_review_app(&root, &["codex"]).await;

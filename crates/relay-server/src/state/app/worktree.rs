@@ -44,7 +44,11 @@ const TASK_WORKTREE_ROOT_ENV: &str = "SEALWIRE_TASK_WORKTREE_ROOT";
 
 /// `git -c` override that points hook lookup at a location that cannot hold any,
 /// so a repository's own hooks never execute as the relay user.
-const NO_HOOKS: &str = "core.hooksPath=/dev/null";
+///
+/// Shared with the driver's commit path: `--no-verify` is NOT enough there, since
+/// it skips only `pre-commit` and `commit-msg` while `prepare-commit-msg` and
+/// `post-commit` still run.
+pub(crate) const NO_HOOKS: &str = "core.hooksPath=/dev/null";
 
 const TASK_BRANCH_PREFIX: &str = "task/";
 const MAX_SLUG_BYTES: usize = 40;
@@ -412,6 +416,16 @@ async fn ensure_sealwire_excluded(main: &LiveWorkspace) {
     //  - Degrading a failed read to an empty buffer would TRUNCATE whatever we
     //    could not read. An exclude file is not required to be UTF-8, so this
     //    works in raw bytes and refuses to write at all when the read fails.
+    // The parent matters as much as the leaf: a symlinked `info` directory
+    // redirects `info/exclude` just as effectively, and `create_dir_all` would
+    // happily follow it.
+    match tokio::fs::symlink_metadata(&info_dir).await {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+
     let existing: Vec<u8> = match tokio::fs::symlink_metadata(&exclude_path).await {
         Ok(metadata) if metadata.file_type().is_file() => {
             match tokio::fs::read(&exclude_path).await {
@@ -912,6 +926,31 @@ mod tests {
             std::fs::read_to_string(&victim).unwrap(),
             "important\n",
             "a pre-planted symlink must not redirect this write outside the repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusion_hygiene_refuses_a_symlinked_info_directory() {
+        // The parent redirects the write just as effectively as the leaf, and
+        // `create_dir_all` would happily follow it.
+        let (_repo, root) = init_repo().await;
+        let outside = TempDir::new().expect("tmpdir");
+        let victim_dir = outside.path().canonicalize().unwrap().join("victim");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+
+        let git_dir = Path::new(&root).join(".git");
+        let info = git_dir.join("info");
+        let _ = std::fs::remove_dir_all(&info);
+        std::os::unix::fs::symlink(&victim_dir, &info).unwrap();
+
+        let main = workspace(&root);
+        provision_task_worktree(&main, "symlinked-parent", None, &allow_all())
+            .await
+            .expect("a hostile info dir must not fail provisioning, only be left alone");
+
+        assert!(
+            !victim_dir.join("exclude").exists(),
+            "a symlinked info directory must not redirect the write outside the repo"
         );
     }
 
