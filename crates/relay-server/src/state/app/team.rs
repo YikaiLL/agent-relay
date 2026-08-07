@@ -193,6 +193,40 @@ impl Drop for TeamDriveTicket {
     }
 }
 
+/// Crash net for an immediate stop.
+///
+/// `stop_team_run` marks the run `stopping` and then awaits — the drive gate, a
+/// drain that can take its whole window. An axum handler future is dropped when
+/// the client disconnects, so that await is a real abort point. A `stopping`
+/// marker left behind suppresses the NEXT natural failure, after which the driver
+/// exits and the run sits driverless in `PausePending`, blocking every future
+/// task. Clearing it degrades the run to an ordinary pending pause, which the
+/// driver settles at its next boundary and which no longer suppresses anything.
+struct TeamStopGuard {
+    app: AppState,
+    run_id: String,
+    disarmed: bool,
+}
+
+impl TeamStopGuard {
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for TeamStopGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let app = self.app.clone();
+        let run_id = self.run_id.clone();
+        tokio::spawn(async move {
+            app.abandon_team_stop(&run_id).await;
+        });
+    }
+}
+
 /// Crash net for a `Blocked` recovery.
 ///
 /// `Resolving` is non-terminal and has no driver, so a recovery that dies
@@ -500,6 +534,12 @@ over on resume"
     }
 
     #[cfg(test)]
+    pub(crate) fn set_team_liveness_window_ms(&self, ms: u64) {
+        self.team_liveness_window_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_team_step_stall_ms(&self, ms: u64) {
         self.team_step_stall_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -676,6 +716,13 @@ over on resume"
             relay.update_team_run(&run_id, |run| run.request_stop(&device_id));
             relay.notify();
         }
+        // Armed from the moment the marker is set: everything below awaits, and a
+        // dropped future would otherwise leave it set forever.
+        let mut stop_guard = TeamStopGuard {
+            app: self.clone(),
+            run_id: run_id.clone(),
+            disarmed: false,
+        };
 
         // Drain AND settle under the drive gate, so no turn can be starting while
         // we decide the run is quiescent. Acquired after the relay guard above is
@@ -687,6 +734,7 @@ over on resume"
                 "the task could not be stopped: at least one owned turn did not confirm stopping",
             )
             .await;
+            stop_guard.disarm();
             return Err(
                 "this task is blocked because an owned turn did not confirm stopping".to_string(),
             );
@@ -694,6 +742,7 @@ over on resume"
 
         self.settle_team_run(&run_id, kind.settled_status(), kind.reason())
             .await;
+        stop_guard.disarm();
         self.team_run_snapshot(&run_id)
             .await
             .map(|run| run.status)
@@ -813,6 +862,30 @@ over on resume"
             return Err("this task is blocked; resolve it first".to_string());
         }
         Ok(status)
+    }
+
+    /// Degrade an abandoned stop to an ordinary pending pause.
+    ///
+    /// `pause_requested` is deliberately LEFT set: the user did ask for the run to
+    /// stop, and a live driver settles that at its next boundary. Only the
+    /// `stopping` marker goes, because that one is a claim about right now — that
+    /// a drain is in progress — and nothing is draining any more.
+    pub(super) async fn abandon_team_stop(&self, run_id: &str) {
+        let mut relay = self.relay.write().await;
+        let mut abandoned = false;
+        relay.update_team_run(run_id, |run| {
+            if run.stopping && !run.status.is_terminal() {
+                run.stopping = false;
+                abandoned = true;
+            }
+        });
+        if abandoned {
+            relay.push_log(
+                "warn",
+                format!("Task {run_id}: a stop was abandoned before it settled"),
+            );
+            relay.notify();
+        }
     }
 
     /// Put a `Resolving` run back to `Blocked` after a recovery that never landed.
@@ -966,7 +1039,14 @@ over on resume"
     /// this a cancel returns and releases the tree to a new session while the old
     /// driver is still staging into it — the same race the gate closes for turns,
     /// through a door that is not a turn.
-    async fn team_git_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    /// `None` when the run settled while we were queued for the gate.
+    ///
+    /// Holding the gate is only half of it. A stop that got there FIRST settles,
+    /// releases, and returns — and the driver, queued behind it, would then take
+    /// the gate and commit into a workspace already handed back to the user. The
+    /// answer is the same one `team_turn_preflight` gives: re-read the run's right
+    /// to act AFTER taking the lock, never before.
+    async fn team_git_gate(&self, run_id: &str) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         let gate = self.team_drive_gate.lock().await;
         #[cfg(test)]
         {
@@ -974,7 +1054,10 @@ over on resume"
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(self.team_commit_barrier.lock().await);
         }
-        gate
+        let drivable = self.team_run_snapshot(run_id).await.is_some_and(|run| {
+            !run.status.is_terminal() && !run.status.is_settled_without_driver()
+        });
+        drivable.then_some(gate)
     }
 
     /// Hold the driver inside a git mutation of the worktree.
@@ -1287,14 +1370,22 @@ over on resume"
                         Err(error) => error.to_string(),
                         Ok(_) => "the provider returned no turn id".to_string(),
                     };
-                    if !self.stop_and_drain(&thread_id).await {
-                        // The marker STAYS. It is what stops cleanup from later
-                        // confirming quiescence for a turn nobody can observe, and
-                        // clearing it here threw that away at the one moment it
-                        // mattered most.
-                        return TeamStepOutcome::Blocked(format!(
-                            "thread {thread_id}'s turn did not confirm stopping after an uncertain start: {why}"
-                        ));
+                    // Draining FIRST would prove nothing. A provider marks a thread
+                    // working only after `start_turn` returns, and codex refuses a
+                    // stop without a turn id it never gave us — so `stop_and_drain`
+                    // sees an idle runtime and answers "stopped" for a turn it never
+                    // looked at. LOOK first, for long enough that a turn which
+                    // really began would have announced itself.
+                    if self.observe_turn_liveness(&thread_id).await {
+                        if !self.stop_and_drain(&thread_id).await {
+                            // The marker STAYS. It is what stops cleanup from later
+                            // confirming quiescence for a turn nobody can observe,
+                            // and clearing it here threw that away at the one moment
+                            // it mattered most.
+                            return TeamStepOutcome::Blocked(format!(
+                                "thread {thread_id}'s turn started despite a failed request and did not confirm stopping: {why}"
+                            ));
+                        }
                     }
                     self.set_in_flight_thread(run_id, None).await;
                     return TeamStepOutcome::Failed(format!(
@@ -1539,6 +1630,49 @@ over on resume"
             self.unpark_team_run(run_id).await;
         }
         None
+    }
+
+    /// Watch a thread for a bounded moment and report whether a turn appears.
+    ///
+    /// The honest answer to an uncertain start. The request may have been refused
+    /// before any work — a context window, a bad model, a dead socket — or the
+    /// work may have begun and only the response been lost. Nothing in the record
+    /// distinguishes those, and a stop cannot: there is no turn id to stop with.
+    ///
+    /// So this waits instead. A turn that really started publishes liveness within
+    /// a beat of doing so, and that is what makes the difference observable rather
+    /// than assumed. The residual risk is a provider that runs work and never
+    /// announces it at all — that is a broken provider, and no amount of local
+    /// bookkeeping can see through it.
+    async fn observe_turn_liveness(&self, thread_id: &str) -> bool {
+        let window = Duration::from_millis(
+            self.team_liveness_window_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let deadline = Instant::now() + window;
+        let mut rx = self.subscribe();
+        loop {
+            {
+                let relay = self.relay.read().await;
+                if relay
+                    .runtime_for_thread(thread_id)
+                    .is_some_and(|runtime| runtime.is_working())
+                {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
     }
 
     /// Deny a tool approval raised by a team thread and let the turn continue.
@@ -2052,10 +2186,10 @@ its turn cannot continue",
         let _seat = match task.dev_thread_id.clone() {
             Some(existing) if task.rounds_used > 0 => existing,
             _ => {
-                let base = {
-                    let _gate = self.team_git_gate().await;
-                    self.checkpoint_commit(&workspace).await
-                };
+                // Ungated on purpose: `checkpoint_commit` only reads HEAD. The gate
+                // is for MUTATIONS, and holding it for a `rev-parse` would make
+                // every latch fire on a call that cannot race anything.
+                let base = self.checkpoint_commit(&workspace).await;
                 let started = match self
                     .start_team_thread(run_id, TeamRole::Dev, &workspace)
                     .await
@@ -2262,7 +2396,7 @@ finding per line.",
         // were its own.
         if let Ok(workspace) = self.require_team_workspace(run_id).await {
             if let Err(error) = self
-                .commit_worktree_gated(&workspace, &format!("task: {}", task.title))
+                .commit_worktree_gated(run_id, &workspace, &format!("task: {}", task.title))
                 .await
             {
                 self.fail_team_run(run_id, error).await;
@@ -2297,7 +2431,7 @@ finding per line.",
         // stop the run: reviewing an uncommitted tree and then reporting Done is
         // exactly how work goes missing.
         if let Err(error) = self
-            .commit_worktree_gated(&workspace, "task: work in progress")
+            .commit_worktree_gated(run_id, &workspace, "task: work in progress")
             .await
         {
             self.fail_team_run(run_id, error).await;
@@ -2456,14 +2590,14 @@ history with it and no fork point was recorded",
         if self.tl_turn(run_id, prompt).await.is_none() {
             return false;
         }
-        if let Err(error) = self.commit_worktree_gated(&workspace, "task: final").await {
+        if let Err(error) = self
+            .commit_worktree_gated(run_id, &workspace, "task: final")
+            .await
+        {
             self.fail_team_run(run_id, error).await;
             return false;
         }
-        let head = {
-            let _gate = self.team_git_gate().await;
-            self.checkpoint_commit(&workspace).await
-        };
+        let head = self.checkpoint_commit(&workspace).await;
 
         let mut relay = self.relay.write().await;
         relay.update_team_run(run_id, |run| {
@@ -2516,10 +2650,13 @@ history with it and no fork point was recorded",
     /// through this; the ungated one stays for tests that commit directly.
     async fn commit_worktree_gated(
         &self,
+        run_id: &str,
         workspace: &LiveWorkspace,
         message: &str,
     ) -> Result<bool, String> {
-        let _gate = self.team_git_gate().await;
+        let Some(_gate) = self.team_git_gate(run_id).await else {
+            return Err("the task settled before this commit could run".to_string());
+        };
         self.commit_worktree(workspace, message).await
     }
 

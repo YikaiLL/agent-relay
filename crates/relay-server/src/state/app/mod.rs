@@ -163,6 +163,10 @@ pub struct AppState {
     team_commit_barrier: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     team_commit_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// How long (ms) to watch a thread for signs of a turn after a start request
+    /// failed, before concluding the provider never began one. Overridable in
+    /// tests.
+    team_liveness_window_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Task team run ids that currently have a driver. The ONE piece of team run
     /// state that cannot live on the record: two concurrent Resumes both read
     /// `Paused`, both pass their guard, and both spawn a driver onto the same
@@ -291,6 +295,7 @@ impl AppState {
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            team_liveness_window_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_000)),
             #[cfg(test)]
             team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -405,6 +410,7 @@ impl AppState {
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            team_liveness_window_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_000)),
             #[cfg(test)]
             team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]

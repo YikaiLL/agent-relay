@@ -8973,6 +8973,11 @@ mod review_tests {
         // idle when the error arrives, the drain confirms trivially, and the path
         // worth testing is never reached.
         fail_next_turn_live: Arc<AtomicBool>,
+        // Milliseconds AFTER the error before liveness appears. The real
+        // response-lost shape: `start_turn` returns an error and the turn it
+        // started announces itself a beat later. A stop issued before that beat
+        // looks at an idle thread and answers "stopped" for a turn that is running.
+        fail_next_turn_live_delay_ms: Arc<AtomicU64>,
         // When set, every turn EXCEPT a team-lead handover fails with this error.
         // Models a lead that can always be briefed but always dies on real work,
         // which is what drives the succession chain to its cap.
@@ -9063,6 +9068,7 @@ mod review_tests {
                 scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fail_next_turn_with: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fail_next_turn_live: Arc::new(AtomicBool::new(false)),
+                fail_next_turn_live_delay_ms: Arc::new(AtomicU64::new(0)),
                 fail_work_turns_with: Arc::new(Mutex::new(None)),
                 answered_asks: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -9290,11 +9296,23 @@ mod review_tests {
             self.require_live_cwd(thread_id, "start a turn for").await?;
             if let Some(error) = self.fail_next_turn_with.lock().await.pop_front() {
                 if self.fail_next_turn_live.load(Ordering::Relaxed) {
-                    let mut relay = self.state.write().await;
-                    let now = unix_now();
-                    relay.bg_set_active_turn(thread_id, Some(self.next_token("turn")), now);
-                    relay.bg_set_thread_status(thread_id, "active".to_string(), Vec::new(), now);
-                    relay.notify();
+                    let delay = self.fail_next_turn_live_delay_ms.load(Ordering::Relaxed);
+                    let state = self.state.clone();
+                    let thread_id = thread_id.to_string();
+                    let turn = self.next_token("turn");
+                    tokio::spawn(async move {
+                        sleep(Duration::from_millis(delay)).await;
+                        let mut relay = state.write().await;
+                        let now = unix_now();
+                        relay.bg_set_active_turn(&thread_id, Some(turn), now);
+                        relay.bg_set_thread_status(
+                            &thread_id,
+                            "active".to_string(),
+                            Vec::new(),
+                            now,
+                        );
+                        relay.notify();
+                    });
                 }
                 return Err(error);
             }
@@ -18069,6 +18087,269 @@ turn) must allow a review: {error:?}"
             .await
             .expect_err("a session living in the task's worktree must not be resumed into it");
         assert!(error.contains("belongs to a running task"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_start_whose_response_was_lost_is_watched_before_it_is_believed() {
+        // The dangerous shape: `start_turn` returns an error and the turn it
+        // actually started announces itself a beat LATER. Draining immediately
+        // proves nothing — the runtime reads idle, and codex cannot even issue a
+        // stop without a turn id it never gave us, so `stop_and_drain` answers
+        // "stopped" about a turn it never looked at.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        provider.fail_next_turn_live.store(true, Ordering::Relaxed);
+        // The beat. Short, but strictly after the error returns.
+        provider
+            .fail_next_turn_live_delay_ms
+            .store(60, Ordering::Relaxed);
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_team_liveness_window_ms(600);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run_blocked(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "a turn that announced itself after the error must not be declared stopped: {:?}",
+            run.error
+        );
+        assert!(run.in_flight_thread.is_some(), "the marker must survive");
+        assert!(
+            run.tl_succession.is_empty(),
+            "and the context-window wording must not buy a successor while that turn runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_that_never_began_is_not_treated_as_a_live_turn() {
+        // The other side of the same coin, and the reason the window exists rather
+        // than a blanket refusal: a provider that rejects a request outright never
+        // started anything. Treating that as unknown would make every transient
+        // provider error block the run — and would kill the reactive re-seed, whose
+        // whole trigger is a rejected start.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        // No liveness ever — the request was refused before any work.
+        app.set_team_liveness_window_ms(80);
+        script_replies(
+            provider,
+            &[
+                "Taking over; the plan is current.",
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nDo it.\nEND SUBTASK",
+                "Implemented.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted.",
+                "In scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "a refused start is recoverable: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "the re-seed still happens when nothing was ever running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_queued_behind_a_stop_never_lands() {
+        // The ordering the gate alone does not cover. A stop that gets the gate
+        // FIRST settles, releases, and returns — and the driver, queued behind it,
+        // would take the gate and commit into a workspace already handed back.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        app.set_workflow_drain_max_ms(500);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // Something for the commit to actually contain — otherwise `git add -A`
+        // stages nothing and the assertion below cannot tell the two paths apart.
+        {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                for _ in 0..600 {
+                    let cwd = app
+                        .relay
+                        .read()
+                        .await
+                        .team_run(&run_id)
+                        .map(|run| run.cwd.clone());
+                    if let Some(cwd) = cwd {
+                        let path = std::path::Path::new(&cwd);
+                        if path.is_dir() {
+                            let _ = std::fs::write(path.join("landed.txt"), "work\n");
+                            return;
+                        }
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+
+        // The latch fires inside `team_git_gate`, and every arrival there is now a
+        // real commit — `checkpoint_commit` is ungated because it only reads HEAD.
+        let barrier = app.hold_team_commit_barrier().await;
+        for _ in 0..1200 {
+            if app.team_commit_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_commit_arrivals() > 0,
+            "the driver never reached a commit"
+        );
+        let commits_before = git_commit_count(&app, &run_id).await;
+
+        // Settle the run out from under it, exactly as a stop that won the gate
+        // would have left things, then let the driver proceed.
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.cancel("the task was cancelled by the user");
+        });
+        drop(barrier);
+        sleep(Duration::from_millis(400)).await;
+
+        assert_eq!(
+            git_commit_count(&app, &run_id).await,
+            commits_before,
+            "a driver queued behind a stop must not commit into a released workspace"
+        );
+    }
+
+    async fn git_commit_count(app: &AppState, run_id: &str) -> usize {
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(run_id)
+            .map(|run| run.cwd.clone())
+            .unwrap_or_default();
+        let out = tokio::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(&cwd)
+            .output()
+            .await
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_stop_cannot_leave_the_run_driverless() {
+        // `stop_team_run` marks the run `stopping` and then awaits. An axum handler
+        // future is dropped when the client disconnects, so that await is a real
+        // abort point — and a `stopping` marker left behind suppresses the next
+        // natural failure, after which the driver exits and the run sits driverless
+        // in `PausePending`, blocking every future task.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        // Long enough that the stop is certain to still be inside its drain.
+        app.set_workflow_drain_max_ms(10_000);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let stopper = {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
+                    .await
+            })
+        };
+        for _ in 0..400 {
+            let stopping = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.stopping)
+                .unwrap_or(false);
+            if stopping {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.stopping)
+                .unwrap_or(false),
+            "the stop never marked the run"
+        );
+
+        // The client hangs up.
+        stopper.abort();
+
+        let mut cleared = false;
+        for _ in 0..400 {
+            cleared = !app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.stopping)
+                .unwrap_or(true);
+            if cleared {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "an abandoned stop must not leave `stopping` set, or the next failure is \
+swallowed and the run strands"
+        );
+
+        // The pause request survives, so the run is still on its way to a state
+        // somebody can act on rather than stuck claiming a drain that ended.
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(run.pause_requested, "the user did ask for it to stop");
     }
 
     #[tokio::test]
