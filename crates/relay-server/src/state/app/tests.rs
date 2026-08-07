@@ -8962,6 +8962,14 @@ mod review_tests {
         // Replies to emit, one popped per turn (FIFO), overriding every other
         // reply rule. Lets a test script a whole multi-role pipeline in order.
         scripted_replies: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // Errors `start_turn` should return, one popped per turn (FIFO). Models a
+        // provider refusing a turn — a full context window is the case that
+        // matters, since it is the only honest re-seed trigger.
+        fail_next_turn_with: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // When set, every turn EXCEPT a team-lead handover fails with this error.
+        // Models a lead that can always be briefed but always dies on real work,
+        // which is what drives the succession chain to its cap.
+        fail_work_turns_with: Arc<Mutex<Option<String>>>,
         // AskUserQuestion request ids that were actually ANSWERED through the
         // bridge. A parked turn watches this rather than the pending map, because
         // cleanup also empties that map — and a turn that was drained must not
@@ -9046,6 +9054,8 @@ mod review_tests {
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
                 scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                fail_next_turn_with: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                fail_work_turns_with: Arc::new(Mutex::new(None)),
                 answered_asks: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 raise_approval_on_fix_turn: Arc::new(AtomicBool::new(false)),
@@ -9270,6 +9280,14 @@ mod review_tests {
                 }
             }
             self.require_live_cwd(thread_id, "start a turn for").await?;
+            if let Some(error) = self.fail_next_turn_with.lock().await.pop_front() {
+                return Err(error);
+            }
+            if !text.contains("taking over as team lead") {
+                if let Some(error) = self.fail_work_turns_with.lock().await.clone() {
+                    return Err(error);
+                }
+            }
             self.turns
                 .lock()
                 .await
@@ -17526,6 +17544,163 @@ turn) must allow a review: {error:?}"
             .await
             .expect_err("nor may its sandbox be rewritten mid-run");
         assert!(error.contains("belongs to a running task"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_that_runs_out_of_room_is_replaced_and_the_work_continues() {
+        // There is no token or context-window signal anywhere in `ThreadRuntime`,
+        // so the only HONEST trigger is the provider saying so. The successor
+        // inherits the PLAN FILE, never the retired lead's transcript — which is
+        // exactly why a lead that hits its limit is recoverable instead of fatal.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // The first TL turn fails the way a full session fails; everything after
+        // it succeeds.
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        script_replies(
+            provider,
+            &[
+                "Taking over; the plan is current.",
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+                "Implemented the parser.",
+                "Reads well.\nVERDICT: APPROVED",
+                "Noted, continuing.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "a replaced team lead must not end the run: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "the retired lead is recorded, not forgotten"
+        );
+        let retired = &run.tl_succession[0];
+        assert!(
+            retired.reason.contains("too long"),
+            "the succession should say WHY: {}",
+            retired.reason
+        );
+        assert_ne!(
+            run.tl_thread_id, retired.thread_id,
+            "the successor is a different session"
+        );
+        assert!(
+            run.owned_thread_ids().contains(&retired.thread_id),
+            "the retired lead stays drainable and auditable"
+        );
+        assert!(run.tl_reseed_reason.is_none(), "the request was consumed");
+
+        // The successor was briefed from the spec and the plan file, and was NOT
+        // handed the retired lead's conversation.
+        let turns = provider.turns.lock().await.clone();
+        let handover = turns
+            .iter()
+            .filter(|(thread, _)| thread == &run.tl_thread_id)
+            .map(|(_, text)| text)
+            .find(|text| text.contains("taking over as team lead"))
+            .expect("the successor should have been briefed");
+        assert!(handover.contains(".sealwire/PLAN.md"));
+        assert!(handover.contains("Add a parser"), "the spec comes across");
+        assert!(
+            !handover.contains("Implemented the parser"),
+            "but never the previous conversation: {handover}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_that_dies_on_real_work_fails_the_run_after_one_replacement() {
+        // The retry budget, not the succession cap, is what bounds this: one
+        // action may trigger at most one re-seed. A lead that can be briefed but
+        // always dies on the actual work must therefore end the run promptly
+        // rather than being replaced over and over. (The cap itself is a model
+        // invariant — `the_team_lead_succession_chain_is_capped`.)
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_work_turns_with
+            .lock()
+            .await
+            .replace("context length exceeded".to_string());
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run(&app, &run_id).await;
+
+        assert!(
+            run.status.is_terminal(),
+            "the run must settle rather than loop"
+        );
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "exactly one replacement was tried before giving up, not a cascade"
+        );
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("context length"),
+            "and the provider's own words survive into the failure: {:?}",
+            run.error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paused_task_whose_team_lead_session_is_gone_gets_a_new_one_on_resume() {
+        // The case brick 7 deliberately left as a hole: a recorded lead that no
+        // longer routes to any provider. The plan file is the durable state, so
+        // this is recoverable — but it has to be NOTICED at boot, while a probe is
+        // cheap, rather than blowing up on the first turn after Resume.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+
+        // A team lead id that names nothing — what a restart leaves behind.
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.tl_thread_id = "codex-thread-from-a-previous-relay".to_string();
+        });
+
+        app.validate_paused_team_runs().await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "an unroutable lead is recoverable, not a reason to block"
+        );
+        assert!(
+            run.tl_reseed_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not survive"),
+            "the run should carry why: {:?}",
+            run.tl_reseed_reason
+        );
     }
 
     #[tokio::test]

@@ -44,6 +44,18 @@ use super::*;
 /// completes; this only trips on a turn that makes no progress at all. Lives on
 /// `AppState` as `team_step_stall_ms` so a test can shrink it.
 
+/// Turns one team lead may take before it is replaced.
+///
+/// A PROXY, and knowingly a crude one: `ThreadRuntime` carries no token or
+/// context-window signal at all, so there is nothing honest to threshold on. It
+/// is paired with a byte budget and, more importantly, with a reactive escape —
+/// a lead that hits its real limit before either proxy trips says so, and that
+/// error is what actually triggers the re-seed.
+const TL_MAX_TURNS_PER_GENERATION: u32 = 40;
+
+/// The other half of the proxy: how much transcript one lead may accumulate.
+const TL_MAX_TRANSCRIPT_BYTES: usize = 400 * 1024;
+
 /// How long a turn may stay parked on an `AskUserQuestion` before the run gives
 /// up on it. Deliberately enormous: the person being asked may be asleep, and the
 /// only cost of waiting is a worktree nobody else wants. It exists so an
@@ -376,15 +388,15 @@ impl AppState {
     /// than a card that says the tree is gone. The branch survives either way, so
     /// blocking loses nothing.
     pub(crate) async fn validate_paused_team_runs(&self) {
-        let paused: Vec<(String, String)> = {
+        let paused: Vec<(String, String, String)> = {
             let relay = self.relay.read().await;
             relay
                 .team_runs_snapshot()
                 .filter(|run| run.status.is_resumable())
-                .map(|run| (run.id.clone(), run.cwd.clone()))
+                .map(|run| (run.id.clone(), run.cwd.clone(), run.tl_thread_id.clone()))
                 .collect()
         };
-        for (run_id, cwd) in paused {
+        for (run_id, cwd, tl_thread_id) in paused {
             if LiveWorkspace::from_path(&cwd).is_none() {
                 self.block_team_run(
                     &run_id,
@@ -394,6 +406,27 @@ resumed; its branch is untouched"
                     ),
                 )
                 .await;
+                continue;
+            }
+            // A recorded team lead whose session no longer routes to any provider
+            // is not a dead run — the plan file is the durable state and a fresh
+            // lead can read it. Mark it now, while a provider probe is cheap and
+            // nobody is waiting, rather than letting Resume fail on its first turn.
+            if !tl_thread_id.is_empty() && self.find_thread_provider(&tl_thread_id).await.is_err() {
+                let mut relay = self.relay.write().await;
+                relay.update_team_run(&run_id, |run| {
+                    run.request_tl_reseed(
+                        "the team lead's session did not survive the relay restart",
+                    );
+                });
+                relay.push_log(
+                    "info",
+                    format!(
+                        "Task {run_id}: the team lead's session is gone; a new one will take \
+over on resume"
+                    ),
+                );
+                relay.notify();
             }
         }
     }
@@ -719,6 +752,16 @@ resumed; its branch is untouched"
                 // a stranded run, and reconciling it would destroy the feature.
                 lifeguard.disarm();
                 return;
+            }
+
+            // Between the boundary and the action, because a re-seed is not an
+            // action: it replaces WHO performs the next one, and the record's
+            // next action is unchanged by it.
+            if let Some(reason) = self.tl_needs_reseed(&run_id).await {
+                if !self.reseed_tl(&run_id, &reason).await {
+                    lifeguard.disarm();
+                    return;
+                }
             }
 
             let Some(action) = self.next_team_action_for(&run_id).await else {
@@ -1096,25 +1139,33 @@ resumed; its branch is untouched"
                 .runtime_for_thread(&thread_id)
                 .map(|runtime| runtime.model.clone());
 
-            match self
+            let outcome = self
                 .send_message_to_thread(&thread_id, prompt, model.as_deref(), None)
-                .await
-            {
+                .await;
+            match &outcome {
                 Ok(Some(_)) => {}
                 // Both are uncertain starts: `Ok(None)` returned no turn id, and a
                 // provider can begin work before returning `Err`. Drain either way,
                 // or a started turn keeps mutating the worktree after the run
                 // settles.
                 Ok(None) | Err(_) => {
+                    // The provider's own words, kept. They are the only place a
+                    // context-window failure is ever stated — discarding them left
+                    // the re-seed's reactive trigger with nothing to match on, and
+                    // left every other start failure undiagnosable.
+                    let why = match &outcome {
+                        Err(error) => error.to_string(),
+                        Ok(_) => "the provider returned no turn id".to_string(),
+                    };
                     let drained = self.stop_and_drain(&thread_id).await;
                     self.set_in_flight_thread(run_id, None).await;
                     if !drained {
                         return TeamStepOutcome::Failed(format!(
-                            "thread {thread_id}'s turn did not confirm stopping after an uncertain start"
+                            "thread {thread_id}'s turn did not confirm stopping after an uncertain start: {why}"
                         ));
                     }
                     return TeamStepOutcome::Failed(format!(
-                        "could not start a turn on thread {thread_id}"
+                        "could not start a turn on thread {thread_id}: {why}"
                     ));
                 }
             }
@@ -1551,24 +1602,153 @@ its turn cannot continue",
 
     /// Run one TL turn, counting it against the generation's turn budget.
     async fn tl_turn(&self, run_id: &str, prompt: String) -> Option<String> {
-        self.ensure_tl_thread(run_id).await.ok()?;
-        let outcome = self
-            .team_turn(run_id, TeamThreadSlot::Tl, TeamRole::Tl, &prompt)
-            .await;
-        {
-            let mut relay = self.relay.write().await;
-            relay.update_team_run(run_id, |run| run.tl_turns_this_generation += 1);
-        }
-        match outcome {
-            TeamStepOutcome::Replied(text) => Some(text),
-            TeamStepOutcome::Silent => {
-                self.fail_team_run(run_id, "the team lead replied with nothing")
-                    .await;
-                None
+        // At most one retry, and the bound is the loop itself rather than a
+        // counter someone has to remember to reset.
+        for attempt in 0..2 {
+            self.ensure_tl_thread(run_id).await.ok()?;
+            let outcome = self
+                .team_turn(run_id, TeamThreadSlot::Tl, TeamRole::Tl, &prompt)
+                .await;
+            {
+                let mut relay = self.relay.write().await;
+                relay.update_team_run(run_id, |run| run.tl_turns_this_generation += 1);
             }
+            match outcome {
+                TeamStepOutcome::Replied(text) => return Some(text),
+                TeamStepOutcome::Silent => {
+                    self.fail_team_run(run_id, "the team lead replied with nothing")
+                        .await;
+                    return None;
+                }
+                TeamStepOutcome::Failed(error) => {
+                    // The reactive escape, and the only trigger that is not a
+                    // guess: the lead itself reported it cannot hold any more.
+                    // A fresh one reading the plan file can carry on, so this is
+                    // recoverable rather than fatal — retry the SAME action once.
+                    if attempt == 0
+                        && looks_like_context_exhaustion(&error)
+                        && self.reseed_tl(run_id, &error).await
+                    {
+                        continue;
+                    }
+                    self.fail_team_run(run_id, error).await;
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the team lead should be replaced before the next action.
+    ///
+    /// Read-only, and it consults the record's own request first: a re-seed asked
+    /// for reactively, or at boot for a lead whose session no longer routes, must
+    /// be honoured even when neither budget is close.
+    async fn tl_needs_reseed(&self, run_id: &str) -> Option<String> {
+        let run = self.team_run_snapshot(run_id).await?;
+        if let Some(reason) = run.tl_reseed_reason.clone() {
+            return Some(reason);
+        }
+        if run.tl_thread_id.is_empty() {
+            // Nothing to replace: `ensure_tl_thread` starts the first one.
+            return None;
+        }
+        if run.tl_turns_this_generation >= TL_MAX_TURNS_PER_GENERATION {
+            return Some(format!(
+                "the team lead had taken {} turns",
+                run.tl_turns_this_generation
+            ));
+        }
+        let bytes = self.tl_transcript_bytes(&run.tl_thread_id).await;
+        (bytes >= TL_MAX_TRANSCRIPT_BYTES)
+            .then(|| format!("the team lead's transcript had reached {bytes} bytes"))
+    }
+
+    async fn tl_transcript_bytes(&self, thread_id: &str) -> usize {
+        self.relay
+            .read()
+            .await
+            .runtime_for_thread(thread_id)
+            .map(|runtime| {
+                runtime
+                    .transcript
+                    .iter()
+                    .filter_map(|record| record.text.as_ref())
+                    .map(String::len)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Replace the team lead. Returns whether the run can carry on.
+    ///
+    /// The successor inherits the PLAN FILE, not a transcript — which is the whole
+    /// reason a single long-lived team lead is survivable. The retired thread is
+    /// kept (audit trail, and still drainable); only the seat changes.
+    async fn reseed_tl(&self, run_id: &str, reason: &str) -> bool {
+        let Some(run) = self.team_run_snapshot(run_id).await else {
+            return false;
+        };
+        let retired = {
+            let mut relay = self.relay.write().await;
+            let mut retired = false;
+            relay.update_team_run(run_id, |run| retired = run.retire_tl(reason));
+            if retired {
+                relay.push_log(
+                    "info",
+                    format!("Task {run_id}: replacing the team lead ({reason})"),
+                );
+            }
+            relay.notify();
+            retired
+        };
+        if !retired {
+            // The cap exists so a task no lead can hold fails loudly instead of
+            // burning tokens through an endless succession.
+            self.fail_team_run(
+                run_id,
+                format!(
+                    "the team lead was replaced {} times and still could not carry the task",
+                    run.tl_generation_count()
+                ),
+            )
+            .await;
+            return false;
+        }
+
+        if self.ensure_tl_thread(run_id).await.is_err() {
+            return false;
+        }
+        let completed: Vec<String> = run
+            .sub_tasks
+            .iter()
+            .filter(|task| task.status.is_terminal())
+            .map(|task| format!("{} — {}", task.title, task.status.as_str()))
+            .collect();
+        let prompt = prompts::tl_reseed(
+            &run.spec,
+            &run.plan_rel_path,
+            run.phase.as_str(),
+            &completed,
+            reason,
+        );
+        // The handover turn is the successor's first. Its reply is an
+        // acknowledgement we do not read: what matters is that the context is in
+        // its session before it is asked to decide anything.
+        match self
+            .team_turn(run_id, TeamThreadSlot::Tl, TeamRole::Tl, &prompt)
+            .await
+        {
             TeamStepOutcome::Failed(error) => {
-                self.fail_team_run(run_id, error).await;
-                None
+                self.fail_team_run(run_id, format!("could not brief a new team lead: {error}"))
+                    .await;
+                false
+            }
+            _ => {
+                let mut relay = self.relay.write().await;
+                relay.update_team_run(run_id, |run| run.tl_turns_this_generation += 1);
+                relay.notify();
+                true
             }
         }
     }
@@ -2223,6 +2403,28 @@ history with it and no fork point was recorded",
 /// is exactly the product rule: a reviewer never talks to the user. TL and dev
 /// run non-prompting but writable, because the worktree is isolated and there is
 /// nobody to answer a tool approval; their `AskUserQuestion` channel stays open.
+/// Whether a failed turn is the provider saying the session is full.
+///
+/// Matched on text because there is nothing better: no provider in this codebase
+/// surfaces a typed context-exhaustion error, and `ThreadRuntime` has no usage
+/// signal to infer it from. Kept deliberately narrow — a false positive costs a
+/// wasted re-seed, but a broad pattern would re-seed on ordinary failures and
+/// hide real bugs behind a fresh session.
+fn looks_like_context_exhaustion(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "context window",
+        "context length",
+        "context limit",
+        "too long",
+        "token limit",
+        "maximum context",
+        "prompt is too long",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
 fn team_thread_settings(
     provider: &str,
     role: TeamRole,

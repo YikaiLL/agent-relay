@@ -451,6 +451,15 @@ pub(crate) struct TeamRun {
     pub(crate) tl_model: String,
     pub(crate) tl_succession: Vec<TlGeneration>,
     pub(crate) tl_turns_this_generation: u32,
+    /// Why the team lead should be replaced before the next action, if it should.
+    ///
+    /// A single `Option<String>` rather than a flag plus a reason: the two can
+    /// never disagree, and it decodes leniently by default so it is not another
+    /// persisted enum to get wrong. Set proactively by the driver's budget check,
+    /// reactively by a context-window failure, and at boot by
+    /// `validate_paused_team_runs` when the recorded session no longer routes to
+    /// any provider. Cleared by the re-seed that acts on it.
+    pub(crate) tl_reseed_reason: Option<String>,
 
     /// Threads owned by the RUN rather than by a sub-task: the design reviewer,
     /// each MR-gate reviewer, and the dev thread that addresses MR findings.
@@ -578,6 +587,49 @@ impl TeamRun {
         // surviving `awaiting` would render a card for a question that is gone.
         self.awaiting = None;
         self.status = TeamRunStatus::Paused;
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// Ask for a fresh team lead before the next action. Idempotent — the FIRST
+    /// reason wins, because it is the one that actually diagnosed the problem.
+    pub(crate) fn request_tl_reseed(&mut self, reason: impl Into<String>) {
+        if self.tl_reseed_reason.is_some() {
+            return;
+        }
+        self.tl_reseed_reason = Some(reason.into());
+        self.updated_at = unix_now();
+    }
+
+    /// How many team leads this run has had, including the current one.
+    pub(crate) fn tl_generation_count(&self) -> usize {
+        self.tl_succession.len() + 1
+    }
+
+    /// Retire the current team lead so a fresh one can take over.
+    ///
+    /// Returns false when the succession chain is already at its cap: a re-seed
+    /// loop would otherwise burn tokens forever on a task no team lead can hold.
+    ///
+    /// The old thread is NEVER deleted. It is the audit trail for everything that
+    /// generation decided, it stays in `owned_thread_ids` so a drain still reaches
+    /// it, and the plan file on disk — not the session — is what the successor
+    /// actually inherits.
+    pub(crate) fn retire_tl(&mut self, reason: impl Into<String>) -> bool {
+        if self.tl_generation_count() >= MAX_TL_GENERATIONS {
+            return false;
+        }
+        let reason = reason.into();
+        if !self.tl_thread_id.is_empty() {
+            self.tl_succession.push(TlGeneration {
+                thread_id: std::mem::take(&mut self.tl_thread_id),
+                reason: reason.clone(),
+                retired_at: unix_now(),
+            });
+        }
+        self.tl_thread_id = String::new();
+        self.tl_turns_this_generation = 0;
+        self.tl_reseed_reason = None;
         self.updated_at = unix_now();
         true
     }
@@ -1126,6 +1178,49 @@ Change only what these findings call for.",
     }
 
     /// TL writes the closing report.
+    /// The handover a fresh team lead gets.
+    ///
+    /// Deliberately built from the SPEC and the PLAN FILE, never from the retired
+    /// lead's transcript — inheriting that transcript is the very thing the
+    /// re-seed exists to escape. This is what makes a lost or exhausted team lead
+    /// recoverable rather than fatal: the durable state was always on disk.
+    pub(crate) fn tl_reseed(
+        spec: &TaskSpec,
+        plan_path: &str,
+        phase: &str,
+        completed: &[String],
+        reason: &str,
+    ) -> String {
+        let done = if completed.is_empty() {
+            "No sub-task has been completed yet.".to_string()
+        } else {
+            format!(
+                "Sub-tasks already completed (do NOT redo them):
+{}",
+                completed
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+"
+                    )
+            )
+        };
+        format!(
+            "You are taking over as team lead for a task already in progress. The previous lead was replaced ({reason}). You do NOT have its conversation, and you do not need it.
+
+{}
+
+Read `{plan_path}` — it is the plan of record and it is current. The work is in the phase `{phase}`.
+
+{done}
+
+Reply with a one-line acknowledgement of where the work stands. Do not restate the plan, and do not start any work in this turn; you will be asked for the next step separately.",
+            spec_block(spec)
+        )
+    }
+
     pub(crate) fn wrap(spec: &TaskSpec, report_path: &str, unresolved: &[String]) -> String {
         let leftovers = if unresolved.is_empty() {
             "Nothing was left unresolved.".to_string()
@@ -1279,6 +1374,60 @@ mod tests {
         assert_eq!(run.status, TeamRunStatus::Paused);
         assert!(!run.pause_requested, "the request is consumed by settling");
         assert_eq!(run.pause_reason.as_deref(), Some("boundary reached"));
+    }
+
+    #[test]
+    fn the_team_lead_succession_chain_is_capped() {
+        // A task no lead can hold must fail loudly rather than replace its lead
+        // forever, each successor dying the same way. The cap lives here rather
+        // than in the driver because the driver's own retry budget hides it: one
+        // action can only ever trigger one re-seed, so nothing upstream would
+        // reach eight generations on its own.
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        for generation in 1..MAX_TL_GENERATIONS {
+            run.tl_thread_id = format!("tl-{generation}");
+            run.tl_turns_this_generation = 12;
+            assert!(
+                run.retire_tl("out of room"),
+                "generation {generation} should still be replaceable"
+            );
+            assert!(run.tl_thread_id.is_empty(), "the seat is vacated");
+            assert_eq!(
+                run.tl_turns_this_generation, 0,
+                "the successor starts on a fresh budget"
+            );
+        }
+
+        run.tl_thread_id = "tl-last".to_string();
+        assert_eq!(run.tl_generation_count(), MAX_TL_GENERATIONS);
+        assert!(
+            !run.retire_tl("out of room"),
+            "the chain must not grow past its cap"
+        );
+        assert_eq!(
+            run.tl_thread_id, "tl-last",
+            "a refused retirement leaves the current lead in place"
+        );
+        assert_eq!(run.tl_succession.len(), MAX_TL_GENERATIONS - 1);
+    }
+
+    #[test]
+    fn a_reseed_request_keeps_the_reason_that_diagnosed_it() {
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.tl_thread_id = "tl-1".to_string();
+        run.request_tl_reseed("the session did not survive the restart");
+        run.request_tl_reseed("out of room");
+        assert_eq!(
+            run.tl_reseed_reason.as_deref(),
+            Some("the session did not survive the restart"),
+            "the FIRST diagnosis is the one that knew what was wrong"
+        );
+
+        assert!(run.retire_tl("out of room"));
+        assert!(
+            run.tl_reseed_reason.is_none(),
+            "acting on the request consumes it, or the next loop re-seeds forever"
+        );
     }
 
     #[test]
