@@ -74,6 +74,45 @@ function scenarioConfig() {
         },
       },
       {
+        // Keyed on the TASK TITLE, which reaches this prompt through the spec
+        // block. That is what lets one scenario file drive legs that must end
+        // differently — the sub-task name it produces then keys the review below.
+        contains: ["Split this task into sub-tasks", "Escalate me"],
+        scenario: {
+          reply: [
+            "One sub-task.",
+            "SUBTASK: Rejected work",
+            "This will not be approved.",
+            "END SUBTASK",
+          ].join("\n"),
+        },
+      },
+      {
+        contains: ["Review this sub-task's changes", "Rejected work"],
+        scenario: { reply: "Not close.\nVERDICT: NEEDS_CHANGES\n- the parser is missing" },
+      },
+      {
+        contains: ["Split this task into sub-tasks", "Ask me something"],
+        scenario: {
+          reply: ["One sub-task.", "SUBTASK: Needs a decision", "Ask first.", "END SUBTASK"].join(
+            "\n"
+          ),
+        },
+      },
+      {
+        // The developer stops and asks. The SAME turn continues once answered.
+        contains: ["You are the developer on one sub-task", "Needs a decision"],
+        scenario: {
+          reply: "Went with the first option.",
+          write_files: [{ path: DEV_FILE, contents: DEV_CONTENTS }],
+          ask_user: {
+            question: "Which encoding should the parser prefer?",
+            header: "Encoding",
+            options: ["UTF-8", "Latin-1"],
+          },
+        },
+      },
+      {
         contains: ["Split this task into sub-tasks"],
         scenario: {
           reply: [
@@ -141,10 +180,15 @@ async function main() {
 
     const happy = await runHappyPath(relayPort, stateDir);
     const lifecycle = await runLifecycle(relayPort, stateDir);
+    const escalation = await runEscalation(relayPort, stateDir);
+    // Before the isolation leg: that one deliberately opens a session at the end,
+    // and the question leg asserts there is NO foreground session anywhere — which
+    // is the unattended state the team's answer exception exists for.
+    const question = await runQuestion(relayPort, stateDir);
     const isolation = await runIsolation(relayPort, stateDir);
 
     console.log(
-      JSON.stringify({ ok: true, happy, lifecycle, isolation }, null, 2)
+      JSON.stringify({ ok: true, happy, lifecycle, isolation, escalation, question }, null, 2)
     );
   } catch (error) {
     dumpProcessLogs(relay);
@@ -327,6 +371,88 @@ async function runIsolation(relayPort, stateDir) {
   assert.ok(branches.includes(started.branch), "cancelling never deletes the branch");
 
   return { team_run_id: started.team_run_id, status: cancelled.data.status };
+}
+
+// ---- leg 4: work that is never approved escalates rather than passing --------
+
+async function runEscalation(relayPort, stateDir) {
+  const repo = await makeRepo(stateDir, "escalation");
+  const started = await startTeam(relayPort, repo, "Escalate me");
+  const run = await waitForTerminalTeam(relayPort, started.team_run_id);
+
+  assert.equal(
+    run.status,
+    "escalated",
+    `unapproved work must not report done (status=${run.status}, error=${run.error})`
+  );
+  assert.equal(run.sub_tasks.length, 1);
+  const task = run.sub_tasks[0];
+  assert.equal(task.status, "escalated", "the sub-task ran out of review rounds");
+  assert.equal(task.rounds_used, 2, "two rounds is the ceiling, not a suggestion");
+  assert.ok(
+    (task.result_summary || "").includes("parser is missing"),
+    `the team lead must learn WHY it escalated: ${task.result_summary}`
+  );
+  assert.ok(
+    run.unresolved.length > 0,
+    "and the run must carry the leftovers into its report"
+  );
+  // The branch still exists: escalation hands work back, it does not throw it away.
+  const branches = await git(repo, ["branch", "--list", started.branch]);
+  assert.ok(branches.includes(started.branch));
+
+  return { team_run_id: run.team_run_id, status: run.status, rounds: task.rounds_used };
+}
+
+// ---- leg 5: the team asks a person, and the same turn carries on -------------
+
+async function runQuestion(relayPort, stateDir) {
+  const repo = await makeRepo(stateDir, "question");
+  const started = await startTeam(relayPort, repo, "Ask me something");
+
+  // The run parks and says so on the record — including WHICH seat is waiting.
+  const parked = await waitForTeam(
+    relayPort,
+    started.team_run_id,
+    (run) => run.status === "awaiting_user" && run.awaiting
+  );
+  assert.equal(parked.awaiting.role, "dev", "the developer is the one asking");
+  assert.ok(parked.awaiting.request_id, "and the card is addressable");
+
+  // Answering goes through the ordinary ask-user route — no foreground session
+  // exists anywhere, which is the normal state while a task runs unattended.
+  const snapshot = await fetchEnvelope(relayPort, "/api/session");
+  assert.equal(
+    snapshot.data?.active_thread_id ?? null,
+    null,
+    "this is the unattended case the team exception exists for"
+  );
+  const answered = await postEnvelope(
+    relayPort,
+    `/api/ask-user-questions/${encodeURIComponent(parked.awaiting.request_id)}/answer`,
+    {
+      device_id: DEVICE,
+      answers: { "Which encoding should the parser prefer?": "UTF-8" },
+    }
+  );
+  assert.ok(answered.ok, `answering failed: ${JSON.stringify(answered.error)}`);
+
+  const run = await waitForTerminalTeam(relayPort, started.team_run_id);
+  assert.equal(
+    run.status,
+    "done",
+    `the answered turn should carry the run to the end (error=${run.error})`
+  );
+  assert.equal(run.awaiting, null, "the parked question is cleared once answered");
+  // The answered turn's WORK landed — proof the same turn continued rather than
+  // being restarted or abandoned.
+  const tracked = (await git(repo, ["ls-tree", "-r", "--name-only", started.branch])).split("\n");
+  assert.ok(
+    tracked.includes(DEV_FILE),
+    `the answered turn's work must reach the branch, got:\n${tracked.join("\n")}`
+  );
+
+  return { team_run_id: run.team_run_id, status: run.status, asked_role: parked.awaiting.role };
 }
 
 // ---- helpers -----------------------------------------------------------------

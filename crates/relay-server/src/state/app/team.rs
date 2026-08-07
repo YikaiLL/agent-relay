@@ -55,10 +55,10 @@ use super::*;
 /// is paired with a byte budget and, more importantly, with a reactive escape —
 /// a lead that hits its real limit before either proxy trips says so, and that
 /// error is what actually triggers the re-seed.
-const TL_MAX_TURNS_PER_GENERATION: u32 = 40;
+pub(super) const TL_MAX_TURNS_PER_GENERATION: u32 = 40;
 
 /// The other half of the proxy: how much transcript one lead may accumulate.
-const TL_MAX_TRANSCRIPT_BYTES: usize = 400 * 1024;
+pub(super) const TL_MAX_TRANSCRIPT_BYTES: usize = 400 * 1024;
 
 /// How long a turn may stay parked on an `AskUserQuestion` before the run gives
 /// up on it. Deliberately enormous: the person being asked may be asleep, and the
@@ -2339,6 +2339,7 @@ finding per line.",
         let verdict = verdict_from(&text);
 
         let mut relay = self.relay.write().await;
+        let mut escalated: Option<String> = None;
         relay.update_team_run(run_id, |run| {
             let max_rounds = run.max_review_rounds;
             if let Some(task) = run.sub_tasks.get_mut(index) {
@@ -2363,11 +2364,24 @@ finding per line.",
                             .collect::<Vec<_>>()
                             .join("\n")
                     ));
+                    // Also on the RUN's leftovers, not only the sub-task's summary.
+                    // `unresolved` is what `prompts::wrap` enumerates for the
+                    // report, so without this a run that escalates hands the user a
+                    // report headed "Nothing was left unresolved" — the one
+                    // statement its own status contradicts. The detail stays in
+                    // `result_summary`; this is the line that has to be visible.
+                    escalated = Some(format!(
+                        "sub-task \"{}\" was not approved after {} review round(s)",
+                        task.title, task.rounds_used
+                    ));
                 } else {
                     // Back to the same dev for another round.
                     task.status = SubTaskStatus::Pending;
                 }
                 task.last_verdict = Some(verdict.clone());
+            }
+            if let Some(leftover) = escalated.take() {
+                run.unresolved.push(leftover);
             }
         });
         relay.notify();

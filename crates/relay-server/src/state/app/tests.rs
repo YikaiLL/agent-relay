@@ -16592,6 +16592,15 @@ turn) must allow a review: {error:?}"
             crate::state::TeamRunStatus::Escalated,
             "a run with an unapproved sub-task cannot report Done"
         );
+        assert!(
+            run.unresolved
+                .iter()
+                .any(|entry| entry.contains("Add the parser") && entry.contains("not approved")),
+            "an escalated sub-task must reach the run's leftovers — `unresolved` is \
+what the report enumerates, so without it a run that escalated hands the user a \
+report headed \"Nothing was left unresolved\": {:?}",
+            run.unresolved
+        );
 
         // Round 2 reused the SAME dev (it should see its own prior work) but a
         // FRESH reviewer (so round 2 judges the work, not its own opinion).
@@ -18350,6 +18359,120 @@ swallowed and the run strands"
         // somebody can act on rather than stuck claiming a drain that ended.
         let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
         assert!(run.pause_requested, "the user did ask for it to stop");
+    }
+
+    /// Block until the team lead's thread exists — the window in which a
+    /// proactive re-seed trigger can be armed.
+    async fn wait_for_team_lead(app: &AppState, run_id: &str) -> String {
+        for _ in 0..800 {
+            let tl = app
+                .relay
+                .read()
+                .await
+                .team_run(run_id)
+                .map(|run| run.tl_thread_id.clone())
+                .unwrap_or_default();
+            if !tl.is_empty() {
+                return tl;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the team lead thread never started");
+    }
+
+    /// A full simple pipeline with one extra reply at the front for the
+    /// successor's handover turn.
+    async fn script_reseeding_pipeline(provider: &ReviewTestProvider) {
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "Taking over; the plan is current.",
+                "SUBTASK: Add the parser\nDo it.\nEND SUBTASK",
+                "Implemented.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted.",
+                "In scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_is_replaced_once_it_has_taken_too_many_turns() {
+        // One of the two PROXY triggers. There is no token or context-window
+        // signal anywhere in `ThreadRuntime`, so this threshold is a guess by
+        // construction — which is exactly why it needs a test. Nothing else would
+        // notice if the counter stopped being read, and it WAS counted for a whole
+        // milestone before anything looked at it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_reseeding_pipeline(provider).await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let first_tl = wait_for_team_lead(&app, &run_id).await;
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.tl_turns_this_generation = crate::state::app::team::TL_MAX_TURNS_PER_GENERATION;
+        });
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "the turn budget must retire the lead that spent it: {:?}",
+            run.error
+        );
+        assert_eq!(run.tl_succession[0].thread_id, first_tl);
+        assert!(
+            run.tl_succession[0].reason.contains("turns"),
+            "the succession should say WHICH budget ran out: {}",
+            run.tl_succession[0].reason
+        );
+        assert_ne!(run.tl_thread_id, first_tl, "the successor is a new session");
+    }
+
+    #[tokio::test]
+    async fn a_team_lead_is_replaced_once_its_transcript_is_too_large() {
+        // The other proxy, and the one that actually stands in for context: turns
+        // are cheap to count but say nothing about how much a lead is carrying.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        script_reseeding_pipeline(provider).await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let first_tl = wait_for_team_lead(&app, &run_id).await;
+        {
+            let mut relay = app.relay.write().await;
+            let runtime = relay.ensure_runtime_for_thread(&first_tl);
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: "bulk".to_string(),
+                    kind: crate::protocol::TranscriptEntryKind::AgentText,
+                    text: Some("x".repeat(crate::state::app::team::TL_MAX_TRANSCRIPT_BYTES + 1)),
+                    status: "completed".to_string(),
+                    turn_id: None,
+                    tool: None,
+                });
+            relay.notify();
+        }
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.tl_succession.len(),
+            1,
+            "a lead carrying too much must be retired: {:?}",
+            run.error
+        );
+        assert!(
+            run.tl_succession[0].reason.contains("bytes"),
+            "the succession should name the budget: {}",
+            run.tl_succession[0].reason
+        );
+        assert_ne!(run.tl_thread_id, first_tl);
     }
 
     #[tokio::test]

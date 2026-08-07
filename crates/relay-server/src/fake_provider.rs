@@ -59,6 +59,15 @@ struct FakeScenarioMatcher {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct FakeAskUser {
+    question: String,
+    #[serde(default)]
+    header: String,
+    #[serde(default)]
+    options: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct FakeFileWrite {
     path: String,
     #[serde(default)]
@@ -97,6 +106,13 @@ struct FakeTurnScenario {
     late_chunk_delay_ms: Option<u64>,
     #[serde(default)]
     require_approval: bool,
+    /// Park this turn on an `AskUserQuestion` instead of replying, then CONTINUE
+    /// the same turn once it is answered. That continuation is the whole point:
+    /// a parked turn is not stopped, it is blocked inside the provider's tool
+    /// callback, and a double that ended the turn instead would make the feature
+    /// look like it needed machinery it does not have.
+    #[serde(default)]
+    ask_user: Option<FakeAskUser>,
     #[serde(default)]
     terminal: FakeTerminalBehavior,
     error_message: Option<String>,
@@ -141,6 +157,13 @@ struct FakeProviderEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<serde_json::Value>,
 }
+
+/// Ask-user request ids answered through the bridge.
+///
+/// A parked turn watches THIS rather than the pending map: cleanup empties that
+/// map too, and a turn that was drained must not behave as though someone had
+/// answered it.
+type AnsweredAsks = Arc<Mutex<std::collections::HashSet<String>>>;
 
 #[derive(Clone)]
 struct FakeScenarioHarness {
@@ -371,6 +394,7 @@ pub struct FakeProviderBridge {
     approval_gates: Arc<Mutex<HashMap<String, FakeApprovalGate>>>,
     turn_stop_behaviors: Arc<Mutex<HashMap<String, FakeStopBehavior>>>,
     stopped_turns: Arc<Mutex<HashSet<String>>>,
+    answered_asks: AnsweredAsks,
     scenario_harness: Option<FakeScenarioHarness>,
 }
 
@@ -398,6 +422,7 @@ impl FakeProviderBridge {
             approval_gates: Arc::new(Mutex::new(HashMap::new())),
             turn_stop_behaviors: Arc::new(Mutex::new(HashMap::new())),
             stopped_turns: Arc::new(Mutex::new(HashSet::new())),
+            answered_asks: Arc::new(Mutex::new(std::collections::HashSet::new())),
             scenario_harness,
         })
     }
@@ -649,6 +674,11 @@ impl ProviderBridge for FakeProviderBridge {
                 let _ = tokio::fs::write(&target, file.contents.as_bytes()).await;
             }
         }
+        let ask_user = scenario
+            .as_ref()
+            .and_then(|scenario| scenario.ask_user.clone());
+        let answered_asks = self.answered_asks.clone();
+        let ask_request_id = self.next_token("fake-ask");
         let scenario_harness = self.scenario_harness.clone();
         let turn_id = self.next_token("fake-turn");
         let user_item_id = self.next_token("fake-user");
@@ -729,6 +759,51 @@ impl ProviderBridge for FakeProviderBridge {
                     );
                 }
                 relay.notify();
+            }
+
+            // 1b. Park on a question, if the scenario asks for one. The thread is
+            // already marked working above, which the relay REQUIRES: it drops a
+            // thread's pending requests the moment its status settles, so a
+            // question recorded on an idle thread would vanish immediately.
+            if let Some(ask) = ask_user.as_ref() {
+                {
+                    let mut relay = state.write().await;
+                    relay.add_pending_ask_user_question(crate::state::PendingAskUserQuestion {
+                        request_id: ask_request_id.clone(),
+                        tool_use_id: format!("toolu-{ask_request_id}"),
+                        thread_id: thread_id.clone(),
+                        requested_at: unix_now(),
+                        questions: vec![crate::protocol::AskUserQuestionView {
+                            question: ask.question.clone(),
+                            header: ask.header.clone(),
+                            multi_select: false,
+                            options: ask
+                                .options
+                                .iter()
+                                .map(|label| crate::protocol::AskUserOptionView {
+                                    label: label.clone(),
+                                    description: String::new(),
+                                })
+                                .collect(),
+                        }],
+                    });
+                    relay.notify();
+                }
+                // A parked turn is NOT stopped. It is blocked inside the
+                // provider's tool callback and the SAME turn carries on the moment
+                // the answer lands — so this waits for a real answer and then falls
+                // through to the ordinary reply below.
+                let mut answered = false;
+                for _ in 0..6_000 {
+                    if answered_asks.lock().await.contains(&ask_request_id) {
+                        answered = true;
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+                if !answered {
+                    return;
+                }
             }
 
             // 2. Park on an approval request when the policy requires it. Only
@@ -1306,10 +1381,14 @@ impl ProviderBridge for FakeProviderBridge {
 
     async fn respond_to_ask_user_question(
         &self,
-        _request_id: &str,
+        request_id: &str,
         _answers: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {
-        Err("fake provider does not surface AskUserQuestion".to_string())
+        self.answered_asks
+            .lock()
+            .await
+            .insert(request_id.to_string());
+        Ok(())
     }
 
     fn provider_name(&self) -> &'static str {
