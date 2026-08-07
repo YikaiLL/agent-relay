@@ -198,7 +198,7 @@ mod providers;
 mod review;
 mod sessions;
 mod task_list;
-mod team;
+pub(crate) mod team;
 #[cfg(test)]
 mod tests;
 mod threads;

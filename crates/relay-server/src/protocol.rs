@@ -2523,6 +2523,112 @@ pub struct StartWorkflowReceipt {
     pub message: String,
 }
 
+/// Start a Task team run. Flat rather than nesting the spec, because a client
+/// filling this in is filling in a form, not assembling a domain object.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StartTeamInput {
+    pub title: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub acceptance_criteria: String,
+    /// The MR gate's yardstick, along with `quality_rules`. Immutable once the run
+    /// starts: the team must not be able to edit what it is measured against.
+    #[serde(default)]
+    pub agreed_scope: String,
+    #[serde(default)]
+    pub quality_rules: String,
+    /// Any directory inside the repository to fork from. Defaults to the relay's
+    /// current workspace.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Branch to fork from; defaults to the main worktree's current branch.
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    #[serde(default)]
+    pub tl_provider: Option<String>,
+    #[serde(default)]
+    pub dev_provider: Option<String>,
+    #[serde(default)]
+    pub reviewer_provider: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+/// Every whole-run action takes the same shape: which run, and who is asking.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TeamActionInput {
+    /// Optional while one task runs at a time; required once that relaxes.
+    #[serde(default)]
+    pub team_run_id: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamActionReceipt {
+    pub team_run_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartTeamReceipt {
+    pub team_run_id: String,
+    pub cwd: String,
+    pub branch: String,
+    pub status: String,
+    pub message: String,
+}
+
+/// One sub-task, as a client sees it. The brief is deliberately absent: it is
+/// TL-authored instruction for a developer, not status.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamSubTaskView {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub rounds_used: u32,
+    pub digested: bool,
+    pub result_summary: Option<String>,
+}
+
+/// A parked question, so a client knows who is waiting and on what.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamAwaitingView {
+    pub thread_id: String,
+    pub request_id: String,
+    pub role: String,
+    pub asked_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamRunView {
+    pub team_run_id: String,
+    pub title: String,
+    pub status: String,
+    pub phase: String,
+    pub cwd: String,
+    pub branch: String,
+    pub target_ref: String,
+    pub tl_thread_id: String,
+    /// How many team leads this run has had. Anything above 1 means a re-seed.
+    pub tl_generations: usize,
+    pub sub_tasks: Vec<TeamSubTaskView>,
+    pub awaiting: Option<TeamAwaitingView>,
+    pub unresolved: Vec<String>,
+    pub head_commit: Option<String>,
+    pub pause_reason: Option<String>,
+    pub error: Option<String>,
+    pub requested_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamsResponse {
+    pub teams: Vec<TeamRunView>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WorkflowActionInput {
     #[serde(default)]

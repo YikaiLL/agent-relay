@@ -29,6 +29,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::protocol::{
+    StartTeamInput, StartTeamReceipt, TeamActionInput, TeamActionReceipt, TeamAwaitingView,
+    TeamRunView, TeamSubTaskView, TeamsResponse,
+};
 use crate::state::{
     next_team_action, parse_complexity, parse_sub_tasks, parse_verdict, prompts, SubTaskStatus,
     TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus, TeamThreadSlot, WorkflowVerdict,
@@ -219,9 +223,11 @@ impl Drop for TeamRecoveryGuard {
     }
 }
 
-/// What a caller needs to start a task.
+/// What the relay needs to start a task, after the wire input has been
+/// resolved. Kept separate from `protocol::StartTeamInput` so the domain type
+/// never carries `Option`s that were only ever an HTTP convenience.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct StartTeamInput {
+pub(crate) struct TeamStartRequest {
     pub(crate) spec: TaskSpec,
     /// Any directory inside the repository the task should fork from.
     pub(crate) origin_cwd: String,
@@ -235,7 +241,7 @@ pub(crate) struct StartTeamInput {
 
 impl AppState {
     /// Provision a worktree, record the run, and start driving it.
-    pub(crate) async fn start_team_run(&self, input: StartTeamInput) -> Result<String, String> {
+    pub(crate) async fn start_team_run(&self, input: TeamStartRequest) -> Result<String, String> {
         // One at a time in M1, and the check has to be atomic with the insert or
         // two requests can both pass it. `acquire_session_slot` is the existing
         // check-then-act mutex; it is released as soon as the run is recorded, NOT
@@ -498,6 +504,89 @@ over on resume"
         if let Ok(mut driving) = self.driving_team_runs.lock() {
             driving.remove(run_id);
         }
+    }
+
+    /// The HTTP entry point: resolve a wire request and start the run.
+    pub async fn start_team(&self, input: StartTeamInput) -> Result<StartTeamReceipt, String> {
+        let title = non_empty(Some(input.title)).ok_or_else(|| "title is required".to_string())?;
+        let device_id = require_device_id(input.device_id)?;
+        let origin_cwd = match non_empty(input.cwd) {
+            Some(cwd) => cwd,
+            None => self.defaults().await.current_cwd,
+        };
+        let run_id = self
+            .start_team_run(TeamStartRequest {
+                spec: TaskSpec {
+                    title,
+                    context: input.context,
+                    acceptance_criteria: input.acceptance_criteria,
+                    agreed_scope: input.agreed_scope,
+                    quality_rules: input.quality_rules,
+                },
+                origin_cwd,
+                target_branch: non_empty(input.target_branch),
+                device_id,
+                tl_provider: non_empty(input.tl_provider).unwrap_or_default(),
+                dev_provider: non_empty(input.dev_provider).unwrap_or_default(),
+                reviewer_provider: non_empty(input.reviewer_provider).unwrap_or_default(),
+            })
+            .await?;
+        let run = self
+            .team_run_snapshot(&run_id)
+            .await
+            .ok_or_else(|| "the task vanished before it could be reported".to_string())?;
+        Ok(StartTeamReceipt {
+            team_run_id: run.id,
+            cwd: run.cwd,
+            branch: run.branch.clone(),
+            status: run.status.as_str().to_string(),
+            message: format!("Task started on {}.", run.branch),
+        })
+    }
+
+    /// Every whole-run action, behind one entry point.
+    ///
+    /// One function because the five differ only in which transition they ask
+    /// for; giving each its own handler would have been five chances to forget
+    /// the receipt, the log line, or the status read-back.
+    pub async fn team_action(
+        &self,
+        action: TeamAction2,
+        input: TeamActionInput,
+    ) -> Result<TeamActionReceipt, String> {
+        let run_id = input.team_run_id.clone();
+        let device_id = input.device_id.clone();
+        let status = match action {
+            TeamAction2::Pause => self.pause_team_run(run_id, device_id).await?,
+            TeamAction2::Stop => self.force_stop_team_run(run_id, device_id).await?,
+            TeamAction2::Cancel => self.cancel_team_run(run_id, device_id).await?,
+            TeamAction2::Resume => self.resume_team_run(run_id, device_id).await?,
+            TeamAction2::Resolve => self.resolve_blocked_team_run(run_id, device_id).await?,
+        };
+        let resolved = {
+            let relay = self.relay.read().await;
+            relay
+                .active_team_run_id(input.team_run_id.as_deref())
+                .unwrap_or_else(|_| input.team_run_id.clone().unwrap_or_default())
+        };
+        Ok(TeamActionReceipt {
+            team_run_id: resolved,
+            status: status.as_str().to_string(),
+            message: action.message(status),
+        })
+    }
+
+    /// Every recorded task, newest first.
+    pub async fn teams(&self) -> TeamsResponse {
+        let relay = self.relay.read().await;
+        let mut teams: Vec<TeamRunView> = relay.team_runs_snapshot().map(team_run_view).collect();
+        teams.sort_by(|left, right| {
+            right
+                .requested_at
+                .cmp(&left.requested_at)
+                .then_with(|| right.team_run_id.cmp(&left.team_run_id))
+        });
+        TeamsResponse { teams }
     }
 
     /// Ask the run to pause at its next step boundary.
@@ -2403,6 +2492,70 @@ history with it and no fork point was recorded",
 /// is exactly the product rule: a reviewer never talks to the user. TL and dev
 /// run non-prompting but writable, because the worktree is isolated and there is
 /// nobody to answer a tool approval; their `AskUserQuestion` channel stays open.
+/// Which whole-run action an HTTP request is asking for.
+///
+/// Named to avoid colliding with `state::team::TeamAction`, which is the
+/// driver's next PIPELINE step — a different thing entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamAction2 {
+    Pause,
+    Stop,
+    Cancel,
+    Resume,
+    Resolve,
+}
+
+impl TeamAction2 {
+    fn message(self, status: TeamRunStatus) -> String {
+        let status = status.as_str();
+        match self {
+            Self::Pause => format!("Pause requested; the task is {status}."),
+            Self::Stop => format!("Task stopped; it is {status}."),
+            Self::Cancel => format!("Task cancelled; it is {status}."),
+            Self::Resume => format!("Task resumed; it is {status}."),
+            Self::Resolve => format!("Task unblocked; it is {status}."),
+        }
+    }
+}
+
+fn team_run_view(run: &TeamRun) -> TeamRunView {
+    TeamRunView {
+        team_run_id: run.id.clone(),
+        title: run.spec.title.clone(),
+        status: run.status.as_str().to_string(),
+        phase: run.phase.as_str().to_string(),
+        cwd: run.cwd.clone(),
+        branch: run.branch.clone(),
+        target_ref: run.target_ref.clone(),
+        tl_thread_id: run.tl_thread_id.clone(),
+        tl_generations: run.tl_generation_count(),
+        sub_tasks: run
+            .sub_tasks
+            .iter()
+            .map(|task| TeamSubTaskView {
+                id: task.id.clone(),
+                title: task.title.clone(),
+                status: task.status.as_str().to_string(),
+                rounds_used: task.rounds_used,
+                digested: task.digested,
+                result_summary: task.result_summary.clone(),
+            })
+            .collect(),
+        awaiting: run.awaiting.as_ref().map(|awaiting| TeamAwaitingView {
+            thread_id: awaiting.thread_id.clone(),
+            request_id: awaiting.request_id.clone(),
+            role: awaiting.role.clone(),
+            asked_at: awaiting.asked_at,
+        }),
+        unresolved: run.unresolved.clone(),
+        head_commit: run.head_commit.clone(),
+        pause_reason: run.pause_reason.clone(),
+        error: run.error.clone(),
+        requested_at: run.requested_at,
+        updated_at: run.updated_at,
+    }
+}
+
 /// Whether a failed turn is the provider saying the session is full.
 ///
 /// Matched on text because there is nothing better: no provider in this codebase

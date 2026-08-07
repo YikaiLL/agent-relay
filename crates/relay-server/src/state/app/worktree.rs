@@ -103,7 +103,11 @@ pub(crate) async fn provision_task_worktree(
     origin: &LiveWorkspace,
     slug_seed: &str,
     target_branch: Option<&str>,
-    path_guard: &dyn Fn(&str) -> Result<(), String>,
+    // `+ Sync` is load-bearing, not decoration: this reference is held across
+    // awaits, so without it the whole provisioning future is not `Send` and
+    // `start_team_run` cannot be called from an HTTP handler or a spawned task at
+    // all. Nothing caught that until a route tried.
+    path_guard: &(dyn Fn(&str) -> Result<(), String> + Sync),
 ) -> Result<TaskWorktree, String> {
     if !git_flag(origin, "--is-inside-work-tree").await {
         return Err(format!("{} is not a git repository", origin.as_str()));

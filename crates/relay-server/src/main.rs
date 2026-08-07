@@ -45,11 +45,12 @@ use protocol::{
     ReadThreadTranscriptInput, RenameThreadInput, RequestReviewInput, RequestReviewReceipt,
     ResumeSessionInput, ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse,
     RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, SessionSnapshotCompactProfile,
-    StartSessionInput, StartWorkflowInput, StartWorkflowReceipt, StopTurnInput,
-    SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
-    ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadTranscriptResponse, ThreadsQuery,
-    ThreadsResponse, TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput,
-    WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse,
+    StartSessionInput, StartTeamInput, StartTeamReceipt, StartWorkflowInput, StartWorkflowReceipt,
+    StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, TeamActionInput, TeamActionReceipt,
+    TeamsResponse, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse,
+    ThreadRenameReceipt, ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse,
+    TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput,
+    WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -57,7 +58,7 @@ use relay_http::{
     request_uses_https, SecurityHeadersConfig,
 };
 use serde::Deserialize;
-use state::{AppState, ApprovalError, AskUserAnswerError};
+use state::{AppState, ApprovalError, AskUserAnswerError, TeamAction2};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -341,6 +342,13 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/session/workflow/resolve", post(resolve_workflow))
         .route("/api/session/reviews", get(list_reviews))
         .route("/api/session/workflows", get(list_workflows))
+        .route("/api/session/team", post(start_team))
+        .route("/api/session/team/pause", post(pause_team))
+        .route("/api/session/team/stop", post(stop_team))
+        .route("/api/session/team/cancel", post(cancel_team))
+        .route("/api/session/team/resume", post(resume_team))
+        .route("/api/session/team/resolve", post(resolve_team))
+        .route("/api/session/teams", get(list_teams))
         .route(
             "/api/session/reviews/:review_id/delete",
             post(delete_review),
@@ -1165,6 +1173,92 @@ async fn list_workflows(
 ) -> Result<Json<ApiEnvelope<WorkflowsResponse>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
     Ok(Json(ApiEnvelope::ok(context.app.workflows(None).await)))
+}
+
+async fn start_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<StartTeamInput>,
+) -> Result<Json<ApiEnvelope<StartTeamReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .start_team(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+/// The five whole-run actions share one body; only the verb differs.
+async fn team_action(
+    context: AppContext,
+    headers: HeaderMap,
+    uri: Uri,
+    action: TeamAction2,
+    input: TeamActionInput,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .team_action(action, input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+async fn pause_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Pause, input).await
+}
+
+async fn stop_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Stop, input).await
+}
+
+async fn cancel_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Cancel, input).await
+}
+
+async fn resume_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Resume, input).await
+}
+
+async fn resolve_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Resolve, input).await
+}
+
+async fn list_teams(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<TeamsResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.teams().await)))
 }
 
 async fn list_devices(

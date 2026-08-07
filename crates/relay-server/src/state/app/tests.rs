@@ -16387,8 +16387,8 @@ turn) must allow a review: {error:?}"
         }
     }
 
-    fn team_input(cwd: &str) -> crate::state::app::team::StartTeamInput {
-        crate::state::app::team::StartTeamInput {
+    fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
+        crate::state::app::team::TeamStartRequest {
             spec: crate::state::TaskSpec {
                 title: "Add a parser".to_string(),
                 context: "The loader needs one.".to_string(),
@@ -17700,6 +17700,117 @@ turn) must allow a review: {error:?}"
                 .contains("did not survive"),
             "the run should carry why: {:?}",
             run.tl_reseed_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn the_http_surface_starts_a_task_and_drives_its_whole_lifecycle() {
+        // The wire types are the only place a client meets this feature, so the
+        // shape matters as much as the behaviour: a flat form in, a run id and a
+        // branch back, and every lifecycle verb reachable by name.
+        use crate::protocol::{StartTeamInput, TeamActionInput};
+        use crate::state::TeamAction2;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let receipt = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                context: "The loader needs one.".to_string(),
+                acceptance_criteria: "Parses all three encodings.".to_string(),
+                agreed_scope: "Parser only.".to_string(),
+                quality_rules: "No unwrap in library code.".to_string(),
+                cwd: Some(root.clone()),
+                target_branch: None,
+                tl_provider: Some("codex".to_string()),
+                dev_provider: Some("codex".to_string()),
+                reviewer_provider: Some("codex".to_string()),
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("the task should start");
+        assert_eq!(receipt.branch, "task/add-a-parser");
+        assert!(receipt.cwd.contains(".sealwire/worktrees/"));
+        assert!(receipt.message.contains("task/add-a-parser"));
+
+        // The listing shows it, without leaking a sub-task brief.
+        let teams = app.teams().await;
+        let view = teams
+            .teams
+            .iter()
+            .find(|team| team.team_run_id == receipt.team_run_id)
+            .expect("the task should be listed");
+        assert_eq!(view.title, "Add a parser");
+        assert_eq!(view.branch, "task/add-a-parser");
+        assert_eq!(view.tl_generations, 1);
+
+        wait_for_team_turn_in_flight(&app, &receipt.team_run_id).await;
+        let action = |id: &str| TeamActionInput {
+            team_run_id: Some(id.to_string()),
+            device_id: Some("device-1".to_string()),
+        };
+
+        let paused = app
+            .team_action(TeamAction2::Stop, action(&receipt.team_run_id))
+            .await
+            .expect("stop");
+        assert_eq!(paused.status, "paused");
+        assert_eq!(paused.team_run_id, receipt.team_run_id);
+        assert!(paused.message.contains("paused"), "{}", paused.message);
+
+        resume_team_run_when_free(&app, &receipt.team_run_id).await;
+        let cancelled = app
+            .team_action(TeamAction2::Cancel, action(&receipt.team_run_id))
+            .await
+            .expect("cancel");
+        assert_eq!(cancelled.status, "cancelled");
+
+        // A cancelled task stays listed — the branch it left behind is the point.
+        let teams = app.teams().await;
+        let view = teams
+            .teams
+            .iter()
+            .find(|team| team.team_run_id == receipt.team_run_id)
+            .expect("a finished task is still listed");
+        assert_eq!(view.status, "cancelled");
+        assert_eq!(view.branch, "task/add-a-parser");
+    }
+
+    #[tokio::test]
+    async fn starting_a_task_over_http_requires_a_title_and_a_device() {
+        use crate::protocol::StartTeamInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+        let error = app
+            .start_team(StartTeamInput {
+                title: "   ".to_string(),
+                cwd: Some(root.clone()),
+                device_id: Some("device-1".to_string()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect_err("a task with no title has no spec to be measured against");
+        assert!(error.contains("title is required"), "{error}");
+
+        let error = app
+            .start_team(StartTeamInput {
+                title: "Add a parser".to_string(),
+                cwd: Some(root.clone()),
+                ..StartTeamInput::default()
+            })
+            .await
+            .expect_err("an unidentified caller cannot start a task");
+        assert!(error.contains("device_id"), "{error}");
+
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "a refused start must leave nothing behind"
         );
     }
 

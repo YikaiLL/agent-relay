@@ -41,6 +41,8 @@ pub(crate) use self::review::{
 // a live path isn't wired up yet, so keep the re-export without an unused-import
 // warning in non-test builds.
 #[allow(unused_imports)]
+pub(crate) use self::app::team::TeamAction2;
+#[allow(unused_imports)]
 pub(crate) use self::review::Verdict;
 pub(crate) use self::security::SecurityProfile;
 #[allow(unused_imports)]
