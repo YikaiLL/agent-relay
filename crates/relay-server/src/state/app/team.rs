@@ -144,6 +144,28 @@ impl Drop for TeamRunLifeguard {
     }
 }
 
+/// The exclusive right to drive one run, held for the driver's lifetime.
+///
+/// Two concurrent Resumes both read `Paused`, both pass the status guard, and
+/// both spawn a driver onto the same worktree — two agents editing the same
+/// files with two orchestrators recording over each other. The record cannot
+/// express this: "a driver exists" is true only of THIS process, and a `Running`
+/// status persists across a restart where no driver does.
+///
+/// Ownership is per-ticket, not per-run-id, so the caller that claimed it is the
+/// one that releases it. A release keyed on the id alone would let a driver
+/// finishing its last step free the ticket a newly-resumed driver is holding.
+pub(super) struct TeamDriveTicket {
+    app: AppState,
+    run_id: String,
+}
+
+impl Drop for TeamDriveTicket {
+    fn drop(&mut self) {
+        self.app.release_team_drive(&self.run_id);
+    }
+}
+
 /// Crash net for a `Blocked` recovery.
 ///
 /// `Resolving` is non-terminal and has no driver, so a recovery that dies
@@ -264,12 +286,126 @@ impl AppState {
             relay.notify();
         }
 
-        let app = self.clone();
-        let spawned = run_id.clone();
-        tokio::spawn(async move {
-            app.run_team_job(spawned).await;
-        });
+        let ticket = self
+            .claim_team_drive(&run_id)
+            .ok_or_else(|| "this task already has a driver".to_string())?;
+        self.spawn_team_driver(run_id.clone(), ticket);
         Ok(run_id)
+    }
+
+    /// Pick a paused run back up.
+    ///
+    /// Cold start and resume are the SAME code path: `next_team_action` is a pure
+    /// function of the record, so there is no second path that could disagree
+    /// about where the run left off. All this has to do is prove the run may be
+    /// driven, prove nothing else is driving it, and hand the driver its ticket.
+    pub(crate) async fn resume_team_run(
+        &self,
+        run_id: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<TeamRunStatus, String> {
+        let (run_id, _device_id) = self
+            .authorize_team_action(run_id.as_deref(), device_id)
+            .await?;
+        let status = self
+            .team_run_snapshot(&run_id)
+            .await
+            .map(|run| run.status)
+            .ok_or_else(|| "there is no task with that id".to_string())?;
+        if !status.is_resumable() {
+            return Err(format!(
+                "only a paused task can be resumed; this one is {}",
+                status.as_str()
+            ));
+        }
+        // The worktree is where every seat's turns run and cannot be relocated, so
+        // a resume into a tree that is gone would fail at the first turn with a
+        // provider error instead of a reason. This blocks the run and says so.
+        self.require_team_workspace(&run_id)
+            .await
+            .map_err(|()| "the task worktree no longer exists".to_string())?;
+
+        // Claim BEFORE flipping the status: a ticket we cannot get means another
+        // driver is already live, and nothing about the record has changed yet.
+        let ticket = self
+            .claim_team_drive(&run_id)
+            .ok_or_else(|| "this task already has a driver".to_string())?;
+
+        let mut resumed = false;
+        {
+            let mut relay = self.relay.write().await;
+            relay.update_team_run(&run_id, |run| resumed = run.resume());
+            if resumed {
+                relay.push_log("info", format!("Task {run_id}: resumed"));
+                relay.notify();
+            }
+        }
+        if !resumed {
+            return Err("this task is no longer paused".to_string());
+        }
+
+        self.spawn_team_driver(run_id, ticket);
+        Ok(TeamRunStatus::Running)
+    }
+
+    /// Validate every restored `Paused` task once the relay is up.
+    ///
+    /// Deliberately does NOT auto-resume anything: a pause is a decision the user
+    /// made, and only the user un-makes it. What it does is stop a Resume from
+    /// being offered when it cannot work — a worktree deleted between relay runs
+    /// is the ordinary case, and a Resume that dies at its first turn is worse
+    /// than a card that says the tree is gone. The branch survives either way, so
+    /// blocking loses nothing.
+    pub(crate) async fn validate_paused_team_runs(&self) {
+        let paused: Vec<(String, String)> = {
+            let relay = self.relay.read().await;
+            relay
+                .team_runs_snapshot()
+                .filter(|run| run.status.is_resumable())
+                .map(|run| (run.id.clone(), run.cwd.clone()))
+                .collect()
+        };
+        for (run_id, cwd) in paused {
+            if LiveWorkspace::from_path(&cwd).is_none() {
+                self.block_team_run(
+                    &run_id,
+                    format!(
+                        "the task worktree {cwd} no longer exists, so this task cannot be \
+resumed; its branch is untouched"
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    fn spawn_team_driver(&self, run_id: String, ticket: TeamDriveTicket) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            // Held for the driver's whole life, including an unwind: dropping the
+            // future drops the ticket, so a panicking driver still frees the run.
+            let _ticket = ticket;
+            app.run_team_job(run_id).await;
+        });
+    }
+
+    /// Take the exclusive right to drive a run, or `None` if it is already taken.
+    pub(super) fn claim_team_drive(&self, run_id: &str) -> Option<TeamDriveTicket> {
+        let claimed = self
+            .driving_team_runs
+            .lock()
+            .map(|mut driving| driving.insert(run_id.to_string()))
+            .unwrap_or(false);
+        claimed.then(|| TeamDriveTicket {
+            app: self.clone(),
+            run_id: run_id.to_string(),
+        })
+    }
+
+    fn release_team_drive(&self, run_id: &str) {
+        if let Ok(mut driving) = self.driving_team_runs.lock() {
+            driving.remove(run_id);
+        }
     }
 
     /// Ask the run to pause at its next step boundary.

@@ -1776,6 +1776,11 @@ impl RelayState {
         self.team_runs.get(id)
     }
 
+    /// Every recorded team run, in no particular order.
+    pub(crate) fn team_runs_snapshot(&self) -> impl Iterator<Item = &TeamRun> {
+        self.team_runs.values()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn update_team_run<F: FnOnce(&mut TeamRun)>(&mut self, id: &str, update: F) -> bool {
         match self.team_runs.get_mut(id) {

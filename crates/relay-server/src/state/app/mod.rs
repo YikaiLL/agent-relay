@@ -116,6 +116,13 @@ pub struct AppState {
     /// Review job ids whose orchestrators must stop before starting another turn.
     /// A set is required because unrelated parent threads may be reviewed concurrently.
     cancel_requested_jobs: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Task team run ids that currently have a driver. The ONE piece of team run
+    /// state that cannot live on the record: two concurrent Resumes both read
+    /// `Paused`, both pass their guard, and both spawn a driver onto the same
+    /// worktree. A `std` mutex rather than a `tokio` one on purpose — the ticket
+    /// releases from `Drop`, which cannot await, and every critical section here
+    /// is one set operation with no await inside it.
+    driving_team_runs: Arc<std::sync::Mutex<HashSet<String>>>,
     /// The compacted, pre-serialized local snapshot for one change version, shared by
     /// every SSE surface that wakes on it.
     ///
@@ -236,6 +243,7 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -335,6 +343,7 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -353,6 +362,10 @@ impl AppState {
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
         }
+
+        // After restore AND after `spawn_providers`: a restored task's threads can
+        // only be routed once the providers that own them exist.
+        state.validate_paused_team_runs().await;
 
         crate::broker::spawn_broker_task(state.clone()).await?;
 

@@ -561,6 +561,30 @@ impl TeamRun {
         true
     }
 
+    /// Leave `Paused` for a fresh drive. Returns whether it took.
+    ///
+    /// The ONLY way out of a settled state back into work, and deliberately
+    /// narrow: `is_resumable` is `Paused` alone, so this can never restart a run
+    /// that was cancelled, blocked, or is already being driven. Resume needs no
+    /// cursor of its own — `next_team_action` reads the record, so a resumed
+    /// driver and a cold one take exactly the same path.
+    ///
+    /// `error` is cleared because the only errors that reach a resumable run are
+    /// the ones a recovery already dealt with; keeping one would leave a resumed
+    /// task wearing a failure that is no longer true.
+    pub(crate) fn resume(&mut self) -> bool {
+        if !self.status.is_resumable() {
+            return false;
+        }
+        self.pause_requested = false;
+        self.pause_requested_by = String::new();
+        self.pause_reason = None;
+        self.error = None;
+        self.status = TeamRunStatus::Running;
+        self.updated_at = unix_now();
+        true
+    }
+
     /// Settle the run at the user's request. TERMINAL.
     ///
     /// Unlike `set_status` this may leave `Paused`/`Blocked`/`Resolving`: those

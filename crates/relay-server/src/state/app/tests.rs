@@ -17333,6 +17333,280 @@ underneath it"
     }
 
     #[tokio::test]
+    async fn a_resume_continues_from_the_record_without_redoing_finished_sub_tasks() {
+        // Resume is only real if the record is genuinely sufficient. What proves it
+        // is what does NOT happen: a sub-task that already finished must not get a
+        // second dev thread or a second round charged against its budget, because
+        // `next_team_action` reads the record rather than any cursor the lost
+        // driver was holding.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_delay_ms.store(60, Ordering::Relaxed);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: One\nDo the first.\nEND SUBTASK\n\
+SUBTASK: Two\nDo the second.\nEND SUBTASK",
+                "Implemented one.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted one.",
+                "Implemented two.",
+                "Good.\nVERDICT: APPROVED",
+                "Noted two.",
+                "Stays in scope.\nVERDICT: APPROVED",
+                "Report written.",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        // Pause as soon as the first sub-task has been reported to the TL.
+        let mut paused_after_first = false;
+        for _ in 0..800 {
+            let done = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| {
+                    run.sub_tasks
+                        .first()
+                        .is_some_and(|task| task.status == crate::state::SubTaskStatus::Done)
+                })
+                .unwrap_or(false);
+            if done {
+                app.pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                    .await
+                    .expect("pause");
+                paused_after_first = true;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(paused_after_first, "the first sub-task never finished");
+
+        let paused = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            paused.status,
+            crate::state::TeamRunStatus::Paused,
+            "{:?}",
+            paused.error
+        );
+        assert_eq!(
+            paused.phase,
+            crate::state::TeamPhase::SubTasks,
+            "the pause has to land mid-pipeline for this test to mean anything"
+        );
+        let first_dev = paused.sub_tasks[0].dev_thread_id.clone().expect("dev");
+        let first_reviewer = paused.sub_tasks[0]
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer");
+        assert_ne!(
+            paused.sub_tasks[1].status,
+            crate::state::SubTaskStatus::Done,
+            "the second sub-task must still be outstanding"
+        );
+
+        let status = app
+            .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("a paused task should resume");
+        assert_eq!(status, crate::state::TeamRunStatus::Running);
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Done,
+            "the resumed run should finish the pipeline: {:?}",
+            run.error
+        );
+        assert!(
+            run.pause_reason.is_none() && !run.pause_requested,
+            "a resumed run must not still look paused"
+        );
+        assert_eq!(
+            run.sub_tasks[0].dev_thread_id.as_deref(),
+            Some(first_dev.as_str()),
+            "the finished sub-task must not be handed to a new developer"
+        );
+        assert_eq!(
+            run.sub_tasks[0].reviewer_thread_id.as_deref(),
+            Some(first_reviewer.as_str()),
+            "nor reviewed a second time"
+        );
+        assert_eq!(
+            run.sub_tasks[0].rounds_used, 1,
+            "a resume must not charge the finished sub-task another round"
+        );
+        assert_eq!(run.sub_tasks[1].status, crate::state::SubTaskStatus::Done);
+        assert_ne!(
+            run.sub_tasks[1].dev_thread_id, run.sub_tasks[0].dev_thread_id,
+            "the second sub-task still gets its own fresh developer"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_one_driver_may_ever_hold_a_task() {
+        // Two Resumes landing together both read `Paused`, both pass the status
+        // guard, and both spawn a driver onto the same worktree — two agents
+        // editing the same files. The record cannot express "a driver exists", so
+        // an in-process ticket has to.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        // The turn never completes, so this driver is parked and unambiguously
+        // alive: its ticket must be unavailable to anyone else.
+        assert!(
+            app.claim_team_drive(&run_id).is_none(),
+            "a task's own driver holds its ticket from the moment it starts"
+        );
+
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+
+        // Stand in for the Resume that got there first. Claiming it doubles as the
+        // wait for the original driver to let go.
+        let mut ticket = None;
+        for _ in 0..400 {
+            ticket = app.claim_team_drive(&run_id);
+            if ticket.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let ticket = ticket.expect("the stopped driver should have released the run");
+        let error = app
+            .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("a second driver must be refused");
+        assert!(error.contains("already has a driver"), "{error}");
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status),
+            Some(crate::state::TeamRunStatus::Paused),
+            "a refused resume must not have moved the run"
+        );
+
+        // Once the first driver lets go, Resume works again.
+        drop(ticket);
+        app.resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("the run should be drivable once its ticket is free");
+    }
+
+    #[tokio::test]
+    async fn only_a_paused_task_can_be_resumed() {
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        for status in [
+            crate::state::TeamRunStatus::Running,
+            crate::state::TeamRunStatus::Blocked,
+            crate::state::TeamRunStatus::Cancelled,
+        ] {
+            app.relay.write().await.update_team_run(&run_id, |run| {
+                // Reach past the guards: this is about what Resume refuses, not
+                // about how a run got there.
+                run.status = status;
+            });
+            let error = app
+                .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("only a paused task is resumable");
+            assert!(
+                error.contains("only a paused task can be resumed"),
+                "{status:?}: {error}"
+            );
+            assert_eq!(
+                app.relay
+                    .read()
+                    .await
+                    .team_run(&run_id)
+                    .map(|run| run.status),
+                Some(status),
+                "a refused resume must leave the status alone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_task_whose_worktree_vanished_is_blocked_rather_than_offered_a_resume() {
+        // The ordinary case after a restart: the user cleaned up their worktrees
+        // between relay runs. Provider threads re-send their cwd every turn and
+        // cannot be relocated, so a Resume would die at its first turn with a
+        // provider error. Say so up front instead — the branch is untouched.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .expect("cwd");
+        std::fs::remove_dir_all(&cwd).expect("remove the worktree");
+
+        app.validate_paused_team_runs().await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+        assert!(
+            !run.status.is_terminal(),
+            "the record is kept, not discarded"
+        );
+        assert!(
+            run.error.as_deref().unwrap_or_default().contains(&cwd),
+            "the reason should name the missing tree: {:?}",
+            run.error
+        );
+        assert_eq!(
+            run.branch, "task/add-a-parser",
+            "the branch survives; only the checkout is gone"
+        );
+
+        let error = app
+            .resume_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("a blocked task is not resumable");
+        assert!(
+            error.contains("only a paused task can be resumed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_a_task_frees_the_slot_and_keeps_the_work_on_disk() {
         // Pausing deliberately does NOT free the slot — a paused task still owns
         // its worktree and expects a resume. Cancel is the action that ends it,
