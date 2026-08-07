@@ -130,6 +130,71 @@ async function realWheelUp(page, deltaPx) {
   await page.mouse.wheel(0, -deltaPx);
 }
 
+// Wait until the scroller stops moving: `stableReads` consecutive equal samples.
+// Used after an escape, because a wheel scrolls on the compositor and its DOM
+// event can be delivered a beat later — returning while one is still in flight
+// lets it move the reader in the middle of the caller's assertions.
+async function waitForScrollQuiet(page, { everyMs = 150, stableReads = 3, timeoutMs = 5000 } = {}) {
+  const startedAt = Date.now();
+  let previous = null;
+  let stable = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    const { scrollTop } = await page.evaluate(readMetricsInPage);
+    stable = previous !== null && scrollTop === previous ? stable + 1 : 0;
+    if (stable >= stableReads) return scrollTop;
+    previous = scrollTop;
+    await delay(everyMs);
+  }
+  return previous;
+}
+
+// Escape the bottom-follow with a real wheel-up, and do not return until the
+// escape has actually LANDED and the scroller has gone quiet.
+//
+// A scrollTop DELTA cannot be the signal, which is what this suite used to do
+// ("moved up by more than 40px"). While the follower is STUCK it re-pins on every
+// resize, and the virtualized transcript's scrollHeight churns by a couple of
+// hundred px a beat as rows measure and the composer resizes — so a stuck
+// follower's scrollTop legitimately wanders well past any movement threshold.
+// Traced against the live follower, the old check passed while the follower was
+// still stuck at the bottom and the wheel had not been delivered at all; the
+// wheel then landed a beat later and un-stuck it in the middle of the assertions
+// the escape was supposed to set up. A leg built on that precondition is not
+// testing what it says it tests, however it happens to come out.
+//
+// Distance-to-bottom is the honest signal: while stuck, the follower re-pins to
+// the bottom on every one of those resizes, so distance stays ~0 for exactly as
+// long as we have NOT escaped. It cannot be faked by churn.
+async function escapeBottomFollow(page, label, { deltaPx = 900, minDistance = ESCAPE_MIN_DISTANCE_PX } = {}) {
+  const startedAt = Date.now();
+  let landed = false;
+  for (let attempt = 0; attempt < 3 && !landed; attempt += 1) {
+    await realWheelUp(page, deltaPx);
+    landed = await page
+      .waitForFunction(
+        (min) => {
+          const t = document.querySelector(".chat-thread");
+          if (!t) return false;
+          return Math.max(0, t.scrollHeight - t.clientHeight - t.scrollTop) > min;
+        },
+        minDistance,
+        { timeout: 3000 }
+      )
+      .then(() => true)
+      .catch(() => false);
+  }
+  await waitForScrollQuiet(page);
+  const metrics = await page.evaluate(readMetricsInPage);
+  console.log(`[${label}] escape landed in ${Date.now() - startedAt}ms, distance ${metrics.distance}`);
+  assert.ok(
+    landed && metrics.distance > minDistance,
+    `${label}: a real wheel-up must ESCAPE the bottom-follow — distance-to-bottom must `
+    + `exceed ${minDistance}px (landed ${landed}, distance ${metrics.distance}). A stuck `
+    + `follower re-pins to the bottom, so this cannot be satisfied by layout churn.`
+  );
+  return metrics;
+}
+
 // A REAL, SLOW upward touch drag over the transcript, via CDP trusted input.
 // The finger moves DOWN in many small steps (2-4px each) -> content scrolls UP.
 // This is the case a per-move-delta escape heuristic misses (each step is below
@@ -173,6 +238,38 @@ async function sample(page, count, everyMs) {
 
 const maxOf = (samples, key) => Math.max(...samples.map((s) => s[key]));
 const minOf = (samples, key) => Math.min(...samples.map((s) => s[key]));
+
+// "The viewport is following the bottom."
+//
+// Deliberately NOT `max(distance) <= threshold`. The follower re-pins from a
+// ResizeObserver, which fires AFTER layout — so between the virtualizer growing
+// a row (rows re-measure by ~225px on this transcript) and the pin landing there
+// is a one-frame window where the distance really is a couple of hundred px. The
+// sampler runs as its own task and can land inside it, so a lone spike is the
+// probe catching a frame mid-flight, not a follow failure.
+//
+// It is also not something a reader can see: ResizeObserver callbacks are
+// delivered in the rendering steps AFTER layout but BEFORE paint, so the pin is
+// applied in the same frame that grew the content. `page.evaluate` is privileged
+// here in a way the human eye is not — which is exactly why the assertion has to
+// be about SUSTAINED distance rather than any single observation.
+//
+// The regressions this leg exists to catch differ in KIND, not degree: the old
+// 60vh reserve and a frozen off-the-bottom viewport both hold the gap open for
+// every sample. So require the excursions to be isolated — never two in a row,
+// and never more than one across the run.
+function assertFollowsBottom(samples, message) {
+  const distances = samples.map((s) => s.distance);
+  const over = distances.filter((d) => d > FOLLOW_MAX_DISTANCE_PX).length;
+  const sustained = distances.some(
+    (d, index) => index > 0 && d > FOLLOW_MAX_DISTANCE_PX && distances[index - 1] > FOLLOW_MAX_DISTANCE_PX
+  );
+  assert.ok(
+    !sustained && over <= 1,
+    `${message} (distances: ${distances.join(", ")}; `
+    + `${over} over ${FOLLOW_MAX_DISTANCE_PX}px, consecutive: ${sustained})`
+  );
+}
 
 async function turnInFlight(page) {
   return page.evaluate(() => {
@@ -259,10 +356,9 @@ async function exercise(page, label) {
     phaseA.at(-1).streamTextLen - phaseA[0].streamTextLen > 80,
     `${label} A: stream should be growing (${phaseA[0].streamTextLen} -> ${phaseA.at(-1).streamTextLen})`
   );
-  assert.ok(
-    maxDistA <= FOLLOW_MAX_DISTANCE_PX,
-    `${label} A: after send the viewport must FOLLOW the bottom — no 60vh gap, no `
-    + `freeze (distances: ${phaseA.map((s) => s.distance).join(", ")})`
+  assertFollowsBottom(
+    phaseA,
+    `${label} A: after send the viewport must FOLLOW the bottom — no 60vh gap, no freeze`
   );
   assert.ok(
     phaseA.at(-1).scrollTop >= phaseA[0].scrollTop,
@@ -271,25 +367,7 @@ async function exercise(page, label) {
   );
 
   // ---- Phase B: a REAL upward wheel mid-stream escapes the follow at once.
-  // Retry the wheel: after a virtualized reload the first synthetic wheel can be
-  // dropped by Chromium before it registers a scroll (a Playwright input quirk,
-  // not the follower). We re-read the baseline each attempt so stream growth
-  // while following doesn't confuse the "moved up" check.
-  let beforeWheelTop = 0;
-  let afterWheelTop = 0;
-  let wheelEscaped = false;
-  for (let attempt = 0; attempt < 3 && !wheelEscaped; attempt += 1) {
-    beforeWheelTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    await realWheelUp(page, 800);
-    await delay(400); // let the async scroll settle before sampling
-    afterWheelTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    wheelEscaped = afterWheelTop < beforeWheelTop - 40;
-  }
-  assert.ok(
-    wheelEscaped,
-    `${label} B: a real wheel-up must move the viewport UP (before ${beforeWheelTop}, `
-    + `after ${afterWheelTop}); the stream must not snap it back to the bottom`
-  );
+  await escapeBottomFollow(page, `${label} B`, { deltaPx: 800 });
   // Confirm we escaped MID-stream (not at turn end). The text-growth probe can't
   // be used here: escaped far up a virtualized list, the streaming row is
   // rendered OUT of the DOM, so its growth is invisible from the reader's
@@ -312,10 +390,9 @@ async function exercise(page, label) {
   const phaseC = await sample(page, 8, 150);
   const maxDistC = maxOf(phaseC, "distance");
   console.log(`[${label}] C distances: ${phaseC.map((s) => s.distance).join(", ")}; maxDist ${maxDistC}`);
-  assert.ok(
-    maxDistC <= FOLLOW_MAX_DISTANCE_PX,
-    `${label} C: scroll-to-latest must re-lock and follow the bottom `
-    + `(distances: ${phaseC.map((s) => s.distance).join(", ")})`
+  assertFollowsBottom(
+    phaseC,
+    `${label} C: scroll-to-latest must re-lock and follow the bottom`
   );
 
   // ---- Phase D: let the turn end -> we are at the true bottom.
@@ -375,21 +452,10 @@ async function exerciseApprovalVisibility(page, label) {
   );
   await delay(300);
 
-  let leftBottom = false;
-  let preTop = 0;
-  let postTop = 0;
-  for (let attempt = 0; attempt < 3 && !leftBottom; attempt += 1) {
-    preTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    await realWheelUp(page, 900);
-    await delay(300);
-    postTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    leftBottom = postTop < preTop - 40;
-  }
-  assert.ok(
-    leftBottom,
-    `${label}: precondition — the reader must be scrolled UP before the request `
-    + `arrives (before ${preTop}, after ${postTop})`
-  );
+  // Precondition: genuinely OFF the bottom-follow before the request arrives.
+  // This has to be the real thing, not a scrollTop wobble — the whole point of
+  // the leg is that the request reaches a reader who had left the bottom.
+  await escapeBottomFollow(page, `${label} pre`);
   assert.ok(
     !(await page.$("[data-approval-id]")),
     `${label}: precondition — the approval must not have arrived yet`
@@ -432,21 +498,7 @@ async function exerciseApprovalVisibility(page, label) {
   // The reader escapes upward while the SAME approval stays pending. The relay
   // keeps notifying throughout, so this samples many renders — every one of them
   // a chance for a mis-scoped trigger to yank the reader back down.
-  let escaped = false;
-  let beforeTop = 0;
-  let afterTop = 0;
-  for (let attempt = 0; attempt < 3 && !escaped; attempt += 1) {
-    beforeTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    await realWheelUp(page, 800);
-    await delay(400);
-    afterTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    escaped = afterTop < beforeTop - 40;
-  }
-  assert.ok(
-    escaped,
-    `${label}: the reader must be able to scroll up while an approval is pending `
-    + `(before ${beforeTop}, after ${afterTop})`
-  );
+  await escapeBottomFollow(page, `${label} post`, { deltaPx: 800 });
   const samples = await sample(page, 10, 200);
   const minDist = minOf(samples, "distance");
   console.log(`[${label}] escaped distances: ${samples.map((s) => s.distance).join(", ")}; min ${minDist}`);
@@ -559,21 +611,7 @@ async function exerciseAskUserPin(page, label) {
   );
 
   // The reader may still leave, and must be left alone while it stays pending.
-  let escaped = false;
-  let beforeTop = 0;
-  let afterTop = 0;
-  for (let attempt = 0; attempt < 3 && !escaped; attempt += 1) {
-    beforeTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    await realWheelUp(page, 800);
-    await delay(400);
-    afterTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    escaped = afterTop < beforeTop - 40;
-  }
-  assert.ok(
-    escaped,
-    `${label}: the reader must be able to scroll up while a question is pending `
-    + `(before ${beforeTop}, after ${afterTop})`
-  );
+  await escapeBottomFollow(page, `${label} post`, { deltaPx: 800 });
   const samples = await sample(page, 8, 200);
   const minDist = minOf(samples, "distance");
   console.log(`[${label}] escaped distances: ${samples.map((s) => s.distance).join(", ")}; min ${minDist}`);
@@ -627,10 +665,7 @@ async function exerciseTouchEscape(page, label) {
     await delay(200);
     await sendStreamPrompt(page);
     const before = await sample(page, 4, 150);
-    assert.ok(
-      maxOf(before, "distance") <= FOLLOW_MAX_DISTANCE_PX,
-      `${label} touch: must be following before the drag (distances: ${before.map((s) => s.distance).join(", ")})`
-    );
+    assertFollowsBottom(before, `${label} touch: must be following before the drag`);
     assert.ok(await turnInFlight(page), `${label} touch: turn must still be streaming`);
 
     const x = Math.round(await page.evaluate(() => window.innerWidth / 2));
@@ -666,10 +701,7 @@ async function exerciseTouchEscape(page, label) {
 
     await clickScrollToLatest(page);
     const rejoined = await sample(page, 4, 150);
-    assert.ok(
-      maxOf(rejoined, "distance") <= FOLLOW_MAX_DISTANCE_PX,
-      `${label} touch: scroll-to-latest must re-lock (distances: ${rejoined.map((s) => s.distance).join(", ")})`
-    );
+    assertFollowsBottom(rejoined, `${label} touch: scroll-to-latest must re-lock`);
     await waitTurnSettled(page);
   } finally {
     await client.detach().catch(() => {});
@@ -706,10 +738,9 @@ async function exerciseEmptyFirstSend(page, label, workspaceDir) {
     samples.at(-1).streamTextLen - samples[0].streamTextLen > 80,
     `${label}: stream should be growing`
   );
-  assert.ok(
-    maxDist <= FOLLOW_MAX_DISTANCE_PX,
-    `${label}: the FIRST send must land at the bottom and FOLLOW the stream `
-    + `(distances: ${samples.map((s) => s.distance).join(", ")})`
+  assertFollowsBottom(
+    samples,
+    `${label}: the FIRST send must land at the bottom and FOLLOW the stream`
   );
 
   await waitTurnSettled(page);
