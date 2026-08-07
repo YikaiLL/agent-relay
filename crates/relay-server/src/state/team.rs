@@ -492,6 +492,15 @@ pub(crate) struct TeamRun {
     pub(crate) in_flight_thread: Option<String>,
 
     pub(crate) pause_requested: bool,
+    /// Whether a stop is DRAINING this run's turns right now.
+    ///
+    /// Distinct from `pause_requested`, and the distinction is load-bearing. A
+    /// graceful pause stops nothing, so a turn that fails during one failed on its
+    /// own and the run really did fail. A stop KILLS the turn the driver is
+    /// waiting on, so the failure it then reports is an artefact of the stop and
+    /// must not become the run's verdict. Conflating the two strands a gracefully
+    /// paused run in `PausePending` with no driver left to settle it.
+    pub(crate) stopping: bool,
     pub(crate) pause_requested_by: String,
     pub(crate) pause_reason: Option<String>,
     pub(crate) awaiting: Option<AwaitingUser>,
@@ -548,13 +557,17 @@ impl TeamRun {
             return;
         }
         self.error = Some(error.into());
-        // A stop already asked for outranks the failure it almost certainly
-        // caused. Draining a turn makes the driver see it end with no reply, and
-        // between `request_pause` and the settlement the run is `PausePending` —
-        // neither terminal nor settled-without-driver — so the driver would win
-        // that race and the user would get `failed` for pressing Cancel. The
-        // reason is still recorded above; it is just not the run's verdict.
-        if self.pause_requested {
+        // A stop that is DRAINING outranks the failure it just caused. Killing a
+        // turn makes the driver see it end with no reply, and between
+        // `request_stop` and the settlement the run is `PausePending` — neither
+        // terminal nor settled-without-driver — so the driver would win that race
+        // and the user would get `failed` for pressing Cancel. The reason is still
+        // recorded above; it is just not the run's verdict.
+        //
+        // Only while DRAINING. A graceful pause stops nothing, so a failure during
+        // one is the run's own, and suppressing it there would leave a driverless
+        // `PausePending` that blocks every future task and that Resume refuses.
+        if self.stopping {
             self.updated_at = unix_now();
             return;
         }
@@ -566,6 +579,7 @@ impl TeamRun {
             return;
         }
         self.error = Some(error.into());
+        self.stopping = false;
         self.status = TeamRunStatus::Blocked;
         self.updated_at = unix_now();
     }
@@ -581,12 +595,26 @@ impl TeamRun {
         self.set_status(TeamRunStatus::PausePending);
     }
 
+    /// Record a stop that is about to drain this run's turns.
+    ///
+    /// Everything `request_pause` does, plus the marker that says the failures
+    /// about to arrive were CAUSED by us.
+    pub(crate) fn request_stop(&mut self, device_id: impl Into<String>) {
+        if self.status.is_terminal() || self.status.is_settled_without_driver() {
+            return;
+        }
+        self.request_pause(device_id);
+        self.stopping = true;
+        self.updated_at = unix_now();
+    }
+
     /// Settle a requested pause. Returns whether it took.
     pub(crate) fn settle_paused(&mut self, reason: impl Into<String>) -> bool {
         if self.status.is_terminal() || self.status.is_settled_without_driver() {
             return false;
         }
         self.pause_requested = false;
+        self.stopping = false;
         self.pause_reason = Some(reason.into());
         // Nothing is in flight once a pause settles: the caller proved every owned
         // turn is quiescent before getting here. Leaving a stale marker would make
@@ -660,6 +688,7 @@ impl TeamRun {
             return false;
         }
         self.pause_requested = false;
+        self.stopping = false;
         self.pause_requested_by = String::new();
         self.pause_reason = None;
         self.error = None;
@@ -681,6 +710,7 @@ impl TeamRun {
         }
         self.error = Some(reason.into());
         self.pause_requested = false;
+        self.stopping = false;
         self.awaiting = None;
         self.in_flight_thread = None;
         self.status = TeamRunStatus::Cancelled;
@@ -711,6 +741,7 @@ impl TeamRun {
             return false;
         }
         self.pause_requested = false;
+        self.stopping = false;
         self.pause_reason = Some(reason.into());
         self.in_flight_thread = None;
         self.status = TeamRunStatus::Paused;
@@ -1441,38 +1472,55 @@ mod tests {
     }
 
     #[test]
-    fn a_step_failure_cannot_beat_a_stop_the_user_already_asked_for() {
-        // A stop drains the very turn the driver is waiting on, so the driver
-        // observes that turn end with no reply and calls `fail`. Between
-        // `request_pause` and the settlement the run is `PausePending`, which is
-        // neither terminal nor settled-without-driver — so the driver used to win
-        // that race and the user got `failed` instead of `cancelled`. Found by the
-        // end-to-end run, where the timing is real.
-        let mut run = run_with(TeamPhase::SubTasks, vec![]);
-        run.request_pause("device-1");
-        assert_eq!(run.status, TeamRunStatus::PausePending);
+    fn a_draining_stop_outranks_the_failure_it_caused_but_a_pause_does_not() {
+        // Two situations that look identical on the record and are not.
+        //
+        // A STOP kills the turn the driver is waiting on, so the driver sees it
+        // end with no reply and calls `fail`. Between the request and the
+        // settlement the run is `PausePending` — neither terminal nor
+        // settled-without-driver — so without this the driver wins and the user
+        // gets `failed` for pressing Cancel.
+        let mut stopping = run_with(TeamPhase::SubTasks, vec![]);
+        stopping.request_stop("device-1");
+        assert_eq!(stopping.status, TeamRunStatus::PausePending);
+        assert!(stopping.stopping);
 
-        run.fail("the team lead replied with nothing");
+        stopping.fail("the team lead replied with nothing");
         assert_eq!(
-            run.status,
+            stopping.status,
             TeamRunStatus::PausePending,
-            "a stop in progress outranks the failure it caused"
+            "a stop that is draining outranks the failure it caused"
         );
         assert_eq!(
-            run.error.as_deref(),
+            stopping.error.as_deref(),
             Some("the team lead replied with nothing"),
             "the reason is still recorded — it is just not the run's verdict"
         );
+        assert!(stopping.settle_paused("stopped by the user"));
+        assert_eq!(stopping.status, TeamRunStatus::Paused);
+        assert!(!stopping.stopping, "settling ends the drain");
 
-        // And the stop still lands as itself.
-        assert!(run.settle_paused("stopped by the user"));
-        assert_eq!(run.status, TeamRunStatus::Paused);
+        // A graceful PAUSE stops nothing, so a turn that fails during one failed
+        // on its own. Suppressing it here would strand the run in `PausePending`
+        // with no driver left to settle it: it blocks every future task, and
+        // Resume refuses it for not being `Paused`.
+        let mut pausing = run_with(TeamPhase::SubTasks, vec![]);
+        pausing.request_pause("device-1");
+        assert!(!pausing.stopping, "a pause is not a drain");
+        pausing.fail("the provider errored");
+        assert_eq!(
+            pausing.status,
+            TeamRunStatus::Failed,
+            "a failure during a graceful pause is the run's own"
+        );
 
+        // And a cancel still lands as itself either way.
         let mut cancelling = run_with(TeamPhase::SubTasks, vec![]);
-        cancelling.request_pause("device-1");
+        cancelling.request_stop("device-1");
         cancelling.fail("the team lead replied with nothing");
         assert!(cancelling.cancel("the task was cancelled by the user"));
         assert_eq!(cancelling.status, TeamRunStatus::Cancelled);
+        assert!(!cancelling.stopping);
     }
 
     #[test]

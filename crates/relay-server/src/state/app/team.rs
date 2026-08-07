@@ -109,6 +109,11 @@ enum TeamStepOutcome {
     Silent,
     /// Could not start, timed out, or was stopped. Carries why.
     Failed(String),
+    /// A turn could not be confirmed stopped, so it may STILL BE RUNNING. The
+    /// caller must leave the run non-terminal and must not start anything else:
+    /// settling would release the worktree to an agent that is still writing it,
+    /// and re-seeding would put a second team lead alongside the first.
+    Blocked(String),
 }
 
 /// What a user-driven stop leaves behind.
@@ -554,23 +559,24 @@ over on resume"
         action: TeamAction2,
         input: TeamActionInput,
     ) -> Result<TeamActionReceipt, String> {
-        let run_id = input.team_run_id.clone();
-        let device_id = input.device_id.clone();
-        let status = match action {
-            TeamAction2::Pause => self.pause_team_run(run_id, device_id).await?,
-            TeamAction2::Stop => self.force_stop_team_run(run_id, device_id).await?,
-            TeamAction2::Cancel => self.cancel_team_run(run_id, device_id).await?,
-            TeamAction2::Resume => self.resume_team_run(run_id, device_id).await?,
-            TeamAction2::Resolve => self.resolve_blocked_team_run(run_id, device_id).await?,
-        };
-        let resolved = {
+        // Resolved BEFORE the action runs. Cancel makes the only run terminal, so
+        // re-resolving afterwards finds nothing active and the receipt would name
+        // no run at all — the one case where the id is most worth returning.
+        let run_id = {
             let relay = self.relay.read().await;
-            relay
-                .active_team_run_id(input.team_run_id.as_deref())
-                .unwrap_or_else(|_| input.team_run_id.clone().unwrap_or_default())
+            relay.active_team_run_id(input.team_run_id.as_deref())?
+        };
+        let device_id = input.device_id.clone();
+        let target = Some(run_id.clone());
+        let status = match action {
+            TeamAction2::Pause => self.pause_team_run(target, device_id).await?,
+            TeamAction2::Stop => self.force_stop_team_run(target, device_id).await?,
+            TeamAction2::Cancel => self.cancel_team_run(target, device_id).await?,
+            TeamAction2::Resume => self.resume_team_run(target, device_id).await?,
+            TeamAction2::Resolve => self.resolve_blocked_team_run(target, device_id).await?,
         };
         Ok(TeamActionReceipt {
-            team_run_id: resolved,
+            team_run_id: run_id,
             status: status.as_str().to_string(),
             message: action.message(status),
         })
@@ -667,7 +673,7 @@ over on resume"
 
         {
             let mut relay = self.relay.write().await;
-            relay.update_team_run(&run_id, |run| run.request_pause(&device_id));
+            relay.update_team_run(&run_id, |run| run.request_stop(&device_id));
             relay.notify();
         }
 
@@ -872,7 +878,12 @@ over on resume"
                 TeamAction::Wrap => self.run_wrap_up(&run_id).await,
             };
             if !progressed {
-                // The step already recorded why and settled the run.
+                // The step already recorded why AND settled the run — `fail` and
+                // `block` are the only ways to get here. That matters more than it
+                // looks: a pause requested mid-step has nobody left to settle it
+                // once this returns, and a driverless `PausePending` blocks every
+                // future task while Resume refuses it for not being `Paused`. Any
+                // new early return added below must settle before it exits.
                 lifeguard.disarm();
                 return;
             }
@@ -946,6 +957,36 @@ over on resume"
             other => run.set_status(other),
         });
         relay.notify();
+    }
+
+    /// Hold the drive gate across a git mutation of the task worktree.
+    ///
+    /// Stop and Cancel promise the workspace is quiescent when they return, and
+    /// the relay's OWN `git add`/`git commit` are part of that workspace. Without
+    /// this a cancel returns and releases the tree to a new session while the old
+    /// driver is still staging into it — the same race the gate closes for turns,
+    /// through a door that is not a turn.
+    async fn team_git_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        let gate = self.team_drive_gate.lock().await;
+        #[cfg(test)]
+        {
+            self.team_commit_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(self.team_commit_barrier.lock().await);
+        }
+        gate
+    }
+
+    /// Hold the driver inside a git mutation of the worktree.
+    #[cfg(test)]
+    pub(crate) async fn hold_team_commit_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.team_commit_barrier.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn team_commit_arrivals(&self) -> u64 {
+        self.team_commit_arrivals
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Which of the run's own threads are observably mid-turn right now.
@@ -1246,13 +1287,16 @@ over on resume"
                         Err(error) => error.to_string(),
                         Ok(_) => "the provider returned no turn id".to_string(),
                     };
-                    let drained = self.stop_and_drain(&thread_id).await;
-                    self.set_in_flight_thread(run_id, None).await;
-                    if !drained {
-                        return TeamStepOutcome::Failed(format!(
+                    if !self.stop_and_drain(&thread_id).await {
+                        // The marker STAYS. It is what stops cleanup from later
+                        // confirming quiescence for a turn nobody can observe, and
+                        // clearing it here threw that away at the one moment it
+                        // mattered most.
+                        return TeamStepOutcome::Blocked(format!(
                             "thread {thread_id}'s turn did not confirm stopping after an uncertain start: {why}"
                         ));
                     }
+                    self.set_in_flight_thread(run_id, None).await;
                     return TeamStepOutcome::Failed(format!(
                         "could not start a turn on thread {thread_id}: {why}"
                     ));
@@ -1268,13 +1312,12 @@ over on resume"
             thread_id = promoted;
         }
         if let Some(error) = outcome {
-            let drained = self.stop_and_drain(&thread_id).await;
-            self.set_in_flight_thread(run_id, None).await;
-            if !drained {
-                return TeamStepOutcome::Failed(format!(
+            if !self.stop_and_drain(&thread_id).await {
+                return TeamStepOutcome::Blocked(format!(
                     "{error}; and thread {thread_id} did not confirm stopping"
                 ));
             }
+            self.set_in_flight_thread(run_id, None).await;
             return TeamStepOutcome::Failed(error);
         }
 
@@ -1709,6 +1752,14 @@ its turn cannot continue",
                         .await;
                     return None;
                 }
+                // A turn that may still be running gets NO successor and no
+                // retry: a second team lead alongside a live one is two agents
+                // writing the same worktree. Checked before the re-seed branch on
+                // purpose — this outcome can carry a context-window message too.
+                TeamStepOutcome::Blocked(error) => {
+                    self.block_team_run(run_id, error).await;
+                    return None;
+                }
                 TeamStepOutcome::Failed(error) => {
                     // The reactive escape, and the only trigger that is not a
                     // guess: the lead itself reported it cannot hold any more.
@@ -1828,6 +1879,10 @@ its turn cannot continue",
             .team_turn(run_id, TeamThreadSlot::Tl, TeamRole::Tl, &prompt)
             .await
         {
+            TeamStepOutcome::Blocked(error) => {
+                self.block_team_run(run_id, error).await;
+                false
+            }
             TeamStepOutcome::Failed(error) => {
                 self.fail_team_run(run_id, format!("could not brief a new team lead: {error}"))
                     .await;
@@ -1915,6 +1970,10 @@ its turn cannot continue",
         {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
+            TeamStepOutcome::Blocked(error) => {
+                self.block_team_run(run_id, error).await;
+                return false;
+            }
             TeamStepOutcome::Failed(error) => {
                 self.fail_team_run(run_id, error).await;
                 return false;
@@ -1993,7 +2052,10 @@ its turn cannot continue",
         let _seat = match task.dev_thread_id.clone() {
             Some(existing) if task.rounds_used > 0 => existing,
             _ => {
-                let base = self.checkpoint_commit(&workspace).await;
+                let base = {
+                    let _gate = self.team_git_gate().await;
+                    self.checkpoint_commit(&workspace).await
+                };
                 let started = match self
                     .start_team_thread(run_id, TeamRole::Dev, &workspace)
                     .await
@@ -2040,9 +2102,16 @@ its turn cannot continue",
                 &prompt,
             )
             .await;
-        if let TeamStepOutcome::Failed(error) = outcome {
-            self.fail_team_run(run_id, error).await;
-            return false;
+        match outcome {
+            TeamStepOutcome::Blocked(error) => {
+                self.block_team_run(run_id, error).await;
+                return false;
+            }
+            TeamStepOutcome::Failed(error) => {
+                self.fail_team_run(run_id, error).await;
+                return false;
+            }
+            _ => {}
         }
 
         let mut relay = self.relay.write().await;
@@ -2124,6 +2193,10 @@ finding per line.",
         {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
+            TeamStepOutcome::Blocked(error) => {
+                self.block_team_run(run_id, error).await;
+                return false;
+            }
             TeamStepOutcome::Failed(error) => {
                 self.fail_team_run(run_id, error).await;
                 return false;
@@ -2189,7 +2262,7 @@ finding per line.",
         // were its own.
         if let Ok(workspace) = self.require_team_workspace(run_id).await {
             if let Err(error) = self
-                .commit_worktree(&workspace, &format!("task: {}", task.title))
+                .commit_worktree_gated(&workspace, &format!("task: {}", task.title))
                 .await
             {
                 self.fail_team_run(run_id, error).await;
@@ -2224,7 +2297,7 @@ finding per line.",
         // stop the run: reviewing an uncommitted tree and then reporting Done is
         // exactly how work goes missing.
         if let Err(error) = self
-            .commit_worktree(&workspace, "task: work in progress")
+            .commit_worktree_gated(&workspace, "task: work in progress")
             .await
         {
             self.fail_team_run(run_id, error).await;
@@ -2301,6 +2374,10 @@ history with it and no fork point was recorded",
         {
             TeamStepOutcome::Replied(text) => text,
             TeamStepOutcome::Silent => String::new(),
+            TeamStepOutcome::Blocked(error) => {
+                self.block_team_run(run_id, error).await;
+                return false;
+            }
             TeamStepOutcome::Failed(error) => {
                 self.fail_team_run(run_id, error).await;
                 return false;
@@ -2350,11 +2427,16 @@ history with it and no fork point was recorded",
         let slot = self.record_run_thread(run_id, &thread_id).await;
 
         let prompt = prompts::address_mr(&findings, &run.plan_rel_path);
-        if let TeamStepOutcome::Failed(error) =
-            self.team_turn(run_id, slot, TeamRole::Dev, &prompt).await
-        {
-            self.fail_team_run(run_id, error).await;
-            return false;
+        match self.team_turn(run_id, slot, TeamRole::Dev, &prompt).await {
+            TeamStepOutcome::Blocked(error) => {
+                self.block_team_run(run_id, error).await;
+                return false;
+            }
+            TeamStepOutcome::Failed(error) => {
+                self.fail_team_run(run_id, error).await;
+                return false;
+            }
+            _ => {}
         }
         // Clearing the verdict sends the gate back to `MrReview` on the next tick.
         let mut relay = self.relay.write().await;
@@ -2374,11 +2456,14 @@ history with it and no fork point was recorded",
         if self.tl_turn(run_id, prompt).await.is_none() {
             return false;
         }
-        if let Err(error) = self.commit_worktree(&workspace, "task: final").await {
+        if let Err(error) = self.commit_worktree_gated(&workspace, "task: final").await {
             self.fail_team_run(run_id, error).await;
             return false;
         }
-        let head = self.checkpoint_commit(&workspace).await;
+        let head = {
+            let _gate = self.team_git_gate().await;
+            self.checkpoint_commit(&workspace).await
+        };
 
         let mut relay = self.relay.write().await;
         relay.update_team_run(run_id, |run| {
@@ -2427,6 +2512,17 @@ history with it and no fork point was recorded",
     /// `--no-verify` alone is NOT sufficient: it skips `pre-commit` and
     /// `commit-msg`, but `prepare-commit-msg` and `post-commit` still run, which
     /// would reopen the arbitrary-code surface on an unaudited repository.
+    /// `commit_worktree` under the drive gate. Every driver-side commit goes
+    /// through this; the ungated one stays for tests that commit directly.
+    async fn commit_worktree_gated(
+        &self,
+        workspace: &LiveWorkspace,
+        message: &str,
+    ) -> Result<bool, String> {
+        let _gate = self.team_git_gate().await;
+        self.commit_worktree(workspace, message).await
+    }
+
     pub(super) async fn commit_worktree(
         &self,
         workspace: &LiveWorkspace,

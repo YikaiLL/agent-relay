@@ -8966,6 +8966,13 @@ mod review_tests {
         // provider refusing a turn — a full context window is the case that
         // matters, since it is the only honest re-seed trigger.
         fail_next_turn_with: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // When true, a turn that fails via `fail_next_turn_with` first publishes
+        // liveness. That is the DANGEROUS shape of a failed start: the provider
+        // began work and only the response was lost, so the turn may still be
+        // running and a drain cannot confirm otherwise. Without this the thread is
+        // idle when the error arrives, the drain confirms trivially, and the path
+        // worth testing is never reached.
+        fail_next_turn_live: Arc<AtomicBool>,
         // When set, every turn EXCEPT a team-lead handover fails with this error.
         // Models a lead that can always be briefed but always dies on real work,
         // which is what drives the succession chain to its cap.
@@ -9055,6 +9062,7 @@ mod review_tests {
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
                 scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fail_next_turn_with: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                fail_next_turn_live: Arc::new(AtomicBool::new(false)),
                 fail_work_turns_with: Arc::new(Mutex::new(None)),
                 answered_asks: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -9281,6 +9289,13 @@ mod review_tests {
             }
             self.require_live_cwd(thread_id, "start a turn for").await?;
             if let Some(error) = self.fail_next_turn_with.lock().await.pop_front() {
+                if self.fail_next_turn_live.load(Ordering::Relaxed) {
+                    let mut relay = self.state.write().await;
+                    let now = unix_now();
+                    relay.bg_set_active_turn(thread_id, Some(self.next_token("turn")), now);
+                    relay.bg_set_thread_status(thread_id, "active".to_string(), Vec::new(), now);
+                    relay.notify();
+                }
                 return Err(error);
             }
             if !text.contains("taking over as team lead") {
@@ -17763,11 +17778,24 @@ turn) must allow a review: {error:?}"
         assert!(paused.message.contains("paused"), "{}", paused.message);
 
         resume_team_run_when_free(&app, &receipt.team_run_id).await;
+        // Cancel with the id OMITTED — the shape a client uses while one task runs
+        // at a time. The receipt must still name the run it acted on, which means
+        // resolving it BEFORE the action makes it terminal and unresolvable.
         let cancelled = app
-            .team_action(TeamAction2::Cancel, action(&receipt.team_run_id))
+            .team_action(
+                TeamAction2::Cancel,
+                TeamActionInput {
+                    team_run_id: None,
+                    device_id: Some("device-1".to_string()),
+                },
+            )
             .await
             .expect("cancel");
         assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            cancelled.team_run_id, receipt.team_run_id,
+            "the receipt must name the task it cancelled, not an empty string"
+        );
 
         // A cancelled task stays listed — the branch it left behind is the point.
         let teams = app.teams().await;
@@ -17812,6 +17840,235 @@ turn) must allow a review: {error:?}"
             app.teams().await.teams.is_empty(),
             "a refused start must leave nothing behind"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pause_whose_turn_then_fails_never_strands_the_run() {
+        // A graceful pause stops nothing, so the turn it is waiting on can fail on
+        // its own. If that failure is suppressed as "the stop caused it", the
+        // driver returns with the run still `PausePending` — non-terminal, so it
+        // blocks every future task, and Resume refuses it for not being `Paused`.
+        // Nothing is left alive to settle it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // The turn will fail on its own, unrelated to any stop.
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("the provider fell over".to_string());
+        // Hold the driver just before it starts that turn, so the pause is
+        // guaranteed to be pending while the failure happens.
+        let barrier = app.hold_team_turn_barrier().await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        for _ in 0..600 {
+            if app.team_turn_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_turn_arrivals() > 0,
+            "the driver never reached a turn"
+        );
+
+        app.pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("pause");
+        drop(barrier);
+
+        // Whatever it settles as, it must not sit in `pause_pending` with nobody
+        // driving it.
+        let mut settled = None;
+        for _ in 0..600 {
+            let run = app.relay.read().await.team_run(&run_id).cloned();
+            if let Some(run) = run {
+                if run.status != crate::state::TeamRunStatus::PausePending
+                    && run.status != crate::state::TeamRunStatus::Queued
+                    && run.status != crate::state::TeamRunStatus::Running
+                {
+                    settled = Some(run);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let run = settled.expect("the run never settled — it is stranded in pause_pending");
+        assert!(
+            matches!(
+                run.status,
+                crate::state::TeamRunStatus::Paused
+                    | crate::state::TeamRunStatus::Failed
+                    | crate::state::TeamRunStatus::Blocked
+            ),
+            "a paused-then-failed run must reach a state someone can act on, got {:?}",
+            run.status
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_turn_start_blocks_and_never_gets_a_successor() {
+        // The worst shape: `start_turn` errors AND the stop cannot be confirmed,
+        // so the provider may be running a turn nobody can see. Failing the run
+        // would release the worktree to it; re-seeding — which the error text
+        // invites, because it looks like a context window — would put a SECOND
+        // team lead in the same tree alongside it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("prompt is too long for this model's context window".to_string());
+        provider.fail_next_turn_live.store(true, Ordering::Relaxed);
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let run = wait_for_team_run_blocked(&app, &run_id).await;
+
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Blocked,
+            "an unconfirmed start must not settle the run: {:?}",
+            run.error
+        );
+        assert!(
+            !run.status.is_terminal(),
+            "Blocked keeps the workspace held"
+        );
+        assert!(
+            run.in_flight_thread.is_some(),
+            "the marker must survive, or cleanup will confirm quiescence for a turn nobody can observe"
+        );
+        assert!(
+            run.tl_succession.is_empty(),
+            "no successor team lead may be started alongside a turn that may still be running"
+        );
+    }
+
+    async fn wait_for_team_run_blocked(app: &AppState, run_id: &str) -> crate::state::TeamRun {
+        for _ in 0..800 {
+            if let Some(run) = app.relay.read().await.team_run(run_id).cloned() {
+                if run.status.is_terminal() || run.status == crate::state::TeamRunStatus::Blocked {
+                    return run;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("task {run_id} never settled");
+    }
+
+    #[tokio::test]
+    async fn a_stop_waits_for_the_relays_own_git_mutation() {
+        // The gate covers turns. The driver ALSO mutates the worktree itself —
+        // `git add`, `git commit` at each checkpoint, the merge gate and wrap-up —
+        // and those are not turns, so the turn latches miss them entirely. A stop
+        // returning here releases the tree to a new session while the relay is
+        // still staging into it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        app.set_workflow_drain_max_ms(500);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+            ],
+        )
+        .await;
+
+        let barrier = app.hold_team_commit_barrier().await;
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        for _ in 0..800 {
+            if app.team_commit_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_commit_arrivals() > 0,
+            "the driver never reached a git mutation"
+        );
+
+        let stopper = {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                app.cancel_team_run(Some(run_id), Some("device-1".to_string()))
+                    .await
+            })
+        };
+        let raced = tokio::time::timeout(Duration::from_millis(250), stopper).await;
+        assert!(
+            raced.is_err(),
+            "a cancel must not release the workspace while the relay is staging into it"
+        );
+        drop(barrier);
+    }
+
+    #[tokio::test]
+    async fn a_session_already_living_in_the_worktree_cannot_be_resumed_into_it() {
+        // The outer guard only knows a thread's id, so a session the team does not
+        // own — restored, or created before the task started — slipped through and
+        // became the active thread inside a worktree three agents are editing.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+
+        let outsider = start_parent(&app, &root, "codex").await;
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let cwd = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .expect("cwd");
+
+        // Point the outsider at a subdirectory of the task worktree, the way a
+        // restored session rooted there would look.
+        let subdir = std::path::Path::new(&cwd).join("src");
+        std::fs::create_dir_all(&subdir).expect("subdir");
+        let subdir = subdir.to_string_lossy().into_owned();
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread(&outsider.id).current_cwd = subdir.clone();
+            if let Some(thread) = relay.threads.iter_mut().find(|item| item.id == outsider.id) {
+                thread.cwd = subdir.clone();
+            }
+        }
+        // The guard reads the cwd the PROVIDER reports, which is the one the thread
+        // will actually run in — so the double has to report it too, or the test
+        // would be checking relay bookkeeping rather than where work lands.
+        {
+            let mut threads = providers.get("codex").unwrap().threads.lock().await;
+            if let Some(thread) = threads.get_mut(&outsider.id) {
+                thread.cwd = subdir.clone();
+            }
+        }
+
+        let error = app
+            .resume_session(ResumeSessionInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: outsider.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                provider: None,
+            })
+            .await
+            .expect_err("a session living in the task's worktree must not be resumed into it");
+        assert!(error.contains("belongs to a running task"), "{error}");
     }
 
     #[tokio::test]

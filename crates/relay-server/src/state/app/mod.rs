@@ -156,6 +156,13 @@ pub struct AppState {
     team_gated_barrier: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     team_gated_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// The third window: the driver's OWN git mutation of the worktree. Not a
+    /// turn, so the turn latches miss it entirely — and a stop that returned here
+    /// would release the tree while the relay was still staging into it.
+    #[cfg(test)]
+    team_commit_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    team_commit_arrivals: Arc<std::sync::atomic::AtomicU64>,
     /// Task team run ids that currently have a driver. The ONE piece of team run
     /// state that cannot live on the record: two concurrent Resumes both read
     /// `Paused`, both pass their guard, and both spawn a driver onto the same
@@ -292,6 +299,10 @@ impl AppState {
             team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -402,6 +413,10 @@ impl AppState {
             team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),

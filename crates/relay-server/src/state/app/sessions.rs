@@ -236,6 +236,13 @@ impl AppState {
             {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
             }
+            // The outer guard only knew this thread's id. A session the team does
+            // not own but which LIVES in its worktree — restored, or created
+            // before the task started — is still a writer in that tree, and the
+            // cwd is only knowable here, after the provider was asked.
+            if relay.is_cwd_team_locked(&preview.thread.cwd) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
+            }
         }
 
         bridge

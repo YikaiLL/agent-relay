@@ -84,9 +84,9 @@ jobs:
         run: cargo test --workspace
 
   review-recap-modes-e2e:
-    name: review-recap-modes-e2e
+    name: relay-http-e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -117,6 +117,13 @@ jobs:
       # the recap turn's presence/absence and the reviewer's briefing source.
       - name: Review recap-modes e2e
         run: npm run test:review-recap-modes
+
+      # Same shape for the Task team: the real relay binary, the fake provider, a
+      # real git repository. It covers the layer the in-process Rust tests cannot
+      # reach — HTTP routes, provisioning, and the branch left on disk — and it has
+      # already caught two defects that only exist there.
+      - name: Task team e2e
+        run: npm run test:task-team
 
   browser-smoke:
     name: browser-page-smoke
