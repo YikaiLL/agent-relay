@@ -9,13 +9,26 @@ impl AppState {
         let device_id = require_device_id(device_id)?;
         let request = {
             let relay = self.relay.read().await;
-            relay.ensure_device_can_approve(&device_id)?;
-            relay
+            let pending = relay
                 .pending_ask_user_questions
                 .get(request_id)
                 .cloned()
-                .ok_or_else(|| "there is no AskUserQuestion waiting for remote detail".to_string())?
-                .to_view()
+                .ok_or_else(|| {
+                    "there is no AskUserQuestion waiting for remote detail".to_string()
+                })?;
+            // Same authority as answering it, for the same reason. A remote
+            // snapshot externalizes any question body over 4 KB, so without this an
+            // unattended task's question renders as "Loading question detail"
+            // forever: visible, nominally answerable, and impossible to read.
+            match relay.team_run_cwd_for_thread(&pending.thread_id) {
+                Some(cwd) => ensure_path_within_device_scope(
+                    &cwd,
+                    &relay.device_path_scope(&device_id),
+                    &relay.allowed_roots,
+                )?,
+                None => relay.ensure_device_can_approve(&device_id)?,
+            }
+            pending.to_view()
         };
 
         Ok(AskUserQuestionDetailResponse { request })
@@ -121,14 +134,25 @@ impl AppState {
             // active session to "approve for" — and requiring one would close the
             // run's only channel to a person exactly when a relay has no foreground
             // session open, which is the normal state while a task runs unattended.
-            // The run itself is the context that authorizes the answer.
-            let team_owned = pending
+            //
+            // It is authorized against the RUN's worktree instead, exactly as
+            // pause / stop / resume are. Merely SKIPPING the check would leave only
+            // "is this a paired device" — and an answer steers an agent that writes
+            // files, so any device holding a request id could direct work in a
+            // worktree outside its own path scope.
+            match pending
                 .as_ref()
-                .is_some_and(|pending| relay.is_thread_team_locked(&pending.thread_id));
-            if !team_owned {
-                relay
+                .and_then(|pending| relay.team_run_cwd_for_thread(&pending.thread_id))
+            {
+                Some(cwd) => ensure_path_within_device_scope(
+                    &cwd,
+                    &relay.device_path_scope(&device_id),
+                    &relay.allowed_roots,
+                )
+                .map_err(AskUserAnswerError::Bridge)?,
+                None => relay
                     .ensure_device_can_approve(&device_id)
-                    .map_err(AskUserAnswerError::Bridge)?;
+                    .map_err(AskUserAnswerError::Bridge)?,
             }
             pending
         };

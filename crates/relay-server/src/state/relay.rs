@@ -1574,10 +1574,33 @@ impl RelayState {
     /// The reciprocal of the run's own isolation: a review or workflow started
     /// against the task worktree would walk into a tree three agents are already
     /// editing under an orchestrator that knows nothing about it.
+    ///
+    /// Containment, NOT string equality. `has_working_thread_in_cwd` compares
+    /// exact strings and can afford to — it asks "is this same session busy". This
+    /// asks "would this touch the task's files", and a thread started in
+    /// `<worktree>/src` is in the very same git worktree. Exact matching let
+    /// precisely the writer this lock exists to exclude in through a subdirectory.
     pub(crate) fn is_cwd_team_locked(&self, cwd: &str) -> bool {
+        let candidate = super::normalize_cwd(cwd);
+        self.team_runs.values().any(|run| {
+            !run.status.is_terminal()
+                && !run.cwd.is_empty()
+                && super::path_within_allowed_roots(&candidate, std::slice::from_ref(&run.cwd))
+        })
+    }
+
+    /// The worktree of the non-terminal team run that owns `thread_id`.
+    ///
+    /// The authority a user action on a team thread is authorized against: the
+    /// run's own cwd path-scope, exactly as pause / stop / resume use. A team
+    /// thread has no other workspace of its own to check.
+    pub(crate) fn team_run_cwd_for_thread(&self, thread_id: &str) -> Option<String> {
         self.team_runs
             .values()
-            .any(|run| !run.status.is_terminal() && run.cwd == cwd)
+            .find(|run| {
+                !run.status.is_terminal() && run.owned_thread_ids().iter().any(|id| id == thread_id)
+            })
+            .map(|run| run.cwd.clone())
     }
 
     pub(crate) fn is_thread_or_cwd_team_locked(&self, thread_id: &str) -> bool {

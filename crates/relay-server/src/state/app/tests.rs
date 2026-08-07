@@ -17027,12 +17027,12 @@ turn) must allow a review: {error:?}"
     }
 
     #[tokio::test]
-    async fn a_running_task_keeps_reviews_and_workflows_out_of_its_worktree() {
+    async fn a_running_task_keeps_every_other_writer_out_of_its_worktree() {
         // The reciprocal lock, and the one that is easy to forget: a team run does
         // NOT trip `has_active_workflow` or `has_active_review` — those scan their
-        // own maps. Without an explicit check, an ad-hoc review would snapshot a
-        // tree three agents are mid-edit in, and a workflow would launch its own
-        // file-mutating author into it.
+        // own maps. It also has to hold for a SUBDIRECTORY: `<worktree>/src` is the
+        // same git worktree, so exact-string cwd matching would let in precisely
+        // the concurrent writer this lock exists to exclude.
         let (_repo, root) = init_team_repo().await;
         let (app, providers) = build_review_app(&root, &["codex"]).await;
         providers
@@ -17051,9 +17051,66 @@ turn) must allow a review: {error:?}"
             .team_run(&run_id)
             .map(|run| run.cwd.clone())
             .expect("cwd");
+        let subdir = std::path::Path::new(&cwd).join("src");
+        std::fs::create_dir_all(&subdir).expect("subdir");
+        let subdir = subdir.to_string_lossy().into_owned();
 
-        // A user thread living in the task's worktree — the only way in.
-        let outsider = start_parent(&app, &cwd, "codex").await;
+        // Starting a session in the worktree is the worst door: a provider that
+        // consumes an initial prompt during `start_thread` launches a writer with
+        // no thread for any thread-scoped lock to catch. So the refusal has to
+        // happen BEFORE the provider is asked to create anything — an error
+        // returned after `start_thread` would be a writer already in the tree.
+        let threads_before = providers
+            .get("codex")
+            .unwrap()
+            .start_thread_cwds
+            .lock()
+            .await
+            .len();
+        for target in [&cwd, &subdir] {
+            let error = app
+                .start_session(StartSessionInput {
+                    device_id: Some("device-1".to_string()),
+                    cwd: Some(target.clone()),
+                    model: None,
+                    effort: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    provider: Some("codex".to_string()),
+                    initial_prompt: Some("go rewrite everything".to_string()),
+                })
+                .await
+                .expect_err("no new session may be started inside a running task");
+            assert!(
+                error.contains("belongs to a running task"),
+                "{target}: {error}"
+            );
+        }
+        assert_eq!(
+            providers
+                .get("codex")
+                .unwrap()
+                .start_thread_cwds
+                .lock()
+                .await
+                .len(),
+            threads_before,
+            "the provider must never have been asked to create a thread there"
+        );
+
+        // A thread that already lives in the worktree's subdirectory — the shape a
+        // string-equality lock waves through.
+        let outsider = start_parent(&app, &root, "codex").await;
+        app.relay
+            .write()
+            .await
+            .ensure_runtime_for_thread(&outsider.id)
+            .current_cwd = subdir.clone();
+        assert!(
+            app.relay.read().await.is_cwd_team_locked(&subdir),
+            "a subdirectory of the task worktree is the same worktree"
+        );
+
         let error = app
             .request_review(RequestReviewInput {
                 parent_thread_id: Some(outsider.id.clone()),
@@ -17076,10 +17133,399 @@ turn) must allow a review: {error:?}"
         app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
             .await
             .expect("cancel");
+        let relay = app.relay.read().await;
+        assert!(!relay.is_cwd_team_locked(&cwd));
+        assert!(!relay.is_cwd_team_locked(&subdir));
+    }
+
+    /// Resume once the stopped driver has actually let go of its ticket. A driver
+    /// that has settled still has a moment of unwinding left, and that is not the
+    /// "another driver is live" case Resume is refusing.
+    async fn resume_team_run_when_free(app: &AppState, run_id: &str) {
+        for _ in 0..400 {
+            match app
+                .resume_team_run(Some(run_id.to_string()), Some("device-1".to_string()))
+                .await
+            {
+                Ok(_) => return,
+                Err(error)
+                    if error.contains("already has a driver")
+                        || error.contains("finishing a turn") =>
+                {
+                    sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("resume: {error}"),
+            }
+        }
+        panic!("task {run_id} never became resumable");
+    }
+
+    #[tokio::test]
+    async fn a_stop_and_a_turn_start_can_never_interleave() {
+        // The boundary check that let a step run is many awaits behind the moment
+        // it actually calls `start_turn` — a worktree probe, a git checkpoint, a
+        // thread start. A stop landing in that window drains an idle runtime,
+        // records the run stopped, and then the driver starts a turn anyway. For a
+        // cancel that is not merely a lie: terminal releases the workspace lock
+        // while an agent writes into it.
+        //
+        // Driven deterministically by holding the drive gate — the same gate a
+        // stop takes — across the moment the driver wants to start its turn.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        let turns_when_stopped = provider.turns.lock().await.len();
+
+        // Latch the driver in the window itself: past its boundary check, not yet
+        // holding the drive gate. Settling as PAUSED is the case that matters —
+        // `Cancelled` is terminal and was already refused, `Paused` is not.
+        let barrier = app.hold_team_turn_barrier().await;
+        let arrivals_before = app.team_turn_arrivals();
+        resume_team_run_when_free(&app, &run_id).await;
+        for _ in 0..400 {
+            if app.team_turn_arrivals() > arrivals_before {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
         assert!(
-            !app.relay.read().await.is_cwd_team_locked(&cwd),
-            "a finished task holds nothing"
+            app.team_turn_arrivals() > arrivals_before,
+            "the resumed driver never reached the turn-start window"
         );
+
+        // The driver is now committed to starting a turn and is one step away from
+        // doing it. Stop the run out from under it.
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        let settled_at = provider.turns.lock().await.len();
+        drop(barrier);
+
+        sleep(Duration::from_millis(400)).await;
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "a settled run must stay settled: {:?}",
+            run.error
+        );
+        assert_eq!(
+            provider.turns.lock().await.len(),
+            settled_at,
+            "no turn may start on a run already recorded as stopped"
+        );
+        assert!(
+            settled_at >= turns_when_stopped,
+            "sanity: the turn count never goes backwards"
+        );
+
+        // Cancel closes it out, and the workspace is released with nothing running.
+        app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        let cancelled_at = provider.turns.lock().await.len();
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status),
+            Some(crate::state::TeamRunStatus::Cancelled)
+        );
+        assert_eq!(provider.turns.lock().await.len(), cancelled_at);
+        // And nothing is left running in the worktree the cancel just released.
+        assert!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.owned_thread_ids())
+                .unwrap_or_default()
+                .iter()
+                .all(|id| !app
+                    .relay
+                    .try_read()
+                    .map(|relay| relay
+                        .runtime_for_thread(id)
+                        .is_some_and(|runtime| runtime.is_working()))
+                    .unwrap_or(false)),
+            "a cancelled run released the workspace, so nothing may still be working"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_waits_for_a_turn_that_is_already_starting() {
+        // The second half of the same guarantee, and the half a status check
+        // cannot cover: preflight has already passed and `start_turn` has not
+        // fired yet. A stop that drained the idle runtime here would settle the
+        // run — releasing the workspace on a cancel — and then the provider call
+        // would land anyway. The drive gate is what makes that impossible, so the
+        // proof is that the stop CANNOT COMPLETE while the driver holds it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let barrier = app.hold_team_gated_barrier().await;
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        for _ in 0..600 {
+            if app.team_gated_arrivals() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            app.team_gated_arrivals() > 0,
+            "the driver never reached the in-gate window"
+        );
+
+        let stopper = {
+            let app = app.clone();
+            let run_id = run_id.clone();
+            tokio::spawn(async move {
+                app.force_stop_team_run(Some(run_id), Some("device-1".to_string()))
+                    .await
+            })
+        };
+        let raced = tokio::time::timeout(Duration::from_millis(250), stopper).await;
+        assert!(
+            raced.is_err(),
+            "a stop must not be able to settle a run whose turn is already starting"
+        );
+
+        drop(barrier);
+        // And once the turn has actually started, the stop completes normally by
+        // draining it rather than by pretending it was never there.
+        for _ in 0..600 {
+            let settled = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status == crate::state::TeamRunStatus::Paused);
+            if settled == Some(true) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "the stop should land once the turn it was waiting on exists: {:?}",
+            run.error
+        );
+        assert!(
+            !provider.interrupts.lock().await.is_empty(),
+            "and it should have stopped a real turn, not an imaginary one"
+        );
+    }
+
+    #[tokio::test]
+    async fn talking_to_a_paused_team_lead_cannot_race_a_resume() {
+        // While paused the user may redirect the team lead. That send does slow
+        // provider work before `start_turn`, so without the drive gate a resume
+        // landing in between puts the driver's turn on top of the user's — two
+        // turns on one thread — and a cancel can mark the run terminal moments
+        // before the user's turn actually starts.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        let tl = app
+            .relay
+            .read()
+            .await
+            .team_run(&run_id)
+            .map(|run| run.tl_thread_id.clone())
+            .expect("tl");
+
+        // A resume in flight holds the drive gate; the send must refuse rather
+        // than proceed on a stale "the run is paused" reading.
+        {
+            let _gate = app
+                .try_hold_team_drive_gate()
+                .expect("the gate should be free");
+            let error = app
+                .send_message(SendMessageInput {
+                    device_id: Some("device-1".to_string()),
+                    thread_id: tl.clone(),
+                    text: "do it differently".to_string(),
+                    model: None,
+                    effort: None,
+                })
+                .await
+                .expect_err("a send must not proceed while the task is mid-transition");
+            assert!(error.contains("try again in a moment"), "{error}");
+        }
+
+        // And once the run is actually resumed, the team lead is no longer the
+        // user's to talk to.
+        resume_team_run_when_free(&app, &run_id).await;
+        let error = app
+            .send_message(SendMessageInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                text: "do it differently".to_string(),
+                model: None,
+                effort: None,
+            })
+            .await
+            .expect_err("a resumed run drives its own team lead");
+        assert!(error.contains("belongs to a running task"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn answering_a_team_question_is_authorized_against_the_tasks_worktree() {
+        // Skipping `ensure_device_can_approve` for a team thread was necessary —
+        // every seat is background, so it would close the run's only channel to a
+        // person. Skipping it and checking NOTHING is a different mistake: an
+        // answer steers an agent that writes files, so any paired device holding a
+        // request id could direct work in a worktree outside its own path scope.
+        use crate::protocol::SubmitAskUserAnswerInput;
+
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_ask_user.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let mut request_id = String::new();
+        for _ in 0..600 {
+            let awaiting = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .and_then(|run| run.awaiting.clone());
+            if let Some(awaiting) = awaiting {
+                request_id = awaiting.request_id;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!request_id.is_empty(), "the run never parked");
+
+        // Put the task's worktree outside this device's reach.
+        let elsewhere = TempDir::new().expect("tmpdir");
+        app.relay.write().await.allowed_roots =
+            vec![elsewhere.path().to_string_lossy().into_owned()];
+
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            "Which approach?".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        let error = app
+            .submit_ask_user_answer(
+                &request_id,
+                SubmitAskUserAnswerInput {
+                    answers: answers.clone(),
+                    device_id: Some("device-1".to_string()),
+                },
+            )
+            .await
+            .expect_err("an out-of-scope device must not steer the task");
+        assert!(
+            format!("{error:?}").contains("allowed roots"),
+            "the refusal should name the scope: {error:?}"
+        );
+
+        // Reading the question is the same authority — a remote snapshot
+        // externalizes any body over 4 KB, so the two must agree.
+        let error = app
+            .read_ask_user_question_detail(&request_id, Some("device-1".to_string()))
+            .await
+            .expect_err("nor may it read the question");
+        assert!(error.contains("allowed roots"), "{error}");
+
+        // Back in scope, both work — with no foreground session anywhere.
+        app.relay.write().await.allowed_roots = vec![root.clone()];
+        assert!(
+            app.relay.read().await.active_thread_id.is_none(),
+            "this is the unattended case the exception exists for"
+        );
+        app.read_ask_user_question_detail(&request_id, Some("device-1".to_string()))
+            .await
+            .expect("an in-scope device can read the question");
+        app.submit_ask_user_answer(
+            &request_id,
+            SubmitAskUserAnswerInput {
+                answers,
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("and answer it");
+    }
+
+    #[tokio::test]
+    async fn a_task_thread_refuses_every_other_session_action() {
+        // The design's contract is that a task's threads are driven, not operated:
+        // no per-agent stop, no resume that makes one active, no settings edit that
+        // rewrites the sandbox its ROLE chose for it.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let tl = wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let error = app
+            .stop_active_turn(StopTurnInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+            })
+            .await
+            .expect_err("a task has no per-agent stop; the only stop is the run's");
+        assert!(error.contains("belongs to a running task"), "{error}");
+
+        let error = app
+            .resume_session(ResumeSessionInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                provider: None,
+            })
+            .await
+            .expect_err("nor may a seat be made the active thread");
+        assert!(error.contains("belongs to a running task"), "{error}");
+
+        let error = app
+            .update_session_settings(UpdateSessionSettingsInput {
+                device_id: Some("device-1".to_string()),
+                thread_id: tl.clone(),
+                model: None,
+                effort: None,
+                approval_policy: Some("never".to_string()),
+                sandbox: Some("danger-full-access".to_string()),
+            })
+            .await
+            .expect_err("nor may its sandbox be rewritten mid-run");
+        assert!(error.contains("belongs to a running task"), "{error}");
     }
 
     #[tokio::test]
@@ -17678,6 +18124,75 @@ underneath it"
             relay.team_run(&run_id).map(|run| run.status),
             Some(crate::state::TeamRunStatus::AwaitingUser),
             "an approval is the run's to answer, not the user's"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_denying_an_approval_never_eats_the_users_question() {
+        // The obvious implementation of "deny it and move on" is
+        // `deny_thread_approvals_best_effort` + `clear_thread_interactions`, and
+        // it is wrong twice over. Best-effort denial swallows provider errors, so
+        // clearing unconditionally deletes the only signal that the turn is still
+        // blocked; and clearing a thread's INTERACTIONS also deletes an
+        // AskUserQuestion that belongs to the user, not to the run.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.raise_approval.store(true, Ordering::Relaxed);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let tl = wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        // The question goes in FIRST, before the provider raises its approval at
+        // ~15 ms, so the two provably coexist on the thread when the run denies.
+        // Trying to observe the approval as a transient does not work: the wait
+        // loop denies it within microseconds of it appearing.
+        app.relay.write().await.pending_ask_user_questions.insert(
+            "ask:user-owned".to_string(),
+            crate::state::PendingAskUserQuestion {
+                request_id: "ask:user-owned".to_string(),
+                tool_use_id: "toolu-user-owned".to_string(),
+                thread_id: tl.clone(),
+                requested_at: crate::state::unix_now(),
+                questions: Vec::new(),
+            },
+        );
+
+        // The note on `unresolved` is written only by the denial path, so it is a
+        // positive signal that the denial actually ran.
+        let mut denied = false;
+        for _ in 0..600 {
+            denied = app
+                .relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| {
+                    run.unresolved
+                        .iter()
+                        .any(|entry| entry.contains("denied automatically"))
+                })
+                .unwrap_or(false);
+            if denied {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(denied, "the approval was never auto-denied");
+
+        let relay = app.relay.read().await;
+        assert!(
+            relay
+                .pending_approvals
+                .values()
+                .all(|approval| approval.thread_id != tl),
+            "the approval is the run's and must be denied"
+        );
+        assert!(
+            relay
+                .pending_ask_user_questions
+                .contains_key("ask:user-owned"),
+            "the question is the USER's and must survive"
         );
     }
 

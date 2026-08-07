@@ -337,6 +337,19 @@ impl AppState {
             .claim_team_drive(&run_id)
             .ok_or_else(|| "this task already has a driver".to_string())?;
 
+        // The gate makes the flip-and-spawn atomic against a turn start. It has to
+        // be: while paused the user may send to the team lead, and that send
+        // releases the gate the moment its turn BEGINS, so without the liveness
+        // check below a resume would put the driver's turn on top of theirs.
+        let _gate = self.team_drive_gate.lock().await;
+        let working = self.working_team_threads(&run_id).await;
+        if !working.is_empty() {
+            return Err(format!(
+                "{} is still finishing a turn; try again in a moment",
+                working.join(", ")
+            ));
+        }
+
         let mut resumed = false;
         {
             let mut relay = self.relay.write().await;
@@ -406,6 +419,40 @@ resumed; its branch is untouched"
             app: self.clone(),
             run_id: run_id.to_string(),
         })
+    }
+
+    /// Take the drive gate for a USER action on a team thread, or `None` if the
+    /// run is mid-transition.
+    ///
+    /// `try_lock`, deliberately: a drain can hold this for its whole window, and
+    /// making someone's message block on that is worse than telling them to try
+    /// again in a moment.
+    pub(super) fn try_hold_team_drive_gate(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.team_drive_gate.try_lock().ok()
+    }
+
+    /// Hold the driver at the pre-gate latch. Drop the guard to release it.
+    #[cfg(test)]
+    pub(crate) async fn hold_team_turn_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.team_turn_barrier.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn team_turn_arrivals(&self) -> u64 {
+        self.team_turn_arrivals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Hold the driver INSIDE the drive gate, after preflight.
+    #[cfg(test)]
+    pub(crate) async fn hold_team_gated_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.team_gated_barrier.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn team_gated_arrivals(&self) -> u64 {
+        self.team_gated_arrivals
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -502,6 +549,10 @@ resumed; its branch is untouched"
             relay.notify();
         }
 
+        // Drain AND settle under the drive gate, so no turn can be starting while
+        // we decide the run is quiescent. Acquired after the relay guard above is
+        // dropped: a relay lock is never held across taking this.
+        let _gate = self.team_drive_gate.lock().await;
         if !self.drain_team_run(&run_id).await {
             self.block_team_run(
                 &run_id,
@@ -561,6 +612,7 @@ resumed; its branch is untouched"
             disarmed: false,
         };
 
+        let _gate = self.team_drive_gate.lock().await;
         if !self.drain_team_run(&run_id).await {
             self.block_team_run(
                 &run_id,
@@ -817,6 +869,7 @@ resumed; its branch is untouched"
             return;
         }
 
+        let _gate = self.team_drive_gate.lock().await;
         if !self.drain_team_run(run_id).await {
             self.block_team_run(
                 run_id,
@@ -1003,42 +1056,67 @@ resumed; its branch is untouched"
         let Some(mut thread_id) = self.resolve_team_slot(run_id, slot).await else {
             return TeamStepOutcome::Failed(format!("task run {run_id} has no thread in {slot:?}"));
         };
-        if let Err(error) = self.team_turn_preflight(run_id, &thread_id).await {
-            return TeamStepOutcome::Failed(error);
-        }
         let baseline = self
             .latest_assistant_entry(&thread_id)
             .await
             .map(|(id, _)| id);
-        self.set_in_flight_thread(run_id, Some(thread_id.clone()))
-            .await;
 
-        let model = self
-            .relay
-            .read()
-            .await
-            .runtime_for_thread(&thread_id)
-            .map(|runtime| runtime.model.clone());
-
-        match self
-            .send_message_to_thread(&thread_id, prompt, model.as_deref(), None)
-            .await
+        // Everything from the preflight to the provider's `start_turn` runs under
+        // the drive gate. The boundary check that let this step run is many awaits
+        // behind us — a worktree probe, a git checkpoint, a thread start — and a
+        // stop landing in that window would drain an idle runtime, record the run
+        // stopped, and then watch this line start a turn anyway. Under the gate a
+        // stop either completes first (and the preflight below sees it) or waits.
+        #[cfg(test)]
         {
-            Ok(Some(_)) => {}
-            // Both are uncertain starts: `Ok(None)` returned no turn id, and a
-            // provider can begin work before returning `Err`. Drain either way, or
-            // a started turn keeps mutating the worktree after the run settles.
-            Ok(None) | Err(_) => {
-                let drained = self.stop_and_drain(&thread_id).await;
-                self.set_in_flight_thread(run_id, None).await;
-                if !drained {
+            // The window a stop must not be able to exploit: past the boundary
+            // check, not yet holding the drive gate.
+            self.team_turn_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(self.team_turn_barrier.lock().await);
+        }
+        {
+            let _gate = self.team_drive_gate.lock().await;
+            if let Err(error) = self.team_turn_preflight(run_id, &thread_id).await {
+                return TeamStepOutcome::Failed(error);
+            }
+            self.set_in_flight_thread(run_id, Some(thread_id.clone()))
+                .await;
+            #[cfg(test)]
+            {
+                self.team_gated_arrivals
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(self.team_gated_barrier.lock().await);
+            }
+
+            let model = self
+                .relay
+                .read()
+                .await
+                .runtime_for_thread(&thread_id)
+                .map(|runtime| runtime.model.clone());
+
+            match self
+                .send_message_to_thread(&thread_id, prompt, model.as_deref(), None)
+                .await
+            {
+                Ok(Some(_)) => {}
+                // Both are uncertain starts: `Ok(None)` returned no turn id, and a
+                // provider can begin work before returning `Err`. Drain either way,
+                // or a started turn keeps mutating the worktree after the run
+                // settles.
+                Ok(None) | Err(_) => {
+                    let drained = self.stop_and_drain(&thread_id).await;
+                    self.set_in_flight_thread(run_id, None).await;
+                    if !drained {
+                        return TeamStepOutcome::Failed(format!(
+                            "thread {thread_id}'s turn did not confirm stopping after an uncertain start"
+                        ));
+                    }
                     return TeamStepOutcome::Failed(format!(
-                        "thread {thread_id}'s turn did not confirm stopping after an uncertain start"
+                        "could not start a turn on thread {thread_id}"
                     ));
                 }
-                return TeamStepOutcome::Failed(format!(
-                    "could not start a turn on thread {thread_id}"
-                ));
             }
         }
         if let Some(promoted) = self.resolve_team_slot(run_id, slot).await {
@@ -1112,7 +1190,7 @@ resumed; its branch is untouched"
         let run = relay
             .team_run(run_id)
             .ok_or_else(|| format!("task run {run_id} is gone"))?;
-        if run.status.is_terminal() {
+        if run.status.is_terminal() || run.status.is_settled_without_driver() {
             return Err(format!(
                 "task run {run_id} settled as {} before this turn started",
                 run.status.as_str()
@@ -1219,7 +1297,14 @@ resumed; its branch is untouched"
 
             // Outside the read lock: both of these take locks of their own.
             if has_approval {
-                self.auto_handle_team_approval(run_id, thread_id).await;
+                // A denial the provider refused leaves the turn blocked with no way
+                // out, so fail the step rather than spin denying it forever.
+                if let Err(error) = self.auto_handle_team_approval(run_id, thread_id).await {
+                    if parked_since.is_some() {
+                        self.unpark_team_run(run_id).await;
+                    }
+                    return Some(error);
+                }
                 continue;
             }
 
@@ -1279,23 +1364,83 @@ resumed; its branch is untouched"
     /// what makes non-prompting correct in the first place. It IS recorded on the
     /// run, because a denial means the agent was stopped from doing something and
     /// the final report is where the user finds that out.
-    async fn auto_handle_team_approval(&self, run_id: &str, thread_id: &str) {
-        self.deny_thread_approvals_best_effort(thread_id).await;
-        self.clear_thread_interactions(thread_id).await;
+    /// Returns `Err` when the provider would not take the denial, which means the
+    /// turn is still blocked and this loop cannot unblock it.
+    ///
+    /// Two things it deliberately does NOT do, both of which the obvious
+    /// implementation (`deny_thread_approvals_best_effort` +
+    /// `clear_thread_interactions`) gets wrong:
+    ///
+    /// - It removes only the approvals the provider ACCEPTED. Best-effort denial
+    ///   swallows provider errors, so clearing unconditionally would delete the
+    ///   one signal that the turn is still waiting — and then only the stall
+    ///   timeout, ten minutes later, would notice.
+    /// - It never touches `pending_ask_user_questions`. A thread can hold an
+    ///   approval and a question at once, and the question is the USER's. Clearing
+    ///   the thread's interactions wholesale would silently delete a question
+    ///   somebody was in the middle of answering.
+    async fn auto_handle_team_approval(&self, run_id: &str, thread_id: &str) -> Result<(), String> {
+        let pending: Vec<crate::state::PendingApproval> = {
+            let relay = self.relay.read().await;
+            relay
+                .pending_approvals
+                .values()
+                .filter(|approval| approval.thread_id == thread_id)
+                .cloned()
+                .collect()
+        };
+
+        let mut denied = Vec::new();
+        let mut refused = Vec::new();
+        for approval in pending {
+            let bridge = match self.find_thread_provider(&approval.thread_id).await {
+                Ok((_, bridge)) => bridge.clone(),
+                Err(error) => {
+                    refused.push(error);
+                    continue;
+                }
+            };
+            let input = ApprovalDecisionInput {
+                decision: ApprovalDecision::Deny,
+                scope: None,
+                device_id: None,
+            };
+            match bridge.respond_to_approval(&approval, &input).await {
+                Ok(_) => denied.push(approval.request_id.clone()),
+                Err(error) => refused.push(error),
+            }
+        }
+
         let note = format!(
             "a tool approval on thread {thread_id} was denied automatically; the task \
 worktree is sandboxed and nobody is watching a background turn"
         );
-        let mut relay = self.relay.write().await;
-        relay.update_team_run(run_id, |run| {
-            // Deduplicated: a thread that keeps asking must not fill the report with
-            // the same line.
-            if !run.unresolved.iter().any(|entry| entry == &note) {
-                run.unresolved.push(note.clone());
+        {
+            let mut relay = self.relay.write().await;
+            for request_id in &denied {
+                relay.remove_pending_approval(request_id);
             }
-        });
-        relay.push_log("warn", format!("Task {run_id}: {note}"));
-        relay.notify();
+            if !denied.is_empty() {
+                relay.update_team_run(run_id, |run| {
+                    // Deduplicated: a thread that keeps asking must not fill the
+                    // report with the same line.
+                    if !run.unresolved.iter().any(|entry| entry == &note) {
+                        run.unresolved.push(note.clone());
+                    }
+                });
+                relay.push_log("warn", format!("Task {run_id}: {note}"));
+            }
+            relay.notify();
+        }
+
+        if refused.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "thread {thread_id} raised a tool approval that could not be denied ({}); \
+its turn cannot continue",
+            refused.join("; ")
+        ))
     }
 
     async fn park_team_run_on_question(

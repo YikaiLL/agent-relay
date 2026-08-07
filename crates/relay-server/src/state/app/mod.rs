@@ -125,6 +125,37 @@ pub struct AppState {
     /// every scrap of progress and FREEZES entirely while a turn is parked on a
     /// user's question. Overridable in tests.
     team_step_stall_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes the two things that must never interleave for a task team:
+    /// STARTING a turn on one of its threads, and CHANGING whether the run may be
+    /// driven at all.
+    ///
+    /// Without it the driver's boundary check and its `start_turn` are separated
+    /// by provider and git work, so a stop landing in between drains an idle
+    /// runtime, records the run stopped, and then watches the driver start a turn
+    /// into a worktree it just told the user was quiet. For a cancel that is worse
+    /// than a lie: terminal releases the workspace lock while an agent writes.
+    ///
+    /// One gate rather than one per run because M1 allows a single run at a time;
+    /// key it by run id when that relaxes.
+    team_drive_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only latch held across the exact window a stop must not be able to
+    /// exploit: after the driver's boundary check, before it takes the drive gate.
+    /// A test holds it, settles the run, and releases — which is the only way to
+    /// drive that interleaving deterministically rather than hoping for it.
+    #[cfg(test)]
+    team_turn_barrier: Arc<tokio::sync::Mutex<()>>,
+    /// Counts drivers that have REACHED that latch, so a test can wait for the
+    /// driver to be genuinely past its boundary check instead of sleeping.
+    #[cfg(test)]
+    team_turn_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// The second window, INSIDE the drive gate: preflight has passed and
+    /// `start_turn` has not been called. A stop reaching the worktree here is the
+    /// failure the gate exists to make impossible, so a test proves it by holding
+    /// this and showing the stop cannot complete.
+    #[cfg(test)]
+    team_gated_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    team_gated_arrivals: Arc<std::sync::atomic::AtomicU64>,
     /// Task team run ids that currently have a driver. The ONE piece of team run
     /// state that cannot live on the record: two concurrent Resumes both read
     /// `Paused`, both pass their guard, and both spawn a driver onto the same
@@ -252,6 +283,15 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -353,6 +393,15 @@ impl AppState {
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
