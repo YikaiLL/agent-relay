@@ -1800,6 +1800,56 @@ impl RelayState {
         self.team_runs.values().any(|run| !run.status.is_terminal())
     }
 
+    /// Resolve the run a whole-run action targets.
+    ///
+    /// An omitted id is allowed only while it is unambiguous. M1 runs one task at
+    /// a time, so that is the normal case — but the ambiguity is checked rather
+    /// than assumed, because the cap is a policy in `start_team_run` and this has
+    /// to keep telling the truth when that policy relaxes.
+    pub(crate) fn active_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
+        if let Some(run_id) = run_id {
+            return match self.team_runs.get(run_id) {
+                Some(run) => Ok(run.id.clone()),
+                None => Err("there is no task with that id".to_string()),
+            };
+        }
+        let live: Vec<&TeamRun> = self
+            .team_runs
+            .values()
+            .filter(|run| !run.status.is_terminal())
+            .collect();
+        match live.as_slice() {
+            [] => Err("there is no active task".to_string()),
+            [run] => Ok(run.id.clone()),
+            _ => Err("team_run_id is required when more than one task is active".to_string()),
+        }
+    }
+
+    /// Resolve the run a `Blocked` recovery targets, refusing anything that is not
+    /// actually blocked so a recovery cannot drain a healthy run's threads.
+    pub(crate) fn blocked_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
+        if let Some(run_id) = run_id {
+            return match self.team_runs.get(run_id) {
+                Some(run) if matches!(run.status, TeamRunStatus::Blocked) => Ok(run.id.clone()),
+                Some(run) if matches!(run.status, TeamRunStatus::Resolving) => {
+                    Err("this task is already being resolved".to_string())
+                }
+                Some(_) => Err("this task is not blocked".to_string()),
+                None => Err("there is no task with that id".to_string()),
+            };
+        }
+        let blocked: Vec<&TeamRun> = self
+            .team_runs
+            .values()
+            .filter(|run| matches!(run.status, TeamRunStatus::Blocked))
+            .collect();
+        match blocked.as_slice() {
+            [] => Err("there is no blocked task to resolve".to_string()),
+            [run] => Ok(run.id.clone()),
+            _ => Err("team_run_id is required when more than one task is blocked".to_string()),
+        }
+    }
+
     fn prune_team_runs(&mut self) {
         if self.team_runs.len() < MAX_WORKFLOW_RUNS {
             return;

@@ -17020,6 +17020,357 @@ turn) must allow a review: {error:?}"
         );
     }
 
+    /// Block until the run has a turn in flight, so a stop is guaranteed to
+    /// arrive mid-turn rather than in a gap between two of them.
+    async fn wait_for_team_turn_in_flight(app: &AppState, run_id: &str) -> String {
+        for _ in 0..600 {
+            let in_flight = app
+                .relay
+                .read()
+                .await
+                .team_run(run_id)
+                .and_then(|run| run.in_flight_thread.clone());
+            if let Some(thread_id) = in_flight {
+                return thread_id;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("task {run_id} never started a turn");
+    }
+
+    #[tokio::test]
+    async fn a_pause_lands_at_the_next_step_boundary_not_mid_turn() {
+        // A pause that cut a turn short would leave the worktree in whatever state
+        // a half-finished edit left it, and lose the work of the turn it killed.
+        // So Pause sets a flag and stops NOTHING: the in-flight turn runs to
+        // completion, its result is recorded, and only then does the run settle.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // A slow turn, so the pause is certain to land while one is in flight.
+        provider.complete_delay_ms.store(200, Ordering::Relaxed);
+        script_replies(provider, &["Plan written.\nCOMPLEXITY: simple"]).await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let status = app
+            .pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("a pause on a live task should be accepted");
+        assert_eq!(
+            status,
+            crate::state::TeamRunStatus::PausePending,
+            "a pause is a request, not an instant stop"
+        );
+
+        let run = wait_for_team_run(&app, &run_id).await;
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "{:?}",
+            run.error
+        );
+        assert!(
+            !run.status.is_terminal(),
+            "a paused task is not a finished one"
+        );
+        assert!(!run.pause_requested, "settling consumes the request");
+        assert_eq!(
+            run.complex,
+            Some(false),
+            "the turn that was in flight when the pause arrived must have run to \
+completion and had its result recorded"
+        );
+        assert!(
+            run.in_flight_thread.is_none(),
+            "a settled pause leaves nothing in flight"
+        );
+        assert!(
+            provider.interrupts.lock().await.is_empty(),
+            "a boundary pause must not stop a single turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_rechecks_its_right_to_continue_at_every_boundary() {
+        // A user action can settle the run while the driver is inside a turn. The
+        // driver never learns that from the turn itself, so it has to re-read its
+        // own right to continue at the boundary rather than only look for the
+        // pause flag it knows about — a settled stop CLEARS that flag. Miss this
+        // and a stopped task quietly starts its next turn.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_delay_ms.store(250, Ordering::Relaxed);
+        script_replies(
+            provider,
+            &[
+                "Plan written.\nCOMPLEXITY: simple",
+                "SUBTASK: Add the parser\nHandle three encodings.\nEND SUBTASK",
+            ],
+        )
+        .await;
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        assert_eq!(provider.turns.lock().await.len(), 1, "one turn in flight");
+
+        // Settle the run out from under the driver, exactly as a force stop does:
+        // status Paused, and the pause REQUEST consumed.
+        app.relay.write().await.update_team_run(&run_id, |run| {
+            run.settle_paused("settled by the user mid-turn");
+        });
+
+        // Long enough for the in-flight turn to finish (250 ms) and for the driver
+        // to have dispatched the next action if it were going to.
+        sleep(Duration::from_millis(600)).await;
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "{:?}",
+            run.error
+        );
+        assert_eq!(
+            provider.turns.lock().await.len(),
+            1,
+            "the driver must not start another turn on a run that was settled \
+underneath it"
+        );
+        assert_eq!(
+            run.phase,
+            crate::state::TeamPhase::Planning,
+            "the turn that WAS in flight still had its result recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_force_stop_settles_paused_and_the_driver_cannot_overwrite_it() {
+        // The race this pins: a force stop drains the very turn the driver is
+        // waiting on, so moments later that driver observes its turn end with no
+        // reply and tries to record "the team lead replied with nothing". If a
+        // driver could still write status, every successful force stop would land
+        // as Failed — the user asks for a pause and gets a dead run.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        // The turn never ends on its own, so only the stop can end it.
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        let in_flight = wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let status = app
+            .force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("a confirmed drain should settle the run");
+        assert_eq!(status, crate::state::TeamRunStatus::Paused);
+        assert!(
+            provider
+                .interrupts
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == &in_flight),
+            "the in-flight turn must actually have been stopped"
+        );
+
+        // Give the driver time to notice its turn ended and try to fail the run.
+        sleep(Duration::from_millis(200)).await;
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(
+            run.status,
+            crate::state::TeamRunStatus::Paused,
+            "a driver that lost the run must not write over the user's decision: {:?}",
+            run.error
+        );
+        assert!(!run.status.is_terminal(), "the task stays resumable");
+        assert!(
+            run.in_flight_thread.is_none(),
+            "a settled stop leaves nothing in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_force_stop_that_cannot_confirm_the_drain_blocks_instead_of_lying() {
+        // Reporting "stopped" when a turn is still running is the one outcome that
+        // is worse than failing: the run goes quiet, its locks look free, and an
+        // agent keeps writing the worktree nobody is watching any more.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+
+        let error = app
+            .force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("an unconfirmed drain must not be reported as a stop");
+        assert!(
+            error.contains("did not confirm stopping"),
+            "the error should say why: {error}"
+        );
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+        assert!(
+            !run.status.is_terminal(),
+            "Blocked keeps the task's locks held"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_a_blocked_task_drains_it_and_leaves_it_resumable() {
+        // A task that took two attempts to stop has not lost its work: the
+        // worktree, the branch and every finished sub-task are still on disk, and
+        // the next action is a pure function of the record. So the recovery lands
+        // on Paused, not on a terminal state that would throw all of that away.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        provider.interrupt_fails.store(true, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(50);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("the first stop cannot confirm the drain");
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .team_run(&run_id)
+                .map(|run| run.status),
+            Some(crate::state::TeamRunStatus::Blocked)
+        );
+
+        // The provider now cooperates with the stop.
+        provider.interrupt_fails.store(false, Ordering::Relaxed);
+        let status = app
+            .resolve_blocked_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("the recovery should land");
+        assert_eq!(
+            status,
+            crate::state::TeamRunStatus::Paused,
+            "a drained task keeps its work and stays resumable"
+        );
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(
+            run.in_flight_thread.is_none(),
+            "a stale in-flight marker would make the next cleanup pass block it again"
+        );
+        assert_eq!(
+            run.branch, "task/add-a-parser",
+            "the recovery never throws the branch away"
+        );
+        assert!(std::path::Path::new(&run.cwd).is_dir());
+
+        let error = app
+            .resolve_blocked_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect_err("a second recovery has nothing to resolve");
+        assert!(error.contains("not blocked"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn whole_run_stops_refuse_a_device_outside_the_tasks_path_scope() {
+        // Stops are authorized by the task's WORKTREE path scope, the same way
+        // starting one is. A device that could never have started this task must
+        // not be able to reach into its worktree and drain its turns.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        providers
+            .get("codex")
+            .unwrap()
+            .complete_turns
+            .store(false, Ordering::Relaxed);
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+        let elsewhere = TempDir::new().expect("tmpdir");
+        app.relay.write().await.allowed_roots =
+            vec![elsewhere.path().to_string_lossy().into_owned()];
+
+        for error in [
+            app.pause_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("pause must be authorized"),
+            app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("force stop must be authorized"),
+            app.cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+                .await
+                .expect_err("cancel must be authorized"),
+        ] {
+            assert!(
+                error.contains("allowed roots"),
+                "the refusal should name the scope: {error}"
+            );
+        }
+
+        let error = app
+            .pause_team_run(Some(run_id.clone()), None)
+            .await
+            .expect_err("an unidentified caller cannot stop a task");
+        assert!(error.contains("device_id"), "{error}");
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(
+            !run.pause_requested && run.status != crate::state::TeamRunStatus::Blocked,
+            "a refused stop must leave the run untouched: {:?}",
+            run.status
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_task_frees_the_slot_and_keeps_the_work_on_disk() {
+        // Pausing deliberately does NOT free the slot — a paused task still owns
+        // its worktree and expects a resume. Cancel is the action that ends it,
+        // and it still never deletes the branch or the tree: that is the user's
+        // work, and throwing it away is not this action's call.
+        let (_repo, root) = init_team_repo().await;
+        let (app, providers) = build_review_app(&root, &["codex"]).await;
+        let provider = providers.get("codex").unwrap();
+        provider.complete_turns.store(false, Ordering::Relaxed);
+        app.set_workflow_drain_max_ms(500);
+
+        let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+        wait_for_team_turn_in_flight(&app, &run_id).await;
+        app.force_stop_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("stop");
+        assert!(
+            app.start_team_run(team_input(&root)).await.is_err(),
+            "a paused task still holds the one-at-a-time slot"
+        );
+
+        let status = app
+            .cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+            .await
+            .expect("cancel");
+        assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+        assert!(status.is_terminal());
+
+        let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+        assert!(
+            std::path::Path::new(&run.cwd).is_dir(),
+            "cancelling never deletes the user's work"
+        );
+        app.start_team_run(team_input(&root))
+            .await
+            .expect("a cancelled task must not hold the slot forever");
+    }
+
     #[tokio::test]
     async fn submit_ask_user_answer_on_a_reviewed_thread_is_blocked() {
         use crate::protocol::SubmitAskUserAnswerInput;

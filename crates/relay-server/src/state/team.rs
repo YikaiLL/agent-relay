@@ -146,10 +146,17 @@ impl TeamRunStatus {
         matches!(self, Self::Paused)
     }
 
-    /// Whether the run holds its threads and worktree without a driver to move
-    /// them. `Blocked` waits for an explicit recovery; `Paused` waits for the user.
-    fn is_sticky(self) -> bool {
-        matches!(self, Self::Blocked | Self::Resolving)
+    /// Whether the run holds its threads and worktree with no driver entitled to
+    /// move it. `Paused` waits for the user, `Blocked` for an explicit recovery,
+    /// `Resolving` for the recovery already in progress.
+    ///
+    /// These states are writable only by a deliberate user action, never by a
+    /// driver. That asymmetry is the point: a force stop settles `Paused` while
+    /// the driver is still inside a turn, and moments later that driver observes
+    /// its own turn vanish and tries to record a failure. Letting it through would
+    /// turn every successful force stop into `Failed`.
+    pub(crate) fn is_settled_without_driver(self) -> bool {
+        matches!(self, Self::Paused | Self::Blocked | Self::Resolving)
     }
 }
 
@@ -497,11 +504,13 @@ impl TeamRun {
         }
     }
 
-    /// Advance the status. Terminal is final, and `Blocked`/`Resolving` are sticky
-    /// so a cancel that won a race can never be clobbered by the driver's next
-    /// between-step write. Same guard `WorkflowRun` uses.
+    /// Advance the status. Terminal is final, and a state the user settled is
+    /// off-limits, so a decision that won a race can never be clobbered by the
+    /// driver's next between-step write. Same guard `WorkflowRun` uses, widened by
+    /// `Paused` because this run type is the one that can be settled underneath a
+    /// live driver.
     pub(crate) fn set_status(&mut self, status: TeamRunStatus) {
-        if self.status.is_terminal() || self.status.is_sticky() {
+        if self.status.is_terminal() || self.status.is_settled_without_driver() {
             return;
         }
         self.status = status;
@@ -509,7 +518,7 @@ impl TeamRun {
     }
 
     pub(crate) fn fail(&mut self, error: impl Into<String>) {
-        if self.status.is_terminal() || self.status.is_sticky() {
+        if self.status.is_terminal() || self.status.is_settled_without_driver() {
             return;
         }
         self.error = Some(error.into());
@@ -528,10 +537,7 @@ impl TeamRun {
     /// Record a pause request. Does not stop anything: the driver settles at the
     /// next boundary.
     pub(crate) fn request_pause(&mut self, device_id: impl Into<String>) {
-        if self.status.is_terminal()
-            || self.status.is_sticky()
-            || matches!(self.status, TeamRunStatus::Paused)
-        {
+        if self.status.is_terminal() || self.status.is_settled_without_driver() {
             return;
         }
         self.pause_requested = true;
@@ -541,13 +547,76 @@ impl TeamRun {
 
     /// Settle a requested pause. Returns whether it took.
     pub(crate) fn settle_paused(&mut self, reason: impl Into<String>) -> bool {
-        if self.status.is_terminal() || self.status.is_sticky() {
+        if self.status.is_terminal() || self.status.is_settled_without_driver() {
             return false;
         }
         self.pause_requested = false;
         self.pause_reason = Some(reason.into());
+        // Nothing is in flight once a pause settles: the caller proved every owned
+        // turn is quiescent before getting here. Leaving a stale marker would make
+        // the next cleanup pass read an unobservable turn and block the run.
+        self.in_flight_thread = None;
         self.status = TeamRunStatus::Paused;
         self.updated_at = unix_now();
+        true
+    }
+
+    /// Settle the run at the user's request. TERMINAL.
+    ///
+    /// Unlike `set_status` this may leave `Paused`/`Blocked`/`Resolving`: those
+    /// states exist to stop a DRIVER from writing over a decision, not to stop the
+    /// user from making one. Callers must confirm every owned turn stopped first —
+    /// terminal releases the run's locks, and an agent still writing the worktree
+    /// after that is exactly what `Blocked` exists to prevent.
+    pub(crate) fn cancel(&mut self, reason: impl Into<String>) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
+        self.error = Some(reason.into());
+        self.pause_requested = false;
+        self.awaiting = None;
+        self.in_flight_thread = None;
+        self.status = TeamRunStatus::Cancelled;
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// `Blocked` -> `Resolving`. Only a blocked run may enter, so two concurrent
+    /// recoveries cannot drain the same threads twice.
+    pub(crate) fn begin_resolving_blocked(&mut self) -> bool {
+        if !matches!(self.status, TeamRunStatus::Blocked) {
+            return false;
+        }
+        self.status = TeamRunStatus::Resolving;
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// `Resolving` -> `Paused`, once the recovery's drain confirmed.
+    ///
+    /// Deliberately NOT terminal, unlike `WorkflowRun::resolve_blocked_as_failed`.
+    /// A drained team run is quiescent with its worktree and plan file intact,
+    /// which is precisely what `Paused` describes — and `next_team_action` is a
+    /// pure function of the record, so the work is genuinely resumable. Throwing
+    /// that away would discard finished sub-tasks over a stop that took two tries.
+    pub(crate) fn resolve_as_paused(&mut self, reason: impl Into<String>) -> bool {
+        if !matches!(self.status, TeamRunStatus::Resolving) {
+            return false;
+        }
+        self.pause_requested = false;
+        self.pause_reason = Some(reason.into());
+        self.in_flight_thread = None;
+        self.status = TeamRunStatus::Paused;
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// `Resolving` -> `Blocked`, for a recovery that never finished.
+    pub(crate) fn restore_resolving_as_blocked(&mut self, error: impl Into<String>) -> bool {
+        if !matches!(self.status, TeamRunStatus::Resolving) {
+            return false;
+        }
+        self.block(error);
         true
     }
 
@@ -1165,6 +1234,110 @@ mod tests {
         assert_eq!(run.status, TeamRunStatus::Paused);
         assert!(!run.pause_requested, "the request is consumed by settling");
         assert_eq!(run.pause_reason.as_deref(), Some("boundary reached"));
+    }
+
+    #[test]
+    fn a_run_the_user_settled_is_off_limits_to_its_driver() {
+        // A force stop settles the run while the driver is still inside a turn.
+        // That driver then watches its own turn end with no reply and tries to
+        // record a failure — so every state a user settles has to be unwritable
+        // by a driver, or a successful stop lands as Failed.
+        for settled in [
+            TeamRunStatus::Paused,
+            TeamRunStatus::Blocked,
+            TeamRunStatus::Resolving,
+        ] {
+            let mut run = run_with(TeamPhase::SubTasks, vec![]);
+            run.status = settled;
+
+            run.set_status(TeamRunStatus::Running);
+            assert_eq!(run.status, settled, "a driver must not restart {settled:?}");
+            run.fail("the team lead replied with nothing");
+            assert_eq!(
+                run.status, settled,
+                "a driver must not fail a run it no longer drives"
+            );
+            assert!(
+                run.error.is_none(),
+                "and must not leave its own reason behind either"
+            );
+
+            // The user, however, can always end it.
+            assert!(run.cancel("stopped by the user"));
+            assert_eq!(run.status, TeamRunStatus::Cancelled);
+        }
+    }
+
+    #[test]
+    fn every_settled_stop_clears_the_in_flight_marker() {
+        // `in_flight_thread` names a turn that may be running with no runtime to
+        // observe it, and cleanup reads that as UNKNOWN rather than idle. Leaving
+        // a stale one behind therefore blocks a run that is genuinely quiescent —
+        // and every settlement below has just PROVEN quiescence.
+        let mut paused = run_with(TeamPhase::SubTasks, vec![]);
+        paused.in_flight_thread = Some("thread-1".to_string());
+        assert!(paused.settle_paused("boundary"));
+        assert!(paused.in_flight_thread.is_none());
+
+        let mut cancelled = run_with(TeamPhase::SubTasks, vec![]);
+        cancelled.in_flight_thread = Some("thread-1".to_string());
+        assert!(cancelled.cancel("stopped by the user"));
+        assert!(cancelled.in_flight_thread.is_none());
+
+        let mut recovered = run_with(TeamPhase::SubTasks, vec![]);
+        recovered.in_flight_thread = Some("thread-1".to_string());
+        recovered.block("a drain that did not confirm");
+        assert!(recovered.begin_resolving_blocked());
+        assert!(recovered.resolve_as_paused("recovered"));
+        assert!(recovered.in_flight_thread.is_none());
+    }
+
+    #[test]
+    fn a_blocked_run_recovers_into_a_resumable_pause_and_only_once() {
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.sub_tasks = vec![sub_task(SubTaskStatus::Done, true)];
+        run.block("a drain that did not confirm");
+
+        assert!(run.begin_resolving_blocked());
+        assert_eq!(run.status, TeamRunStatus::Resolving);
+        assert!(
+            !run.begin_resolving_blocked(),
+            "a second recovery must not drain the same threads again"
+        );
+
+        assert!(run.resolve_as_paused("recovered by stopping every owned turn"));
+        assert_eq!(
+            run.status,
+            TeamRunStatus::Paused,
+            "a drained run keeps its work; it does not get thrown away"
+        );
+        assert!(run.status.is_resumable());
+        assert_eq!(
+            run.sub_tasks[0].status,
+            SubTaskStatus::Done,
+            "finished sub-tasks survive the recovery"
+        );
+        assert!(
+            !run.resolve_as_paused("again"),
+            "only a Resolving run can be resolved"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_recovery_falls_back_to_blocked_not_to_limbo() {
+        // `Resolving` is non-terminal and has no driver, so a recovery that dies
+        // mid-drain would strand the run somewhere nothing ever moves it from.
+        let mut run = run_with(TeamPhase::SubTasks, vec![]);
+        run.block("a drain that did not confirm");
+        assert!(run.begin_resolving_blocked());
+
+        assert!(run.restore_resolving_as_blocked("the recovery was interrupted"));
+        assert_eq!(run.status, TeamRunStatus::Blocked);
+        assert!(!run.status.is_terminal(), "it still owns its threads");
+        assert!(
+            !run.restore_resolving_as_blocked("again"),
+            "a run that is not resolving has nothing to restore"
+        );
     }
 
     #[test]

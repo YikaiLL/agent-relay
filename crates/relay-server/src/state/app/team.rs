@@ -89,6 +89,31 @@ enum TeamStepOutcome {
     Failed(String),
 }
 
+/// What a user-driven stop leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamStopKind {
+    /// Stop now and stay resumable. The worktree, branch and plan file survive.
+    Pause,
+    /// Stop now and hand the slot back. TERMINAL.
+    Cancel,
+}
+
+impl TeamStopKind {
+    fn settled_status(self) -> TeamRunStatus {
+        match self {
+            Self::Pause => TeamRunStatus::Paused,
+            Self::Cancel => TeamRunStatus::Cancelled,
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Pause => "stopped by the user",
+            Self::Cancel => "the task was cancelled by the user",
+        }
+    }
+}
+
 /// Crash net for `run_team_job`.
 ///
 /// Unlike `WorkflowRunLifeguard` this must NOT reconcile a resumable run: a
@@ -115,6 +140,41 @@ impl Drop for TeamRunLifeguard {
         let run_id = self.run_id.clone();
         tokio::spawn(async move {
             app.interrupt_team_run_if_stranded(&run_id).await;
+        });
+    }
+}
+
+/// Crash net for a `Blocked` recovery.
+///
+/// `Resolving` is non-terminal and has no driver, so a recovery that dies
+/// mid-drain — a panic, or an HTTP client that hung up — would strand the run in
+/// a state nothing ever moves again. Put it back to `Blocked`, which at least
+/// keeps the recovery offerable.
+struct TeamRecoveryGuard {
+    app: AppState,
+    run_id: String,
+    disarmed: bool,
+}
+
+impl TeamRecoveryGuard {
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for TeamRecoveryGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let app = self.app.clone();
+        let run_id = self.run_id.clone();
+        tokio::spawn(async move {
+            app.restore_resolving_team_run_as_blocked(
+                &run_id,
+                "the task's recovery was interrupted before its owned turns confirmed stopping",
+            )
+            .await;
         });
     }
 }
@@ -212,6 +272,234 @@ impl AppState {
         Ok(run_id)
     }
 
+    /// Ask the run to pause at its next step boundary.
+    ///
+    /// Sets a flag and NOTHING else: no turn is stopped, no thread is touched.
+    /// That is the entire safety property — a dev is never cut off mid-edit, so a
+    /// paused worktree is always a tree some agent finished writing. The driver
+    /// settles it at the top of its next iteration. Use `force_stop_team_run` when
+    /// the wait is unacceptable.
+    pub(crate) async fn pause_team_run(
+        &self,
+        run_id: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<TeamRunStatus, String> {
+        let (run_id, device_id) = self
+            .authorize_team_action(run_id.as_deref(), device_id)
+            .await?;
+        let status = self.require_stoppable_team_run(&run_id).await?;
+        // Idempotent: a second Pause on a run that already settled is the user
+        // pressing twice, not an error worth surfacing.
+        if status == TeamRunStatus::Paused {
+            return Ok(status);
+        }
+
+        let mut relay = self.relay.write().await;
+        relay.update_team_run(&run_id, |run| run.request_pause(&device_id));
+        let settled = relay
+            .team_run(&run_id)
+            .map(|run| run.status)
+            .unwrap_or(TeamRunStatus::Failed);
+        relay.push_log(
+            "info",
+            format!("Task {run_id}: pause requested; it settles after the current turn"),
+        );
+        relay.notify();
+        Ok(settled)
+    }
+
+    /// Stop the run now rather than at a boundary, keeping it resumable.
+    pub(crate) async fn force_stop_team_run(
+        &self,
+        run_id: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<TeamRunStatus, String> {
+        self.stop_team_run(run_id, device_id, TeamStopKind::Pause)
+            .await
+    }
+
+    /// Stop the run now and give the slot back. The worktree and branch survive —
+    /// the user's work is on disk and deleting it is never this action's call.
+    pub(crate) async fn cancel_team_run(
+        &self,
+        run_id: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<TeamRunStatus, String> {
+        self.stop_team_run(run_id, device_id, TeamStopKind::Cancel)
+            .await
+    }
+
+    /// The shared body of both immediate stops.
+    ///
+    /// The ORDER is the design. Requesting the pause first means a driver that
+    /// reaches its own boundary while we drain settles there instead of starting
+    /// one more turn; draining second confirms every owned turn actually stopped;
+    /// settling last goes through `settle_team_run`, which re-checks quiescence
+    /// and blocks rather than persisting a stop that is not true. Any other order
+    /// leaves a window where the run reads "stopped" while an agent writes.
+    async fn stop_team_run(
+        &self,
+        run_id: Option<String>,
+        device_id: Option<String>,
+        kind: TeamStopKind,
+    ) -> Result<TeamRunStatus, String> {
+        let (run_id, device_id) = self
+            .authorize_team_action(run_id.as_deref(), device_id)
+            .await?;
+        self.require_stoppable_team_run(&run_id).await?;
+
+        {
+            let mut relay = self.relay.write().await;
+            relay.update_team_run(&run_id, |run| run.request_pause(&device_id));
+            relay.notify();
+        }
+
+        if !self.drain_team_run(&run_id).await {
+            self.block_team_run(
+                &run_id,
+                "the task could not be stopped: at least one owned turn did not confirm stopping",
+            )
+            .await;
+            return Err(
+                "this task is blocked because an owned turn did not confirm stopping".to_string(),
+            );
+        }
+
+        self.settle_team_run(&run_id, kind.settled_status(), kind.reason())
+            .await;
+        self.team_run_snapshot(&run_id)
+            .await
+            .map(|run| run.status)
+            .ok_or_else(|| "there is no task with that id".to_string())
+    }
+
+    /// Recover a `Blocked` task by draining its owned turns again.
+    ///
+    /// Succeeds into `Paused`, not into a terminal state: a drained run is
+    /// quiescent with its worktree, branch and plan file intact, and
+    /// `next_team_action` is a pure function of that record. Throwing the run away
+    /// would discard finished sub-tasks over a stop that needed two attempts.
+    pub(crate) async fn resolve_blocked_team_run(
+        &self,
+        run_id: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<TeamRunStatus, String> {
+        let device_id = require_device_id(device_id)?;
+        let run_id = {
+            let mut relay = self.relay.write().await;
+            let run_id = relay.blocked_team_run_id(run_id.as_deref())?;
+            let cwd = relay
+                .team_run(&run_id)
+                .map(|run| run.cwd.clone())
+                .unwrap_or_default();
+            ensure_path_within_device_scope(
+                &cwd,
+                &relay.device_path_scope(&device_id),
+                &relay.allowed_roots,
+            )?;
+            // Blocked -> Resolving under the SAME write lock that resolved the id,
+            // or two recoveries can both pass the check and drain the same threads.
+            let mut began = false;
+            relay.update_team_run(&run_id, |run| began = run.begin_resolving_blocked());
+            if !began {
+                return Err("this task is no longer blocked".to_string());
+            }
+            relay.notify();
+            run_id
+        };
+        let mut guard = TeamRecoveryGuard {
+            app: self.clone(),
+            run_id: run_id.clone(),
+            disarmed: false,
+        };
+
+        if !self.drain_team_run(&run_id).await {
+            self.block_team_run(
+                &run_id,
+                "this task is still blocked: at least one owned turn did not confirm stopping",
+            )
+            .await;
+            guard.disarm();
+            return Err(
+                "this task is still blocked because an owned turn did not confirm stopping"
+                    .to_string(),
+            );
+        }
+
+        {
+            let mut relay = self.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.resolve_as_paused("recovered by stopping every owned turn");
+            });
+            relay.push_log(
+                "info",
+                format!("Task {run_id}: unblocked; owned turns are stopped and it can be resumed"),
+            );
+            relay.notify();
+        }
+        guard.disarm();
+        Ok(TeamRunStatus::Paused)
+    }
+
+    /// Resolve and authorize a whole-run action.
+    ///
+    /// Authorized by the run's WORKTREE path scope, the way `cancel_review`
+    /// authorizes a stop rather than by active-session control: a task you were
+    /// allowed to start you must be allowed to stop, and gating that on control
+    /// would strand a run whose starter is no longer the controlling device.
+    async fn authorize_team_action(
+        &self,
+        run_id: Option<&str>,
+        device_id: Option<String>,
+    ) -> Result<(String, String), String> {
+        let device_id = require_device_id(device_id)?;
+        let relay = self.relay.read().await;
+        let run_id = relay.active_team_run_id(run_id)?;
+        let cwd = relay
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .unwrap_or_default();
+        ensure_path_within_device_scope(
+            &cwd,
+            &relay.device_path_scope(&device_id),
+            &relay.allowed_roots,
+        )?;
+        Ok((run_id, device_id))
+    }
+
+    /// The statuses a stop may act on, with a reason for each refusal.
+    ///
+    /// `Blocked`/`Resolving` are refused rather than re-drained: they already have
+    /// a dedicated recovery, and a second drain racing the first is how one
+    /// recovery confirms quiescence the other just broke.
+    async fn require_stoppable_team_run(&self, run_id: &str) -> Result<TeamRunStatus, String> {
+        let status = self
+            .team_run_snapshot(run_id)
+            .await
+            .map(|run| run.status)
+            .ok_or_else(|| "there is no task with that id".to_string())?;
+        if status.is_terminal() {
+            return Err(format!("this task already finished as {}", status.as_str()));
+        }
+        if matches!(status, TeamRunStatus::Blocked | TeamRunStatus::Resolving) {
+            return Err("this task is blocked; resolve it first".to_string());
+        }
+        Ok(status)
+    }
+
+    /// Put a `Resolving` run back to `Blocked` after a recovery that never landed.
+    pub(super) async fn restore_resolving_team_run_as_blocked(&self, run_id: &str, error: &str) {
+        let mut relay = self.relay.write().await;
+        let mut restored = false;
+        relay.update_team_run(run_id, |run| {
+            restored = run.restore_resolving_as_blocked(error);
+        });
+        if restored {
+            relay.push_log("warn", format!("Task {run_id}: {error}"));
+            relay.notify();
+        }
+    }
+
     /// The driver loop.
     async fn run_team_job(&self, run_id: String) {
         let mut lifeguard = TeamRunLifeguard {
@@ -225,7 +513,8 @@ impl AppState {
         loop {
             // ---- THE boundary. The only place a pause can land. ----
             if let Some(settled) = self.team_boundary_check(&run_id).await {
-                self.settle_team_run(&run_id, settled).await;
+                self.settle_team_run(&run_id, settled, "paused at a step boundary")
+                    .await;
                 // Return normally so the lifeguard disarms: a settled pause is not
                 // a stranded run, and reconciling it would destroy the feature.
                 lifeguard.disarm();
@@ -268,10 +557,11 @@ impl AppState {
         if run.status.is_terminal() {
             return Some(run.status);
         }
-        if matches!(
-            run.status,
-            TeamRunStatus::Blocked | TeamRunStatus::Resolving
-        ) {
+        // A user action can settle the run underneath a live driver, so the driver
+        // re-reads its own right to continue here rather than only looking for the
+        // pause flag it knows about. Without this a force stop would settle
+        // `Paused` and then watch the driver walk straight into the next action.
+        if run.status.is_settled_without_driver() {
             return Some(run.status);
         }
         run.pause_requested.then_some(TeamRunStatus::Paused)
@@ -282,43 +572,62 @@ impl AppState {
         next_team_action(relay.team_run(run_id)?)
     }
 
-    async fn settle_team_run(&self, run_id: &str, status: TeamRunStatus) {
-        if status == TeamRunStatus::Paused {
-            // Never persist "paused" while a turn is still mutating the tree: that
-            // would be a lie the user acts on. A run that cannot prove quiescence
-            // is Blocked instead, which keeps its locks and asks for a decision.
-            let owned = self.team_owned_threads(run_id).await;
-            let mut working = Vec::new();
-            {
-                let relay = self.relay.read().await;
-                for id in &owned {
-                    if relay
-                        .runtime_for_thread(id)
-                        .is_some_and(|runtime| runtime.is_working())
-                    {
-                        working.push(id.clone());
-                    }
-                }
-            }
+    /// Write a settlement, refusing to persist one that is not true.
+    ///
+    /// `reason` is recorded only by the settlements that keep one (`Paused`,
+    /// `Cancelled`); the sticky and terminal statuses carry their own already.
+    async fn settle_team_run(&self, run_id: &str, status: TeamRunStatus, reason: &str) {
+        // Already there. The driver and a user action both reach this, and the
+        // loser must not re-run the quiescence check against a run it no longer
+        // drives — its own next turn would look like a reason to block.
+        if self.team_run_snapshot(run_id).await.map(|run| run.status) == Some(status) {
+            return;
+        }
+        // Both of these hand the workspace back — `Paused` to a later resume,
+        // `Cancelled` outright — so neither may be written while a turn is still
+        // mutating the tree. That would be a lie the user acts on. A run that
+        // cannot prove quiescence is Blocked instead, keeping its locks.
+        if matches!(status, TeamRunStatus::Paused | TeamRunStatus::Cancelled) {
+            let working = self.working_team_threads(run_id).await;
             if !working.is_empty() {
                 self.block_team_run(
                     run_id,
                     format!(
-                        "cannot pause: {} still has a turn in flight",
+                        "cannot settle this task as {}: {} still has a turn in flight",
+                        status.as_str(),
                         working.join(", ")
                     ),
                 )
                 .await;
                 return;
             }
-            let mut relay = self.relay.write().await;
-            relay.update_team_run(run_id, |run| {
-                run.settle_paused("paused at a step boundary");
-            });
-            relay.notify();
-            return;
         }
-        self.update_team_status(run_id, status).await;
+
+        let mut relay = self.relay.write().await;
+        relay.update_team_run(run_id, |run| match status {
+            TeamRunStatus::Paused => {
+                run.settle_paused(reason);
+            }
+            TeamRunStatus::Cancelled => {
+                run.cancel(reason);
+            }
+            other => run.set_status(other),
+        });
+        relay.notify();
+    }
+
+    /// Which of the run's own threads are observably mid-turn right now.
+    async fn working_team_threads(&self, run_id: &str) -> Vec<String> {
+        let owned = self.team_owned_threads(run_id).await;
+        let relay = self.relay.read().await;
+        owned
+            .into_iter()
+            .filter(|id| {
+                relay
+                    .runtime_for_thread(id)
+                    .is_some_and(|runtime| runtime.is_working())
+            })
+            .collect()
     }
 
     async fn update_team_status(&self, run_id: &str, status: TeamRunStatus) {
@@ -360,31 +669,7 @@ impl AppState {
             return;
         }
 
-        let mut drained = true;
-        for thread_id in self.team_owned_threads(run_id).await {
-            drained &= self.stop_and_drain(&thread_id).await;
-        }
-        // A turn caught mid-start is the dangerous case: the provider marks a
-        // thread working only AFTER `start_turn` returns, so a thread with no
-        // runtime at all may still be executing. "No runtime" therefore means
-        // UNKNOWN here, not idle — confirming it would release the locks while an
-        // agent keeps writing.
-        if let Some(in_flight) = self
-            .team_run_snapshot(run_id)
-            .await
-            .and_then(|run| run.in_flight_thread)
-        {
-            let observable = self
-                .relay
-                .read()
-                .await
-                .runtime_for_thread(&in_flight)
-                .is_some();
-            if !observable {
-                drained = false;
-            }
-        }
-        if !drained {
+        if !self.drain_team_run(run_id).await {
             self.block_team_run(
                 run_id,
                 "the task's driver ended unexpectedly and at least one owned turn did not confirm stopping",
@@ -407,6 +692,44 @@ impl AppState {
             );
             relay.notify();
         }
+    }
+
+    /// Stop every turn this run owns and confirm each one actually stopped.
+    ///
+    /// Returns whether ALL of them confirmed. A caller that gets `false` MUST
+    /// leave the run non-terminal: settling releases the run's locks, and a dev
+    /// turn still writing the worktree after that is unsupervised.
+    ///
+    /// Shared by the lifeguard and by both user stops on purpose — one contract,
+    /// so a stop the user asked for cannot be more optimistic than the one
+    /// cleanup performs.
+    async fn drain_team_run(&self, run_id: &str) -> bool {
+        let mut drained = true;
+        for thread_id in self.team_owned_threads(run_id).await {
+            drained &= self.stop_and_drain(&thread_id).await;
+        }
+        // A turn caught mid-start is the dangerous case: the provider marks a
+        // thread working only AFTER `start_turn` returns, so a thread with no
+        // runtime at all may still be executing. "No runtime" therefore means
+        // UNKNOWN here, not idle — confirming it would release the locks while an
+        // agent keeps writing. Read AFTER the drain, so a marker cleared by the
+        // stop we just landed is not counted against us.
+        if let Some(in_flight) = self
+            .team_run_snapshot(run_id)
+            .await
+            .and_then(|run| run.in_flight_thread)
+        {
+            let observable = self
+                .relay
+                .read()
+                .await
+                .runtime_for_thread(&in_flight)
+                .is_some();
+            if !observable {
+                drained = false;
+            }
+        }
+        drained
     }
 
     async fn team_owned_threads(&self, run_id: &str) -> Vec<String> {
