@@ -4674,6 +4674,12 @@ input:focus, textarea:focus, select:focus {
   margin-top: auto;
   padding-top: 12px;
   border-top: 1px solid var(--border-subtle);
+  /* Flex so `.sidebar-settings-button`'s `margin-left: auto` anchors the gear at
+     the far end. Local gets this from `.sidebar-host-status` on the same element;
+     remote has no host line to carry it, and the gear has to land in the same
+     place on both or the two footers read as different components. */
+  display: flex;
+  align-items: center;
 }
 
 /* Sidebar footer: relay host / online status line (replaces the theme picker,

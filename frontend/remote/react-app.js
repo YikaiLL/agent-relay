@@ -40,7 +40,6 @@ import {
   threadIsBusyForFork,
 } from "../shared/fork-fields.js";
 import { copyTextToClipboard } from "../shared/clipboard.js";
-import { ThemePickerRow } from "../shared/theme-picker.js";
 import { installThreadListWheelProxy } from "../shared/thread-list-scroll.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { createVerbCycler } from "../progress-verbs.js";
@@ -128,7 +127,7 @@ import {
   isReviewInProgressForThread,
   selectReviewLaunchModel,
 } from "../shared/review-state.js";
-import { BELL_SVG, SEARCH_SVG, X_SVG } from "../svg.js";
+import { BELL_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
 import { selectThreadState } from "../shared/thread-dot.js";
 import {
   composeListChrome,
@@ -217,7 +216,8 @@ import {
 import { normalizeProjectName, projectsMenuReady } from "../shared/project-menu.js";
 import { selectThreadSheet } from "../shared/thread-actions-model.js";
 import { runThreadSheetAction } from "./thread-sheet-action.js";
-import { ProviderStatusSection } from "./provider-status-section.js";
+import { ManagedDialog } from "../shared/managed-dialog.js";
+import { RemoteSettingsModal } from "./settings-modal.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
 import { renderLog } from "./session-surface.js";
 import { formatRelativeTime, formatTimestamp, shortId } from "./utils.js";
@@ -1708,6 +1708,13 @@ function RemoteApp() {
         onOpenPairing() {
           remoteUiStore.getState().setPairingModalOpen(true);
         },
+        onOpenSettings() {
+          // Closes the drawer first on phones: the modal renders over the shell,
+          // and leaving the nav open behind it means dismissing Settings drops
+          // you back onto a drawer you did not ask to reopen.
+          closeRemoteNavigation();
+          remoteUiStore.getState().setSettingsModalOpen(true);
+        },
         onRefreshRelayDirectory() {
           void handlers.onRefreshRelayDirectory();
         },
@@ -1941,6 +1948,13 @@ function RemoteApp() {
         remoteUiStore.getState().setPairingInputValue(value);
       },
     }),
+    h(RemoteSettingsModal, {
+      open: remoteUi.settingsModalOpen,
+      providerModel: buildProviderStatusModel(session),
+      onClose() {
+        remoteUiStore.getState().setSettingsModalOpen(false);
+      },
+    }),
     h(RemoteInfoModal, {
       open: remoteUi.remoteInfoModalOpen,
       onClose() {
@@ -1980,6 +1994,7 @@ function RemoteSidebar({
   hasUsableRelay,
   onOpenInfo,
   onOpenPairing,
+  onOpenSettings,
   onRefreshRelayDirectory,
   onRefreshThreads,
   remoteUiState,
@@ -2269,7 +2284,11 @@ function RemoteSidebar({
       },
       "New session"
     ),
-    h(ProviderStatusSection, { model: buildProviderStatusModel(session) }),
+    // The Providers health panel used to sit here, between the primary action and
+    // the relay list. It is now a Settings tab — the same place local files it.
+    // Provider is per-session and immutable once a session starts, so nothing on
+    // this panel is ever acted on from the sidebar; it was spending permanent
+    // column space to answer a question you ask about twice a week.
     h(
       "section",
       { className: "remote-access-shell remote-relay-shell" },
@@ -2396,10 +2415,29 @@ function RemoteSidebar({
         })
       )
     ),
+    // Footer, matching local's: what you are connected to on the left, the way
+    // into Settings on the right. The theme picker used to be the footer's only
+    // occupant — one preference, permanently on screen, with no home to belong
+    // to. It is now the Appearance tab.
     h(
       "div",
       { className: "sidebar-bottom-bar" },
-      h(ThemePickerRow)
+      h(
+        "button",
+        {
+          className: "sidebar-settings-button",
+          id: "remote-sidebar-settings",
+          onClick: onOpenSettings,
+          type: "button",
+          title: "Settings",
+          "aria-label": "Settings",
+        },
+        h("span", {
+          className: "inline-icon",
+          "aria-hidden": "true",
+          dangerouslySetInnerHTML: { __html: SETTINGS_SVG },
+        })
+      )
     ),
     h("div", {
       className: "sidebar-resize",
@@ -3285,74 +3323,6 @@ function ThreadActionsSheet({ onClose, onSelect, open, sections, threadTitle }) 
         )
       )
     )
-  );
-}
-
-function ManagedDialog({
-  children,
-  className,
-  id,
-  onRequestClose,
-  open,
-}) {
-  const dialogRef = useRef(null);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) {
-      return;
-    }
-
-    if (open) {
-      if (!dialog.open) {
-        if (typeof dialog.showModal === "function") {
-          dialog.showModal();
-        } else {
-          dialog.setAttribute("open", "");
-        }
-      }
-      return;
-    }
-
-    if (dialog.open) {
-      if (typeof dialog.close === "function") {
-        dialog.close();
-      } else {
-        dialog.removeAttribute("open");
-      }
-    }
-  }, [open]);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) {
-      return undefined;
-    }
-
-    const handleCancel = (event) => {
-      event.preventDefault();
-      onRequestClose?.();
-    };
-
-    dialog.addEventListener("cancel", handleCancel);
-    return () => {
-      dialog.removeEventListener("cancel", handleCancel);
-    };
-  }, [onRequestClose]);
-
-  return h(
-    "dialog",
-    {
-      className,
-      id,
-      onClick: (event) => {
-        if (event.target === event.currentTarget) {
-          onRequestClose?.();
-        }
-      },
-      ref: dialogRef,
-    },
-    children
   );
 }
 

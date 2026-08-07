@@ -39,6 +39,7 @@ export function createRemoteUiStore(initialState = {}) {
       error: "",
     },
     remoteInfoModalOpen: false,
+    settingsModalOpen: false,
     providerModels: {},
     // Per-provider catalog fetch status: "loading" | "ready" | "error".
     // Lets the new-session dialog show a truthful state instead of silently
@@ -135,6 +136,11 @@ export function createRemoteUiStore(initialState = {}) {
     setRemoteInfoModalOpen(open) {
       set({
         remoteInfoModalOpen: Boolean(open),
+      });
+    },
+    setSettingsModalOpen(open) {
+      set({
+        settingsModalOpen: Boolean(open),
       });
     },
     setProviderModels(provider, models) {

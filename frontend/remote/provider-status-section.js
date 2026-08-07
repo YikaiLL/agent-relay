@@ -13,14 +13,25 @@ import { providerMark } from "../shared/provider-mark.js";
 
 const h = React.createElement;
 
-export function ProviderStatusSection({ model }) {
+// `className` is a prop because this panel now has two homes with different
+// layout contracts: Settings passes `.provider-status-panel` (the wrapper local
+// uses), while the sidebar's `.remote-access-shell` carries padding that is only
+// neutralised while it is inside `.sidebar`.
+// `caption` is nullable because Settings puts this under a tab already labelled
+// "Providers" — repeating the word 40px below the thing that says it is noise.
+// In the sidebar there is no such label, so the caption is what names the list.
+export function ProviderStatusSection({
+  caption = "Providers",
+  className = "remote-access-shell provider-status-shell",
+  model,
+}) {
   if (!model || model.length === 0) {
     return null;
   }
   return h(
     "section",
-    { className: "remote-access-shell provider-status-shell" },
-    h("p", { className: "sidebar-caption" }, "Providers"),
+    { className },
+    caption ? h("p", { className: "sidebar-caption" }, caption) : null,
     h(
       "ul",
       { className: "provider-status-list", id: "remote-provider-status-list" },
