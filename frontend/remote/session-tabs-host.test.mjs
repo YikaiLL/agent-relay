@@ -1071,6 +1071,81 @@ test("a swept session cannot be re-opened by a later adoption", async () => {
   assert.deepEqual(tabThreadIds(host, { kind: "project", projectId: "P" }), []);
 });
 
+// The refusal above, at the only moment the sweep actually runs.
+//
+// Boot is when this fires, and at boot `hydrate()` deliberately routes NO thread — so a
+// sweep that reads the location without waiting for the restore samples `null` and
+// protects nothing. The restore is about to put a session on screen, and this would close
+// it out from under it. Same ordering `reconcileProjects` already had to learn.
+test("the session the boot restore is about to show is never swept", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  const probe = probeReturning([]);
+  // Both start in the same tick, exactly as the mount effects do.
+  await Promise.all([
+    second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} }),
+    second.sweepMissingThreads({ knownThreadIds: [], probeThreads: probe }),
+  ]);
+
+  assert.equal(
+    probe.asked.flat().includes("A"),
+    false,
+    "the restored session must not even be asked about"
+  );
+  assert.deepEqual(
+    tabThreadIds(second, { kind: "project", projectId: "P" }),
+    ["A"],
+    "and must certainly not be closed out from under the restore"
+  );
+  assert.equal(second.controller.getState().location.threadId, "A");
+});
+
+// The server caps one probe at 128 ids and drops the rest — and a dropped id is absent
+// from the answer, which is the same shape as "deleted". Unchunked, a user with more
+// stale tabs than the cap would lose every one past #128 at once, tombstoned. That is the
+// precise mistake this whole feature exists to avoid, reintroduced by a limit the client
+// cannot see.
+test("a probe larger than the server's cap is chunked, never truncated", async () => {
+  const host = hostWith();
+  const ids = Array.from({ length: 300 }, (_, index) => `T${index}`);
+  for (const id of ids) {
+    await host.openThread({ threadId: id, threadProjectId: {} });
+  }
+  // Park on the first one so it is exempt, leaving 299 candidates.
+  await host.openThread({ threadId: "T0", threadProjectId: {} });
+
+  const asked = [];
+  await host.sweepMissingThreads({
+    knownThreadIds: [],
+    probeThreads: async (batch) => {
+      asked.push([...batch]);
+      // Everything is alive; nothing may be swept.
+      return { threads: batch.map((id) => ({ id })), unavailableProviders: [] };
+    },
+  });
+
+  assert.ok(asked.length > 1, "a 299-id sweep must be split into batches");
+  for (const batch of asked) {
+    assert.ok(batch.length <= 128, `a batch of ${batch.length} exceeds the server cap`);
+  }
+  assert.deepEqual(
+    asked.flat().sort(),
+    ids.slice(1).sort(),
+    "every candidate must be asked about exactly once, across the batches"
+  );
+  assert.equal(
+    tabThreadIds(host, { kind: "sessions" }).length,
+    300,
+    "and nothing may be swept when every answer says alive"
+  );
+});
+
 // The user's own rule: whatever the relay says, do not close the tab they are looking at.
 test("the session on screen is never swept", async () => {
   const host = await surfaceWithTabs();

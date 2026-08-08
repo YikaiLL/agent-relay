@@ -59,11 +59,26 @@ fn normalize_thread_query(query: Option<&str>) -> Option<String> {
 /// `name` is already the user's rename when one exists: `apply_custom_thread_name`
 /// overlays it BEFORE this runs. That ordering is what makes a renamed session findable
 /// under its new title and not under the provider's old one.
+fn thread_display_title(thread: &ThreadSummaryView) -> &str {
+    match thread.name.as_deref() {
+        Some(name) if !name.is_empty() => name,
+        _ if !thread.preview.is_empty() => thread.preview.as_str(),
+        // The UI shows the first 8 characters; matching the whole id keeps those 8
+        // findable (they are a prefix) and also accepts a pasted full id.
+        _ => thread.id.as_str(),
+    }
+}
+
 /// How many ids one probe may ask about.
 ///
 /// A probe's caller is a client listing the sessions it still holds a reference to — open
 /// tabs — so the realistic count is single digits. The cap is a bound on what an untrusted
 /// client can make the relay do, not a product limit.
+///
+/// A caller must never let a probe EXCEED this, and the client chunks so that it cannot:
+/// over-cap ids are dropped, and a dropped id is absent from the answer, which is the same
+/// shape as "deleted". Silent truncation is the one behaviour this path must not have,
+/// because its whole purpose is to stop a client mistaking absence for deletion.
 const MAX_THREAD_ID_PROBE: usize = 128;
 
 /// Normalize a raw id list into a probe set, or `None` for "not a probe".
@@ -73,28 +88,24 @@ const MAX_THREAD_ID_PROBE: usize = 128;
 /// with nothing, and a caller that diffs its ids against an empty answer concludes every
 /// session it asked about is gone. Making the degenerate input mean "no probe" keeps a
 /// client bug from reading as mass deletion.
+///
+/// Deduplicated BEFORE the cap, so a caller that repeats an id does not spend its budget
+/// on the same question twice.
 fn normalize_thread_id_probe(ids: Option<&[String]>) -> Option<HashSet<String>> {
-    let wanted = ids?
+    let mut wanted = ids?
         .iter()
         .map(|id| id.trim())
         .filter(|id| !id.is_empty())
-        .take(MAX_THREAD_ID_PROBE)
         .map(|id| id.to_string())
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
+    wanted.sort();
+    wanted.dedup();
+    wanted.truncate(MAX_THREAD_ID_PROBE);
+    let wanted = wanted.into_iter().collect::<HashSet<_>>();
     if wanted.is_empty() {
         return None;
     }
     Some(wanted)
-}
-
-fn thread_display_title(thread: &ThreadSummaryView) -> &str {
-    match thread.name.as_deref() {
-        Some(name) if !name.is_empty() => name,
-        _ if !thread.preview.is_empty() => thread.preview.as_str(),
-        // The UI shows the first 8 characters; matching the whole id keeps those 8
-        // findable (they are a prefix) and also accepts a pasted full id.
-        _ => thread.id.as_str(),
-    }
 }
 
 impl AppState {
@@ -254,16 +265,24 @@ impl AppState {
         });
         let response_threads = threads.clone();
 
-        if query.is_some() {
+        if query.is_some() || wanted_ids.is_some() {
             // A search is a NARROWED VIEW, not a new authoritative list: assigning it to
             // the routing cache would stop every non-matching thread routing while the
             // sidebar kept rendering it. Hints go in their own map instead — see
             // `RelayState::search_routing_hints` for why appending here is not enough.
+            //
+            // An id probe is narrower still, and unlike a search it is issued
+            // automatically on every remote boot rather than by someone typing. Its worst
+            // case is also worse: when every probed session really is gone the answer is
+            // EMPTY, so the cache would be wiped to reviewer rows and nothing would be
+            // routable at all. The hints are what keep the probed threads — old ones, by
+            // construction — routable afterwards, which is exactly what they exist for.
             for thread in &response_threads {
                 relay.remember_search_routing_hint(thread);
             }
             // Deliberately no `notify()`. A search is one client narrowing its own view;
-            // waking every connected client per keystroke would be pure noise.
+            // waking every connected client per keystroke would be pure noise. A probe is
+            // the same claim: it tells the asker something, not the room.
         } else {
             // The routing cache (relay.threads) must retain reviewer-thread rows even
             // though they are filtered from the nav-visible response. `find_thread_provider`

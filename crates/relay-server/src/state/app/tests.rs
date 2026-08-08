@@ -8711,6 +8711,114 @@ got {}",
         );
     }
 
+    /// The same invariant, for the id probe — which is NARROWER than a search and now
+    /// fires automatically on every remote boot rather than on a keystroke.
+    ///
+    /// Writing a probe's answer into `relay.threads` would leave the routing cache holding
+    /// only the handful of ids one client happened to ask about. Everything else stops
+    /// being routable while every sidebar keeps rendering it: `find_thread_provider` loses
+    /// its cache hit, `thread_cwd` returns `None` (and its callers reject the request),
+    /// push labels lose their names, and `upsert_thread` stops restoring previews. Worst
+    /// case — every probed session really is gone — the answer is empty and the cache is
+    /// wiped to reviewer rows.
+    #[tokio::test]
+    async fn thread_id_probe_does_not_evict_the_routing_cache() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+        let listed = app.list_threads(20, None).await.expect("list");
+        assert_eq!(
+            app.relay.read().await.threads.len(),
+            3,
+            "precondition: the unfiltered list must populate the routing cache"
+        );
+        let probed_id = listed.threads[0].id.clone();
+
+        let found = app
+            .list_threads_matching(20, None, None, Some(&[probed_id]))
+            .await
+            .expect("probe");
+        assert_eq!(found.threads.len(), 1, "the response must be narrowed");
+
+        assert_eq!(
+            app.relay.read().await.threads.len(),
+            3,
+            "a probe must not strip the threads it did not ask about out of the routing cache"
+        );
+    }
+
+    /// ...and a probe that resolves NOTHING is the same claim, at its most destructive.
+    #[tokio::test]
+    async fn thread_id_probe_that_resolves_nothing_leaves_the_routing_cache_alone() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+        app.list_threads(20, None).await.expect("list");
+
+        let found = app
+            .list_threads_matching(20, None, None, Some(&["not-a-thread".to_string()]))
+            .await
+            .expect("probe");
+        assert!(found.threads.is_empty(), "nothing resolves");
+
+        assert_eq!(
+            app.relay.read().await.threads.len(),
+            3,
+            "an empty answer must not be mistaken for an authoritative empty list"
+        );
+    }
+
+    /// The probe cap is a DoS bound, and it TRUNCATES — so a caller that exceeds it gets
+    /// silence for the overflow, which is the same shape as "deleted". The client chunks
+    /// so it never happens; this pins the server side of that contract so the number
+    /// cannot drift away from the client's copy unnoticed.
+    ///
+    /// Also pins that duplicates are collapsed BEFORE the cap, or a caller repeating one
+    /// id would spend its budget asking the same question twice.
+    #[tokio::test]
+    async fn thread_id_probe_is_capped_and_deduplicated_before_the_cap() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+        let listed = app.list_threads(20, None).await.expect("list");
+        let real = listed.threads[0].id.clone();
+
+        // 200 distinct junk ids, then the real one LAST. Without the cap it resolves;
+        // with the cap it is dropped along with everything past #128.
+        let mut ids = (0..200).map(|n| format!("junk-{n}")).collect::<Vec<_>>();
+        ids.push(real.clone());
+        let capped = app
+            .list_threads_matching(20, None, None, Some(&ids))
+            .await
+            .expect("probe");
+        assert!(
+            capped.threads.is_empty(),
+            "an over-cap probe silently drops the overflow — which is exactly why the client chunks"
+        );
+
+        // Same real id, repeated far past the cap: dedup happens first, so it survives.
+        let repeated = vec![real.clone(); 200];
+        let deduped = app
+            .list_threads_matching(20, None, None, Some(&repeated))
+            .await
+            .expect("probe");
+        assert_eq!(
+            deduped
+                .threads
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec![real],
+            "duplicates must collapse before the cap is applied"
+        );
+    }
+
     /// "No results" is a positive claim that nothing matches. A provider that failed to
     /// list is dropped from the merge and the request still succeeds — so without naming
     /// it, an unreachable Codex/Claude is indistinguishable from an empty search, and the

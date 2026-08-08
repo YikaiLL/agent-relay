@@ -56,6 +56,13 @@ export const UNPAIRED_RELAY_SCOPE = "unpaired";
 // silently disabling the repair.
 export const BOOT_RESTORE_REASON = "boot-restore";
 
+// Mirrors `MAX_THREAD_ID_PROBE` in crates/relay-server/src/state/app/threads.rs. The relay
+// DROPS ids past its cap, and a dropped id is absent from the answer — indistinguishable
+// from "deleted" — so the client must never send more than one probe's worth at a time.
+// Duplicated rather than negotiated because it is a bound on one request, and a client
+// that guessed too high would mass-close live tabs rather than fail.
+export const MAX_THREAD_ID_PROBE = 128;
+
 export function sessionViewDbNameForRelay(relayId) {
   const scope = typeof relayId === "string" && relayId ? relayId : UNPAIRED_RELAY_SCOPE;
   return `sealwire-session-view-remote-${scope}`;
@@ -547,6 +554,15 @@ export function createRemoteSessionTabsHost({
         return null;
       }
       try {
+        // The boot restore FIRST, and this is the only moment it matters: the sweep runs
+        // once, at boot, and until the restore commits `hydrate` has deliberately routed
+        // no thread. Reading the location before then samples `null`, so "never sweep the
+        // session on screen" would protect nothing and this would close the very session
+        // the restore is about to show. Same ordering `reconcileProjects` already honours,
+        // and for the same reason.
+        if (bootRestore) {
+          await bootRestore;
+        }
         await controller.whenIdle();
         const state = controller.getState();
         const visibleThreadId = state.location.threadId;
@@ -562,14 +578,28 @@ export function createRemoteSessionTabsHost({
           return null;
         }
 
-        const answer = await probeThreads(candidates);
-        if (!answer || (answer.unavailableProviders || []).length) {
-          return null;
+        // Chunked to the relay's cap, because over-cap ids are DROPPED there and a
+        // dropped id is absent from the answer — the same shape as "deleted". The
+        // candidate set is by construction the one that grows without bound (old tabs
+        // across every project workspace, none of them recent enough to be on a page), so
+        // this is the population most likely to cross it, on exactly the surface this
+        // feature was written for. Silent truncation here would mass-close live tabs and
+        // tombstone them, which is the mistake the whole design exists to prevent.
+        const missing = [];
+        for (let start = 0; start < candidates.length; start += MAX_THREAD_ID_PROBE) {
+          const batch = candidates.slice(start, start + MAX_THREAD_ID_PROBE);
+          const answer = await probeThreads(batch);
+          // One unusable answer discards the WHOLE sweep, not just its batch: a partial
+          // conclusion is still a conclusion, and the batches that did answer have no
+          // more claim to be acted on than the one that could not.
+          if (!answer || (answer.unavailableProviders || []).length) {
+            return null;
+          }
+          const resolved = new Set(
+            (answer.threads || []).map((thread) => thread?.id).filter(Boolean)
+          );
+          missing.push(...batch.filter((id) => !resolved.has(id)));
         }
-        const resolved = new Set(
-          (answer.threads || []).map((thread) => thread?.id).filter(Boolean)
-        );
-        const missing = candidates.filter((id) => !resolved.has(id));
         if (!missing.length) {
           return null;
         }
