@@ -20,9 +20,18 @@ export function ensureRemoteRuntimeConfigured() {
   }
 
   configureBrokerClient({
-    onBrokerReady(frame, reason) {
-      if (state.pairingTicket) {
-        void sendPairingRequest();
+    onBrokerReady(frame, reason, connection) {
+      // Decided by what THIS socket was opened for, not by a global predicate. A
+      // retired/expired ticket stays in state for its error card, and when a device
+      // profile also exists a clock-dependent check would flip mid-connection and
+      // recover the old session over the PAIRING room (or send a dead pairing request
+      // into the device's room). `connection.kind` cannot drift.
+      if (connection?.kind === "pairing") {
+        // Catch rather than `void`: the request re-validates its attempt before
+        // publishing, but a socket torn down underneath it still rejects.
+        void sendPairingRequest().catch((error) => {
+          renderLog(`Pairing request could not be sent: ${error.message}`);
+        });
         return;
       }
 
@@ -87,6 +96,19 @@ export async function bootRemoteRuntime() {
   // iOS Safari shows no automatic install prompt, so nudge the user toward
   // Share → Add to Home Screen (no-op on every other platform / when installed).
   mountIosInstallHint();
+
+  // The pairing payload arrives in the URL fragment (it holds the pairing_secret,
+  // which must never reach the broker that serves this page). A fragment-only
+  // navigation is a SAME-document navigation, so re-opening the same pairing link
+  // in an already-loaded tab — re-scanning the QR, or following the link twice —
+  // fires `hashchange` and never re-runs this boot. Watch for it explicitly, or a
+  // second scan silently does nothing.
+  window.addEventListener("hashchange", () => {
+    const rescanned = applyPairingQuery();
+    if (rescanned) {
+      void beginPairing(rescanned, { auto: true });
+    }
+  });
 
   const pairingQuery = applyPairingQuery();
 

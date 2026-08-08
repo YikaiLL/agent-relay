@@ -117,14 +117,22 @@ function deriveAgentWorkingIndicator(currentState, session, approval) {
 }
 
 export function selectDeviceChromeRenderModel(currentState) {
-  const emptyMessage = !currentState.remoteAuth && !currentState.pairingTicket
+  // A pairing failure has to be shown even when there is no ticket to hang it on. The
+  // link that gets rejected hardest is a legacy `?pairing=` one — rejected precisely
+  // BECAUSE its secret already reached the broker — and parsing is what failed there, so
+  // no ticket was ever built. Gating this card on `pairingTicket` hid the only actionable
+  // instruction ("generate a fresh QR") behind the generic unpaired screen.
+  const showPairingCard = Boolean(currentState.pairingTicket)
+    || currentState.pairingPhase === "error";
+  const emptyMessage = !currentState.remoteAuth && !showPairingCard
     ? currentState.relayDirectory?.length
       ? "Open one of your relays from home or the sidebar to enter its remote surface."
       : "No paired remote device is stored in this browser yet."
     : null;
 
   const cards = [];
-  if (currentState.pairingTicket) {
+  if (showPairingCard) {
+    const ticket = currentState.pairingTicket;
     cards.push({
       badges: [
         {
@@ -133,7 +141,9 @@ export function selectDeviceChromeRenderModel(currentState) {
         },
       ],
       metaLines: [
-        `${shortId(currentState.pairingTicket.pairing_id)} · expires ${formatTimestamp(currentState.pairingTicket.expires_at)}`,
+        ...(ticket
+          ? [`${shortId(ticket.pairing_id)} · expires ${formatTimestamp(ticket.expires_at)}`]
+          : []),
         pairingCopy(currentState),
       ],
       title: pairingHeading(currentState),

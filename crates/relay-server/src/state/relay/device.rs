@@ -390,6 +390,20 @@ impl RelayState {
             .map(|pairing| (pairing.expires_at, pairing.path_scope.clone()))
             .ok_or_else(|| "pairing request is missing or expired".to_string())?;
         if let Some(existing) = self.pending_pairing_requests.get_mut(pairing_id) {
+            // Rebinding exists so ONE device can retry over a fresh broker peer (a
+            // network blip mid-approval). It must stay keyed to that device: the
+            // Ed25519 verify key is the only stable identity here, since device_id
+            // and label are both attacker-chosen. Without this check anyone else
+            // holding the QR could register last and silently inherit the approval
+            // the operator is about to grant — along with the payload_secret and
+            // refresh tokens that ride the pairing result.
+            if existing.device_verify_key != device_verify_key {
+                return Err(
+                    "another device is already waiting for approval on this pairing ticket; \
+                     generate a fresh pairing ticket for this device"
+                        .to_string(),
+                );
+            }
             let label_fallback = requested_device_id
                 .as_deref()
                 .or(Some(peer_id))
@@ -401,7 +415,6 @@ impl RelayState {
             }
             existing.label = normalize_device_label(device_label, label_fallback);
             existing.broker_peer_id = peer_id.to_string();
-            existing.device_verify_key = device_verify_key;
             existing.path_scope = ticket_path_scope;
             return Ok(existing.to_view());
         }
@@ -1030,11 +1043,19 @@ fn pairing_payload(
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("pairing payload should serialize"))
 }
 
+/// The scannable pairing link.
+///
+/// The payload rides in the URL **fragment**, never the query string. It contains
+/// the `pairing_secret`, which is the only key sealing the pairing handshake — the
+/// envelope carrying the device's `payload_secret` and refresh tokens. The broker
+/// itself serves this page, so a query string would put that secret in the
+/// broker's request line and in every proxy/CDN access log in front of it, letting
+/// the broker decrypt a handshake `private` mode promises it cannot read.
+/// Fragments are never transmitted to the server.
 fn pairing_url(broker_url: &str, pairing_payload: &str) -> String {
     let mut url = browser_url(broker_url);
-    url.query_pairs_mut()
-        .clear()
-        .append_pair("pairing", pairing_payload);
+    url.set_query(None);
+    url.set_fragment(Some(&format!("pairing={pairing_payload}")));
     url.to_string()
 }
 

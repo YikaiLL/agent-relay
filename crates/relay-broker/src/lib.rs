@@ -406,6 +406,7 @@ enum BrokerJoinVerifier {
 struct VerifiedBrokerJoin {
     peer_id: Option<String>,
     device_id: Option<String>,
+    pairing_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -703,6 +704,7 @@ impl BrokerJoinVerifier {
             .map(|claims| VerifiedBrokerJoin {
                 peer_id: claims.peer_id,
                 device_id: claims.device_id,
+                pairing_id: claims.pairing_id,
             }),
             Self::PublicControlPlane(control_plane) => verify_join_ticket_for_connection(
                 control_plane.issuer_key(),
@@ -713,6 +715,7 @@ impl BrokerJoinVerifier {
             .map(|claims| VerifiedBrokerJoin {
                 peer_id: claims.peer_id,
                 device_id: claims.device_id,
+                pairing_id: claims.pairing_id,
             }),
             Self::Misconfigured(error) => Err(error.clone()),
         }
@@ -1948,8 +1951,19 @@ async fn handle_socket(
         }
     };
 
-    let mut peer_id =
-        trimmed_option_string(query.peer_id).or_else(|| verified_join.peer_id.clone());
+    // Only a ticket that PINS a peer_id (a relay join) may have it echoed back in
+    // the query — the equality check below then validates the match. A surface
+    // ticket pins nothing, so honoring the query parameter let a surface name
+    // itself after the relay and take that slot; and because the relay's own
+    // ticket pins its id, the regenerate-on-collision retry below never fires for
+    // it, so the relay was locked out of its own room until the squatter dropped
+    // the socket. Surfaces get a broker-assigned id instead, which is what the
+    // remote client already reads back out of `Welcome`.
+    let mut peer_id = if verified_join.peer_id.is_some() {
+        trimmed_option_string(query.peer_id).or_else(|| verified_join.peer_id.clone())
+    } else {
+        None
+    };
     let join = loop {
         let candidate = peer_id
             .clone()
@@ -1978,6 +1992,7 @@ async fn handle_socket(
                 &candidate,
                 query.role,
                 verified_join.device_id.clone(),
+                verified_join.pairing_id.clone(),
             )
             .await
         {

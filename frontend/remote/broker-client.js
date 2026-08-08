@@ -1,12 +1,15 @@
 import { renderLog } from "./session-surface.js";
-import { isExpiredPairingError, normalizePairingError } from "./pairing-errors.js";
+import { classifyBrokerPairingError, expiredPairingMessage } from "./pairing-errors.js";
+import { clearPairingQueryFromUrl } from "./crypto.js";
 import {
   brokerControlUrl,
   canRefreshDeviceJoinTicket,
   clearSocketPeerId,
   connectionTarget,
   currentClientControlUrl,
+  hasActivePairing,
   hasExpiredDeviceJoinTicket,
+  pairingTicketIsLive,
   saveClientAuth,
   setSocketPeerId,
   setRelayDirectory,
@@ -31,6 +34,11 @@ let onBrokerPayload = async () => {};
 let onBrokerDisconnect = () => {};
 let onRelayPresence = () => {};
 const inFlightDeviceRefreshes = new Map();
+// What the CURRENT socket was opened for (`connectionTarget()`'s descriptor). A frame
+// must be judged against the attempt its own socket belongs to: the broker validates
+// expiry only at join, so a ticket can lapse while its socket is already established,
+// and a clock-dependent global predicate then mislabels that socket.
+let currentConnection = null;
 let socketReconnectFailures = 0;
 let socketReconnectSelectionKey = null;
 let socketReconnectWindow = null;
@@ -43,7 +51,7 @@ export function configureBrokerClient(handlers) {
 }
 
 function currentConnectionSelectionKey() {
-  if (state.pairingTicket?.pairing_id) {
+  if (hasActivePairing()) {
     return `pairing:${state.pairingTicket.pairing_id}`;
   }
   if (state.remoteAuth?.relayId) {
@@ -143,13 +151,84 @@ async function ensureDeviceRefreshStillOwnsProfile(relayId, expectedSignature, b
   throw new StaleDeviceRefreshError();
 }
 
+/// End the current pairing attempt for good.
+///
+/// A dead pairing ticket owes three things, and every one of them has been the
+/// source of a bug when handled separately, so they live together here:
+///
+///  1. retire it — `connectionTarget`/`hasActivePairing` then stop offering it, which
+///     is what actually breaks the automatic-reconnect loop. Two clients sharing one
+///     QR otherwise evict each other on every retry until the ticket expires.
+///  2. scrub the URL — the payload rides in the fragment, so a reload would rehydrate
+///     the dead ticket and let a superseded client evict its successor all over again.
+///  3. close the socket — a client whose pairing is over must not keep holding a seat
+///     in the room.
+///
+/// The ticket itself is deliberately KEPT in state: its error card is the only place
+/// the user learns why pairing failed (see `selectDeviceChromeRenderModel`).
+export function retirePairing(message, { attemptId = state.pairingAttemptId } = {}) {
+  if (attemptId !== state.pairingAttemptId) {
+    // A later attempt already replaced this one; retiring now would clobber its state.
+    return;
+  }
+  applyRemoteSurfacePatch(createPairingStatePatch({
+    pairingPhase: "error",
+    pairingError: message,
+    pairingRetired: true,
+  }));
+  clearPairingQueryFromUrl();
+  renderLog(`Pairing failed: ${message}`);
+  // ONLY this attempt's own socket. Scanning an invalid QR in a tab that already holds
+  // a working device connection must not drop that session — and it would not come back
+  // on its own, because `closeBrokerSocket` clears `state.socket` first and the close
+  // handler's replacement guard then suppresses the reconnect.
+  if (
+    currentConnection?.kind === "pairing"
+    && currentConnection.pairingAttemptId === attemptId
+  ) {
+    closeBrokerSocket();
+  }
+}
+
+/// Promote the live connection from a pairing handshake to an ordinary device session.
+///
+/// The success path deliberately reuses the pairing socket for the post-pairing claim and
+/// clears `pairingTicket` first, so without this the socket still carries a `pairing`
+/// descriptor and the very next frame is judged against a ticket that no longer exists —
+/// reported as expired, and the socket closed under a device that just paired fine.
+///
+/// Mutates the descriptor in place ON PURPOSE: every open handler captured this exact
+/// object, so mutating it is what lets already-registered listeners see the promotion.
+export function promoteConnectionToDevice(relayId) {
+  if (currentConnection?.kind !== "pairing") {
+    return;
+  }
+  currentConnection.kind = "device";
+  currentConnection.relayId = relayId || null;
+  delete currentConnection.pairingAttemptId;
+}
+
+/// Let go of a socket belonging to a pairing attempt that has been abandoned.
+///
+/// Starting a new attempt bumps the attempt id, which makes every frame on the old
+/// socket get dropped for mismatch — so if nothing closes it, it keeps a seat in the
+/// broker room, unattended, until the server's idle timeout.
+export function releaseSupersededPairingSocket() {
+  if (
+    currentConnection?.kind === "pairing"
+    && currentConnection.pairingAttemptId !== state.pairingAttemptId
+  ) {
+    closeBrokerSocket();
+  }
+}
+
 export async function connectBroker(reason) {
   const selectionKey = currentConnectionSelectionKey();
   syncSocketReconnectBackoff(selectionKey);
   if (reason !== "reconnect") {
     resetSocketReconnectBackoff(selectionKey);
   }
-  if (!state.pairingTicket && state.remoteAuth && !connectionTarget() && canRefreshDeviceJoinTicket()) {
+  if (!hasActivePairing() && state.remoteAuth && !connectionTarget() && canRefreshDeviceJoinTicket()) {
     try {
       await refreshDeviceJoinTicket(reason);
     } catch (error) {
@@ -163,6 +242,15 @@ export async function connectBroker(reason) {
       renderLog("Broker connect skipped because the relay selection changed during refresh.");
       return;
     }
+  }
+
+  // Retire before choosing a target, not after: when a device profile exists the
+  // target falls back to it, so an expired pairing would otherwise never be retired
+  // and its renewal message never shown. Checked here rather than only on an error
+  // frame because the broker answers failed joins with a generic "broker join
+  // rejected" and a plain close carries no message at all.
+  if (state.pairingTicket && !state.pairingRetired && !pairingTicketIsLive(state.pairingTicket)) {
+    retirePairing(expiredPairingMessage());
   }
 
   const target = connectionTarget();
@@ -203,6 +291,8 @@ export async function connectBroker(reason) {
 
   renderLog(`Connecting to broker (${reason}) via ${url.host}.`);
   const socket = new WebSocket(url.toString());
+  const connection = target;
+  currentConnection = connection;
   let socketOpenedAtMs = null;
   applyRemoteSurfacePatch(createBrokerConnectionPatch({
     relayConnected: false,
@@ -233,7 +323,7 @@ export async function connectBroker(reason) {
       return;
     }
 
-    void handleSocketMessage(event.data, reason);
+    void handleSocketMessage(event.data, reason, connection);
   });
 
   socket.addEventListener("close", (event) => {
@@ -291,6 +381,7 @@ export function closeBrokerSocket(resetConnectionState = true) {
   }
 
   const socket = state.socket;
+  currentConnection = null;
   if (resetConnectionState) {
     cancelSocketReconnect();
     resetSocketReconnectBackoff();
@@ -489,13 +580,34 @@ export async function refreshRelayDirectory(reason, { silent = false } = {}) {
   return payload?.relays || [];
 }
 
-async function handleSocketMessage(rawData, connectReason) {
+async function handleSocketMessage(rawData, connectReason, connection = currentConnection) {
   let frame;
   try {
     frame = JSON.parse(rawData);
   } catch (error) {
     renderLog(`Broker frame parse failed: ${error.message}`);
     return;
+  }
+
+  // Judge the frame against the attempt ITS OWN socket was opened for, before any
+  // dispatch. The broker validates a join ticket only at join time, so a pairing ticket
+  // can lapse while its socket is already established; deciding from a clock-dependent
+  // global predicate then treats this pairing socket as a device connection — recovering
+  // the old profile over the pairing room, or dropping a `pairing_ticket_superseded`.
+  if (connection?.kind === "pairing") {
+    if (connection.pairingAttemptId !== state.pairingAttemptId) {
+      return;
+    }
+    // An expired or retired attempt drops the frame, whatever it is. A bundle whose
+    // delivery crosses the deadline is discarded with it: the relay may have minted
+    // credentials we never adopt, which costs a re-pair but cannot admit anything unsafe.
+    if (!state.pairingRetired && !pairingTicketIsLive(state.pairingTicket)) {
+      retirePairing(expiredPairingMessage(), { attemptId: connection.pairingAttemptId });
+      return;
+    }
+    if (state.pairingRetired) {
+      return;
+    }
   }
 
   if (frame.type === "welcome") {
@@ -518,7 +630,7 @@ async function handleSocketMessage(rawData, connectReason) {
         ? null
         : "Relay server disconnected. Waiting for it to reconnect.",
     }));
-    void onBrokerReady(frame, connectReason);
+    void onBrokerReady(frame, connectReason, connection);
     return;
   }
 
@@ -537,12 +649,11 @@ async function handleSocketMessage(rawData, connectReason) {
   }
 
   if (frame.type === "error") {
-    if (state.pairingTicket && isExpiredPairingError(frame.message)) {
-      applyRemoteSurfacePatch(createPairingStatePatch({
-        pairingPhase: "error",
-        pairingError: normalizePairingError(frame.message),
-      }));
-      renderLog(`Pairing failed: ${state.pairingError}`);
+    const pairingOutcome = classifyBrokerPairingError(frame, {
+      hasPairingTicket: connection?.kind === "pairing",
+    });
+    if (pairingOutcome.terminal) {
+      retirePairing(pairingOutcome.message, { attemptId: connection?.pairingAttemptId });
       return;
     }
     renderLog(`Broker error: ${frame.message}`);

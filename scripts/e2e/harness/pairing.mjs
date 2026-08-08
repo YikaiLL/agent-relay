@@ -87,9 +87,12 @@ export async function startPairingFromLocalPage(
     { timeout: timeoutMs }
   );
   const pairingUrl = await localPage.inputValue("#pairing-link-input");
+  // The payload rides in the FRAGMENT, never the query: the broker serves this
+  // page, so a query string would put the pairing_secret in its request line and
+  // access logs. See `pairing_url` in relay-server's state/relay/device.rs.
   assert.ok(
-    pairingUrl.startsWith(`http://${lanIp}:${brokerPort}/?pairing=`),
-    `pairing url should use broker public url, got: ${pairingUrl}`
+    pairingUrl.startsWith(`http://${lanIp}:${brokerPort}/#pairing=`),
+    `pairing url should use broker public url with a fragment payload, got: ${pairingUrl}`
   );
   return pairingUrl;
 }

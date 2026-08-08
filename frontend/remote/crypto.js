@@ -11,14 +11,33 @@ const REMOTE_DEVICE_KEY_KIND_SOFTWARE = "software";
 
 let deviceKeypairPromise = null;
 
+// SECURITY: the payload carries the pairing_secret, the only key sealing the
+// pairing handshake (whose envelope ships this device's payload_secret and refresh
+// tokens). The broker serves the page this link points at, so a payload in the
+// QUERY string lands in the broker's request line — and in any proxy/CDN access
+// log in front of it — letting the broker decrypt a handshake that `private` mode
+// promises it cannot read. Fragments are never transmitted to the server, so the
+// payload is read from there only. A link that still uses the query is refused
+// rather than honored: by the time we see it the secret has already gone over the
+// wire, so the operator needs a fresh ticket, not a working one.
 export function parsePairingPayload(rawInput) {
   let raw = rawInput.trim();
 
   try {
     const url = new URL(raw);
-    raw = url.searchParams.get("pairing") || raw;
-  } catch {
-    if (raw.startsWith("pairing=")) {
+    if (url.searchParams.has("pairing")) {
+      throw new Error(
+        "this pairing link carries its secret in the query string, which exposes it to the broker; generate a fresh QR or pairing link from the local relay (the payload belongs in the URL fragment)"
+      );
+    }
+    raw = pairingFromFragment(url.hash) || raw;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("fragment")) {
+      throw error;
+    }
+    if (raw.startsWith("#")) {
+      raw = pairingFromFragment(raw) || raw;
+    } else if (raw.startsWith("pairing=")) {
       raw = raw.slice("pairing=".length);
     }
   }
@@ -51,12 +70,27 @@ export function parsePairingPayload(rawInput) {
   return payload;
 }
 
+function pairingFromFragment(hash) {
+  if (!hash) {
+    return null;
+  }
+  const params = new URLSearchParams(hash.startsWith("#") ? hash.slice(1) : hash);
+  return params.get("pairing");
+}
+
 export function clearPairingQueryFromUrl() {
   const url = new URL(window.location.href);
-  if (!url.searchParams.has("pairing")) {
+  const hadFragment = Boolean(pairingFromFragment(url.hash));
+  // A legacy link may still put it in the query. Scrub both so the secret does not
+  // linger in the address bar or in history.
+  const hadQuery = url.searchParams.has("pairing");
+  if (!hadFragment && !hadQuery) {
     return;
   }
   url.searchParams.delete("pairing");
+  if (hadFragment) {
+    url.hash = "";
+  }
   window.history.replaceState({}, "", url);
 }
 

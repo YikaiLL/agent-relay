@@ -549,11 +549,13 @@ async fn websocket_relays_messages_between_peers() {
         Some("relay-1"),
         JoinTicketClaims::relay_join("room-a", "relay-1"),
     );
+    // Surfaces do not name themselves — the broker assigns the id (see
+    // `a_surface_cannot_squat_the_relays_peer_id`), so read it back out of Welcome.
     let surface_url = websocket_url(
         address,
         "room-a",
         protocol::PeerRole::Surface,
-        Some("phone-1"),
+        None,
         JoinTicketClaims::pairing_surface_join("room-a", "pair-1", u64::MAX),
     );
 
@@ -570,20 +572,25 @@ async fn websocket_relays_messages_between_peers() {
         .await
         .expect("surface should connect");
     let welcome = next_server_message(&mut surface).await;
-    match welcome {
-        ServerMessage::Welcome { peers, .. } => {
+    let surface_peer_id = match welcome {
+        ServerMessage::Welcome {
+            peers,
+            peer_id: assigned_peer_id,
+            ..
+        } => {
             assert_eq!(peers.len(), 1);
             assert_eq!(peers[0].peer_id, "relay-1");
             assert_eq!(peers[0].device_id, None);
+            assigned_peer_id
         }
         other => panic!("unexpected welcome frame: {other:?}"),
-    }
+    };
 
     let presence = next_server_message(&mut relay).await;
     match presence {
         ServerMessage::Presence { kind, peer, .. } => {
             assert_eq!(kind, protocol::PresenceKind::Joined);
-            assert_eq!(peer.peer_id, "phone-1");
+            assert_eq!(peer.peer_id, surface_peer_id);
             assert_eq!(peer.device_id, None);
         }
         other => panic!("unexpected presence frame: {other:?}"),
@@ -613,6 +620,227 @@ async fn websocket_relays_messages_between_peers() {
             assert_eq!(payload, json!({"ciphertext":"abc"}));
         }
         other => panic!("unexpected relayed frame: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_surface_cannot_squat_the_relays_peer_id() {
+    // SECURITY: surface tickets carry no peer_id, so `lib.rs` falls back to the
+    // client-supplied query parameter unchecked. A surface can therefore claim the
+    // relay's own peer_id, and because a relay's ticket PINS its peer_id the
+    // no-peer_id retry loop never fires for it — the relay is locked out of its own
+    // room until the squatter drops the socket.
+    let address = spawn_app().await;
+    let squatter_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("relay-1"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-squat", u64::MAX),
+    );
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let squatter = connect_async(&squatter_url).await;
+    let Ok((mut squatter, _)) = squatter else {
+        // Already hardened: a surface may not name itself after a relay.
+        return;
+    };
+    let seated = next_server_message(&mut squatter).await;
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("the real relay should still be able to connect");
+    let relay_welcome = next_server_message(&mut relay).await;
+
+    assert!(
+        matches!(relay_welcome, ServerMessage::Welcome { .. }),
+        "a surface holding a pairing ticket must not be able to lock the relay out \
+         of its own room; squatter got {seated:?}, relay got {relay_welcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bare_pairing_result_is_refused_while_other_directed_payloads_still_flow() {
+    // SECURITY: `encrypted_pairing_result` carries the new device's payload_secret
+    // and refresh tokens, sealed with the pairing_secret from the QR. It shipped
+    // for a while with a `target_peer_id` field but WITHOUT the
+    // `targeted_messages` wrapper, and the broker's fanout routes on the wrapper
+    // alone — so it went to the whole room, handing the sealed credentials to any
+    // bystander replaying the same QR join ticket. The wrapper must be the only
+    // way to address one peer: a bare payload that names a recipient is refused
+    // outright, so the next one that forgets it fails loudly instead of leaking.
+    let address = spawn_app().await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let intended_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("phone-intended"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-target", u64::MAX),
+    );
+    // A distinct pairing id, so the two surfaces stay seated together — one ticket
+    // holds only one seat (see `a_second_join_on_one_pairing_ticket_supersedes_the_first`),
+    // and this test is about the fanout, not the seat.
+    let bystander_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("phone-bystander"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-bystander", u64::MAX),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay should connect");
+    let _ = next_server_message(&mut relay).await;
+    let (mut intended, _) = connect_async(&intended_url)
+        .await
+        .expect("intended surface should connect");
+    let _ = next_server_message(&mut intended).await;
+    let (mut bystander, _) = connect_async(&bystander_url)
+        .await
+        .expect("bystander surface should connect");
+    let _ = next_server_message(&mut bystander).await;
+    // The bystander's arrival notifies everyone already seated; drain it so the
+    // only frame that could still show up is the publish under test.
+    let _ = next_server_message(&mut intended).await;
+
+    relay
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage::Publish {
+                protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+                payload: json!({
+                    "kind": "encrypted_pairing_result",
+                    "pairing_id": "pair-target",
+                    "target_peer_id": "phone-intended",
+                    "envelope": {"nonce": "n", "ciphertext": "c"},
+                }),
+            })
+            .expect("client frame should serialize"),
+        ))
+        .await
+        .expect("publish should send");
+
+    // Every OTHER directed payload keeps its existing broadcast + client-side
+    // filter behaviour. Treating `target_peer_id` itself as a routing directive
+    // would silently drop every remote action response, so pin that here: this
+    // frame must still be delivered.
+    relay
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage::Publish {
+                protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+                payload: json!({
+                    "kind": "encrypted_remote_action_result",
+                    "action_id": "action-1",
+                    "target_peer_id": "phone-intended",
+                    "device_id": "device-1",
+                    "envelope": {"nonce": "n", "ciphertext": "c"},
+                }),
+            })
+            .expect("client frame should serialize"),
+        ))
+        .await
+        .expect("publish should send");
+
+    match next_server_message(&mut intended).await {
+        ServerMessage::Message { payload, .. } => assert_eq!(
+            payload["kind"], "encrypted_remote_action_result",
+            "a remote action result must still reach the room; the pairing-result \
+             guard must not generalise to every payload naming a peer"
+        ),
+        other => panic!("remote action result should be delivered: {other:?}"),
+    }
+    let _ = next_server_message(&mut bystander).await;
+
+    for (label, socket) in [
+        ("the named target", &mut intended),
+        ("a bystander", &mut bystander),
+    ] {
+        let received = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            next_server_message(socket),
+        )
+        .await;
+        assert!(
+            received.is_err(),
+            "a payload naming one peer but published without the \
+             `targeted_messages` wrapper must reach nobody; {label} got {received:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_join_on_one_pairing_ticket_supersedes_the_first() {
+    // SECURITY: the pairing join_ticket is what the QR code hands out, and
+    // verification is stateless HMAC + expiry — nothing stops the same ticket from
+    // being replayed. Every replay used to become an independent room member, so a
+    // bystander who photographed the QR could sit in the room alongside the device
+    // being paired and read what the relay published. One ticket must hold exactly
+    // one seat: a later join supersedes the earlier holder rather than joining it.
+    //
+    // Supersede (not reject) is deliberate — the remote client re-presents the
+    // pairing ticket automatically after a network blip, and that reconnect has to
+    // be able to reclaim its own seat.
+    let address = spawn_app().await;
+    let ticket = test_join_ticket_key()
+        .mint(&JoinTicketClaims::pairing_surface_join(
+            "room-a",
+            "pair-shared",
+            u64::MAX,
+        ))
+        .expect("pairing join ticket should mint");
+
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay should connect");
+    let _ = next_server_message(&mut relay).await;
+
+    let surface_url = format!("ws://{address}/ws/room-a?role=surface&join_ticket={ticket}");
+
+    let (mut first, _) = connect_async(&surface_url)
+        .await
+        .expect("the first surface should connect");
+    let first_peer_id = match next_server_message(&mut first).await {
+        ServerMessage::Welcome { peer_id, .. } => peer_id,
+        other => panic!("unexpected welcome frame: {other:?}"),
+    };
+
+    let (mut second, _) = connect_async(&surface_url)
+        .await
+        .expect("a reconnect on the same ticket should be admitted");
+    match next_server_message(&mut second).await {
+        ServerMessage::Welcome { peers, peer_id, .. } => {
+            assert_ne!(peer_id, first_peer_id, "the seat should be a fresh peer");
+            assert!(
+                !peers.iter().any(|peer| peer.peer_id == first_peer_id),
+                "the superseded holder must already be gone from the room; saw {peers:?}"
+            );
+        }
+        other => panic!("unexpected welcome frame: {other:?}"),
+    }
+
+    match next_server_message(&mut first).await {
+        ServerMessage::Error { code, .. } => assert_eq!(code, "pairing_ticket_superseded"),
+        other => panic!("the first holder should be told it lost its seat: {other:?}"),
     }
 }
 
@@ -733,25 +961,55 @@ async fn surface_connections_can_use_broker_assigned_peer_ids() {
 }
 
 #[tokio::test]
-async fn duplicate_peers_get_error_frame() {
+async fn surfaces_asking_for_the_same_peer_id_get_distinct_assigned_ids() {
+    // This used to assert the second surface was rejected for reusing `dup-1`.
+    // Surfaces no longer name themselves at all — honoring the query parameter let
+    // one squat the relay's id and lock it out of its own room — so a requested id
+    // is ignored and the broker hands out a fresh one instead. Two surfaces asking
+    // for the same id must therefore both be seated, under different ids.
     let address = spawn_app().await;
-    let url = websocket_url(
-        address,
-        "room-a",
-        protocol::PeerRole::Surface,
-        Some("dup-1"),
-        JoinTicketClaims::pairing_surface_join("room-a", "pair-3", u64::MAX),
-    );
+    // Distinct pairing ids on purpose: one ticket seats only one peer, so sharing a
+    // ticket here would evict the first connection and the test would prove nothing
+    // about two surfaces coexisting.
+    let url = |pairing_id: &str| {
+        websocket_url(
+            address,
+            "room-a",
+            protocol::PeerRole::Surface,
+            Some("dup-1"),
+            JoinTicketClaims::pairing_surface_join("room-a", pairing_id, u64::MAX),
+        )
+    };
 
-    let (_first, _) = connect_async(&url)
+    let (mut first, _) = connect_async(url("pair-3a"))
         .await
         .expect("first peer should connect");
-    let (mut duplicate, _) = connect_async(&url).await.expect("duplicate should connect");
+    let (mut second, _) = connect_async(url("pair-3b"))
+        .await
+        .expect("second should connect");
 
-    let error = next_server_message(&mut duplicate).await;
-    match error {
-        ServerMessage::Error { code, .. } => assert_eq!(code, "join_rejected"),
-        other => panic!("unexpected error frame: {other:?}"),
+    let assigned = |message: ServerMessage| match message {
+        ServerMessage::Welcome { peer_id, peers, .. } => (peer_id, peers),
+        other => panic!("unexpected welcome frame: {other:?}"),
+    };
+    let (first_peer_id, _) = assigned(next_server_message(&mut first).await);
+    let (second_peer_id, second_sees) = assigned(next_server_message(&mut second).await);
+
+    assert_ne!(
+        first_peer_id, second_peer_id,
+        "each surface must get its own broker-assigned peer id"
+    );
+    // Both are genuinely seated at once — the second peer's Welcome lists the first,
+    // which is what makes this a statement about coexistence and not about eviction.
+    assert!(
+        second_sees.iter().any(|peer| peer.peer_id == first_peer_id),
+        "the second surface should see the first still seated; saw {second_sees:?}"
+    );
+    for peer_id in [&first_peer_id, &second_peer_id] {
+        assert_ne!(
+            peer_id, "dup-1",
+            "a client-requested surface peer id must be ignored"
+        );
     }
 }
 

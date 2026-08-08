@@ -1720,3 +1720,59 @@ mod transcript_delta_delivery {
         );
     }
 }
+
+#[test]
+fn a_pairing_result_is_addressed_to_one_peer_and_never_broadcast() {
+    // SECURITY: the pairing result seals payload_secret + refresh tokens with the
+    // pairing_secret printed into the QR. If it goes out as a bare payload the
+    // broker fans it out to the whole room, so any bystander replaying the same
+    // pairing join ticket gets the envelope and can open it with the QR's secret.
+    // The `targeted_messages` wrapper is what confines it to one peer.
+    let result = crate::state::PendingPairingResult {
+        pairing_id: "pair-abc".to_string(),
+        target_peer_id: "surface-intended".to_string(),
+        pairing_secret: "pairing-secret-from-the-qr".to_string(),
+        device: None,
+        payload_secret: Some("payload-secret-must-stay-sealed".to_string()),
+        relay_id: Some("relay-1".to_string()),
+        relay_label: None,
+        client_id: Some("client-1".to_string()),
+        client_refresh_token: Some("cref-must-stay-sealed".to_string()),
+        device_refresh_token: Some("dref-must-stay-sealed".to_string()),
+        device_join_ticket: Some("join-ticket-must-stay-sealed".to_string()),
+        device_join_ticket_expires_at: Some(300),
+        error: None,
+    };
+
+    let message = pairing_result_targeted_message(result).expect("pairing result should seal");
+    assert_eq!(
+        message.target_peer_id, "surface-intended",
+        "the wrapper must address the peer that completed the handshake"
+    );
+
+    let frame = frame_text_for_payload(&OutboundBrokerPayload::TargetedMessages {
+        messages: vec![message],
+    });
+    let parsed: serde_json::Value =
+        serde_json::from_str(&frame).expect("outbound frame should parse");
+    assert_eq!(
+        parsed["payload"]["kind"], "targeted_messages",
+        "a pairing result published bare is broadcast by the broker; frame was {frame}"
+    );
+    assert_eq!(
+        parsed["payload"]["messages"][0]["target_peer_id"], "surface-intended",
+        "the broker routes on the wrapper's target_peer_id"
+    );
+
+    for secret in [
+        "payload-secret-must-stay-sealed",
+        "cref-must-stay-sealed",
+        "dref-must-stay-sealed",
+        "join-ticket-must-stay-sealed",
+    ] {
+        assert!(
+            !frame.contains(secret),
+            "{secret} must be sealed inside the envelope, not readable in the frame"
+        );
+    }
+}

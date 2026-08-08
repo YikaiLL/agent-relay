@@ -2597,9 +2597,25 @@ fn pairing_ticket_includes_scannable_broker_link() {
         Some(60),
     );
 
-    assert!(ticket
-        .pairing_url
-        .starts_with("https://relay.example.com/?pairing="));
+    // SECURITY: the payload carries the pairing_secret, which is the ONLY key
+    // sealing the pairing handshake — the envelope that ships payload_secret and
+    // the refresh tokens. It must ride in the URL fragment, never the query: the
+    // broker serves this very page, so a query string puts the secret in its
+    // request line (and in any proxy/CDN access log in front of it), letting the
+    // broker decrypt a handshake that `private` mode promises it cannot read.
+    // Fragments are never sent to the server.
+    assert!(
+        ticket
+            .pairing_url
+            .starts_with("https://relay.example.com/#pairing="),
+        "pairing payload must ride in the fragment, got {}",
+        ticket.pairing_url
+    );
+    assert!(
+        !ticket.pairing_url.contains("?pairing="),
+        "pairing payload must never appear in the query string, got {}",
+        ticket.pairing_url
+    );
     assert!(ticket.pairing_qr_svg.contains("<svg"));
 
     let encoded = ticket
@@ -3794,6 +3810,85 @@ fn repeated_pairing_request_rebinds_to_latest_broker_peer() {
         .decide_pairing_request(&ticket.pairing_id, true, None, 102)
         .expect("approval should use the rebound broker peer");
     assert_eq!(result.target_peer_id, "surface-new");
+}
+
+#[test]
+fn a_second_device_cannot_steal_a_pending_pairing_request() {
+    // SECURITY: the rebind in `repeated_pairing_request_rebinds_to_latest_broker
+    // _peer` exists so ONE device can retry over a new broker peer. It must not
+    // also let a DIFFERENT device (different Ed25519 verify key) overwrite the
+    // request the operator is about to approve: whoever holds the QR payload can
+    // then wait for the victim to register, register last, and receive the
+    // approval — plus the payload_secret and refresh tokens that come with it.
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("victim-phone".to_string()),
+            Some("Victim Phone".to_string()),
+            "surface-victim",
+            "victim-verify-key".to_string(),
+            100,
+        )
+        .expect("the victim's pairing request should register");
+
+    let stolen = relay.register_pairing_request(
+        &ticket.pairing_id,
+        Some("victim-phone".to_string()),
+        Some("Victim Phone".to_string()),
+        "surface-attacker",
+        "attacker-verify-key".to_string(),
+        101,
+    );
+
+    assert!(
+        stolen.is_err(),
+        "a request carrying a different verify key must not rebind an existing \
+         pending pairing request, got {stolen:?}"
+    );
+
+    let result = relay
+        .decide_pairing_request(&ticket.pairing_id, true, None, 102)
+        .expect("approval should still resolve the victim's request");
+    assert_eq!(
+        result.target_peer_id, "surface-victim",
+        "the approval must land on the device the operator actually saw"
+    );
+    assert_eq!(
+        result
+            .device
+            .as_ref()
+            .expect("approved device")
+            .fingerprint
+            .as_deref(),
+        device_fingerprint_for("victim-verify-key").as_deref(),
+        "the paired device must be keyed to the victim's verify key"
+    );
+}
+
+fn device_fingerprint_for(verify_key: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(verify_key)
+        .unwrap_or_else(|_| verify_key.as_bytes().to_vec());
+    let digest = Sha256::digest(&bytes);
+    let mut fingerprint = String::new();
+    for (index, byte) in digest.iter().take(8).enumerate() {
+        if index > 0 {
+            fingerprint.push(':');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    Some(fingerprint)
 }
 
 #[test]

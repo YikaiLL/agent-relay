@@ -37,6 +37,18 @@ export const state = {
   deviceKeypair: null,
   pairingError: null,
   pairingPhase: null,
+  // Set when the current pairing ticket is dead for good — superseded by a later
+  // client claiming its single seat, or expired. The ticket itself is KEPT so its
+  // error card stays on screen (see `selectDeviceChromeRenderModel`), but
+  // `connectionTarget` stops offering it so the automatic reconnect cannot
+  // re-present it.
+  pairingRetired: false,
+  // Identity of the current pairing attempt. Every socket opened for a pairing records
+  // the id it was opened under, so a frame can be judged against the attempt it
+  // actually belongs to instead of against a global predicate that changes with the
+  // clock (a ticket lapsing between `open` and Welcome used to re-classify a live
+  // pairing socket as a device connection).
+  pairingAttemptId: 0,
   pairingTicket: null,
   pendingActions: new Map(),
   pendingActionChunks: new Map(),
@@ -125,9 +137,53 @@ export function patchRemoteState(patch, { persist = false } = {}) {
   return state;
 }
 
+/// Whether a pairing ticket is still worth presenting to the broker.
+///
+/// The broker deliberately answers every failed join with a generic
+/// "broker join rejected" (so rooms cannot be probed), so the reason a join failed
+/// is not reliably readable from the error message — and a plain socket close
+/// carries no message at all. The ticket's own `expires_at` is therefore the
+/// authoritative local check. An absent/garbled expiry is treated as live so the
+/// broker stays the decider rather than us refusing a usable ticket.
+export function pairingTicketIsLive(ticket, nowMs = Date.now()) {
+  if (!ticket) {
+    return false;
+  }
+  if (!Number.isFinite(ticket.expires_at)) {
+    return true;
+  }
+  return ticket.expires_at * 1000 > nowMs;
+}
+
+/// Whether a pairing handshake is actually in flight right now.
+///
+/// This is THE definition — every "are we pairing?" branch must use it rather than
+/// testing `state.pairingTicket` directly. A retired or expired ticket is kept in
+/// state so its error card stays on screen, so the mere presence of a ticket no
+/// longer means a pairing is running. When a browser already has a paired device,
+/// `connectionTarget` falls back to that device profile, and a stale
+/// `state.pairingTicket` check would then fire the pairing handshake against the
+/// OLD relay's room and skip normal session recovery.
+export function hasActivePairing() {
+  return (
+    Boolean(state.pairingTicket)
+    && !state.pairingRetired
+    && pairingTicketIsLive(state.pairingTicket)
+  );
+}
+
+/// Begin a new pairing attempt, invalidating any frame still in flight for the last one.
+export function nextPairingAttemptId() {
+  state.pairingAttemptId += 1;
+  return state.pairingAttemptId;
+}
+
 export function connectionTarget() {
-  if (state.pairingTicket) {
+  if (hasActivePairing()) {
     return {
+      kind: "pairing",
+      pairingAttemptId: state.pairingAttemptId,
+      pairingId: state.pairingTicket.pairing_id,
       brokerUrl: state.pairingTicket.broker_url,
       brokerChannelId: state.pairingTicket.broker_channel_id,
       joinTicket: state.pairingTicket.pairing_join_ticket,
@@ -136,6 +192,8 @@ export function connectionTarget() {
 
   if (state.remoteAuth && hasUsableDeviceJoinTicket()) {
     return {
+      kind: "device",
+      relayId: state.remoteAuth.relayId,
       brokerUrl: state.remoteAuth.brokerUrl,
       brokerChannelId: state.remoteAuth.brokerChannelId,
       joinTicket: state.remoteAuth.deviceJoinTicket,

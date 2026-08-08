@@ -1693,10 +1693,18 @@ async fn publish_transcript_delta(
     Ok(())
 }
 
-async fn publish_pairing_result(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+/// Seal a pairing result for exactly one broker peer.
+///
+/// The envelope carries the new device's `payload_secret` and refresh tokens
+/// sealed with nothing but the `pairing_secret` printed into the QR code, so any
+/// peer that can read the frame AND has seen the QR can open it. It therefore
+/// MUST leave here inside a `targeted_messages` wrapper: the broker routes on
+/// that wrapper alone, and a bare payload carrying an inner `target_peer_id` used
+/// to be fanned out to the whole room — handing the credentials to any bystander
+/// replaying the same pairing join ticket.
+fn pairing_result_targeted_message(
     result: crate::state::PendingPairingResult,
-) -> Result<(), String> {
+) -> Result<TargetedBrokerMessage, String> {
     let encrypted = encrypt_json(
         &result.pairing_secret,
         &PairingResultPlaintext {
@@ -1713,16 +1721,21 @@ async fn publish_pairing_result(
             error: result.error,
         },
     )?;
-    publish_payload(
-        sender,
-        OutboundBrokerPayload::EncryptedPairingResult {
+    Ok(TargetedBrokerMessage {
+        target_peer_id: result.target_peer_id.clone(),
+        payload: Box::new(OutboundBrokerPayload::EncryptedPairingResult {
             pairing_id: result.pairing_id,
             target_peer_id: result.target_peer_id,
             envelope: encrypted,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())
+        }),
+    })
+}
+
+async fn publish_pairing_result(
+    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    result: crate::state::PendingPairingResult,
+) -> Result<(), String> {
+    publish_targeted_messages(sender, vec![pairing_result_targeted_message(result)?]).await
 }
 
 async fn publish_payload(

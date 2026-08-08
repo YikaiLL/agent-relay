@@ -71,6 +71,7 @@ export function createRemoteThreadSearchPatch(threadSearch) {
 export function createPairingStatePatch({
   pairingError,
   pairingPhase,
+  pairingRetired,
   pairingTicket,
 }) {
   const patch = {};
@@ -79,6 +80,9 @@ export function createPairingStatePatch({
   }
   if (pairingPhase !== undefined) {
     patch.pairingPhase = pairingPhase;
+  }
+  if (pairingRetired !== undefined) {
+    patch.pairingRetired = pairingRetired;
   }
   if (pairingTicket !== undefined) {
     patch.pairingTicket = pairingTicket;

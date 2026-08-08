@@ -11,6 +11,9 @@ import {
   clearDeviceRefreshSession,
   closeBrokerSocket,
   connectBroker,
+  promoteConnectionToDevice,
+  releaseSupersededPairingSocket,
+  retirePairing,
   cancelDeviceRefreshesForRelay,
   establishClientRefreshSession,
   establishDeviceRefreshSession,
@@ -29,7 +32,9 @@ import {
   normalizedDeviceLabel,
   ensureDeviceIdentity,
   forgetCurrentRemoteProfile,
+  hasActivePairing,
   loadDeviceLabel,
+  nextPairingAttemptId,
   saveClientAuth,
   saveDeviceLabel,
   saveRemoteAuth,
@@ -44,17 +49,44 @@ import {
 import { cancelRemoteThreadSearch, clearSessionRuntime } from "./session-ops.js";
 import { shortId } from "./utils.js";
 
+// Session-cookie requests for the CURRENT pairing attempt.
+//
+// `stillOurs()` can stop a superseded attempt from writing local state, but it cannot undo
+// an HTTP response: the browser installs `Set-Cookie` before JS resumes, so attempt A's
+// late response can overwrite attempt B's cookie for the same broker. Aborting A's request
+// the moment B starts is what actually narrows that window. It does not close it — a
+// response already in flight may land first — so this is a mitigation, not a proof.
+let pairingSessionAbort = null;
+
+function beginPairingSessionScope() {
+  pairingSessionAbort?.abort();
+  pairingSessionAbort = typeof AbortController === "function" ? new AbortController() : null;
+  return pairingSessionAbort;
+}
+
 export function applyPairingQuery() {
-  const raw = new URL(window.location.href).searchParams.get("pairing");
-  if (!raw) {
+  const url = new URL(window.location.href);
+  // The payload lives in the fragment so the pairing_secret never reaches the
+  // broker that serves this page — see `parsePairingPayload`. A legacy `?pairing=`
+  // link is still routed into the parser on purpose, so it surfaces as an error
+  // telling the operator to regenerate rather than being silently honored after
+  // the secret has already gone over the wire.
+  const fromFragment = new URLSearchParams(url.hash.replace(/^#/, "")).get("pairing");
+  if (!fromFragment && !url.searchParams.has("pairing")) {
     return null;
   }
 
   try {
-    const pairingTicket = parsePairingPayload(raw);
+    const pairingTicket = parsePairingPayload(url.href);
+    const raw = fromFragment;
     renderLog(`Loaded pairing ticket ${pairingTicket.pairing_id} from URL.`);
     return raw;
   } catch (error) {
+    // Scrub before surfacing the error. A rejected legacy `?pairing=` link has
+    // already handed its secret to the broker; leaving it in the address bar keeps
+    // it in history and re-sends it on every refresh. Same for a fragment payload
+    // we could not parse — there is nothing left to do with it.
+    clearPairingQueryFromUrl();
     applyRemoteSurfacePatch(createPairingStatePatch({
       pairingPhase: "error",
       pairingError: error.message,
@@ -73,15 +105,26 @@ export async function beginPairing(rawValue, { auto = false, deviceLabel = null 
 
   try {
     const pairingTicket = parsePairingPayload(raw);
+    // A new attempt gets a new identity, so any frame still in flight for the previous
+    // one is recognisably stale and cannot publish or retire on this one's behalf.
+    nextPairingAttemptId();
+    // ...and the abandoned attempt's socket has to go, or it squats a room seat while
+    // every frame on it is dropped for attempt mismatch.
+    releaseSupersededPairingSocket();
+    // Abort the previous attempt's session requests so their responses cannot install a
+    // cookie over this attempt's.
+    beginPairingSessionScope();
     applyRemoteSurfacePatch(createPairingStatePatch({
       pairingTicket,
+      // A fresh ticket starts un-retired, or the previous ticket's retirement would
+      // make `connectionTarget` refuse this one too.
+      pairingRetired: false,
     }));
     if (pairingTicket.expires_at * 1000 <= Date.now()) {
-      applyRemoteSurfacePatch(createPairingStatePatch({
-        pairingPhase: "error",
-        pairingError: expiredPairingMessage(),
-      }));
-      renderLog(`Pairing failed: ${state.pairingError}`);
+      // Full terminal cleanup, not just an error flag: boot returns right after this,
+      // so `connectBroker`'s retire path never runs and the expired payload would sit
+      // in the address bar and history, re-entering broker/proxy logs on every reload.
+      retirePairing(expiredPairingMessage());
       return false;
     }
     applyRemoteSurfacePatch(createPairingStatePatch({
@@ -115,19 +158,34 @@ export async function beginPairing(rawValue, { auto = false, deviceLabel = null 
 }
 
 export async function sendPairingRequest() {
+  // Guarded on the shared predicate so a retired ticket can never be sent, even if a
+  // caller checks the wrong thing: the connection open at that point may belong to an
+  // already-paired device's relay, and a dead pairing request would go to ITS room.
+  if (!hasActivePairing()) {
+    if (state.pairingTicket && !state.pairingRetired) {
+      retirePairing(expiredPairingMessage());
+    }
+    return;
+  }
   const ticket = state.pairingTicket;
-  if (!ticket) {
-    return;
-  }
-  if (ticket.expires_at * 1000 <= Date.now()) {
-    applyRemoteSurfacePatch(createPairingStatePatch({
-      pairingPhase: "error",
-      pairingError: expiredPairingMessage(),
-    }));
-    renderLog(`Pairing failed: ${state.pairingError}`);
-    return;
-  }
+  // Pin the attempt AND the socket now. Everything below awaits — device identity, then
+  // an Ed25519 signature — and a superseded error or a second QR scan during those awaits
+  // must not let this frame escape: onto a closed socket it throws (the caller invokes us
+  // as `void sendPairingRequest()`, so that surfaces as an unhandled rejection), and onto
+  // a socket that has since been replaced it would publish into someone else's room.
+  const attemptId = state.pairingAttemptId;
+  const socket = state.socket;
+  const stillOurs = () =>
+    state.pairingAttemptId === attemptId
+    && state.socket === socket
+    && state.pairingTicket?.pairing_id === ticket.pairing_id
+    && hasActivePairing();
+
   const deviceKeypair = await ensureDeviceIdentity();
+  if (!stillOurs()) {
+    renderLog(`Dropped the pairing request for ${ticket.pairing_id}; the attempt ended first.`);
+    return;
+  }
 
   applyRemoteSurfacePatch(createPairingStatePatch({
     pairingPhase: "requesting",
@@ -149,12 +207,22 @@ export async function sendPairingRequest() {
     }),
   };
 
+  // Re-check after signing, immediately before publishing.
+  if (!stillOurs()) {
+    renderLog(`Dropped the pairing request for ${ticket.pairing_id}; the attempt ended first.`);
+    return;
+  }
+
   sendBrokerFrame(payload);
   renderLog(`Sent pairing request for ${ticket.pairing_id}; waiting for local approval.`);
 }
 
 export async function handleEncryptedPairingResult(payload) {
-  if (!state.pairingTicket) {
+  // Same policy as the socket gate: an expired or retired attempt discards the frame.
+  // Keeping the two in step matters — the gate already drops these before dispatch, so a
+  // handler that accepted them would only ever be reachable from a test, and would document
+  // behaviour the product does not have.
+  if (!hasActivePairing()) {
     return;
   }
 
@@ -165,32 +233,54 @@ export async function handleEncryptedPairingResult(payload) {
     return;
   }
 
-  const result = await decryptJson(state.pairingTicket.pairing_secret, payload.envelope);
+  // Pin the attempt and its ticket. Everything below awaits — decryption, then a device
+  // session and a client session round trip — and a second scan during those waits swaps
+  // `state.pairingTicket` underneath us. Reading the global afterwards filed THIS
+  // attempt's credentials against the NEW attempt's broker and wiped its pairing state.
+  const ticket = state.pairingTicket;
+  const attemptId = state.pairingAttemptId;
+  // Retirement wins. If the attempt gets retired mid-flight — superseded, or expired —
+  // this result is abandoned and NOTHING durable is written. The relay may have minted
+  // credentials we never adopt; that costs a re-pair, which is the cheap side of the
+  // trade compared with filing credentials next to a live terminal error or claiming on
+  // a socket retirement already closed.
+  const stillOurs = () =>
+    state.pairingAttemptId === attemptId
+    && state.pairingTicket === ticket
+    && !state.pairingRetired;
+  const abandon = () => {
+    renderLog(`Ignored a pairing result for ${ticket.pairing_id}; a newer attempt replaced it.`);
+  };
+
+  const result = await decryptJson(ticket.pairing_secret, payload.envelope);
+  if (!stillOurs()) {
+    abandon();
+    return;
+  }
   if (!result.ok) {
-    applyRemoteSurfacePatch(createPairingStatePatch({
-      pairingPhase: "error",
-      pairingError: normalizePairingError(result.error),
-    }));
-    renderLog(`Pairing failed: ${state.pairingError}`);
+    // Terminal by construction: the relay consumes the pending pairing when it decides
+    // (approve OR reject), so the ticket behind this failure is already gone
+    // server-side. Retrying it can only fail, and leaving the fragment in the URL
+    // keeps a spent secret in history.
+    retirePairing(normalizePairingError(result.error));
     return;
   }
 
   const device = result.device;
   if (!device || !result.payload_secret || !result.device_join_ticket) {
-    applyRemoteSurfacePatch(createPairingStatePatch({
-      pairingPhase: "error",
-      pairingError: "pairing result is incomplete",
-    }));
+    // Also terminal: an incomplete bundle means the approval already happened, so the
+    // pending pairing is spent and this ticket cannot be retried either.
+    retirePairing("pairing result is incomplete");
     renderLog("Pairing failed: relay returned an incomplete device credential bundle.");
     return;
   }
   const remoteAuth = {
-    relayId: result.relay_id || state.pairingTicket.broker_channel_id,
+    relayId: result.relay_id || ticket.broker_channel_id,
     relayLabel: result.relay_label || null,
-    brokerUrl: state.pairingTicket.broker_url,
-    brokerChannelId: state.pairingTicket.broker_channel_id,
-    relayPeerId: state.pairingTicket.relay_peer_id,
-    securityMode: state.pairingTicket.security_mode,
+    brokerUrl: ticket.broker_url,
+    brokerChannelId: ticket.broker_channel_id,
+    relayPeerId: ticket.relay_peer_id,
+    securityMode: ticket.security_mode,
     deviceId: device.device_id,
     deviceLabel: device.label,
     payloadSecret: result.payload_secret,
@@ -207,7 +297,8 @@ export async function handleEncryptedPairingResult(payload) {
       const session = await establishDeviceRefreshSession(
         remoteAuth.deviceRefreshToken,
         remoteAuth.brokerUrl,
-        remoteAuth.brokerChannelId || null
+        remoteAuth.brokerChannelId || null,
+        { signal: pairingSessionAbort?.signal }
       );
       if (session.deviceEndpointMode === "scoped") {
         remoteAuth.deviceRefreshMode = "cookie";
@@ -219,21 +310,37 @@ export async function handleEncryptedPairingResult(payload) {
       );
     }
   }
+  if (!stillOurs()) {
+    abandon();
+    return;
+  }
   if (result.client_refresh_token && result.client_id) {
     try {
       await establishClientRefreshSession(
         result.client_refresh_token,
-        state.pairingTicket.broker_url
+        ticket.broker_url
       );
+      if (!stillOurs()) {
+        abandon();
+        return;
+      }
       saveClientAuth({
         clientId: result.client_id,
-        brokerControlUrl: brokerControlUrl(state.pairingTicket.broker_url),
+        brokerControlUrl: brokerControlUrl(ticket.broker_url),
       });
     } catch (error) {
       renderLog(`Broker client session cookie could not be established yet: ${error.message}`);
     }
   }
+  if (!stillOurs()) {
+    abandon();
+    return;
+  }
   saveRemoteAuth(remoteAuth);
+  // Before the ticket goes away: this socket is about to be reused for the post-pairing
+  // claim, so it must stop being judged as a pairing socket or the claim response reads
+  // as an expired ticket and tears the connection down.
+  promoteConnectionToDevice(remoteAuth.relayId);
   applyRemoteSurfacePatch(createPairingStatePatch({
     pairingTicket: null,
     pairingPhase: null,

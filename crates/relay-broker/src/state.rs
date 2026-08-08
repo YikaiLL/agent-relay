@@ -28,6 +28,9 @@ struct PeerHandle {
     connection_id: u64,
     role: PeerRole,
     device_id: Option<String>,
+    /// Set when this peer was seated by a pairing join ticket. One ticket may hold
+    /// at most one seat at a time (see [`BrokerState::join`]).
+    pairing_id: Option<String>,
     tx: mpsc::UnboundedSender<ServerMessage>,
 }
 
@@ -62,12 +65,23 @@ impl BrokerState {
         }
     }
 
+    /// Seat a peer in a channel.
+    ///
+    /// `pairing_id` is set for a surface admitted by a pairing join ticket — the
+    /// credential encoded in a QR code. Ticket verification is stateless HMAC, so
+    /// nothing stops the same ticket from being replayed by any number of clients;
+    /// a ticket therefore holds at most ONE seat here, and a later join supersedes
+    /// the earlier holder. That keeps a bystander who photographed the QR from
+    /// sitting silently in the room alongside the device being paired, while still
+    /// letting the real device's reconnect (the remote client retries the pairing
+    /// ticket automatically after a network blip) reclaim its own seat.
     pub async fn join(
         &self,
         channel_id: &str,
         peer_id: &str,
         role: PeerRole,
         device_id: Option<String>,
+        pairing_id: Option<String>,
     ) -> Result<JoinResult, String> {
         let (tx, rx) = mpsc::unbounded_channel();
         let joined_peer = PeerSummary {
@@ -116,6 +130,56 @@ impl BrokerState {
             ));
         }
 
+        // One pairing ticket, one seat: evict any earlier holder before the new peer
+        // is announced, so it never appears in this peer's `existing_peers` and the
+        // room cannot contain two surfaces admitted by the same QR.
+        let superseded = match pairing_id.as_deref() {
+            Some(pairing_id) => room
+                .peers
+                .iter()
+                .filter(|(existing_peer_id, handle)| {
+                    existing_peer_id.as_str() != peer_id
+                        && handle.pairing_id.as_deref() == Some(pairing_id)
+                })
+                .map(|(existing_peer_id, _)| existing_peer_id.clone())
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        for superseded_peer_id in &superseded {
+            let Some(handle) = room.peers.remove(superseded_peer_id) else {
+                continue;
+            };
+            info!(
+                channel_id,
+                peer_id,
+                superseded_peer_id = %superseded_peer_id,
+                "broker surface superseded by a later join on the same pairing ticket"
+            );
+            let _ = handle.tx.send(ServerMessage::Error {
+                code: "pairing_ticket_superseded".to_string(),
+                message: "another client joined with this pairing ticket".to_string(),
+            });
+            let left_peer = PeerSummary {
+                peer_id: superseded_peer_id.clone(),
+                role: handle.role,
+                device_id: handle.device_id.clone(),
+            };
+            for remaining in room.peers.values() {
+                let _ = remaining.tx.send(ServerMessage::Presence {
+                    channel_id: channel_id.to_string(),
+                    kind: PresenceKind::Left,
+                    peer: left_peer.clone(),
+                });
+            }
+            self.record_event(UsageEvent::new(
+                UsageEventKind::Disconnect,
+                channel_id,
+                superseded_peer_id,
+                handle.role,
+                handle.device_id,
+            ));
+        }
+
         let existing_peers = room
             .peers
             .iter()
@@ -144,6 +208,7 @@ impl BrokerState {
                 connection_id,
                 role,
                 device_id,
+                pairing_id,
                 tx,
             },
         );
@@ -353,6 +418,21 @@ impl BrokerState {
             return Ok(());
         }
 
+        // Confidentiality backstop, fail closed. Checked BEFORE the publish is
+        // recorded, so a refused frame does not land in the usage stream.
+        //
+        // Deliberately keyed on the payload KIND, not on the presence of a
+        // `target_peer_id` field: across this protocol that field is a client-side
+        // filter hint on a broadcast payload (see the `[broker-filter]` logging in
+        // the remote surface), and remote action results legitimately rely on it.
+        // Only the kinds listed here must never reach a second peer.
+        if must_not_be_broadcast(&outbound_payload_kind) {
+            return Err(format!(
+                "payload `{outbound_payload_kind}` must be published inside a \
+                 `targeted_messages` wrapper; refusing to broadcast it"
+            ));
+        }
+
         self.record_event(publish_event);
 
         let mut recipient_count = 0usize;
@@ -413,6 +493,24 @@ struct TargetedMessagePayload {
 
 fn is_targeted_messages_payload(payload: &serde_json::Value) -> bool {
     payload.get("kind").and_then(serde_json::Value::as_str) == Some("targeted_messages")
+}
+
+/// Payload kinds that carry a secret a *bystander in the room* could open, and so
+/// may only ever be delivered through the `targeted_messages` wrapper.
+///
+/// `encrypted_pairing_result` seals the new device's `payload_secret` and refresh
+/// tokens with nothing but the `pairing_secret` printed into the QR code. Anyone
+/// who photographed that QR can decrypt it, so broadcasting the frame handed them
+/// the device's credentials. It shipped bare for a while; this refuses the bare
+/// form outright rather than re-routing it, so a regression fails loudly here.
+///
+/// This is intentionally NOT "any payload with a `target_peer_id`". That field is
+/// a client-side filter hint throughout the rest of the protocol — remote action
+/// results, session snapshots and transcript deltas are all broadcast with it and
+/// filtered by the receiving surface — so treating it as a routing directive would
+/// silently drop every remote action response.
+fn must_not_be_broadcast(payload_kind: &str) -> bool {
+    matches!(payload_kind, "encrypted_pairing_result")
 }
 
 fn payload_kind(payload: &serde_json::Value) -> &str {
