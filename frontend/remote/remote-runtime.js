@@ -1,6 +1,8 @@
 import { clearClaimLifecycle, configureRemoteActions, handleRemoteBrokerPayload, recoverRemoteSession, rejectPendingActions } from "./actions.js";
 import { closeBrokerSocket, configureBrokerClient, connectBroker, refreshRelayDirectory } from "./broker-client.js";
+import { replaceRemoteIdentity } from "./identity-change.js";
 import { initializeRemoteNavigation, openRemoteNavigation } from "./navigation.js";
+import { initializeRemotePointerClass } from "./pointer-mode.js";
 import { applyPairingQuery, beginPairing, forgetCurrentDevice, handleEncryptedPairingResult, sendPairingRequest } from "./pairing.js";
 import { mountIosInstallHint } from "./ios-install.js";
 import { registerRemotePwa } from "./pwa.js";
@@ -63,6 +65,7 @@ export function ensureRemoteRuntimeConfigured() {
 
 export function initializeRemoteSurface() {
   initializeRemoteNavigation();
+  initializeRemotePointerClass();
   ensureRemoteRuntimeConfigured();
 }
 
@@ -118,19 +121,26 @@ export async function switchRemoteRelay(relayId) {
     return;
   }
 
-  if (!selectRelayProfile(relayId)) {
+  if (!state.remoteProfiles?.[relayId]) {
     renderLog("This relay is not stored in the current browser profile yet.");
     return;
   }
 
   cancelRemoteThreadsPoll();
-  applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
-    cancelThreadSearch: cancelRemoteThreadSearch,
-    clearClaimLifecycle,
-    clearSessionRuntime,
-    rejectPendingActions,
-    reason: "switched to a different relay profile",
-  }));
+  // The profile is validated above rather than by `selectRelayProfile`'s return value, so
+  // that a switch which cannot happen resets nothing. See identity-change.js for why the
+  // reset has to precede the move.
+  replaceRemoteIdentity({
+    resetSurface: () =>
+      applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+        cancelThreadSearch: cancelRemoteThreadSearch,
+        clearClaimLifecycle,
+        clearSessionRuntime,
+        rejectPendingActions,
+        reason: "switched to a different relay profile",
+      })),
+    moveIdentity: () => selectRelayProfile(relayId),
+  });
   renderLog(`Switching to relay ${relayId}.`);
   void connectBroker("switch relay");
 }
@@ -141,14 +151,17 @@ export function returnToRelayHome() {
   }
 
   cancelRemoteThreadsPoll();
-  applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
-    cancelThreadSearch: cancelRemoteThreadSearch,
-    clearClaimLifecycle,
-    clearSessionRuntime,
-    rejectPendingActions,
-    reason: "returned to relay directory before broker actions completed",
-  }));
-  clearActiveRelaySelection();
+  replaceRemoteIdentity({
+    resetSurface: () =>
+      applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+        cancelThreadSearch: cancelRemoteThreadSearch,
+        clearClaimLifecycle,
+        clearSessionRuntime,
+        rejectPendingActions,
+        reason: "returned to relay directory before broker actions completed",
+      })),
+    moveIdentity: clearActiveRelaySelection,
+  });
   closeBrokerSocket();
   openRemoteNavigation();
   renderLog("Returned to relay directory.");

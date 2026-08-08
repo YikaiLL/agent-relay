@@ -1,3 +1,4 @@
+import { replaceRemoteIdentity } from "./identity-change.js";
 import {
   clearPairingQueryFromUrl,
   decryptJson,
@@ -261,14 +262,17 @@ export function forgetCurrentDevice() {
     pairingPhase: null,
     pairingTicket: null,
   }));
-  forgetCurrentRemoteProfile();
-  applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
-    cancelThreadSearch: cancelRemoteThreadSearch,
-    clearClaimLifecycle,
-    clearSessionRuntime,
-    rejectPendingActions,
-    reason: "device was forgotten before broker actions completed",
-  }));
+  replaceRemoteIdentity({
+    resetSurface: () =>
+      applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+        cancelThreadSearch: cancelRemoteThreadSearch,
+        clearClaimLifecycle,
+        clearSessionRuntime,
+        rejectPendingActions,
+        reason: "device was forgotten before broker actions completed",
+      })),
+    moveIdentity: forgetCurrentRemoteProfile,
+  });
   clearPairingQueryFromUrl();
   closeBrokerSocket();
   void clearDeviceRefreshSession(brokerUrl, room, { allowLegacyFallback });
