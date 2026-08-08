@@ -8772,15 +8772,24 @@ got {}",
         );
     }
 
-    /// The probe cap is a DoS bound, and it TRUNCATES — so a caller that exceeds it gets
-    /// silence for the overflow, which is the same shape as "deleted". The client chunks
-    /// so it never happens; this pins the server side of that contract so the number
-    /// cannot drift away from the client's copy unnoticed.
+    /// An over-cap probe is REFUSED, not truncated.
     ///
-    /// Also pins that duplicates are collapsed BEFORE the cap, or a caller repeating one
-    /// id would spend its budget asking the same question twice.
+    /// Truncating drops the overflow, and a dropped id is absent from the answer — which
+    /// is precisely how a probe's caller concludes "deleted". That turns one number
+    /// disagreeing across two languages into mass closure of live sessions, silently, in
+    /// the one direction (lowering this cap) that looks harmless from the Rust side.
+    ///
+    /// Refusing makes the contract enforced rather than documented: a client that asks for
+    /// too much gets an error, and `sweepMissingThreads` discards any sweep it could not
+    /// complete — so the failure mode is "nothing happened" rather than "everything
+    /// closed". The client still chunks, which is why this is a backstop and not a
+    /// behaviour anyone should meet.
+    ///
+    /// Duplicates still collapse BEFORE the cap, or a caller repeating one id would spend
+    /// its budget twice on the same question and be refused a probe that is really about
+    /// a handful of sessions.
     #[tokio::test]
-    async fn thread_id_probe_is_capped_and_deduplicated_before_the_cap() {
+    async fn thread_id_probe_refuses_to_exceed_its_cap_rather_than_truncating() {
         let project = TempDir::new().expect("project tempdir");
         let cwd = project.path().to_string_lossy().to_string();
         let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
@@ -8789,20 +8798,18 @@ got {}",
         let listed = app.list_threads(20, None).await.expect("list");
         let real = listed.threads[0].id.clone();
 
-        // 200 distinct junk ids, then the real one LAST. Without the cap it resolves;
-        // with the cap it is dropped along with everything past #128.
         let mut ids = (0..200).map(|n| format!("junk-{n}")).collect::<Vec<_>>();
         ids.push(real.clone());
-        let capped = app
-            .list_threads_matching(20, None, None, Some(&ids))
-            .await
-            .expect("probe");
         assert!(
-            capped.threads.is_empty(),
-            "an over-cap probe silently drops the overflow — which is exactly why the client chunks"
+            app.list_threads_matching(20, None, None, Some(&ids))
+                .await
+                .is_err(),
+            "an over-cap probe must fail loudly; answering about a subset is \
+             indistinguishable from the rest being gone"
         );
 
-        // Same real id, repeated far past the cap: dedup happens first, so it survives.
+        // Same real id, repeated far past the cap: dedup first, so this is a probe about
+        // ONE session and must succeed.
         let repeated = vec![real.clone(); 200];
         let deduped = app
             .list_threads_matching(20, None, None, Some(&repeated))

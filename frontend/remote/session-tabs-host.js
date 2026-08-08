@@ -40,7 +40,7 @@ import {
   selectOwningContext,
   sessionViewContextKey,
 } from "../shared/session-view-state.js";
-import { layoutThreadIds } from "../shared/tab-layout.js";
+import { createTabWorkspace, focusedTab, layoutThreadIds } from "../shared/tab-layout.js";
 import { detectDeferredThreadPromotion } from "../shared/thread-promotion.js";
 import { renderLog } from "./client-log.js";
 import { getRemoteProjectsStore } from "./projects-host.js";
@@ -56,11 +56,12 @@ export const UNPAIRED_RELAY_SCOPE = "unpaired";
 // silently disabling the repair.
 export const BOOT_RESTORE_REASON = "boot-restore";
 
-// Mirrors `MAX_THREAD_ID_PROBE` in crates/relay-server/src/state/app/threads.rs. The relay
-// DROPS ids past its cap, and a dropped id is absent from the answer — indistinguishable
-// from "deleted" — so the client must never send more than one probe's worth at a time.
-// Duplicated rather than negotiated because it is a bound on one request, and a client
-// that guessed too high would mass-close live tabs rather than fail.
+// Mirrors `MAX_THREAD_ID_PROBE` in crates/relay-server/src/state/app/threads.rs, and is
+// now only a batch SIZE rather than a correctness dependency: the relay REFUSES an
+// over-cap probe instead of truncating one, so the two numbers disagreeing costs a failed
+// sweep — which sweeps nothing — rather than the mass tab closure a silently dropped id
+// would have caused. Kept in step so the common case takes one round trip, not so the
+// result is correct.
 export const MAX_THREAD_ID_PROBE = 128;
 
 export function sessionViewDbNameForRelay(relayId) {
@@ -554,18 +555,27 @@ export function createRemoteSessionTabsHost({
         return null;
       }
       try {
-        // The boot restore FIRST, and this is the only moment it matters: the sweep runs
-        // once, at boot, and until the restore commits `hydrate` has deliberately routed
-        // no thread. Reading the location before then samples `null`, so "never sweep the
-        // session on screen" would protect nothing and this would close the very session
-        // the restore is about to show. Same ordering `reconcileProjects` already honours,
-        // and for the same reason.
-        if (bootRestore) {
-          await bootRestore;
-        }
         await controller.whenIdle();
         const state = controller.getState();
-        const visibleThreadId = state.location.threadId;
+        // What is on screen, AND what is about to be.
+        //
+        // Awaiting the restore above only covers the orders where something already
+        // started it. The sweep and the adoption fire on independent arrivals — the thread
+        // list and the session snapshot — so the sweep can be first, and then `threadId`
+        // is still `hydrate`'s deliberate no-thread state and protects nothing.
+        //
+        // The workspace's REMEMBERED FOCUS is the order-independent form of the same fact:
+        // it is exactly what the restore will route, computed from state that is already
+        // settled rather than from who happened to start first. Sparing it costs one tab
+        // that will be re-examined on the next boot; not sparing it closes the session the
+        // user left open, and lands the surface on no conversation at all.
+        const currentWorkspace = createTabWorkspace(
+          state.workspaces[sessionViewContextKey(state.location.context)] || {}
+        );
+        const rememberedTab = focusedTab(currentWorkspace);
+        const spared = new Set(
+          [rememberedTab ? layoutThreadIds(rememberedTab.layout)[0] : null].filter(Boolean)
+        );
         const known = new Set(knownThreadIds || []);
         const candidates = [
           ...new Set(
@@ -573,7 +583,7 @@ export function createRemoteSessionTabsHost({
               (workspace?.tabs || []).flatMap((tab) => layoutThreadIds(tab.layout))
             )
           ),
-        ].filter((id) => id && id !== visibleThreadId && !known.has(id));
+        ].filter((id) => id && !spared.has(id) && !known.has(id));
         if (!candidates.length) {
           return null;
         }
@@ -604,14 +614,25 @@ export function createRemoteSessionTabsHost({
           return null;
         }
 
-        // Recorded BEFORE the removals, so the sweep and every later command read the
-        // same set: `getUnavailableThreadIds` is what stops a snapshot re-filing a tab for
-        // a session that has just been established not to exist.
-        for (const id of missing) {
-          missingThreadIds.add(id);
-        }
         let last = null;
         for (const id of missing) {
+          // Re-read the location per id, and BEFORE recording the tombstone rather than
+          // only before the removal. A probe answer is asynchronous by nature, so the
+          // location can move under any sweep — the boot restore is the loud case, a user
+          // tapping a session mid-flight is the quiet one — and an up-front snapshot
+          // cannot see either.
+          //
+          // Before the tombstone specifically, because `getUnavailableThreadIds` is
+          // consulted by the reducer on EVERY dispatch: recording an id and then declining
+          // to remove it does not spare it at all, it just makes some other command in
+          // this loop sweep it a moment later. That is how the version with the check in
+          // only the removal step still closed the session the user had just opened.
+          if (id === controller.getState().location.threadId) {
+            continue;
+          }
+          // Recorded before its own removal, so nothing can re-file a tab for a session
+          // that has just been established not to exist.
+          missingThreadIds.add(id);
           last = await controller.removeThread(id);
         }
         return last;

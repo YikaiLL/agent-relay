@@ -75,10 +75,12 @@ fn thread_display_title(thread: &ThreadSummaryView) -> &str {
 /// tabs — so the realistic count is single digits. The cap is a bound on what an untrusted
 /// client can make the relay do, not a product limit.
 ///
-/// A caller must never let a probe EXCEED this, and the client chunks so that it cannot:
-/// over-cap ids are dropped, and a dropped id is absent from the answer, which is the same
-/// shape as "deleted". Silent truncation is the one behaviour this path must not have,
-/// because its whole purpose is to stop a client mistaking absence for deletion.
+/// Exceeding it is an ERROR, not a truncation. A dropped id is absent from the answer, and
+/// absence is exactly how a probe's caller concludes "deleted" — so truncating here would
+/// turn this one number disagreeing with the client's copy of it into mass closure of live
+/// sessions, silently, in the direction (lowering it) that looks harmless from this side.
+/// Failing loudly makes the bound enforced rather than documented: the caller discards a
+/// sweep it could not complete, so the worst case is that nothing happens.
 const MAX_THREAD_ID_PROBE: usize = 128;
 
 /// Normalize a raw id list into a probe set, or `None` for "not a probe".
@@ -91,8 +93,11 @@ const MAX_THREAD_ID_PROBE: usize = 128;
 ///
 /// Deduplicated BEFORE the cap, so a caller that repeats an id does not spend its budget
 /// on the same question twice.
-fn normalize_thread_id_probe(ids: Option<&[String]>) -> Option<HashSet<String>> {
-    let mut wanted = ids?
+fn normalize_thread_id_probe(ids: Option<&[String]>) -> Result<Option<HashSet<String>>, String> {
+    let Some(ids) = ids else {
+        return Ok(None);
+    };
+    let mut wanted = ids
         .iter()
         .map(|id| id.trim())
         .filter(|id| !id.is_empty())
@@ -100,12 +105,18 @@ fn normalize_thread_id_probe(ids: Option<&[String]>) -> Option<HashSet<String>> 
         .collect::<Vec<_>>();
     wanted.sort();
     wanted.dedup();
-    wanted.truncate(MAX_THREAD_ID_PROBE);
-    let wanted = wanted.into_iter().collect::<HashSet<_>>();
-    if wanted.is_empty() {
-        return None;
+    if wanted.len() > MAX_THREAD_ID_PROBE {
+        return Err(format!(
+            "a thread-id probe may ask about at most {MAX_THREAD_ID_PROBE} sessions; \
+             got {}. Split it — a truncated answer is indistinguishable from those \
+             sessions being deleted.",
+            wanted.len()
+        ));
     }
-    Some(wanted)
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(wanted.into_iter().collect::<HashSet<_>>()))
 }
 
 impl AppState {
@@ -128,7 +139,7 @@ impl AppState {
         ids: Option<&[String]>,
     ) -> Result<ThreadsResponse, String> {
         let query = normalize_thread_query(query);
-        let wanted_ids = normalize_thread_id_probe(ids);
+        let wanted_ids = normalize_thread_id_probe(ids)?;
         // Read reviewer ids before the provider fetch so we can request a larger
         // page from each provider. If the newest N slots are all reviewer threads
         // we would return fewer than `limit` normal threads otherwise.

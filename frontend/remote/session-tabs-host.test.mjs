@@ -1106,6 +1106,117 @@ test("the session the boot restore is about to show is never swept", async () =>
   assert.equal(second.controller.getState().location.threadId, "A");
 });
 
+// ...and from the OTHER side, which is the direction an ordering guard cannot cover.
+//
+// The sweep and the adoption fire on independent arrivals — the thread list and the
+// session snapshot — so either can be first. When the SWEEP is, nothing has started the
+// restore yet, so awaiting it is a no-op and the location it samples is still `hydrate`'s
+// deliberate no-thread state. The restore then lands while the probe is in flight and puts
+// a session on screen that the probe's answer is about to close.
+//
+// The answer is not a third ordering guard: a probe answer is asynchronous by nature, so
+// the location can move under ANY sweep. What has to hold is checked at the moment of
+// removal.
+test("a sweep that started before the restore still spares what ends up on screen", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  // Note the order: the sweep is created FIRST, so `bootRestore` is still null when it
+  // reads the location.
+  await Promise.all([
+    second.sweepMissingThreads({ knownThreadIds: [], probeThreads: probeReturning([]) }),
+    second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} }),
+  ]);
+
+  assert.deepEqual(
+    tabThreadIds(second, { kind: "project", projectId: "P" }),
+    ["A"],
+    "the session the restore put on screen must survive an answer that predates it"
+  );
+  assert.equal(
+    second.controller.getState().location.threadId,
+    "A",
+    "and the surface must not be left with no conversation at all"
+  );
+});
+
+// The other way the location moves under a sweep, and the one no up-front snapshot can
+// cover: the user taps a session while the probe is in flight. The answer that comes back
+// is about a surface that no longer exists.
+test("a session opened while the probe was in flight is not closed by its answer", async () => {
+  const host = await surfaceWithTabs();
+
+  await host.sweepMissingThreads({
+    knownThreadIds: [],
+    probeThreads: async () => {
+      // Mid-flight navigation: the user picks B, which this answer is about to call gone.
+      // B deliberately sorts BEFORE the other doomed session in the sweep order, so a
+      // later removal still has a chance to act on B's tombstone — which is what makes
+      // this test able to see WHERE the check happens, not just that one exists.
+      await host.openThread({ threadId: "B", threadProjectId: {} });
+      return { threads: [], unavailableProviders: [] };
+    },
+  });
+
+  assert.ok(
+    tabThreadIds(host, { kind: "sessions" }).includes("B"),
+    "the session the user just opened must survive an answer that predates the tap"
+  );
+  assert.equal(host.controller.getState().location.threadId, "B");
+  assert.deepEqual(
+    tabThreadIds(host, { kind: "project", projectId: "P" }),
+    [],
+    "and a session that really is gone is still swept"
+  );
+});
+
+// The mechanism the test above depends on, asserted directly rather than through a
+// scenario: a tombstone is not a note, it is an instruction the reducer obeys on EVERY
+// dispatch. So recording one for an id and then declining to remove it spares nothing —
+// the next command in the same loop sweeps it. This is why the location check sits before
+// the tombstone and not merely before the removal.
+test("a tombstoned session is swept by the next dispatch, whoever makes it", async () => {
+  const host = await surfaceWithTabs();
+  // Establish the tombstone through the supported path, then show that an UNRELATED
+  // command is enough to act on it.
+  await host.sweepMissingThreads({
+    knownThreadIds: [],
+    probeThreads: probeReturning(["B"]),
+  });
+  assert.deepEqual(tabThreadIds(host, { kind: "project", projectId: "P" }), []);
+
+  // C is tombstoned. Re-opening it is a dispatch like any other, and the sweep runs at
+  // the top of the reduction — so it cannot come back.
+  await host.openThread({ threadId: "C", threadProjectId: { C: "P" } });
+  assert.deepEqual(
+    tabThreadIds(host, { kind: "project", projectId: "P" }),
+    [],
+    "the reducer consults the tombstone set on every command, not only on removals"
+  );
+});
+
+// The observable end state of the rule above, stated once for every sweep rather than per
+// id: remote has no screen for "nothing is open", and no repair path back from it — the
+// subscriber's fallback is scoped to CLOSE_TAB, and a sweep dispatches REMOVE_THREAD.
+test("a sweep never empties the surface it was pointed at", async () => {
+  const host = await surfaceWithTabs();
+  const before = host.controller.getState().location.threadId;
+  assert.ok(before);
+
+  await host.sweepMissingThreads({ knownThreadIds: [], probeThreads: probeReturning([]) });
+
+  assert.equal(
+    host.controller.getState().location.threadId,
+    before,
+    "a sweep may close tabs, never the conversation"
+  );
+});
+
 // The server caps one probe at 128 ids and drops the rest — and a dropped id is absent
 // from the answer, which is the same shape as "deleted". Unchunked, a user with more
 // stale tabs than the cap would lose every one past #128 at once, tombstoned. That is the
