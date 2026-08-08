@@ -6,8 +6,8 @@ import {
   layoutThreadIds,
   openThreadTab,
   tabIdForThread,
-} from "../shared/tab-layout.js";
-import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
+} from "./tab-layout.js";
+import { SESSIONS_KEY } from "./tab-workspace-store.js";
 import { selectContextAfterProjectDelete } from "./session-view-state.js";
 import {
   createBrowserSessionViewHistoryAdapter,

@@ -6,10 +6,13 @@
 // including transactions opened by another same-origin window. That is the
 // cross-window guarantee localStorage read/write/verify sequences cannot provide.
 
-import { createTabWorkspace } from "../shared/tab-layout.js";
-import { browserTabWorkspacePersistence } from "../shared/tab-workspace-prefs.js";
+import { createTabWorkspace } from "./tab-layout.js";
+import { browserTabWorkspacePersistence } from "./tab-workspace-prefs.js";
 
-const DB_NAME = "sealwire-session-view";
+// The local surface's database. Other surfaces pass their own `dbName`, because a tab
+// set is keyed by thread and project ids and those are only unique within one relay —
+// sharing a database would let one relay's tabs attach to another's sessions.
+export const DEFAULT_SESSION_VIEW_DB_NAME = "sealwire-session-view";
 const DB_VERSION = 1;
 const WORKSPACES_STORE = "tab-workspaces";
 
@@ -53,6 +56,7 @@ function normalizedSnapshot(records) {
 export function createIndexedDbSessionViewPersistence({
   indexedDb = defaultIndexedDb(),
   legacyPersistence = browserTabWorkspacePersistence,
+  dbName = DEFAULT_SESSION_VIEW_DB_NAME,
 } = {}) {
   function openDatabase() {
     return new Promise((resolve, reject) => {
@@ -61,7 +65,7 @@ export function createIndexedDbSessionViewPersistence({
         return;
       }
 
-      const request = indexedDb.open(DB_NAME, DB_VERSION);
+      const request = indexedDb.open(dbName, DB_VERSION);
       request.onupgradeneeded = () => {
         const database = request.result;
         if (database.objectStoreNames.contains(WORKSPACES_STORE)) {

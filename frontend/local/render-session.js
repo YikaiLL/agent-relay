@@ -49,7 +49,7 @@ import {
   selectPinnedProjectId,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
-import { selectOwningContext } from "./session-view-state.js";
+import { selectOwningContext } from "../shared/session-view-state.js";
 import { syncComposerError } from "./composer-error.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";

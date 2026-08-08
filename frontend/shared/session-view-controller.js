@@ -9,7 +9,7 @@
 import {
   createTabWorkspace,
   sameWorkspace,
-} from "../shared/tab-layout.js";
+} from "./tab-layout.js";
 import {
   createSessionViewState,
   isTasksWorkspaceKey,

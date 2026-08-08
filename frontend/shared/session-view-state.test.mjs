@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { layoutThreadIds, setTabPinned, tabIdForThread } from "../shared/tab-layout.js";
-import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
+import { layoutThreadIds, setTabPinned, tabIdForThread } from "./tab-layout.js";
+import { SESSIONS_KEY } from "./tab-workspace-store.js";
 import {
   createSessionViewState,
   reduceSessionView,

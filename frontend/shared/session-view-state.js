@@ -1,4 +1,4 @@
-// Pure state machine for the local surface's visible session + scoped tab sets.
+// Pure state machine for a surface's visible session + scoped tab sets.
 //
 // `location` is the single canonical answer to "what is on screen":
 //   - Sessions home:        { context: { kind: "sessions" }, threadId: null }
@@ -27,8 +27,8 @@ import {
   promoteTab,
   retargetThread,
   setTabPinned,
-} from "../shared/tab-layout.js";
-import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
+} from "./tab-layout.js";
+import { SESSIONS_KEY } from "./tab-workspace-store.js";
 
 const HISTORY_VERSION = 1;
 

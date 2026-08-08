@@ -233,14 +233,14 @@ import {
   createBrowserSessionViewHistoryAdapter,
   createSessionViewController,
   createSessionViewStore,
-} from "./local/session-view-controller.js";
+} from "./shared/session-view-controller.js";
 import {
   browserSessionViewPersistence,
-} from "./local/session-view-persistence.js";
+} from "./shared/session-view-persistence.js";
 import {
   selectContextAfterProjectDelete,
   sessionViewContextKey,
-} from "./local/session-view-state.js";
+} from "./shared/session-view-state.js";
 import {
   loadRemovedThreadIds,
   rememberRemovedThreadId,

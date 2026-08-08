@@ -5,9 +5,10 @@ import {
   createTabWorkspace,
   layoutThreadIds,
   openThreadTab,
-} from "../shared/tab-layout.js";
-import { SESSIONS_KEY } from "../shared/tab-workspace-store.js";
+} from "./tab-layout.js";
+import { SESSIONS_KEY } from "./tab-workspace-store.js";
 import {
+  DEFAULT_SESSION_VIEW_DB_NAME,
   createIndexedDbSessionViewPersistence,
 } from "./session-view-persistence.js";
 
@@ -267,4 +268,43 @@ test("workspace deletes commit in the same object-store transaction", async () =
   });
   assert.equal(finalSnapshot["deleted-project"], undefined);
   assert.equal(indexedDb.records.has("deleted-project"), false);
+});
+
+// A tab set is keyed by thread and project ids, which are only unique within one
+// relay. Surfaces that can point at more than one relay therefore need their own
+// database, or one relay's tabs would attach to another's sessions. Local keeps the
+// historical name so its stored tabs survive this becoming a parameter.
+//
+// The fake fails the open outright: the assertion is about the NAME the adapter asks
+// for, and a fake that also had to complete a transaction would be all scaffolding.
+test("the database name is the caller's, defaulting to the local surface's", async () => {
+  const opened = [];
+  const indexedDb = {
+    open(name) {
+      opened.push(name);
+      const request = { result: null, error: new Error("refused"), onsuccess: null, onerror: null };
+      queueMicrotask(() => request.onerror?.());
+      return request;
+    },
+  };
+
+  assert.equal(DEFAULT_SESSION_VIEW_DB_NAME, "sealwire-session-view");
+
+  const scoped = createIndexedDbSessionViewPersistence({
+    indexedDb,
+    legacyPersistence: null,
+    dbName: "sealwire-session-view-remote-relay-a",
+  });
+  await assert.rejects(() => scoped.transact(() => ({ value: null, writes: {} })));
+
+  const local = createIndexedDbSessionViewPersistence({
+    indexedDb,
+    legacyPersistence: null,
+  });
+  await assert.rejects(() => local.transact(() => ({ value: null, writes: {} })));
+
+  assert.deepEqual(opened, [
+    "sealwire-session-view-remote-relay-a",
+    "sealwire-session-view",
+  ]);
 });
