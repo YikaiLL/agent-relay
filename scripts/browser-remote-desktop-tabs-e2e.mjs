@@ -1,0 +1,630 @@
+// The session tab strip on the REMOTE surface, and the device gate that decides whether
+// it exists at all.
+//
+// Three things here cannot be shown by a unit test:
+//
+//   1. The gate is a live media query. `(hover: hover) and (pointer: fine)` is resolved
+//      by the browser against the emulated device, so only a real context can prove that
+//      a mouse-driven window gets the strip and a touch one does not.
+//   2. The BIG-SCREEN touch case. The rule the maintainer asked for is about input, not
+//      width: a 1280x800 tablet must keep the plain single-session view. A viewport-based
+//      gate would pass every desktop assertion below and still get this one wrong, so it
+//      is the assertion that actually pins the rule.
+//   3. The strip and the transcript agreeing. Opening a tab commits through the
+//      controller and the VIEW happens in a subscriber; a wiring mistake there leaves a
+//      strip that highlights one session while another is on screen — which renders fine
+//      and passes every pure test.
+//
+// Lightweight like the other remote-* scenarios: it serves the built web/ bundle over a
+// static server and stubs the relay WebSocket — no relay / broker / worker process.
+
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+
+import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
+import { attachPageDebugLogging, launchBrowser } from "./e2e/harness/browser.mjs";
+import { startStaticServer } from "./e2e/harness/static-server.mjs";
+
+const ROOT = process.cwd();
+const WEB_ROOT = path.join(ROOT, "web");
+const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 30000);
+const SHOT_DIR = process.env.BROWSER_E2E_SHOT_DIR || "";
+const RELAY_ID = "relay-e2e";
+const THREAD_ACTIVE = "thread-tabs-active";
+const THREAD_B = "thread-tabs-beta";
+const THREAD_C = "thread-tabs-gamma";   // the only one in a project
+const THREAD_D = "thread-tabs-delta";
+
+const DESKTOP_VIEWPORT = { width: 1440, height: 900 };
+// Deliberately WIDE. This is the iPad shape: plenty of room for a strip, but a finger
+// is the primary pointer.
+const TABLET_VIEWPORT = { width: 1280, height: 800 };
+const PHONE_VIEWPORT = { width: 390, height: 844 };
+
+function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) {
+  const REMOTE_STATE_STORAGE_KEY = "agent-relay.remote-state";
+  const REMOTE_STATE_SCHEMA_VERSION = 1;
+  const REMOTE_SECRET_DB_NAME = "agent-relay-secrets";
+  const REMOTE_SECRET_STORE_NAME = "payload-secrets";
+  const REMOTE_SECRET_KEY_STORE_NAME = "secret-keys";
+
+  const relayProfile = {
+    relayId,
+    relayLabel: "Fake Relay",
+    brokerUrl: "ws://fake-broker.test",
+    brokerChannelId: "room-e2e",
+    relayPeerId: "relay-peer-e2e",
+    securityMode: "managed",
+    deviceId: "device-e2e",
+    deviceLabel: "Browser E2E",
+    hasStoredPayloadSecret: true,
+    deviceJoinTicket: "device-join-ticket-e2e",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 3600,
+  };
+
+  const thread = (id, name, updatedAt) => ({
+    id,
+    name,
+    preview: "a preview",
+    cwd: "/tmp/e2e-remote-tabs",
+    updated_at: updatedAt,
+    source: "codex",
+    provider: "codex",
+    status: "completed",
+    model_provider: "openai",
+  });
+  const threads = [
+    thread(threadActive, "Active session", 3),
+    thread(threadB, "Beta session", 2),
+    thread(threadC, "Gamma session", 1),
+    thread(threadD, "Delta session", 0),
+  ];
+
+  const snapshot = {
+    provider: "codex",
+    service_ready: true,
+    codex_connected: true,
+    broker_connected: true,
+    broker_channel_id: "room-e2e",
+    broker_peer_id: "relay-peer-e2e",
+    security_mode: "managed",
+    e2ee_enabled: false,
+    broker_can_read_content: true,
+    audit_enabled: false,
+    active_thread_id: threadActive,
+    active_controller_device_id: "device-e2e",
+    active_controller_last_seen_at: Math.floor(Date.now() / 1000),
+    controller_lease_expires_at: Math.floor(Date.now() / 1000) + 60,
+    controller_lease_seconds: 15,
+    active_turn_id: null,
+    current_status: "idle",
+    active_flags: [],
+    pending_approvals: [],
+    thread_activity: [],
+    current_cwd: "/tmp/e2e-remote-tabs",
+    model: "gpt-5.4",
+    available_models: [],
+    approval_policy: "never",
+    sandbox: "workspace-write",
+    reasoning_effort: "medium",
+    allowed_roots: [],
+    device_records: [],
+    paired_devices: [],
+    pending_pairing_requests: [],
+    projects_revision: 1,
+    provider_status: [
+      { provider: "codex", status: "connected", connected: true, display_name: "Codex" },
+    ],
+    transcript_truncated: false,
+    transcript: [],
+    logs: [],
+  };
+
+  window.localStorage.setItem(
+    REMOTE_STATE_STORAGE_KEY,
+    JSON.stringify({
+      schemaVersion: REMOTE_STATE_SCHEMA_VERSION,
+      activeRelayId: relayId,
+      clientAuth: null,
+      remoteProfiles: { [relayId]: relayProfile },
+    })
+  );
+
+  window.__agentRelaySecretReady = false;
+  const openRequest = indexedDB.open(REMOTE_SECRET_DB_NAME, 1);
+  openRequest.onupgradeneeded = () => {
+    const database = openRequest.result;
+    if (!database.objectStoreNames.contains(REMOTE_SECRET_STORE_NAME)) {
+      database.createObjectStore(REMOTE_SECRET_STORE_NAME, { keyPath: "id" });
+    }
+    if (!database.objectStoreNames.contains(REMOTE_SECRET_KEY_STORE_NAME)) {
+      database.createObjectStore(REMOTE_SECRET_KEY_STORE_NAME, { keyPath: "id" });
+    }
+  };
+  openRequest.onsuccess = () => {
+    const database = openRequest.result;
+    const tx = database.transaction(REMOTE_SECRET_STORE_NAME, "readwrite");
+    tx.objectStore(REMOTE_SECRET_STORE_NAME).put({
+      id: relayId,
+      kind: "software",
+      payloadSecret: "payload-secret-e2e",
+    });
+    tx.oncomplete = () => {
+      window.__agentRelaySecretReady = true;
+    };
+  };
+
+  class FakeWebSocket extends EventTarget {
+    static OPEN = 1;
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = FakeWebSocket.OPEN;
+      queueMicrotask(() => {
+        this.dispatchEvent(new Event("open"));
+        this.#emit({
+          type: "welcome",
+          protocol_version: 1,
+          peer_id: "surface-e2e",
+          channel_id: "room-e2e",
+          peers: [{ peer_id: "relay-peer-e2e", role: "relay" }],
+        });
+        this.#emit({
+          type: "presence",
+          kind: "joined",
+          peer: { peer_id: "relay-peer-e2e", role: "relay" },
+        });
+        this.#emit({
+          type: "message",
+          payload: { protocol_version: 1, kind: "session_snapshot", snapshot },
+        });
+      });
+    }
+    send(raw) {
+      const frame = JSON.parse(raw);
+      const payload = frame.payload;
+      const request = payload?.request || {};
+      const actionId = payload?.action_id;
+      if (request.type === "heartbeat") {
+        this.#respond(actionId, { action: "heartbeat", ok: true, snapshot });
+        return;
+      }
+      if (request.type === "list_threads") {
+        this.#respond(actionId, {
+          action: "list_threads",
+          ok: true,
+          snapshot,
+          threads: { threads },
+        });
+        return;
+      }
+      if (request.type === "fetch_projects") {
+        this.#respond(actionId, {
+          action: "fetch_projects",
+          ok: true,
+          snapshot,
+          projects: {
+            // THREAD_C belongs to project P; the other two belong to nothing. That gap
+            // between "owns" and "is pinned" is where the filing bug lives.
+            projects: [{ id: "P", name: "Alpha project" }],
+            thread_project_id: { [threadC]: "P" },
+            projects_revision: 1,
+          },
+        });
+        return;
+      }
+      if (request.type === "fetch_reviews") {
+        this.#respond(actionId, {
+          action: "fetch_reviews",
+          ok: true,
+          snapshot,
+          reviews: { reviews: [] },
+        });
+        return;
+      }
+      if (request.type === "fetch_workflows") {
+        this.#respond(actionId, {
+          action: "fetch_workflows",
+          ok: true,
+          snapshot,
+          workflows: { workflows: [] },
+        });
+        return;
+      }
+      if (request.type === "fetch_thread_transcript") {
+        // Answer for the thread that was ASKED for. A hardcoded id would let a
+        // mis-wired view change still land on a plausible-looking transcript.
+        this.#respond(actionId, {
+          action: "fetch_thread_transcript",
+          ok: true,
+          snapshot,
+          thread_transcript: {
+            thread_id: request.thread_id || request.input?.thread_id || threadActive,
+            entries: [],
+            prev_cursor: null,
+          },
+        });
+      }
+    }
+    close() {
+      this.readyState = 3;
+      this.dispatchEvent(new CloseEvent("close", { code: 1000, reason: "closed" }));
+    }
+    #respond(actionId, result) {
+      this.#emit({
+        type: "message",
+        payload: {
+          protocol_version: 1,
+          kind: "remote_action_result",
+          action_id: actionId,
+          ...result,
+        },
+      });
+    }
+    #emit(frame) {
+      this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(frame) }));
+    }
+  }
+  window.WebSocket = FakeWebSocket;
+}
+
+async function openSurface(browserContext, origin, label) {
+  const page = await browserContext.newPage();
+  attachPageDebugLogging(page, "remote", { prefix: `remote-desktop-tabs-e2e:${label}` });
+  await page.addInitScript(installFakeRelay, {
+    relayId: RELAY_ID,
+    threadActive: THREAD_ACTIVE,
+    threadB: THREAD_B,
+    threadC: THREAD_C,
+    threadD: THREAD_D,
+  });
+  await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(`#remote-threads-list [data-thread-id="${THREAD_B}"]`, {
+    timeout: TIMEOUT_MS,
+  });
+  return page;
+}
+
+// The strip's own invariant, borrowed from the local scenario: what it highlights must
+// be the session on screen. Polled, because the commit is async and the view follows it.
+async function waitForFocusedTab(page, threadId) {
+  try {
+    await page.waitForFunction(
+      (expected) => {
+        const focused = document.querySelector(".session-tab.is-focused");
+        return focused?.dataset.threadId === expected;
+      },
+      threadId,
+      { timeout: TIMEOUT_MS }
+    );
+  } catch (error) {
+    // A bare "Timeout 30000ms exceeded" here reads as a rendering problem and sends you
+    // looking in the wrong place. Report what the strip ACTUALLY holds instead.
+    const actual = await page
+      .evaluate(() => ({
+        focused: document.querySelector(".session-tab.is-focused")?.dataset.threadId ?? null,
+        tabs: [...document.querySelectorAll(".session-tab[data-thread-id]")].map(
+          (node) => node.dataset.threadId
+        ),
+      }))
+      .catch(() => null);
+    throw new Error(
+      `expected the strip to focus ${threadId}; it held ${JSON.stringify(actual)}`
+    );
+  }
+}
+
+// Never assert on an ElementHandle. `assert.equal(handle, null)` makes node serialize
+// the handle to build its message, which exhausts memory and kills the process — so the
+// test fails as a bare SIGKILL with no assertion text. Count nodes instead.
+async function shoot(page, name) {
+  if (!SHOT_DIR) return;
+  await fs.mkdir(SHOT_DIR, { recursive: true });
+  await page.screenshot({ path: path.join(SHOT_DIR, `${name}.png`), fullPage: false });
+}
+
+async function stripCount(page) {
+  return page.$$eval(".session-tab-strip", (nodes) => nodes.length);
+}
+
+async function tabThreadIds(page) {
+  return page.$$eval(".session-tab[data-thread-id]", (nodes) =>
+    nodes.map((node) => node.dataset.threadId)
+  );
+}
+
+async function main() {
+  const server = await startStaticServer({
+    rootDir: WEB_ROOT,
+    indexFile: "remote.html",
+    pathAliases: {
+      "/manifest.webmanifest": "remote-manifest.webmanifest",
+      "/static/remote-sw.js": "remote-sw.js",
+    },
+    stripStaticPrefix: true,
+  });
+  const origin = `http://127.0.0.1:${server.port}`;
+
+  const { browser, context: desktopContext } = await launchBrowser({
+    contextOptions: { viewport: DESKTOP_VIEWPORT },
+  });
+  let page = null;
+
+  try {
+    page = await openSurface(desktopContext, origin, "desktop");
+
+    // ---- 1. A mouse-driven window gets the strip, describing what is on screen. ----
+    await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+    assert.deepEqual(
+      await tabThreadIds(page),
+      [THREAD_ACTIVE],
+      "boot must open exactly one tab, for the session actually being shown"
+    );
+
+    // ---- 2. Opening sessions from the sidebar fills the strip. ----
+    // Double-click, because a single click PEEKS: it reuses the one preview slot, so
+    // two single clicks would leave one tab and prove nothing about accumulation.
+    await page.dblclick(`#remote-threads-list [data-thread-id="${THREAD_B}"]`);
+    await waitForFocusedTab(page, THREAD_B);
+    await page.dblclick(`#remote-threads-list [data-thread-id="${THREAD_D}"]`);
+    await waitForFocusedTab(page, THREAD_D);
+    assert.deepEqual(
+      await tabThreadIds(page),
+      [THREAD_ACTIVE, THREAD_B, THREAD_D],
+      "each kept session takes its own tab, in the order they were opened"
+    );
+
+    await shoot(page, "remote-desktop-tabs-strip");
+
+    // ---- 3. A single click PEEKS rather than stacking. ----
+    // Reopening an already-open session must focus it, not duplicate it — the rule a
+    // browser applies to "switch to tab".
+    await page.click(`#remote-threads-list [data-thread-id="${THREAD_B}"]`);
+    await waitForFocusedTab(page, THREAD_B);
+    assert.deepEqual(
+      await tabThreadIds(page),
+      [THREAD_ACTIVE, THREAD_B, THREAD_D],
+      "a session that is already open must be focused, never duplicated"
+    );
+
+    // ---- 4. Clicking a tab moves the view. ----
+    await page.click(`.session-tab[data-thread-id="${THREAD_ACTIVE}"] .session-tab-main`);
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+
+    // ---- 5. Pinning floats a tab to the front. ----
+    await page.click(`.session-tab[data-thread-id="${THREAD_D}"] .session-tab-pin`);
+    await page.waitForFunction(
+      (expected) =>
+        document.querySelector(".session-tab[data-thread-id]")?.dataset.threadId === expected,
+      THREAD_D,
+      { timeout: TIMEOUT_MS }
+    );
+    assert.equal(
+      (await tabThreadIds(page))[0],
+      THREAD_D,
+      "a pinned tab holds the zone at the front of the strip"
+    );
+
+    // ---- 6. Closing a tab closes the VIEW, not the session. ----
+    await page.click(`.session-tab[data-thread-id="${THREAD_B}"] .session-tab-close`);
+    await page.waitForFunction(
+      (gone) => !document.querySelector(`.session-tab[data-thread-id="${gone}"]`),
+      THREAD_B,
+      { timeout: TIMEOUT_MS }
+    );
+    assert.equal(
+      await page.$$eval(
+        `#remote-threads-list [data-thread-id="${THREAD_B}"]`,
+        (nodes) => nodes.length
+      ),
+      1,
+      "closing a tab must not remove the session from the sidebar"
+    );
+
+    // ---- 7. A session is filed under ITS project, not the one it was opened from. ----
+    // THREAD_C belongs to project P; everything else is unassigned. Opening it moves the
+    // location into P's workspace, which must hold C alone.
+    await page.click(`.session-tab[data-thread-id="${THREAD_ACTIVE}"] .session-tab-main`);
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+    await page.dblclick(`#remote-threads-list [data-thread-id="${THREAD_C}"]`);
+    await waitForFocusedTab(page, THREAD_C);
+    assert.deepEqual(
+      await tabThreadIds(page),
+      [THREAD_C],
+      "a session in a project gets that project's tab set, not the one it was opened from"
+    );
+
+    // ---- 8. Closing the LAST tab in a workspace must move the view, not orphan it. ----
+    // Remote always renders a conversation, so emptying a workspace falls back to the
+    // relay's live thread — which also lands us back in the unassigned workspace, proving
+    // the strip followed rather than being left describing an empty set.
+    //
+    // Waits on the CLOSED tab disappearing. Waiting for "something is focused" is
+    // satisfied by the pre-close frame, and then reads a stale highlight.
+    await page.click(`.session-tab[data-thread-id="${THREAD_C}"] .session-tab-close`);
+    await page.waitForFunction(
+      (gone) => !document.querySelector(`.session-tab[data-thread-id="${gone}"]`),
+      THREAD_C,
+      { timeout: TIMEOUT_MS }
+    );
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+    assert.deepEqual(
+      await tabThreadIds(page),
+      [THREAD_D, THREAD_ACTIVE],
+      "emptying a workspace returns to the live thread's workspace, intact"
+    );
+
+    // ---- 9. Selecting an EMPTY project must stick. ----
+    // P's only session was closed in step 8, so this switches into a workspace with no
+    // tabs — the case where the close-fallback and the context switch collide. If the
+    // fallback is not scoped to a close, the live thread is re-filed into ITS context and
+    // yanks the selection straight back out, which reads as "the switcher does nothing".
+    await page.click(".project-switcher-trigger");
+    await page.locator(".project-switcher-option", { hasText: /^Alpha project$/ }).first().click();
+    await page.waitForFunction(
+      () => document.querySelectorAll(".session-tab[data-thread-id]").length === 0,
+      undefined,
+      { timeout: TIMEOUT_MS }
+    );
+    // Hold it: a yank-back arrives a tick later, so sampling once would pass either way.
+    await page.waitForFunction(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(
+            () => resolve(document.querySelectorAll(".session-tab[data-thread-id]").length === 0),
+            250
+          );
+        }),
+      undefined,
+      { timeout: TIMEOUT_MS }
+    );
+    assert.equal(
+      await page.$eval("#remote-pinned-project .pinned-project-chip-name", (n) =>
+        n.textContent.trim()
+      ),
+      "Alpha project",
+      "the sidebar pin must follow the committed context"
+    );
+    // Back to the unassigned workspace for the reload assertion below.
+    await page.click(`#remote-threads-list [data-thread-id="${THREAD_ACTIVE}"]`);
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+
+    // ---- 10. Closing the LIVE thread's only tab re-creates it, on purpose. ----
+    // Documented rather than "fixed": that conversation is still on screen and remote has
+    // no home screen to close it in favour of, so the strip re-describes it rather than
+    // lying. Pinned here so the behaviour is a decision and not an accident.
+    await page.click(`.session-tab[data-thread-id="${THREAD_D}"] .session-tab-pin`);
+    await page.click(`.session-tab[data-thread-id="${THREAD_D}"] .session-tab-close`);
+    await page.waitForFunction(
+      (gone) => !document.querySelector(`.session-tab[data-thread-id="${gone}"]`),
+      THREAD_D,
+      { timeout: TIMEOUT_MS }
+    );
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+    await page.click(`.session-tab[data-thread-id="${THREAD_ACTIVE}"] .session-tab-close`);
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+    assert.deepEqual(
+      await tabThreadIds(page),
+      [THREAD_ACTIVE],
+      "the live thread's tab comes back, because its conversation never left the screen"
+    );
+
+    // ---- 11. The tab set survives a reload. ----
+    // Remote has no URL routing, so this is the ONLY thing proving the IndexedDB round
+    // trip: the strip is rebuilt from storage, not from anything on the page. The
+    // focused tab after a reload is the relay's ACTIVE session, because remote's default
+    // view is still the live thread — restoring the previously-focused tab would mean
+    // taking that decision away from the relay, which is deliberately not done here.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
+    await waitForFocusedTab(page, THREAD_ACTIVE);
+    await page.waitForFunction(
+      (expected) =>
+        document.querySelectorAll(".session-tab[data-thread-id]").length === expected,
+      1,
+      { timeout: TIMEOUT_MS }
+    );
+    assert.deepEqual(
+      await tabThreadIds(page),
+      [THREAD_ACTIVE],
+      "a reload restores the stored workspace, read back from storage"
+    );
+
+    await page.close();
+    page = null;
+
+    // ---- 12. A BIG-SCREEN touch device keeps today's single-session view. ----
+    // The case the whole gate exists for: same width class as the desktop run above,
+    // but a finger is the primary pointer.
+    const tabletContext = await browser.newContext({
+      viewport: TABLET_VIEWPORT,
+      hasTouch: true,
+    });
+    const tabletPage = await openSurface(tabletContext, origin, "tablet");
+    assert.equal(
+      await tabletPage.evaluate(() =>
+        matchMedia("(hover: hover) and (pointer: fine)").matches
+      ),
+      false,
+      "fixture check: a touch context must not report a desktop pointer"
+    );
+    await shoot(tabletPage, "remote-tablet-no-strip");
+    assert.equal(
+      await stripCount(tabletPage),
+      0,
+      "a wide TOUCH surface must keep the plain single-session view — width is not the rule"
+    );
+    // ...and switching sessions still works there, exactly as before.
+    await tabletPage.tap(`#remote-threads-list [data-thread-id="${THREAD_B}"]`);
+    await tabletPage.waitForFunction(
+      (expected) =>
+        document.querySelector("#remote-threads-list .conversation-item.is-active")
+          ?.dataset.threadId === expected,
+      THREAD_B,
+      { timeout: TIMEOUT_MS }
+    );
+    assert.equal(
+      await stripCount(tabletPage),
+      0,
+      "switching sessions on a touch surface must not conjure a strip"
+    );
+    await tabletContext.close();
+
+    // ---- 13. A NARROW window with a mouse still gets the strip. ----
+    // pointer-mode.js draws this distinction explicitly ("a narrow desktop window is
+    // drawer-shaped but still mouse-driven"), and it is the other half of the rule step
+    // 12 proves: the gate is about input, never about width. Without this, a viewport
+    // condition could creep into the gate and only step 12 would notice — and it would
+    // pass, because a touch tablet is wide.
+    const narrowContext = await browser.newContext({ viewport: { width: 500, height: 900 } });
+    const narrowPage = await openSurface(narrowContext, origin, "narrow");
+    assert.equal(
+      await stripCount(narrowPage),
+      1,
+      "a narrow but mouse-driven window keeps the strip — the gate is input, not width"
+    );
+    await narrowContext.close();
+
+    // ---- 14. A phone, for completeness. ----
+    const phoneContext = await browser.newContext({
+      viewport: PHONE_VIEWPORT,
+      deviceScaleFactor: 2,
+      hasTouch: true,
+      isMobile: true,
+    });
+    const phonePage = await phoneContext.newPage();
+    attachPageDebugLogging(phonePage, "remote", { prefix: "remote-desktop-tabs-e2e:phone" });
+    await phonePage.addInitScript(installFakeRelay, {
+      relayId: RELAY_ID,
+      threadActive: THREAD_ACTIVE,
+      threadB: THREAD_B,
+      threadC: THREAD_C,
+    });
+    await phonePage.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
+    await phonePage.waitForSelector("#remote-nav-toggle-button", {
+      state: "visible",
+      timeout: TIMEOUT_MS,
+    });
+    assert.equal(
+      await stripCount(phonePage),
+      0,
+      "a phone must keep the plain single-session view"
+    );
+    await phoneContext.close();
+
+    console.log("remote-desktop-tabs e2e: OK");
+  } catch (error) {
+    if (page) {
+      await writeFailureArtifacts(page, "remote-desktop-tabs", error).catch(() => {});
+    }
+    throw error;
+  } finally {
+    await browser.close().catch(() => {});
+    await server.close().catch(() => {});
+  }
+}
+
+await main();

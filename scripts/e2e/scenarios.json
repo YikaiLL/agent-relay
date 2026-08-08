@@ -58,6 +58,7 @@
       "remote-mobile-header",
       "remote-mobile-session-actions",
       "remote-mobile-bell",
+      "remote-desktop-tabs",
       "public-session-rename",
       "public-broker",
       "public-enrollment",
@@ -75,6 +76,7 @@
       "remote-mobile-header",
       "remote-mobile-session-actions",
       "remote-mobile-bell",
+      "remote-desktop-tabs",
       "public-session-rename",
       "public-refresh",
       "public-thread-settings",
@@ -182,6 +184,17 @@
       "transport": "static-remote",
       "coverage": [
         "activity-filter-mobile"
+      ]
+    },
+    "remote-desktop-tabs": {
+      "script": "browser-remote-desktop-tabs-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "static-remote",
+      "coverage": [
+        "session-tabs",
+        "device-gate",
+        "mobile-layout"
       ]
     },
     "remote-mobile-session-actions": {

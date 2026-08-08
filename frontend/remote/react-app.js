@@ -240,6 +240,10 @@ import { RemoteSettingsModal } from "./settings-modal.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
 import { renderLog } from "./session-surface.js";
 import { formatRelativeTime, formatTimestamp, shortId } from "./utils.js";
+import { SessionTabStrip, buildSessionTabItems } from "../shared/session-tab-strip.js";
+import { layoutThreadIds } from "../shared/tab-layout.js";
+import { sessionViewContextKey } from "../shared/session-view-state.js";
+import { useRemoteSessionTabs } from "./session-tabs-host.js";
 
 const h = React.createElement;
 const LIVE_TRANSCRIPT_DETAIL_REFRESH_MS = 1000;
@@ -616,8 +620,14 @@ function RemoteApp() {
   });
   const promptRemoteProjectName = (current = "") =>
     normalizeProjectName(window.prompt("Project name", current));
-  const setActiveProject = (projectId) =>
-    threadListStore.getState().setActiveProject(projectId);
+  // Straight through the session-view controller, exactly as local's switcher does: each
+  // context owns its own workspace and its own remembered focus, so selecting a project
+  // has to MOVE the location or the strip would describe a workspace nobody is in. The
+  // sidebar's pinned id is then written back from the committed context by the projection
+  // effect below, which keeps one source of truth instead of two.
+  const setActiveProject = (projectId) => {
+    void sessionTabsHost.selectProject(projectId);
+  };
   const setThreadFilter = (next) => threadListStore.getState().setThreadFilter(next);
   const setThreadFilterRetained = (retained) =>
     threadListStore.getState().setThreadFilterRetained(retained);
@@ -630,6 +640,26 @@ function RemoteApp() {
       { threads: currentState.threads, search: currentState.threadSearch },
       threadId
     );
+
+  // The session tab set, keyed by the selected project exactly as local keys its own.
+  // The host owns the store/controller lifecycle per relay; see session-tabs-host.js.
+  const { host: sessionTabsHost, viewState: sessionTabsView } = useRemoteSessionTabs(
+    currentState.remoteAuth?.relayId || null
+  );
+  // Membership, held in a ref: it is an INPUT to filing a tab, not a trigger for it.
+  const threadProjectIdRef = useRef(null);
+  threadProjectIdRef.current = remoteProjects.threadProjectId || null;
+  // The RELAY's live thread, read from realSession rather than the rendered projection —
+  // the projection rewrites active_thread_id to whatever is pinned, so reading it here
+  // would make "fall back to the live thread" mean "fall back to the one just closed".
+  const liveThreadIdRef = useRef(null);
+  liveThreadIdRef.current = currentState.realSession?.active_thread_id || null;
+  // The canonical answer to "which tab set is on screen", exactly as on local: the
+  // LOCATION owns it, and the sidebar's pinned project is a projection of it (see the
+  // onCommit hook in the host wiring below). Deriving it the other way — from the pin —
+  // files sessions into whichever project happens to be selected, which is the bug
+  // `selectOwningContext` was written to fix.
+  const sessionTabsContext = sessionTabsView.location.context;
 
   // Whether the field is open, and what has been typed into it, both live in
   // `threadListStore` — the same place local reads them from. They were a pair of
@@ -709,13 +739,12 @@ function RemoteApp() {
     if (!confirmed) return;
     try {
       await deleteRemoteProject(projectId);
-      // Stand the pin down BEFORE the refetch. The switcher already fails open on an id
-      // it cannot resolve, so the screen would recover either way — but leaving a dead
-      // id in the store means the next payload that happens to contain a project with
-      // that id silently re-pins it.
-      if (readActiveProjectId(threadListStore) === projectId) {
-        threadListStore.getState().setActiveProject(null);
-      }
+      // Move the LOCATION out of the dead project, before the refetch. Writing the
+      // sidebar pin here instead would desync the two: the pin is a projection of the
+      // context and its effect is edge-triggered ON the context, so clearing the pin
+      // directly leaves the strip rendering — and every close/pin/move aiming at — a
+      // workspace whose project no longer exists.
+      await sessionTabsHost.forgetProject(projectId);
       refreshRemoteProjects();
       renderLog(`Deleted project "${name}".`);
     } catch (error) {
@@ -1052,6 +1081,97 @@ function RemoteApp() {
   // tab (rail + modal) and the mobile chip badge stay in sync with the session.
   const remoteDeviceId = currentState.remoteAuth?.deviceId;
   const remoteViewedThreadId = session?.active_thread_id || null;
+
+
+  // The two halves of keeping the strip honest. They are separate because the causes
+  // are: one is the user steering, the other is the world moving underneath.
+  //
+  // 1. Controller -> screen. A committed location change performs the view.
+  //
+  // A CLOSE that lands on no thread (it emptied the workspace) still has to put something
+  // on screen: remote always shows a conversation, so it falls back to the relay's live
+  // thread, which re-opens a tab for it. Skipping instead would leave the just-closed
+  // session rendered under a strip claiming nothing is open.
+  //
+  // Scoped to CLOSE_TAB, and that scope is load-bearing. A context SWITCH also lands on
+  // no thread whenever the project you picked has no tabs yet — and falling back there
+  // would immediately re-file the live thread into ITS owning context, yanking you back
+  // out of the project you just selected. That reads as "the project switcher does
+  // nothing", which is how it was found.
+  //
+  // Two consequences worth knowing, both accepted rather than overlooked:
+  //
+  //   - Closing the LIVE thread's only tab re-creates it, so the × looks inert there.
+  //     It is the strip refusing to lie: that conversation is still on screen, and remote
+  //     has no home screen to close it in favour of.
+  //   - Selecting an empty project leaves the previous conversation under an empty strip.
+  //     Local expresses this state as the sessions-home overview; remote has no such
+  //     screen, so this is the least-bad of the available shapes rather than a good one.
+  useEffect(
+    () =>
+      sessionTabsHost.controller.subscribe((change) => {
+        if (!change.locationChanged) return;
+        const threadId = change.next.location.threadId;
+        if (threadId) {
+          void handlersRef.current.onViewThread?.(threadId);
+          return;
+        }
+        const liveThreadId = liveThreadIdRef.current;
+        if (change.action?.type === "CLOSE_TAB" && liveThreadId) {
+          void sessionTabsHost.adoptViewedThread({
+            threadId: liveThreadId,
+            threadProjectId: threadProjectIdRef.current,
+          });
+        }
+      }),
+    [sessionTabsHost]
+  );
+
+  // The sidebar's pinned project is a PROJECTION of the committed context, never a second
+  // source of truth — the same one-way sync local does in `syncThreadListViewFromContext`.
+  // Guarded on inequality so this cannot ping-pong with `selectProject`.
+  const contextProjectId =
+    sessionTabsContext?.kind === "project" ? sessionTabsContext.projectId : null;
+  useEffect(() => {
+    if (readActiveProjectId(threadListStore) !== contextProjectId) {
+      threadListStore.getState().setActiveProject(contextProjectId);
+    }
+  }, [contextProjectId, threadListStore]);
+
+  // Boot hydration. Every other command reads persistence as a side effect of doing
+  // something; with no active thread nothing would ever dispatch, so a populated database
+  // would render as an empty strip until the user happened to click a session.
+  useEffect(() => {
+    void sessionTabsHost.hydrate();
+  }, [sessionTabsHost]);
+
+  // 2. Screen -> controller. Remote's viewed thread is NOT owned by the controller —
+  // boot shows the relay's active thread, another client can move it, and a Claude
+  // pending id gets promoted mid-turn. Mirroring it back guarantees the strip always
+  // describes what is actually rendered, which is the invariant five review rounds on
+  // the local surface were spent establishing.
+  //
+  // `preview` is deliberately omitted rather than passed: omitting it routes without
+  // re-flagging an already-open tab, so a session the user chose to KEEP is not demoted
+  // back to a peek by the snapshot that follows.
+  // The relay's own lineage field. It is the ONLY signal that separates a Claude
+  // pending->real promotion from another device switching threads; without it the pending
+  // tab would survive beside its promoted self, persisted, one per session.
+  //
+  // Held in a ref for the same reason as the others: it is an INPUT to how the change is
+  // classified, never a reason to re-classify. Reading it inline would be correct — it
+  // comes from the same render's `session` as `remoteViewedThreadId` — but it would read
+  // as a missing dependency to everyone after this.
+  const promotedFromRef = useRef(null);
+  promotedFromRef.current = session?.active_thread_promoted_from || null;
+  useEffect(() => {
+    if (!remoteViewedThreadId) return;
+    void sessionTabsHost.adoptViewedThread({
+      threadId: remoteViewedThreadId,
+      promotedFrom: promotedFromRef.current,
+      threadProjectId: threadProjectIdRef.current,
+    });
+  }, [remoteViewedThreadId, sessionTabsHost]);
   // Reviewer-panel data over the dedicated (uncompacted) `fetch_reviews` channel, cached and
   // re-fetched only when the snapshot's `reviews_revision` changes.
   const remoteReviewsCacheRef = useRef(null);
@@ -1129,6 +1249,42 @@ function RemoteApp() {
     remoteDeviceId,
     hasControllerLease,
   ]);
+
+  // Built once per render and shared by the sidebar's group roll-up, its per-row dots,
+  // and the tab strip — the same hoist local does (render-session.js), one level up now
+  // that a second region needs them. Beyond the wasted rebuild, `snapshotMap()` copies
+  // mutable state on every call, so two copies could let a tab's dot disagree with the
+  // sidebar row for the same session.
+  const threadActivityMap = buildThreadActivityMap(session);
+  const threadAttentionMap = threadAttention.snapshotMap();
+  const threadReviewingSet = buildReviewingThreadSet(session, remoteReviews);
+
+  // The strip's view model. `workspace` is the tab set for the CURRENT context, so
+  // selecting a project swaps the whole strip, exactly as on local.
+  const sessionTabItems = buildSessionTabItems({
+    workspace: sessionTabsView.workspaces[sessionViewContextKey(sessionTabsContext)] || {
+      tabs: [],
+      focusedTabId: null,
+    },
+    layoutThreadIds,
+    // A tab can outlive the thread it names — the list is paginated and a session can
+    // be deleted from another surface — so an unresolvable id still gets a readable
+    // label rather than vanishing from a strip that is meant to describe the screen.
+    resolveThread(threadId) {
+      const thread = findVisible(threadId);
+      if (!thread) {
+        return { title: shortId(threadId), tooltip: threadId };
+      }
+      return {
+        title: thread.name || thread.preview || shortId(thread.id),
+        tooltip: thread.cwd || thread.name || thread.id,
+        provider: thread.provider || "",
+      };
+    },
+    threadActivity: threadActivityMap,
+    threadAttention: threadAttentionMap,
+    threadReviewing: threadReviewingSet,
+  });
 
   // Inputs for the composer idle nudge ("Want a second opinion on these
   // changes?"), mirroring the local surface. Plain render-time derivations — not
@@ -1474,7 +1630,22 @@ function RemoteApp() {
     }
   }
 
-  async function handleResumeThread(threadId) {
+  // The strip renames in place (right-click or F2) rather than through the actions
+  // sheet, so it commits a raw string here. An empty commit is a RESET to the agent's
+  // own name, which is why the normalized value falls back to `null` rather than being
+  // rejected — the same two intents `promptRename` distinguishes for the sheet.
+  async function handleRenameThreadInline(threadId, rawName) {
+    try {
+      await renameRemoteThread(threadId, normalizeThreadName(rawName) || null);
+      await runThreadRefresh("session renamed", { silent: true, fresh: true });
+    } catch (error) {
+      renderLog(`Rename failed: ${error?.message || error}`);
+    }
+  }
+
+  // `preview` comes from the shared row: a single click peeks (reusing the one preview
+  // tab), a double click keeps. It used to be dropped here because remote had no strip.
+  async function handleResumeThread(threadId, { preview } = {}) {
     closeRemoteNavigation();
     // Opening a thread clears its attention dot; treat the click as the user
     // gesture that unlocks notification permission for later events. Store the
@@ -1482,7 +1653,14 @@ function RemoteApp() {
     // the user dismissed the prompt during pairing).
     threadAttention.clear(threadId);
     void requestAndStorePermission();
-    await handlers.onViewThread?.(threadId);
+    // Navigation goes through the controller so the tab set and what is on screen can
+    // never disagree; the subscriber below performs the actual view change. The host
+    // files it under the thread's OWNING project, not the pinned one.
+    await sessionTabsHost.openThread({
+      threadId,
+      threadProjectId: threadProjectIdRef.current,
+      preview,
+    });
   }
 
   // VAPID public key arrives on the session snapshot (null until the server
@@ -1746,6 +1924,9 @@ function RemoteApp() {
         currentState,
         hasRelay,
         hasUsableRelay,
+        threadActivityMap,
+        threadAttentionMap,
+        threadReviewingSet,
         onOpenInfo() {
           closeRemoteNavigation();
           remoteUiStore.getState().setRemoteInfoModalOpen(true);
@@ -1851,6 +2032,48 @@ function RemoteApp() {
           },
           statusBadgeModel,
         }),
+        // Desktop-pointer only. On touch the strip is ABSENT rather than inert: its pin
+        // and close controls are hover-revealed and reordering needs a hold-and-drag,
+        // so a finger would get a row of controls it cannot reach. The tab set is still
+        // maintained underneath, so attaching a mouse reveals a correct strip rather
+        // than an empty one.
+        currentState.remotePointerClass === "desktop"
+          ? h(SessionTabStrip, {
+              items: sessionTabItems,
+              // Derived from the VIEWED thread, with no fallback to the workspace's
+              // remembered focus or to active_thread_id. A fallback is how the strip
+              // starts disagreeing with the screen.
+              focusedTabId:
+                sessionTabItems.find((item) => item.threadId === remoteViewedThreadId)
+                  ?.tabId || null,
+              onFocus(tabId) {
+                const item = sessionTabItems.find((entry) => entry.tabId === tabId);
+                if (item) void handleResumeThread(item.threadId, { preview: undefined });
+              },
+              onClose(tabId) {
+                void sessionTabsHost.controller.closeTab(tabId, {
+                  context: sessionTabsContext,
+                });
+              },
+              onPromote(tabId) {
+                void sessionTabsHost.controller.promoteTab(tabId, {
+                  context: sessionTabsContext,
+                });
+              },
+              onTogglePin(tabId, pinned) {
+                void sessionTabsHost.controller.pinTab(tabId, pinned, {
+                  context: sessionTabsContext,
+                });
+              },
+              onMove(tabId, toIndex) {
+                void sessionTabsHost.controller.moveTab(tabId, toIndex, {
+                  context: sessionTabsContext,
+                });
+              },
+              onRename: handleRenameThreadInline,
+              emptyMessage: "No open sessions. Pick one from the sidebar.",
+            })
+          : null,
         h(RemoteThreadPanel, {
           agentWorkingIndicatorModel,
           onForkFromMessage: handleOpenForkDialog,
@@ -2037,6 +2260,9 @@ function RemoteSidebar({
   currentState,
   hasRelay,
   hasUsableRelay,
+  threadActivityMap,
+  threadAttentionMap,
+  threadReviewingSet,
   onOpenInfo,
   onOpenPairing,
   onOpenSettings,
@@ -2102,14 +2328,6 @@ function RemoteSidebar({
       void onResumeThread?.(threadId);
     },
   });
-
-  // Built once per render and shared by the group headers' roll-up and the per-row dots
-  // below — the same hoist local does (render-session.js). Beyond the wasted rebuild per
-  // project, `threadAttention.snapshotMap()` copies mutable state on every call, so
-  // recomputing per group could let a header's badge disagree with the row under it.
-  const threadActivityMap = buildThreadActivityMap(session);
-  const threadAttentionMap = threadAttention.snapshotMap();
-  const threadReviewingSet = buildReviewingThreadSet(session, remoteReviews);
 
   // The bell re-buckets the SAME rows by state. It belongs here for the same reason the
   // roll-up does: this is where all three per-thread maps are in scope. Doing it in the
