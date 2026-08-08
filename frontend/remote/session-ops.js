@@ -1348,7 +1348,7 @@ function runRemoteThreadsPoll() {
  * caller reads this. It only matters for search — where an empty answer reads as "that
  * session does not exist" — but it rides both paths so there is one shape.
  */
-export async function fetchRemoteThreadPage({ limit = 80, q = "" } = {}) {
+export async function fetchRemoteThreadPage({ limit = 80, q = "", ids = null } = {}) {
   if (!state.remoteAuth) {
     return { threads: [], unavailableProviders: [] };
   }
@@ -1356,6 +1356,13 @@ export async function fetchRemoteThreadPage({ limit = 80, q = "" } = {}) {
   const query = { limit };
   if (q) {
     query.q = q;
+  }
+  // Ask about specific sessions instead of for a page. The relay scans as deeply as a
+  // search for these and does not truncate to `limit`, so absence from the answer means
+  // it genuinely could not resolve the id — the one thing a page cannot tell you, because
+  // its bound applies to the provider scan too. See `ThreadsQuery.ids`.
+  if (Array.isArray(ids) && ids.length) {
+    query.ids = ids;
   }
   const result = await dispatchOrRecover("list_threads", { query });
   return {
@@ -1366,6 +1373,21 @@ export async function fetchRemoteThreadPage({ limit = 80, q = "" } = {}) {
 
 export async function fetchRemoteThreads(options = {}) {
   return (await fetchRemoteThreadPage(options)).threads;
+}
+
+/**
+ * Ask the relay which of these sessions it can still resolve.
+ *
+ * Deliberately NOT routed through the thread-list query cache. That cache is keyed by the
+ * resting list, and a probe is a different question with a different answer shape —
+ * seeding it would let a narrow probe answer a later request for the whole page.
+ */
+export async function probeRemoteThreadsExist(threadIds) {
+  const ids = [...new Set((threadIds || []).filter(Boolean))];
+  if (!ids.length) {
+    return { threads: [], unavailableProviders: [] };
+  }
+  return fetchRemoteThreadPage({ limit: ids.length, ids });
 }
 
 let remoteThreadSearchGeneration = 0;

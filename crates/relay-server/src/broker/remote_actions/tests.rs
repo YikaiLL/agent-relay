@@ -1209,6 +1209,7 @@ async fn list_threads_action_carries_the_search_query() {
                         limit: Some(50),
                         device_id: None,
                         q,
+                        ids: None,
                     },
                 },
             )

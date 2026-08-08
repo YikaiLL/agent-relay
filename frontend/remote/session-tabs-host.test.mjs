@@ -1012,6 +1012,125 @@ test("leaving a phantom context lets the next sweep collect its bucket", async (
   );
 });
 
+// ---------------------------------------------------------------------------
+// Sweeping tabs whose session is gone.
+//
+// Absence from the thread LIST is not evidence of anything — the page is bounded by
+// `limit`, and that bound is applied to the provider scan too, so every session older
+// than the newest 80 is absent while being perfectly alive. The relay answers the actual
+// question by id instead (`ThreadsQuery.ids`), scanned as deeply as a search. Only ids
+// the relay could not resolve at that depth are treated as gone.
+// ---------------------------------------------------------------------------
+
+function probeReturning(aliveIds, extra = {}) {
+  const asked = [];
+  const probe = async (ids) => {
+    asked.push([...ids]);
+    return {
+      threads: ids.filter((id) => aliveIds.includes(id)).map((id) => ({ id })),
+      unavailableProviders: [],
+      ...extra,
+    };
+  };
+  probe.asked = asked;
+  return probe;
+}
+
+async function surfaceWithTabs() {
+  const host = hostWith();
+  await host.openThread({ threadId: "A", threadProjectId: {} });
+  await host.openThread({ threadId: "B", threadProjectId: {} });
+  await host.openThread({ threadId: "C", threadProjectId: { C: "P" } });
+  // Park the view on A, so B and C are the sweepable ones.
+  await host.openThread({ threadId: "A", threadProjectId: {} });
+  return host;
+}
+
+test("a tab whose session the relay cannot resolve is closed", async () => {
+  const host = await surfaceWithTabs();
+  const probe = probeReturning(["B"]);
+
+  await host.sweepMissingThreads({ knownThreadIds: [], probeThreads: probe });
+
+  assert.deepEqual(tabThreadIds(host, { kind: "sessions" }), ["A", "B"]);
+  assert.deepEqual(
+    tabThreadIds(host, { kind: "project", projectId: "P" }),
+    [],
+    "C was unresolvable, so its tab goes"
+  );
+});
+
+// ...and it stays gone. Without a tombstone the next snapshot that mentions the id would
+// file a fresh tab for a session that does not exist.
+test("a swept session cannot be re-opened by a later adoption", async () => {
+  const host = await surfaceWithTabs();
+  await host.sweepMissingThreads({ knownThreadIds: [], probeThreads: probeReturning(["B"]) });
+
+  await host.openThread({ threadId: "C", threadProjectId: { C: "P" } });
+
+  assert.deepEqual(tabThreadIds(host, { kind: "project", projectId: "P" }), []);
+});
+
+// The user's own rule: whatever the relay says, do not close the tab they are looking at.
+test("the session on screen is never swept", async () => {
+  const host = await surfaceWithTabs();
+  const probe = probeReturning([]);
+
+  await host.sweepMissingThreads({ knownThreadIds: [], probeThreads: probe });
+
+  assert.ok(
+    tabThreadIds(host, { kind: "sessions" }).includes("A"),
+    "the visible tab survives even an answer that resolves nothing"
+  );
+  assert.equal(
+    probe.asked.flat().includes("A"),
+    false,
+    "and is not even asked about"
+  );
+});
+
+// A provider that could not be listed is dropped from the merge and the action still
+// succeeds, so "resolved nothing" and "could not look" arrive identically unless the
+// caller reads this. Sweeping on the second one closes live tabs.
+test("an unreachable provider sweeps nothing", async () => {
+  const host = await surfaceWithTabs();
+  const probe = probeReturning([], { unavailableProviders: ["codex"] });
+
+  await host.sweepMissingThreads({ knownThreadIds: [], probeThreads: probe });
+
+  assert.deepEqual(tabThreadIds(host, { kind: "sessions" }), ["A", "B"]);
+  assert.deepEqual(tabThreadIds(host, { kind: "project", projectId: "P" }), ["C"]);
+});
+
+// The list the surface already has is free evidence. Most tabs are recent, so the common
+// case must cost no round trip at all.
+test("sessions already known to be alive are never probed", async () => {
+  const host = await surfaceWithTabs();
+  const probe = probeReturning(["B", "C"]);
+
+  await host.sweepMissingThreads({ knownThreadIds: ["B", "C"], probeThreads: probe });
+
+  assert.deepEqual(probe.asked, [], "nothing to ask about means no request");
+});
+
+test("a probe that fails sweeps nothing and says so", async () => {
+  const logs = [];
+  const host = hostWith({ log: (line) => logs.push(line) });
+  await host.openThread({ threadId: "A", threadProjectId: {} });
+  await host.openThread({ threadId: "B", threadProjectId: {} });
+  await host.openThread({ threadId: "A", threadProjectId: {} });
+
+  await host.sweepMissingThreads({
+    knownThreadIds: [],
+    probeThreads: async () => {
+      throw new Error("broker timed out");
+    },
+  });
+
+  assert.deepEqual(tabThreadIds(host, { kind: "sessions" }), ["A", "B"]);
+  assert.ok(logs.some((line) => line.includes("sweep")), "the failure must be reported");
+});
+
 // The `urlThreadId` trap: RESTORE_HISTORY with a null thread routes to NO thread, which
 // on remote means dropping the surface to an overview it has no screen for. The reconcile
 // must re-run the CURRENT location, not a blank one.

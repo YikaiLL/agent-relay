@@ -40,6 +40,7 @@ import {
   selectOwningContext,
   sessionViewContextKey,
 } from "../shared/session-view-state.js";
+import { layoutThreadIds } from "../shared/tab-layout.js";
 import { detectDeferredThreadPromotion } from "../shared/thread-promotion.js";
 import { renderLog } from "./client-log.js";
 import { getRemoteProjectsStore } from "./projects-host.js";
@@ -165,11 +166,19 @@ export function createRemoteSessionTabsHost({
     // sweeping the cold tab sets. Remote fetches Projects over the broker, so this
     // window is wider here than on local.
     getProjectIds: restorableProjectIds,
-    // Local writes these tombstones; remote has no archive/delete transport of its own.
-    // Sharing the set is deliberate: a session deleted from the local surface in this
-    // browser must not come back as a remote tab.
+    // Two sources, and they answer different halves of the same question.
+    //
+    // `loadRemovedThreadIds` is what the LOCAL surface in this browser archived or
+    // deleted; sharing it is deliberate, so a session deleted there does not come back as
+    // a remote tab. It says nothing about deletions made on another device, because it
+    // cannot — it is a localStorage key.
+    //
+    // `missingThreadIds` is the other device's half: ids the relay itself could not
+    // resolve when asked (see `sweepMissingThreads`). Held in memory rather than
+    // persisted, because it is a conclusion drawn from one boot's answer and the next
+    // boot draws its own — a stale tombstone would outlive whatever made it true.
     getUnavailableThreadIds() {
-      return new Set(loadRemovedThreadIds());
+      return new Set([...loadRemovedThreadIds(), ...missingThreadIds]);
     },
     // Runs BEFORE the subscribers, which is the whole reason the restore records itself
     // here rather than from the value its own `dispatch` resolves with. `commitNow`
@@ -221,6 +230,9 @@ export function createRemoteSessionTabsHost({
 
   // The project set this host has already reconciled against — see `reconcileProjects`.
   let reconciledProjectSignature = null;
+
+  // Sessions the relay could not resolve — see `sweepMissingThreads`.
+  const missingThreadIds = new Set();
 
   function startBootRestore() {
     bootRestore ||= (async () => {
@@ -499,6 +511,84 @@ export function createRemoteSessionTabsHost({
         return await reconcileProjectsNow();
       } catch (error) {
         log(`[session-tabs] project reconcile failed: ${error?.message || error}`);
+        return null;
+      }
+    },
+
+    /**
+     * Close tabs whose session no longer exists anywhere the relay can see.
+     *
+     * The question this answers cannot be answered from the thread LIST, and getting that
+     * wrong is worse than not trying. A page is bounded by `limit`, and the relay applies
+     * that bound to the provider SCAN as well as the result, so every session older than
+     * the newest 80 is absent from it while being perfectly alive — a client that read
+     * absence as deletion would close the tabs of most of a long-lived relay's sessions.
+     * There are at least six reasons a row can be missing from a page and only two of them
+     * mean "gone". So this asks by ID (`ThreadsQuery.ids`), which the relay scans as
+     * deeply as a search and does not truncate.
+     *
+     * Absence from THAT answer means the relay cannot resolve the id: deleted, archived,
+     * or outside this device's `allowed_roots`. All three make the session unopenable
+     * here, which is the property a tab actually claims — so all three are swept, and the
+     * tab that "went missing" is one that would have failed to open anyway.
+     *
+     * Three refusals, each with a test:
+     *
+     *   - the session ON SCREEN is never swept, and never even asked about. The user is
+     *     looking at it; closing that tab is the one outcome with no recovery.
+     *   - an unreachable provider sweeps NOTHING. A provider that fails to list is dropped
+     *     from the merge and the action still succeeds, so "resolved nothing" and "could
+     *     not look" arrive identically unless the caller reads `unavailable_providers`.
+     *   - anything already known alive is not asked about, so the common case — every tab
+     *     is recent — costs no round trip at all.
+     */
+    async sweepMissingThreads({ knownThreadIds = null, probeThreads = null } = {}) {
+      if (typeof probeThreads !== "function") {
+        return null;
+      }
+      try {
+        await controller.whenIdle();
+        const state = controller.getState();
+        const visibleThreadId = state.location.threadId;
+        const known = new Set(knownThreadIds || []);
+        const candidates = [
+          ...new Set(
+            Object.values(state.workspaces).flatMap((workspace) =>
+              (workspace?.tabs || []).flatMap((tab) => layoutThreadIds(tab.layout))
+            )
+          ),
+        ].filter((id) => id && id !== visibleThreadId && !known.has(id));
+        if (!candidates.length) {
+          return null;
+        }
+
+        const answer = await probeThreads(candidates);
+        if (!answer || (answer.unavailableProviders || []).length) {
+          return null;
+        }
+        const resolved = new Set(
+          (answer.threads || []).map((thread) => thread?.id).filter(Boolean)
+        );
+        const missing = candidates.filter((id) => !resolved.has(id));
+        if (!missing.length) {
+          return null;
+        }
+
+        // Recorded BEFORE the removals, so the sweep and every later command read the
+        // same set: `getUnavailableThreadIds` is what stops a snapshot re-filing a tab for
+        // a session that has just been established not to exist.
+        for (const id of missing) {
+          missingThreadIds.add(id);
+        }
+        let last = null;
+        for (const id of missing) {
+          last = await controller.removeThread(id);
+        }
+        return last;
+      } catch (error) {
+        // Fail-soft like every other seam here: a probe that could not complete is not
+        // evidence that anything is gone, and the caller is a `void`.
+        log(`[session-tabs] missing-thread sweep failed: ${error?.message || error}`);
         return null;
       }
     },

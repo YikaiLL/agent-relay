@@ -8492,7 +8492,7 @@ got {}",
         let buried_id = seed_listable_threads(&codex, &cwd, 300, "Refactor the auth guard").await;
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8542,7 +8542,7 @@ got {}",
         );
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("search");
         assert!(
@@ -8600,7 +8600,7 @@ got {}",
 
         // Case-insensitive, and finds the user's title.
         let found = app
-            .list_threads_matching(50, None, Some("auth WORK"))
+            .list_threads_matching(50, None, Some("auth WORK"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8610,7 +8610,7 @@ got {}",
         );
 
         let stale = app
-            .list_threads_matching(50, None, Some("Fake E2E"))
+            .list_threads_matching(50, None, Some("Fake E2E"), None)
             .await
             .expect("search");
         assert!(
@@ -8666,7 +8666,7 @@ got {}",
         }
 
         let found = app
-            .list_threads_matching(20, None, Some("scroll jitter"))
+            .list_threads_matching(20, None, Some("scroll jitter"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8698,7 +8698,7 @@ got {}",
         );
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("search");
         assert_eq!(found.threads.len(), 1, "the response must be narrowed");
@@ -8727,7 +8727,7 @@ got {}",
             .store(true, Ordering::Relaxed);
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("a partial listing must still succeed");
         assert_eq!(
@@ -8783,7 +8783,7 @@ got {}",
 
         // Exactly the 8 characters the row displays.
         let found = app
-            .list_threads_matching(20, None, Some("abcd1234"))
+            .list_threads_matching(20, None, Some("abcd1234"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8795,7 +8795,7 @@ got {}",
         // A titled row must NOT be reachable by its id: the id is a fallback, not a
         // second searchable field, or every query would risk hitting unrelated rows.
         let by_id = app
-            .list_threads_matching(20, None, Some("seeded-thread-0"))
+            .list_threads_matching(20, None, Some("seeded-thread-0"), None)
             .await
             .expect("search");
         assert!(
@@ -8837,13 +8837,13 @@ got {}",
         }
 
         let hit = app
-            .list_threads_matching(20, None, Some(&format!("{prefix}TAIL")))
+            .list_threads_matching(20, None, Some(&format!("{prefix}TAIL")), None)
             .await
             .expect("search");
         assert_eq!(hit.threads.len(), 1, "the full query must still match");
 
         let miss = app
-            .list_threads_matching(20, None, Some(&format!("{prefix}NOPE")))
+            .list_threads_matching(20, None, Some(&format!("{prefix}NOPE")), None)
             .await
             .expect("search");
         assert!(
@@ -8864,7 +8864,7 @@ got {}",
 
         for blank in ["", "   "] {
             let listed = app
-                .list_threads_matching(20, None, Some(blank))
+                .list_threads_matching(20, None, Some(blank), None)
                 .await
                 .expect("search");
             assert_eq!(
@@ -14320,6 +14320,110 @@ settings update: {error}"
         assert!(
             pos_active < pos_stale,
             "recent-activity thread must outrank the merely-selected one (active={pos_active}, stale={pos_stale})"
+        );
+    }
+
+    /// The question a client holding open tabs actually has, and the one a page cannot
+    /// answer: is THIS id still resolvable?
+    ///
+    /// `limit` bounds the provider SCAN, not just the result (`bridge.list_threads`
+    /// truncates), so a session older than the page is absent from it while being
+    /// perfectly alive. A client diffing its tabs against a page would read that as
+    /// deletion and close them — which is the normal state of any long-lived relay, not a
+    /// corner case. An `ids` probe therefore scans as deeply as a search and is not
+    /// truncated to `limit`.
+    #[tokio::test]
+    async fn list_threads_by_id_finds_a_session_older_than_the_page() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, _providers) = build_review_app(cwd, &["codex"]).await;
+
+        let oldest = start_parent(&app, cwd, "codex").await;
+        let middle = start_parent(&app, cwd, "codex").await;
+        let newest = start_parent(&app, cwd, "codex").await;
+        {
+            let mut relay = app.relay.write().await;
+            relay
+                .thread_last_activity_at
+                .insert(oldest.id.clone(), 1_000);
+            relay
+                .thread_last_activity_at
+                .insert(middle.id.clone(), 2_000);
+            relay
+                .thread_last_activity_at
+                .insert(newest.id.clone(), 3_000);
+        }
+
+        // A page of one shows only the newest — this is the trap being avoided.
+        let page = app.list_threads(1, None).await.expect("page");
+        assert!(
+            page.threads.iter().all(|thread| thread.id != oldest.id),
+            "precondition: the oldest session must be off the page"
+        );
+
+        // TWO off-page ids against a page size of one, deliberately: asking for a single
+        // id would leave `truncate(limit)` a no-op and so would not notice a probe still
+        // being cut down to the sidebar's page size.
+        let probed = app
+            .list_threads_matching(1, None, None, Some(&[oldest.id.clone(), middle.id.clone()]))
+            .await
+            .expect("probe");
+
+        let mut answered = probed
+            .threads
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>();
+        answered.sort();
+        let mut expected = vec![oldest.id.clone(), middle.id.clone()];
+        expected.sort();
+        assert_eq!(
+            answered, expected,
+            "an id probe must answer for every id it was given, at any depth, and for nothing else"
+        );
+    }
+
+    /// The other half: a session that is genuinely gone must be ABSENT from the answer,
+    /// which is how the caller learns it. Archive is the case with no tombstone anywhere —
+    /// it removes the row and the provider stops listing it, and that is the entire signal.
+    #[tokio::test]
+    async fn list_threads_by_id_omits_a_session_that_was_archived() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, _providers) = build_review_app(cwd, &["codex"]).await;
+
+        let kept = start_parent(&app, cwd, "codex").await;
+        let doomed = start_parent(&app, cwd, "codex").await;
+        // A live session that is NOT asked about. Without it this test would pass on a
+        // plain page too — two threads minus the archived one look identical either way —
+        // and would therefore prove nothing about the id filter.
+        let unrelated = start_parent(&app, cwd, "codex").await;
+
+        app.archive_thread(&doomed.id, None)
+            .await
+            .expect("archive should succeed");
+
+        let probed = app
+            .list_threads_matching(80, None, None, Some(&[kept.id.clone(), doomed.id.clone()]))
+            .await
+            .expect("probe");
+
+        let answered = probed
+            .threads
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            answered.contains(&kept.id),
+            "a live session must still be resolvable: {answered:?}"
+        );
+        assert!(
+            !answered.contains(&doomed.id),
+            "an archived session must be absent, because absence is the only signal there is"
+        );
+        assert!(
+            !answered.contains(&unrelated.id),
+            "and a probe must answer only for what it asked about: {answered:?}"
         );
     }
 

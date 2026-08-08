@@ -1227,6 +1227,30 @@ function RemoteApp() {
     void sessionTabsHost.reconcileProjects();
   }, [projectsSettled, remoteProjects.projects, sessionTabsHost]);
 
+  // 6. Close tabs whose session is gone — ONCE per boot, and only after the thread list
+  // has arrived so its ids can spare the probe the sessions it already proves are alive.
+  //
+  // Once, deliberately. This is the one operation here that closes something the user
+  // opened, its input is a network answer, and repeating it on every list poll would keep
+  // re-asking a question whose answer only changes when someone deletes a session on
+  // another device. A reload is soon enough for that, and it is when the tabs are being
+  // rebuilt from storage anyway.
+  // `currentState.threads` and not `threadsModel`: the render model returns GROUPS, with
+  // no flat list on it, so keying this off the model would compile, read fine, and never
+  // fire. The raw list is also the honest input — the ids that came back from the relay,
+  // before any grouping or pin policy touched them.
+  const remoteThreadList = currentState.threads;
+  const sweptMissingRef = useRef(null);
+  useEffect(() => {
+    if (sweptMissingRef.current === sessionTabsHost) return;
+    if (!remoteThreadList?.length) return;
+    sweptMissingRef.current = sessionTabsHost;
+    void sessionTabsHost.sweepMissingThreads({
+      knownThreadIds: remoteThreadList.map((thread) => thread?.id).filter(Boolean),
+      probeThreads: (ids) => handlersRef.current.onProbeThreadsExist?.(ids),
+    });
+  }, [remoteThreadList, sessionTabsHost]);
+
   // Reviewer-panel data over the dedicated (uncompacted) `fetch_reviews` channel, cached and
   // re-fetched only when the snapshot's `reviews_revision` changes.
   const remoteReviewsCacheRef = useRef(null);

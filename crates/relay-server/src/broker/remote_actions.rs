@@ -1175,6 +1175,7 @@ async fn execute_remote_action(
                 query.limit.unwrap_or(80).clamp(1, 200),
                 query.device_id.clone(),
                 query.q.as_deref(),
+                query.ids.as_deref(),
             )
             .await
             .map(|threads| RemoteActionOutcome {

@@ -2246,6 +2246,23 @@ pub struct ThreadsQuery {
     /// the whole reason to search.
     #[serde(default)]
     pub q: Option<String>,
+    /// Ask about specific sessions by id, rather than for a page of the list.
+    ///
+    /// Same argument as `q`, for the same reason: a page is bounded by `limit`, and the
+    /// bound is applied to the PROVIDER SCAN as well as the result, so a client that
+    /// diffs its own ids against a page cannot tell "this session is gone" from "this
+    /// session is older than the newest 80". That distinction is the whole question a
+    /// client holding long-lived references — open tabs — needs answered, and it is not
+    /// answerable client-side at all.
+    ///
+    /// Absence from the answer therefore means the relay cannot resolve the id: deleted,
+    /// archived, or outside this device's `allowed_roots`. All three mean the same thing
+    /// to a caller, because all three make the session unopenable here.
+    ///
+    /// Scanned as deeply as a search (`SEARCH_SCAN_LIMIT`) and not truncated to `limit`,
+    /// or it would reproduce the very ambiguity it exists to remove.
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

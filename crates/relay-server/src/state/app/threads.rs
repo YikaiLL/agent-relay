@@ -59,6 +59,34 @@ fn normalize_thread_query(query: Option<&str>) -> Option<String> {
 /// `name` is already the user's rename when one exists: `apply_custom_thread_name`
 /// overlays it BEFORE this runs. That ordering is what makes a renamed session findable
 /// under its new title and not under the provider's old one.
+/// How many ids one probe may ask about.
+///
+/// A probe's caller is a client listing the sessions it still holds a reference to — open
+/// tabs — so the realistic count is single digits. The cap is a bound on what an untrusted
+/// client can make the relay do, not a product limit.
+const MAX_THREAD_ID_PROBE: usize = 128;
+
+/// Normalize a raw id list into a probe set, or `None` for "not a probe".
+///
+/// An EMPTY list normalizes to `None` — i.e. "the normal page" — rather than to "a probe
+/// about nothing". The alternative is worse than it looks: a probe about nothing answers
+/// with nothing, and a caller that diffs its ids against an empty answer concludes every
+/// session it asked about is gone. Making the degenerate input mean "no probe" keeps a
+/// client bug from reading as mass deletion.
+fn normalize_thread_id_probe(ids: Option<&[String]>) -> Option<HashSet<String>> {
+    let wanted = ids?
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .take(MAX_THREAD_ID_PROBE)
+        .map(|id| id.to_string())
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() {
+        return None;
+    }
+    Some(wanted)
+}
+
 fn thread_display_title(thread: &ThreadSummaryView) -> &str {
     match thread.name.as_deref() {
         Some(name) if !name.is_empty() => name,
@@ -75,18 +103,21 @@ impl AppState {
         limit: usize,
         device_id: Option<String>,
     ) -> Result<ThreadsResponse, String> {
-        self.list_threads_matching(limit, device_id, None).await
+        self.list_threads_matching(limit, device_id, None, None)
+            .await
     }
 
     /// `list_threads`, optionally narrowed to rows whose displayed title contains
-    /// `query` (case-insensitive).
+    /// `query` (case-insensitive), or to an explicit set of thread `ids`.
     pub async fn list_threads_matching(
         &self,
         limit: usize,
         device_id: Option<String>,
         query: Option<&str>,
+        ids: Option<&[String]>,
     ) -> Result<ThreadsResponse, String> {
         let query = normalize_thread_query(query);
+        let wanted_ids = normalize_thread_id_probe(ids);
         // Read reviewer ids before the provider fetch so we can request a larger
         // page from each provider. If the newest N slots are all reviewer threads
         // we would return fewer than `limit` normal threads otherwise.
@@ -96,7 +127,11 @@ impl AppState {
         };
         // A search asks each provider for a deep scan, because the row it is looking
         // for is almost always one that fell off the end of a normal page.
-        let scan_limit = if query.is_some() {
+        //
+        // An id probe scans the same way, and for a stronger reason: its caller is asking
+        // whether specific sessions still exist, so a shallow scan would answer "gone" for
+        // every session older than the page and be indistinguishable from the truth.
+        let scan_limit = if query.is_some() || wanted_ids.is_some() {
             SEARCH_SCAN_LIMIT.max(limit)
         } else {
             limit
@@ -204,8 +239,19 @@ impl AppState {
         if let Some(needle) = &query {
             threads.retain(|thread| thread_display_title(thread).to_lowercase().contains(needle));
         }
+        // Applied AFTER the active-thread re-add above, so a probe cannot be handed a row
+        // it did not ask about.
+        if let Some(wanted) = &wanted_ids {
+            threads.retain(|thread| wanted.contains(&thread.id));
+        }
         sort_threads_by_recency(&mut threads);
-        threads.truncate(limit);
+        // A probe is bounded by how many ids it asked about, never by the page size — the
+        // caller's `limit` describes a sidebar, and truncating to it would drop answers it
+        // explicitly requested, which reads as "deleted".
+        threads.truncate(match &wanted_ids {
+            Some(wanted) => wanted.len(),
+            None => limit,
+        });
         let response_threads = threads.clone();
 
         if query.is_some() {
