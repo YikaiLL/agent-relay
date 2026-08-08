@@ -243,7 +243,7 @@ import { formatRelativeTime, formatTimestamp, shortId } from "./utils.js";
 import { SessionTabStrip, buildSessionTabItems } from "../shared/session-tab-strip.js";
 import { layoutThreadIds } from "../shared/tab-layout.js";
 import { sessionViewContextKey } from "../shared/session-view-state.js";
-import { useRemoteSessionTabs } from "./session-tabs-host.js";
+import { BOOT_RESTORE_REASON, useRemoteSessionTabs } from "./session-tabs-host.js";
 
 const h = React.createElement;
 const LIVE_TRANSCRIPT_DETAIL_REFRESH_MS = 1000;
@@ -1113,7 +1113,34 @@ function RemoteApp() {
         if (!change.locationChanged) return;
         const threadId = change.next.location.threadId;
         if (threadId) {
-          void handlersRef.current.onViewThread?.(threadId);
+          const viewed = handlersRef.current.onViewThread?.(threadId);
+          // Repair for the ONE navigation nobody asked for: the boot restore.
+          //
+          // It routes to a session the surface has not fetched yet, so it can fail — the
+          // broker may still be settling. Left alone, that leaves the location naming a
+          // thread the screen is not showing, and the strip highlighting it. Clicking that
+          // tab then does nothing at all: the location already IS that thread, so the
+          // command commits no change and never re-fires this subscriber. Falling back to
+          // the live thread costs the restore and returns a surface that works.
+          //
+          // Scoped to the restore, and that scope is the point. A project selection that
+          // failed the same way must NOT fall back — it would drag the user out of the
+          // project they just chose, which is the trap the CLOSE_TAB branch below spells
+          // out at length.
+          if (change.action?.reason === BOOT_RESTORE_REASON) {
+            void Promise.resolve(viewed).then((shown) => {
+              // The decision itself lives on the host (`shouldRepairBootRestore`), where it
+              // is checkable without rendering — notably the part that makes `false` safe
+              // to act on, since `viewRemoteThread` returns it both for a failed fetch and
+              // for one a newer navigation superseded.
+              const liveThreadId = liveThreadIdRef.current;
+              if (!sessionTabsHost.shouldRepairBootRestore({ shown, liveThreadId })) return;
+              void sessionTabsHost.adoptViewedThread({
+                threadId: liveThreadId,
+                threadProjectId: threadProjectIdRef.current,
+              });
+            });
+          }
           return;
         }
         const liveThreadId = liveThreadIdRef.current;
@@ -1172,6 +1199,34 @@ function RemoteApp() {
       threadProjectId: threadProjectIdRef.current,
     });
   }, [remoteViewedThreadId, sessionTabsHost]);
+
+  // 5. Dead-workspace GC. A deleted project's tab set is COLD data — nothing renders it,
+  // so nothing would ever notice it, and `validHistoryWorkspaces` (the only thing in the
+  // codebase that deletes a whole workspace bucket) runs on RESTORE_HISTORY alone. Remote
+  // had no boot restore to dispatch one, so those buckets accumulated in IndexedDB
+  // forever. This reconciles on the same signal local does (`app.js`'s projects
+  // subscriber) with the same remedy: re-run the current location as a restore.
+  //
+  // Two gates, and they are not redundant. This effect only fires on a SETTLED payload;
+  // the controller's `getProjectIds()` independently reports "not authoritative" until
+  // then, which disables the sweep inside the reduction. Either one alone would be a
+  // single point of failure for an operation whose failure mode is deleting live tab
+  // sets — the sweep is an allowlist diffed against disk, so every key it omits is a
+  // delete, and a payload that is merely still loading looks exactly like "every project
+  // was deleted".
+  //
+  // Fires on every SETTLED payload; the host decides whether that payload is a new
+  // project set. Deliberately not deduped here: a refresh passes through `loading: true`,
+  // so any signature computed in this component goes X -> null -> X and re-fires anyway,
+  // and a ref holding the last one would outlive a relay switch (RemoteApp never
+  // remounts) while the rule it implements is per relay. `reconcileProjects` owns it.
+  const projectsSettled =
+    remoteProjects.loaded && !remoteProjects.loading && !remoteProjects.error;
+  useEffect(() => {
+    if (!projectsSettled) return;
+    void sessionTabsHost.reconcileProjects();
+  }, [projectsSettled, remoteProjects.projects, sessionTabsHost]);
+
   // Reviewer-panel data over the dedicated (uncompacted) `fetch_reviews` channel, cached and
   // re-fetched only when the snapshot's `reviews_revision` changes.
   const remoteReviewsCacheRef = useRef(null);

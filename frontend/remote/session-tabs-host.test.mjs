@@ -22,6 +22,7 @@ const {
   getRemoteSessionTabsHost,
   remoteSessionViewContext,
   resetRemoteSessionTabsHost,
+  BOOT_RESTORE_REASON,
   sessionViewDbNameForRelay,
 } = await import("./session-tabs-host.js");
 const { sessionViewContextKey } = await import("../shared/session-view-state.js");
@@ -244,6 +245,250 @@ function memoryPersistence() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Boot restore. Remote has no URL, so "where was I" has to come from storage — the
+// equivalent of local's `window.history.state` + `?thread=`, which is what makes a
+// reload on local return to the same project and the same session.
+//
+// The tab a workspace remembers is NOT stored separately: `focusedTabId` already
+// round-trips through the workspace record, and the location's thread is defined to be
+// that workspace's focused thread. Only the CONTEXT needs remembering, which is one
+// fewer thing that can disagree with itself.
+// ---------------------------------------------------------------------------
+
+function memoryStorage() {
+  const map = new Map();
+  return {
+    map,
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => map.set(key, String(value)),
+    removeItem: (key) => map.delete(key),
+  };
+}
+
+function bootableHost({ persistence, storage, relayId = "relay-a", projects = ["P", "Q"] }) {
+  return createRemoteSessionTabsHost({
+    relayId,
+    persistence,
+    storage,
+    projectsStore: {
+      getState: () => ({ loaded: true, projects: projects.map((id) => ({ id })) }),
+    },
+    log() {},
+  });
+}
+
+test("a reload returns to the workspace and the tab the surface was last on", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+
+  const first = bootableHost({ persistence, storage });
+  await first.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  // The reload: a brand-new host over the same two stores, exactly as boot builds it.
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  // ...and then the relay's first snapshot arrives, naming its own live thread.
+  await second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+
+  const location = second.controller.getState().location;
+  assert.deepEqual(
+    location.context,
+    { kind: "project", projectId: "P" },
+    "the restored context must survive the relay's first snapshot"
+  );
+  assert.equal(location.threadId, "A", "and so must the tab that context remembered");
+});
+
+// The other half of the same rule. Adopting the live thread does not merely move the
+// location — it FILES a tab. Suppressing the move but not the tab would leave a session
+// the user never opened sitting in their strip after every reload, persisted.
+test("the relay's live thread opens no tab when a restore took precedence", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  await second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+
+  assert.deepEqual(
+    tabThreadIds(second, { kind: "sessions" }),
+    [],
+    "a live thread the user did not open must not be filed on top of their restored view"
+  );
+  assert.equal(second.controller.getState().location.threadId, "A");
+});
+
+// The first-ever boot, and the guard that this change did not take the default away:
+// with nothing remembered, remote still shows what the relay is running.
+test("with nothing remembered, the relay's live thread is still the default view", async () => {
+  const host = bootableHost({ persistence: memoryPersistence(), storage: memoryStorage() });
+  await host.hydrate();
+  await host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+
+  const location = host.controller.getState().location;
+  assert.deepEqual(location.context, { kind: "sessions" });
+  assert.equal(location.threadId, "LIVE");
+});
+
+// A remembered CONTEXT with no remembered TAB is not a restore — it is an empty strip
+// over whatever conversation the relay happens to be running. Remote has no overview
+// screen to land on, so this must fall through to the live thread rather than restore.
+test("a remembered context with no remembered tab falls through to the live thread", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  await second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+
+  assert.equal(second.controller.getState().location.threadId, "LIVE");
+});
+
+// The restore is a ONE-SHOT claim on the first snapshot, not a lock. Everything after it
+// — the user clicking a tab, another client moving focus, a Claude promotion — must move
+// the surface exactly as it did before.
+test("the restore yields to the next thread the surface actually shows", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  await second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+  assert.equal(second.controller.getState().location.threadId, "A");
+
+  await second.adoptViewedThread({ threadId: "B", threadProjectId: {} });
+  assert.equal(
+    second.controller.getState().location.threadId,
+    "B",
+    "the restore must not outlive the snapshot it claimed"
+  );
+});
+
+// The restore routes to a session that has not been fetched yet, so it can fail — and a
+// failed restore is unrecoverable without a repair: the location already names that
+// thread, so clicking its tab commits no change and never re-fires the subscriber. The
+// repair lives in react-app.js; what has to hold HERE is that the restore is
+// distinguishable from an ordinary context switch, or the repair cannot be scoped to it.
+test("the boot restore announces itself, so a failed view can be repaired", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  const changes = [];
+  second.controller.subscribe((change) => changes.push(change));
+  await second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+
+  const restore = changes.find((change) => change.action?.reason === BOOT_RESTORE_REASON);
+  assert.ok(restore, "the restore must be tagged, not inferred from its shape");
+  assert.equal(restore.next.location.threadId, "A");
+
+  // ...and an ordinary project switch must NOT carry the tag, or the repair would fire
+  // on a selection and drag the user back out of the project they just picked.
+  changes.length = 0;
+  await second.selectProject("Q");
+  assert.equal(
+    changes.some((change) => change.action?.reason === BOOT_RESTORE_REASON),
+    false
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The boot seam is CONCURRENT, and every test above walked it one await at a time.
+// React fires the mount effects in one flush, so the restore and the reconcile start
+// together — and `whenIdle()` does not serialize them: both observe the same drained
+// queue and both return before either has enqueued anything, so the second one reads a
+// location the first has already decided to replace.
+// ---------------------------------------------------------------------------
+
+async function restoredSurface() {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  const second = bootableHost({ persistence, storage });
+  await second.hydrate();
+  return second;
+}
+
+// The reconcile re-runs "the current location" — and during boot the current location is
+// deliberately thread-less, because `hydrate` routes nothing. Reading it before the
+// restore lands turns the reconcile into the exact `urlThreadId: null` call its own doc
+// comment forbids, reached by a stale read rather than a literal null.
+test("a reconcile racing the boot restore cannot blank it", async () => {
+  const host = await restoredSurface();
+
+  await Promise.all([
+    host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} }),
+    host.reconcileProjects(),
+  ]);
+
+  assert.equal(
+    host.controller.getState().location.threadId,
+    "A",
+    "the boot restore must survive a reconcile that started in the same tick"
+  );
+});
+
+// A boolean latch set BEFORE an await is not a latch: the second caller sees it already
+// taken, skips the restore, and files the live thread first — so the restore then reads
+// the live thread's context instead of the remembered one and restores the wrong tab set.
+test("a second adoption arriving mid-restore still loses to it", async () => {
+  const host = await restoredSurface();
+
+  await Promise.all([
+    host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} }),
+    host.adoptViewedThread({ threadId: "LIVE2", threadProjectId: {} }),
+  ]);
+
+  const location = host.controller.getState().location;
+  assert.deepEqual(location.context, { kind: "project", projectId: "P" });
+  assert.equal(location.threadId, "A");
+  assert.deepEqual(
+    tabThreadIds(host, { kind: "sessions" }),
+    [],
+    "neither live thread may be filed on top of the restored view"
+  );
+});
+
+// Same hazard `sealwire:removed-threads` already has and this must not repeat: a context
+// is a PROJECT id, and project ids are unique only within one relay.
+test("each relay remembers its own last location", async () => {
+  const storage = memoryStorage();
+
+  const a = bootableHost({ persistence: memoryPersistence(), storage, relayId: "relay-a" });
+  await a.selectProject("P");
+  const b = bootableHost({ persistence: memoryPersistence(), storage, relayId: "relay-b" });
+  await b.selectProject("Q");
+
+  const backToA = bootableHost({ persistence: memoryPersistence(), storage, relayId: "relay-a" });
+  await backToA.hydrate();
+  assert.deepEqual(backToA.controller.getState().location.context, {
+    kind: "project",
+    projectId: "P",
+  });
+});
+
 function hostWith(overrides = {}) {
   return createRemoteSessionTabsHost({
     relayId: "relay-a",
@@ -378,6 +623,428 @@ test("deleting another project leaves the current location alone", async () => {
     projectId: "P",
   });
   assert.equal(host.controller.getState().location.threadId, "A");
+});
+
+// ---------------------------------------------------------------------------
+// Dead-workspace GC. `validHistoryWorkspaces` is the ONLY thing in the codebase that
+// deletes a whole workspace bucket, and it runs on RESTORE_HISTORY alone — which remote
+// never dispatched, so a deleted project's tab set stayed on disk forever.
+//
+// These assert against the injected persistence rather than the in-memory state,
+// because "the bucket is gone from storage" is the actual claim: the store's snapshot
+// would look identical either way on the very next command.
+// ---------------------------------------------------------------------------
+
+function reconcilableHost(projects, persistence = memoryPersistence()) {
+  const state = { loaded: true, projects: projects.map((id) => ({ id })) };
+  const host = hostWith({ persistence, projectsStore: { getState: () => state } });
+  return { host, persistence, state };
+}
+
+test("reconciling drops the tab set of a project that no longer exists", async () => {
+  const { host, persistence, state } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  await host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
+  assert.ok(persistence.records.has("P"), "P's tabs must be on disk to begin with");
+  assert.ok(persistence.records.has("Q"));
+
+  // P was deleted by a peer; the payload arrives without it.
+  state.projects = [{ id: "Q" }];
+  await host.reconcileProjects();
+
+  assert.equal(
+    persistence.records.has("P"),
+    false,
+    "a deleted project's cold bucket must be deleted from storage, not just hidden"
+  );
+  assert.ok(persistence.records.has("Q"), "a surviving project's tabs must be left alone");
+});
+
+// The GC is an allowlist diffed against disk: every key it omits is a delete. So it must
+// stay disabled until the payload is authoritative — a window that is WIDER on remote
+// than on local, because Projects arrive over the broker.
+test("reconciling sweeps nothing while the projects payload is not authoritative", async () => {
+  const { host, persistence, state } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  await host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
+
+  state.loaded = false;
+  state.projects = [];
+  await host.reconcileProjects();
+
+  assert.ok(
+    persistence.records.has("P"),
+    "an unloaded payload is not evidence that every project was deleted"
+  );
+  assert.ok(persistence.records.has("Q"));
+});
+
+// Remote does NOT share local's reading of "absent from an authoritative payload".
+//
+// Local treats it as deleted. Remote has decided the opposite and tests it in the mobile
+// bell scenario: the pin "fails OPEN" when its project disappears, and is REVERSIBLE —
+// *"the selection was never destroyed, only unresolvable, so the project coming back
+// re-pins it without the user re-choosing"*. The difference is real: local reads a
+// project list off its own disk, remote reads one that crossed a broker and a relay.
+//
+// So the GC has to be gated on more than "the payload settled", or it converts every
+// transiently-wrong payload into permanent deletion. Two gates, each defending a
+// different thing.
+//
+// (1) BLAST RADIUS. An empty list is the shape that would delete every bucket at once,
+// and it is also the shape with nothing legitimate to do: a relay that genuinely has no
+// projects has no project buckets to sweep. Giving it up costs nothing.
+test("an empty projects payload sweeps nothing, whatever it claims", async () => {
+  const { host, persistence, state } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  await host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
+
+  state.projects = [];
+  await host.reconcileProjects();
+
+  assert.ok(persistence.records.has("P"), "an empty payload is a symptom, not an inventory");
+  assert.ok(persistence.records.has("Q"));
+});
+
+// (2) REVERSIBILITY. The context you are IN must survive its project going missing, or
+// coming back cannot re-pin it — there is nothing left to resolve.
+test("a context whose project went missing stays recoverable", async () => {
+  const { host, persistence, state } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  state.projects = [{ id: "Q" }];
+  await host.reconcileProjects();
+
+  assert.deepEqual(
+    host.controller.getState().location.context,
+    { kind: "project", projectId: "P" },
+    "the selection must be unresolvable, not destroyed"
+  );
+  assert.ok(persistence.records.has("P"), "and its tabs must still be there when it returns");
+});
+
+// Memoizing the restore as a promise caches a REJECTED one just as happily as a
+// fulfilled one — and every adoption now awaits it, forever. So one transient failure
+// during boot would rethrow on every later adoption: the strip stops describing the
+// rendered thread for the rest of the page's life, and the reconcile dies with it. The
+// old boolean latch confined that to a single adoption, so this is a failure mode the
+// fix introduced, in a module whose every other seam degrades instead of throwing.
+test("a boot restore that fails does not poison every later adoption", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+  const first = bootableHost({ persistence, storage });
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  let failing = false;
+  const logs = [];
+  const second = createRemoteSessionTabsHost({
+    relayId: "relay-a",
+    persistence,
+    storage,
+    projectsStore: {
+      getState() {
+        if (failing) throw new Error("transient projects read");
+        return { loaded: true, projects: [{ id: "P" }, { id: "Q" }] };
+      },
+    },
+    log: (line) => logs.push(line),
+  });
+  await second.hydrate();
+
+  failing = true;
+  // This one rejecting is expected and not the point: while the store is broken every
+  // dispatch rejects, here as anywhere else. What must not happen is that it stays broken
+  // after the store recovers.
+  await second.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} }).catch(() => {});
+  failing = false;
+
+  await second.adoptViewedThread({ threadId: "T1", threadProjectId: {} });
+  assert.equal(
+    second.controller.getState().location.threadId,
+    "T1",
+    "the strip must keep following the rendered thread after a failed restore"
+  );
+  assert.ok(
+    logs.some((line) => line.includes("boot restore")),
+    "and the failure must be reported, not swallowed into an unhandled rejection"
+  );
+});
+
+// The repair (react-app.js) consults `isShowingBootRestore()` from inside the commit
+// listener. `commitNow` runs listeners BEFORE returning, so anything the host derives
+// from the dispatch's RESOLVED value is not there yet when the listener asks. Today that
+// is masked only because `viewRemoteThread` always crosses a network turn first — an
+// ordering nothing states, and one a synchronous guard or a test double would break.
+test("the restore is observable as such from the listener that must repair it", async () => {
+  const host = await restoredSurface();
+  let observed = null;
+  host.controller.subscribe((change) => {
+    if (change.action?.reason === BOOT_RESTORE_REASON) {
+      observed = host.isShowingBootRestore();
+    }
+  });
+
+  await host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+
+  assert.equal(
+    observed,
+    true,
+    "the repair must not depend on winning a race against the dispatch it is reacting to"
+  );
+});
+
+// The repair's whole decision, asserted without rendering anything. Each condition has a
+// distinct reason to exist, so each gets a case.
+test("the repair fires only for a failed view that is still on screen", async () => {
+  const host = await restoredSurface();
+  await host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+
+  assert.equal(
+    host.shouldRepairBootRestore({ shown: false, liveThreadId: "LIVE" }),
+    true,
+    "a failed restore that is still what the location names must be repaired"
+  );
+  assert.equal(
+    host.shouldRepairBootRestore({ shown: true, liveThreadId: "LIVE" }),
+    false,
+    "a view that succeeded is not a failure"
+  );
+  assert.equal(
+    host.shouldRepairBootRestore({ shown: undefined, liveThreadId: "LIVE" }),
+    false,
+    "no handler having run is not a failure report either"
+  );
+  assert.equal(
+    host.shouldRepairBootRestore({ shown: false, liveThreadId: null }),
+    false,
+    "with no live thread there is nothing better to show"
+  );
+
+  // The superseded case: the user has already moved on, so the stale `false` for the
+  // restored thread must not drag them anywhere.
+  await host.openThread({ threadId: "B", threadProjectId: {} });
+  assert.equal(
+    host.shouldRepairBootRestore({ shown: false, liveThreadId: "LIVE" }),
+    false,
+    "a stale answer must not act on a surface that has navigated away"
+  );
+});
+
+// ...but failing open must not turn the collector OFF. `hydrate` re-enters a remembered
+// context WITHOUT validating it (nothing can be validated that early), so a phantom
+// project survives every reload — and an implementation that skipped the whole sweep
+// while the current project was unresolvable would therefore stop collecting, forever, on
+// exactly the surface that had accumulated the most dead buckets.
+test("an unresolvable current project does not disable the sweep for everything else", async () => {
+  const { host, persistence, state } = reconcilableHost(["P", "Q", "R"]);
+  await host.openThread({ threadId: "B", threadProjectId: { B: "R" } });
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  assert.ok(persistence.records.has("R"));
+
+  // P and R are both gone; the surface is sitting in P.
+  state.projects = [{ id: "Q" }];
+  await host.reconcileProjects();
+
+  assert.ok(persistence.records.has("P"), "the context you are in stays recoverable");
+  assert.deepEqual(
+    host.controller.getState().location.context,
+    { kind: "project", projectId: "P" },
+    "and so does the selection naming it"
+  );
+  assert.equal(
+    persistence.records.has("R"),
+    false,
+    "but a dead bucket you are NOT in must still be collected"
+  );
+});
+
+// The fail-open state is PERMANENT, and that is a decision rather than an accident, so it
+// is asserted rather than left to be discovered. `hydrate` re-enters the remembered
+// context without validating it — nothing can be validated that early — and the allowlist
+// keeps exempting it, so a project a peer deleted stays pinned across every reload.
+// `forgetProject` is the only thing that clears it, and it only fires for deletions made
+// on THIS surface.
+//
+// The trade-off this test exists to pin: that permanence must not cost the collector.
+test("a phantom project survives every reload without ever stalling the sweep", async () => {
+  const persistence = memoryPersistence();
+  const storage = memoryStorage();
+  const state = { loaded: true, projects: [{ id: "P" }, { id: "Q" }] };
+  const projectsStore = { getState: () => state };
+
+  const boot = () =>
+    createRemoteSessionTabsHost({ relayId: "relay-a", persistence, storage, projectsStore, log() {} });
+
+  const first = boot();
+  await first.selectProject("P");
+  await first.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  // A peer deletes P. Q survives, so the payload stays non-empty and authoritative.
+  state.projects = [{ id: "Q" }];
+
+  for (let reboot = 1; reboot <= 3; reboot += 1) {
+    const host = boot();
+    await host.hydrate();
+    await host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+    assert.deepEqual(
+      host.controller.getState().location.context,
+      { kind: "project", projectId: "P" },
+      `reboot ${reboot}: the selection stays, unresolvable but recoverable`
+    );
+
+    // ...and a bucket for some OTHER dead project is still collected while P is phantom.
+    // Note the switch back: opening into `GONE` makes it the current context, which would
+    // earn it the same fail-open exemption P has — the exemption is one project, the one
+    // you are in, and this is the difference the test would otherwise hide from itself.
+    await host.openThread({ threadId: `Z${reboot}`, threadProjectId: { [`Z${reboot}`]: "GONE" } });
+    await host.selectProject("P");
+    await host.reconcileProjects();
+    assert.equal(
+      persistence.records.has("GONE"),
+      false,
+      `reboot ${reboot}: the sweep must keep working while the phantom persists`
+    );
+    assert.ok(persistence.records.has("P"), `reboot ${reboot}: and P's tabs wait for it`);
+  }
+});
+
+// The predicate the repair for a failed restore keys on. `viewRemoteThread` returns
+// `false` for two unrelated reasons — the fetch failed, or a NEWER navigation superseded
+// it — so a repair that only checks the boolean would drag a user who tapped another
+// session mid-boot back to the relay's live thread.
+test("the surface stops reporting a boot restore once it has moved on", async () => {
+  const host = await restoredSurface();
+  await host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
+  assert.equal(host.isShowingBootRestore(), true, "the restore is what is on screen");
+
+  await host.openThread({ threadId: "B", threadProjectId: {} });
+  assert.equal(
+    host.isShowingBootRestore(),
+    false,
+    "a stale answer for the restored thread must not act on a surface that has moved"
+  );
+});
+
+// Once per project SET, not once per settled payload — a refresh passes through
+// `loading: true`, so the caller re-fires on every post-mutation refetch and every poll.
+// The memory is the HOST's, so a relay switch (which builds a new host) always sweeps
+// once, even if the new relay's ids happen to serialize identically.
+test("reconciling the same project set twice does the work once", async () => {
+  const { host, persistence, state } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  await host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
+
+  state.projects = [{ id: "Q" }];
+  assert.ok(await host.reconcileProjects(), "the first pass for a set does the sweep");
+  assert.equal(persistence.records.has("P"), false);
+  assert.equal(
+    await host.reconcileProjects(),
+    null,
+    "an unchanged set must not re-dispatch a restore"
+  );
+
+  // A genuinely new set is reconciled again.
+  state.projects = [{ id: "Q" }, { id: "Z" }];
+  assert.ok(await host.reconcileProjects());
+});
+
+// A sweep that FAILED has not reconciled anything, so it must not be recorded as though
+// it had — otherwise the cold buckets survive and nothing retries them for the life of
+// the host. Same latch-on-failure the boot restore had; this was the last seam with it.
+test("a sweep whose dispatch fails is retried for the same project set", async () => {
+  const persistence = memoryPersistence();
+  const logs = [];
+  const state = { loaded: true, projects: [{ id: "P" }, { id: "Q" }] };
+  // Counted rather than flagged, so the failure lands INSIDE the dispatch. A store that
+  // throws from the first read fails at the empty-payload gate instead, never reaching the
+  // signature — which would make this test pass whether or not the signature is recorded
+  // before the sweep, i.e. prove nothing about the ordering it exists to protect.
+  let readsBeforeFailing = Infinity;
+  const host = createRemoteSessionTabsHost({
+    relayId: "relay-a",
+    persistence,
+    storage: memoryStorage(),
+    projectsStore: {
+      getState() {
+        if (readsBeforeFailing-- <= 0) throw new Error("transient projects read");
+        return state;
+      },
+    },
+    log: (line) => logs.push(line),
+  });
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  await host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
+
+  state.projects = [{ id: "Q" }];
+  readsBeforeFailing = 1; // the payload gate reads once; the dispatch's read then throws
+  assert.equal(await host.reconcileProjects(), null, "the failed sweep reports nothing");
+  assert.ok(persistence.records.has("P"), "and sweeps nothing");
+  assert.ok(
+    logs.some((line) => line.includes("reconcile failed")),
+    "the failure must be logged, not escape the caller's void as an unhandled rejection"
+  );
+
+  readsBeforeFailing = Infinity;
+  assert.ok(await host.reconcileProjects(), "the same set must be retried, not skipped");
+  assert.equal(persistence.records.has("P"), false);
+});
+
+// The sweep's answer depends on the current CONTEXT as well as the payload — the project
+// you are in is exempt — so keying the dedup on the payload alone left a phantom project's
+// bucket exempt long after you had navigated away from it.
+test("leaving a phantom context lets the next sweep collect its bucket", async () => {
+  const { host, persistence, state } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  await host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
+  await host.selectProject("P");
+
+  state.projects = [{ id: "Q" }];
+  await host.reconcileProjects();
+  assert.ok(persistence.records.has("P"), "exempt while you are in it");
+
+  await host.selectProject("Q");
+  await host.reconcileProjects();
+  assert.equal(
+    persistence.records.has("P"),
+    false,
+    "and collected once you are not, without waiting for a reload"
+  );
+});
+
+// The `urlThreadId` trap: RESTORE_HISTORY with a null thread routes to NO thread, which
+// on remote means dropping the surface to an overview it has no screen for. The reconcile
+// must re-run the CURRENT location, not a blank one.
+test("reconciling leaves the thread that is on screen exactly where it was", async () => {
+  const { host } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  await host.reconcileProjects();
+
+  const location = host.controller.getState().location;
+  assert.deepEqual(location.context, { kind: "project", projectId: "P" });
+  assert.equal(location.threadId, "A", "the reconcile must not drop the surface to overview");
+  assert.deepEqual(tabThreadIds(host, { kind: "project", projectId: "P" }), ["A"]);
+});
+
+// The Projects payload and a project click race by construction — the click is what
+// triggers the refetch. A reconcile that read the location before the click committed
+// would restore the PREVIOUS context on top of the new one, undoing the navigation.
+test("reconciling waits for in-flight navigation before reading the location", async () => {
+  const { host } = reconcilableHost(["P", "Q"]);
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+
+  const pending = host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
+  const reconciled = host.reconcileProjects();
+  await Promise.all([pending, reconciled]);
+
+  const location = host.controller.getState().location;
+  assert.deepEqual(
+    location.context,
+    { kind: "project", projectId: "Q" },
+    "the reconcile must not restore a context the user has already navigated away from"
+  );
+  assert.equal(location.threadId, "B");
 });
 
 // The queue drain matters: a project click still persisting reports the PREVIOUS context,

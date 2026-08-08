@@ -512,26 +512,78 @@ async function main() {
       "the live thread's tab comes back, because its conversation never left the screen"
     );
 
-    // ---- 11. The tab set survives a reload. ----
-    // Remote has no URL routing, so this is the ONLY thing proving the IndexedDB round
-    // trip: the strip is rebuilt from storage, not from anything on the page. The
-    // focused tab after a reload is the relay's ACTIVE session, because remote's default
-    // view is still the live thread — restoring the previously-focused tab would mean
-    // taking that decision away from the relay, which is deliberately not done here.
+    // ---- 11. A reload returns to the tab you left open, not to the relay's. ----
+    // Remote has no URL routing, so this is the ONLY thing proving both storage round
+    // trips at once: the tab set comes back from IndexedDB, and the surface re-enters
+    // the session it was on from the location memo. Neither is recoverable from
+    // anything on the page — which is exactly what local gets for free from
+    // `history.state` + `?thread=`.
+    //
+    // Focused on THREAD_B specifically, because a session the relay is NOT running is
+    // the only case with an answer to get wrong. The relay's first snapshot names its
+    // own live thread, and adopting that snapshot is what would otherwise claim the
+    // surface a few hundred milliseconds after load — reproducing the old behaviour
+    // while looking, for that moment, exactly like a correct restore.
+    //
+    // And note what `waitForFocusedTab` proves here. The strip's focus is derived from
+    // the RENDERED thread with no fallback to the workspace's remembered focus (see the
+    // SessionTabStrip call site), so this asserts the transcript on screen is B's — not
+    // merely that the location says so.
+    //
+    // Done from inside a PROJECT workspace, which is what makes the context half of the
+    // memo observable at all. Reloading in the sessions context would restore correctly
+    // even if the context were never stored, because sessions is also the cold-start
+    // default — the assertion would hold for the wrong reason. THREAD_C is the fixture's
+    // only project member, so its workspace holds exactly one tab.
+    //
+    // Which assertion catches what, precisely: a wrongly adopted live thread moves the
+    // CONTEXT (THREAD_ACTIVE is unassigned, so the sessions workspace owns it), which is
+    // what `waitForFocusedTab` fails on. The tab list then pins the restored workspace's
+    // shape — one tab, the project's — a claim that in the sessions context could not be
+    // told apart from the THREAD_ACTIVE tab already sitting there.
+    await page.click(".project-switcher-trigger");
+    await page.locator(".project-switcher-option", { hasText: /^Alpha project$/ }).first().click();
+    await page.dblclick(`#remote-threads-list [data-thread-id="${THREAD_C}"]`);
+    await waitForFocusedTab(page, THREAD_C);
+
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector(".session-tab-strip", { timeout: TIMEOUT_MS });
-    await waitForFocusedTab(page, THREAD_ACTIVE);
+    await waitForFocusedTab(page, THREAD_C);
+    // Re-check at +250ms rather than sampling the instant the focus is right: the adoption
+    // that would clobber the restore arrives a tick LATER, which is the whole shape of the
+    // bug, so an immediate sample passes either way. Note what this is and is not — an
+    // async predicate makes `waitForFunction` "sample once at +250ms, retry until true",
+    // not "must stay true for 250ms". That is enough here because the clobber is permanent
+    // rather than a flicker, and it matches the idiom step 9 established.
     await page.waitForFunction(
       (expected) =>
-        document.querySelectorAll(".session-tab[data-thread-id]").length === expected,
-      1,
+        new Promise((resolve) => {
+          setTimeout(() => {
+            const tabs = [...document.querySelectorAll(".session-tab[data-thread-id]")].map(
+              (node) => node.dataset.threadId
+            );
+            const focused = document.querySelector(".session-tab.is-focused");
+            resolve(
+              tabs.length === 1 && tabs[0] === expected && focused?.dataset.threadId === expected
+            );
+          }, 250);
+        }),
+      THREAD_C,
       { timeout: TIMEOUT_MS }
     );
     assert.deepEqual(
       await tabThreadIds(page),
-      [THREAD_ACTIVE],
-      "a reload restores the stored workspace, read back from storage"
+      [THREAD_C],
+      "the restored workspace is the project's, and the relay's live thread is not filed into it"
     );
+    assert.equal(
+      await page.$eval("#remote-pinned-project .pinned-project-chip-name", (n) =>
+        n.textContent.trim()
+      ),
+      "Alpha project",
+      "and the sidebar pin follows the restored context, as a projection of it"
+    );
+    await shoot(page, "remote-desktop-tabs-reload-restored");
 
     await page.close();
     page = null;
