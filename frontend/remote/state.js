@@ -47,6 +47,9 @@ export const state = {
   relayConnectionMessage: null,
   remoteNavMode: "desktop",
   remoteNavOpen: true,
+  // "touch" until measured, so the surface never flashes desktop-only chrome on a
+  // phone. `pointer-mode.js` resolves it during surface init and keeps it live.
+  remotePointerClass: "touch",
   remoteAuth: null,
   serverConnectionMessage: null,
   serverConnectionState: "idle",
