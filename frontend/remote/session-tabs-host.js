@@ -130,36 +130,42 @@ export function createRemoteSessionTabsHost({
     return projects?.loaded ? (projects.projects || []).map((project) => project.id) : null;
   }
 
-  // What may be RESTORED from the memo — the payload, plus the project this surface is
-  // currently in even once the payload has stopped naming it.
-  //
-  // That addition is remote's "fail open" rule, and it has to live in the ALLOWLIST
-  // rather than in a decision to skip the sweep. The first version of this skipped the
-  // whole reconcile whenever the current project went missing, which preserved
-  // reversibility and quietly disabled the garbage collector: a phantom context survives
-  // reloads (`hydrate` re-enters it without validating, because at that point nothing can
-  // be validated), so every OTHER dead workspace stopped being collected too — on exactly
-  // the surface that had accumulated them. Widening the allowlist by one keeps the
-  // unresolvable project and its tabs while still sweeping everything genuinely gone.
-  //
-  // Note the exact scope, because it is narrower than "remote never trusts absence": the
-  // exemption covers the ONE project you are in. Any other project absent from a settled,
-  // non-empty payload has its tab set deleted, same as on local. That is a deliberate
-  // floor rather than an oversight — the alternative is never collecting anything — and
-  // the cost of being wrong is bounded to a tab set, never a session. `reconcileProjects`
-  // declines empty payloads separately, which removes the case where being wrong would
-  // cost all of them at once.
-  //
-  // Only `RESTORE_HISTORY` reads this fact, so nothing else can be affected by it.
-  function restorableProjectIds() {
-    const ids = payloadProjectIds();
-    if (!ids) {
-      return null;
+  /**
+   * Re-file a dead project's tabs into the default workspace.
+   *
+   * Deleting a project deletes NO session: the relay drops the group and its membership
+   * and nothing else (`delete_project` in state/relay.rs). So the sessions that workspace
+   * held are all still there and are now unassigned — which is precisely what the default
+   * workspace is for. Moving them is not a rescue, it is filing them where they belong
+   * now, by the same `selectOwningContext` rule every other open uses.
+   *
+   * Done BEFORE the reconcile's `RESTORE_HISTORY`, which is what falls the context back
+   * and collects the empty bucket. The previously-visible thread is re-opened last so it
+   * keeps the focus, and so the restore that follows finds it.
+   *
+   * Pinned and preview flags do not survive the move: `openThreadTab` only flags a NEW
+   * tab, and these arrive as new ones. Accepted — the alternative is a workspace-merge
+   * action in the shared reducer for a case that dissolves the workspace anyway.
+   */
+  async function absorbProjectTabsIntoSessions(deadContext) {
+    const state = controller.getState();
+    const dead = createTabWorkspace(
+      state.workspaces[sessionViewContextKey(deadContext)] || {}
+    );
+    const threadIds = [
+      ...new Set((dead.tabs || []).flatMap((tab) => layoutThreadIds(tab.layout))),
+    ].filter(Boolean);
+    if (!threadIds.length) {
+      return;
     }
-    const context = store.getState().location.context;
-    return context?.kind === "project" && !ids.includes(context.projectId)
-      ? [...ids, context.projectId]
-      : ids;
+    const visibleThreadId = state.location.threadId;
+    for (const threadId of threadIds) {
+      if (threadId === visibleThreadId) continue;
+      await controller.openThread(threadId, { context: { kind: "sessions" } });
+    }
+    if (visibleThreadId && threadIds.includes(visibleThreadId)) {
+      await controller.openThread(visibleThreadId, { context: { kind: "sessions" } });
+    }
   }
 
   const controller = createSessionViewController({
@@ -173,7 +179,7 @@ export function createRemoteSessionTabsHost({
     // from treating an unloaded payload as evidence that every project was deleted and
     // sweeping the cold tab sets. Remote fetches Projects over the broker, so this
     // window is wider here than on local.
-    getProjectIds: restorableProjectIds,
+    getProjectIds: payloadProjectIds,
     // Two sources, and they answer different halves of the same question.
     //
     // `loadRemovedThreadIds` is what the LOCAL surface in this browser archived or
@@ -692,14 +698,30 @@ export function createRemoteSessionTabsHost({
       // switch (RemoteApp never remounts) and would let relay B skip its first sweep
       // whenever its id set happened to serialize the same as relay A's last one.
       //
-      // The CONTEXT belongs in the key because the sweep's answer depends on it: the
-      // project you are in is exempt from collection, so the same payload yields a
-      // different result once you leave. Keying on the set alone meant a phantom project's
-      // bucket stayed exempt after you had navigated away from it, until a reload. It is
-      // still not immediate — nothing re-runs this on a context change, only on a settled
-      // payload — but the next payload now collects it instead of skipping.
-      const location = controller.getState().location;
-      const signature = JSON.stringify([payload, sessionViewContextKey(location.context)]);
+      // The payload alone, and no longer the context with it. While the project you were
+      // in was EXEMPT from collection, the same payload gave different answers depending
+      // on where you stood, so the context had to be part of the key. Dissolving instead
+      // of exempting removed that: the allowlist is now `sessions` plus the payload, which
+      // is the same set from anywhere. The dissolve itself runs above this check, so it
+      // still happens on the first reconcile for a payload regardless.
+      // A project the payload no longer names is GONE, and holding its workspace open
+      // would leave the surface sitting in a group nothing can resolve — and with no name,
+      // since the chip fails open. Dissolve it instead, moving its tabs to where those
+      // sessions now belong.
+      //
+      // Only the workspace you are IN. Relocating every cold dead project's tabs as well
+      // would pour every deleted group's history into the default workspace and never stop
+      // — which is the accumulation this sweep exists to end. The ones you are not looking
+      // at are collected, as before.
+      let location = controller.getState().location;
+      if (
+        location.context?.kind === "project"
+        && !payload.includes(location.context.projectId)
+      ) {
+        await absorbProjectTabsIntoSessions(location.context);
+        location = controller.getState().location;
+      }
+      const signature = JSON.stringify(payload);
       if (signature === reconciledProjectSignature) {
         return null;
       }

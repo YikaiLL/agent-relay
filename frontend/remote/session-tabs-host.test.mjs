@@ -706,21 +706,41 @@ test("an empty projects payload sweeps nothing, whatever it claims", async () =>
   assert.ok(persistence.records.has("Q"));
 });
 
-// (2) REVERSIBILITY. The context you are IN must survive its project going missing, or
-// coming back cannot re-pin it — there is nothing left to resolve.
-test("a context whose project went missing stays recoverable", async () => {
+// (2) DISSOLVING, not deleting and not preserving. A project that a settled non-empty
+// payload no longer names is gone, and holding its workspace open forever means sitting in
+// a group with no name that nothing can ever resolve. But its TABS are sessions the user
+// has open, and deleting a project deletes no session — the relay only drops the group and
+// its membership (`relay.rs`'s `delete_project`), so those sessions are all still there,
+// merely unassigned now. Which is exactly the default workspace.
+//
+// So the workspace dissolves and its tabs move to where those sessions now belong.
+test("a deleted project you are in dissolves into the default workspace, tabs and all", async () => {
   const { host, persistence, state } = reconcilableHost(["P", "Q"]);
   await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  await host.openThread({ threadId: "D", threadProjectId: { D: "P" } });
+  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
+  assert.deepEqual(tabThreadIds(host, { kind: "project", projectId: "P" }), ["A", "D"]);
 
   state.projects = [{ id: "Q" }];
   await host.reconcileProjects();
 
+  const location = host.controller.getState().location;
   assert.deepEqual(
-    host.controller.getState().location.context,
-    { kind: "project", projectId: "P" },
-    "the selection must be unresolvable, not destroyed"
+    location.context,
+    { kind: "sessions" },
+    "a group that no longer exists must not keep holding the surface"
   );
-  assert.ok(persistence.records.has("P"), "and its tabs must still be there when it returns");
+  assert.equal(location.threadId, "A", "and you stay on the session you were reading");
+  assert.deepEqual(
+    tabThreadIds(host, { kind: "sessions" }).sort(),
+    ["A", "D"],
+    "every tab it held comes with it — those sessions were never deleted"
+  );
+  assert.equal(
+    persistence.records.has("P"),
+    false,
+    "and the empty bucket is collected rather than kept as a phantom"
+  );
 });
 
 // Memoizing the restore as a promise caches a REJECTED one just as happily as a
@@ -831,12 +851,11 @@ test("the repair fires only for a failed view that is still on screen", async ()
   );
 });
 
-// ...but failing open must not turn the collector OFF. `hydrate` re-enters a remembered
-// context WITHOUT validating it (nothing can be validated that early), so a phantom
-// project survives every reload — and an implementation that skipped the whole sweep
-// while the current project was unresolvable would therefore stop collecting, forever, on
+// The sweep must keep collecting the projects you are NOT in while it dissolves the one
+// you are. Those are different outcomes for the same event, and an implementation that
+// short-circuited on an unresolvable current context would stop collecting entirely — on
 // exactly the surface that had accumulated the most dead buckets.
-test("an unresolvable current project does not disable the sweep for everything else", async () => {
+test("dissolving the project you are in still collects the ones you are not", async () => {
   const { host, persistence, state } = reconcilableHost(["P", "Q", "R"]);
   await host.openThread({ threadId: "B", threadProjectId: { B: "R" } });
   await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
@@ -846,35 +865,45 @@ test("an unresolvable current project does not disable the sweep for everything 
   state.projects = [{ id: "Q" }];
   await host.reconcileProjects();
 
-  assert.ok(persistence.records.has("P"), "the context you are in stays recoverable");
   assert.deepEqual(
     host.controller.getState().location.context,
-    { kind: "project", projectId: "P" },
-    "and so does the selection naming it"
+    { kind: "sessions" },
+    "the group you were in dissolves"
   );
+  assert.deepEqual(
+    tabThreadIds(host, { kind: "sessions" }),
+    ["A"],
+    "and its open session comes with you"
+  );
+  assert.equal(persistence.records.has("P"), false, "its bucket is collected, not kept");
   assert.equal(
     persistence.records.has("R"),
     false,
-    "but a dead bucket you are NOT in must still be collected"
+    "and so is a dead bucket you were never in — whose tabs are NOT relocated, or every \
+deleted group would pour its history into the default workspace forever"
+  );
+  assert.equal(
+    tabThreadIds(host, { kind: "sessions" }).includes("B"),
+    false,
+    "R's tabs are collected with it: you were not looking at them"
   );
 });
 
-// The fail-open state is PERMANENT, and that is a decision rather than an accident, so it
-// is asserted rather than left to be discovered. `hydrate` re-enters the remembered
-// context without validating it — nothing can be validated that early — and the allowlist
-// keeps exempting it, so a project a peer deleted stays pinned across every reload.
-// `forgetProject` is the only thing that clears it, and it only fires for deletions made
-// on THIS surface.
-//
-// The trade-off this test exists to pin: that permanence must not cost the collector.
-test("a phantom project survives every reload without ever stalling the sweep", async () => {
+// A dissolve is permanent in the only sense that matters — it does not come back on the
+// next boot, because the location memo followed the context out of the dead project.
+test("a dissolved project does not reappear on the next boot", async () => {
   const persistence = memoryPersistence();
   const storage = memoryStorage();
   const state = { loaded: true, projects: [{ id: "P" }, { id: "Q" }] };
   const projectsStore = { getState: () => state };
-
   const boot = () =>
-    createRemoteSessionTabsHost({ relayId: "relay-a", persistence, storage, projectsStore, log() {} });
+    createRemoteSessionTabsHost({
+      relayId: "relay-a",
+      persistence,
+      storage,
+      projectsStore,
+      log() {},
+    });
 
   const first = boot();
   await first.selectProject("P");
@@ -882,31 +911,20 @@ test("a phantom project survives every reload without ever stalling the sweep", 
 
   // A peer deletes P. Q survives, so the payload stays non-empty and authoritative.
   state.projects = [{ id: "Q" }];
+  await first.reconcileProjects();
+  assert.deepEqual(first.controller.getState().location.context, { kind: "sessions" });
 
-  for (let reboot = 1; reboot <= 3; reboot += 1) {
-    const host = boot();
-    await host.hydrate();
-    await host.adoptViewedThread({ threadId: "LIVE", threadProjectId: {} });
-    assert.deepEqual(
-      host.controller.getState().location.context,
-      { kind: "project", projectId: "P" },
-      `reboot ${reboot}: the selection stays, unresolvable but recoverable`
-    );
-
-    // ...and a bucket for some OTHER dead project is still collected while P is phantom.
-    // Note the switch back: opening into `GONE` makes it the current context, which would
-    // earn it the same fail-open exemption P has — the exemption is one project, the one
-    // you are in, and this is the difference the test would otherwise hide from itself.
-    await host.openThread({ threadId: `Z${reboot}`, threadProjectId: { [`Z${reboot}`]: "GONE" } });
-    await host.selectProject("P");
-    await host.reconcileProjects();
-    assert.equal(
-      persistence.records.has("GONE"),
-      false,
-      `reboot ${reboot}: the sweep must keep working while the phantom persists`
-    );
-    assert.ok(persistence.records.has("P"), `reboot ${reboot}: and P's tabs wait for it`);
-  }
+  const second = boot();
+  await second.hydrate();
+  assert.deepEqual(
+    second.controller.getState().location.context,
+    { kind: "sessions" },
+    "the remembered context must be the one the dissolve left behind"
+  );
+  assert.ok(
+    tabThreadIds(second, { kind: "sessions" }).includes("A"),
+    "and the session it held is still open, in the workspace it now belongs to"
+  );
 });
 
 // The predicate the repair for a failed restore keys on. `viewRemoteThread` returns
@@ -988,28 +1006,6 @@ test("a sweep whose dispatch fails is retried for the same project set", async (
   readsBeforeFailing = Infinity;
   assert.ok(await host.reconcileProjects(), "the same set must be retried, not skipped");
   assert.equal(persistence.records.has("P"), false);
-});
-
-// The sweep's answer depends on the current CONTEXT as well as the payload — the project
-// you are in is exempt — so keying the dedup on the payload alone left a phantom project's
-// bucket exempt long after you had navigated away from it.
-test("leaving a phantom context lets the next sweep collect its bucket", async () => {
-  const { host, persistence, state } = reconcilableHost(["P", "Q"]);
-  await host.openThread({ threadId: "A", threadProjectId: { A: "P" } });
-  await host.openThread({ threadId: "B", threadProjectId: { B: "Q" } });
-  await host.selectProject("P");
-
-  state.projects = [{ id: "Q" }];
-  await host.reconcileProjects();
-  assert.ok(persistence.records.has("P"), "exempt while you are in it");
-
-  await host.selectProject("Q");
-  await host.reconcileProjects();
-  assert.equal(
-    persistence.records.has("P"),
-    false,
-    "and collected once you are not, without waiting for a reload"
-  );
 });
 
 // ---------------------------------------------------------------------------
