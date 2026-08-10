@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFileSync, unwatchFile, watchFile } from "node:fs";
+import { existsSync, readFileSync, unwatchFile, watchFile } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -140,7 +140,21 @@ spawnManaged(
   buildEnv
 );
 spawnManaged("relay-broker", "cargo", ["run", "-p", "relay-broker"], brokerEnv);
-spawnManaged("relay-server", "cargo", ["run", "-p", "relay-server"], relayEnv);
+// Build with the engines when this checkout has them (see PRIVATE_ENGINES.md).
+// Without this, `scripts/with-engines.sh npm run dev:full` would swap the private
+// crate in and then build a relay that ignores it — a dev loop where task teams
+// answer "not available in this build".
+const engines = existsSync(
+  new URL("../crates/relay-orchestrators/src/team", import.meta.url)
+);
+const relayArgs = ["run", "-p", "relay-server"];
+if (engines) {
+  relayArgs.push("--features", "orchestrators");
+  console.log("[dev:full] orchestration engines present — building with them");
+} else {
+  console.log("[dev:full] stub orchestration engine — task list and task team are off");
+}
+spawnManaged("relay-server", "cargo", relayArgs, relayEnv);
 
 function runCommand(command, args, env) {
   return new Promise((resolve, reject) => {
