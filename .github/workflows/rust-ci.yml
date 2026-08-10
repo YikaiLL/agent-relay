@@ -55,6 +55,11 @@ jobs:
     name: fmt-check-test
     runs-on: ubuntu-latest
 
+    # Job level, not step level: a step's own `if` is evaluated before its `env`
+    # block exists, so guarding on the secret only works from here.
+    env:
+      ENGINES_KEY: ${{ secrets.RELAY_ENGINES_DEPLOY_KEY }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -83,10 +88,45 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      # The public checkout has only the stub engine, so the task-team suite is
+      # compiled out above. Pull the private engines in and run the SAME suite
+      # against the code that actually ships — otherwise the 42 team tests would
+      # never run anywhere, and a change to the public driver could break them
+      # with CI still green.
+      #
+      # Forks and Dependabot get no secret, so this step is skipped there rather
+      # than failing: the job above still covers everything outside the engines.
+      # NOT on `pull_request`. This step hands a key that reads the proprietary
+      # engines to the workflow, and a pull request is the one trigger whose
+      # contents someone other than a maintainer can influence. Fork PRs get no
+      # secrets from GitHub at all, but a PR from a branch in this repo would —
+      # so the moment anyone else has write access, a PR could print the engines
+      # into a public build log. Push, schedule and manual runs cover the same
+      # code a moment later, which is the cheaper side of the trade.
+      - name: Checkout private engines
+        id: engines
+        if: env.ENGINES_KEY != '' && github.event_name != 'pull_request'
+        uses: actions/checkout@v5
+        with:
+          repository: sealwire/relay-orchestrators
+          ssh-key: ${{ secrets.RELAY_ENGINES_DEPLOY_KEY }}
+          path: .engines
+
+      - name: cargo test (with engines)
+        if: env.ENGINES_KEY != '' && github.event_name != 'pull_request' && steps.engines.outcome == 'success'
+        env:
+          RELAY_ENGINES_PATH: ${{ github.workspace }}/.engines
+        run: scripts/with-engines.sh cargo test --workspace --features relay-server/orchestrators
+
   review-recap-modes-e2e:
     name: relay-http-e2e
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
+    # Job level so a step's `if` can read it — a step's own `env` is not in scope
+    # for its own condition.
+    env:
+      ENGINES_KEY: ${{ secrets.RELAY_ENGINES_DEPLOY_KEY }}
 
     steps:
       - name: Checkout
@@ -122,8 +162,27 @@ jobs:
       # real git repository. It covers the layer the in-process Rust tests cannot
       # reach — HTTP routes, provisioning, and the branch left on disk — and it has
       # already caught two defects that only exist there.
+      # Needs the real engines: against the public stub the suite skips itself,
+      # which would be a green tick asserting nothing. NOT on `pull_request` — see
+      # the note on the same guard in the `rust` job.
+      - name: Checkout private engines
+        id: engines
+        if: env.ENGINES_KEY != '' && github.event_name != 'pull_request'
+        uses: actions/checkout@v5
+        with:
+          repository: sealwire/relay-orchestrators
+          ssh-key: ${{ secrets.RELAY_ENGINES_DEPLOY_KEY }}
+          path: .engines
+
       - name: Task team e2e
-        run: npm run test:task-team
+        env:
+          RELAY_ENGINES_PATH: ${{ github.workspace }}/.engines
+        run: |
+          if [ "${{ steps.engines.outcome }}" = "success" ]; then
+            scripts/with-engines.sh npm run test:task-team
+          else
+            npm run test:task-team
+          fi
 
   browser-smoke:
     name: browser-page-smoke
