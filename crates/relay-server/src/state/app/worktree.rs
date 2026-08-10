@@ -27,7 +27,7 @@
 
 // Later bricks (the TeamRun driver and its HTTP surface) consume these; keep the
 // provisioning layer ahead of its wiring without dead-code warnings, mirroring
-// `state/workflow.rs` and `state/task_list.rs`.
+// `state/workflow.rs`.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

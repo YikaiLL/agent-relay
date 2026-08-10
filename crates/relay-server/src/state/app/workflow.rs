@@ -150,9 +150,10 @@ impl AppState {
         let max_rounds = input.max_rounds.unwrap_or(2).clamp(1, MAX_CODE_FLOW_ROUNDS);
         let device_id = require_device_id(input.device_id)?;
         self.expire_stale_controller_if_needed().await;
-        // A running task list owns the workspace and drives its own child workflows;
-        // refuse a user-initiated ad-hoc Code Flow under it.
-        if self.relay.read().await.has_active_task_list() {
+        // A running orchestrator owns the workspace and drives its own child
+        // workflows; refuse a user-initiated ad-hoc Code Flow under it. Answers
+        // `false` in a build with no engines registered.
+        if self.orchestrators.has_active() {
             return Err(
                 "a task list is running on this workspace; wait for it to finish before \
 starting a workflow"

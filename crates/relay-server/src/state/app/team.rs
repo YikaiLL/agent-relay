@@ -34,8 +34,8 @@ use crate::protocol::{
     TeamRunView, TeamSubTaskView, TeamsResponse,
 };
 use crate::state::{
-    next_team_action, parse_complexity, parse_sub_tasks, parse_verdict, prompts, SubTaskStatus,
-    TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus, TeamThreadSlot, WorkflowVerdict,
+    parse_verdict, SubTaskStatus, TaskSpec, TeamAction, TeamPhase, TeamRun, TeamRunStatus,
+    TeamThreadSlot, WorkflowVerdict,
 };
 
 use super::review::{
@@ -553,6 +553,13 @@ over on resume"
 
     /// The HTTP entry point: resolve a wire request and start the run.
     pub async fn start_team(&self, input: StartTeamInput) -> Result<StartTeamReceipt, String> {
+        // Refuse at the door rather than recording a run this build cannot drive.
+        if !self.has_team_brain() {
+            return Err(
+                "task team is not available in this build; install a release that includes it"
+                    .to_string(),
+            );
+        }
         let title = non_empty(Some(input.title)).ok_or_else(|| "title is required".to_string())?;
         let device_id = require_device_id(input.device_id)?;
         let origin_cwd = match non_empty(input.cwd) {
@@ -940,6 +947,18 @@ over on resume"
 
     /// The driver loop.
     async fn run_team_job(&self, run_id: String) {
+        // The one place every entry path converges — a fresh start, a resume, and
+        // the boot-time revalidation of a paused run. Guarding here means the
+        // decision layer is present for everything downstream, so the leaf call
+        // sites do not each have to re-ask.
+        if !self.has_team_brain() {
+            self.fail_team_run(
+                &run_id,
+                "this build has no task-team engine, so the run cannot be driven",
+            )
+            .await;
+            return;
+        }
         let mut lifeguard = TeamRunLifeguard {
             app: self.clone(),
             run_id: run_id.clone(),
@@ -1022,7 +1041,7 @@ over on resume"
 
     async fn next_team_action_for(&self, run_id: &str) -> Option<TeamAction> {
         let relay = self.relay.read().await;
-        next_team_action(relay.team_run(run_id)?)
+        self.brain().next_action(relay.team_run(run_id)?)
     }
 
     /// Write a settlement, refusing to persist one that is not true.
@@ -2036,7 +2055,7 @@ its turn cannot continue",
             .filter(|task| task.status.is_terminal())
             .map(|task| format!("{} — {}", task.title, task.status.as_str()))
             .collect();
-        let prompt = prompts::tl_reseed(
+        let prompt = self.brain().tl_reseed(
             &run.spec,
             &run.plan_rel_path,
             run.phase.as_str(),
@@ -2072,13 +2091,15 @@ its turn cannot continue",
         let Some(run) = self.team_run_snapshot(run_id).await else {
             return false;
         };
-        let prompt = prompts::intake(&run.spec, &run.plan_rel_path, run.source_dirty);
+        let prompt = self
+            .brain()
+            .intake(&run.spec, &run.plan_rel_path, run.source_dirty);
         let Some(reply) = self.tl_turn(run_id, prompt).await else {
             return false;
         };
         // Silence is not "complex": a TL that did not answer gets the cheaper path,
         // and the design phase stays something it has to ASK for.
-        let complex = parse_complexity(&reply).unwrap_or(false);
+        let complex = self.brain().parse_complexity(&reply).unwrap_or(false);
         let mut relay = self.relay.write().await;
         relay.update_team_run(run_id, |run| {
             run.complex = Some(complex);
@@ -2096,7 +2117,9 @@ its turn cannot continue",
         let Some(run) = self.team_run_snapshot(run_id).await else {
             return false;
         };
-        let prompt = prompts::design(&run.spec, &run.design_rel_path, &run.plan_rel_path);
+        let prompt = self
+            .brain()
+            .design(&run.spec, &run.design_rel_path, &run.plan_rel_path);
         if self.tl_turn(run_id, prompt).await.is_none() {
             return false;
         }
@@ -2184,11 +2207,11 @@ its turn cannot continue",
         let Some(run) = self.team_run_snapshot(run_id).await else {
             return false;
         };
-        let prompt = prompts::plan(&run.spec, &run.plan_rel_path);
+        let prompt = self.brain().plan(&run.spec, &run.plan_rel_path);
         let Some(reply) = self.tl_turn(run_id, prompt).await else {
             return false;
         };
-        let sub_tasks = parse_sub_tasks(&reply);
+        let sub_tasks = self.brain().parse_sub_tasks(&reply);
         if sub_tasks.is_empty() {
             self.fail_team_run(
                 run_id,
@@ -2258,7 +2281,7 @@ its turn cannot continue",
             .as_ref()
             .map(|verdict| verdict.findings.clone())
             .unwrap_or_default();
-        let prompt = prompts::dev(
+        let prompt = self.brain().dev(
             &run.spec,
             &task.title,
             &task.brief,
@@ -2436,7 +2459,9 @@ finding per line.",
         if task.status != SubTaskStatus::Skipped {
             let approved = task.status == SubTaskStatus::Done;
             let summary = task.result_summary.clone().unwrap_or_default();
-            let prompt = prompts::sub_task_result(&task.title, approved, &summary);
+            let prompt = self
+                .brain()
+                .sub_task_result(&task.title, approved, &summary);
             if self.tl_turn(run_id, prompt).await.is_none() {
                 return false;
             }
@@ -2552,7 +2577,7 @@ history with it and no fork point was recorded",
         }
         let slot = self.record_run_thread(run_id, &thread_id).await;
 
-        let prompt = prompts::mr_gate(&run.spec, &diff, workspace.as_str());
+        let prompt = self.brain().mr_gate(&run.spec, &diff, workspace.as_str());
         let text = match self
             .team_turn(run_id, slot, TeamRole::Reviewer, &prompt)
             .await
@@ -2611,7 +2636,7 @@ history with it and no fork point was recorded",
         };
         let slot = self.record_run_thread(run_id, &thread_id).await;
 
-        let prompt = prompts::address_mr(&findings, &run.plan_rel_path);
+        let prompt = self.brain().address_mr(&findings, &run.plan_rel_path);
         match self.team_turn(run_id, slot, TeamRole::Dev, &prompt).await {
             TeamStepOutcome::Blocked(error) => {
                 self.block_team_run(run_id, error).await;
@@ -2637,7 +2662,9 @@ history with it and no fork point was recorded",
         let Some(run) = self.team_run_snapshot(run_id).await else {
             return false;
         };
-        let prompt = prompts::wrap(&run.spec, &run.report_rel_path, &run.unresolved);
+        let prompt = self
+            .brain()
+            .wrap(&run.spec, &run.report_rel_path, &run.unresolved);
         if self.tl_turn(run_id, prompt).await.is_none() {
             return false;
         }

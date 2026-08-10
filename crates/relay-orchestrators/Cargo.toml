@@ -1,0 +1,17 @@
+[package]
+name = "relay-orchestrators"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# STUB. The real orchestration engines are proprietary and live in a separate
+# private repository.
+#
+# This placeholder exists because Cargo must be able to READ the manifest of every
+# declared dependency — optional or not, enabled or not. Without it, `cargo build`
+# fails for anyone who does not have the private crate, which would make the relay
+# unauditable and unbuildable for everyone but us. Its source is never compiled in
+# a default build: the dependency is optional and off.
+#
+# A release build substitutes the real crate through a `paths` override in
+# `.cargo/config.toml` — see CONTRIBUTING.

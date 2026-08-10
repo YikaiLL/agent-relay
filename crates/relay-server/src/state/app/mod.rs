@@ -91,6 +91,18 @@ pub(crate) const TEAM_LOCKED_THREAD_MSG: &str =
 #[derive(Clone)]
 pub struct AppState {
     relay: Arc<RwLock<RelayState>>,
+    /// The private orchestration engines this build registered, if any.
+    ///
+    /// Empty in a build without them, and every lock question answers "free" —
+    /// which is why the guards below need no `cfg` and the public repo compiles
+    /// and runs untouched.
+    orchestrators: relay_api::Orchestrators,
+    /// The team decision layer, when this build has one.
+    ///
+    /// `None` in a build without the private engine: `start_team` refuses up
+    /// front and `run_team_job` never begins, so nothing downstream has to keep
+    /// re-asking.
+    team_brain: Option<Arc<dyn relay_api::TeamBrain>>,
     providers: HashMap<String, Arc<dyn ProviderBridge>>,
     provider_model_catalogs: Arc<RwLock<HashMap<String, Vec<ModelOptionView>>>>,
     change_tx: watch::Sender<u64>,
@@ -204,11 +216,11 @@ mod approvals;
 mod broker;
 mod fork;
 mod pairing;
+mod port;
 mod projects;
 mod providers;
 mod review;
 mod sessions;
-mod task_list;
 pub(crate) mod team;
 #[cfg(test)]
 mod tests;
@@ -284,6 +296,8 @@ impl AppState {
 
         Self {
             relay,
+            orchestrators: relay_api::Orchestrators::default(),
+            team_brain: None,
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
             change_tx,
@@ -399,6 +413,8 @@ impl AppState {
 
         let state = Self {
             relay,
+            orchestrators: relay_api::Orchestrators::default(),
+            team_brain: None,
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
             change_tx,
@@ -647,6 +663,44 @@ in thread {thread_id}: {error}"
             _ => left.cmp(right),
         });
         providers
+    }
+
+    /// Register the private orchestration engines.
+    ///
+    /// Call once, before the state is shared: `Orchestrators` is held by value, so
+    /// clones taken earlier (an engine's own port handle, for instance) keep the
+    /// empty registry. That is deliberate — an engine has no business asking the
+    /// relay about its peers.
+    pub fn with_orchestrators(mut self, engines: Vec<Arc<dyn relay_api::Orchestrator>>) -> Self {
+        self.orchestrators = relay_api::Orchestrators::new(engines);
+        self
+    }
+
+    /// The registered engines, for the guards and the snapshot.
+    pub fn orchestrators(&self) -> &relay_api::Orchestrators {
+        &self.orchestrators
+    }
+
+    /// Install the team decision layer. Call once, before the state is shared.
+    pub fn with_team_brain(mut self, brain: Arc<dyn relay_api::TeamBrain>) -> Self {
+        self.team_brain = Some(brain);
+        self
+    }
+
+    /// Whether this build can drive a team run at all.
+    pub(crate) fn has_team_brain(&self) -> bool {
+        self.team_brain.is_some()
+    }
+
+    /// The decision layer.
+    ///
+    /// Panics only if an unreachable state were reached: `start_team` refuses
+    /// without a brain and `run_team_job` bails before its first action, so every
+    /// caller below those two doors is already past the check.
+    pub(crate) fn brain(&self) -> &dyn relay_api::TeamBrain {
+        self.team_brain
+            .as_deref()
+            .expect("a team run cannot be driven by a build with no decision layer")
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {

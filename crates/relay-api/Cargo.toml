@@ -1,0 +1,20 @@
+[package]
+name = "relay-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The seam between the public relay and its private orchestrators.
+#
+# This crate exists so the two can depend on a shared vocabulary WITHOUT
+# depending on each other: `relay-orchestrators` implements `Orchestrator`
+# against `RelayPort`, and `relay-server` implements `RelayPort` for its
+# `AppState` and holds the engines as `dyn Orchestrator`. Cargo rejects a package
+# cycle, so neither may name the other — only this crate, which names neither.
+#
+# Keep it dependency-light and logic-free: types and traits only.
+
+[dependencies]
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true

@@ -24,6 +24,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -31,6 +32,11 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
 const ROOT = process.cwd();
+// Whether this checkout has the real orchestration engines or the public stub.
+//
+// The stub carries no `team` module, so its absence is the honest signal. Probing
+// the built binary instead would mean paying for a full build first, only to skip.
+const ENGINES = existsSync(path.join(ROOT, "crates", "relay-orchestrators", "src", "team"));
 const TIMEOUT_MS = Number(process.env.TASK_TEAM_E2E_TIMEOUT_MS || 120000);
 const DEVICE = "task-team-e2e";
 const TERMINAL = new Set(["done", "escalated", "failed", "interrupted", "cancelled"]);
@@ -159,6 +165,18 @@ function scenarioConfig() {
 }
 
 async function main() {
+  // A public checkout builds the relay against the stub engine, so every leg below
+  // would fail on `start_team` refusing. Skip loudly rather than fail: this suite
+  // asserts what the ENGINES do, and a checkout without them has nothing to assert.
+  // The private CI runs it for real — see .github/workflows/rust-ci.yml.
+  if (!ENGINES) {
+    console.log(
+      "task-team-e2e: SKIPPED — this checkout has the stub orchestration engine.\n" +
+        "  Run scripts/with-engines.sh npm run test:task-team against the private crate."
+    );
+    return;
+  }
+
   const relayPort = await getFreePort();
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-relay-task-team-e2e-"));
   const statePath = path.join(stateDir, "session.json");
@@ -557,7 +575,9 @@ async function postEnvelope(relayPort, pathName, body = undefined) {
 
 function buildRelay() {
   return new Promise((resolve, reject) => {
-    const build = spawn("cargo", ["build", "-p", "relay-server"], {
+    // With the feature, always: a build without it answers `start_team` with a
+    // refusal, and this suite exists to exercise the engine rather than that error.
+    const build = spawn("cargo", ["build", "-p", "relay-server", "--features", "orchestrators"], {
       cwd: ROOT,
       env: process.env,
       stdio: ["ignore", "inherit", "inherit"],

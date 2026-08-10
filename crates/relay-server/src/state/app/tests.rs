@@ -9828,7 +9828,14 @@ mod review_tests {
             bridges.insert(name.to_string(), Arc::new(provider.clone()));
             map.insert(*name, provider);
         }
-        (AppState::from_parts(relay, bridges, change_tx), map)
+        let app = AppState::from_parts(relay, bridges, change_tx);
+        // A build with the private engines linked gets the real decision layer, so
+        // the team tests below exercise the same code the product ships.
+        #[cfg(feature = "orchestrators")]
+        let app = app.with_team_brain(std::sync::Arc::new(
+            relay_orchestrators::TeamBrainImpl::default(),
+        ));
+        (app, map)
     }
 
     async fn start_parent(app: &AppState, cwd: &str, provider: &str) -> ThreadSummaryView {
@@ -11428,117 +11435,6 @@ mod review_tests {
     }
 
     const WORKFLOW_TERMINAL: &[&str] = &["done", "escalated", "failed", "interrupted", "cancelled"];
-
-    async fn wait_for_task_list_status(app: &AppState, run_id: &str, statuses: &[&str]) -> String {
-        for _ in 0..800 {
-            if let Some(status) = app
-                .relay
-                .read()
-                .await
-                .task_list_run(run_id)
-                .map(|run| run.status.as_str().to_string())
-            {
-                if statuses.contains(&status.as_str()) {
-                    return status;
-                }
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-        panic!("task list {run_id} never reached {statuses:?}");
-    }
-
-    #[tokio::test]
-    async fn task_list_runs_two_tasks_serially_to_done() {
-        use crate::state::{CheckpointMode, EscalatePolicy, TaskItem};
-        let dir = TempDir::new().expect("tmpdir");
-        let cwd = dir.path().to_str().unwrap();
-        let (app, providers) = build_review_app(cwd, &["codex"]).await;
-        let _parent = start_parent(&app, cwd, "codex").await;
-        // Each task's Code Flow is execute -> review APPROVE -> Done, so two tasks
-        // consume two reviewer verdicts. If the driver ran them concurrently (or
-        // skipped one) the counts below would be wrong.
-        queue_verdicts(providers.get("codex").unwrap(), &["APPROVE", "APPROVE"]).await;
-
-        let tasks = vec![
-            TaskItem::new("t0", "do task 0", "codex", None, None, 1),
-            TaskItem::new("t1", "do task 1", "codex", None, None, 1),
-        ];
-        let run_id = app
-            .start_task_list(
-                Some("device-1".to_string()),
-                "Nightly".to_string(),
-                tasks,
-                None,
-                EscalatePolicy::Halt,
-                CheckpointMode::None,
-                String::new(),
-            )
-            .await
-            .expect("task list should start");
-
-        let status =
-            wait_for_task_list_status(&app, &run_id, &["done", "escalated", "failed"]).await;
-        assert_eq!(status, "done", "both tasks approved -> list Done");
-
-        let relay = app.relay.read().await;
-        let run = relay.task_list_run(&run_id).expect("run exists");
-        assert_eq!(run.done_count(), 2, "both tasks reached Done");
-        assert_eq!(run.current_index, 2, "cursor advanced past both tasks");
-        assert!(
-            run.tasks.iter().all(|task| task.child_run_id.is_some()),
-            "each task recorded the child workflow that ran it"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_halts_and_skips_remaining_on_escalation() {
-        use crate::state::{CheckpointMode, EscalatePolicy, TaskItem, TaskStatus};
-        let dir = TempDir::new().expect("tmpdir");
-        let cwd = dir.path().to_str().unwrap();
-        let (app, providers) = build_review_app(cwd, &["codex"]).await;
-        let _parent = start_parent(&app, cwd, "codex").await;
-        // Task 0's single review round is NEEDS_CHANGES -> escalates (max_rounds=1).
-        // Only ONE verdict is queued: task 1 must never run, so it never consumes one.
-        queue_verdicts(providers.get("codex").unwrap(), &["NEEDS_CHANGES"]).await;
-
-        let tasks = vec![
-            TaskItem::new("t0", "do task 0", "codex", None, None, 1),
-            TaskItem::new("t1", "do task 1", "codex", None, None, 1),
-        ];
-        let run_id = app
-            .start_task_list(
-                Some("device-1".to_string()),
-                "Halt list".to_string(),
-                tasks,
-                None,
-                EscalatePolicy::Halt,
-                CheckpointMode::None,
-                String::new(),
-            )
-            .await
-            .expect("task list should start");
-
-        let status =
-            wait_for_task_list_status(&app, &run_id, &["done", "escalated", "failed"]).await;
-        assert_eq!(
-            status, "escalated",
-            "escalation under Halt -> list Escalated"
-        );
-
-        let relay = app.relay.read().await;
-        let run = relay.task_list_run(&run_id).expect("run exists");
-        assert_eq!(run.tasks[0].status, TaskStatus::Escalated);
-        assert_eq!(
-            run.tasks[1].status,
-            TaskStatus::Skipped,
-            "the later task is skipped by the halt"
-        );
-        assert!(
-            run.tasks[1].child_run_id.is_none(),
-            "a skipped task never started a workflow"
-        );
-        assert_eq!(run.done_count(), 0);
-    }
 
     #[tokio::test]
     async fn workflow_completes_after_revise_then_approve() {
@@ -16669,6 +16565,7 @@ turn) must allow a review: {error:?}"
         panic!("team run {run_id} never settled");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_task_team_splits_implements_reviews_and_passes_the_mr_gate() {
         let (_repo, root) = init_team_repo().await;
@@ -16761,6 +16658,7 @@ turn) must allow a review: {error:?}"
         assert!(dev_turn.contains("No unwrap in library code."));
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_sub_task_escalates_after_two_review_rounds_without_approval() {
         let (_repo, root) = init_team_repo().await;
@@ -16899,6 +16797,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_reviewer_sees_files_the_dev_created_not_just_tracked_edits() {
         // `WorkspaceDiffResponse::diff` carries only TRACKED changes; untracked
@@ -17015,6 +16914,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         std::fs::remove_file(path.join(".git").join("index.lock")).unwrap();
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_lost_driver_drains_owned_turns_and_blocks_when_it_cannot() {
         // Marking a run terminal releases its locks. If the driver died while a dev
@@ -17156,6 +17056,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_target_with_no_common_history_fails_instead_of_reviewing_nothing() {
         // The trap: run_mr_round commits the tree first, so falling back to `HEAD`
@@ -17223,6 +17124,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn cleanup_will_not_confirm_a_drain_for_a_turn_it_cannot_observe() {
         // A provider marks a thread working only AFTER start_turn returns. A driver
@@ -17305,6 +17207,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_running_task_keeps_every_other_writer_out_of_its_worktree() {
         // The reciprocal lock, and the one that is easy to forget: a team run does
@@ -17439,6 +17342,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         panic!("task {run_id} never became resumable");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_stop_and_a_turn_start_can_never_interleave() {
         // The boundary check that let a step run is many awaits behind the moment
@@ -17541,6 +17445,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_stop_waits_for_a_turn_that_is_already_starting() {
         // The second half of the same guarantee, and the half a status check
@@ -17610,6 +17515,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn talking_to_a_paused_team_lead_cannot_race_a_resume() {
         // While paused the user may redirect the team lead. That send does slow
@@ -17671,6 +17577,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         assert!(error.contains("belongs to a running task"), "{error}");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn answering_a_team_question_is_authorized_against_the_tasks_worktree() {
         // Skipping `ensure_device_can_approve` for a team thread was necessary —
@@ -17755,6 +17662,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         .expect("and answer it");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_task_thread_refuses_every_other_session_action() {
         // The design's contract is that a task's threads are driven, not operated:
@@ -17807,6 +17715,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         assert!(error.contains("belongs to a running task"), "{error}");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_team_lead_that_runs_out_of_room_is_replaced_and_the_work_continues() {
         // There is no token or context-window signal anywhere in `ThreadRuntime`,
@@ -17885,6 +17794,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_team_lead_that_dies_on_real_work_fails_the_run_after_one_replacement() {
         // The retry budget, not the succession cap, is what bounds this: one
@@ -17923,6 +17833,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_paused_task_whose_team_lead_session_is_gone_gets_a_new_one_on_resume() {
         // The case brick 7 deliberately left as a hole: a recorded lead that no
@@ -17964,6 +17875,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn the_http_surface_starts_a_task_and_drives_its_whole_lifecycle() {
         // The wire types are the only place a client meets this feature, so the
@@ -18054,6 +17966,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         assert_eq!(view.branch, "task/add-a-parser");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn starting_a_task_over_http_requires_a_title_and_a_device() {
         use crate::protocol::StartTeamInput;
@@ -18088,6 +18001,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_task_naming_a_provider_that_does_not_exist_leaves_nothing_behind() {
         // The other half of the same defect. Defaulting an ABSENT provider was
@@ -18140,6 +18054,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_task_started_without_a_provider_picks_one_instead_of_failing() {
         // The three provider fields are OPTIONAL on `StartTeamInput`, so a client
@@ -18250,6 +18165,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         assert_eq!(view.sub_tasks[1].reviewer_thread_id, None);
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_pause_whose_turn_then_fails_never_strands_the_run() {
         // A graceful pause stops nothing, so the turn it is waiting on can fail on
@@ -18316,6 +18232,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn an_unconfirmed_turn_start_blocks_and_never_gets_a_successor() {
         // The worst shape: `start_turn` errors AND the stop cannot be confirmed,
@@ -18371,6 +18288,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         panic!("task {run_id} never settled");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_stop_waits_for_the_relays_own_git_mutation() {
         // The gate covers turns. The driver ALSO mutates the worktree itself —
@@ -18479,6 +18397,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         assert!(error.contains("belongs to a running task"), "{error}");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_start_whose_response_was_lost_is_watched_before_it_is_believed() {
         // The dangerous shape: `start_turn` returns an error and the turn it
@@ -18520,6 +18439,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_start_that_never_began_is_not_treated_as_a_live_turn() {
         // The other side of the same coin, and the reason the window exists rather
@@ -18567,6 +18487,7 @@ report headed \"Nothing was left unresolved\": {:?}",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_commit_queued_behind_a_stop_never_lands() {
         // The ordering the gate alone does not cover. A stop that gets the gate
@@ -18664,6 +18585,7 @@ report headed \"Nothing was left unresolved\": {:?}",
             .unwrap_or(0)
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn an_abandoned_stop_cannot_leave_the_run_driverless() {
         // `stop_team_run` marks the run `stopping` and then awaits. An axum handler
@@ -18780,6 +18702,7 @@ swallowed and the run strands"
         .await;
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_team_lead_is_replaced_once_it_has_taken_too_many_turns() {
         // One of the two PROXY triggers. There is no token or context-window
@@ -18814,6 +18737,7 @@ swallowed and the run strands"
         assert_ne!(run.tl_thread_id, first_tl, "the successor is a new session");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_team_lead_is_replaced_once_its_transcript_is_too_large() {
         // The other proxy, and the one that actually stands in for context: turns
@@ -18897,6 +18821,7 @@ swallowed and the run strands"
         panic!("task {run_id} never started a turn");
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_pause_lands_at_the_next_step_boundary_not_mid_turn() {
         // A pause that cut a turn short would leave the worktree in whatever state
@@ -18951,6 +18876,7 @@ completion and had its result recorded"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_driver_rechecks_its_right_to_continue_at_every_boundary() {
         // A user action can settle the run while the driver is inside a turn. The
@@ -19005,6 +18931,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_force_stop_settles_paused_and_the_driver_cannot_overwrite_it() {
         // The race this pins: a force stop drains the very turn the driver is
@@ -19053,6 +18980,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_force_stop_that_cannot_confirm_the_drain_blocks_instead_of_lying() {
         // Reporting "stopped" when a turn is still running is the one outcome that
@@ -19085,6 +19013,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn resolving_a_blocked_task_drains_it_and_leaves_it_resumable() {
         // A task that took two attempts to stop has not lost its work: the
@@ -19191,6 +19120,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_question_parks_the_task_and_the_answer_carries_the_same_turn_on() {
         // The insight the whole brick rests on: a parked turn is NOT stopped. It is
@@ -19282,6 +19212,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_team_thread_takes_no_typed_messages_but_the_team_lead_takes_them_once_paused() {
         // The asymmetry the product needs: a person watching a dev can read its
@@ -19364,6 +19295,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_parked_question_freezes_the_stall_clock_rather_than_racing_it() {
         // A user thinking about a question is not a stalled agent. If the parked
@@ -19408,6 +19340,7 @@ underneath it"
         assert!(run.awaiting.is_some());
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_tool_approval_on_a_team_thread_is_denied_and_never_reaches_the_user() {
         // Nobody is watching a background turn. The worktree is sandboxed, which is
@@ -19455,6 +19388,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn auto_denying_an_approval_never_eats_the_users_question() {
         // The obvious implementation of "deny it and move on" is
@@ -19524,6 +19458,7 @@ underneath it"
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_resume_continues_from_the_record_without_redoing_finished_sub_tasks() {
         // Resume is only real if the record is genuinely sufficient. What proves it
@@ -19641,6 +19576,7 @@ SUBTASK: Two\nDo the second.\nEND SUBTASK",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn only_one_driver_may_ever_hold_a_task() {
         // Two Resumes landing together both read `Paused`, both pass the status
@@ -19740,6 +19676,7 @@ SUBTASK: Two\nDo the second.\nEND SUBTASK",
         }
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn a_paused_task_whose_worktree_vanished_is_blocked_rather_than_offered_a_resume() {
         // The ordinary case after a restart: the user cleaned up their worktrees
@@ -19798,6 +19735,7 @@ SUBTASK: Two\nDo the second.\nEND SUBTASK",
         );
     }
 
+    #[cfg(feature = "orchestrators")]
     #[tokio::test]
     async fn cancelling_a_task_frees_the_slot_and_keeps_the_work_on_disk() {
         // Pausing deliberately does NOT free the slot — a paused task still owns
