@@ -19939,8 +19939,9 @@ mod double_approve_race {
         };
         let client_grant = |Json(body): Json<serde_json::Value>| async move {
             Json(serde_json::json!({
-                "client_id": "client-1",
-                "client_refresh_token": "cref-attempt",
+                "claim_id": "claim-attempt",
+                "claim_nonce": "nonce-attempt",
+                "claim_expires_at": 4102444800_u64,
                 "relay_id": "relay-owner-1",
                 "broker_room_id": "demo-room",
                 "device_id": body["device_id"],

@@ -170,6 +170,20 @@ export async function signClaimChallengeProof(
   );
 }
 
+// Must match `client_claim_message` in crates/relay-broker/src/public_control.rs.
+// The relay id is in the message on purpose: a signature produced for one
+// relay's pairing cannot be replayed to claim against a different relay.
+export function clientClaimProofMessage(claimId, nonce, relayId) {
+  return `agent-relay:client-claim:${claimId}:${nonce}:${relayId}`;
+}
+
+export async function signClientClaim(claimId, nonce, relayId, keypair = null) {
+  return signDeviceProof(
+    clientClaimProofMessage(claimId, nonce, relayId),
+    keypair || (await ensureDeviceKeypair())
+  );
+}
+
 async function signDeviceProof(message, keypair) {
   const encodedMessage = new TextEncoder().encode(message);
   const signature = await keypair.sign(encodedMessage);

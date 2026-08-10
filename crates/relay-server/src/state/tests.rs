@@ -3961,8 +3961,9 @@ fn completed_pairing_can_carry_client_directory_grant() {
             &ticket.pairing_id,
             Some("relay-directory".to_string()),
             Some("Demo Relay".to_string()),
-            Some("client-directory".to_string()),
-            Some("client-refresh-directory".to_string()),
+            Some("claim-directory".to_string()),
+            Some("nonce-directory".to_string()),
+            Some(900),
         )
         .expect("client directory grant should attach");
 
@@ -3973,11 +3974,12 @@ fn completed_pairing_can_carry_client_directory_grant() {
 
     assert_eq!(replay.relay_id.as_deref(), Some("relay-directory"));
     assert_eq!(replay.relay_label.as_deref(), Some("Demo Relay"));
-    assert_eq!(replay.client_id.as_deref(), Some("client-directory"));
+    assert_eq!(replay.client_claim_id.as_deref(), Some("claim-directory"));
     assert_eq!(
-        replay.client_refresh_token.as_deref(),
-        Some("client-refresh-directory")
+        replay.client_claim_nonce.as_deref(),
+        Some("nonce-directory")
     );
+    assert_eq!(replay.client_claim_expires_at, Some(900));
 }
 
 #[test]

@@ -118,8 +118,9 @@ async fn spawn_public_control_mock() -> String {
 
     async fn client_grant(Json(request): Json<ClientGrantRequest>) -> Json<ClientGrantResponse> {
         Json(ClientGrantResponse {
-            client_id: format!("client-for-{}", request.device_id),
-            client_refresh_token: format!("client-refresh-{}", request.device_id),
+            claim_id: format!("claim-for-{}", request.device_id),
+            claim_nonce: format!("nonce-for-{}", request.device_id),
+            claim_expires_at: 999,
             relay_id: request.relay_id,
             broker_room_id: request.broker_room_id,
             device_id: request.device_id,
@@ -507,8 +508,9 @@ async fn broker_config_public_mode_uses_control_plane_tokens() {
         .await
         .expect("public mode should fetch a client grant")
         .expect("public mode should issue a client grant");
-    assert_eq!(client_grant.client_id, "client-for-device-1");
-    assert_eq!(client_grant.refresh_token, "client-refresh-device-1");
+    assert_eq!(client_grant.claim_id, "claim-for-device-1");
+    assert_eq!(client_grant.claim_nonce, "nonce-for-device-1");
+    assert_eq!(client_grant.claim_expires_at, 999);
     assert_eq!(client_grant.relay_id, "relay-owner-1");
     assert_eq!(client_grant.relay_label.as_deref(), Some("Demo Relay"));
 }
@@ -1736,8 +1738,9 @@ fn a_pairing_result_is_addressed_to_one_peer_and_never_broadcast() {
         payload_secret: Some("payload-secret-must-stay-sealed".to_string()),
         relay_id: Some("relay-1".to_string()),
         relay_label: None,
-        client_id: Some("client-1".to_string()),
-        client_refresh_token: Some("cref-must-stay-sealed".to_string()),
+        client_claim_id: Some("claim-1".to_string()),
+        client_claim_nonce: Some("cn-must-stay-sealed".to_string()),
+        client_claim_expires_at: Some(300),
         device_refresh_token: Some("dref-must-stay-sealed".to_string()),
         device_join_ticket: Some("join-ticket-must-stay-sealed".to_string()),
         device_join_ticket_expires_at: Some(300),

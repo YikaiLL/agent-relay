@@ -4,6 +4,7 @@ import {
   decryptJson,
   encryptJson,
   parsePairingPayload,
+  signClientClaim,
   signPairingProof,
 } from "./crypto.js";
 import { expiredPairingMessage, normalizePairingError } from "./pairing-errors.js";
@@ -15,6 +16,7 @@ import {
   releaseSupersededPairingSocket,
   retirePairing,
   cancelDeviceRefreshesForRelay,
+  claimClientIdentity,
   establishClientRefreshSession,
   establishDeviceRefreshSession,
   sendBrokerFrame,
@@ -314,10 +316,26 @@ export async function handleEncryptedPairingResult(payload) {
     abandon();
     return;
   }
-  if (result.client_refresh_token && result.client_id) {
+  if (result.client_claim_id && result.client_claim_nonce && result.relay_id) {
     try {
+      // The relay only attested that our key may reach it; we redeem that
+      // attestation ourselves so the credential never passes through a relay.
+      const claimSignature = await signClientClaim(
+        result.client_claim_id,
+        result.client_claim_nonce,
+        result.relay_id
+      );
+      const claimed = await claimClientIdentity({
+        claimId: result.client_claim_id,
+        claimSignature,
+        brokerUrl: ticket.broker_url,
+      });
+      if (!stillOurs()) {
+        abandon();
+        return;
+      }
       await establishClientRefreshSession(
-        result.client_refresh_token,
+        claimed.client_refresh_token,
         ticket.broker_url
       );
       if (!stillOurs()) {
@@ -325,7 +343,7 @@ export async function handleEncryptedPairingResult(payload) {
         return;
       }
       saveClientAuth({
-        clientId: result.client_id,
+        clientId: claimed.client_id,
         brokerControlUrl: brokerControlUrl(ticket.broker_url),
       });
     } catch (error) {

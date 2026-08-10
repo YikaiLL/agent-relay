@@ -42,10 +42,10 @@ use protocol::{
     BROKER_PROTOCOL_VERSION,
 };
 use public_control::{
-    ClientGrantRequest, ClientGrantResponse, ClientIdentityRevokeResponse,
-    ClientIdentityRotateResponse, ClientRelaysResponse, ClientSessionResponse,
-    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
+    ClientClaimRequest, ClientClaimResponse, ClientGrantRequest, ClientGrantResponse,
+    ClientIdentityRevokeResponse, ClientIdentityRotateResponse, ClientRelaysResponse,
+    ClientSessionResponse, DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse,
+    DeviceGrantRequest, DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
     DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
     PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
     RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayRegistrationSnapshot,
@@ -852,6 +852,10 @@ fn app_with_web_root_and_verifier_and_hardening_and_licenses(
             "/api/public/clients/grants",
             post(public_issue_client_grant),
         )
+        .route(
+            "/api/public/client/claim",
+            post(public_claim_client_identity),
+        )
         .route("/api/public/relays", get(public_list_client_relays))
         .route(
             "/api/public/client/session",
@@ -1483,6 +1487,26 @@ async fn public_issue_client_grant(
     let bearer = bearer_token(&headers)?;
     control_plane
         .issue_client_grant(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+/// Redeem a relay's attestation for a client credential.
+///
+/// Intentionally takes no bearer: the Ed25519 signature in the body *is* the
+/// authentication, and it belongs to the client, not to the relay that
+/// attested it. Rate-limited like the rest of the public control plane so the
+/// unauthenticated shape cannot be used to grind at claim ids.
+async fn public_claim_client_identity(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    Json(input): Json<ClientClaimRequest>,
+) -> Result<Json<ClientClaimResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "client_claim").await?;
+    let control_plane = require_public_control_plane(&state)?;
+    control_plane
+        .claim_client_identity(input)
         .await
         .map(Json)
         .map_err(public_api_error)

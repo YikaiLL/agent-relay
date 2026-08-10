@@ -2217,6 +2217,14 @@ test("a stale attempt cannot overwrite persisted client authorization", async ()
   });
   let clientCalls = 0;
   globalThis.fetch = async (url) => {
+    if (String(url).includes("/api/public/client/claim")) {
+      return {
+        ok: true,
+        async json() {
+          return { client_id: "client-a", client_refresh_token: "cref-a" };
+        },
+      };
+    }
     if (String(url).includes("/api/public/client/session")) {
       clientCalls += 1;
       await clientGate;
@@ -2251,8 +2259,8 @@ test("a stale attempt cannot overwrite persisted client authorization", async ()
     pairing_id: "pair-client-a",
     target_peer_id: "surface-a",
     envelope: await encryptJson(secretA, pairedResultBundle({
-      client_refresh_token: "cref-a",
-      client_id: "client-a",
+      client_claim_id: "claim-a",
+      client_claim_nonce: "nonce-a",
     })),
   });
   await waitFor(() => clientCalls > 0);

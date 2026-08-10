@@ -172,8 +172,9 @@ pub(crate) struct CompletedPairing {
     pub(crate) payload_secret: Option<String>,
     pub(crate) relay_id: Option<String>,
     pub(crate) relay_label: Option<String>,
-    pub(crate) client_id: Option<String>,
-    pub(crate) client_refresh_token: Option<String>,
+    pub(crate) client_claim_id: Option<String>,
+    pub(crate) client_claim_nonce: Option<String>,
+    pub(crate) client_claim_expires_at: Option<u64>,
     pub(crate) device_refresh_token: Option<String>,
     pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
@@ -221,8 +222,9 @@ pub(crate) struct PendingPairingResult {
     pub(crate) payload_secret: Option<String>,
     pub(crate) relay_id: Option<String>,
     pub(crate) relay_label: Option<String>,
-    pub(crate) client_id: Option<String>,
-    pub(crate) client_refresh_token: Option<String>,
+    pub(crate) client_claim_id: Option<String>,
+    pub(crate) client_claim_nonce: Option<String>,
+    pub(crate) client_claim_expires_at: Option<u64>,
     pub(crate) device_refresh_token: Option<String>,
     pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
@@ -510,8 +512,9 @@ impl RelayState {
                     payload_secret: Some(token.clone()),
                     relay_id: None,
                     relay_label: None,
-                    client_id: None,
-                    client_refresh_token: None,
+                    client_claim_id: None,
+                    client_claim_nonce: None,
+                    client_claim_expires_at: None,
                     device_refresh_token: None,
                     device_join_ticket: None,
                     device_join_ticket_expires_at,
@@ -527,8 +530,9 @@ impl RelayState {
                 payload_secret: Some(token),
                 relay_id: None,
                 relay_label: None,
-                client_id: None,
-                client_refresh_token: None,
+                client_claim_id: None,
+                client_claim_nonce: None,
+                client_claim_expires_at: None,
                 device_refresh_token: None,
                 device_join_ticket: None,
                 device_join_ticket_expires_at,
@@ -556,8 +560,9 @@ impl RelayState {
                 payload_secret: None,
                 relay_id: None,
                 relay_label: None,
-                client_id: None,
-                client_refresh_token: None,
+                client_claim_id: None,
+                client_claim_nonce: None,
+                client_claim_expires_at: None,
                 device_refresh_token: None,
                 device_join_ticket: None,
                 device_join_ticket_expires_at: None,
@@ -573,8 +578,9 @@ impl RelayState {
             payload_secret: None,
             relay_id: None,
             relay_label: None,
-            client_id: None,
-            client_refresh_token: None,
+            client_claim_id: None,
+            client_claim_nonce: None,
+            client_claim_expires_at: None,
             device_refresh_token: None,
             device_join_ticket: None,
             device_join_ticket_expires_at: None,
@@ -606,8 +612,9 @@ impl RelayState {
             payload_secret: completed.payload_secret,
             relay_id: completed.relay_id,
             relay_label: completed.relay_label,
-            client_id: completed.client_id,
-            client_refresh_token: completed.client_refresh_token,
+            client_claim_id: completed.client_claim_id,
+            client_claim_nonce: completed.client_claim_nonce,
+            client_claim_expires_at: completed.client_claim_expires_at,
             device_refresh_token: completed.device_refresh_token,
             device_join_ticket: completed.device_join_ticket,
             device_join_ticket_expires_at: completed.device_join_ticket_expires_at,
@@ -842,8 +849,9 @@ impl RelayState {
         pairing_id: &str,
         relay_id: Option<String>,
         relay_label: Option<String>,
-        client_id: Option<String>,
-        client_refresh_token: Option<String>,
+        client_claim_id: Option<String>,
+        client_claim_nonce: Option<String>,
+        client_claim_expires_at: Option<u64>,
     ) -> Result<(), String> {
         let completed = self
             .completed_pairings
@@ -851,8 +859,9 @@ impl RelayState {
             .ok_or_else(|| "completed pairing result is missing".to_string())?;
         completed.relay_id = relay_id;
         completed.relay_label = relay_label;
-        completed.client_id = client_id;
-        completed.client_refresh_token = client_refresh_token;
+        completed.client_claim_id = client_claim_id;
+        completed.client_claim_nonce = client_claim_nonce;
+        completed.client_claim_expires_at = client_claim_expires_at;
         Ok(())
     }
 

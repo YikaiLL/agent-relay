@@ -495,6 +495,33 @@ export async function establishDeviceRefreshSession(
   };
 }
 
+/**
+ * Redeem a relay's attestation for this browser's own client credential.
+ *
+ * Sends no bearer: the signature is the authentication, and it is ours. The
+ * token comes back straight from the broker over TLS, so the relay that
+ * attested us never sees it — that is the entire point of the two-step flow.
+ */
+export async function claimClientIdentity({ claimId, claimSignature, brokerUrl }) {
+  const url = new URL("/api/public/client/claim", brokerControlUrl(brokerUrl));
+  const response = await fetch(url, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ claim_id: claimId, claim_signature: claimSignature }),
+  });
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.message || payload?.error || "client claim failed");
+  }
+  return payload;
+}
+
 export async function establishClientRefreshSession(refreshToken, brokerUrl) {
   const url = new URL("/api/public/client/session", brokerControlUrl(brokerUrl));
   const response = await fetch(url, {

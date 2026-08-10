@@ -182,6 +182,12 @@ Notes:
 - set `RELAY_API_TOKEN` to protect `/api` routes
 - when `BIND_HOST` is non-loopback, `RELAY_API_TOKEN` is now required by default
 - `RELAY_ALLOW_INSECURE_NO_AUTH=1` only exists as an explicit insecure development escape hatch for non-loopback binds
+- **`RELAY_ALLOWED_HOSTS` — read this if you run the relay behind a reverse proxy.** The relay now refuses any request whose `Host` header is not one it recognises, answering `421 Misdirected Request`. This is the DNS-rebinding defence: after a rebind the browser still sends the attacker's hostname, so an `Origin` check cannot catch it (the expected origin is *derived* from `Host`, and the two agree) — only pinning the hostname does.
+  - always accepted: `localhost`, anything in `127.0.0.0/8`, `::1`, and a non-loopback `BIND_HOST`'s own address
+  - enforced when `BIND_HOST` is loopback (the default) **or** when `RELAY_ALLOWED_HOSTS` is set
+  - not enforced when `BIND_HOST` is non-loopback and `RELAY_ALLOWED_HOSTS` is unset, since the external hostname cannot be guessed and those binds already require a token
+  - **migration:** if nginx/Caddy proxies to a loopback-bound relay while preserving the external `Host` (`proxy_set_header Host $host`, which is Caddy's default), every request starts returning 421 after upgrading. Set `RELAY_ALLOWED_HOSTS=relay.example.com` (comma-separated for several names, port optional). The alternative is to have the proxy send the relay's own name instead (`proxy_set_header Host $proxy_host`).
+  - a refused request is logged with the `Host` it carried, so a hosts-file alias that stops working is diagnosable rather than mysterious
 - the local web UI now exchanges `RELAY_API_TOKEN` for an `HttpOnly` same-site session cookie, so normal browser use no longer needs to keep sending the raw token on every request
 - direct `Authorization: Bearer ...` API access still works for scripts and manual clients
 - relay HTTP responses now send CSP, `Permissions-Policy`, `Referrer-Policy: no-referrer`, and `X-Content-Type-Options: nosniff`

@@ -66,6 +66,7 @@ async fn image_accepting_routes_accept_a_body_over_the_default_limit() {
             auth: test_auth(),
             launch_id: None,
             security_headers: SecurityHeadersConfig::default(),
+            host_policy: HostPolicy::loopback_only(),
         };
         let router = build_router(context, WebAssets::Embedded);
 
@@ -761,6 +762,7 @@ async fn rename_thread_refuses_an_unparseable_body_instead_of_clearing_the_name(
             auth: test_auth(),
             launch_id: None,
             security_headers: SecurityHeadersConfig::default(),
+            host_policy: HostPolicy::loopback_only(),
         };
         let router = build_router(context, WebAssets::Embedded);
 
@@ -814,6 +816,7 @@ async fn rename_thread_refuses_a_body_that_omits_the_name_field() {
         auth: test_auth(),
         launch_id: None,
         security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
     };
     let router = build_router(context, WebAssets::Embedded);
 
@@ -864,6 +867,7 @@ async fn rename_thread_accepts_an_explicit_null_name_as_a_reset() {
         auth: test_auth(),
         launch_id: None,
         security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
     };
     let router = build_router(context, WebAssets::Embedded);
 
@@ -922,6 +926,7 @@ async fn the_first_stream_frame_is_built_fresh_not_served_from_the_fanout_cache(
         auth: test_auth(),
         launch_id: None,
         security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
     };
     let router = build_router(context, WebAssets::Embedded);
 
@@ -958,5 +963,354 @@ async fn the_first_stream_frame_is_built_fresh_not_served_from_the_fanout_cache(
         "a connecting surface must build its own snapshot; serving the warm fan-out \
          entry would hand it `server_time`/`devices_revision` from an arbitrarily old \
          build and skip the expiry sweeps that building runs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Local surface hardening: Host allowlist + CSRF on the unauthenticated path.
+// ---------------------------------------------------------------------------
+
+fn no_auth() -> AuthConfig {
+    AuthConfig::from_parts(
+        None,
+        None,
+        "127.0.0.1".parse().expect("loopback should parse"),
+    )
+    .expect("a loopback bind with no token is a valid config")
+}
+
+/// Returns the `TempDir` alongside the context: the caller has to hold it for
+/// the lifetime of the router, and dropping it cleans the directory up.
+fn test_context(auth: AuthConfig, host_policy: HostPolicy) -> (AppContext, tempfile::TempDir) {
+    let project = tempfile::TempDir::new().expect("project tempdir");
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        project.path().display().to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    let context = AppContext {
+        app: crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx),
+        auth,
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+        host_policy,
+    };
+    (context, project)
+}
+
+/// DNS rebinding: after the rebind the browser still sends the ATTACKER's
+/// hostname, only the resolved IP changed. Asserting on Host (not Origin) is
+/// the whole point — `request_origin` derives the expected origin FROM Host,
+/// so the same-origin check happily compares `http://evil.example` against
+/// itself and passes. Only an allowlist on the Host header stops this.
+#[tokio::test]
+async fn a_rebound_attacker_host_is_rejected_before_routing() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (context, _project) = test_context(no_auth(), HostPolicy::loopback_only());
+    let router = build_router(context, WebAssets::Embedded);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/start")
+                .header(header::HOST, "evil.example")
+                // The rebound page's own origin — self-consistent with Host,
+                // which is exactly why the Origin check cannot catch it.
+                .header(header::ORIGIN, "http://evil.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::MISDIRECTED_REQUEST,
+        "a foreign Host must be refused before any handler runs"
+    );
+}
+
+#[test]
+fn the_host_allowlist_accepts_loopback_names_and_the_configured_bind_host() {
+    let policy = HostPolicy::loopback_only();
+    for host in [
+        "127.0.0.1:8787",
+        "127.0.0.1",
+        "localhost:8787",
+        "localhost",
+        "[::1]:8787",
+        "[::1]",
+        "127.0.0.53:8787",
+    ] {
+        assert!(
+            policy.allows_host(Some(host)),
+            "{host} is a loopback name and must be accepted"
+        );
+    }
+
+    for host in ["evil.example", "evil.example:8787", "10.0.0.4:8787"] {
+        assert!(
+            !policy.allows_host(Some(host)),
+            "{host} must be rejected by a loopback-only policy"
+        );
+    }
+
+    let bound = HostPolicy::from_parts("192.168.1.166".parse().expect("ip"), None)
+        .expect("a non-loopback bind with no explicit list is valid");
+    assert!(
+        bound.allows_host(Some("anything.example")),
+        "a non-loopback bind with no explicit allowlist must not enforce, or every \
+         existing reverse-proxy deployment breaks"
+    );
+
+    let listed = HostPolicy::from_parts(
+        "0.0.0.0".parse().expect("ip"),
+        Some("relay.example, other.example".to_string()),
+    )
+    .expect("an explicit allowlist is valid");
+    assert!(listed.allows_host(Some("relay.example")));
+    assert!(listed.allows_host(Some("other.example:8787")));
+    assert!(
+        listed.allows_host(Some("localhost:8787")),
+        "loopback stays allowed alongside an explicit list"
+    );
+    assert!(!listed.allows_host(Some("evil.example")));
+}
+
+/// The `!auth.enabled()` short-circuit is what this pins: with no token
+/// configured — the default for the laptop UI — a mutating `/api/` request
+/// carrying a foreign Origin currently sails straight through.
+#[test]
+fn csrf_rejects_a_foreign_origin_when_no_token_is_configured() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://evil.example"),
+    );
+
+    let error = authorize_csrf_protection(
+        &no_auth(),
+        &Method::POST,
+        &headers,
+        &Uri::from_static("/api/session/start"),
+    )
+    .expect_err("a foreign origin must be rejected even with auth disabled");
+
+    assert_eq!(error.0, StatusCode::FORBIDDEN);
+    assert_eq!(error.1 .0.error.code, "csrf_rejected");
+}
+
+/// The counterweight: a browser ALWAYS attaches `Origin` to a cross-site
+/// mutating request, so "no Origin at all" is not reachable from a hostile
+/// page — it is curl, a Node e2e script, or the Tauri shell. Rejecting those
+/// would buy nothing and break every non-browser client.
+#[test]
+fn csrf_allows_a_mutating_request_that_carries_no_origin_at_all() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_ok(),
+        "non-browser clients send no Origin and must keep working"
+    );
+}
+
+/// `vite.config.js` proxies /api with `changeOrigin: true`, so in dev the
+/// browser's Origin is the vite port while Host is rewritten to the relay's —
+/// a legitimate mismatch that must keep working.
+///
+/// The custom header is what makes accepting it safe, and it is why this test
+/// sends one: every mutating call from the real frontend goes through
+/// `createApiFetch` -> `applyCsrfHeader` (`frontend/local/api.js`). Loopback
+/// alone is NOT sufficient — see
+/// `another_loopback_page_cannot_post_without_the_csrf_header`.
+#[test]
+fn csrf_allows_a_loopback_origin_from_the_vite_dev_proxy() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://localhost:5173"),
+    );
+    headers.insert(
+        HeaderName::from_static(CSRF_HEADER_NAME),
+        HeaderValue::from_static(CSRF_HEADER_VALUE),
+    );
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_ok(),
+        "the vite dev proxy must keep working"
+    );
+}
+
+/// These two routes take no body extractor, so they are CORS "simple
+/// requests": no preflight, sendable cross-origin straight from a form.
+/// Impact is denial of service — unpair the user's phone — and `device_id` is
+/// client-chosen at pairing, so `iphone` is a guessable target.
+#[tokio::test]
+async fn body_less_revoke_routes_reject_a_cross_origin_form_post() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    for route in [
+        "/api/devices/iphone/revoke",
+        "/api/devices/iphone/revoke-others",
+    ] {
+        let (context, _project) = test_context(no_auth(), HostPolicy::loopback_only());
+        let router = build_router(context, WebAssets::Embedded);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(route)
+                    .header(header::HOST, "127.0.0.1:8787")
+                    .header(header::ORIGIN, "https://evil.example")
+                    // A real form post: a CORS-simple content type, no preflight.
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{route} must refuse a cross-origin form post"
+        );
+    }
+}
+
+/// `Origin: null` is what a browser sends from an opaque origin. It is a
+/// *declared* origin that names nobody, and it must not be laundered into "no
+/// Origin header, therefore a non-browser client" — an ordinary web page can
+/// arrange to send it, with no Referer alongside.
+///
+/// `relay_http::header_origin` collapses `null` to `None` exactly like an
+/// absent header, so anything built on it has to re-check the raw header.
+/// This is not hypothetical: the first cut of this check did not, and the
+/// body-less revoke routes stayed reachable.
+#[tokio::test]
+async fn an_opaque_origin_is_not_mistaken_for_a_non_browser_client() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (context, _project) = test_context(no_auth(), HostPolicy::loopback_only());
+    let router = build_router(context, WebAssets::Embedded);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/devices/iphone/revoke")
+                .header(header::HOST, "127.0.0.1:8787")
+                .header(header::ORIGIN, "null")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an opaque `Origin: null` must be refused, not treated as undeclared"
+    );
+}
+
+#[test]
+fn an_opaque_or_unparseable_origin_is_refused_rather_than_ignored() {
+    for value in ["null", "NULL", "  null  ", "", "not a url"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_str(value).expect("header"),
+        );
+
+        assert!(
+            authorize_csrf_protection(
+                &no_auth(),
+                &Method::POST,
+                &headers,
+                &Uri::from_static("/api/session/start"),
+            )
+            .is_err(),
+            "`Origin: {value}` is declared but names nobody; it must not pass"
+        );
+    }
+}
+
+/// A present-but-opaque `Origin` must not fall through to `Referer`. Origin is
+/// the authoritative statement; if it says "opaque", a same-origin Referer
+/// alongside it is not a second opinion worth taking.
+#[test]
+fn an_opaque_origin_does_not_fall_through_to_a_friendly_referer() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(header::ORIGIN, HeaderValue::from_static("null"));
+    headers.insert(
+        header::REFERER,
+        HeaderValue::from_static("http://127.0.0.1:8787/app"),
+    );
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_err(),
+        "Origin is authoritative; a friendly Referer must not rescue an opaque one"
+    );
+}
+
+/// Loopback is not a trust boundary. Another page served from this machine —
+/// a second dev server, a static server showing an untrusted file, a local
+/// tool with an XSS — presents `http://localhost:<port>` just as legitimately
+/// as vite does. What separates them is the custom header: a cross-origin page
+/// cannot set it without a CORS preflight this server never grants.
+#[test]
+fn another_loopback_page_cannot_post_without_the_csrf_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://localhost:8000"),
+    );
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_err(),
+        "a cross-port loopback origin without the custom header must be refused"
     );
 }

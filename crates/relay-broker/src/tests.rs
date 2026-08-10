@@ -21,12 +21,13 @@ use super::*;
 use crate::auth::BrokerAuthMode;
 use crate::join_ticket::{JoinTicketClaims, JoinTicketKey};
 use crate::public_control::{
-    ClientGrantRequest, ClientGrantResponse, ClientIdentityRevokeResponse,
-    ClientIdentityRotateResponse, ClientRelaysResponse, ClientSessionResponse,
-    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
-    PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+    client_claim_message, ClientClaimRequest, ClientClaimResponse, ClientGrantRequest,
+    ClientGrantResponse, ClientIdentityRevokeResponse, ClientIdentityRotateResponse,
+    ClientRelaysResponse, ClientSessionResponse, DeviceGrantBulkRevokeRequest,
+    DeviceGrantBulkRevokeResponse, DeviceGrantRequest, DeviceGrantResponse,
+    DeviceGrantRevokeRequest, DeviceGrantRevokeResponse, DeviceSessionResponse,
+    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
+    RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
     RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
     RelayWsTokenResponse,
 };
@@ -177,6 +178,38 @@ where
         .json::<TResp>()
         .await
         .expect("response should decode")
+}
+
+/// Drive a full client pairing over HTTP: the relay attests the key, then the
+/// key holder redeems the attestation on its own (no bearer — the signature is
+/// the authentication). Returns the credential the *client* receives; the relay
+/// never sees one.
+async fn public_client_pair(
+    address: SocketAddr,
+    relay_bearer: &str,
+    signing_key: &SigningKey,
+    request: &ClientGrantRequest,
+) -> ClientClaimResponse {
+    let relay_id = request.relay_id.clone();
+    let attestation: ClientGrantResponse =
+        public_post(address, "/api/public/clients/grants", relay_bearer, request).await;
+    let message = client_claim_message(&attestation.claim_id, &attestation.claim_nonce, &relay_id);
+    let claim_signature = STANDARD.encode(signing_key.sign(message.as_bytes()).to_bytes());
+
+    reqwest::Client::new()
+        .post(format!("http://{address}/api/public/client/claim"))
+        .json(&ClientClaimRequest {
+            claim_id: attestation.claim_id,
+            claim_signature,
+        })
+        .send()
+        .await
+        .expect("claim request should succeed")
+        .error_for_status()
+        .expect("claim response should be successful")
+        .json::<ClientClaimResponse>()
+        .await
+        .expect("claim response should decode")
 }
 
 async fn public_post_response<TReq>(
@@ -1941,10 +1974,10 @@ async fn public_client_grants_list_relays_and_track_revoke() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -1987,10 +2020,10 @@ async fn public_client_session_cookie_can_list_relays() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[8_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -2045,10 +2078,10 @@ async fn cookie_authenticated_relay_directory_is_no_store() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[24_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -2097,10 +2130,10 @@ async fn public_client_refresh_token_can_rotate() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -2155,10 +2188,10 @@ async fn public_client_session_cookie_can_rotate() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -2234,10 +2267,10 @@ async fn public_client_session_cookie_fails_after_revoke() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[10_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -2884,10 +2917,10 @@ async fn client_environment_mutations_are_tracked() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),

@@ -5,6 +5,7 @@ mod codex;
 mod codex_local;
 mod fake_provider;
 mod file_changes;
+mod host_guard;
 mod instance_lock;
 mod protocol;
 #[cfg(test)]
@@ -35,6 +36,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::stream::{self, StreamExt};
+use host_guard::HostPolicy;
 use protocol::{
     AllowedRootsInput, AllowedRootsReceipt, ApiEnvelope, ApiError, ApplyFileChangeInput,
     ApplyFileChangeReceipt, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
@@ -54,8 +56,8 @@ use protocol::{
 };
 use provider::ProviderImage;
 use relay_http::{
-    apply_standard_security_headers, header_origin, parse_optional_string_env, request_origin,
-    request_uses_https, SecurityHeadersConfig,
+    apply_standard_security_headers, parse_optional_string_env, request_origin, request_uses_https,
+    SecurityHeadersConfig,
 };
 use serde::Deserialize;
 use state::{AppState, ApprovalError, AskUserAnswerError, TeamAction2};
@@ -65,7 +67,6 @@ use tower_http::{
 };
 use tracing::{info, warn};
 
-#[cfg(test)]
 use axum::http::HeaderValue;
 
 const CSP_CONNECT_SRC_ENV: &str = "RELAY_CSP_CONNECT_SRC";
@@ -99,6 +100,7 @@ struct AppContext {
     auth: AuthConfig,
     launch_id: Option<String>,
     security_headers: SecurityHeadersConfig,
+    host_policy: HostPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +181,8 @@ async fn main() {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
     let auth = AuthConfig::from_env_for_bind_host(host)
         .unwrap_or_else(|error| panic!("relay-server auth config is invalid: {error}"));
+    let host_policy = HostPolicy::from_env_for_bind_host(host)
+        .unwrap_or_else(|error| panic!("relay-server host allowlist is invalid: {error}"));
     let security_headers = security_headers_from_env()
         .unwrap_or_else(|error| panic!("relay-server security header config is invalid: {error}"));
     if auth.enabled() {
@@ -262,6 +266,7 @@ async fn main() {
             .ok()
             .filter(|value| !value.is_empty()),
         security_headers,
+        host_policy,
     };
     let app = build_router(context, web_assets);
     let address = SocketAddr::from((host, port));
@@ -378,6 +383,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             .nest_service("/static", ServeDir::new(web_root)),
     };
 
+    let host_policy_context = context.clone();
     router
         .with_state(context.clone())
         .layer(middleware::from_fn_with_state(
@@ -390,6 +396,12 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         ))
         .layer(middleware::from_fn(with_cache_headers))
         .layer(TraceLayer::new_for_http())
+        // Outermost on purpose: a request addressed to a hostname we do not
+        // answer to should never reach routing, a handler, or the body reader.
+        .layer(middleware::from_fn_with_state(
+            host_policy_context,
+            with_host_allowlist,
+        ))
 }
 
 /// Cache policy for the static web surface. Without this the HTML shell is served
@@ -1741,6 +1753,50 @@ async fn with_security_headers(
     response
 }
 
+/// Refuse any request addressed to a hostname this process does not answer to.
+///
+/// This is the DNS-rebinding guard. It cannot be expressed as an `Origin`
+/// check: after a rebind the attacker's page sends `Host: evil.example` AND
+/// `Origin: http://evil.example`, and since the expected origin is *derived*
+/// from `Host` those two agree. Only pinning the hostname breaks the loop.
+async fn with_host_allowlist(
+    State(context): State<AppContext>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (allowed, host) = {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| request.uri().authority().map(|value| value.as_str()));
+        (
+            context.host_policy.allows_host(host),
+            host.unwrap_or("<none>").to_string(),
+        )
+    };
+
+    if !allowed {
+        // Without this the symptom of a legitimate custom hostname (a hosts-file
+        // alias, a local reverse proxy) is an unexplained 421 on every request.
+        warn!(
+            "refused a request addressed to Host `{host}`; \
+             set {} to add it if this hostname is yours",
+            host_guard::ALLOWED_HOSTS_ENV
+        );
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            Json(ApiError::new(
+                "host_not_allowed",
+                "This relay only answers to its own local hostnames.".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
 async fn with_csrf_protection(
     State(context): State<AppContext>,
     request: Request,
@@ -1764,27 +1820,56 @@ fn authorize_csrf_protection(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
-    if !uri.path().starts_with("/api/") || method_is_safe(method) || !auth.enabled() {
+    if !uri.path().starts_with("/api/") || method_is_safe(method) {
         return Ok(());
     }
 
-    if auth.authenticates_with_bearer(headers) || !auth.authenticates_with_cookie(headers) {
+    // A bearer token is not ambient authority: a hostile page cannot read it,
+    // so it cannot be replayed through a confused deputy.
+    if auth.authenticates_with_bearer(headers) {
         return Ok(());
     }
 
-    if !has_valid_csrf_header(headers) {
-        return Err(forbidden_csrf(
-            "Cookie-authenticated requests must include X-Agent-Relay-CSRF.",
-        ));
+    if auth.enabled() && auth.authenticates_with_cookie(headers) {
+        // Cookie credentials ARE ambient. Demand the custom header (which a
+        // cross-origin page cannot set without a preflight this server never
+        // grants) *and* a trusted origin.
+        if !has_valid_csrf_header(headers) {
+            return Err(forbidden_csrf(
+                "Cookie-authenticated requests must include X-Agent-Relay-CSRF.",
+            ));
+        }
+
+        return match classify_request_origin(headers, uri) {
+            RequestOrigin::Trusted => Ok(()),
+            _ => Err(forbidden_csrf(
+                "Cookie-authenticated requests must come from the same Origin or Referer.",
+            )),
+        };
     }
 
-    if request_is_same_origin(headers, uri) {
+    if auth.enabled() {
+        // Authenticated by neither cookie nor bearer: `authorize_api` turns
+        // this away on its own merits, and doing it there keeps the 401/403
+        // distinction honest.
         return Ok(());
     }
 
-    Err(forbidden_csrf(
-        "Cookie-authenticated requests must come from the same Origin or Referer.",
-    ))
+    // No token configured — the laptop default, and the case the old
+    // `!auth.enabled()` short-circuit skipped entirely. Every caller is
+    // ambiently authorized here, so the browser check has to apply.
+    //
+    // Judging on a *declared* origin (rather than demanding one) is what keeps
+    // this from breaking every non-browser client: curl, the Node e2e scripts
+    // and the Tauri shell declare no origin, while a browser always attaches
+    // one to a cross-site mutating request — including the CORS-simple form
+    // posts that reach the body-less revoke routes.
+    match classify_request_origin(headers, uri) {
+        RequestOrigin::Untrusted => Err(forbidden_csrf(
+            "Cross-origin requests are refused on the local API.",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn method_is_safe(method: &Method) -> bool {
@@ -1801,17 +1886,84 @@ fn has_valid_csrf_header(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value == CSRF_HEADER_VALUE)
 }
 
-fn request_is_same_origin(headers: &HeaderMap, uri: &Uri) -> bool {
-    let Some(expected_origin) = request_origin(headers, Some(uri)) else {
-        return false;
+/// What a request says about where it came from.
+enum RequestOrigin {
+    /// Neither `Origin` nor `Referer` was sent. A browser always declares one
+    /// on a cross-site mutating request, so this is curl, a Node script, or
+    /// the Tauri shell — not a page we could be a confused deputy for.
+    Undeclared,
+    Trusted,
+    /// Declared and not trusted. Includes an origin that is *present but names
+    /// nobody* — see the `null` case below.
+    Untrusted,
+}
+
+/// Classify the origin a request declares.
+///
+/// Two things here are load-bearing and easy to undo by accident:
+///
+/// 1. **`Origin: null` is Untrusted, not Undeclared.** That is what a browser
+///    sends from an opaque origin, and a page can arrange to be one. Note that
+///    `relay_http::header_origin` maps `null` to `None`, exactly like an absent
+///    header — so this reads the raw header rather than leaning on it.
+///    Collapsing the two would admit such a page as "not a browser".
+/// 2. **Referer is consulted only when `Origin` is absent entirely.** Origin is
+///    the authoritative statement; if it is present and opaque, a friendly
+///    Referer next to it is not a second opinion worth taking.
+fn classify_request_origin(headers: &HeaderMap, uri: &Uri) -> RequestOrigin {
+    // `.get()` is Some for a present-but-opaque header, so this falls through
+    // to Referer only when Origin was genuinely not sent.
+    let Some(raw) = headers
+        .get(header::ORIGIN)
+        .or_else(|| headers.get(header::REFERER))
+    else {
+        return RequestOrigin::Undeclared;
     };
 
-    if headers.contains_key(header::ORIGIN) {
-        return header_origin(headers, header::ORIGIN)
-            .is_some_and(|origin| origin == expected_origin);
+    let Some(declared) = declared_origin_value(raw) else {
+        return RequestOrigin::Untrusted;
+    };
+
+    if request_origin(headers, Some(uri)).is_some_and(|expected| expected == declared) {
+        return RequestOrigin::Trusted;
     }
 
-    header_origin(headers, header::REFERER).is_some_and(|origin| origin == expected_origin)
+    // A cross-port loopback origin is the vite dev proxy (`changeOrigin: true`
+    // rewrites Host, so `localhost:5173` -> `127.0.0.1:8787` is a legitimate
+    // mismatch) — but loopback is NOT a trust boundary on its own. Any other
+    // page served from this machine has a loopback origin too: a second dev
+    // server, a static server showing an untrusted file, a local tool with an
+    // XSS. The custom header is what separates them, because a cross-origin
+    // page cannot set it without a CORS preflight this server never grants.
+    // Every mutating call from the real frontend carries it already
+    // (`frontend/local/api.js` `applyCsrfHeader`).
+    let loopback = declared
+        .parse::<Uri>()
+        .ok()
+        .and_then(|value| value.authority().map(|value| value.as_str().to_string()))
+        .is_some_and(|authority| host_guard::authority_is_loopback(&authority));
+
+    if loopback && has_valid_csrf_header(headers) {
+        RequestOrigin::Trusted
+    } else {
+        RequestOrigin::Untrusted
+    }
+}
+
+/// `scheme://authority` for an `Origin`/`Referer` value, or `None` when it
+/// names no usable origin: `null`, empty, or unparseable.
+fn declared_origin_value(value: &HeaderValue) -> Option<String> {
+    let raw = value.to_str().ok()?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
+        return None;
+    }
+
+    let parsed = raw.parse::<Uri>().ok()?;
+    Some(format!(
+        "{}://{}",
+        parsed.scheme_str()?,
+        parsed.authority()?
+    ))
 }
 
 fn forbidden_csrf(message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
