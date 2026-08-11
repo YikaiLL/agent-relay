@@ -38,4 +38,14 @@ echo "restart-dev-cloud: starting relay-server at http://${BIND_HOST:-127.0.0.1}
 # RELAY_BROKER_URL and the relay derives the control URL from it. Guard the
 # expansion so `set -u` does not abort before the relay even starts.
 echo "restart-dev-cloud: using broker ${RELAY_BROKER_CONTROL_URL:-${RELAY_BROKER_URL:-<derived by relay-server>}}"
+
+# Build with the orchestration engines when this checkout has them, and say which
+# of the two it got. A cloud relay is where long task lists actually get started,
+# so starting one that answers every request with "not available in this build" is
+# the worst place to discover the feature was compiled out — see PRIVATE_ENGINES.md.
+if [ -d "$(dirname "$0")/../crates/relay-orchestrators/src/team" ]; then
+  echo "restart-dev-cloud: orchestration engines present — building with them"
+  exec cargo run -p relay-server --features orchestrators
+fi
+echo "restart-dev-cloud: stub orchestration engine — task list and task team are off"
 exec cargo run -p relay-server
