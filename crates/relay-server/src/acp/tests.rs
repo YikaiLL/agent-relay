@@ -475,13 +475,11 @@ fn auto_approve_grants_once_never_always() {
         Some("allow-once")
     );
 
-    // If the agent offers no single-shot allow, falling back to the broad grant
-    // is better than deadlocking the turn.
+    // Superseded: this used to fall back to `allow_always` when no single-shot
+    // option existed. See `auto_approve_cancels_rather_than_granting_a_permanent_allowlist_entry`
+    // for why that was wrong — the turn is cancelled instead, not deadlocked.
     let only_always = vec![json!({"optionId":"allow-always","kind":"allow_always"})];
-    assert_eq!(
-        crate::acp::rpc::auto_approve_option_id(&only_always).as_deref(),
-        Some("allow-always")
-    );
+    assert_eq!(crate::acp::rpc::auto_approve_option_id(&only_always), None);
 
     // Nothing allowable at all: no option, so the caller cancels rather than
     // picking a reject and pretending it approved.
@@ -894,4 +892,175 @@ fn an_approval_recovers_the_command_from_the_tool_call_that_preceded_it() {
         crate::acp::rpc::command_for_tool_call(&runtime, "unknown"),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round-3 review: read-only mode drift, capture leaks, approval fallback,
+// and catalog defaults.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_mode_update_is_read_under_either_spelling() {
+    // The ACP spec names the field `modeId`; Cursor sends `currentModeId`.
+    // A bridge that claims to be generic has to accept both, and reading only
+    // the measured one means a spec-compliant agent's mode change is invisible.
+    for field in ["modeId", "currentModeId"] {
+        let mut runtime = session();
+        let op = plan_update(
+            &json!({"sessionUpdate":"current_mode_update", field: "agent"}),
+            &mut runtime,
+        );
+        assert_eq!(
+            op,
+            TranscriptOp::ModeChanged("agent".to_string()),
+            "`{field}` must be understood"
+        );
+    }
+}
+
+#[test]
+fn leaving_the_required_mode_is_drift_that_must_be_repaired() {
+    // ACP lets the agent change its own mode. A thread the relay put in `plan`
+    // for a read-only review can therefore be moved back to full `agent` by the
+    // agent itself — the relay has to notice, not just narrate.
+    let mut runtime = SessionRuntime {
+        required_mode: Some("plan"),
+        mode: "plan".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(runtime.mode_drift(), None);
+
+    runtime.mode = "agent".to_string();
+    assert_eq!(
+        runtime.mode_drift(),
+        Some("plan"),
+        "a read-only thread that left plan must report the mode to restore"
+    );
+
+    // A thread with no read-only requirement may sit in any mode.
+    let free = SessionRuntime {
+        required_mode: None,
+        mode: "plan".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(free.mode_drift(), None);
+}
+
+#[test]
+fn auto_approve_cancels_rather_than_granting_a_permanent_allowlist_entry() {
+    // Supersedes the round-2 fallback. The premise there — that `allow_always`
+    // beats deadlocking the turn — was wrong: returning nothing makes the caller
+    // answer `cancelled`, which ends the turn cleanly. A no-prompt policy must
+    // never be the thing that writes a user-global, on-disk grant.
+    let only_always = vec![json!({"optionId":"allow-always","kind":"allow_always"})];
+    assert_eq!(
+        crate::acp::rpc::auto_approve_option_id(&only_always),
+        None,
+        "a broad grant is worse than a cancelled turn"
+    );
+
+    let with_once = vec![
+        json!({"optionId":"allow-once","kind":"allow_once"}),
+        json!({"optionId":"allow-always","kind":"allow_always"}),
+    ];
+    assert_eq!(
+        crate::acp::rpc::auto_approve_option_id(&with_once).as_deref(),
+        Some("allow-once")
+    );
+}
+
+#[test]
+fn only_a_new_session_defines_the_providers_default_model() {
+    use crate::acp::protocol::model_options;
+
+    let available = vec![
+        json!({"modelId":"default[]","name":"Auto"}),
+        json!({"modelId":"claude-sonnet-4-6[thinking=true]","name":"claude-sonnet-4-6"}),
+    ];
+
+    // `session/new` reports the model a FRESH session starts on — that is the
+    // provider's default.
+    let fresh = model_options(&available, Some("default[]"), "cursor");
+    assert!(fresh[0].is_default);
+    assert!(!fresh[1].is_default);
+
+    // `session/load` reports the model THAT session happens to use. Treating it
+    // as the provider default means opening an old Sonnet thread silently makes
+    // every future new session start on Sonnet.
+    let loaded = model_options(&available, None, "cursor");
+    assert!(
+        loaded.iter().all(|option| !option.is_default),
+        "a loaded session's model must not be marketed as the provider default"
+    );
+}
+
+#[tokio::test]
+async fn an_aborted_read_does_not_leave_a_capture_swallowing_live_updates() {
+    // `read_thread` installs a capture, awaits `session/load`, then removes it.
+    // If the future is dropped mid-await — a client disconnect, an aborted task —
+    // the manual cleanup never runs and the capture stays installed forever.
+    // Every later `session/update` for that session is then diverted into a
+    // buffer nobody reads: a permanent transcript blackhole.
+    let state = relay_state();
+
+    let (outbound, _outbound_peer) = tokio::io::duplex(4096);
+    // Nothing ever answers the load, so the read parks until it is aborted.
+    let (inbound_writer, inbound) = tokio::io::duplex(4096);
+
+    let bridge = std::sync::Arc::new(AcpBridge::for_test(
+        state.clone(),
+        outbound,
+        inbound,
+        "cursor",
+    ));
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+    bridge.allow_session_load_for_test().await;
+
+    let reading = {
+        let bridge = bridge.clone();
+        tokio::spawn(async move {
+            let _ = crate::provider::ProviderBridge::read_thread(&*bridge, "t1").await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    reading.abort();
+    let _ = reading.await;
+
+    assert!(
+        !bridge.has_capture_for_test("t1").await,
+        "an aborted read must not leave its capture installed"
+    );
+
+    // And the proof that it matters: a live update now reaches RelayState.
+    let update = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "t1",
+            "update": {"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"alive"}}
+        }
+    }))
+    .unwrap();
+    {
+        let mut writer = inbound_writer;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{update}\n").as_bytes())
+            .await
+            .expect("write update");
+        tokio::io::AsyncWriteExt::flush(&mut writer)
+            .await
+            .expect("flush");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let relay = state.read().await;
+        let entries = relay
+            .runtime_for_thread("t1")
+            .map(|runtime| runtime.transcript_views())
+            .unwrap_or_default();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.text.as_deref() == Some("alive")),
+            "a delta after an aborted read must reach the transcript, not a dead buffer"
+        );
+    }
 }

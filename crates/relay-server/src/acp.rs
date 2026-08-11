@@ -76,6 +76,15 @@ pub(crate) struct SessionRuntime {
     /// tracks the session's model and pushes a change only when the relay's
     /// selection actually differs.
     pub(crate) model: String,
+    /// The mode the session is actually in, per the agent's own reporting.
+    pub(crate) mode: String,
+    /// The mode the relay's policy REQUIRES, when it requires one.
+    ///
+    /// Set only for a read-only thread (a reviewer, a read-only sandbox). ACP
+    /// lets the agent change its own mode, so without this the relay would keep
+    /// believing a thread is contained after the agent moved it back to full
+    /// `agent` — a permission change the user never asked for.
+    pub(crate) required_mode: Option<&'static str>,
     /// The turn the relay minted for the in-flight `session/prompt`. ACP has no
     /// turn concept of its own — a prompt is one request/response — so turn ids
     /// are relay-owned.
@@ -146,6 +155,14 @@ impl SessionRuntime {
         Some(requested.to_string())
     }
 
+    /// The mode this session must be restored to, if it has drifted out of it.
+    ///
+    /// `None` means either "no requirement" or "already correct".
+    pub(crate) fn mode_drift(&self) -> Option<&'static str> {
+        let required = self.required_mode?;
+        (!self.mode.is_empty() && self.mode != required).then_some(required)
+    }
+
     /// Whether it is safe to run a `session/load` replay through this session.
     ///
     /// A replay renumbers items from the start, and the counters are shared with
@@ -186,6 +203,60 @@ pub(crate) type Sessions = Arc<Mutex<HashMap<String, SessionRuntime>>>;
 /// transcript rather than mutate live state. Installing a capture for the
 /// session id redirects the replay into a buffer.
 pub(crate) type Captures = Arc<Mutex<HashMap<String, Vec<TranscriptEntryView>>>>;
+
+/// Installs a capture for the length of one `session/load`, and takes it back
+/// out on drop.
+///
+/// Manual insert/remove around an `.await` leaks the capture whenever the future
+/// does not run to completion — an aborted task, a disconnected client. A leaked
+/// capture is not inert: the notification path diverts EVERY later update for
+/// that session into a buffer nobody will ever read, so the thread's transcript
+/// silently stops advancing. Tying removal to the guard's lifetime makes the
+/// cleanup unconditional.
+pub(crate) struct CaptureGuard {
+    captures: Captures,
+    thread_id: String,
+}
+
+impl CaptureGuard {
+    async fn install(captures: Captures, thread_id: &str) -> Self {
+        captures
+            .lock()
+            .await
+            .insert(thread_id.to_string(), Vec::new());
+        Self {
+            captures,
+            thread_id: thread_id.to_string(),
+        }
+    }
+
+    /// The replay collected so far, leaving the capture installed until drop.
+    async fn take(&self) -> Vec<TranscriptEntryView> {
+        self.captures
+            .lock()
+            .await
+            .get_mut(&self.thread_id)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        let captures = self.captures.clone();
+        let thread_id = std::mem::take(&mut self.thread_id);
+        // Drop is sync and the map is behind an async mutex, so the removal is
+        // handed to the runtime. `try_lock` first keeps the common (uncontended)
+        // case immediate.
+        if let Ok(mut guard) = captures.try_lock() {
+            guard.remove(&thread_id);
+            return;
+        }
+        tokio::spawn(async move {
+            captures.lock().await.remove(&thread_id);
+        });
+    }
+}
 
 pub struct AcpBridge {
     /// `None` in tests, where the peer is an in-memory duplex rather than a
@@ -448,7 +519,12 @@ impl AcpBridge {
     }
 
     /// Cache the model catalog that rides along on `session/new` / `session/load`.
-    async fn absorb_catalog(&self, result: &Value) {
+    /// `from_new_session` marks a `session/new` answer, whose `currentModelId` is
+    /// the model a FRESH session starts on — the provider's default. A
+    /// `session/load` reports that conversation's own model, so treating it as
+    /// the default would make opening one old thread change what every later new
+    /// session starts on.
+    async fn absorb_catalog(&self, result: &Value, from_new_session: bool) {
         let Some(models) = result.get("models") else {
             return;
         };
@@ -460,7 +536,9 @@ impl AcpBridge {
         if available.is_empty() {
             return;
         }
-        let current = models.get("currentModelId").and_then(Value::as_str);
+        let current = from_new_session
+            .then(|| models.get("currentModelId").and_then(Value::as_str))
+            .flatten();
         let options = protocol::model_options(&available, current, self.provider_name);
         write_cached_models(&models_cache_path(self.provider_name), &options);
         *self.models.lock().await = options;
@@ -563,6 +641,16 @@ impl AcpBridge {
     }
 
     #[cfg(test)]
+    pub(crate) async fn allow_session_load_for_test(&self) {
+        self.capabilities.lock().await.load_session = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_capture_for_test(&self, thread_id: &str) -> bool {
+        self.captures.lock().await.contains_key(thread_id)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn session_turn_for_test(&self, thread_id: &str) -> Option<String> {
         self.sessions
             .lock()
@@ -601,8 +689,30 @@ impl AcpBridge {
 
         // A model this agent does not offer is not a selection for it — the
         // relay's session defaults carry another provider's id until this
-        // provider's picker has been populated. Skip rather than fail the turn.
+        // provider's picker has been populated, and a catalog refresh can drop a
+        // model a cached selection still names. Skipping keeps the turn alive,
+        // but it is a DISCREPANCY: the relay records the requested model as the
+        // thread's, so saying nothing would leave the UI naming a model that
+        // never answered. Logged on a relay-owned channel so the audit view
+        // shows it rather than filtering it as provider chatter.
         if !protocol::model_is_known(&self.models.lock().await, &target) {
+            let effective = self
+                .sessions
+                .lock()
+                .await
+                .get(thread_id)
+                .map(|session| session.model.clone())
+                .filter(|model| !model.is_empty())
+                .unwrap_or_else(|| "the agent's own default".to_string());
+            let mut relay = self.state.write().await;
+            relay.push_log(
+                "warn",
+                format!(
+                    "{} does not offer `{target}`; `{thread_id}` is running {effective} instead.",
+                    self.display_name
+                ),
+            );
+            relay.notify();
             return Ok(());
         }
 
@@ -649,6 +759,20 @@ impl AcpBridge {
                 json!({ "sessionId": thread_id, "modeId": mode }),
             )
             .await;
+
+        {
+            // Record the requirement even if the call below fails, so a later
+            // `current_mode_update` is still measured against the right target.
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions.entry(thread_id.to_string()).or_default();
+            // Only a read-only mode is a REQUIREMENT; `agent` is just the
+            // default, and pinning it would fight an agent that legitimately
+            // enters plan mode on its own.
+            session.required_mode = (mode != protocol::MODE_AGENT).then_some(mode);
+            if outcome.is_ok() {
+                session.mode = mode.to_string();
+            }
+        }
 
         match outcome {
             Ok(_) => Ok(()),
@@ -808,7 +932,7 @@ impl ProviderBridge for AcpBridge {
             .ok_or_else(|| format!("{} returned no sessionId", self.display_name))?
             .to_string();
 
-        self.absorb_catalog(&result).await;
+        self.absorb_catalog(&result, true).await;
 
         self.sessions.lock().await.insert(
             session_id.clone(),
@@ -891,10 +1015,7 @@ impl ProviderBridge for AcpBridge {
             }
             // A resume replays the whole conversation; capture and discard it so
             // it does not double-write the transcript the relay already holds.
-            self.captures
-                .lock()
-                .await
-                .insert(thread_id.to_string(), Vec::new());
+            let _capture = CaptureGuard::install(self.captures.clone(), thread_id).await;
 
             let result = self
                 .send_request(
@@ -903,9 +1024,8 @@ impl ProviderBridge for AcpBridge {
                 )
                 .await;
 
-            self.captures.lock().await.remove(thread_id);
             let result = result?;
-            self.absorb_catalog(&result).await;
+            self.absorb_catalog(&result, false).await;
         }
 
         // Unconditional: a resume that relaxes a thread from read-only back to
@@ -965,10 +1085,7 @@ impl ProviderBridge for AcpBridge {
             }
             session.reset_for_replay();
         }
-        self.captures
-            .lock()
-            .await
-            .insert(thread_id.to_string(), Vec::new());
+        let capture = CaptureGuard::install(self.captures.clone(), thread_id).await;
 
         let result = self
             .send_request(
@@ -977,14 +1094,9 @@ impl ProviderBridge for AcpBridge {
             )
             .await;
 
-        let transcript = self
-            .captures
-            .lock()
-            .await
-            .remove(thread_id)
-            .unwrap_or_default();
+        let transcript = capture.take().await;
         let result = result?;
-        self.absorb_catalog(&result).await;
+        self.absorb_catalog(&result, false).await;
 
         let preview = transcript
             .iter()

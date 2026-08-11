@@ -200,7 +200,7 @@ async fn handle_line(
     }
 
     if has_method {
-        handle_notification(payload, state, sessions, captures, provider_key).await;
+        handle_notification(payload, stdin, state, sessions, captures, provider_key).await;
         return;
     }
 
@@ -233,8 +233,10 @@ pub(crate) fn acp_error_message(error: &Value) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_notification(
     payload: Value,
+    stdin: &super::Outbound,
     state: &Arc<RwLock<RelayState>>,
     sessions: &Sessions,
     captures: &Captures,
@@ -260,6 +262,14 @@ async fn handle_notification(
         plan_update(update, session)
     };
     if matches!(op, TranscriptOp::Ignore) {
+        return;
+    }
+    // A mode change is a permission event, not a transcript entry: it has to be
+    // recorded on the session and, if it left a required read-only mode,
+    // actively repaired. Handled here rather than in `apply_op` because putting
+    // the session back needs the outbound pipe.
+    if let TranscriptOp::ModeChanged(mode) = op {
+        handle_mode_change(session_id, mode, stdin, state, sessions, provider_key).await;
         return;
     }
 
@@ -472,8 +482,12 @@ pub(crate) fn plan_update(update: &Value, session: &mut SessionRuntime) -> Trans
         // ACP lets the agent change mode itself and announce it here. Ignoring
         // it would leave the relay believing a thread is still read-only after
         // the agent moved it back to full `agent` mode.
+        // The spec names this `modeId`; Cursor sends `currentModeId`. A bridge
+        // that only understands the measured spelling would miss a
+        // spec-compliant agent's mode change entirely.
         "current_mode_update" => update
-            .get("currentModeId")
+            .get("modeId")
+            .or_else(|| update.get("currentModeId"))
             .and_then(Value::as_str)
             .filter(|mode| !mode.is_empty())
             .map(|mode| TranscriptOp::ModeChanged(mode.to_string()))
@@ -688,15 +702,8 @@ fn apply_op(
             thread.name = Some(title);
             relay.upsert_thread(thread);
         }
-        TranscriptOp::ModeChanged(mode) => {
-            // Surface it: a thread the user set to read-only silently leaving
-            // `plan` is a permission change they never asked for, and the relay
-            // cannot enforce ACP modes itself.
-            relay.push_log(
-                provider_key,
-                format!("`{thread_id}` switched to `{mode}` mode."),
-            );
-        }
+        // Handled before `apply_op` — see `handle_mode_change`.
+        TranscriptOp::ModeChanged(_) => return false,
         TranscriptOp::Ignore => return false,
     }
     true
@@ -917,6 +924,69 @@ async fn handle_server_request(
     relay.notify();
 }
 
+/// Record an agent-initiated mode change, and put a read-only thread back.
+///
+/// ACP lets the agent change its own mode. For a thread the relay put in `plan`
+/// to keep it read-only — a reviewer, a read-only sandbox — that is a silent
+/// permission escalation, so the bridge asks for the required mode back rather
+/// than only narrating the drift.
+///
+/// The log goes to `error`, a relay-owned channel: a line filed under the
+/// provider's own channel is treated as subprocess chatter by the audit view and
+/// filtered out, which is precisely the wrong fate for a permission event.
+async fn handle_mode_change(
+    session_id: &str,
+    mode: String,
+    stdin: &super::Outbound,
+    state: &Arc<RwLock<RelayState>>,
+    sessions: &Sessions,
+    provider_key: &'static str,
+) {
+    let drift = {
+        let mut sessions = sessions.lock().await;
+        let session = sessions.entry(session_id.to_string()).or_default();
+        session.mode = mode.clone();
+        session.mode_drift()
+    };
+
+    let Some(required) = drift else {
+        let mut relay = state.write().await;
+        relay.push_log(
+            provider_key,
+            format!("`{session_id}` switched to `{mode}` mode."),
+        );
+        relay.notify();
+        return;
+    };
+
+    // Fire-and-forget: the id is never registered, so the reply lands on no
+    // waiter and is dropped. Awaiting here would block the reader that has to
+    // process that very reply.
+    {
+        let mut stdin = stdin.lock().await;
+        let _ = write_line(
+            &mut **stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": format!("mode-restore-{session_id}"),
+                "method": "session/set_mode",
+                "params": { "sessionId": session_id, "modeId": required },
+            }),
+            provider_key,
+        )
+        .await;
+    }
+
+    let mut relay = state.write().await;
+    relay.push_log(
+        "error",
+        format!(
+            "`{session_id}` left read-only `{required}` mode for `{mode}`; asking              {provider_key} to restore it. Treat any work it did meanwhile as unconfined."
+        ),
+    );
+    relay.notify();
+}
+
 /// The command behind a tool call, recovered from the session's accumulated
 /// view.
 ///
@@ -933,23 +1003,22 @@ pub(crate) fn command_for_tool_call(session: &SessionRuntime, raw_id: &str) -> O
 
 /// The option to auto-answer a permission request with under a no-prompt policy.
 ///
-/// Deliberately prefers `allow_once` over `allow_always`: an "always" grant is
-/// recorded in the *agent's* own allowlist, outliving the thread and the relay
-/// process and invisible to the relay's policy layer. Answering once per call
-/// keeps every tool use round-tripping through the bridge, so the relay remains
-/// the authority on what this thread may do. `allow_always` is only used when
-/// the agent offers no single-shot option, since deadlocking the turn is worse.
+/// Only ever `allow_once`. An "always" grant is recorded in the *agent's* own
+/// allowlist, outliving the thread and the relay process and invisible to the
+/// relay's policy layer — so a thread set to "never prompt" would quietly widen
+/// permissions for every later, possibly stricter, thread.
+///
+/// Falling back to `allow_always` when no single-shot option exists was the
+/// round-2 behaviour, on the theory that it beat deadlocking the turn. It does
+/// not: returning `None` makes the caller answer `cancelled`, which ends the
+/// turn cleanly. A cancelled turn is recoverable; a permanent global grant the
+/// user never saw is not.
 pub(crate) fn auto_approve_option_id(options: &[Value]) -> Option<String> {
-    for kind in ["allow_once", "allow_always"] {
-        if let Some(id) = options
-            .iter()
-            .find(|option| option.get("kind").and_then(Value::as_str) == Some(kind))
-            .and_then(|option| option.get("optionId").and_then(Value::as_str))
-        {
-            return Some(id.to_string());
-        }
-    }
-    None
+    options
+        .iter()
+        .find(|option| option.get("kind").and_then(Value::as_str) == Some("allow_once"))
+        .and_then(|option| option.get("optionId").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 /// Serve `read_thread` from the relay's own runtime when a turn is streaming.

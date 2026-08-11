@@ -524,7 +524,9 @@ impl RelayState {
             push_vapid_public_key: None,
             push_attention: PushAttentionTracker::new(),
         };
-        state.push_log("info", "Relay booted. Waiting for Codex app-server.");
+        // Provider-neutral: which bridges are configured is decided later (and a
+        // relay running only Cursor is not waiting for Codex at all).
+        state.push_log("info", "Relay booted. Waiting for an agent provider.");
         state
     }
 

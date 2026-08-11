@@ -381,7 +381,8 @@ impl AppState {
 
         if providers.is_empty() {
             return Err(
-                "no agent providers are available; install codex or claude CLI".to_string(),
+                "no agent providers are available; install the codex, claude or cursor-agent CLI"
+                    .to_string(),
             );
         }
 

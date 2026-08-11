@@ -146,6 +146,11 @@ pub(crate) fn model_effort(model_id: &str) -> Option<String> {
 /// an ACP agent proxies many vendors — Cursor's catalog spans Anthropic, OpenAI,
 /// Google, xAI, Moonshot and its own Composer — and `list_models` filters on
 /// this field to keep one bridge's catalog out of another's picker.
+/// `current_model_id` should be passed ONLY from `session/new`, whose answer is
+/// the model a fresh session starts on — i.e. the provider's default. A
+/// `session/load` reports the model *that* conversation happens to use, and
+/// marking it default would make opening one old Sonnet thread silently change
+/// what every future new session starts on.
 pub(crate) fn model_options(
     available: &[Value],
     current_model_id: Option<&str>,

@@ -1647,9 +1647,12 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
     assert_eq!(restored.paired_devices.len(), 0);
     assert_eq!(restored.transcript.len(), 0);
     assert_eq!(restored.logs.len(), 1);
+    // The point is that a restore resets the log to exactly the fresh boot line,
+    // not what that line says — the copy is provider-neutral now that a relay
+    // can be running only Cursor.
     assert_eq!(
         restored.logs[0].message,
-        "Relay booted. Waiting for Codex app-server."
+        "Relay booted. Waiting for an agent provider."
     );
     assert_eq!(restored.allowed_roots, vec!["/tmp/project".to_string()]);
     assert_eq!(
