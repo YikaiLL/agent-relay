@@ -733,6 +733,13 @@ impl ProviderBridge for AcpBridge {
         // Optional in ACP. An agent without it simply has no history to offer;
         // the relay still drives sessions it starts itself, so this is an empty
         // list rather than an error.
+        //
+        // Measured: Cursor lists only sessions that have CONTENT — a
+        // `session/new` that was never prompted does not come back, so a thread
+        // created and abandoned before its first turn will not survive a relay
+        // restart. Same shape as Claude's deferred start. It also means the
+        // pagination below cannot be reached by creating empty sessions; 132 of
+        // them still came back as one page with no `nextCursor`.
         if !self.capabilities.lock().await.list_sessions {
             return Ok(Vec::new());
         }
