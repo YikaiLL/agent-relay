@@ -50,6 +50,7 @@ import {
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
 import { selectOwningContext } from "../shared/session-view-state.js";
+import { shouldShowAuditEntry } from "../shared/audit-log.js";
 import { syncComposerError } from "./composer-error.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
@@ -2199,19 +2200,6 @@ export function createSessionRenderer({
     }
 
     return "neutral";
-  }
-
-  function shouldShowAuditEntry(entry) {
-    const kind = String(entry?.kind || "").toLowerCase();
-    const message = String(entry?.message || "");
-
-    if (kind !== "codex") {
-      return true;
-    }
-
-    return /approval|pair|revoke|connected|disconnected|take over|control|broker|session/i.test(
-      message
-    );
   }
 
   return {

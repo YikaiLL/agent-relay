@@ -454,3 +454,41 @@ test("submission is allowed once a concrete model exists", () => {
     true
   );
 });
+
+test("an ACP anchor is never mistaken for an unresolvable Codex live id", () => {
+  // The drop rule reads a Codex live agent-message id (`msg_…`) by SHAPE, on the
+  // stated grounds that every other provider's ids are distinguishable. A third
+  // provider makes that claim worth pinning: the ACP bridge mints
+  // `acp-<kind>-<n>`, and — unlike Codex's live ids — those survive a
+  // `session/load` unchanged, so the relay CAN resolve them and dropping one
+  // would silently fork content the user did not select.
+  for (const itemId of [
+    "acp-user-1",
+    "acp-msg-12",
+    "acp-tool-3",
+    "acp-thought-7",
+  ]) {
+    const payload = forkFieldsToPayload({
+      sourceThreadId: "t1",
+      upToItemId: itemId,
+      forkPointIsTip: true,
+      provider: "cursor",
+    });
+    assert.equal(
+      payload.up_to_item_id,
+      itemId,
+      `${itemId} must survive: an ACP anchor resolves server-side`,
+    );
+  }
+});
+
+test("the drop rule stays anchored to the `msg_` prefix, not to a substring", () => {
+  // Guards the shape claim from the other direction: an id that merely CONTAINS
+  // `msg_` is not a Codex live anchor.
+  const payload = forkFieldsToPayload({
+    sourceThreadId: "t1",
+    upToItemId: "acp-msg_1",
+    forkPointIsTip: true,
+  });
+  assert.equal(payload.up_to_item_id, "acp-msg_1");
+});

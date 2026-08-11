@@ -4190,17 +4190,6 @@ function classifyAuditEntry(entry) {
   return "neutral";
 }
 
-function shouldShowAuditEntry(entry) {
-  const kind = String(entry?.kind || "").toLowerCase();
-  const message = String(entry?.message || "");
-
-  if (kind !== "codex") {
-    return true;
-  }
-
-  return /approval|pair|revoke|connected|disconnected|take over|control|broker|session/i.test(message);
-}
-
 function isCurrentDeviceActiveController(session) {
   if (!session?.active_thread_id || !session.active_controller_device_id) {
     return false;
