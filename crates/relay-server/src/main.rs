@@ -1,3 +1,4 @@
+mod acp;
 mod auth;
 mod broker;
 mod claude;

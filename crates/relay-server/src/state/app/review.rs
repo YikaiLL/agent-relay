@@ -2515,12 +2515,38 @@ pub(super) fn reviewer_thread_settings(
             parent_sandbox.to_string(),
             false,
         ),
+        // The fake provider has no filesystem at all — it cannot write whatever
+        // it is told, which is exactly the property `read_only_enforced` names.
+        "fake" => ("never".to_string(), "read-only".to_string(), true),
+        // Cursor over ACP has modes (`agent`/`plan`/`ask`), not an OS sandbox.
+        // `review_read_only` is what the ACP bridge maps onto `plan`, so the
+        // reviewer is contained at the prompt/tool level — but that is NOT
+        // isolation, hence `false`.
+        "cursor" => (
+            "review_read_only".to_string(),
+            parent_sandbox.to_string(),
+            false,
+        ),
+        // Unknown provider: never inherit the parent's policy. A parent
+        // typically runs `bypass` + `workspace-write`, so falling through would
+        // hand an unrecognized reviewer full write access to the artifact it is
+        // judging. Restrict to the strongest mode we have a name for and claim
+        // no enforcement.
         _ => (
-            parent_approval.to_string(),
+            "review_read_only".to_string(),
             parent_sandbox.to_string(),
             false,
         ),
     }
+}
+
+/// Whether a provider's read-only reviewer mode is enforced by something
+/// stronger than a prompt.
+///
+/// The single source of truth for "may this provider judge an artifact it could
+/// otherwise edit?", shared by workflow validation so the two cannot drift.
+pub(super) fn reviewer_read_only_is_enforced(provider: &str) -> bool {
+    reviewer_thread_settings(provider, "on-request", "workspace-write").2
 }
 
 fn reviewer_failure_message(outcome: &WaitOutcome) -> &'static str {
@@ -2556,4 +2582,47 @@ pub(super) fn random_suffix() -> String {
         .map(char::from)
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod reviewer_settings_tests {
+    use super::reviewer_thread_settings;
+
+    /// A reviewer must never be handed the parent's write-capable settings just
+    /// because its provider wasn't recognized. The parent is typically running
+    /// `bypass` + `workspace-write`, so falling through hands the reviewer full
+    /// write access to the artifact it was asked to judge.
+    #[test]
+    fn an_unrecognized_provider_is_not_given_the_parents_write_access() {
+        let (approval, _sandbox, enforced) =
+            reviewer_thread_settings("some-future-agent", "bypass", "workspace-write");
+        assert_ne!(
+            approval, "bypass",
+            "an unknown reviewer must not inherit an auto-approve policy"
+        );
+        assert!(!enforced, "an unknown provider cannot claim hard read-only");
+    }
+
+    #[test]
+    fn cursor_reviews_read_only_and_does_not_claim_a_hard_sandbox() {
+        let (approval, _sandbox, enforced) =
+            reviewer_thread_settings("cursor", "bypass", "workspace-write");
+        // `review_read_only` is what the ACP bridge maps onto `plan` mode.
+        assert_eq!(approval, "review_read_only");
+        // Cursor's plan mode is prompt/tool-level containment, not OS isolation.
+        assert!(
+            !enforced,
+            "ACP modes are not a sandbox; claiming enforcement would let a \
+             cursor reviewer be accepted where a hard read-only one is required"
+        );
+    }
+
+    #[test]
+    fn codex_remains_the_enforced_case_and_claude_the_unenforced_one() {
+        assert_eq!(
+            reviewer_thread_settings("codex", "bypass", "workspace-write"),
+            ("never".to_string(), "read-only".to_string(), true)
+        );
+        assert!(!reviewer_thread_settings("claude_code", "bypass", "workspace-write").2);
+    }
 }

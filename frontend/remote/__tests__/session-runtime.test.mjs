@@ -54,10 +54,13 @@ test("deriveSessionRuntime returns runtime state from the session view", () => {
     currentEffortValue: "medium",
     currentModelValue: "gpt-5.5",
     errorMessage: "",
+    // This session carries no `provider`, so the generic settings apply. They
+    // used to have no effort labels at all, which surfaced the raw wire values
+    // (`xhigh`) in the UI for any provider the frontend didn't know by name.
     effortOptions: [
-      { label: "minimal", value: "minimal" },
-      { label: "medium", value: "medium" },
-      { label: "xhigh", value: "xhigh" },
+      { label: "Minimal", value: "minimal" },
+      { label: "Medium", value: "medium" },
+      { label: "Extra high", value: "xhigh" },
     ],
     messagePlaceholder: "Another device has control. Take over to reply.",
     models: [{
