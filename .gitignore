@@ -47,3 +47,8 @@ node_modules/
 
 # Local design explorations / static preview mocks — not part of the app build.
 design/
+
+# Never let the private engines reach a public commit (scripts/with-engines.sh).
+crates/relay-orchestrators/src/team/
+crates/relay-orchestrators/src/task_list/
+crates/relay-orchestrators/.gitignore
