@@ -52,6 +52,15 @@ fi
 
 stash="$(mktemp -d)"
 cp -R "$target" "$stash/stub"
+# The lock file too. A build with the private crate writes ITS dependency list
+# into the public `Cargo.lock`, which is both a dirty tree after every run and a
+# slow leak of exactly the thing a private repository is for: not the names
+# themselves, but which ones changed and when. The cost is that a `cargo add` made
+# during a session under this script is reverted with everything else — do that in
+# a plain checkout.
+if [[ -f "$repo_root/Cargo.lock" ]]; then
+  cp "$repo_root/Cargo.lock" "$stash/Cargo.lock"
+fi
 
 # Ignore further signals while restoring. The window between removing the private
 # crate and putting the stub back is short, but a second Ctrl-C landing inside it
@@ -65,6 +74,9 @@ restore() {
     cp -R "$stash/stub" "$target.swapping"
     rm -rf "$target"
     mv "$target.swapping" "$target"
+  fi
+  if [[ -f "$stash/Cargo.lock" ]]; then
+    cp "$stash/Cargo.lock" "$repo_root/Cargo.lock"
   fi
   rm -rf "$stash"
 }

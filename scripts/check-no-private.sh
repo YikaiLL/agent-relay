@@ -15,6 +15,25 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The lock file leaks separately from the sources. A build with the private crate
+# writes its dependency list into the public `Cargo.lock`, and the stub — which
+# has no dependencies at all — leaves that entry bare. So a `dependencies = [`
+# under it means a swapped build's lock is about to be committed, even if the
+# sources themselves were restored.
+if [[ -f "$root/Cargo.lock" ]] &&
+   grep -A3 '^name = "sealwire-private"$' "$root/Cargo.lock" | grep -q '^dependencies = \['; then
+  cat >&2 <<EOF
+
+REFUSING TO COMMIT: Cargo.lock carries the private crate's dependencies.
+
+  A build under with-private.sh wrote them there. Restore it with:
+    git checkout -- Cargo.lock
+
+EOF
+  exit 1
+fi
+
 if [[ ! -f "$root/crates/sealwire-private/STUB" ]]; then
   cat >&2 <<EOF
 
