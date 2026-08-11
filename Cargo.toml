@@ -2,7 +2,7 @@
 members = [
     "crates/relay-api",
     "crates/relay-broker",
-    "crates/relay-orchestrators",
+    "crates/sealwire-private",
     "crates/relay-http",
     "crates/relay-server",
     "crates/relay-util",

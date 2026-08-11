@@ -48,7 +48,14 @@ node_modules/
 # Local design explorations / static preview mocks — not part of the app build.
 design/
 
-# Never let the private engines reach a public commit (scripts/with-engines.sh).
-crates/relay-orchestrators/src/team/
-crates/relay-orchestrators/src/task_list/
-crates/relay-orchestrators/.gitignore
+# Never let the private crate reach a public commit (scripts/with-private.sh).
+#
+# A whitelist of the three files the stub is made of, not a list of the modules
+# the private crate happens to have today: whatever goes private next is ignored
+# here without anyone remembering to add it.
+crates/sealwire-private/*
+!crates/sealwire-private/Cargo.toml
+!crates/sealwire-private/STUB
+!crates/sealwire-private/src/
+crates/sealwire-private/src/*
+!crates/sealwire-private/src/lib.rs

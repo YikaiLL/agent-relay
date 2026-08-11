@@ -6,8 +6,8 @@ license.workspace = true
 
 [features]
 default = []
-# Build with the private orchestration engines linked in.
-orchestrators = ["dep:relay-orchestrators"]
+# Build with the private crate linked in.
+private = ["dep:sealwire-private"]
 
 [dependencies]
 aes-gcm.workspace = true
@@ -28,7 +28,7 @@ relay-broker = { path = "../relay-broker" }
 # PRIVATE and optional. Without it the relay builds, runs, and is fully
 # auditable — it simply has no orchestration engines registered. Switch the
 # `path` for a `git` source once the private repo has a remote.
-relay-orchestrators = { path = "../relay-orchestrators", optional = true }
+sealwire-private = { path = "../sealwire-private", optional = true }
 relay-http = { path = "../relay-http" }
 relay-util = { path = "../relay-util" }
 rusqlite.workspace = true

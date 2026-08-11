@@ -1,31 +1,47 @@
-# Private orchestration engines
+# The private crate
 
 The relay in this repository is complete and buildable on its own. What it does
-**not** contain is the orchestration engines — the layer that decides what a long
-running agent arrangement does next and how it phrases that to the agent. Those
-live in a separate private repository and are linked in only for release builds.
+**not** contain is `sealwire-private` — today that is the orchestration engines,
+the layer that decides what a long running agent arrangement does next and how it
+phrases that to the agent. It lives in a separate private repository and is linked
+in only for release builds.
 
 Everything else is here: the transport, the end-to-end encryption, the broker (which
 is a blind relay and never sees a decrypted payload), the run records, the HTTP
-surface, and the driver that executes whatever the engines decide.
+surface, and the driver that executes whatever the private side decides.
 
 ```
 crates/relay-api             the seam — shared records and traits, no logic
-crates/relay-orchestrators   a STUB in this repo; the real crate is private
+crates/sealwire-private      a STUB in this repo; the real crate is private
 crates/relay-server          the relay: records, driver, routes, persistence
 ```
+
+The crate is named for **what it is** — closed — not for what is currently in it.
+Anything else that has to stay closed later arrives as another module inside it
+rather than as a second hidden crate, so the swap script, the commit guard, the
+ignore rules and the feature flag stay at one each and never need to learn a new
+name. The domain names live one level down, in its modules (`task_list`, `team`).
 
 ## What a public checkout gets
 
 | | |
 |---|---|
-| `cargo build` / `cargo test --workspace` | works, no engines registered |
-| `cargo build --features orchestrators` | **fails on purpose** — this checkout has no engines, and a stub that silently satisfied the feature would ship a relay whose task teams quietly do nothing |
+| `cargo build` / `cargo test --workspace` | works, nothing private registered |
+| `cargo build --features private` | **fails on purpose** — this checkout has no private crate, and a stub that silently satisfied the feature would ship a relay whose task teams quietly do nothing |
 | `npm run test:task-team` | skips itself, with a message saying why |
 | Task list / task team at runtime | `start_team` refuses with a clear error |
 
 Everything else — sessions, threads, review, workflow, pairing, the broker
 protocol, the crypto — runs and is tested normally.
+
+## How the two halves are told apart
+
+`crates/sealwire-private/STUB` is a marker file the stub carries and the private
+crate does not. Present means stub; absent means the private sources are in the
+tree. The commit guard, both dev loops and the task-team suite all key off exactly
+that, rather than probing for a module name today's private crate happens to have —
+a probe like that fails open and silently the day the private side is renamed or
+grows something new.
 
 ---
 
@@ -35,7 +51,7 @@ Steps only a maintainer can do. Nothing here is needed to build or audit the rel
 
 ## 1. Create the private repository
 
-GitHub → New repository → `sealwire/relay-orchestrators` → **Private**.
+GitHub → New repository → `sealwire/sealwire-private` → **Private**.
 Do not initialise it with any files.
 
 The organisation rather than a personal account: `sealwire/sealwire` already lives
@@ -48,19 +64,19 @@ workflow, which has none.
 
 ```bash
 cd "$(mktemp -d)" && pwd     # note this path, you delete it in step 5
-ssh-keygen -t ed25519 -f engines-key -N "" -C "relay-orchestrators deploy key"
+ssh-keygen -t ed25519 -f private-key -N "" -C "sealwire-private deploy key"
 ```
 
 Not under `~/git/`: a key generated inside a working tree can be committed by
-accident, and this one reads the engines.
+accident, and this one reads the private crate.
 
 ## 3. Public key → the private repo, read only
 
 ```bash
-cat engines-key.pub
+cat private-key.pub
 ```
 
-`sealwire/relay-orchestrators` → Settings → Deploy keys → Add deploy key
+`sealwire/sealwire-private` → Settings → Deploy keys → Add deploy key
 
 - Title: `CI read-only`
 - Key: the output above
@@ -72,17 +88,22 @@ to *you* — a much larger blast radius for the same job.
 ## 4. Private key → the public repo's Actions secret
 
 ```bash
-cat engines-key
+cat private-key
 ```
 
 `sealwire/sealwire` → Settings → Secrets and variables → **Actions** → New
 repository secret
 
-- Name: `RELAY_ENGINES_DEPLOY_KEY`
+- Name: `RELAY_PRIVATE_DEPLOY_KEY`
 - Secret: the output above, including the `-----BEGIN` and `-----END` lines
 
 GitHub stores it encrypted and never shows it again — not even to you — and masks
 it in logs.
+
+The name has to match the workflow exactly. Getting it wrong does not turn CI red:
+both jobs are guarded on the secret being non-empty, so a typo means they quietly
+run the public half only. After the first push, check that the run shows **1212**
+tests and not 1141.
 
 ## 5. Destroy the local copy
 
@@ -92,25 +113,25 @@ rm -rf "$(pwd)"      # the temp directory from step 2
 
 No backup is needed. To rotate, generate a new pair and delete the old deploy key.
 
-## 6. Push the engines
+## 6. Push the private crate
 
 ```bash
-cd ../relay-orchestrators
-git remote add origin git@github.com:sealwire/relay-orchestrators.git
+cd ../sealwire-private
+git remote add origin git@github.com:sealwire/sealwire-private.git
 git push -u origin main
 ```
 
 ---
 
-# Working with the engines locally
+# Working with the private crate locally
 
-The private checkout is expected at `../relay-orchestrators`, or wherever
-`RELAY_ENGINES_PATH` points.
+The private checkout is expected at `../sealwire-private`, or wherever
+`RELAY_PRIVATE_PATH` points.
 
 ```bash
-scripts/with-engines.sh cargo test --workspace --features relay-server/orchestrators
-scripts/with-engines.sh npm run test:task-team
-scripts/with-engines.sh cargo build --release -p relay-server --features orchestrators
+scripts/with-private.sh cargo test --workspace --features relay-server/private
+scripts/with-private.sh npm run test:task-team
+scripts/with-private.sh cargo build --release -p relay-server --features private
 ```
 
 The script copies the private crate over the stub for the duration of one command
@@ -123,17 +144,17 @@ undo is leaving the real sources in a public working tree.
 | Trigger | Unit tests | Task-team e2e |
 |---|---|---|
 | `pull_request` (including forks) | 1141, no secret in scope | skipped, says so |
-| `push` / `schedule` / manual | 1212, real engines | runs for real |
+| `push` / `schedule` / manual | 1212, real private crate | runs for real |
 | No secret configured | 1141 | skipped |
 
-The engines are deliberately **not** checked out on `pull_request`. Forks never
+The private crate is deliberately **not** checked out on `pull_request`. Forks never
 receive secrets — GitHub enforces that — but a pull request from a branch in this
-repository would, so a workflow edit could print the engines into a public log.
+repository would, so a workflow edit could print the sources into a public log.
 Push and schedule cover the same code minutes later.
 
 **The exposure is exactly "who has write access to `sealwire/sealwire`."** While
 that is one person this is fine. Before adding anyone, either trust them with the
-engines or move the release pipeline into the private repository (see below).
+private crate or move the release pipeline into the private repository (see below).
 
 ## When to restructure
 

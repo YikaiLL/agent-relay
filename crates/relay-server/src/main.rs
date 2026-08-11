@@ -262,14 +262,13 @@ async fn main() {
     // clone everything downstream uses, so it must be installed before the state
     // is shared. Without the feature there is simply no engine, and every guard
     // that asks the registry a question gets the "nothing is running" answer.
-    #[cfg(feature = "orchestrators")]
+    #[cfg(feature = "private")]
     let state = {
-        let task_list =
-            std::sync::Arc::new(relay_orchestrators::TaskListEngine::new(state.clone()));
+        let task_list = std::sync::Arc::new(sealwire_private::TaskListEngine::new(state.clone()));
         state
             .with_orchestrators(vec![task_list])
             .with_team_brain(std::sync::Arc::new(
-                relay_orchestrators::TeamBrainImpl::default(),
+                sealwire_private::TeamBrainImpl::default(),
             ))
     };
     let web_assets = default_web_assets();

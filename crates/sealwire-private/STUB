@@ -1,0 +1,17 @@
+This file marks this directory as the PUBLIC STUB of `sealwire-private`.
+
+The real crate is proprietary and lives in a separate private repository.
+`scripts/with-private.sh` swaps it over this directory for the duration of one
+command, which deletes this file; the trap that restores the stub puts it back.
+
+So: this file present = stub, absent = the private sources are in the tree.
+
+Four things test exactly that, rather than looking for a module name that only
+today's private crate happens to have:
+
+  scripts/check-no-private.sh   refuses to commit while the private crate is in
+  scripts/dev-full.mjs          picks --features private when it can
+  scripts/restart-dev-cloud.sh  same, for the cloud dev loop
+  scripts/task-team-e2e.mjs     skips itself instead of failing without them
+
+Do not delete it, and do not add it to the private repository.

@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Run a command against the REAL orchestration engines.
+# Run a command against the REAL private crate.
 #
-#   scripts/with-engines.sh cargo test --workspace --features relay-server/orchestrators
+#   scripts/with-private.sh cargo test --workspace --features relay-server/private
 #
-# The public repo carries a stub at `crates/relay-orchestrators` so anyone can
-# build and audit the relay without the proprietary engines. This script swaps the
+# The public repo carries a stub at `crates/sealwire-private` so anyone can build
+# and audit the relay without the proprietary sources. This script swaps the
 # private checkout into that path for the duration of one command, then puts the
 # stub back.
+#
+# One crate, whatever is in it. Everything that has to stay closed lives in
+# `sealwire-private` as another module rather than as a second hidden crate, so
+# this script never grows a list of things to swap.
 #
 # Restore runs from a trap, so it happens on failure, on Ctrl-C, and on a test that
 # panics — not only on the happy path. Leaving the real sources in a public working
@@ -18,31 +22,31 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-engines_src="${RELAY_ENGINES_PATH:-$repo_root/../relay-orchestrators}"
-target="$repo_root/crates/relay-orchestrators"
+private_src="${RELAY_PRIVATE_PATH:-$repo_root/../sealwire-private}"
+target="$repo_root/crates/sealwire-private"
 
-# Escape hatch for a public checkout, which has no engines to swap in. Off by
+# Escape hatch for a public checkout, which has no private crate to swap in. Off by
 # default and deliberately explicit: the scripts that route through here are the
 # ones that start long-running task lists, and a relay that came up quietly
 # without them would refuse every start while looking perfectly healthy.
-if [[ "${RELAY_NO_ENGINES:-}" == "1" ]]; then
+if [[ "${RELAY_PUBLIC_ONLY:-}" == "1" ]]; then
   exec "$@"
 fi
 
-if [[ ! -f "$engines_src/Cargo.toml" ]]; then
+if [[ ! -f "$private_src/Cargo.toml" ]]; then
   cat >&2 <<EOF
-with-engines: no orchestration engines at $engines_src
+with-private: no private crate at $private_src
 
-  Task lists and task teams need the private engines. Either:
-    - clone them next to this repo, or set RELAY_ENGINES_PATH, or
-    - RELAY_NO_ENGINES=1 <your command>   (starts without them; long tasks refuse)
+  Task lists and task teams need it. Either:
+    - clone it next to this repo, or set RELAY_PRIVATE_PATH, or
+    - RELAY_PUBLIC_ONLY=1 <your command>   (starts without it; long tasks refuse)
 
-  See PRIVATE_ENGINES.md.
+  See PRIVATE_CRATE.md.
 EOF
   exit 1
 fi
 if [[ ! -d "$target" ]]; then
-  echo "with-engines: expected the stub crate at $target" >&2
+  echo "with-private: expected the stub crate at $target" >&2
   exit 1
 fi
 
@@ -67,8 +71,12 @@ restore() {
 trap restore EXIT INT TERM
 
 rm -rf "$target"
-cp -R "$engines_src" "$target"
+cp -R "$private_src" "$target"
 rm -rf "$target/.git" "$target/Cargo.lock"
+# Belt and braces: the private repo must not carry the stub's marker file, because
+# everything else keys "is the private crate in the tree" off its absence. Copying
+# one in would make the guard wave the real sources straight through.
+rm -f "$target/STUB"
 # The private checkout points at the relay by a path that only makes sense from
 # outside the workspace; in here it is a plain sibling crate.
 perl -pi -e 's{path = "\.\./agent-relay/crates/relay-api"}{path = "../relay-api"}' "$target/Cargo.toml"

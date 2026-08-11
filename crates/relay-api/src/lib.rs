@@ -1,4 +1,4 @@
-//! The seam between the public relay and its private orchestrators.
+//! The seam between the public relay and the private crate.
 //!
 //! # Why this crate exists
 //!
@@ -14,12 +14,12 @@
 //! ```text
 //!   relay-api  (public, this crate — traits + shared vocabulary, no logic)
 //!      ^   ^
-//!      |   +---- relay-orchestrators (private) ---+
+//!      |   +---- sealwire-private (private) ------+
 //!      |                                          |
 //!      +-------- relay-server (public) <----------+
 //! ```
 //!
-//! `relay-orchestrators` implements [`Orchestrator`] and consumes [`RelayPort`].
+//! `sealwire-private` implements [`Orchestrator`] and consumes [`RelayPort`].
 //! `relay-server` implements [`RelayPort`] for its `AppState` and holds engines as
 //! `Arc<dyn Orchestrator>`. The public repo builds and is fully auditable with no
 //! engine registered at all — the routes simply report the feature absent.
