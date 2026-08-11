@@ -78,6 +78,12 @@ pub(crate) struct SessionRuntime {
     pub(crate) model: String,
     /// The mode the session is actually in, per the agent's own reporting.
     pub(crate) mode: String,
+    /// Whether this session has ever carried a turn.
+    ///
+    /// Measured: Cursor cannot load a session with no content — it answers
+    /// `Session "…" not found`. So a thread created and not yet prompted has to
+    /// read as empty rather than as a provider error.
+    pub(crate) has_content: bool,
     /// The mode the relay's policy REQUIRES, when it requires one.
     ///
     /// Set only for a read-only thread (a reviewer, a read-only sandbox). ACP
@@ -794,6 +800,54 @@ impl AcpBridge {
     }
 }
 
+/// A thread row for a session that exists but has no content yet.
+fn empty_thread_sync(thread_id: &str, cwd: &str, provider_key: &'static str) -> ThreadSyncData {
+    ThreadSyncData {
+        thread: ThreadSummaryView {
+            id: thread_id.to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: cwd.to_string(),
+            updated_at: crate::state::unix_now(),
+            source: provider_key.to_string(),
+            status: "idle".to_string(),
+            model_provider: provider_key.to_string(),
+            provider: provider_key.to_string(),
+            forked_from: None,
+            renamed: false,
+        },
+        status: "idle".to_string(),
+        active_flags: Vec::new(),
+        transcript: Vec::new(),
+    }
+}
+
+/// Record the mode and model a `session/new` or `session/load` reports.
+///
+/// Cursor persists both with the session — measured to survive a reload and a
+/// process restart — so the response is authoritative about what the session is
+/// actually set to. Recording it stops a resume from re-pushing a model that is
+/// already in place, and gives drift detection a baseline before the first
+/// `current_mode_update`. A response that carries neither leaves what we knew.
+pub(crate) fn absorb_session_settings(session: &mut SessionRuntime, result: &Value) {
+    if let Some(mode) = result
+        .get("modes")
+        .and_then(|modes| modes.get("currentModeId"))
+        .and_then(Value::as_str)
+        .filter(|mode| !mode.is_empty())
+    {
+        session.mode = mode.to_string();
+    }
+    if let Some(model) = result
+        .get("models")
+        .and_then(|models| models.get("currentModelId"))
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    {
+        session.model = model.to_string();
+    }
+}
+
 /// Read a previously harvested model catalog.
 ///
 /// ACP has no standalone catalog method — `availableModels` rides on
@@ -848,6 +902,11 @@ pub(crate) fn absorb_thread_cwds(
         if entry.cwd.is_empty() {
             entry.cwd = thread.cwd.clone();
         }
+        // Being listed IS the evidence of content: the agent only returns
+        // sessions that have some (an un-prompted one is not listed and cannot
+        // be loaded). Without this the entry created here would default to
+        // "empty" and make every cold thread read back as blank.
+        entry.has_content = true;
     }
 }
 
@@ -934,21 +993,19 @@ impl ProviderBridge for AcpBridge {
 
         self.absorb_catalog(&result, true).await;
 
-        self.sessions.lock().await.insert(
-            session_id.clone(),
-            SessionRuntime {
+        {
+            let mut runtime = SessionRuntime {
                 cwd: cwd.to_string(),
                 approval_policy: approval_policy.to_string(),
-                // Whatever `session/new` chose, until the relay says otherwise.
-                model: result
-                    .get("models")
-                    .and_then(|models| models.get("currentModelId"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
                 ..Default::default()
-            },
-        );
+            };
+            // Whatever `session/new` chose, until the relay says otherwise.
+            absorb_session_settings(&mut runtime, &result);
+            self.sessions
+                .lock()
+                .await
+                .insert(session_id.clone(), runtime);
+        }
 
         self.apply_mode(&session_id, approval_policy, sandbox)
             .await?;
@@ -995,7 +1052,9 @@ impl ProviderBridge for AcpBridge {
             let sessions = self.sessions.lock().await;
             sessions
                 .get(thread_id)
-                .map(|session| session.can_replay_into())
+                // An un-prompted session has nothing to replay and cannot be
+                // loaded at all; a streaming one must not be replayed over.
+                .map(|session| session.has_content && session.can_replay_into())
                 .unwrap_or(true)
         };
 
@@ -1026,6 +1085,12 @@ impl ProviderBridge for AcpBridge {
 
             let result = result?;
             self.absorb_catalog(&result, false).await;
+            {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions.entry(thread_id.to_string()).or_default();
+                absorb_session_settings(session, &result);
+                session.has_content = true;
+            }
         }
 
         // Unconditional: a resume that relaxes a thread from read-only back to
@@ -1065,6 +1130,20 @@ impl ProviderBridge for AcpBridge {
             return Ok(data);
         }
 
+        // A session the relay opened but never prompted has no content, and the
+        // agent answers `Session "…" not found` for it. That is an empty thread,
+        // not a failure — Claude short-circuits its pending threads the same way.
+        let (known, has_content, cwd_hint) = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(thread_id) {
+                Some(session) => (true, session.has_content, session.cwd.clone()),
+                None => (false, false, String::new()),
+            }
+        };
+        if known && !has_content {
+            return Ok(empty_thread_sync(thread_id, &cwd_hint, self.provider_name));
+        }
+
         if !self.capabilities.lock().await.load_session {
             return Err(format!(
                 "{} does not support loading a session, so its history cannot be read",
@@ -1097,6 +1176,12 @@ impl ProviderBridge for AcpBridge {
         let transcript = capture.take().await;
         let result = result?;
         self.absorb_catalog(&result, false).await;
+        {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions.entry(thread_id.to_string()).or_default();
+            absorb_session_settings(session, &result);
+            session.has_content = true;
+        }
 
         let preview = transcript
             .iter()
@@ -1186,6 +1271,9 @@ impl ProviderBridge for AcpBridge {
             let mut sessions = self.sessions.lock().await;
             let session = sessions.entry(thread_id.to_string()).or_default();
             session.turn_id = Some(turn_id.clone());
+            // From here the session is loadable; before it, the agent has
+            // nothing to replay and refuses the id outright.
+            session.has_content = true;
             session.close_streams();
             session.next_item_id("user")
         };

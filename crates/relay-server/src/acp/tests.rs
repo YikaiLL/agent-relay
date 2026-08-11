@@ -1064,3 +1064,89 @@ async fn an_aborted_read_does_not_leave_a_capture_swallowing_live_updates() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_thread_with_no_turn_yet_reads_as_empty_rather_than_erroring() {
+    // Measured: Cursor cannot load a session that has no content — it answers
+    // `Session "…" not found`. So "new session, switch away before sending,
+    // switch back" would surface a provider error for a thread that is simply
+    // empty. Claude short-circuits its pending threads the same way.
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(4096);
+    let (_inbound_writer, inbound) = tokio::io::duplex(4096);
+
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+    bridge.allow_session_load_for_test().await;
+
+    let data = crate::provider::ProviderBridge::read_thread(&bridge, "t1")
+        .await
+        .expect("an un-prompted thread is readable");
+    assert!(data.transcript.is_empty());
+    assert_eq!(data.thread.cwd, "/tmp/project");
+
+    // And it must not have asked the agent to load something that cannot load.
+    let mut buffer = vec![0_u8; 256];
+    let quiet = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut outbound_peer, &mut buffer),
+    )
+    .await;
+    assert!(
+        quiet.is_err(),
+        "no session/load should be attempted for an empty session"
+    );
+}
+
+#[test]
+fn a_loaded_session_reports_the_mode_and_model_it_kept() {
+    // Measured: Cursor preserves both across a reload AND across a process
+    // restart, so the load response is authoritative about what the session is
+    // actually set to. Recording it means a resume does not blindly re-push a
+    // model that is already in place, and drift detection has a baseline before
+    // the first `current_mode_update` arrives.
+    let mut runtime = SessionRuntime::default();
+    crate::acp::absorb_session_settings(
+        &mut runtime,
+        &json!({
+            "modes": {"currentModeId": "plan"},
+            "models": {"currentModelId": "claude-sonnet-4-6[thinking=true]"}
+        }),
+    );
+    assert_eq!(runtime.mode, "plan");
+    assert_eq!(runtime.model, "claude-sonnet-4-6[thinking=true]");
+    // Already in place: nothing to push.
+    assert_eq!(
+        runtime.model_change_needed("claude-sonnet-4-6[thinking=true]"),
+        None
+    );
+
+    // A response carrying neither must not blank what we already knew.
+    crate::acp::absorb_session_settings(&mut runtime, &json!({}));
+    assert_eq!(runtime.mode, "plan");
+    assert_eq!(runtime.model, "claude-sonnet-4-6[thinking=true]");
+}
+
+#[test]
+fn a_listed_session_is_known_to_have_content() {
+    // Caught by the live e2e: caching cwds creates a session entry, and a
+    // default entry claims no content — so every cold thread short-circuited to
+    // an empty transcript. Being listed is itself the proof of content, because
+    // the agent does not list (or load) a session that has none.
+    let mut sessions = std::collections::HashMap::new();
+    let listed = vec![crate::acp::protocol::thread_summary(
+        &json!({"sessionId":"s1","cwd":"/repo","title":"t"}),
+        "cursor",
+        0,
+    )
+    .expect("thread")];
+
+    crate::acp::absorb_thread_cwds(&mut sessions, &listed);
+
+    let session = sessions.get("s1").expect("entry");
+    assert_eq!(session.cwd, "/repo");
+    assert!(
+        session.has_content,
+        "a listed session must be loadable, not treated as an empty draft"
+    );
+}
