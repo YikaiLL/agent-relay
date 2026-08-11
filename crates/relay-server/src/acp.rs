@@ -45,6 +45,15 @@ mod tests;
 pub(crate) type PendingResponses =
     Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 
+/// The bridge's outbound pipe.
+///
+/// A trait object rather than `ChildStdin` so tests can drive the real request
+/// and turn-lifecycle code over `tokio::io::duplex` instead of a real
+/// `cursor-agent` — which is the only way to exercise send failures and stream
+/// death, neither of which a live agent can be asked to produce on cue.
+pub(crate) type Outbound = Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
+pub(crate) type Inbound = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
 const ACP_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// `session/prompt` runs for as long as the agent works, so it gets no deadline
 /// from the request layer — the turn ends when the agent says it does, or when
@@ -179,8 +188,10 @@ pub(crate) type Sessions = Arc<Mutex<HashMap<String, SessionRuntime>>>;
 pub(crate) type Captures = Arc<Mutex<HashMap<String, Vec<TranscriptEntryView>>>>;
 
 pub struct AcpBridge {
-    _child: Arc<Mutex<Child>>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// `None` in tests, where the peer is an in-memory duplex rather than a
+    /// process.
+    _child: Option<Arc<Mutex<Child>>>,
+    stdin: Outbound,
     pending_responses: PendingResponses,
     next_request_id: AtomicU64,
     next_turn_id: AtomicU64,
@@ -244,10 +255,10 @@ impl AcpBridge {
         let pending_responses: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
         let captures: Captures = Arc::new(Mutex::new(HashMap::new()));
-        let stdin = Arc::new(Mutex::new(stdin));
+        let stdin: Outbound = Arc::new(Mutex::new(Box::new(stdin)));
 
         rpc::spawn_stdout_reader(rpc::ReaderContext {
-            stdout,
+            stdout: Box::new(stdout),
             stdin: stdin.clone(),
             pending_responses: pending_responses.clone(),
             state: state.clone(),
@@ -258,7 +269,7 @@ impl AcpBridge {
         rpc::spawn_stderr_reader(stderr, state.clone(), provider_key);
 
         let bridge = Self {
-            _child: child,
+            _child: Some(child),
             stdin,
             pending_responses,
             next_request_id: AtomicU64::new(1),
@@ -268,7 +279,9 @@ impl AcpBridge {
             display_name,
             sessions,
             captures,
-            models: Arc::new(Mutex::new(Vec::new())),
+            models: Arc::new(Mutex::new(read_cached_models(&models_cache_path(
+                provider_key,
+            )))),
             load_locks: Arc::new(Mutex::new(HashMap::new())),
             capabilities: Arc::new(Mutex::new(protocol::AgentCapabilities::default())),
             authenticated: AtomicBool::new(false),
@@ -424,7 +437,7 @@ impl AcpBridge {
 
     async fn send_json(&self, value: Value) -> Result<(), String> {
         let mut stdin = self.stdin.lock().await;
-        rpc::write_line(&mut stdin, &value, self.display_name).await
+        rpc::write_line(&mut **stdin, &value, self.display_name).await
     }
 
     fn mint_turn_id(&self) -> String {
@@ -449,6 +462,7 @@ impl AcpBridge {
         }
         let current = models.get("currentModelId").and_then(Value::as_str);
         let options = protocol::model_options(&available, current, self.provider_name);
+        write_cached_models(&models_cache_path(self.provider_name), &options);
         *self.models.lock().await = options;
     }
 
@@ -490,6 +504,73 @@ impl AcpBridge {
 }
 
 impl AcpBridge {
+    /// Build a bridge whose peer is an in-memory duplex instead of a process.
+    ///
+    /// Exists so the request/turn lifecycle can be driven against a scripted
+    /// agent: send failures and stream death are the two paths a live
+    /// `cursor-agent` cannot be asked to produce on demand, and they are exactly
+    /// where a turn can be stranded.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        state: Arc<RwLock<RelayState>>,
+        outbound: impl tokio::io::AsyncWrite + Send + Unpin + 'static,
+        inbound: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+        provider_key: &'static str,
+    ) -> Self {
+        let pending_responses: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let captures: Captures = Arc::new(Mutex::new(HashMap::new()));
+        let stdin: Outbound = Arc::new(Mutex::new(Box::new(outbound)));
+
+        rpc::spawn_stdout_reader(rpc::ReaderContext {
+            stdout: Box::new(inbound),
+            stdin: stdin.clone(),
+            pending_responses: pending_responses.clone(),
+            state: state.clone(),
+            sessions: sessions.clone(),
+            captures: captures.clone(),
+            provider_key,
+        });
+
+        Self {
+            _child: None,
+            stdin,
+            pending_responses,
+            next_request_id: AtomicU64::new(1),
+            next_turn_id: AtomicU64::new(1),
+            state,
+            provider_name: provider_key,
+            display_name: "TestAgent",
+            sessions,
+            captures,
+            models: Arc::new(Mutex::new(Vec::new())),
+            load_locks: Arc::new(Mutex::new(HashMap::new())),
+            capabilities: Arc::new(Mutex::new(protocol::AgentCapabilities::default())),
+            authenticated: AtomicBool::new(true),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn seed_session_for_test(&self, thread_id: &str, cwd: &str) {
+        self.sessions.lock().await.insert(
+            thread_id.to_string(),
+            SessionRuntime {
+                cwd: cwd.to_string(),
+                approval_policy: "on-request".to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn session_turn_for_test(&self, thread_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .and_then(|session| session.turn_id.clone())
+    }
+
     async fn load_lock(&self, thread_id: &str) -> Arc<Mutex<()>> {
         self.load_locks
             .lock()
@@ -587,6 +668,43 @@ impl AcpBridge {
             )),
         }
     }
+}
+
+/// Read a previously harvested model catalog.
+///
+/// ACP has no standalone catalog method — `availableModels` rides on
+/// `session/new` — so a fresh process has nothing to show in the model picker
+/// until the user has already created a thread. Caching the catalog moves that
+/// empty window to the very first ACP session ever, instead of the first one
+/// after every restart.
+///
+/// A missing or unreadable cache is *absence*, never an error: it degrades to
+/// exactly the uncached behaviour, and a stale file must not block startup.
+pub(crate) fn read_cached_models(path: &std::path::Path) -> Vec<ModelOptionView> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the catalog harvested from `session/new`. Best-effort: a failed write
+/// only costs the next process an empty picker.
+pub(crate) fn write_cached_models(path: &std::path::Path, models: &[ModelOptionView]) {
+    if models.is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(encoded) = serde_json::to_string(models) {
+        let _ = std::fs::write(path, encoded);
+    }
+}
+
+/// Where a provider's catalog cache lives — beside the relay's own state file.
+pub(crate) fn models_cache_path(provider_key: &str) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::state_paths::state_dir(&cwd).join(format!("acp-models-{provider_key}.json"))
 }
 
 /// Seed session cwds from a `session/list` response.
@@ -808,20 +926,23 @@ impl ProviderBridge for AcpBridge {
         // and every caller of `ThreadSyncData.transcript` either merges by item
         // id or prefers `runtime.transcript_views()` already. So serve that,
         // and leave the wire alone.
+        let lock = self.load_lock(thread_id).await;
+        let _guard = lock.lock().await;
+
+        // Checked before the capability gate on purpose: serving the relay's own
+        // runtime issues no `session/load`, so an agent without `loadSession`
+        // can still have a streaming thread read.
+        if let Some(data) =
+            rpc::sync_data_from_runtime(&*self.state.read().await, thread_id, self.provider_name)
+        {
+            return Ok(data);
+        }
+
         if !self.capabilities.lock().await.load_session {
             return Err(format!(
                 "{} does not support loading a session, so its history cannot be read",
                 self.display_name
             ));
-        }
-
-        let lock = self.load_lock(thread_id).await;
-        let _guard = lock.lock().await;
-
-        if let Some(data) =
-            rpc::sync_data_from_runtime(&*self.state.read().await, thread_id, self.provider_name)
-        {
-            return Ok(data);
         }
 
         let cwd = self.resolve_cwd(thread_id).await?;

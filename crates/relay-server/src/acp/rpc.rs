@@ -9,8 +9,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStderr, ChildStdin, ChildStdout},
-    sync::{Mutex, RwLock},
+    process::ChildStderr,
+    sync::RwLock,
 };
 
 use crate::{
@@ -24,8 +24,8 @@ use crate::{
 use super::{protocol, Captures, PendingResponses, SessionRuntime, Sessions};
 
 pub(crate) struct ReaderContext {
-    pub(crate) stdout: ChildStdout,
-    pub(crate) stdin: Arc<Mutex<ChildStdin>>,
+    pub(crate) stdout: super::Inbound,
+    pub(crate) stdin: super::Outbound,
     pub(crate) pending_responses: PendingResponses,
     pub(crate) state: Arc<RwLock<RelayState>>,
     pub(crate) sessions: Sessions,
@@ -34,7 +34,7 @@ pub(crate) struct ReaderContext {
 }
 
 pub(crate) async fn write_line(
-    stdin: &mut ChildStdin,
+    stdin: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     value: &Value,
     display_name: &str,
 ) -> Result<(), String> {
@@ -159,7 +159,7 @@ pub(crate) fn spawn_stderr_reader(
 #[allow(clippy::too_many_arguments)]
 async fn handle_line(
     line: &str,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &super::Outbound,
     pending_responses: &PendingResponses,
     state: &Arc<RwLock<RelayState>>,
     sessions: &Sessions,
@@ -801,7 +801,7 @@ pub(crate) fn apply_turn_finished(
 
 async fn handle_server_request(
     payload: Value,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &super::Outbound,
     state: &Arc<RwLock<RelayState>>,
     sessions: &Sessions,
     provider_key: &'static str,
@@ -815,7 +815,7 @@ async fn handle_server_request(
         // never left blocking on a method the relay does not implement.
         let mut stdin = stdin.lock().await;
         let _ = write_line(
-            &mut stdin,
+            &mut **stdin,
             &json!({ "jsonrpc": "2.0", "id": request_id, "result": {} }),
             provider_key,
         )
@@ -848,7 +848,7 @@ async fn handle_server_request(
         };
         let mut stdin = stdin.lock().await;
         let _ = write_line(
-            &mut stdin,
+            &mut **stdin,
             &json!({ "jsonrpc": "2.0", "id": request_id, "result": { "outcome": outcome } }),
             provider_key,
         )
@@ -862,11 +862,26 @@ async fn handle_server_request(
         .and_then(Value::as_str)
         .unwrap_or("Tool call")
         .to_string();
-    let command = tool_call
+    let command = match tool_call
         .get("rawInput")
         .and_then(|input| input.get("command"))
         .and_then(Value::as_str)
-        .map(str::to_string);
+    {
+        Some(command) => Some(command.to_string()),
+        // Cursor's permission request omits `rawInput`; recover it from the
+        // `tool_call` the relay already recorded.
+        None => {
+            let raw_id = tool_call.get("toolCallId").and_then(Value::as_str);
+            match raw_id {
+                Some(raw_id) => sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(|session| command_for_tool_call(session, raw_id)),
+                None => None,
+            }
+        }
+    };
     let context = protocol::content_text(tool_call.get("content").unwrap_or(&Value::Null));
     let (available_decisions, supports_session_scope) = protocol::approval_decisions(&options);
 
@@ -900,6 +915,20 @@ async fn handle_server_request(
         vec!["waitingOnApproval".to_string()],
     );
     relay.notify();
+}
+
+/// The command behind a tool call, recovered from the session's accumulated
+/// view.
+///
+/// `session/request_permission` carries only a title and status — the command
+/// rode on the earlier `tool_call` update — so the approval card has to look it
+/// back up or show the user nothing but a label.
+pub(crate) fn command_for_tool_call(session: &SessionRuntime, raw_id: &str) -> Option<String> {
+    let item_id = session.tool_items.get(raw_id)?;
+    session
+        .tool_meta
+        .get(item_id)
+        .and_then(|meta| meta.command.clone())
 }
 
 /// The option to auto-answer a permission request with under a no-prompt policy.
@@ -944,7 +973,7 @@ pub(crate) fn sync_data_from_runtime(
     }
 
     let transcript = runtime.transcript_views();
-    let thread = runtime
+    let mut thread = runtime
         .summary
         .clone()
         .unwrap_or_else(|| ThreadSummaryView {
@@ -964,6 +993,10 @@ pub(crate) fn sync_data_from_runtime(
             forked_from: None,
             renamed: false,
         });
+    // The runtime's live cwd wins over whatever a cached summary carries:
+    // `resume_session_inner` and `ensure_thread_runtime_loaded` path-scope-check
+    // this field, and an empty or stale one is rejected downstream.
+    thread.cwd = runtime.current_cwd.clone();
 
     Some(crate::provider::ThreadSyncData {
         thread,

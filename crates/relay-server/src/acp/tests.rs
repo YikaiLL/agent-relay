@@ -673,3 +673,225 @@ fn an_agent_mode_change_is_tracked_so_a_thread_cannot_silently_leave_plan() {
     );
     assert_eq!(ignored, TranscriptOp::Ignore);
 }
+
+// ---------------------------------------------------------------------------
+// Model catalog cache — ACP reports models only on `session/new`, so the first
+// session of a fresh process would otherwise face an empty picker.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_cached_catalog_survives_a_restart_so_the_picker_is_not_empty() {
+    use crate::acp::{read_cached_models, write_cached_models};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("acp-models-cursor.json");
+
+    // Nothing cached yet: the very first run of a fresh install.
+    assert!(read_cached_models(&path).is_empty());
+
+    let harvested = crate::acp::protocol::model_options(
+        &[
+            json!({"modelId":"default[]","name":"Auto"}),
+            json!({"modelId":"claude-sonnet-4-6[thinking=true]","name":"claude-sonnet-4-6"}),
+        ],
+        Some("default[]"),
+        "cursor",
+    );
+    write_cached_models(&path, &harvested);
+
+    let restored = read_cached_models(&path);
+    assert_eq!(restored.len(), 2);
+    // The bracketed id is what `session/set_model` needs back, so it has to
+    // survive the round trip byte for byte.
+    assert_eq!(restored[1].model, "claude-sonnet-4-6[thinking=true]");
+    assert_eq!(restored[1].provider, "cursor");
+    assert_eq!(
+        restored[1].supported_reasoning_efforts,
+        Vec::<String>::new()
+    );
+    assert!(restored[0].is_default);
+}
+
+#[test]
+fn a_corrupt_or_unreadable_cache_is_absence_not_an_error() {
+    use crate::acp::read_cached_models;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("acp-models-cursor.json");
+    std::fs::write(&path, "{ this is not json").expect("write");
+    // A stale cache must never block startup — it degrades to "not harvested
+    // yet", which is exactly the pre-cache behaviour.
+    assert!(read_cached_models(&path).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Transport lifecycle, driven over `tokio::io::duplex`. These are the paths a
+// live agent cannot be asked to produce on cue: a failed write and a dead
+// stream, both of which can strand a turn.
+// ---------------------------------------------------------------------------
+
+use tokio::sync::{watch, RwLock};
+
+use crate::acp::AcpBridge;
+use crate::state::{RelayState, SecurityProfile};
+
+fn relay_state() -> std::sync::Arc<RwLock<RelayState>> {
+    let (change_tx, _) = watch::channel(0_u64);
+    std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )))
+}
+
+#[tokio::test]
+async fn a_failed_prompt_write_leaves_no_thread_stuck_working() {
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("t1".to_string());
+    }
+
+    // Outbound half whose peer is dropped: every write fails.
+    let (outbound, peer) = tokio::io::duplex(64);
+    drop(peer);
+    let (_inbound_writer, inbound) = tokio::io::duplex(64);
+
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+
+    let sent =
+        crate::provider::ProviderBridge::start_turn(&bridge, "t1", "hello", "", "", &[]).await;
+    assert!(sent.is_err(), "a dead pipe must surface as a failed send");
+
+    assert_eq!(
+        bridge.session_turn_for_test("t1").await,
+        None,
+        "the session must not still own a turn the agent never received"
+    );
+
+    let relay = state.read().await;
+    assert_ne!(
+        relay.current_status, "working",
+        "a thread cannot be left working on a turn that was never sent — no \
+         event is coming to settle it"
+    );
+}
+
+#[tokio::test]
+async fn a_dead_stream_fails_in_flight_requests_instead_of_hanging_them() {
+    let state = relay_state();
+
+    let (outbound, mut outbound_peer) = tokio::io::duplex(4096);
+    let (inbound_writer, inbound) = tokio::io::duplex(4096);
+
+    let bridge = std::sync::Arc::new(AcpBridge::for_test(
+        state.clone(),
+        outbound,
+        inbound,
+        "cursor",
+    ));
+
+    // Fire a request that nobody will ever answer.
+    let pending = {
+        let bridge = bridge.clone();
+        tokio::spawn(async move { bridge.send_request("session/list", json!({})).await })
+    };
+
+    // Wait until it is actually on the wire, so the drop below races nothing.
+    let mut buffer = vec![0_u8; 512];
+    tokio::io::AsyncReadExt::read(&mut outbound_peer, &mut buffer)
+        .await
+        .expect("request should reach the peer");
+
+    // The agent dies.
+    drop(inbound_writer);
+
+    // Without draining `pending_responses` on EOF this would sit for the full
+    // 60s request timeout (and an hour for a prompt) on a process that is gone.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("the request must not outlive the stream")
+        .expect("task panicked");
+    let error = outcome.expect_err("a dead stream cannot produce a result");
+    assert!(
+        error.contains("closed") || error.contains("failed"),
+        "unhelpful error for a dead stream: {error}"
+    );
+}
+
+#[tokio::test]
+async fn reading_a_thread_mid_turn_serves_the_relay_and_never_touches_the_wire() {
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("t1".to_string());
+        let runtime = relay.ensure_runtime_for_thread("t1");
+        runtime.current_cwd = "/tmp/project".to_string();
+        runtime.active_turn_id = Some("acp-turn-1".to_string());
+        runtime.current_status = "working".to_string();
+    }
+    {
+        let mut relay = state.write().await;
+        relay.upsert_user_message_for_thread(
+            "t1",
+            "acp-user-1".to_string(),
+            "hi".to_string(),
+            "acp-turn-1".to_string(),
+        );
+    }
+
+    let (outbound, mut outbound_peer) = tokio::io::duplex(4096);
+    let (_inbound_writer, inbound) = tokio::io::duplex(4096);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+
+    let data = crate::provider::ProviderBridge::read_thread(&bridge, "t1")
+        .await
+        .expect("a thread with a live turn is readable");
+
+    assert_eq!(data.transcript.len(), 1);
+    assert_eq!(data.transcript[0].item_id.as_deref(), Some("acp-user-1"));
+    assert_eq!(data.thread.cwd, "/tmp/project");
+
+    // Nothing was written: no `session/load`, so no replay to swallow the live
+    // turn's updates and no reset to renumber its items.
+    let mut buffer = vec![0_u8; 256];
+    let quiet = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut outbound_peer, &mut buffer),
+    )
+    .await;
+    assert!(
+        quiet.is_err(),
+        "read_thread must not issue a session/load while a turn is streaming"
+    );
+}
+
+#[test]
+fn an_approval_recovers_the_command_from_the_tool_call_that_preceded_it() {
+    // Measured: `session/request_permission`'s `toolCall` carries a title and a
+    // status but NO `rawInput` — the command only ever arrives on the earlier
+    // `tool_call` update. Reading it off the request alone leaves the approval
+    // card with nothing to show but a title, which is the one thing a user needs
+    // to see before allowing a shell command to run.
+    let mut runtime = session();
+    plan_update(
+        &json!({
+            "sessionUpdate":"tool_call","toolCallId":"call-7","title":"`nl -ba note.txt`",
+            "kind":"execute","status":"pending","rawInput":{"command":"nl -ba note.txt"}
+        }),
+        &mut runtime,
+    );
+
+    assert_eq!(
+        crate::acp::rpc::command_for_tool_call(&runtime, "call-7").as_deref(),
+        Some("nl -ba note.txt")
+    );
+    // A tool the relay never saw start has nothing to recover, and must not
+    // invent one.
+    assert_eq!(
+        crate::acp::rpc::command_for_tool_call(&runtime, "unknown"),
+        None
+    );
+}
