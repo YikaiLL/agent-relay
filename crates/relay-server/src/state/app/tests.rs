@@ -20679,4 +20679,100 @@ mod late_catalog_tests {
             "the model the caller explicitly asked for was replaced"
         );
     }
+
+    #[tokio::test]
+    async fn a_transient_catalog_failure_is_not_treated_as_an_invented_model() {
+        // `catalog_was_unknown` was a false proxy for "the relay invented this".
+        // `load_provider_model_catalog` returns `None` for three different
+        // reasons, and only one of them justifies healing: the provider has no
+        // catalog YET (the ACP case), it answered empty ("not ready"), or the
+        // call errored. Codex's app-server produces the latter two when it is
+        // busy or restarting — and codex genuinely offers the id `DEFAULT_MODEL`
+        // happens to be, so healing there discards the user's actual model.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        // A provider whose catalog CONTAINS the seed-named id, i.e. codex.
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // The user's global choice IS the seed-named model. No per-thread
+            // setting exists, so the resume falls back to it — which is not the
+            // relay inventing anything, it is the user's choice arriving by the
+            // only route it has.
+            relay.model = DEFAULT_MODEL.to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "a catalog read that merely failed is not evidence the model was invented"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_model_is_healed_even_when_it_is_not_the_seed() {
+        // The other half of the same mistake: the heal also gated on
+        // `model == DEFAULT_MODEL`, so it only ever fired on a brand-new relay.
+        // After any codex use — or a global restored from disk — the fallback
+        // carries codex's REAL id, and a cursor thread recorded and persisted
+        // that instead. Nothing about `DEFAULT_MODEL` is special here; what
+        // matters is that the provider does not offer the id.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        // A provider whose catalog does NOT contain it, i.e. cursor.
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // A warm relay: the global is another provider's real model id.
+            relay.model = "gpt-5.5-codex".to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, "agent-default",
+            "a foreign model id the relay fell back to must not be recorded on this thread"
+        );
+    }
 }

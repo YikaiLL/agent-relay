@@ -40,9 +40,6 @@ impl AppState {
         let provider_models = self
             .load_provider_model_catalog(provider_name, bridge)
             .await;
-        // Whether the model below had to be invented: no caller choice, and no
-        // catalog to take a default from.
-        let catalog_was_unknown = provider_models.is_none();
         // `mut`: healed below, once the provider has had a chance to publish a
         // catalog it could not publish before the thread existed.
         let mut model = resolve_provider_model(
@@ -81,8 +78,8 @@ impl AppState {
 
         // Same re-ask as `resume_session_inner`: a provider that publishes its
         // catalog on the `session/new` response could not answer before the
-        // thread existed, so the model chosen above is the untouched
-        // `DEFAULT_MODEL` seed. Ask again now that the thread is real.
+        // thread existed, so the model chosen above was picked with no catalog
+        // to check it against. Ask again now that the thread is real.
         let provider_models = match provider_models {
             Some(models) => Some(models),
             None => {
@@ -94,22 +91,21 @@ impl AppState {
         {
             let mut relay = self.relay.write().await;
             relay.set_provider_name(provider_name.to_string());
-            // Defer to the healed global ONLY when a real catalog just landed.
-            // Without that guard this clobbers a deliberate normalisation: with
-            // no catalog, `resolve_provider_model` maps codex's inherited
-            // "default" alias onto `DEFAULT_MODEL` on purpose, and that is a
-            // choice, not the seed leaking through.
             if let Some(models) = provider_models {
+                let invented = !model_was_requested && !models.iter().any(|m| m.model == model);
                 relay.set_available_models(models);
-                // Heal ONLY the value the relay itself invented. `DEFAULT_MODEL`
+                // Heal ONLY the value the relay itself invented, and read that
+                // off the catalog rather than off the seed constant.
+                //
+                // "It equals `DEFAULT_MODEL`" is not the same question: that id
                 // is "gpt-5.5", which for Codex is a real, choosable model — so
-                // "equals the seed" does not mean "we made it up". Replacing a
-                // caller-named id here would discard a choice made in this very
-                // request.
-                if catalog_was_unknown
-                    && !model_was_requested
-                    && model == crate::state::DEFAULT_MODEL
-                {
+                // the test fired on a choice, and *only* on a brand-new relay,
+                // missing the case where the fallback carried another provider's
+                // real id. "The provider does not offer it" separates the two
+                // exactly. A caller-named id is left alone either way; absent
+                // from a catalog is deliberately not treated as invalid for
+                // those (see `resolve_provider_model`).
+                if invented {
                     // The initial turn below uses the same healed value.
                     model = relay.model.clone();
                 }
@@ -302,7 +298,6 @@ impl AppState {
         // happens to be Codex's id. By here the bridge has been through a read
         // and a resume, so it knows. The re-ask is an in-memory read for ACP and
         // is skipped entirely for providers that answered the first time.
-        let catalog_was_unknown = provider_models.is_none();
         let provider_models = match provider_models {
             Some(models) => Some(models),
             None => {
@@ -321,14 +316,14 @@ impl AppState {
             // actually landing, so a deliberate no-catalog normalisation stands.
             let mut model = model;
             if let Some(models) = provider_models {
+                // Only the value the relay invented — i.e. one it fell back to
+                // and this provider does not offer. A thread PINNED to a model
+                // keeps it even when the catalog has since dropped it, and a
+                // catalog read that merely failed is not evidence of anything.
+                let invented =
+                    remembered_model.is_none() && !models.iter().any(|m| m.model == model);
                 relay.set_available_models(models);
-                // Only the value the relay invented. A thread pinned to
-                // `DEFAULT_MODEL` on a provider that genuinely offers it — Codex
-                // does — must keep it.
-                if catalog_was_unknown
-                    && remembered_model.is_none()
-                    && model == crate::state::DEFAULT_MODEL
-                {
+                if invented {
                     model = relay.model.clone();
                 }
             }
