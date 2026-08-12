@@ -774,29 +774,94 @@ pub(crate) fn apply_turn_finished(
         Err(error) => Some(error.clone()),
     };
 
+    // A completion that arrives after its turn was abandoned must touch nothing.
+    //
+    // ACP prompts can outlive the relay's patience: a stop the agent never
+    // answers is settled by the stop fallback, and the user can then start a new
+    // turn on the same session. When the abandoned `session/prompt` finally
+    // resolves — with an error, at the one-hour timeout, or when the stream dies
+    // — clearing the active turn here would idle a thread that is genuinely
+    // working, unlock the composer mid-turn, and swallow the *new* turn's own
+    // failure push later. Codex guards the same window with `superseded`
+    // (`codex/rpc.rs`) and Claude bails on a "stale completion".
+    let current_turn = relay
+        .runtime_for_thread(thread_id)
+        .and_then(|runtime| runtime.active_turn_id.clone());
+    if matches!(current_turn.as_deref(), Some(active) if active != turn_id) {
+        return;
+    }
+    // Distinct from the above: `None` means somebody has already settled this
+    // turn (the stream-death path does, and pushes), so the work is done — but
+    // it is not a *newer* turn, so there is nothing to protect.
+    let settling_this_turn = current_turn.as_deref() == Some(turn_id);
+
+    let route = thread_route(relay, thread_id, provider_key);
+    let now = crate::state::unix_now();
+
     if let Some(reason) = &failure {
-        // A failed turn must be visible IN the transcript, not just in the log.
+        // Three separate surfaces, because each one is the only one somebody
+        // looks at. Codex and Claude write all three; this path used to write
+        // only the transcript entry.
+
+        // 1. The operator log — what a maintainer greps when a user reports
+        //    "it just stopped". `error` is a relay-owned channel, so unlike the
+        //    provider's own it survives the audit view's chatter filter.
+        relay.push_log("error", reason.clone());
+
+        // 2. The push. This ALSO suppresses the work→idle "completed" push
+        //    (see `enqueue_error_push` → `suppress_completed`), which is why
+        //    skipping it did more than drop a notification: a phone got a
+        //    success-shaped ping for a turn that died.
+        //
+        //    Only when THIS call is the one settling the turn (see above). When
+        //    the agent dies, two paths converge on the same turn: the reader's
+        //    `fail_in_flight_turns_for_provider` settles it and pushes, and the
+        //    drained `session/prompt` waiter then arrives here with an error for
+        //    a turn that is already over. Codex never collides this way — its
+        //    failures come as their own event — so an unconditional push here
+        //    would mean two notifications for one dead agent.
+        if settling_this_turn {
+            relay.enqueue_error_push(thread_id, reason.clone());
+        }
+
+        // 3. A durable transcript entry, because operator logs are stripped
+        //    from broker-bound snapshots — without this a remote client sees
+        //    the failed turn settle as a clean success.
+        //
+        //    Routed like every other background write: `bg_upsert_transcript_item`
+        //    drops events for a permanently deleted thread, so writing straight
+        //    to the thread runtime would resurrect a session nothing will ever
+        //    clean up again.
         let item_id = format!("turn-error:{turn_id}");
-        relay.upsert_transcript_item_for_thread(
-            thread_id,
-            item_id,
-            TranscriptEntryKind::Error,
-            Some(reason.clone()),
-            "failed".to_string(),
-            Some(turn_id.to_string()),
-            None,
-        );
+        match route {
+            ThreadRoute::Background => relay.bg_upsert_transcript_item(
+                thread_id,
+                item_id,
+                TranscriptEntryKind::Error,
+                Some(reason.clone()),
+                "failed".to_string(),
+                Some(turn_id.to_string()),
+                None,
+                now,
+            ),
+            _ => {
+                relay.upsert_transcript_item_for_thread(
+                    thread_id,
+                    item_id,
+                    TranscriptEntryKind::Error,
+                    Some(reason.clone()),
+                    "failed".to_string(),
+                    Some(turn_id.to_string()),
+                    None,
+                );
+            }
+        }
     }
 
-    match thread_route(relay, thread_id, provider_key) {
+    match route {
         ThreadRoute::Background => {
-            relay.bg_set_active_turn(thread_id, None, crate::state::unix_now());
-            relay.bg_set_thread_status(
-                thread_id,
-                "idle".to_string(),
-                Vec::new(),
-                crate::state::unix_now(),
-            );
+            relay.bg_set_active_turn(thread_id, None, now);
+            relay.bg_set_thread_status(thread_id, "idle".to_string(), Vec::new(), now);
         }
         _ => {
             relay.set_active_turn(None);
@@ -817,9 +882,21 @@ async fn handle_server_request(
     let request_id = payload.get("id").cloned().unwrap_or(Value::Null);
     let params = payload.get("params").cloned().unwrap_or(Value::Null);
 
+    if method == "cursor/create_plan" {
+        handle_create_plan(request_id, params, stdin, state, sessions, provider_key).await;
+        return;
+    }
+
     if method != "session/request_permission" {
         // Unhandled server request: answer with an empty result so the agent is
         // never left blocking on a method the relay does not implement.
+        //
+        // `{}` is only safe for a method whose result the agent ignores. It is
+        // NOT a neutral no-op in general — `cursor/create_plan` (above) reads a
+        // field out of the result, and its handler's catch path turns the
+        // resulting error into silent *success*. Before answering a new
+        // blocking `cursor/*` method this way, check what the agent does with
+        // the reply.
         let mut stdin = stdin.lock().await;
         let _ = write_line(
             &mut **stdin,
@@ -901,7 +978,16 @@ async fn handle_server_request(
 
     let mut relay = state.write().await;
     relay.add_pending_approval(PendingApproval {
-        request_id: format!("acp-approval-{}", normalize_id(&request_id)),
+        request_id: {
+            let id = format!("{PERMISSION_APPROVAL_PREFIX}{}", normalize_id(&request_id));
+            // Load-bearing in the dangerous direction: a permission id that
+            // started with the plan prefix would be answered `accepted`,
+            // granting a tool call nobody approved. The two prefixes are
+            // separate literals, so make the invariant self-enforcing here
+            // rather than trusting whoever edits one of them next.
+            debug_assert!(!protocol::is_plan_approval(&id));
+            id
+        },
         raw_request_id: request_id,
         kind: ApprovalKind::Command,
         thread_id: session_id.clone(),
@@ -913,6 +999,196 @@ async fn handle_server_request(
         // The bridge answers with an ACP `optionId`, so the raw option list has
         // to survive the round trip.
         requested_permissions: Some(Value::Array(options)),
+        available_decisions,
+        supports_session_scope,
+    });
+    relay.set_thread_status(
+        &session_id,
+        "waiting".to_string(),
+        vec!["waitingOnApproval".to_string()],
+    );
+    relay.notify();
+}
+
+/// Prefix for a parked `session/request_permission`. Must never be a prefix of
+/// — or share one with — `protocol::PLAN_APPROVAL_PREFIX`; see the debug assert
+/// at the mint site and `the_two_approval_id_prefixes_can_never_overlap`.
+pub(crate) const PERMISSION_APPROVAL_PREFIX: &str = "acp-approval-";
+
+/// Answer `cursor/create_plan` with one of ACP's three plan outcomes.
+async fn answer_plan(
+    request_id: &Value,
+    decision: crate::protocol::ApprovalDecision,
+    stdin: &super::Outbound,
+    provider_key: &'static str,
+) {
+    let mut stdin = stdin.lock().await;
+    let _ = write_line(
+        &mut **stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": { "outcome": protocol::plan_outcome(decision) },
+        }),
+        provider_key,
+    )
+    .await;
+}
+
+/// Park an agent-authored plan for the user instead of accepting it for them.
+///
+/// Cursor sends this as a *blocking* request when a plan-mode thread is asked to
+/// act. Answering it with a blank result — which is what the generic unhandled
+/// branch does — is read by the agent as an error and degrades to acceptance, so
+/// every plan was approved without the user ever seeing it. Rejection is a real
+/// outcome the agent honours and reacts to (see `protocol::plan_outcome`), and
+/// making it reachable is the whole point of this path.
+///
+/// **Routing.** The request carries no `sessionId` — only a `toolCallId`, which
+/// the agent announced moments earlier on a `tool_call` update that *did* name
+/// its session. That earlier update is the only thing tying a plan to a thread,
+/// so the bridge resolves it by reverse lookup over the tool calls it recorded.
+/// Measured 2026-08-11: the ids match exactly, and the update always arrives
+/// first because both ride the same ordered stdout stream.
+async fn handle_create_plan(
+    request_id: Value,
+    params: Value,
+    stdin: &super::Outbound,
+    state: &Arc<RwLock<RelayState>>,
+    sessions: &Sessions,
+    provider_key: &'static str,
+) {
+    use crate::protocol::ApprovalDecision;
+
+    let field = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    // NOT trimmed: this is a lookup key, and `tool_call` stores the id byte for
+    // byte. Cursor's ids already carry embedded whitespace, so normalising one
+    // side and not the other would turn a routing miss into a silent accept.
+    let tool_call_id = params
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = field("name");
+    let overview = field("overview");
+    let plan = field("plan");
+
+    // Resolve the thread, then insist it is actually mid-turn.
+    //
+    // The routing key is agent-supplied and the only input, so every miss has to
+    // fail toward "ask", not "grant". Two guards: an empty id matches nothing
+    // (`tool_call` will happily record `""`, and a `create_plan` with the field
+    // missing reads as `""` — left alone those two meet and route a plan to an
+    // arbitrary session), and the resolved session must have a prompt in flight.
+    // A plan only ever arrives DURING a turn, so a match on an idle session is a
+    // wrong match — and parking a card there would break the contract in
+    // `state/relay.rs` that a pending request is only added to a thread already
+    // marked working, leaving an unanswerable card on an idle thread.
+    let resolved = if tool_call_id.is_empty() {
+        None
+    } else {
+        let sessions = sessions.lock().await;
+        sessions.iter().find_map(|(session_id, session)| {
+            (session.tool_items.contains_key(&tool_call_id) && session.turn_id.is_some()).then(
+                || {
+                    (
+                        session_id.clone(),
+                        session.approval_policy.clone(),
+                        session.cwd.clone(),
+                    )
+                },
+            )
+        })
+    };
+
+    let Some((session_id, approval_policy, cwd)) = resolved else {
+        // No thread means no surface to ask on. Accepting keeps plan mode
+        // working — rejecting a plan the user never saw would break it for a
+        // reason they cannot see — but this is exactly the silent accept this
+        // path exists to remove, so it has to leave a trace. The line goes on a
+        // relay-owned channel: filed under the provider's own channel it would
+        // be classified as subprocess chatter and filtered out of the audit
+        // view, which is the wrong fate for "the relay decided for you".
+        answer_plan(&request_id, ApprovalDecision::Approve, stdin, provider_key).await;
+        let mut relay = state.write().await;
+        relay.push_log(
+            "warn",
+            format!(
+                "Accepted a Cursor plan that could not be matched to a thread \
+                 (tool call `{}`); nobody was asked.",
+                tool_call_id.replace('\n', "⏎")
+            ),
+        );
+        relay.notify();
+        return;
+    };
+
+    // Nobody to ask, for either of two reasons.
+    //
+    // A no-prompt policy is the same contract `session/request_permission`
+    // already honours. Unlike `allow_always`, accepting a plan grants nothing
+    // that outlives the turn, so there is no permission to leak by doing so.
+    //
+    // A reviewer/workflow/team thread is stronger than that: it runs in `plan`
+    // mode *by construction* (`review_read_only` is what the bridge maps onto
+    // it), so writing a plan is its normal path — but its approvals cannot be
+    // decided by a user, and the review waiter counts a parked approval as a
+    // failed review. Parking here would fail the run for doing the one thing
+    // plan mode exists to do.
+    let can_ask = state.read().await.approval_can_reach_a_user(&session_id);
+    if !can_ask || protocol::auto_approves(&approval_policy) {
+        answer_plan(&request_id, ApprovalDecision::Approve, stdin, provider_key).await;
+        // Say so. The run that owns this thread DENIES every other approval on
+        // it (the review and team wait loops both do), so accepting here is the
+        // opposite decision — and one the user never sees unless it is written
+        // down. Same reasoning as the unroutable branch above.
+        if !can_ask {
+            let mut relay = state.write().await;
+            relay.push_log(
+                "warn",
+                format!(
+                    "Accepted a Cursor plan on `{session_id}` without asking: \
+                     the run that owns this thread answers its approvals itself."
+                ),
+            );
+            relay.notify();
+        }
+        return;
+    }
+
+    let summary = [name, overview.clone()]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .unwrap_or_else(|| "Plan".to_string());
+    let (available_decisions, supports_session_scope) = protocol::approval_decisions(&[]);
+
+    let mut relay = state.write().await;
+    relay.add_pending_approval(PendingApproval {
+        request_id: format!(
+            "{}{}",
+            protocol::PLAN_APPROVAL_PREFIX,
+            normalize_id(&request_id)
+        ),
+        raw_request_id: request_id,
+        kind: ApprovalKind::Plan,
+        thread_id: session_id.clone(),
+        summary,
+        // The plan body IS the thing being approved; a card without it asks the
+        // user to agree to something they cannot read.
+        detail: (!plan.is_empty()).then_some(plan),
+        command: None,
+        cwd: (!cwd.is_empty()).then_some(cwd),
+        context_preview: (!overview.is_empty()).then_some(overview),
+        // A plan has no ACP option list to echo back — the outcome vocabulary
+        // is fixed. `respond_to_approval` keys off the id prefix, not this.
+        requested_permissions: None,
         available_decisions,
         supports_session_scope,
     });

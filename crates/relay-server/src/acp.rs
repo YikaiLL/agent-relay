@@ -39,6 +39,82 @@ use crate::{
 mod protocol;
 mod rpc;
 
+/// How long `<agent> mcp list` gets before the relay gives up on it.
+const MCP_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ask the agent's CLI what its MCP servers are doing, and say so.
+///
+/// Why the CLI and not ACP: measured 2026-08-12, ACP reports nothing about
+/// loaded MCP servers — see `protocol::summarize_mcp_servers`. Codex reached the
+/// same dead end with its app-server and probes `codex mcp list --json`; this is
+/// the same move against a text-only `mcp list`.
+///
+/// Best-effort throughout. A missing subcommand, a non-zero exit, a hang or
+/// unparseable output must never be louder than the thing it is reporting on, so
+/// only a genuine failure to *run* the probe is surfaced. `kill_on_drop` matters:
+/// cancelling `output()` at the timeout only stops awaiting, so without it a hung
+/// CLI survives as an orphan.
+async fn report_mcp_config(
+    binary_name: &'static str,
+    provider_key: &'static str,
+    state: Arc<RwLock<RelayState>>,
+) {
+    let mut command = Command::new(binary_name);
+    command.arg("mcp").arg("list").kill_on_drop(true);
+
+    let summary = match timeout(MCP_LIST_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            protocol::summarize_mcp_servers(provider_key, &String::from_utf8_lossy(&output.stdout))
+        }
+        // Non-zero exit: the subcommand is missing or refused. Not this relay's
+        // problem to narrate — an agent without `mcp list` is not misconfigured.
+        Ok(Ok(_)) => return,
+        Ok(Err(error)) => protocol::McpSummary {
+            headline: None,
+            problems: vec![format!(
+                "Could not check {binary_name} MCP servers: {error}"
+            )],
+        },
+        Err(_) => protocol::McpSummary {
+            headline: None,
+            problems: vec![format!(
+                "`{binary_name} mcp list` timed out; MCP state unknown."
+            )],
+        },
+    };
+
+    log_mcp_summary(&state, summary).await;
+}
+
+/// Put an MCP census in the log panel — on channels a user can actually see.
+///
+/// Deliberately NOT the provider's own channel. `push_log(provider_key, …)` is
+/// classified as subprocess chatter and filtered out of the audit view unless it
+/// happens to match a lifecycle regex, which is why codex's equivalent MCP lines
+/// (filed under `push_log("codex", …)`) are mostly invisible today. A failing
+/// MCP server is precisely the thing that must not be swallowed.
+async fn log_mcp_summary(state: &Arc<RwLock<RelayState>>, summary: protocol::McpSummary) {
+    if summary.headline.is_none() && summary.problems.is_empty() {
+        return;
+    }
+    let mut relay = state.write().await;
+    if let Some(headline) = summary.headline {
+        relay.push_log("info", headline);
+    }
+    for problem in summary.problems {
+        relay.push_log("warn", problem);
+    }
+    relay.notify();
+}
+
+#[cfg(test)]
+pub(crate) async fn log_mcp_summary_for_test(
+    state: &Arc<RwLock<RelayState>>,
+    summary: protocol::McpSummary,
+) {
+    log_mcp_summary(state, summary).await;
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -275,6 +351,10 @@ pub struct AcpBridge {
     state: Arc<RwLock<RelayState>>,
     provider_name: &'static str,
     display_name: &'static str,
+    /// The executable, which is NOT the provider key: `cursor-agent` vs
+    /// `cursor`. Any instruction telling a user to run something has to use
+    /// this, or it names a command that does not exist.
+    binary_name: &'static str,
     sessions: Sessions,
     captures: Captures,
     /// Catalog captured from the first `session/new`, which returns the full
@@ -354,6 +434,7 @@ impl AcpBridge {
             state,
             provider_name: provider_key,
             display_name,
+            binary_name,
             sessions,
             captures,
             models: Arc::new(Mutex::new(read_cached_models(&models_cache_path(
@@ -372,6 +453,14 @@ impl AcpBridge {
             relay.push_log("info", format!("Connected to {display_name} (ACP)."));
             relay.notify();
         }
+
+        // Off the startup critical path, like codex's: a hung `mcp list` must
+        // not delay bridge creation or the providers queued behind it.
+        tokio::spawn(report_mcp_config(
+            binary_name,
+            provider_key,
+            bridge.state.clone(),
+        ));
 
         Ok(bridge)
     }
@@ -434,12 +523,18 @@ impl AcpBridge {
             }
             Err(error) => {
                 // Not fatal: connect anyway and tell the user what to run.
+                //
+                // On `warn`, not the provider's own channel: a line filed under
+                // `cursor` is treated as subprocess chatter and filtered out of
+                // the audit view, and this is the one instruction that unblocks
+                // the provider. And the command names the BINARY — `cursor` is
+                // the relay's key for it, not something the user can run.
                 let mut relay = self.state.write().await;
                 relay.push_log(
-                    self.provider_name,
+                    "warn",
                     format!(
                         "{} is not authenticated ({error}). Run `{} login`, then reconnect.",
-                        self.display_name, self.provider_name
+                        self.display_name, self.binary_name
                     ),
                 );
                 relay.notify();
@@ -625,6 +720,9 @@ impl AcpBridge {
             state,
             provider_name: provider_key,
             display_name: "TestAgent",
+            // Deliberately different from the provider key, which is the whole
+            // point of the field.
+            binary_name: "cursor-agent",
             sessions,
             captures,
             models: Arc::new(Mutex::new(Vec::new())),
@@ -635,12 +733,41 @@ impl AcpBridge {
     }
 
     #[cfg(test)]
+    pub(crate) async fn initialize_for_test(&self) -> Result<(), String> {
+        self.initialize().await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn seed_session_for_test(&self, thread_id: &str, cwd: &str) {
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             SessionRuntime {
                 cwd: cwd.to_string(),
                 approval_policy: "on-request".to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) async fn set_session_turn_for_test(&self, thread_id: &str, turn_id: Option<&str>) {
+        if let Some(session) = self.sessions.lock().await.get_mut(thread_id) {
+            session.turn_id = turn_id.map(str::to_string);
+        }
+    }
+
+    pub(crate) async fn seed_session_with_policy_for_test(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+        approval_policy: &str,
+    ) {
+        self.sessions.lock().await.insert(
+            thread_id.to_string(),
+            SessionRuntime {
+                cwd: cwd.to_string(),
+                approval_policy: approval_policy.to_string(),
                 ..Default::default()
             },
         );
@@ -1323,17 +1450,27 @@ impl ProviderBridge for AcpBridge {
         pending: &PendingApproval,
         input: &ApprovalDecisionInput,
     ) -> Result<(), String> {
-        let options = pending
-            .requested_permissions
-            .as_ref()
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // Plans and permissions share this method and the same `result.outcome`
+        // envelope, but not its vocabulary: a permission is answered with a
+        // `selected` optionId chosen from the list the agent offered, a plan
+        // with `accepted`/`rejected`/`cancelled`. The discriminator is the
+        // relay-minted id prefix — see `protocol::PLAN_APPROVAL_PREFIX` for why
+        // it is not "the pending has no options".
+        let outcome = if protocol::is_plan_approval(&pending.request_id) {
+            protocol::plan_outcome(input.decision)
+        } else {
+            let options = pending
+                .requested_permissions
+                .as_ref()
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
 
-        let outcome = match protocol::approval_option_id(input, &options) {
-            Some(option_id) => json!({ "outcome": "selected", "optionId": option_id }),
-            // Nothing matched — cancel rather than leave the agent parked.
-            None => json!({ "outcome": "cancelled" }),
+            match protocol::approval_option_id(input, &options) {
+                Some(option_id) => json!({ "outcome": "selected", "optionId": option_id }),
+                // Nothing matched — cancel rather than leave the agent parked.
+                None => json!({ "outcome": "cancelled" }),
+            }
         };
 
         self.send_json(json!({

@@ -31,13 +31,21 @@ impl AppState {
             }
         }
         let requested_model = non_empty(input.model);
+        // An id the CALLER named is never healed, even when it happens to equal
+        // `DEFAULT_MODEL`.
+        let model_was_requested = requested_model.is_some();
         let approval_policy = non_empty(input.approval_policy).unwrap_or(defaults.approval_policy);
         let sandbox = non_empty(input.sandbox).unwrap_or(defaults.sandbox);
         let (provider_name, bridge) = self.resolve_provider(input.provider.as_deref())?;
         let provider_models = self
             .load_provider_model_catalog(provider_name, bridge)
             .await;
-        let model = resolve_provider_model(
+        // Whether the model below had to be invented: no caller choice, and no
+        // catalog to take a default from.
+        let catalog_was_unknown = provider_models.is_none();
+        // `mut`: healed below, once the provider has had a chance to publish a
+        // catalog it could not publish before the thread existed.
+        let mut model = resolve_provider_model(
             provider_name,
             &provider_models,
             requested_model,
@@ -71,11 +79,40 @@ impl AppState {
         let initial_user_message = start_result.initial_user_message.clone();
         let started_turn_id = start_result.started_turn_id.clone();
 
+        // Same re-ask as `resume_session_inner`: a provider that publishes its
+        // catalog on the `session/new` response could not answer before the
+        // thread existed, so the model chosen above is the untouched
+        // `DEFAULT_MODEL` seed. Ask again now that the thread is real.
+        let provider_models = match provider_models {
+            Some(models) => Some(models),
+            None => {
+                self.load_provider_model_catalog(provider_name, bridge)
+                    .await
+            }
+        };
+
         {
             let mut relay = self.relay.write().await;
             relay.set_provider_name(provider_name.to_string());
+            // Defer to the healed global ONLY when a real catalog just landed.
+            // Without that guard this clobbers a deliberate normalisation: with
+            // no catalog, `resolve_provider_model` maps codex's inherited
+            // "default" alias onto `DEFAULT_MODEL` on purpose, and that is a
+            // choice, not the seed leaking through.
             if let Some(models) = provider_models {
                 relay.set_available_models(models);
+                // Heal ONLY the value the relay itself invented. `DEFAULT_MODEL`
+                // is "gpt-5.5", which for Codex is a real, choosable model — so
+                // "equals the seed" does not mean "we made it up". Replacing a
+                // caller-named id here would discard a choice made in this very
+                // request.
+                if catalog_was_unknown
+                    && !model_was_requested
+                    && model == crate::state::DEFAULT_MODEL
+                {
+                    // The initial turn below uses the same healed value.
+                    model = relay.model.clone();
+                }
             }
             let turn_revision = relay.thread_turn_revision(&started_thread_id);
             relay.activate_started_thread(
@@ -217,11 +254,14 @@ impl AppState {
             })
             .or_else(|| default_effort_for_model(&provider_models, &defaults.model))
             .unwrap_or(defaults.reasoning_effort);
-        let model = remembered_settings
+        // Split out so the heal below can tell "this thread is pinned to that
+        // model" from "we fell back to the relay's global because nothing else
+        // was known". Merged, the two are indistinguishable.
+        let remembered_model = remembered_settings
             .as_ref()
             .map(|settings| settings.model.clone())
-            .filter(|model| !model.is_empty())
-            .unwrap_or(defaults.model);
+            .filter(|model| !model.is_empty());
+        let model = remembered_model.clone().unwrap_or(defaults.model);
         let preview = bridge.read_thread(&input.thread_id).await?;
         {
             let relay = self.relay.read().await;
@@ -250,11 +290,47 @@ impl AppState {
             .await?;
 
         let thread_data = bridge.read_thread(&input.thread_id).await?;
+
+        // Ask for the catalog again if the first attempt came back empty.
+        //
+        // Not every provider can answer before it has done something: ACP has no
+        // catalog method at all — `cursor-agent acp` publishes its models only on
+        // the `session/new` / `session/load` responses, which the bridge caches.
+        // On the first boot in a workspace there is no cached catalog yet, so the
+        // question above is asked before the bridge could possibly answer, and
+        // the relay falls back to `DEFAULT_MODEL` — a provider-agnostic seed that
+        // happens to be Codex's id. By here the bridge has been through a read
+        // and a resume, so it knows. The re-ask is an in-memory read for ACP and
+        // is skipped entirely for providers that answered the first time.
+        let catalog_was_unknown = provider_models.is_none();
+        let provider_models = match provider_models {
+            Some(models) => Some(models),
+            None => {
+                self.load_provider_model_catalog(provider_name, bridge)
+                    .await
+            }
+        };
+
         {
             let mut relay = self.relay.write().await;
             relay.set_provider_name(provider_name.to_string());
+            // `set_available_models` heals the relay's model when it is still
+            // the untouched seed. Recording the seed on the thread here would
+            // undo that immediately — and persist another provider's model id,
+            // which then survives every later restart. Guarded on a catalog
+            // actually landing, so a deliberate no-catalog normalisation stands.
+            let mut model = model;
             if let Some(models) = provider_models {
                 relay.set_available_models(models);
+                // Only the value the relay invented. A thread pinned to
+                // `DEFAULT_MODEL` on a provider that genuinely offers it — Codex
+                // does — must keep it.
+                if catalog_was_unknown
+                    && remembered_model.is_none()
+                    && model == crate::state::DEFAULT_MODEL
+                {
+                    model = relay.model.clone();
+                }
             }
             // Fold the provider's reported last-activity time into the honest
             // sort key. Only Claude's `read_thread` reports a resume-safe value

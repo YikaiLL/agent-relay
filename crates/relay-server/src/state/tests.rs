@@ -388,8 +388,8 @@ fn available_models_update_default_model_and_effort() {
 #[test]
 fn switching_active_provider_drops_the_previous_providers_catalog() {
     // Repro for: "Codex shows Claude's models." Boot leaves the relay on Claude
-    // with Claude's catalog (the last-spawned provider wins `provider_name`, and
-    // the startup refresh stamps `available_models`).
+    // with Claude's catalog (Claude heads `DEFAULT_PROVIDER_PREFERENCE`, and the
+    // startup refresh stamps `available_models`).
     let mut relay = test_state();
     relay.set_provider_name("claude_code".to_string());
     relay.set_available_models(vec![ModelOptionView {

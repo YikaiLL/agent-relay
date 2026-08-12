@@ -1146,6 +1146,21 @@ test("renderEntryMarkup expands tool details from fetched entry data", () => {
   assert.match(expandedMarkup, /tool-log-pre">{&quot;text&quot;:&quot;file contents&quot;}/);
 });
 
+test("an approval card with no detail does not attribute the wait to Codex", () => {
+  // The fallback copy was "Codex is waiting for a remote approval." — shown on
+  // every provider's card. A Cursor plan or a Claude edit is not Codex waiting,
+  // and the card carries no provider field to name one, so it must not guess.
+  const markup = renderApprovalMarkup({
+    kind: "plan",
+    summary: "Add delta line",
+    detail: "",
+    supports_session_scope: false,
+  });
+
+  assert.doesNotMatch(markup, /Codex/);
+  assert.match(markup, /waiting for a remote approval/);
+});
+
 test("renderApprovalMarkup includes session-scope actions and escapes requested permissions", () => {
   const markup = renderApprovalMarkup({
     kind: "command",

@@ -1150,3 +1150,1073 @@ fn a_listed_session_is_known_to_have_content() {
         "a listed session must be loadable, not treated as an empty draft"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `cursor/create_plan` — the relay must not accept a plan on the user's behalf.
+//
+// Measured 2026-08-11 against `cursor-agent 2026.08.04-aaa8809`, and confirmed
+// against the agent's own handler source
+// (`src/acp/interaction-handlers/create-plan-handler.ts` in the shipped bundle).
+//
+//   request  cursor/create_plan {toolCallId, name, overview, plan, todos,
+//                                isProject, phases}      -- NOTE: no sessionId
+//   result   {outcome: {outcome: "accepted", planUri?}}
+//          | {outcome: {outcome: "rejected", reason?}}
+//          | {outcome: {outcome: "cancelled"}}
+//
+// The blanket `{}` the bridge used to answer with is NOT a no-op: the handler
+// reads `result.outcome.outcome`, throws on the missing field, and its catch
+// path degrades to *success*. So every plan was silently accepted for the user.
+// Rejection is a real, honoured outcome — measured, the agent answers
+// "The plan was rejected (<reason>), so I did not change notes.txt. What should
+// I do instead?" — which is exactly the steering the user was being denied.
+// ---------------------------------------------------------------------------
+
+/// The `cursor/create_plan` request as Cursor actually sends it, trimmed to the
+/// fields the bridge reads. `toolCallId` embeds a raw newline, verbatim.
+fn create_plan_request(id: u64, tool_call_id: &str) -> serde_json::Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "cursor/create_plan",
+        "params": {
+            "toolCallId": tool_call_id,
+            "name": "Add delta line",
+            "overview": "Append a new line containing `delta` to notes.txt.",
+            "plan": "# Add `delta` to notes.txt\n\n## Steps\n\n1. Edit notes.txt",
+            "todos": [{"id":"append-delta","content":"Append line 'delta'","status":"pending"}],
+            "isProject": false,
+            "phases": []
+        }
+    })
+}
+
+const PLAN_TOOL_CALL_ID: &str =
+    "call-67e2c21d-3bbf-4cfe-be86-56924c9c39f0-3\nfc_46511571-5444-9b39-8dd1-96b7d7a07621_0";
+
+/// Read one NDJSON line off the duplex peer, or fail if nothing arrives.
+async fn next_wire_line(peer: &mut tokio::io::DuplexStream) -> serde_json::Value {
+    let mut buffer = vec![0_u8; 8192];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(peer, &mut buffer),
+    )
+    .await
+    .expect("the bridge must answer the agent, not leave it blocked")
+    .expect("read failed");
+    let text = String::from_utf8_lossy(&buffer[..read]);
+    let line = text.lines().next().expect("a line").to_string();
+    serde_json::from_str(&line).expect("valid JSON on the wire")
+}
+
+#[tokio::test]
+async fn a_plan_is_parked_for_the_user_instead_of_being_accepted_for_them() {
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+    // A plan only ever arrives mid-turn, and the routing now insists on it.
+    bridge
+        .set_session_turn_for_test("t1", Some("acp-turn-1"))
+        .await;
+
+    // The agent announces the plan tool call first — that update is the only
+    // thing carrying BOTH the toolCallId and the session it belongs to, because
+    // `cursor/create_plan` itself has no `sessionId`.
+    let mut writer = inbound_writer;
+    let announce = json!({
+        "jsonrpc":"2.0","method":"session/update",
+        "params":{"sessionId":"t1","update":{
+            "sessionUpdate":"tool_call","toolCallId":PLAN_TOOL_CALL_ID,
+            "title":"Create Plan","kind":"other","status":"pending"}}
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{announce}\n").as_bytes())
+        .await
+        .expect("write");
+    tokio::io::AsyncWriteExt::write_all(
+        &mut writer,
+        format!("{}\n", create_plan_request(7, PLAN_TOOL_CALL_ID)).as_bytes(),
+    )
+    .await
+    .expect("write");
+
+    // The user gets asked.
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let relay = state.read().await;
+                if let Some(pending) = relay.pending_approvals.values().next() {
+                    return pending.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a plan must reach the user as an approval, not be answered for them");
+
+    assert_eq!(
+        parked.thread_id, "t1",
+        "the plan must be routed to the thread whose tool call announced it"
+    );
+    assert!(
+        parked.summary.contains("Add delta line"),
+        "the approval must name the plan: {}",
+        parked.summary
+    );
+    assert!(
+        parked
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("Edit notes.txt")),
+        "the plan body is the whole thing being approved, so it has to be shown"
+    );
+    assert!(
+        !parked.supports_session_scope,
+        "ACP has no session-scoped plan grant, and offering one would lie"
+    );
+
+    // And nothing was answered yet — the agent stays blocked on the user.
+    let mut buffer = vec![0_u8; 256];
+    let quiet = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tokio::io::AsyncReadExt::read(&mut outbound_peer, &mut buffer),
+    )
+    .await;
+    assert!(
+        quiet.is_err(),
+        "the bridge answered the plan before the user decided"
+    );
+}
+
+#[tokio::test]
+async fn approving_and_rejecting_a_plan_speak_cursors_outcome_vocabulary() {
+    use crate::protocol::{ApprovalDecision, ApprovalDecisionInput, ApprovalScope};
+    use crate::state::{ApprovalKind, PendingApproval};
+
+    let plan_pending = |raw_id: u64| PendingApproval {
+        // The `acp-plan-` prefix is the discriminator: it, and not the absence
+        // of an option list, is what marks this as a plan (see the guard test
+        // below for why that distinction is load-bearing).
+        request_id: format!("acp-plan-{raw_id}"),
+        raw_request_id: json!(raw_id),
+        kind: ApprovalKind::Plan,
+        thread_id: "t1".to_string(),
+        summary: "Add delta line".to_string(),
+        detail: Some("# Add `delta`".to_string()),
+        command: None,
+        cwd: Some("/tmp/project".to_string()),
+        context_preview: None,
+        requested_permissions: None,
+        available_decisions: vec!["approve".to_string(), "deny".to_string()],
+        supports_session_scope: false,
+    };
+
+    for (decision, expected) in [
+        (ApprovalDecision::Approve, json!({"outcome":"accepted"})),
+        // The reason is not decoration: measured, the agent quotes it back and
+        // changes course — "The plan was rejected (Rejected by the user), so I
+        // did not change notes.txt. What should I do instead?"
+        (
+            ApprovalDecision::Deny,
+            json!({"outcome":"rejected","reason":"Rejected by the user"}),
+        ),
+        (ApprovalDecision::Cancel, json!({"outcome":"cancelled"})),
+    ] {
+        let state = relay_state();
+        let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+        let (_inbound_writer, inbound) = tokio::io::duplex(8192);
+        let bridge = AcpBridge::for_test(state, outbound, inbound, "cursor");
+
+        crate::provider::ProviderBridge::respond_to_approval(
+            &bridge,
+            &plan_pending(7),
+            &ApprovalDecisionInput {
+                decision,
+                scope: Some(ApprovalScope::Once),
+                device_id: None,
+            },
+        )
+        .await
+        .expect("the decision must reach the agent");
+
+        let sent = next_wire_line(&mut outbound_peer).await;
+        assert_eq!(sent["id"], json!(7), "the reply must match the request id");
+        assert_eq!(
+            sent["result"]["outcome"], expected,
+            "wrong outcome for {decision:?}; Cursor reads result.outcome.outcome"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_permission_request_still_answers_with_a_selected_option() {
+    // Regression guard for the branch added above: plans and permissions share
+    // `respond_to_approval` and the same `result.outcome` envelope, but a
+    // permission is answered with `selected` + `optionId`, never `accepted`.
+    use crate::protocol::{ApprovalDecision, ApprovalDecisionInput, ApprovalScope};
+    use crate::state::{ApprovalKind, PendingApproval};
+
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (_inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state, outbound, inbound, "cursor");
+
+    let pending = PendingApproval {
+        request_id: "acp-approval-3".to_string(),
+        raw_request_id: json!(3),
+        kind: ApprovalKind::Command,
+        thread_id: "t1".to_string(),
+        summary: "`ls`".to_string(),
+        detail: None,
+        command: Some("ls".to_string()),
+        cwd: None,
+        context_preview: None,
+        requested_permissions: Some(json!([
+            {"optionId":"allow-once","kind":"allow_once"},
+            {"optionId":"reject-once","kind":"reject_once"}
+        ])),
+        available_decisions: vec!["approve".to_string(), "deny".to_string()],
+        supports_session_scope: false,
+    };
+
+    crate::provider::ProviderBridge::respond_to_approval(
+        &bridge,
+        &pending,
+        &ApprovalDecisionInput {
+            decision: ApprovalDecision::Approve,
+            scope: Some(ApprovalScope::Once),
+            device_id: None,
+        },
+    )
+    .await
+    .expect("send");
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(
+        sent["result"]["outcome"],
+        json!({"outcome":"selected","optionId":"allow-once"})
+    );
+}
+
+#[tokio::test]
+async fn an_option_less_permission_request_cancels_and_is_never_read_as_a_plan() {
+    // The near-miss this guards: discriminating "plan vs permission" on
+    // `requested_permissions.is_none()` reads as elegant and is a security bug.
+    // A permission request that arrived with an empty option list would then be
+    // answered `accepted` — granting a tool call nobody approved. The
+    // discriminator has to be the relay-minted `acp-plan-` id prefix, so a
+    // permission with nothing to select still cancels.
+    use crate::protocol::{ApprovalDecision, ApprovalDecisionInput, ApprovalScope};
+    use crate::state::{ApprovalKind, PendingApproval};
+
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (_inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state, outbound, inbound, "cursor");
+
+    crate::provider::ProviderBridge::respond_to_approval(
+        &bridge,
+        &PendingApproval {
+            request_id: "acp-approval-5".to_string(),
+            raw_request_id: json!(5),
+            kind: ApprovalKind::Command,
+            thread_id: "t1".to_string(),
+            summary: "`rm -rf /`".to_string(),
+            detail: None,
+            command: Some("rm -rf /".to_string()),
+            cwd: None,
+            context_preview: None,
+            requested_permissions: None,
+            available_decisions: vec!["approve".to_string(), "deny".to_string()],
+            supports_session_scope: false,
+        },
+        &ApprovalDecisionInput {
+            decision: ApprovalDecision::Approve,
+            scope: Some(ApprovalScope::Once),
+            device_id: None,
+        },
+    )
+    .await
+    .expect("send");
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(
+        sent["result"]["outcome"],
+        json!({"outcome":"cancelled"}),
+        "a permission with no selectable option must cancel, never accept"
+    );
+}
+
+#[tokio::test]
+async fn a_no_prompt_thread_accepts_the_plan_without_parking_it() {
+    // Same contract as `session/request_permission` under a no-prompt policy:
+    // there is nobody to ask, so the bridge answers immediately. Accepting is
+    // the right default here — unlike `allow_always` it grants nothing that
+    // outlives the turn, and rejecting would break plan mode for a thread whose
+    // whole point is to run unattended.
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge
+        .seed_session_with_policy_for_test("t1", "/tmp/project", "never")
+        .await;
+    bridge
+        .set_session_turn_for_test("t1", Some("acp-turn-1"))
+        .await;
+
+    let mut writer = inbound_writer;
+    let announce = json!({
+        "jsonrpc":"2.0","method":"session/update",
+        "params":{"sessionId":"t1","update":{
+            "sessionUpdate":"tool_call","toolCallId":PLAN_TOOL_CALL_ID,
+            "title":"Create Plan","kind":"other","status":"pending"}}
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{announce}\n").as_bytes())
+        .await
+        .expect("write");
+    tokio::io::AsyncWriteExt::write_all(
+        &mut writer,
+        format!("{}\n", create_plan_request(9, PLAN_TOOL_CALL_ID)).as_bytes(),
+    )
+    .await
+    .expect("write");
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(sent["id"], json!(9));
+    assert_eq!(sent["result"]["outcome"], json!({"outcome":"accepted"}));
+    assert!(
+        state.read().await.pending_approvals.is_empty(),
+        "a no-prompt thread must not park a card nobody will answer"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_on_a_reviewer_thread_is_accepted_rather_than_failing_the_review() {
+    // A reviewer runs in `plan` mode by construction — `review_read_only` is
+    // exactly what `acp_mode_for_policy` maps onto it — so "the agent wrote a
+    // plan" is the NORMAL path for a Cursor review, not an exception.
+    //
+    // But a review-locked thread has no user behind it: the review waiter treats
+    // any pending approval on its thread as an outright failure
+    // (`WaitOutcome::FailedApproval`), and `decide_approval` refuses a decision
+    // on that thread anyway. Parking a plan card there would fail the review for
+    // doing the one thing plan mode exists to do — a regression that only shows
+    // up once a Cursor reviewer is actually run.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.insert_review_job(crate::state::ReviewJob {
+            id: "review-1".to_string(),
+            parent_thread_id: "t1".to_string(),
+            status: crate::state::ReviewJobStatus::WaitingForReviewer,
+            ..Default::default()
+        });
+    }
+
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge
+        .seed_session_with_policy_for_test("t1", "/tmp/project", "review_read_only")
+        .await;
+    bridge
+        .set_session_turn_for_test("t1", Some("acp-turn-1"))
+        .await;
+
+    let mut writer = inbound_writer;
+    let announce = json!({
+        "jsonrpc":"2.0","method":"session/update",
+        "params":{"sessionId":"t1","update":{
+            "sessionUpdate":"tool_call","toolCallId":PLAN_TOOL_CALL_ID,
+            "title":"Create Plan","kind":"other","status":"pending"}}
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{announce}\n").as_bytes())
+        .await
+        .expect("write");
+    tokio::io::AsyncWriteExt::write_all(
+        &mut writer,
+        format!("{}\n", create_plan_request(13, PLAN_TOOL_CALL_ID)).as_bytes(),
+    )
+    .await
+    .expect("write");
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(sent["id"], json!(13));
+    assert_eq!(sent["result"]["outcome"], json!({"outcome":"accepted"}));
+    assert!(
+        state.read().await.pending_approvals.is_empty(),
+        "a plan must not park on a thread whose approvals fail the run that owns it"
+    );
+}
+
+#[tokio::test]
+async fn an_unroutable_plan_is_accepted_loudly_rather_than_silently() {
+    // `cursor/create_plan` carries no sessionId, so a plan whose announcing
+    // `tool_call` the relay never saw cannot be attributed to a thread — and an
+    // approval with no thread has no surface to appear on. Accepting keeps plan
+    // mode working (rejecting would break a plan the user never saw), but it is
+    // exactly the silent-accept this whole change exists to remove, so it must
+    // leave a trace on a relay-owned channel: a line filed under the provider's
+    // own channel is treated as subprocess chatter and filtered out of the audit
+    // view.
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+
+    let mut writer = inbound_writer;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut writer,
+        format!(
+            "{}\n",
+            create_plan_request(11, "a-tool-call-never-announced")
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write");
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(sent["id"], json!(11));
+    assert_eq!(sent["result"]["outcome"], json!({"outcome":"accepted"}));
+
+    let relay = state.read().await;
+    assert!(
+        relay
+            .logs_for_test()
+            .iter()
+            .any(|entry| entry.kind != "cursor" && entry.message.contains("plan")),
+        "an unattributable plan must be visible in the audit log, not swallowed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MCP visibility.
+//
+// Codex probes `codex mcp list --json` at startup; Claude reports live per-server
+// status off the SDK's `init` event. The ACP bridge had neither, so a Cursor MCP
+// server that fails to load produced nothing anywhere in the relay.
+//
+// ACP itself cannot help. Measured 2026-08-12 with two broken servers and one
+// healthy one configured in `~/.cursor/mcp.json`: `initialize` advertises
+// `agentCapabilities.mcpCapabilities {http, sse}` — a statement about what the
+// CLIENT may pass in — and `session/new` answers with exactly
+// `sessionId`/`modes`/`models`/`configOptions`. No MCP field, and no
+// notification, even with servers actively failing. So the CLI is the only
+// signal, exactly as it is for codex.
+//
+// `cursor-agent mcp list` has no `--json`; its grammar, measured in full:
+//
+//     healthy-mini: ready
+//     broken-stdio: Error: Connection failed
+//     unreachable-http: disabled
+//     No MCP servers configured (expected in .cursor/mcp.json or ~/.cursor/mcp.json)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mcp_list_output_is_summarised_by_measured_status() {
+    let summary = crate::acp::protocol::summarize_mcp_servers(
+        "cursor",
+        "healthy-mini: ready\nbroken-stdio: Error: Connection failed\nunreachable-http: disabled\n",
+    );
+
+    assert_eq!(
+        summary.headline.as_deref(),
+        Some("cursor MCP: 3 configured (1 ready, 1 disabled, 1 failed)")
+    );
+    // The failure names the server AND carries the agent's own reason: "one of
+    // them is broken" is not actionable, "broken-stdio: Connection failed" is.
+    assert_eq!(
+        summary.problems,
+        vec!["cursor MCP server `broken-stdio` failed to load: Connection failed"]
+    );
+}
+
+#[test]
+fn nothing_configured_is_silent_rather_than_a_line_of_noise_every_boot() {
+    for text in [
+        "No MCP servers configured (expected in .cursor/mcp.json or ~/.cursor/mcp.json)\n",
+        "",
+        "   \n",
+    ] {
+        let summary = crate::acp::protocol::summarize_mcp_servers("cursor", text);
+        assert_eq!(summary.headline, None, "should stay quiet for: {text:?}");
+        assert!(summary.problems.is_empty());
+    }
+}
+
+#[test]
+fn an_unrecognised_status_is_surfaced_rather_than_counted_as_healthy() {
+    // The grammar was measured against one version of one agent. If a later
+    // build reports something else, bucketing it as `ready` would quietly claim
+    // a server is fine when nobody knows that. Say so instead.
+    let summary = crate::acp::protocol::summarize_mcp_servers(
+        "cursor",
+        "weird-one: needs-auth\nhealthy-mini: ready\n",
+    );
+
+    assert_eq!(
+        summary.headline.as_deref(),
+        Some("cursor MCP: 2 configured (1 ready, 0 disabled, 0 failed, 1 unrecognized)")
+    );
+    assert_eq!(
+        summary.problems,
+        vec!["cursor MCP server `weird-one` reported an unrecognized status: needs-auth"]
+    );
+}
+
+#[tokio::test]
+async fn mcp_problems_go_on_a_channel_the_audit_view_actually_shows() {
+    // The trap this bridge has already been bitten by once: `push_log` filed
+    // under the provider's own key is classified as subprocess chatter and
+    // filtered out of the audit view. Codex files its MCP summary under
+    // `push_log("codex", …)`, which is why codex's own MCP lines are mostly
+    // invisible too — deliberately NOT copied here.
+    let state = relay_state();
+    crate::acp::log_mcp_summary_for_test(
+        &state,
+        crate::acp::protocol::summarize_mcp_servers(
+            "cursor",
+            "broken-stdio: Error: Connection failed\nhealthy: ready\n",
+        ),
+    )
+    .await;
+
+    let relay = state.read().await;
+    let logs = relay.logs_for_test();
+    let problem = logs
+        .iter()
+        .find(|entry| entry.message.contains("broken-stdio"))
+        .expect("the failure must be logged");
+    assert_eq!(
+        problem.kind, "warn",
+        "an MCP failure filed under `{}` would be filtered out of the audit view",
+        problem.kind
+    );
+    let headline = logs
+        .iter()
+        .find(|entry| entry.message.starts_with("cursor MCP:"))
+        .expect("the summary must be logged");
+    assert_eq!(headline.kind, "info");
+}
+
+#[tokio::test]
+async fn a_login_instruction_is_visible_and_names_the_binary_the_user_must_run() {
+    // Two defects in one line, both of which make it useless to the person it
+    // was written for:
+    //
+    // 1. It was filed under `push_log(provider_key, …)`, which the audit view
+    //    classifies as subprocess chatter and filters out — neither
+    //    "authenticated" nor "reconnect" matches the lifecycle regex that lets a
+    //    provider line through. The one instruction that unblocks the provider
+    //    was invisible.
+    // 2. It told the user to run `cursor login`. The binary is `cursor-agent`;
+    //    `cursor` is the relay's provider KEY. The command does not exist.
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+
+    let handshake = tokio::spawn({
+        let mut writer = inbound_writer;
+        async move {
+            // Answer `initialize` (advertising an auth method), then fail
+            // `authenticate` the way a logged-out agent does.
+            let mut buffer = vec![0_u8; 4096];
+            let read = tokio::io::AsyncReadExt::read(&mut outbound_peer, &mut buffer)
+                .await
+                .expect("initialize should reach the peer");
+            let sent: serde_json::Value =
+                serde_json::from_str(String::from_utf8_lossy(&buffer[..read]).trim())
+                    .expect("valid JSON");
+            let init_reply = json!({
+                "jsonrpc":"2.0","id":sent["id"],
+                "result":{"protocolVersion":1,"authMethods":[{"id":"cursor_login","name":"Cursor Login"}]}
+            });
+            tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{init_reply}\n").as_bytes())
+                .await
+                .expect("write");
+
+            let read = tokio::io::AsyncReadExt::read(&mut outbound_peer, &mut buffer)
+                .await
+                .expect("authenticate should reach the peer");
+            let sent: serde_json::Value =
+                serde_json::from_str(String::from_utf8_lossy(&buffer[..read]).trim())
+                    .expect("valid JSON");
+            let auth_reply = json!({
+                "jsonrpc":"2.0","id":sent["id"],
+                "error":{"code":-32000,"message":"Authentication required"}
+            });
+            tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{auth_reply}\n").as_bytes())
+                .await
+                .expect("write");
+            writer
+        }
+    });
+
+    bridge
+        .initialize_for_test()
+        .await
+        .expect("a logged-out agent still connects");
+    let _writer = handshake.await.expect("handshake task");
+
+    let relay = state.read().await;
+    let line = relay
+        .logs_for_test()
+        .iter()
+        .find(|entry| entry.message.contains("not authenticated"))
+        .expect("the login instruction must be logged at all");
+
+    assert_ne!(
+        line.kind, "cursor",
+        "filed under the provider channel, the audit view drops it: {}",
+        line.message
+    );
+    assert!(
+        line.message.contains("cursor-agent login"),
+        "the user must be told the command that exists: {}",
+        line.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A failed turn has to reach the user the way codex's and Claude's do.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_failed_turn_pushes_the_failure_instead_of_a_success_shaped_ping() {
+    // `enqueue_error_push` does two jobs, and skipping it loses both: the phone
+    // never gets the failure, AND — because the call is what sets
+    // `suppress_completed` — the ordinary work→idle transition still fires as a
+    // "finished" push. A user away from the desk was told a turn that died had
+    // completed. Codex (`codex/rpc.rs`) and Claude (`claude.rs`) both call it.
+    let state = relay_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut relay = state.write().await;
+        relay.set_push_runtime(tx, "test-vapid".to_string());
+        relay.active_thread_id = Some("t1".to_string());
+        // The app layer registers the turn once `start_turn` returns; a turn
+        // that was never running cannot be the one this call is settling.
+        relay.set_active_turn(Some("acp-turn-1".to_string()));
+    }
+
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_turn_finished(
+            &mut relay,
+            "t1",
+            "acp-turn-1",
+            Err("Model provider rejected the request".to_string()),
+            "cursor",
+        );
+    }
+
+    let job = rx.try_recv().expect("a failed turn must enqueue a push");
+    assert!(
+        format!("{job:?}").contains("Error"),
+        "the push must be a failure, not a completion: {job:?}"
+    );
+    assert!(
+        format!("{job:?}").contains("Model provider rejected"),
+        "the push must carry the reason: {job:?}"
+    );
+
+    // And the failure is in the audit log, not only the transcript — operator
+    // logs are what a maintainer greps when a user says "it just stopped".
+    let relay = state.read().await;
+    assert!(
+        relay
+            .logs_for_test()
+            .iter()
+            .any(|entry| entry.kind == "error"
+                && entry.message.contains("Model provider rejected")),
+        "a failed turn must leave an error line in the log"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_turn_pushes_nothing() {
+    // The guard on the above: `end_turn` and a user cancel are not failures, and
+    // must not start firing error pushes.
+    for outcome in [
+        Ok(json!({"stopReason": "end_turn"})),
+        Ok(json!({"stopReason": "cancelled"})),
+    ] {
+        let state = relay_state();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut relay = state.write().await;
+            relay.set_push_runtime(tx, "test-vapid".to_string());
+            relay.active_thread_id = Some("t1".to_string());
+        }
+        {
+            let mut relay = state.write().await;
+            crate::acp::rpc::apply_turn_finished(
+                &mut relay,
+                "t1",
+                "acp-turn-1",
+                outcome.clone(),
+                "cursor",
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a clean turn must not enqueue an error push: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_background_turn_does_not_resurrect_a_deleted_thread() {
+    // The background route is not just "the same write plus a progress touch":
+    // `bg_upsert_transcript_item` first drops events for a thread the user has
+    // permanently deleted. Writing the failure entry through the active-thread
+    // path instead re-creates a runtime for a session nothing will ever clean up
+    // again — the exact resurrection `mark_thread_deleted`'s tombstone exists to
+    // prevent.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        // Some OTHER thread is in front of the user, so `t-gone` is background.
+        relay.active_thread_id = Some("t-visible".to_string());
+        relay.mark_thread_deleted("t-gone");
+    }
+
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_turn_finished(
+            &mut relay,
+            "t-gone",
+            "acp-turn-9",
+            Err("boom".to_string()),
+            "cursor",
+        );
+    }
+
+    let relay = state.read().await;
+    assert!(
+        relay.runtime_for_thread("t-gone").is_none(),
+        "a deleted thread must not be resurrected by its own turn failing"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_already_settled_elsewhere_is_not_pushed_about_twice() {
+    // The double-notify this bridge is uniquely exposed to. When the agent dies,
+    // TWO paths run: the reader calls `fail_in_flight_turns_for_provider` (which
+    // settles the turn and pushes "stopped unexpectedly"), and the drained
+    // `session/prompt` waiter then resolves Err and reaches `apply_turn_finished`
+    // with the same turn. Codex never collides this way — its turn failures
+    // arrive as their own event — so copying its shape blindly buys a second
+    // notification for one dead agent.
+    //
+    // The rule: only the call that is ACTUALLY settling this turn may push.
+    let state = relay_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut relay = state.write().await;
+        relay.set_push_runtime(tx, "test-vapid".to_string());
+        relay.active_thread_id = Some("t1".to_string());
+        relay.set_active_turn(Some("acp-turn-1".to_string()));
+        // Something else got there first and cleared the turn.
+        relay.enqueue_error_push("t1", "stopped unexpectedly — the agent exited.");
+        relay.set_active_turn(None);
+    }
+    let first = rx.try_recv().expect("the first path pushed");
+    assert!(format!("{first:?}").contains("stopped unexpectedly"));
+
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_turn_finished(
+            &mut relay,
+            "t1",
+            "acp-turn-1",
+            Err("cursor dropped the turn before it finished".to_string()),
+            "cursor",
+        );
+    }
+
+    assert!(
+        rx.try_recv().is_err(),
+        "a turn someone else already settled must not push a second notification"
+    );
+    // The transcript entry is still wanted: the other path writes none, so this
+    // is the only durable record a remote client will ever see.
+    let relay = state.read().await;
+    let runtime = relay.runtime_for_thread("t1").expect("runtime");
+    assert!(
+        runtime
+            .transcript
+            .iter()
+            .any(|entry| entry.item_id == "turn-error:acp-turn-1"),
+        "the failure must still be in the transcript"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plan routing, hardened after an adversarial pass.
+//
+// `cursor/create_plan` carries no sessionId, so the thread is reverse-looked-up
+// from an AGENT-SUPPLIED `toolCallId`. That makes the routing key attacker- (or
+// bug-) controlled, and every miss used to fall into a branch that answers
+// `accepted` — turning one wrong string into a silent approval.
+// ---------------------------------------------------------------------------
+
+async fn drive_plan_request(
+    state: &std::sync::Arc<RwLock<crate::state::RelayState>>,
+    bridge: &AcpBridge,
+    inbound_writer: &mut tokio::io::DuplexStream,
+    announce_to: Option<(&str, &str)>,
+    request_id: u64,
+    plan_tool_call_id: &str,
+) {
+    if let Some((session_id, tool_call_id)) = announce_to {
+        let announce = json!({
+            "jsonrpc":"2.0","method":"session/update",
+            "params":{"sessionId":session_id,"update":{
+                "sessionUpdate":"tool_call","toolCallId":tool_call_id,
+                "title":"Create Plan","kind":"other","status":"pending"}}
+        });
+        tokio::io::AsyncWriteExt::write_all(inbound_writer, format!("{announce}\n").as_bytes())
+            .await
+            .expect("write");
+    }
+    tokio::io::AsyncWriteExt::write_all(
+        inbound_writer,
+        format!("{}\n", create_plan_request(request_id, plan_tool_call_id)).as_bytes(),
+    )
+    .await
+    .expect("write");
+    let _ = (state, bridge);
+}
+
+#[tokio::test]
+async fn a_plan_never_parks_on_a_thread_that_has_no_turn_in_flight() {
+    // A plan only ever arrives DURING a turn. If the reverse lookup lands on a
+    // session with nothing running, the lookup was wrong — and parking there
+    // breaks the documented contract in `state/relay.rs` that a pending request
+    // is only ever added to a thread already marked working. The card would pin
+    // an idle thread to `waitingOnApproval` with no turn to consume the answer.
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge
+        .seed_session_for_test("idle-thread", "/tmp/project")
+        .await;
+
+    let mut writer = inbound_writer;
+    drive_plan_request(
+        &state,
+        &bridge,
+        &mut writer,
+        Some(("idle-thread", PLAN_TOOL_CALL_ID)),
+        21,
+        PLAN_TOOL_CALL_ID,
+    )
+    .await;
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(sent["id"], json!(21));
+    assert_eq!(sent["result"]["outcome"], json!({"outcome":"accepted"}));
+    assert!(
+        state.read().await.pending_approvals.is_empty(),
+        "a plan must not pin a card on a thread with no turn to answer it"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_tool_call_id_matches_nothing() {
+    // `tool_call` accepts `"toolCallId": ""` (serde's `as_str` on an empty
+    // string is `Some`), so an empty key is insertable — and `create_plan` with
+    // the field missing resolves to the empty string too. Left alone, those two
+    // meet and a plan routes to an arbitrary session.
+    let state = relay_state();
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge.seed_session_for_test("t1", "/tmp/project").await;
+    bridge
+        .set_session_turn_for_test("t1", Some("acp-turn-1"))
+        .await;
+
+    let mut writer = inbound_writer;
+    drive_plan_request(&state, &bridge, &mut writer, Some(("t1", "")), 23, "").await;
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(sent["id"], json!(23));
+    assert!(
+        state.read().await.pending_approvals.is_empty(),
+        "an empty tool call id must never resolve to a session"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_answered_on_behalf_of_a_run_leaves_a_trace() {
+    // The unroutable branch logs because "the relay decided for you" has to be
+    // auditable. This branch makes the same decision — and the opposite one from
+    // what the owning run makes for every other approval on that thread, which
+    // it DENIES — so silence here is worse, not better.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.insert_review_job(crate::state::ReviewJob {
+            id: "review-2".to_string(),
+            parent_thread_id: "t1".to_string(),
+            status: crate::state::ReviewJobStatus::WaitingForReviewer,
+            ..Default::default()
+        });
+    }
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge
+        .seed_session_with_policy_for_test("t1", "/tmp/project", "review_read_only")
+        .await;
+    bridge
+        .set_session_turn_for_test("t1", Some("acp-turn-1"))
+        .await;
+
+    let mut writer = inbound_writer;
+    drive_plan_request(
+        &state,
+        &bridge,
+        &mut writer,
+        Some(("t1", PLAN_TOOL_CALL_ID)),
+        25,
+        PLAN_TOOL_CALL_ID,
+    )
+    .await;
+
+    let sent = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(sent["result"]["outcome"], json!({"outcome":"accepted"}));
+
+    let relay = state.read().await;
+    assert!(
+        relay
+            .logs_for_test()
+            .iter()
+            .any(|entry| entry.kind != "cursor" && entry.message.contains("plan")),
+        "accepting a plan for a run nobody can answer must be recorded"
+    );
+}
+
+#[test]
+fn the_two_approval_id_prefixes_can_never_overlap() {
+    // The discriminator is load-bearing in the dangerous direction: if a
+    // permission id ever started with the plan prefix it would be answered
+    // `accepted`, granting a tool call nobody approved. The permission prefix is
+    // a bare literal at its mint site, so pin the invariant itself.
+    assert!(!crate::acp::protocol::is_plan_approval(
+        crate::acp::rpc::PERMISSION_APPROVAL_PREFIX
+    ));
+    assert!(crate::acp::protocol::is_plan_approval(
+        crate::acp::protocol::PLAN_APPROVAL_PREFIX
+    ));
+    assert!(!crate::acp::rpc::PERMISSION_APPROVAL_PREFIX
+        .starts_with(crate::acp::protocol::PLAN_APPROVAL_PREFIX));
+    assert!(!crate::acp::protocol::PLAN_APPROVAL_PREFIX
+        .starts_with(crate::acp::rpc::PERMISSION_APPROVAL_PREFIX));
+}
+
+#[tokio::test]
+async fn a_stale_turn_finishing_late_must_not_settle_the_turn_that_replaced_it() {
+    // The half-applied guard. `settling_this_turn` gated only the push; the
+    // settle tail ran unconditionally, so a late finisher for turn A cleared
+    // whatever turn was running by then. Both siblings guard the whole block —
+    // codex computes `superseded` (`codex/rpc.rs`), Claude returns early on a
+    // "stale completion".
+    //
+    // Reachable: user stops turn A, the agent does not answer inside the stop
+    // fallback so the relay idles the thread, the user sends turn B, and only
+    // then does A's `session/prompt` resolve. B is live and must survive.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = Some("t1".to_string());
+        relay.set_active_turn(Some("turn-A".to_string()));
+        // A was abandoned and B took over.
+        relay.set_active_turn(Some("turn-B".to_string()));
+        relay.set_thread_status("t1", "working".to_string(), Vec::new());
+    }
+
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_turn_finished(
+            &mut relay,
+            "t1",
+            "turn-A",
+            Err("the abandoned turn finally failed".to_string()),
+            "cursor",
+        );
+    }
+
+    let relay = state.read().await;
+    let runtime = relay.runtime_for_thread("t1").expect("runtime");
+    assert_eq!(
+        runtime.active_turn_id.as_deref(),
+        Some("turn-B"),
+        "a late finisher for an abandoned turn cleared the turn that replaced it"
+    );
+    assert_ne!(
+        runtime.current_status, "idle",
+        "the thread was forced idle while a newer turn was still running"
+    );
+}
+
+#[test]
+fn multi_line_mcp_errors_do_not_become_phantom_servers() {
+    // `mcp list` output is human text, and a failing stdio server can print a
+    // stack trace. Counting every line with a colon as a server turns one broken
+    // server into a dozen phantoms — and each phantom emits its own `warn`, so a
+    // chatty failure evicts the whole 200-line audit log at boot.
+    let summary = crate::acp::protocol::summarize_mcp_servers(
+        "cursor",
+        "healthy-mini: ready\n\
+         broken-stdio: Error: spawn cursor-mcp ENOENT\n\
+         \x20   at ChildProcess.handle (node:internal/child_process:289:12)\n\
+         \x20   at onErrorNT (node:internal/child_process:476:16)\n",
+    );
+
+    assert_eq!(
+        summary.headline.as_deref(),
+        Some("cursor MCP: 2 configured (1 ready, 0 disabled, 1 failed)"),
+        "indented continuation lines are not servers"
+    );
+    assert_eq!(summary.problems.len(), 1);
+}
+
+#[test]
+fn a_server_name_containing_a_colon_is_not_split_in_half() {
+    // Splitting on the FIRST colon truncates any name that contains one, and
+    // then reports a perfectly healthy server as having an unrecognized status.
+    let summary = crate::acp::protocol::summarize_mcp_servers("cursor", "aws:prod: ready\n");
+    assert_eq!(
+        summary.headline.as_deref(),
+        Some("cursor MCP: 1 configured (1 ready, 0 disabled, 0 failed)")
+    );
+    assert!(summary.problems.is_empty(), "{:?}", summary.problems);
+}
+
+#[test]
+fn mcp_lines_name_the_agent_they_describe() {
+    // Two CLIs on one relay produce two `MCP: N configured` lines. Moving off
+    // the provider channel (which is what the audit view filters on) removed the
+    // only attribution these lines had, so they have to carry it themselves.
+    let summary = crate::acp::protocol::summarize_mcp_servers("cursor", "broken: Error: nope\n");
+    assert!(summary
+        .headline
+        .as_deref()
+        .unwrap()
+        .starts_with("cursor MCP:"));
+    assert!(
+        summary.problems[0].contains("cursor"),
+        "{:?}",
+        summary.problems
+    );
+}

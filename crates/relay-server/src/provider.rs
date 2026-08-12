@@ -301,6 +301,47 @@ const FAKE_PROVIDER: ProviderEntry = ProviderEntry {
     aliases: &[],
 };
 
+/// Which provider a fresh relay adopts as its own, in preference order.
+///
+/// Only providers with an opinion belong here; anything else falls back to
+/// registry order. Claude is first because that is what a relay with everything
+/// installed has always reported, and changing it would move every new user's
+/// default agent without anyone deciding to.
+const DEFAULT_PROVIDER_PREFERENCE: &[&str] = &["claude_code", "codex"];
+
+/// Pick the relay's provider from the ones that actually spawned.
+///
+/// This used to be emergent rather than chosen: each bridge called
+/// `set_provider_name` as it started, so the winner was whichever provider sat
+/// last in the registry loop. That silently made the answer a function of
+/// registry ORDER — so adding a provider to the end of the list, or adding the
+/// "missing" call to one that lacked it, would reassign every fresh relay's
+/// default agent as a side effect. It also left a cursor-only relay reporting no
+/// provider at all, because the ACP bridge never made the call.
+///
+/// `spawned` must be in registry order so the fallback is stable.
+pub(crate) fn preferred_default_provider<'a>(spawned: &[&'a str]) -> Option<&'a str> {
+    DEFAULT_PROVIDER_PREFERENCE
+        .iter()
+        .find_map(|preferred| spawned.iter().find(|key| key == &preferred).copied())
+        .or_else(|| spawned.first().copied())
+}
+
+/// The human-facing name for a provider key, for messages a user reads.
+///
+/// The registry already carries one per provider; without a lookup, call sites
+/// end up hardcoding a single vendor's name and telling everyone else's users
+/// something false. Falls back to the key so a provider added to the registry
+/// but not here degrades to "cursor" rather than to a lie.
+pub fn provider_display_name(provider_key: &str) -> &str {
+    DEFAULT_PROVIDERS
+        .iter()
+        .chain(std::iter::once(&FAKE_PROVIDER))
+        .find(|entry| entry.provider_key == provider_key)
+        .map(|entry| entry.display_name)
+        .unwrap_or(provider_key)
+}
+
 const PROVIDER_START_TIMEOUT_SECS: u64 = 30;
 
 fn provider_start_timeout_secs() -> u64 {
@@ -391,6 +432,19 @@ pub async fn spawn_providers(
         });
     }
 
+    // Decide the relay's provider ONCE, here, from what actually came up — the
+    // bridges no longer each claim it on the way past. `status_base` is built in
+    // registry order, so the fallback is stable.
+    let spawned: Vec<&str> = status_base
+        .iter()
+        .filter(|base| base.spawn_error.is_none())
+        .map(|base| base.provider_key.as_str())
+        .collect();
+    if let Some(default_provider) = preferred_default_provider(&spawned) {
+        let mut relay = state.write().await;
+        relay.set_provider_name(default_provider.to_string());
+    }
+
     (providers, status_base)
 }
 
@@ -437,6 +491,49 @@ where
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn the_default_provider_is_declared_not_an_accident_of_spawn_order() {
+        // It used to be whichever provider called `set_provider_name` last
+        // during boot. That is not a decision anyone made: it is the tail of a
+        // `for` loop over the registry. Three measured consequences (2026-08-12,
+        // fresh relay, `snapshot.provider`):
+        //
+        //   all three installed  -> "claude_code"   (only because cursor, which
+        //                                            sorts last, never called it)
+        //   cursor only          -> ""              <- a working relay reporting
+        //                                              no provider at all
+        //   codex + cursor       -> "codex"
+        //
+        // Adding the missing call to the ACP bridge — the "obvious" symmetry fix
+        // — would have silently moved the all-three default from Claude to
+        // Cursor, because Cursor is last in the registry. The order has to be
+        // declared instead.
+        assert_eq!(
+            preferred_default_provider(&["codex", "claude_code", "cursor"]),
+            Some("claude_code"),
+            "Claude stays the default when it is available"
+        );
+        assert_eq!(
+            preferred_default_provider(&["cursor", "claude_code", "codex"]),
+            Some("claude_code"),
+            "the answer must not depend on the order things spawned in"
+        );
+
+        // The case that was broken: a relay with a working provider reported none.
+        assert_eq!(preferred_default_provider(&["cursor"]), Some("cursor"));
+
+        assert_eq!(
+            preferred_default_provider(&["codex", "cursor"]),
+            Some("codex")
+        );
+        // Nothing preferred spawned: fall back to what did, in registry order.
+        assert_eq!(
+            preferred_default_provider(&["cursor", "fake"]),
+            Some("cursor")
+        );
+        assert_eq!(preferred_default_provider(&[]), None);
+    }
 
     fn entry(key: &str) -> &'static ProviderEntry {
         DEFAULT_PROVIDERS

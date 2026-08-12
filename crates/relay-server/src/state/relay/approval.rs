@@ -71,6 +71,13 @@ impl PendingApproval {
                     })
                 }
             }
+            // ACP-only, and unreachable here: a `Plan` approval is only ever
+            // minted by the ACP bridge, whose `respond_to_approval` answers the
+            // agent directly in ACP's own outcome vocabulary and never asks for
+            // a Codex-shaped decision payload. There is no Codex or Claude
+            // equivalent to encode, so inventing one would be a lie that
+            // compiles.
+            ApprovalKind::Plan => json!({}),
         }
     }
 }
@@ -80,6 +87,10 @@ pub enum ApprovalKind {
     Command,
     FileChange,
     Permissions,
+    /// An agent-authored plan awaiting the user's accept/reject (ACP's
+    /// `cursor/create_plan`). Distinct from `Permissions` because it grants
+    /// nothing — it approves a course of action, and the card says so.
+    Plan,
 }
 
 impl ApprovalKind {
@@ -88,6 +99,7 @@ impl ApprovalKind {
             ApprovalKind::Command => "command_execution",
             ApprovalKind::FileChange => "file_change",
             ApprovalKind::Permissions => "permissions",
+            ApprovalKind::Plan => "plan",
         }
     }
 }

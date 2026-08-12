@@ -100,14 +100,18 @@ impl AppState {
         );
         relay.notify();
 
+        // Name the provider that actually received it. This used to say "Codex"
+        // for everyone, which made the receipt wrong for every non-Codex user on
+        // the one surface whose job is to confirm where a permission decision went.
+        let provider = crate::provider::provider_display_name(bridge.provider_name());
         Ok(ApprovalReceipt {
             request_id: request_id.to_string(),
             decision: input.decision,
             resulting_state: "approval_response_sent".to_string(),
             message: match input.decision {
-                ApprovalDecision::Approve => "Remote approval sent to Codex.".to_string(),
-                ApprovalDecision::Deny => "Remote denial sent to Codex.".to_string(),
-                ApprovalDecision::Cancel => "Remote cancel sent to Codex.".to_string(),
+                ApprovalDecision::Approve => format!("Remote approval sent to {provider}."),
+                ApprovalDecision::Deny => format!("Remote denial sent to {provider}."),
+                ApprovalDecision::Cancel => format!("Remote cancel sent to {provider}."),
             },
         })
     }

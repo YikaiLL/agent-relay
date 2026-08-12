@@ -3031,7 +3031,7 @@ got {}",
         );
 
         // Model the REAL fresh-boot state: apply_persisted leaves active_thread_id
-        // SET, provider startup leaves the global provider on the last-spawned
+        // SET, provider startup leaves the global provider on the preferred
         // provider (claude_code), the startup refresh stamped Claude's catalog, and
         // the relay thread/runtime caches are empty (not persisted). Critically,
         // active_thread_id stays set — clearing it would hide the
@@ -3059,7 +3059,7 @@ got {}",
         // and the Codex model catalog loaded (no Claude leakage).
         assert_eq!(
             snapshot.provider, "codex",
-            "a restored Codex session must come back as codex, not the last-spawned provider"
+            "a restored Codex session must come back as codex, not the boot-default provider"
         );
         assert_eq!(
             snapshot.active_thread_id.as_deref(),
@@ -3838,6 +3838,92 @@ got {}",
         assert_eq!(
             *claude.approval_thread_ids.lock().await,
             vec!["claude-thread".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_receipt_names_the_provider_that_actually_got_it() {
+        // The receipt said "sent to Codex." for every provider. A Cursor user
+        // denying a plan, or a Claude user approving an edit, was told their
+        // decision went somewhere it did not — on the one surface whose whole
+        // job is to report what just happened to a permission.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let codex_thread = codex.thread_summary("codex-thread", cwd);
+        let claude_thread = claude.thread_summary("claude-thread", cwd);
+        codex
+            .threads
+            .lock()
+            .await
+            .insert(codex_thread.id.clone(), codex_thread.clone());
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+
+        let pending = |request_id: &str, thread_id: &str| PendingApproval {
+            request_id: request_id.to_string(),
+            raw_request_id: serde_json::json!(request_id),
+            kind: ApprovalKind::Command,
+            thread_id: thread_id.to_string(),
+            summary: "Run command".to_string(),
+            detail: None,
+            command: Some("true".to_string()),
+            cwd: Some(cwd.to_string()),
+            context_preview: None,
+            requested_permissions: None,
+            available_decisions: vec!["approve".to_string(), "deny".to_string()],
+            supports_session_scope: false,
+        };
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(codex_thread.id.clone());
+            relay.threads = vec![codex_thread, claude_thread];
+            relay
+                .pending_approvals
+                .insert("a-codex".to_string(), pending("a-codex", "codex-thread"));
+            relay
+                .pending_approvals
+                .insert("a-claude".to_string(), pending("a-claude", "claude-thread"));
+        }
+
+        let decide = |request_id: &'static str, decision| {
+            let app = &app;
+            async move {
+                app.decide_approval(
+                    request_id,
+                    ApprovalDecisionInput {
+                        decision,
+                        scope: Some(ApprovalScope::Once),
+                        device_id: Some("device-1".to_string()),
+                    },
+                )
+                .await
+                .expect("decision should route")
+                .message
+            }
+        };
+
+        let claude_message = decide("a-claude", ApprovalDecision::Deny).await;
+        assert!(
+            claude_message.contains("Claude Code"),
+            "a denial routed to claude must say so: {claude_message}"
+        );
+        assert!(
+            !claude_message.contains("Codex"),
+            "the receipt named the wrong provider: {claude_message}"
+        );
+
+        // And the provider that IS Codex still reads correctly.
+        let codex_message = decide("a-codex", ApprovalDecision::Approve).await;
+        assert!(
+            codex_message.contains("Codex"),
+            "wrong provider named: {codex_message}"
         );
     }
 
@@ -20020,5 +20106,419 @@ mod local_snapshot_sharing {
             "the fresh build must repopulate the cache, not bypass and abandon it"
         );
         assert!(Arc::ptr_eq(&connecting, &later_waiter));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A provider whose model catalog only becomes knowable once it has been asked
+// to do something — which is ACP's actual shape: `cursor-agent acp` has no
+// `model/list` method at all, and the catalog rides along on `session/new` and
+// `session/load` responses. On the first-ever boot in a workspace there is no
+// cached catalog, so the relay asks before the bridge can possibly answer.
+// ---------------------------------------------------------------------------
+mod late_catalog_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{watch, Mutex, RwLock};
+
+    use crate::protocol::{
+        ApprovalDecisionInput, ResumeSessionInput, ThreadSummaryView, TranscriptEntryView,
+    };
+    use crate::provider::ProviderBridge;
+    use crate::state::{
+        unix_now, AppState, PendingApproval, RelayState, SecurityProfile, DEFAULT_MODEL,
+    };
+
+    struct LateCatalogProvider {
+        name: &'static str,
+        threads: Mutex<HashMap<String, ThreadSummaryView>>,
+        /// Flips once a session operation has happened, exactly as the ACP
+        /// bridge's in-memory catalog is populated by `absorb_catalog`.
+        catalog_known: Mutex<bool>,
+        /// Whether this provider's catalog contains the id `DEFAULT_MODEL`
+        /// happens to be. Codex does — for it "gpt-5.5" is a real, choosable
+        /// model. Cursor does not. That difference is the whole discriminator.
+        offers_seed_named_model: bool,
+    }
+
+    impl LateCatalogProvider {
+        fn new(name: &'static str, cwd: &str) -> Self {
+            let mut threads = HashMap::new();
+            threads.insert(
+                "late-thread".to_string(),
+                ThreadSummaryView {
+                    id: "late-thread".to_string(),
+                    name: Some("late".to_string()),
+                    preview: String::new(),
+                    cwd: cwd.to_string(),
+                    updated_at: unix_now(),
+                    source: name.to_string(),
+                    status: "idle".to_string(),
+                    model_provider: name.to_string(),
+                    provider: name.to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+            );
+            Self {
+                name,
+                threads: Mutex::new(threads),
+                catalog_known: Mutex::new(false),
+                offers_seed_named_model: false,
+            }
+        }
+
+        fn offering_seed_named_model(name: &'static str, cwd: &str) -> Self {
+            Self {
+                offers_seed_named_model: true,
+                ..Self::new(name, cwd)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderBridge for LateCatalogProvider {
+        async fn list_threads(&self, _limit: usize) -> Result<Vec<ThreadSummaryView>, String> {
+            Ok(self.threads.lock().await.values().cloned().collect())
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::protocol::ModelOptionView>, String> {
+            if !*self.catalog_known.lock().await {
+                // "Answered before it was ready" — the relay treats an empty
+                // list as a soft miss and keeps whatever it had.
+                return Ok(Vec::new());
+            }
+            let option = |model: &str, is_default: bool| crate::protocol::ModelOptionView {
+                model: model.to_string(),
+                display_name: model.to_string(),
+                supported_reasoning_efforts: vec!["medium".to_string()],
+                default_reasoning_effort: "medium".to_string(),
+                is_default,
+                hidden: false,
+                provider: self.name.to_string(),
+            };
+            let mut catalog = vec![option("agent-default", true)];
+            if self.offers_seed_named_model {
+                catalog.push(option(DEFAULT_MODEL, false));
+            }
+            Ok(catalog)
+        }
+
+        async fn start_thread(
+            &self,
+            cwd: &str,
+            _model: &str,
+            _approval_policy: &str,
+            _sandbox: &str,
+            _initial_prompt: Option<&str>,
+        ) -> Result<crate::provider::StartThreadResult, String> {
+            // ACP learns its catalog from the `session/new` response, i.e. only
+            // once the thread has actually been created.
+            *self.catalog_known.lock().await = true;
+            let thread = ThreadSummaryView {
+                id: "late-new-thread".to_string(),
+                name: Some("late new".to_string()),
+                preview: String::new(),
+                cwd: cwd.to_string(),
+                updated_at: unix_now(),
+                source: self.name.to_string(),
+                status: "idle".to_string(),
+                model_provider: self.name.to_string(),
+                provider: self.name.to_string(),
+                forked_from: None,
+                renamed: false,
+            };
+            self.threads
+                .lock()
+                .await
+                .insert(thread.id.clone(), thread.clone());
+            Ok(crate::provider::StartThreadResult {
+                thread,
+                consumed_initial_prompt: false,
+                initial_user_message: None,
+                started_turn_id: None,
+            })
+        }
+
+        async fn resume_thread(&self, _t: &str, _a: &str, _s: &str) -> Result<(), String> {
+            *self.catalog_known.lock().await = true;
+            Ok(())
+        }
+
+        async fn read_thread(
+            &self,
+            thread_id: &str,
+        ) -> Result<crate::provider::ThreadSyncData, String> {
+            // The session read is what teaches the bridge its catalog.
+            *self.catalog_known.lock().await = true;
+            let thread = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| format!("thread '{thread_id}' not found"))?;
+            Ok(crate::provider::ThreadSyncData {
+                thread,
+                status: "idle".to_string(),
+                active_flags: Vec::new(),
+                transcript: Vec::new(),
+            })
+        }
+
+        async fn read_thread_entry_detail(
+            &self,
+            _t: &str,
+            _i: &str,
+        ) -> Result<Option<TranscriptEntryView>, String> {
+            Ok(None)
+        }
+
+        async fn archive_thread(&self, _t: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn delete_thread_permanently(
+            &self,
+            _t: &str,
+        ) -> Result<crate::codex_local::LocalThreadDeleteSummary, String> {
+            Err("unsupported".to_string())
+        }
+
+        async fn start_turn(
+            &self,
+            _t: &str,
+            _x: &str,
+            _m: &str,
+            _e: &str,
+            _i: &[crate::provider::ProviderImage],
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn request_turn_stop(&self, _t: &str, _u: Option<&str>) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn respond_to_approval(
+            &self,
+            _p: &PendingApproval,
+            _i: &ApprovalDecisionInput,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn respond_to_ask_user_question(
+            &self,
+            _r: &str,
+            _a: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn a_thread_never_records_the_global_seed_model_of_another_provider() {
+        // `DEFAULT_MODEL` is "gpt-5.5" — a provider-agnostic SEED that happens to
+        // be Codex's id, and which `set_available_models` also uses as its
+        // "nobody has chosen yet" sentinel. On a first-ever boot the relay asks a
+        // provider for its catalog before that provider can answer, gets nothing,
+        // falls back to the seed, and records Codex's model id on a thread that
+        // is not Codex's — then persists it, so it survives every later restart.
+        //
+        // Measured on a real cursor relay: process 1 reports `gpt-5.5`, process 2
+        // (catalog now cached on disk) reports the provider's real default. The
+        // live e2e's "model must survive a relay restart" is what caught it.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+        }
+
+        // Cold: the bridge cannot answer yet.
+        assert!(
+            bridge.list_models().await.expect("list").is_empty(),
+            "precondition: the catalog is not knowable before a session op"
+        );
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_ne!(
+            snapshot.model, DEFAULT_MODEL,
+            "the relay recorded another provider's model id because it asked \
+             before the bridge could answer"
+        );
+        assert_eq!(
+            snapshot.model, "agent-default",
+            "once the provider has been consulted, its own default is what counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_thread_never_records_the_global_seed_model_either() {
+        // The sibling of the resume case. A provider that publishes its catalog
+        // on thread creation cannot answer beforehand, so the model the relay
+        // picks for `start_thread` is the seed — and without healing afterwards
+        // that seed is what gets recorded and persisted on the new thread.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+        }
+
+        let snapshot = app
+            .start_session(crate::protocol::StartSessionInput {
+                cwd: Some(cwd.to_string()),
+                initial_prompt: None,
+                model: None,
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("start should succeed");
+
+        assert_ne!(
+            snapshot.model, DEFAULT_MODEL,
+            "a brand-new thread recorded another provider's seed model id"
+        );
+        assert_eq!(snapshot.model, "agent-default");
+    }
+
+    #[tokio::test]
+    async fn a_deliberately_chosen_model_is_not_overwritten_just_because_it_looks_like_the_seed() {
+        // The trap in the cold-run fix. `DEFAULT_MODEL` is "gpt-5.5" — for Codex
+        // that is not a seed at all, it is a real model a user can pick. So
+        // "this value equals DEFAULT_MODEL" does NOT mean "the relay invented
+        // it": it may be exactly what the user chose for this thread.
+        //
+        // Two threads on one provider, one pinned to the seed-named model and
+        // the global sitting on the other. Resuming the pinned thread must not
+        // adopt the global.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // The user pinned THIS thread to the seed-named model...
+            relay.remember_thread_settings(
+                "late-thread",
+                "untrusted",
+                "workspace-write",
+                "medium",
+                DEFAULT_MODEL,
+            );
+            // ...while the relay's global model is something else entirely.
+            relay.model = "agent-default".to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "resuming silently replaced the model this thread was pinned to"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_requested_model_is_not_overwritten_either() {
+        // Same trap on the start path, and worse: here the id was typed by the
+        // user in this very request.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            relay.model = "agent-default".to_string();
+        }
+
+        let snapshot = app
+            .start_session(crate::protocol::StartSessionInput {
+                cwd: Some(cwd.to_string()),
+                initial_prompt: None,
+                model: Some(DEFAULT_MODEL.to_string()),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("start should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "the model the caller explicitly asked for was replaced"
+        );
     }
 }

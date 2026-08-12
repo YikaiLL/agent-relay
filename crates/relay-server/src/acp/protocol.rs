@@ -4,7 +4,7 @@
 //! `cursor-agent acp` process. The measured wire shapes this targets are
 //! recorded in `markdown/cursor-acp-provider-plan.md` (spike, 2026-08-11).
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::protocol::{
     ApprovalDecision, ApprovalDecisionInput, ApprovalScope, ModelOptionView, ThreadSummaryView,
@@ -37,6 +37,183 @@ pub(crate) fn acp_mode_for_policy(approval_policy: &str, sandbox: &str) -> &'sta
 /// bridge side rather than by a provider flag.
 pub(crate) fn auto_approves(approval_policy: &str) -> bool {
     matches!(approval_policy, "never" | "bypass" | "bypassPermissions")
+}
+
+/// What the agent's MCP servers are doing, ready to be logged.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct McpSummary {
+    /// One-line census. `None` when nothing is configured — a relay that logs
+    /// "MCP: 0 configured" on every boot is training the user to ignore the log.
+    pub(crate) headline: Option<String>,
+    /// One line per server that is failing or reporting something unrecognized.
+    pub(crate) problems: Vec<String>,
+}
+
+/// Parse `<agent> mcp list` into a census plus the problems worth surfacing.
+///
+/// ACP cannot answer this. Measured 2026-08-12 against `cursor-agent
+/// 2026.08.04-aaa8809` with a healthy, a broken and a disabled server
+/// configured: `initialize` advertises `agentCapabilities.mcpCapabilities`
+/// (what the *client* may pass in, not what the agent loaded) and `session/new`
+/// returns only `sessionId`/`modes`/`models`/`configOptions`. No MCP field, and
+/// no notification, while two servers were actively failing. So the CLI is the
+/// only signal — the same conclusion codex reached for its own app-server.
+///
+/// The measured grammar is `<name>: <status>`, with `status` one of `ready`,
+/// `disabled`, or `Error: <message>`; an empty install prints a single
+/// "No MCP servers configured …" line. There is no `--json`.
+pub(crate) fn summarize_mcp_servers(provider: &str, output: &str) -> McpSummary {
+    let (mut ready, mut disabled, mut failed, mut unknown) = (0_usize, 0_usize, 0_usize, 0_usize);
+    let mut problems = Vec::new();
+    let mut total = 0_usize;
+
+    for raw_line in output.lines() {
+        // Indentation means continuation, not a new server. A failing stdio
+        // server prints a stack trace, and every frame contains a colon — read
+        // as `name: status` those become phantom servers, one `warn` line each,
+        // which is enough to evict the whole audit-log buffer at boot.
+        if raw_line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("No MCP servers configured") {
+            continue;
+        }
+
+        // Split at the status, not at the first colon: a name may contain one
+        // (`aws:prod: ready`), and so may the status (`Error: spawn … ENOENT`).
+        // Recognise the known tail first and only fall back to the naive split.
+        let (name, status) = if let Some(name) = strip_status_suffix(line, "ready") {
+            (name, Status::Ready)
+        } else if let Some(name) = strip_status_suffix(line, "disabled") {
+            (name, Status::Disabled)
+        } else if let Some((name, reason)) = split_error_status(line) {
+            (name, Status::Failed(reason))
+        } else {
+            match line.split_once(':') {
+                Some((name, status)) => (name.trim(), Status::Unknown(status.trim())),
+                None => continue,
+            }
+        };
+        if name.is_empty() {
+            continue;
+        }
+        total += 1;
+
+        match status {
+            Status::Ready => ready += 1,
+            Status::Disabled => disabled += 1,
+            Status::Failed(reason) => {
+                failed += 1;
+                problems.push(format!(
+                    "{provider} MCP server `{name}` failed to load: {reason}"
+                ));
+            }
+            // Deliberately not counted as healthy. The grammar was measured
+            // against one build of one agent; a status nobody has seen must
+            // read as "unknown", not as "fine".
+            Status::Unknown(status) => {
+                unknown += 1;
+                problems.push(format!(
+                    "{provider} MCP server `{name}` reported an unrecognized status: {status}"
+                ));
+            }
+        }
+    }
+
+    if total == 0 {
+        return McpSummary::default();
+    }
+
+    // Named, because the channel no longer says whose these are: filed under
+    // `info`/`warn` so the audit view shows them at all, two agents on one relay
+    // would otherwise produce two indistinguishable census lines.
+    let mut headline = format!(
+        "{provider} MCP: {total} configured ({ready} ready, {disabled} disabled, {failed} failed"
+    );
+    if unknown > 0 {
+        headline.push_str(&format!(", {unknown} unrecognized"));
+    }
+    headline.push(')');
+
+    McpSummary {
+        headline: Some(headline),
+        problems,
+    }
+}
+
+enum Status<'a> {
+    Ready,
+    Disabled,
+    Failed(&'a str),
+    Unknown(&'a str),
+}
+
+/// `"<name>: <word>"` → `<name>`, case-insensitively.
+fn strip_status_suffix<'a>(line: &'a str, word: &str) -> Option<&'a str> {
+    let split = line.len().checked_sub(word.len())?;
+    line.get(split..)
+        .filter(|tail| tail.eq_ignore_ascii_case(word))
+        .and_then(|_| line.get(..split))
+        .and_then(|head| head.trim_end().strip_suffix(':'))
+        .map(str::trim)
+}
+
+/// `"<name>: Error: <reason>"` → `(<name>, <reason>)`, case-insensitively on the
+/// marker so a build that lowercases it is still counted as failed rather than
+/// silently bucketed as "unrecognized" with a `0 failed` headline.
+fn split_error_status(line: &str) -> Option<(&str, &str)> {
+    let marker = line
+        .char_indices()
+        .find(|(index, _)| {
+            line[*index..].len() >= 7 && line[*index..*index + 7].eq_ignore_ascii_case(": error")
+        })
+        .map(|(index, _)| index)?;
+    let name = line.get(..marker)?.trim();
+    let reason = line
+        .get(marker + 7..)?
+        .trim_start()
+        .trim_start_matches(':')
+        .trim();
+    Some((name, reason))
+}
+
+/// Prefix marking a parked approval as a `cursor/create_plan`, not a
+/// `session/request_permission`.
+///
+/// The two share `respond_to_approval` and the same `result.outcome` envelope
+/// but speak different vocabularies, so the bridge has to tell them apart after
+/// the round trip through the relay. The discriminator is this relay-minted id
+/// prefix rather than "the pending has no option list": an agent that sent a
+/// *permission* request with an empty `options` array would then be read as a
+/// plan and answered `accepted` — auto-granting a permission nobody approved.
+/// A missing option list must keep meaning "cancel" (see `approval_option_id`).
+pub(crate) const PLAN_APPROVAL_PREFIX: &str = "acp-plan-";
+
+pub(crate) fn is_plan_approval(request_id: &str) -> bool {
+    request_id.starts_with(PLAN_APPROVAL_PREFIX)
+}
+
+/// The outcome to answer `cursor/create_plan` with.
+///
+/// Measured 2026-08-11 against `cursor-agent 2026.08.04-aaa8809`, and confirmed
+/// against the agent's own `create-plan-handler.ts`: the result must be
+/// `{outcome: {outcome: "accepted"|"rejected"|"cancelled", ...}}`. Anything else
+/// — including the blanket `{}` this bridge used to send — throws inside the
+/// handler, and its catch path degrades to *success*. So a malformed reply is
+/// not an inert no-op; it silently accepts the plan on the user's behalf.
+///
+/// `reason` is not cosmetic: it is handed to the agent, which quotes it back and
+/// changes course ("The plan was rejected (…), so I did not change notes.txt.
+/// What should I do instead?").
+pub(crate) fn plan_outcome(decision: ApprovalDecision) -> Value {
+    match decision {
+        ApprovalDecision::Approve => json!({"outcome": "accepted"}),
+        // No `planUri`: the agent writes the plan artifact itself when the
+        // client does not supply one.
+        ApprovalDecision::Deny => json!({"outcome": "rejected", "reason": "Rejected by the user"}),
+        ApprovalDecision::Cancel => json!({"outcome": "cancelled"}),
+    }
 }
 
 /// The ACP `optionId` to answer a permission request with, chosen from the

@@ -1954,7 +1954,9 @@ export function ApprovalCard({ approval, options = null }) {
         h("span", null, approval.kind)
       ),
       h("h3", { className: "approval-title" }, approval.summary),
-      h("p", { className: "approval-copy" }, approval.detail || "Codex is waiting for a remote approval."),
+      // No provider name: the card carries no provider field, and guessing one
+      // told every non-Codex user their agent was Codex.
+      h("p", { className: "approval-copy" }, approval.detail || "The agent is waiting for a remote approval."),
       approval.cwd ? h("p", { className: "approval-copy" }, `cwd: ${approval.cwd}`) : null,
       approval.command
         ? h(ExpandableBlock, {

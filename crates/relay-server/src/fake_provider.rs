@@ -463,7 +463,6 @@ impl FakeProviderBridge {
         {
             let mut relay = state.write().await;
             relay.set_provider_connection("fake", true);
-            relay.set_provider_name("fake".to_string());
             relay.push_log("info", "Connected to fake agent provider.");
             relay.notify();
         }
