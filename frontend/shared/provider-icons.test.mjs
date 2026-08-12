@@ -24,7 +24,7 @@ function renderAgent(options) {
 // --- the vendored assets ----------------------------------------------------
 
 test("ships a mark for each provider the relay can actually run", () => {
-  assert.deepEqual(providersWithIcons().sort(), ["claude_code", "codex"]);
+  assert.deepEqual(providersWithIcons().sort(), ["claude_code", "codex", "cursor"]);
 });
 
 // No mark carries a baked colour. Claude's brand orange used to be, on the

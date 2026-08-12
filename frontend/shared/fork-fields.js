@@ -232,9 +232,13 @@ function orNull(value) {
 // emits that `msg_` id. So a live-stream Codex anchor can NEVER be resolved
 // server-side and is rejected as "not part of the source thread transcript".
 //
-// This shape is unambiguous: Claude entries are always prefixed
-// (`assistant:`/`user:`/`tool:`) and a persisted (past-turn) Codex read is
-// `item-N`, so a bare `msg_` anchor is exclusively a Codex live agent message.
+// This shape is unambiguous across every provider the relay runs: Claude entries
+// are always prefixed (`assistant:`/`user:`/`tool:`), a persisted (past-turn)
+// Codex read is `item-N`, and the ACP bridge mints `acp-<kind>-<n>` — so a bare
+// `msg_` anchor is exclusively a Codex live agent message. ACP ids in particular
+// must NOT be dropped: they are per-kind ordinals that a `session/load` replay
+// reproduces exactly, so the relay can always resolve them (see
+// `acp/protocol.rs::item_id`). fork-fields.test.mjs pins both directions.
 // (Reasoning `rs_` diverges the same way but is never forkable — only the last
 // agent_text of a block is, see transcript-fork.js.)
 function isUnresolvableCodexLiveForkPoint(upToItemId) {

@@ -31,8 +31,8 @@ use crate::state::{
 };
 
 use super::review::{
-    classify_workspace_result, random_suffix, reviewer_thread_settings, ReviewWorkspace,
-    ThreadDriveError,
+    classify_workspace_result, random_suffix, reviewer_read_only_is_enforced,
+    reviewer_thread_settings, ReviewWorkspace, ThreadDriveError,
 };
 use super::*;
 
@@ -1374,15 +1374,19 @@ fn validate_workflow_shape(workflow: &Workflow, parent_provider: &str) -> Result
         }
     }
     // The reviewer must run with a HARD read-only sandbox so it can't mutate the
-    // artifact under review. Codex enforces this; a Claude reviewer's read-only mode
-    // still leaves Bash writable (see the worker), so reject it for now.
+    // artifact under review. This is an ALLOWLIST derived from
+    // `reviewer_thread_settings`, not a denylist of known-bad providers: a
+    // Claude reviewer's read-only mode still leaves Bash writable, and Cursor's
+    // ACP `plan` mode is prompt-level rather than OS isolation. Deriving it
+    // keeps this in lockstep with the settings themselves, and makes a provider
+    // added later rejected by default instead of silently admitted.
     if let Some(review) = workflow.steps.iter().find(|s| s.role == StepRole::Review) {
-        if matches!(review.agent.as_str(), "claude" | "claude_code") {
-            return Err(
-                "phase 1 needs a reviewer with a hard read-only sandbox (e.g. codex); a Claude \
-reviewer can still write via Bash, so it isn't accepted yet"
-                    .to_string(),
-            );
+        if !reviewer_read_only_is_enforced(&review.agent) {
+            return Err(format!(
+                "phase 1 needs a reviewer with a hard read-only sandbox (e.g. codex); `{}` \
+can still write while reviewing, so it isn't accepted",
+                review.agent
+            ));
         }
     }
     // The runner executes steps in execute -> review -> revise order; reject a
@@ -1511,6 +1515,31 @@ mod tests {
         // Execute/Revise run on the active thread, so their provider must match it.
         let err = validate_workflow_shape(&code_flow("codex"), "claude_code").unwrap_err();
         assert!(err.contains("active thread"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_reviewer_without_a_hard_read_only_sandbox() {
+        // The reviewer gate is an ALLOWLIST, not a denylist: only a provider
+        // that can be held read-only by something stronger than a prompt may
+        // judge the artifact it could otherwise edit. Cursor's ACP `plan` mode
+        // is prompt/tool-level, not OS isolation, so it belongs on the reject
+        // side alongside Claude — and a provider added later is rejected by
+        // default rather than silently admitted.
+        for reviewer in ["claude", "claude_code", "cursor"] {
+            let mut wf = code_flow("codex");
+            wf.steps[1] = step("rv", reviewer, StepRole::Review);
+            let err = validate_workflow_shape(&wf, "codex")
+                .expect_err("`{reviewer}` must not be accepted as a code-flow reviewer");
+            assert!(
+                err.contains("read-only"),
+                "reviewer `{reviewer}` rejected for the wrong reason: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_accepts_a_reviewer_with_an_enforced_sandbox() {
+        assert!(validate_workflow_shape(&code_flow("claude_code"), "claude_code").is_ok());
     }
 
     #[test]

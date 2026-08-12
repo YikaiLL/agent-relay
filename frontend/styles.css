@@ -166,6 +166,14 @@
   --provider-codex-bg: rgba(84, 133, 196, 0.20);
   --provider-codex-border: color-mix(in srgb, #5485c4 24%, var(--border-subtle));
   --provider-codex-fill: color-mix(in srgb, #5485c4 18%, transparent);
+  /* Cursor's own mark is monochrome, so the badge hue is ours to choose: violet
+     is the nearest free slot between Claude's orange and Codex's blue. Measured
+     6.73:1 on this surface (Claude 9.84, Codex 4.25), so it sits inside the
+     range the other two already occupy. */
+  --provider-cursor-fg: #b39ddb;
+  --provider-cursor-bg: rgba(124, 58, 237, 0.20);
+  --provider-cursor-border: color-mix(in srgb, #7c3aed 24%, var(--border-subtle));
+  --provider-cursor-fill: color-mix(in srgb, #7c3aed 18%, transparent);
 
   /* Agent MARKS (transcript avatar, session tab) — distinct from the chip
      colours above. Both vendored svgs inherit currentColor, so these tokens are
@@ -251,6 +259,11 @@
     --provider-codex-bg: rgba(55, 109, 175, 0.12);
     --provider-codex-border: color-mix(in srgb, #376daf 35%, var(--border-subtle));
     --provider-codex-fill: color-mix(in srgb, #376daf 12%, transparent);
+    /* Darkened for the same reason as the two above; 7.10:1 on white. */
+    --provider-cursor-fg: #6d28d9;
+    --provider-cursor-bg: rgba(124, 58, 237, 0.12);
+    --provider-cursor-border: color-mix(in srgb, #7c3aed 35%, var(--border-subtle));
+    --provider-cursor-fill: color-mix(in srgb, #7c3aed 12%, transparent);
 }
 
 * {
@@ -1277,6 +1290,10 @@ input:focus, textarea:focus, select:focus {
   color: var(--provider-codex-fg);
   background: var(--provider-codex-bg);
 }
+.conversation-provider-badge.is-cursor {
+  color: var(--provider-cursor-fg);
+  background: var(--provider-cursor-bg);
+}
 .conversation-item:hover {
   background: var(--surface-2);
 }
@@ -1440,6 +1457,11 @@ input:focus, textarea:focus, select:focus {
   color: var(--provider-codex-fg);
   border-color: var(--provider-codex-border);
   background: var(--provider-codex-fill);
+}
+.thread-provider-badge.is-cursor {
+  color: var(--provider-cursor-fg);
+  border-color: var(--provider-cursor-border);
+  background: var(--provider-cursor-fill);
 }
 .conversation-preview {
   display: none;

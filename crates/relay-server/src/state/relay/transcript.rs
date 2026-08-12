@@ -193,6 +193,13 @@ impl RelayState {
         }
     }
 
+    /// The audit log, for tests that assert a line was filed on the channel a
+    /// user can actually see (see `push_log`'s channel classification).
+    #[cfg(test)]
+    pub(crate) fn logs_for_test(&self) -> &[LogEntryView] {
+        &self.logs
+    }
+
     pub fn start_agent_message(&mut self, item_id: String, turn_id: String) {
         if let Some(thread_id) = self.active_thread_id.clone() {
             self.start_agent_message_for_thread(&thread_id, item_id, turn_id);

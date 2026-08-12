@@ -2908,6 +2908,9 @@ fn team_thread_settings(
     match provider {
         "codex" => ("never".to_string(), "workspace-write".to_string()),
         "claude" | "claude_code" => ("bypass".to_string(), default_sandbox.to_string()),
+        // Cursor gets no prompts it could not answer (the team loop is
+        // non-interactive) but stays in `agent` mode so it can actually work.
+        "cursor" => ("bypass".to_string(), default_sandbox.to_string()),
         _ => (default_approval.to_string(), default_sandbox.to_string()),
     }
 }

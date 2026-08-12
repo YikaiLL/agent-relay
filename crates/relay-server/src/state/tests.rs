@@ -388,8 +388,8 @@ fn available_models_update_default_model_and_effort() {
 #[test]
 fn switching_active_provider_drops_the_previous_providers_catalog() {
     // Repro for: "Codex shows Claude's models." Boot leaves the relay on Claude
-    // with Claude's catalog (the last-spawned provider wins `provider_name`, and
-    // the startup refresh stamps `available_models`).
+    // with Claude's catalog (Claude heads `DEFAULT_PROVIDER_PREFERENCE`, and the
+    // startup refresh stamps `available_models`).
     let mut relay = test_state();
     relay.set_provider_name("claude_code".to_string());
     relay.set_available_models(vec![ModelOptionView {
@@ -1647,9 +1647,12 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
     assert_eq!(restored.paired_devices.len(), 0);
     assert_eq!(restored.transcript.len(), 0);
     assert_eq!(restored.logs.len(), 1);
+    // The point is that a restore resets the log to exactly the fresh boot line,
+    // not what that line says — the copy is provider-neutral now that a relay
+    // can be running only Cursor.
     assert_eq!(
         restored.logs[0].message,
-        "Relay booted. Waiting for Codex app-server."
+        "Relay booted. Waiting for an agent provider."
     );
     assert_eq!(restored.allowed_roots, vec!["/tmp/project".to_string()]);
     assert_eq!(
