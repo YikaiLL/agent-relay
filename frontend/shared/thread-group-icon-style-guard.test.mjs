@@ -225,6 +225,29 @@ const STATES = [
   },
 ];
 
+// The invariant below is "every resting stroke moves". That is vacuously true if
+// there are no resting strokes — so if the icon rule ever stops declaring a
+// colour of its own (leaving the mark to inherit `--text-primary` from the
+// header), the loop would iterate nothing and the test would go green while
+// guarding nothing at all. Asserted separately so that failure names itself
+// instead of hiding as a pass.
+test("the icon declares a resting colour for the state rules to move", () => {
+  const resting = restingInk();
+  for (const theme of THEMES) {
+    const strokes = [...resting].flatMap(([part, ink]) =>
+      [...ink]
+        .filter(([, value]) => THEME_RESTING_COLOURS(theme).has(paint(value, theme)))
+        .map(([property]) => `${part}{${property}}`)
+    );
+    assert.ok(
+      strokes.length,
+      `${theme.name}: nothing paints the icon at the resting colour, so the repaint `
+        + "check below has nothing to check — either the icon lost its own colour, or "
+        + "the resting token moved and this guard stopped watching the real one"
+    );
+  }
+});
+
 test("selecting a group repaints every stroke of its icon, in both themes", () => {
   const resting = restingInk();
 
