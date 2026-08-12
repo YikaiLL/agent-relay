@@ -2320,3 +2320,58 @@ async fn a_background_thread_failure_lands_its_transcript_entry_and_its_push() {
     // And the thread the user IS looking at was not disturbed.
     assert_eq!(relay.active_thread_id.as_deref(), Some("front"));
 }
+
+#[tokio::test]
+async fn every_kind_of_run_that_answers_its_own_approvals_closes_the_gate() {
+    // The bridge auto-accepts a plan when `approval_can_reach_a_user` is false,
+    // so that predicate is load-bearing: a branch that wrongly returns true
+    // parks a card no one can answer and fails the run; one that wrongly returns
+    // false accepts a plan a user should have seen. Only the review branch was
+    // covered — a workflow or team run would have gone unnoticed.
+    let unlocked = relay_state();
+    assert!(
+        unlocked.read().await.approval_can_reach_a_user("t1"),
+        "an ordinary thread's approvals belong to the user"
+    );
+
+    let review = relay_state();
+    review
+        .write()
+        .await
+        .insert_review_job(crate::state::ReviewJob {
+            id: "r".to_string(),
+            parent_thread_id: "t1".to_string(),
+            status: crate::state::ReviewJobStatus::WaitingForReviewer,
+            ..Default::default()
+        });
+    assert!(!review.read().await.approval_can_reach_a_user("t1"));
+
+    let workflow = relay_state();
+    workflow
+        .write()
+        .await
+        .insert_workflow_run(crate::state::WorkflowRun {
+            id: "w".to_string(),
+            parent_thread_id: "t1".to_string(),
+            status: crate::state::RunStatus::Running,
+            ..Default::default()
+        });
+    assert!(
+        !workflow.read().await.approval_can_reach_a_user("t1"),
+        "a workflow run answers its own approvals"
+    );
+
+    let team = relay_state();
+    team.write().await.insert_team_run(crate::state::TeamRun {
+        id: "team".to_string(),
+        // A run owns a set of threads (TL, its successions, sub-task seats);
+        // any of them is enough to close the gate.
+        tl_thread_id: "t1".to_string(),
+        status: crate::state::TeamRunStatus::Running,
+        ..Default::default()
+    });
+    assert!(
+        !team.read().await.approval_can_reach_a_user("t1"),
+        "a team run answers its own approvals"
+    );
+}
