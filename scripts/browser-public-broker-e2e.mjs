@@ -193,11 +193,6 @@ async function main() {
 
     await waitFor(() => refreshRequests.length >= 1, TIMEOUT_MS);
     logStep("refresh request observed after broker restart", { count: refreshRequests.length });
-    await remotePage.waitForFunction(() => {
-      const badge = document.querySelector("#remote-status-badge")?.textContent || "";
-      return badge.trim().length > 0 && !badge.toLowerCase().includes("offline");
-    }, null, { timeout: TIMEOUT_MS });
-    logStep("remote status badge recovered");
     await waitForRemoteMessageInput(remotePage, TIMEOUT_MS);
     logStep("message input ready after broker restart");
 

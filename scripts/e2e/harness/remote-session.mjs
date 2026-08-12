@@ -1,3 +1,7 @@
+// This matches compact header badge text ("Offline", "Re-pair"). Broader
+// alert badges such as approval/review/workflow states do not block composing.
+const REMOTE_MESSAGE_INPUT_BLOCKING_STATUS_PATTERN = /\b(?:offline|re-?pair)\b/i;
+
 export async function openRemoteSessionPanel(page, timeoutMs) {
   await selectFirstRelayIfNeeded(page, timeoutMs);
   await page.click("#remote-session-toggle");
@@ -51,13 +55,22 @@ export async function selectFirstRelayIfNeeded(page, timeoutMs) {
 
 export async function waitForRemoteMessageInput(page, timeoutMs) {
   await page.waitForFunction(
-    () => {
+    ({ source, flags }) => {
       const input = document.querySelector("#remote-message-input");
-      return Boolean(input && !input.disabled);
+      const statusText = document.querySelector("#remote-status-badge")?.textContent?.trim() || "";
+      const blockingStatus = new RegExp(source, flags);
+      return Boolean(input && !input.disabled && !blockingStatus.test(statusText));
     },
-    null,
+    {
+      source: REMOTE_MESSAGE_INPUT_BLOCKING_STATUS_PATTERN.source,
+      flags: REMOTE_MESSAGE_INPUT_BLOCKING_STATUS_PATTERN.flags,
+    },
     { timeout: timeoutMs }
   );
+}
+
+export function remoteStatusBlocksMessageInput(statusText) {
+  return REMOTE_MESSAGE_INPUT_BLOCKING_STATUS_PATTERN.test(String(statusText || ""));
 }
 
 export async function startRemoteSession(

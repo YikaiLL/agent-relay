@@ -26,6 +26,7 @@ import {
 import {
   sendPromptAndWaitForReply,
   startRemoteSession,
+  waitForRemoteMessageInput,
 } from "./e2e/harness/remote-session.mjs";
 import { startSelfHostedRelay, waitForBrokerConnection } from "./e2e/harness/relay.mjs";
 
@@ -145,19 +146,11 @@ async function main() {
     await sendPromptAndWaitForReply(remotePage, PROMPT, { timeoutMs: PAIRING_TIMEOUT_MS });
 
     await remotePage.reload({ waitUntil: "domcontentloaded" });
-    await remotePage.waitForFunction(
-      () => {
-        const input = document.querySelector("#remote-message-input");
-        const badge = document.querySelector("#remote-status-badge")?.textContent || "";
-        return Boolean(
-          input && !input.disabled && badge.trim() && !badge.toLowerCase().includes("offline")
-        );
-      },
-      null,
-      { timeout: PAIRING_TIMEOUT_MS }
-    );
+    await waitForRemoteMessageInput(remotePage, PAIRING_TIMEOUT_MS);
 
-    const remoteStatus = await remotePage.textContent("#remote-status-badge");
+    const remoteStatus = await remotePage.evaluate(
+      () => document.querySelector("#remote-status-badge")?.textContent?.trim() || "ready"
+    );
     const remoteDeviceMeta = await remotePage.textContent("#device-meta");
     const relaySession = await fetchSession(relayPort);
     const relayDevices = await fetchDevices(relayPort);

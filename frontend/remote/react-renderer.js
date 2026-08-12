@@ -10,32 +10,31 @@ function compactStatusLabel(label) {
   const normalized = String(label || "").trim().toLowerCase();
 
   switch (normalized) {
-    case "idle":
-    case "ready":
-      return "Ready";
-    case "connected":
-      return "Connected";
-    case "home":
-      return "Home";
-    case "offline":
-      return "Offline";
-    case "connecting":
-      return "Connecting";
     case "approval required":
       return "Approval";
     case "re-pair required":
       return "Re-pair";
     case "pairing failed":
       return "Failed";
-    case "approval pending":
-      return "Pending";
+    case "review in progress":
+      return "Review";
+    case "review blocked — action needed":
+      return "Review blocked";
+    case "code flow in progress":
+      return "Code Flow";
+    case "code flow blocked — action needed":
+      return "Code Flow blocked";
     default:
       return label
         ? String(label)
             .trim()
             .replace(/\b\w/g, (char) => char.toUpperCase())
-        : "Ready";
+        : "";
   }
+}
+
+function shouldShowHeaderStatusBadge(statusBadge) {
+  return Boolean(statusBadge?.label && statusBadge.headerVisible === true);
 }
 
 function relaySubtitle(relay) {
@@ -70,10 +69,9 @@ function InfoIcon() {
   );
 }
 
-export function WorkspaceHeading({ header, statusBadge, onOpenInfo }) {
-  const statusTone = statusBadge?.tone || "offline";
-  const statusLabel = statusBadge?.label || "Offline";
+export function WorkspaceHeading({ header, statusBadge, onOpenInfo, titleNode = null }) {
   const subtitle = header?.subtitle || "";
+  const showStatus = shouldShowHeaderStatusBadge(statusBadge);
 
   return h(
     React.Fragment,
@@ -81,33 +79,26 @@ export function WorkspaceHeading({ header, statusBadge, onOpenInfo }) {
     h(
       "div",
       { className: "chat-heading-title-row" },
-      h(
-        "h1",
-        {
-          id: "remote-workspace-title",
-          title: header?.titleTitle || "",
-        },
-        header?.title || "Pair this browser"
-      ),
-      h(
-        "span",
-        {
-          "aria-label": statusLabel,
-          className: `status-badge status-badge-${statusTone} status-badge-compact`,
-          id: "remote-status-badge",
-          title: statusLabel,
-        },
-        compactStatusLabel(statusLabel)
-      ),
-      header?.modelLabel
+      titleNode
+        ? titleNode
+        : h(
+            "h1",
+            {
+              id: "remote-workspace-title",
+              title: header?.titleTitle || "",
+            },
+            header?.title || "Pair this browser"
+          ),
+      showStatus
         ? h(
             "span",
             {
-              className: "model-badge-compact",
-              id: "remote-model-badge",
-              title: header.modelTitle || header.modelLabel,
+              "aria-label": statusBadge.label,
+              className: `status-badge status-badge-${statusBadge.tone} status-badge-compact`,
+              id: "remote-status-badge",
+              title: statusBadge.label,
             },
-            header.modelLabel
+            compactStatusLabel(statusBadge.label)
           )
         : null,
       onOpenInfo

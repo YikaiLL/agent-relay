@@ -462,8 +462,8 @@ async function main() {
     // tabs — the case where the close-fallback and the context switch collide. If the
     // fallback is not scoped to a close, the live thread is re-filed into ITS context and
     // yanks the selection straight back out, which reads as "the switcher does nothing".
-    await page.click(".project-switcher-trigger");
-    await page.locator(".project-switcher-option", { hasText: /^Alpha project$/ }).first().click();
+    await page.click(".remote-chat-shell .project-switcher-trigger");
+    await page.locator(".remote-chat-shell .project-switcher-option", { hasText: /^Alpha project$/ }).first().click();
     await page.waitForFunction(
       () => document.querySelectorAll(".session-tab[data-thread-id]").length === 0,
       undefined,
@@ -541,8 +541,8 @@ async function main() {
     // what `waitForFocusedTab` fails on. The tab list then pins the restored workspace's
     // shape — one tab, the project's — a claim that in the sessions context could not be
     // told apart from the THREAD_ACTIVE tab already sitting there.
-    await page.click(".project-switcher-trigger");
-    await page.locator(".project-switcher-option", { hasText: /^Alpha project$/ }).first().click();
+    await page.click(".remote-chat-shell .project-switcher-trigger");
+    await page.locator(".remote-chat-shell .project-switcher-option", { hasText: /^Alpha project$/ }).first().click();
     await page.dblclick(`#remote-threads-list [data-thread-id="${THREAD_C}"]`);
     await waitForFocusedTab(page, THREAD_C);
 

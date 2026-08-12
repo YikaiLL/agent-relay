@@ -2486,15 +2486,10 @@ input:focus, textarea:focus, select:focus {
   display: none;
 }
 
-/* Local surface only — `.local-frame` wraps the local shell; remote has no such
-   wrapper, so remote is left entirely on its own (cwd-centric) header design for now.
-   Unifying remote's header is a deliberate follow-up (its title/subtitle/badge differ
-   by design). Both rules here are driven by LOCAL-only header changes:
-   - The title is now the arbitrary-length thread label, so it must truncate instead
-     of shoving the info button or blowing out the header grid.
-   - The subtitle is human status text ("read-only · saved session"), so it reads as
-     sans; mono made it look wide and terminal-ish. */
-.local-frame .chat-heading h1 {
+/* The header title is allowed to be arbitrary project text. It must truncate before
+   it shoves the info button or blows out the header grid. */
+.local-frame .chat-heading h1,
+.remote-chat-shell .chat-heading h1 {
   min-width: 0;
   max-width: min(60vw, 640px);
   white-space: nowrap;
@@ -6157,20 +6152,15 @@ body.is-resizing-panel {
  * heading held plain text. It now holds this button, whose LABEL owns the
  * ellipsis, and clipping at both levels truncates the text before the button has
  * spent the width it was given. One clipper, and it is the label. */
-.local-frame .chat-heading h1.project-switcher-heading {
+.local-frame .chat-heading h1.project-switcher-heading,
+.remote-chat-shell .chat-heading h1.project-switcher-heading {
   max-width: none;
   overflow: visible;
 }
 
-/* Remote's placement: NOT a row above the list. Switching projects is a
- * low-frequency act on a phone — the drawer defaults to sessions and search/filter
- * are the fast paths — so the control is one icon beside search and the bell, and the
- * pinned state is reported by a quiet chip instead of a heading.
- *
- * It is also not in the chat header: at 390px that title row carries a status badge,
- * a model badge and an info button, and a trigger measured there got 58px for a 144px
- * label. A control whose entire job is to name where you are cannot live where it can
- * only render "Defa…". */
+/* Remote sidebar placement: the chat header carries the full project switcher on the
+ * session surface, while the drawer keeps a compact icon beside search and the bell
+ * for quick project changes from the navigation list. */
 /* The top-bar menu is anchored to the TOP BAR, not to its 32px trigger.
  *
  * Anchoring it to the button cannot work at drawer widths and the side makes no
@@ -6265,6 +6255,7 @@ body.is-resizing-panel {
   justify-content: flex-start;
   gap: 6px;
   min-width: 0;
+  max-width: 100%;
   border: 0;
   padding: 2px 6px;
   margin-left: -6px;
@@ -6284,6 +6275,7 @@ body.is-resizing-panel {
 }
 
 .project-switcher-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

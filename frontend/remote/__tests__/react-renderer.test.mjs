@@ -40,6 +40,7 @@ const {
   SessionPanel,
   WorkspaceHeading,
 } = await import("../react-renderer.js");
+const { ProjectSwitcher } = await import("../../shared/project-switcher.js");
 
 test("RelayHomeState renders the paired relay chooser", () => {
   const markup = renderToStaticMarkup(
@@ -90,26 +91,79 @@ test("MissingCredentialsState renders re-pair guidance", () => {
   assert.match(markup, /Work Mac/);
 });
 
-test("WorkspaceHeading compacts status labels for the chrome header", () => {
+test("WorkspaceHeading renders the shared project switcher without session badges", () => {
   const markup = renderToStaticMarkup(
     h(WorkspaceHeading, {
       header: {
-        subtitle: "/Users/luchi/git/agent-relay",
-        subtitleHidden: false,
-        subtitleTitle: "/Users/luchi/git/agent-relay",
+        modelLabel: "Claude · default",
+        subtitle: "",
+        subtitleHidden: true,
         title: "agent-relay",
-        titleTitle: "/Users/luchi/git/agent-relay",
       },
-      statusBadge: {
-        label: "approval required",
-        tone: "alert",
-      },
+      statusBadge: { label: "working", tone: "ready", headerVisible: false },
+      titleNode: h(ProjectSwitcher, {
+        activeProjectId: "project-1",
+        projects: [{ id: "project-1", name: "UI Redesign" }],
+        titleId: "remote-workspace-title",
+      }),
     })
   );
 
-  assert.match(markup, /agent-relay/);
-  assert.match(markup, />Approval</);
-  assert.match(markup, /\/Users\/luchi\/git\/agent-relay/);
+  assert.match(markup, /UI Redesign/);
+  assert.match(markup, /project-switcher-caret/);
+  assert.doesNotMatch(markup, /Claude · default/);
+  assert.doesNotMatch(markup, /working/i);
+  assert.doesNotMatch(markup, /remote-status-badge/);
+  assert.doesNotMatch(markup, /remote-model-badge/);
+});
+
+test("WorkspaceHeading keeps alert status visible", () => {
+  const markup = renderToStaticMarkup(
+    h(WorkspaceHeading, {
+      header: {
+        subtitle: "",
+        subtitleHidden: true,
+        title: "agent-relay",
+      },
+      statusBadge: { label: "Re-pair required", tone: "alert", headerVisible: true },
+    })
+  );
+
+  assert.match(markup, /id="remote-status-badge"/);
+  assert.match(markup, /Re-pair/);
+});
+
+test("WorkspaceHeading keeps offline status visible", () => {
+  const markup = renderToStaticMarkup(
+    h(WorkspaceHeading, {
+      header: {
+        subtitle: "",
+        subtitleHidden: true,
+        title: "agent-relay",
+      },
+      statusBadge: { label: "Offline", tone: "offline", headerVisible: true },
+    })
+  );
+
+  assert.match(markup, /id="remote-status-badge"/);
+  assert.match(markup, /status-badge-offline/);
+  assert.match(markup, /Offline/);
+});
+
+test("WorkspaceHeading can show a ready-toned important status", () => {
+  const markup = renderToStaticMarkup(
+    h(WorkspaceHeading, {
+      header: {
+        subtitle: "",
+        subtitleHidden: true,
+        title: "Pair this browser",
+      },
+      statusBadge: { label: "Approval pending", tone: "ready", headerVisible: true },
+    })
+  );
+
+  assert.match(markup, /id="remote-status-badge"/);
+  assert.match(markup, /Approval/);
 });
 
 test("SessionPanel renders provider and model selects with correct field bindings", () => {

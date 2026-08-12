@@ -49,7 +49,9 @@ import {
   selectResetChromeRenderModel,
   selectSessionChromeRenderModel,
   selectStatusBadgeRenderModel,
+  selectedRelayNeedsRepair,
 } from "./chrome-view-model.js";
+import { selectRemoteHeaderProjectSwitcherModel } from "./header-project-switcher-model.js";
 import { deriveSessionRuntime } from "./session-runtime.js";
 import {
   closeRemoteNavigation,
@@ -752,7 +754,9 @@ function RemoteApp() {
     }
   };
   const hasRelay = Boolean(currentState.remoteAuth);
-  const hasUsableRelay = Boolean(currentState.remoteAuth?.payloadSecret);
+  const hasUsableRelay = Boolean(
+    currentState.remoteAuth?.payloadSecret && !selectedRelayNeedsRepair(currentState)
+  );
   const sessionChromeModel = session
     ? selectSessionChromeRenderModel({ ...currentState, progressVerb }, session)
     : null;
@@ -2097,6 +2101,16 @@ function RemoteApp() {
           currentState,
           deviceChromeModel,
           headerModel,
+          activeProjectId,
+          hasUsableRelay,
+          projects: remoteProjects.projects,
+          projectsError: remoteProjects.error,
+          projectsLoaded: remoteProjects.loaded,
+          projectsReady: remoteProjectsReady,
+          onCreateProject: createRemoteProjectFromToolbar,
+          onDeleteProject: handleDeleteRemoteProject,
+          onRenameProject: handleRenameRemoteProject,
+          onSelectProject: setActiveProject,
           onOpenInfo() {
             remoteUiStore.getState().setRemoteInfoModalOpen(true);
           },
@@ -2765,15 +2779,48 @@ function RemoteHeader({
   currentState,
   deviceChromeModel,
   headerModel,
+  activeProjectId,
+  hasUsableRelay = false,
+  projects = [],
+  projectsError = null,
+  projectsLoaded = false,
+  projectsReady = false,
+  onCreateProject,
+  onDeleteProject,
   onOpenInfo,
   onOpenStartSession,
+  onRenameProject,
   onReturnHome,
+  onSelectProject,
   onToggleNavigation,
   statusBadgeModel,
 }) {
   const usesDrawer = currentState.remoteNavMode === "drawer";
   const navOpen = currentState.remoteNavOpen;
   const navLabel = navOpen ? "Close sidebar" : "Open sidebar";
+  const {
+    label: switcherLabel,
+    labelTooltip: switcherTooltip,
+  } = selectRemoteHeaderProjectSwitcherModel({
+    activeProjectId,
+    headerModel,
+    projects,
+    projectsError,
+    projectsLoaded,
+  });
+  const titleNode = hasUsableRelay
+    ? h(ProjectSwitcher, {
+        activeProjectId,
+        label: switcherLabel,
+        labelTooltip: switcherTooltip,
+        onCreateProject: projectsReady ? onCreateProject : null,
+        onDeleteProject: projectsReady ? onDeleteProject : null,
+        onRenameProject: projectsReady ? onRenameProject : null,
+        onSelectProject,
+        projects,
+        titleId: "remote-workspace-title",
+      })
+    : null;
 
   return h(
     "header",
@@ -2848,8 +2895,9 @@ function RemoteHeader({
         { className: "chat-heading", id: "remote-chat-heading" },
         h(WorkspaceHeading, {
           header: headerModel,
-          statusBadge: statusBadgeModel,
           onOpenInfo,
+          statusBadge: statusBadgeModel,
+          titleNode,
         })
       )
     ),

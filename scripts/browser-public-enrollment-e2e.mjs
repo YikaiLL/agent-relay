@@ -119,7 +119,6 @@ async function main() {
       timeoutMs: TIMEOUT_MS,
     });
     await remotePage.reload({ waitUntil: "domcontentloaded" });
-    await waitForRemoteOnline(remotePage, TIMEOUT_MS);
     await waitForRemoteMessageInput(remotePage, TIMEOUT_MS);
 
     const relaySession = await fetchSession(relayPort);
@@ -205,17 +204,6 @@ async function waitForIdentity(identityPath, timeoutMs = TIMEOUT_MS) {
     await delay(250);
   }
   throw new Error(`timed out waiting for relay identity file: ${identityPath}`);
-}
-
-async function waitForRemoteOnline(page, timeoutMs) {
-  await page.waitForFunction(
-    () => {
-      const badge = document.querySelector("#remote-status-badge")?.textContent || "";
-      return badge.trim().length > 0 && !badge.toLowerCase().includes("offline");
-    },
-    null,
-    { timeout: timeoutMs }
-  );
 }
 
 main().catch((error) => {

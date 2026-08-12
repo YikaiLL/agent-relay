@@ -53,11 +53,10 @@ export function ProjectSwitcher({
   onRenameProject = null,
   onSelectProject = null,
   projects = [],
-  // Whether this control is the PAGE HEADING. True on local, where the switcher
-  // replaced the header title outright. False on remote, whose chat header already
-  // owns `<h1 id="remote-workspace-title">` — rendering a second one there would put
-  // two page headings on one screen, which is the duplication header-labels.js
-  // exists to prevent, one surface over.
+  // Whether this control is the PAGE HEADING. True in the local and remote chat
+  // headers, where the switcher replaced the title outright. False for compact
+  // placements such as remote's drawer icon, where surrounding chrome already names
+  // the region and the control should stay a plain button.
   //
   // Defaults to true so the surface that IS a heading does not have to say so.
   renderHeading = true,
