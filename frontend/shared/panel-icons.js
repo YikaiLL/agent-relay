@@ -98,3 +98,63 @@ export function ComposeIcon() {
     h("path", { d: "M10 5.5l2 2" })
   );
 }
+
+// --- sidebar group marks ----------------------------------------------------
+//
+// The two kinds of thing the sidebar groups by. They used to share one glyph — a
+// folder drawn in CSS with a bordered rect and a `::before` tab — so a project
+// and a working directory were indistinguishable, and at 16px that tab all but
+// vanished, leaving something closer to a rounded blob than a folder.
+//
+// Split by SHAPE rather than by colour, deliberately: in this sidebar colour
+// already means state (`--accent-primary` marks the selected workspace and the
+// active project). A per-kind colour would collide with that — an icon that is
+// always accent has nothing left to say when its group is selected. Shape says
+// kind, colour says state, and the two channels stay readable independently
+// (including for anyone who cannot separate the hues at all).
+//
+// Geometry is Lucide's `folder` and `tag`, copied verbatim at their native 24
+// viewBox and stroke-width 2 — the same source the glyphs in `svg.js` come from
+// (SPARKLES/BELL/SEARCH/REFRESH are all Lucide paths). Copied rather than
+// redrawn so the shapes stay recognisable as the icons users have seen
+// everywhere else, and so a future update means re-copying rather than
+// re-eyeballing. `panel-icons.test.mjs` pins both.
+const LUCIDE_STROKE = {
+  "aria-hidden": "true",
+  fill: "none",
+  height: "16",
+  viewBox: "0 0 24 24",
+  width: "16",
+  stroke: "currentColor",
+  strokeWidth: "2",
+  strokeLinecap: "round",
+  strokeLinejoin: "round",
+};
+
+// A cwd group: a real directory on disk, so a folder is the honest metaphor.
+export function WorkspaceFolderIcon() {
+  return h(
+    "svg",
+    LUCIDE_STROKE,
+    h("path", {
+      d: "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z",
+    })
+  );
+}
+
+// A project group. A tag, NOT a folder: a project is explicitly not bound to a
+// cwd (`ProjectView` in crates/relay-server/src/protocol.rs says so, and says
+// not to reintroduce the binding), so it is a label over whatever the user
+// grouped — which is what a tag draws. The dot is Lucide's own; it inherits
+// `currentColor` along with the outline so the whole mark moves to the accent
+// together when the project is active.
+export function ProjectTagIcon() {
+  return h(
+    "svg",
+    LUCIDE_STROKE,
+    h("path", {
+      d: "M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z",
+    }),
+    h("circle", { cx: "7.5", cy: "7.5", r: ".5", fill: "currentColor" })
+  );
+}

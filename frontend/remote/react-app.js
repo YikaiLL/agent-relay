@@ -210,6 +210,7 @@ import {
 import {
   BackArrowIcon,
   ComposeIcon,
+  ProjectTagIcon,
   ToggleLeftPanelIcon,
   ToggleRightPanelIcon,
 } from "../shared/panel-icons.js";
@@ -2507,7 +2508,11 @@ function RemoteSidebar({
           onSelectProject,
           projects,
           renderHeading: false,
-          triggerIcon: h(RemoteProjectIcon),
+          // The same tag the tree marks project groups with. This used to be a
+          // bespoke folder outline, on the reasoning that a second mark at 16px
+          // would be noise — which held only while projects and cwds shared a
+          // glyph. They no longer do, so a folder here would name the wrong kind.
+          triggerIcon: h(ProjectTagIcon),
         }),
         // No `shortcutHint`: remote is a phone surface with no ⌘F to promise.
         h(SidebarSearchToggle, { open: searchOpen, onToggle: onSetSearchOpen }),
@@ -2708,29 +2713,6 @@ function RemoteSidebar({
       )
     ),
     h(SidebarResizeHandle, { id: "remote-sidebar-resize" })
-  );
-}
-
-// Geometry is a plain folder outline rather than anything project-specific: the
-// drawer already spends its folder glyph on cwd groups, and at 16px a second bespoke
-// mark would just be noise. What identifies this control is its position beside search
-// and the bell, plus `is-active` when a project is pinned.
-function RemoteProjectIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "16",
-      viewBox: "0 0 24 24",
-      width: "16",
-      stroke: "currentColor",
-      strokeWidth: "1.8",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M3 7.5h6l2 2h10v9.5H3z" }),
-    h("path", { d: "M3 7.5V5h5.5l2 2.5" })
   );
 }
 

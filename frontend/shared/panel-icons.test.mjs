@@ -14,8 +14,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   BackArrowIcon,
   ComposeIcon,
+  ProjectTagIcon,
   ToggleLeftPanelIcon,
   ToggleRightPanelIcon,
+  WorkspaceFolderIcon,
 } from "./panel-icons.js";
 
 const h = React.createElement;
@@ -57,10 +59,54 @@ test("the compose mark is a pencil over a baseline", () => {
   assert.match(html, /d="M10 5.5l2 2"/, "the nib detail");
 });
 
-// All four are decorative: every one of them sits inside a button that carries its own
-// `aria-label`, so an accessible name here would be read out twice.
+// The two sidebar group marks are Lucide `folder` and `tag`, copied verbatim. Pinned
+// as EXACT path data for the same reason as the glyphs above, plus one specific to
+// copied geometry: a path that has been nudged still renders a plausible folder, so
+// the only way to notice the drift is to compare against the source it came from.
+// If Lucide's own path changes, re-copy it and update this string deliberately.
+test("the workspace mark is Lucide's folder, unmodified", () => {
+  const html = render(WorkspaceFolderIcon);
+  assert.match(
+    html,
+    /d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7\.9a2 2 0 0 1-1\.69-\.9L9\.6 3\.9A2 2 0 0 0 7\.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/
+  );
+  assert.match(html, /viewBox="0 0 24 24"/, "Lucide's native coordinate space, drawn at 16px");
+  assert.match(html, /stroke-width="2"/, "and its native stroke weight");
+});
+
+test("the project mark is Lucide's tag, dot included", () => {
+  const html = render(ProjectTagIcon);
+  assert.match(
+    html,
+    /d="M12\.586 2\.586A2 2 0 0 0 11\.172 2H4a2 2 0 0 0-2 2v7\.172a2 2 0 0 0 \.586 1\.414l8\.704 8\.704a2\.426 2\.426 0 0 0 3\.42 0l6\.58-6\.58a2\.426 2\.426 0 0 0 0-3\.42z"/
+  );
+  // The dot is filled while the svg is `fill="none"`, so it needs its own fill — and
+  // it has to be currentColor, not a literal: the mark turns accent as a whole when
+  // its project is active, and a hardcoded dot would stay behind.
+  assert.match(html, /<circle cx="7\.5" cy="7\.5" r="\.5" fill="currentColor"/);
+});
+
+// The two group marks must not converge. A project is not a directory, and the
+// defect this pair was added for was precisely one glyph standing in for both.
+test("the project and workspace marks are different shapes", () => {
+  assert.notEqual(
+    render(ProjectTagIcon),
+    render(WorkspaceFolderIcon),
+    "if these ever render the same, the sidebar has stopped distinguishing its two group kinds"
+  );
+});
+
+// All of them are decorative: every one sits inside a button or an aria-hidden slot that
+// carries its own name, so an accessible name here would be read out twice.
 test("every glyph is aria-hidden and stroked in currentColor", () => {
-  for (const Component of [ToggleLeftPanelIcon, ToggleRightPanelIcon, BackArrowIcon, ComposeIcon]) {
+  for (const Component of [
+    ToggleLeftPanelIcon,
+    ToggleRightPanelIcon,
+    BackArrowIcon,
+    ComposeIcon,
+    ProjectTagIcon,
+    WorkspaceFolderIcon,
+  ]) {
     const html = render(Component);
     assert.match(html, /aria-hidden="true"/, Component.name);
     assert.match(html, /stroke="currentColor"/, `${Component.name} must inherit its button's colour`);

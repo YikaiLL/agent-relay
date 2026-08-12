@@ -1104,27 +1104,33 @@ input:focus, textarea:focus, select:focus {
   color: var(--err-fg);
 }
 
+/* The slot for the group's kind mark — a folder or a tag, drawn in
+   shared/panel-icons.js and chosen from `group.projectId`.
+
+   This used to BE the glyph: a bordered 16x11 rect with a `::before` tab, drawn
+   here in CSS. Two things were wrong with that. The tab is 4px tall, so at this
+   size it washed out and the mark read as a rounded blob rather than a folder;
+   and one CSS-drawn shape cannot vary by kind, so a project and a working
+   directory shipped the same icon in a column that shows them side by side.
+
+   It is now a plain 16px box holding an <svg> stroked with `currentColor`, which
+   is what lets the two selection rules below recolour the whole mark by setting
+   `color` alone. The old glyph carried its outline in `border-color`, which does
+   NOT inherit — so `.thread-group-header-project.is-active`, which set only
+   `color`, was a silent no-op and an active project's icon stayed grey.
+   `thread-group-icon-style-guard.test.mjs` holds that shut. */
 .thread-group-icon {
-  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 16px;
-  height: 11px;
-  border: 1.5px solid var(--text-tertiary);
-  border-radius: 3px;
+  height: 16px;
   flex: 0 0 auto;
-  opacity: 0.9;
+  color: var(--text-tertiary);
 }
 
-.thread-group-icon::before {
-  content: "";
-  position: absolute;
-  top: -4px;
-  left: 1px;
-  width: 7px;
-  height: 4px;
-  border: 1.5px solid var(--text-tertiary);
-  border-bottom: 0;
-  border-radius: 3px 3px 0 0;
-  background: var(--bg-surface);
+.thread-group-icon svg {
+  display: block;
 }
 
 /* A section header, not content. It used to sit at body size and 600 — bigger
@@ -1206,11 +1212,12 @@ input:focus, textarea:focus, select:focus {
   border-color: transparent;
 }
 
+/* One property, because the mark is stroked with `currentColor` now. The three
+   selectors and the paired `border-color` this replaced were both load-bearing
+   against the old CSS-drawn glyph, whose outline `color` could not reach. */
 .thread-group.is-selected-workspace .thread-group-name,
-.thread-group.is-selected-workspace .thread-group-icon,
-.thread-group.is-selected-workspace .thread-group-icon::before {
+.thread-group.is-selected-workspace .thread-group-icon {
   color: var(--accent-primary);
-  border-color: var(--accent-primary);
 }
 
 .conversation-item {
@@ -6110,9 +6117,13 @@ body.is-resizing-panel {
   color: var(--accent-primary);
 }
 /* The selected project decides which tab set a new session joins, so it needs to be
- * visible at a glance. */
+ * visible at a glance — and for a long time it wasn't. This named
+ * `.thread-group-icon::before`, the tab of the CSS-drawn folder, and set `color` on
+ * it; that glyph was painted with `border-color`, which `color` does not touch and
+ * which does not inherit. The rule looked handled and did nothing. The mark is an
+ * <svg> on `currentColor` now, so `color` on the slot moves the whole thing. */
 .thread-group-header-project.is-active .thread-group-name,
-.thread-group-header-project.is-active .thread-group-icon::before {
+.thread-group-header-project.is-active .thread-group-icon {
   color: var(--accent-primary);
 }
 
