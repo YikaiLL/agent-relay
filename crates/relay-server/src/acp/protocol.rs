@@ -76,6 +76,10 @@ pub(crate) fn summarize_mcp_servers(provider: &str, output: &str) -> McpSummary 
             continue;
         }
         let line = raw_line.trim();
+        // The measured empty-install sentence has no colon and would fall out of
+        // the parser on its own; this guard is for a build that words it with
+        // one, which would otherwise be read as a broken server named
+        // "No MCP servers configured (expected in".
         if line.is_empty() || line.starts_with("No MCP servers configured") {
             continue;
         }

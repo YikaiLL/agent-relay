@@ -1589,8 +1589,8 @@ async fn an_unroutable_plan_is_accepted_loudly_rather_than_silently() {
         relay
             .logs_for_test()
             .iter()
-            .any(|entry| entry.kind != "cursor" && entry.message.contains("plan")),
-        "an unattributable plan must be visible in the audit log, not swallowed"
+            .any(|entry| entry.kind == "warn" && entry.message.contains("plan")),
+        "an unattributable plan must be on a channel the audit view shows"
     );
 }
 
@@ -1639,13 +1639,21 @@ fn mcp_list_output_is_summarised_by_measured_status() {
 #[test]
 fn nothing_configured_is_silent_rather_than_a_line_of_noise_every_boot() {
     for text in [
+        // The measured sentence. Note it happens to contain NO colon, so it
+        // would fall out of the parser anyway — this case alone does not
+        // exercise the sentinel guard, which is why the variant below exists.
         "No MCP servers configured (expected in .cursor/mcp.json or ~/.cursor/mcp.json)\n",
+        // The same sentence worded with a colon, which is what the guard is
+        // actually for: without it this parses as a server named
+        // "No MCP servers configured (expected in" with an unrecognized status,
+        // and the relay reports a phantom broken server on an empty install.
+        "No MCP servers configured (expected in: .cursor/mcp.json)\n",
         "",
         "   \n",
     ] {
         let summary = crate::acp::protocol::summarize_mcp_servers("cursor", text);
         assert_eq!(summary.headline, None, "should stay quiet for: {text:?}");
-        assert!(summary.problems.is_empty());
+        assert!(summary.problems.is_empty(), "for {text:?}");
     }
 }
 
@@ -1771,10 +1779,11 @@ async fn a_login_instruction_is_visible_and_names_the_binary_the_user_must_run()
         .find(|entry| entry.message.contains("not authenticated"))
         .expect("the login instruction must be logged at all");
 
-    assert_ne!(
-        line.kind, "cursor",
-        "filed under the provider channel, the audit view drops it: {}",
-        line.message
+    assert_eq!(
+        line.kind, "warn",
+        "only a relay-owned channel survives the audit view's chatter filter; \
+         `{}` does not",
+        line.kind
     );
     assert!(
         line.message.contains("cursor-agent login"),
@@ -1818,12 +1827,15 @@ async fn a_failed_turn_pushes_the_failure_instead_of_a_success_shaped_ping() {
 
     let job = rx.try_recv().expect("a failed turn must enqueue a push");
     assert!(
-        format!("{job:?}").contains("Error"),
-        "the push must be a failure, not a completion: {job:?}"
+        matches!(job.kind, crate::state::PushKind::Error),
+        "the push must be a failure, not a completion: {:?}",
+        job.kind
     );
-    assert!(
-        format!("{job:?}").contains("Model provider rejected"),
-        "the push must carry the reason: {job:?}"
+    assert_eq!(job.thread_id, "t1");
+    assert_eq!(
+        job.reason.as_deref(),
+        Some("Model provider rejected the request"),
+        "the push must carry the reason verbatim"
     );
 
     // And the failure is in the audit log, not only the transcript — operator
@@ -2101,8 +2113,8 @@ async fn a_plan_answered_on_behalf_of_a_run_leaves_a_trace() {
         relay
             .logs_for_test()
             .iter()
-            .any(|entry| entry.kind != "cursor" && entry.message.contains("plan")),
-        "accepting a plan for a run nobody can answer must be recorded"
+            .any(|entry| entry.kind == "warn" && entry.message.contains("plan")),
+        "accepting a plan for a run nobody can answer must be recorded visibly"
     );
 }
 
@@ -2219,4 +2231,92 @@ fn mcp_lines_name_the_agent_they_describe() {
         "{:?}",
         summary.problems
     );
+}
+
+#[tokio::test]
+async fn a_turn_finishing_on_a_dropped_thread_touches_nothing() {
+    // `apply_turn_started` has an explicit `ThreadRoute::Drop => {}` arm.
+    // `apply_turn_finished` used `_ =>`, which swallowed Drop into the ACTIVE
+    // behaviour — and both `upsert_transcript_item_for_thread` and
+    // `set_thread_status` call `ensure_runtime_for_thread`, so a route that
+    // means "this event belongs to nobody" created a runtime instead.
+    //
+    // Reachable exactly when it hurts most: deleting a thread clears
+    // `active_thread_id` and tombstones the id, and on any relay that also runs
+    // Claude the provider fallback in `thread_belongs_to_provider` is false for
+    // a cursor thread — so the late failure of the deleted thread's turn lands
+    // here and resurrects the runtime the tombstone exists to bury.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.active_thread_id = None;
+        // The boot default on a relay with Claude installed, which is what makes
+        // the cursor thread fail the provider fallback.
+        relay.set_provider_name("claude_code".to_string());
+        relay.mark_thread_deleted("t-gone");
+    }
+
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_turn_finished(
+            &mut relay,
+            "t-gone",
+            "acp-turn-1",
+            Err("late failure for a thread nobody owns".to_string()),
+            "cursor",
+        );
+    }
+
+    let relay = state.read().await;
+    assert!(
+        relay.runtime_for_thread("t-gone").is_none(),
+        "a dropped event must not create the runtime it claims not to own"
+    );
+}
+
+#[tokio::test]
+async fn a_background_thread_failure_lands_its_transcript_entry_and_its_push() {
+    // The gap the other failure tests left: they cover the ACTIVE thread and a
+    // DELETED one. The case that actually matters to a user away from the desk —
+    // a thread running behind the one they are looking at — was covered only by
+    // the negative assertion that a deleted thread stays buried.
+    let state = relay_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    {
+        let mut relay = state.write().await;
+        relay.set_push_runtime(tx, "test-vapid".to_string());
+        // The user is looking at a different thread.
+        relay.active_thread_id = Some("front".to_string());
+        relay.bg_set_active_turn("back", Some("acp-turn-7".to_string()), 0);
+        relay.bg_set_thread_status("back", "working".to_string(), Vec::new(), 0);
+    }
+
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_turn_finished(
+            &mut relay,
+            "back",
+            "acp-turn-7",
+            Err("the background turn died".to_string()),
+            "cursor",
+        );
+    }
+
+    let job = rx
+        .try_recv()
+        .expect("a background failure must still reach the phone");
+    assert!(matches!(job.kind, crate::state::PushKind::Error));
+    assert_eq!(job.thread_id, "back");
+
+    let relay = state.read().await;
+    let runtime = relay.runtime_for_thread("back").expect("runtime");
+    let entry = runtime
+        .transcript
+        .iter()
+        .find(|entry| entry.item_id == "turn-error:acp-turn-7")
+        .expect("the durable failure entry is the only thing a remote client sees");
+    assert_eq!(entry.text.as_deref(), Some("the background turn died"));
+    assert_eq!(runtime.active_turn_id, None, "the turn must be settled");
+    // And the thread the user IS looking at was not disturbed.
+    assert_eq!(relay.active_thread_id.as_deref(), Some("front"));
 }

@@ -796,6 +796,14 @@ pub(crate) fn apply_turn_finished(
     let settling_this_turn = current_turn.as_deref() == Some(turn_id);
 
     let route = thread_route(relay, thread_id, provider_key);
+    // `Drop` means this event belongs to no thread the relay is tracking — a
+    // deleted one, most often. `apply_turn_started` says so explicitly; this
+    // used to fold Drop into the active arm, where both the transcript write and
+    // the status set call `ensure_runtime_for_thread` and so *created* the
+    // runtime the tombstone exists to bury.
+    if matches!(route, ThreadRoute::Drop) {
+        return;
+    }
     let now = crate::state::unix_now();
 
     if let Some(reason) = &failure {
