@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -262,6 +264,99 @@ pub fn classify_spawn_error(reason: &str) -> crate::protocol::ProviderStatusKind
         crate::protocol::ProviderStatusKind::NotInstalled
     } else {
         crate::protocol::ProviderStatusKind::Failed
+    }
+}
+
+/// Directories searched for a provider binary when `$PATH` misses, in order.
+///
+/// `~/.local/bin` is where a vendor's install *script* puts a CLI when it is not
+/// going through a package manager — `cursor-agent`'s official installer lands
+/// there, as do pipx/uv-style installers. It is on `$PATH` only if the user's
+/// shell profile put it there, and a profile that never did is the common case
+/// (macOS ships none of it by default). The failure that produces is maximally
+/// misleading: the binary IS installed and logged in, `Command::spawn` still
+/// gets ENOENT, and `classify_spawn_error` faithfully reports "not installed".
+///
+/// This covers the relay's own exec only. A child that itself shells out by
+/// bare name (the Claude worker spawning the `claude` CLI) still uses the
+/// inherited `$PATH` and would need that `$PATH` augmented instead.
+fn fallback_bin_dirs(home: &Path) -> [PathBuf; 1] {
+    [home.join(".local").join("bin")]
+}
+
+/// The program to hand `Command::new` for `binary_name`.
+///
+/// `$PATH` wins and is returned as the *bare name*, so the OS keeps doing the
+/// lookup and a shim the user deliberately put ahead of the vendor copy still
+/// takes precedence. Only when `$PATH` has no answer does this fall back to an
+/// absolute path in [`fallback_bin_dirs`]. A binary that is genuinely absent
+/// stays bare, so the spawn still fails with the ENOENT text
+/// [`classify_spawn_error`] keys on rather than a synthesized error.
+pub(crate) fn resolve_binary(binary_name: &str) -> OsString {
+    resolve_binary_within(
+        binary_name,
+        std::env::var_os("PATH").as_deref(),
+        crate::state_paths::home_dir().as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_binary`], with the environment passed in — env is
+/// process-global and shared across the test binary's threads, so the tests
+/// must not have to mutate it.
+fn resolve_binary_within(
+    binary_name: &str,
+    path_var: Option<&OsStr>,
+    home: Option<&Path>,
+) -> OsString {
+    let bare = || OsString::from(binary_name);
+
+    // Already a path, so `Command::new` would skip `$PATH` anyway. Rewriting it
+    // would redirect an explicit choice.
+    if binary_name.contains(['/', '\\']) {
+        return bare();
+    }
+
+    // An empty `$PATH` entry means "the current directory" to a shell; leaving
+    // the lookup to the OS keeps that quirk out of here, and a `$PATH` hit is
+    // returned bare precisely so the OS still performs it.
+    let on_path = path_var.is_some_and(|path_var| {
+        std::env::split_paths(path_var)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .any(|dir| is_executable_file(&dir.join(binary_name)))
+    });
+    if on_path {
+        return bare();
+    }
+
+    let Some(home) = home else {
+        return bare();
+    };
+    fallback_bin_dirs(home)
+        .into_iter()
+        .map(|dir| dir.join(binary_name))
+        .find(|candidate| is_executable_file(candidate))
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(bare)
+}
+
+/// Whether `path` is something `exec` would accept: a file (following symlinks,
+/// which is the shape the cursor installer leaves behind — `~/.local/bin/x` ->
+/// a versioned directory) carrying an execute bit.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -634,6 +729,162 @@ mod registry_tests {
     #[test]
     fn unknown_names_select_nothing_rather_than_defaulting() {
         assert!(select_providers("gemini").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod binary_resolution_tests {
+    use super::*;
+    use std::fs;
+
+    /// A file `exec` would accept, so the resolver's own executability check is
+    /// exercised rather than assumed.
+    fn install(dir: &Path, name: &str) -> PathBuf {
+        fs::create_dir_all(dir).expect("create bin dir");
+        let path = dir.join(name);
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+        }
+        path
+    }
+
+    fn path_var(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs).expect("join PATH")
+    }
+
+    fn local_bin(home: &Path) -> PathBuf {
+        home.join(".local").join("bin")
+    }
+
+    #[test]
+    fn a_binary_installed_only_in_local_bin_is_found_there() {
+        // The reported bug, verbatim: `cursor-agent`'s installer drops the
+        // binary in `~/.local/bin`, that directory is not on the user's `$PATH`,
+        // and the relay logged "failed to start `cursor-agent acp`: No such file
+        // or directory (os error 2)" for a CLI that was installed and logged in.
+        let home = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let installed = install(&local_bin(home.path()), "cursor-agent");
+
+        let resolved = resolve_binary_within(
+            "cursor-agent",
+            Some(path_var(&[elsewhere.path()]).as_os_str()),
+            Some(home.path()),
+        );
+
+        assert_eq!(resolved, installed.into_os_string());
+    }
+
+    #[test]
+    fn a_local_bin_symlink_is_followed() {
+        // The real install is not a file in `~/.local/bin` but a symlink into
+        // `~/.local/share/cursor-agent/versions/<v>/`, so an executability check
+        // that used `symlink_metadata` would reject the actual shipped shape.
+        #[cfg(unix)]
+        {
+            let home = tempfile::tempdir().expect("tempdir");
+            let versioned = install(
+                &home.path().join(".local/share/x/versions/1"),
+                "cursor-agent",
+            );
+            let bin = local_bin(home.path());
+            fs::create_dir_all(&bin).expect("create bin dir");
+            let link = bin.join("cursor-agent");
+            std::os::unix::fs::symlink(&versioned, &link).expect("symlink");
+
+            let resolved = resolve_binary_within("cursor-agent", None, Some(home.path()));
+
+            assert_eq!(resolved, link.into_os_string());
+        }
+    }
+
+    #[test]
+    fn path_wins_over_local_bin_and_stays_bare() {
+        // Returning the bare name keeps the OS doing the lookup, so a shim the
+        // user put earlier on `$PATH` still shadows the vendor copy. Resolving
+        // to the first `$PATH` hit ourselves would quietly take that away.
+        let home = tempfile::tempdir().expect("tempdir");
+        let on_path = tempfile::tempdir().expect("tempdir");
+        install(&local_bin(home.path()), "cursor-agent");
+        install(on_path.path(), "cursor-agent");
+
+        let resolved = resolve_binary_within(
+            "cursor-agent",
+            Some(path_var(&[on_path.path()]).as_os_str()),
+            Some(home.path()),
+        );
+
+        assert_eq!(resolved, OsString::from("cursor-agent"));
+    }
+
+    #[test]
+    fn a_genuinely_missing_binary_stays_bare_so_the_error_is_still_enoent() {
+        // `classify_spawn_error` reads the ENOENT text out of the spawn failure.
+        // Synthesizing a path for a binary that is nowhere would change that
+        // message and mislabel a not-installed provider as `Failed`.
+        let home = tempfile::tempdir().expect("tempdir");
+        let empty = tempfile::tempdir().expect("tempdir");
+
+        let resolved = resolve_binary_within(
+            "cursor-agent",
+            Some(path_var(&[empty.path()]).as_os_str()),
+            Some(home.path()),
+        );
+
+        assert_eq!(resolved, OsString::from("cursor-agent"));
+    }
+
+    #[test]
+    fn a_non_executable_file_in_local_bin_is_ignored() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let home = tempfile::tempdir().expect("tempdir");
+            let bin = local_bin(home.path());
+            fs::create_dir_all(&bin).expect("create bin dir");
+            let path = bin.join("cursor-agent");
+            fs::write(&path, b"not a program").expect("write");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod -x");
+
+            let resolved = resolve_binary_within("cursor-agent", None, Some(home.path()));
+
+            assert_eq!(resolved, OsString::from("cursor-agent"));
+        }
+    }
+
+    #[test]
+    fn a_directory_with_the_binarys_name_is_not_mistaken_for_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(local_bin(home.path()).join("cursor-agent")).expect("create dir");
+
+        let resolved = resolve_binary_within("cursor-agent", None, Some(home.path()));
+
+        assert_eq!(resolved, OsString::from("cursor-agent"));
+    }
+
+    #[test]
+    fn a_name_that_is_already_a_path_is_never_rewritten() {
+        // `Command::new` skips `$PATH` entirely for anything with a separator,
+        // so rewriting it would redirect an explicit choice.
+        let home = tempfile::tempdir().expect("tempdir");
+        install(&local_bin(home.path()), "cursor-agent");
+
+        let resolved = resolve_binary_within("./cursor-agent", None, Some(home.path()));
+
+        assert_eq!(resolved, OsString::from("./cursor-agent"));
+    }
+
+    #[test]
+    fn no_home_is_not_a_panic() {
+        // Containers running as a user without `$HOME`: there is no fallback to
+        // try, and the answer is the unchanged bare name.
+        assert_eq!(
+            resolve_binary_within("cursor-agent", None, None),
+            OsString::from("cursor-agent")
+        );
     }
 }
 

@@ -247,7 +247,7 @@ fn summarize_codex_mcp_servers(json: &str) -> Result<Vec<String>, String> {
 // only stops awaiting — without it a genuinely hung CLI keeps running as an
 // orphan. With it, the child is killed and reaped when the future is dropped.
 async fn collect_codex_mcp_lines(binary_name: &str, timeout: Duration) -> Vec<String> {
-    let mut command = Command::new(binary_name);
+    let mut command = Command::new(crate::provider::resolve_binary(binary_name));
     command
         .arg("mcp")
         .arg("list")
@@ -293,7 +293,9 @@ impl CodexBridge {
         display_name: &'static str,
         provider_key: &'static str,
     ) -> Result<Self, String> {
-        let mut command = Command::new(binary_name);
+        // Resolved, not bare — see `provider::resolve_binary`. The error text
+        // below stays bare: it names a command for a human to run.
+        let mut command = Command::new(crate::provider::resolve_binary(binary_name));
         command
             .arg("app-server")
             .stdin(Stdio::piped())

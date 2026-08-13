@@ -45,7 +45,7 @@ pub(crate) const STATE_PATH_ENV: &str = "RELAY_STATE_PATH";
 /// `$HOME` (or `%USERPROFILE%`), when it is usable as an anchor. An unset or
 /// relative value is rejected rather than silently rebuilding the per-cwd
 /// behaviour under a different name.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
         std::env::var_os(key)
             .map(PathBuf::from)

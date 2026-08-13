@@ -59,7 +59,7 @@ async fn report_mcp_config(
     provider_key: &'static str,
     state: Arc<RwLock<RelayState>>,
 ) {
-    let mut command = Command::new(binary_name);
+    let mut command = Command::new(crate::provider::resolve_binary(binary_name));
     command.arg("mcp").arg("list").kill_on_drop(true);
 
     let summary = match timeout(MCP_LIST_TIMEOUT, command.output()).await {
@@ -380,7 +380,10 @@ impl AcpBridge {
         display_name: &'static str,
         provider_key: &'static str,
     ) -> Result<Self, String> {
-        let mut command = Command::new(binary_name);
+        // Resolved, not bare: the binary may only exist in `~/.local/bin`, which
+        // is where cursor's installer puts it and is often not on `$PATH`. The
+        // error text below stays bare — it names a command for a human to run.
+        let mut command = Command::new(crate::provider::resolve_binary(binary_name));
         command
             .args(launch_args)
             .stdin(Stdio::piped())
