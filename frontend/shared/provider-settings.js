@@ -122,6 +122,40 @@ export function normalizeProviderList(providers = []) {
   return unique.length ? unique : [...DEFAULT_PROVIDERS];
 }
 
+// The models to offer for `provider`: its own fetched catalog, else the session
+// snapshot's `available_models` — but ONLY when the snapshot is that provider's.
+//
+// `available_models` belongs to the ACTIVE session's provider, so using it as a
+// blanket fallback served one provider's catalog under another's name. With a
+// Claude session live, picking Cursor in the launch dialog listed Claude's
+// models ("Default (recommended, Opus 5)"), and the model actually submitted was
+// a Claude id the ACP bridge then had to refuse. It also defeated the fetch that
+// would have fixed it: the fork dialog's `ensureForkProviderModels` skips the
+// request when this returns anything, so a borrowed list meant the real catalog
+// was never loaded.
+//
+// Empty is the honest answer for "not harvested yet" — ACP publishes its models
+// only on `session/new`, so a first-ever Cursor launch genuinely has none, and
+// the dialog's own empty/loading copy says so.
+export function scopedProviderModels(
+  provider,
+  providerModels = {},
+  fallbackProvider = "",
+  fallbackModels = []
+) {
+  const normalized = normalizeProvider(provider);
+  const own = providerModels?.[normalized];
+  if (own?.length) {
+    return own;
+  }
+  // Compared normalized on both sides so `""`/undefined can't alias onto the
+  // provider being asked about.
+  if (!fallbackProvider || normalizeProvider(fallbackProvider) !== normalized) {
+    return [];
+  }
+  return fallbackModels || [];
+}
+
 export function defaultModelForProvider(provider) {
   // No cross-provider fallback: handing an unknown provider Codex's `gpt-5.5`
   // sends one provider's model id to another, and the relay then records it as

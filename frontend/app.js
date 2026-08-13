@@ -267,6 +267,7 @@ import {
   providerOptions,
   providerSettings,
   sandboxOptions,
+  scopedProviderModels,
 } from "./shared/provider-settings.js";
 import { localQueryClient } from "./local/query-client.js";
 import { attachTranscriptHistoryLoader } from "./shared/transcript-history-loader.js";
@@ -3172,7 +3173,11 @@ function seedDefaults(session) {
   void refreshProviderCatalogs(session);
   const activeProvider = session.provider || defaultProvider(state.providers);
   const launchProvider = providerInput?.value || activeProvider;
-  const launchModels = modelsForProvider(launchProvider, session.available_models || []);
+  const launchModels = modelsForProvider(
+    launchProvider,
+    session.available_models || [],
+    session.provider
+  );
 
   syncModelSuggestions(
     messageModel,
@@ -3239,12 +3244,12 @@ async function refreshProviderCatalogs(session) {
     syncLaunchSettingLabels(provider);
     syncModelSuggestions(
       liveModelInput,
-      modelsForProvider(provider, session.available_models || []),
+      modelsForProvider(provider, session.available_models || [], session.provider),
       liveModelInput?.value || defaultModelForProvider(provider)
     );
     syncEffortSuggestions(
       liveStartEffortInput,
-      modelsForProvider(provider, session.available_models || []),
+      modelsForProvider(provider, session.available_models || [], session.provider),
       liveModelInput?.value || defaultModelForProvider(provider),
       liveStartEffortInput?.value || "",
       provider
@@ -3337,11 +3342,17 @@ function syncProviderSuggestions(select, providers, selectedProvider) {
   renderSelectOptions(select, options, selectedProvider || defaultProvider(providers));
 }
 
-function modelsForProvider(provider, fallbackModels = []) {
-  const normalized = provider || "codex";
-  return state.providerModels[normalized]?.length
-    ? state.providerModels[normalized]
-    : fallbackModels;
+// `fallbackModels` is always the session snapshot's `available_models`, which
+// belong to the snapshot's OWN provider — hence `fallbackProvider`. Defaulting
+// it to `state.session?.provider` matches every call site that passes
+// `state.session.available_models`; the few that pass a session object around
+// name its provider explicitly.
+function modelsForProvider(
+  provider,
+  fallbackModels = [],
+  fallbackProvider = state.session?.provider
+) {
+  return scopedProviderModels(provider, state.providerModels, fallbackProvider, fallbackModels);
 }
 
 function handleLaunchFieldInput(id, value) {
@@ -3368,7 +3379,7 @@ function handleLaunchFieldInput(id, value) {
 
   const session = state.session || {};
   void refreshProviderCatalogs(session);
-  const nextModels = modelsForProvider(value, session.available_models || []);
+  const nextModels = modelsForProvider(value, session.available_models || [], session.provider);
   const liveModelInput = document.getElementById("model-input") || modelInput;
   const liveStartEffortInput = document.getElementById("start-effort") || startEffortInput;
   const liveApprovalInput = document.getElementById("approval-policy-input") || approvalPolicyInput;
@@ -3395,7 +3406,11 @@ function handleLaunchFieldInput(id, value) {
 
 function syncLaunchSettingsModal(session, provider, launchModels, activeProvider) {
   const prov = provider || activeProvider || "codex";
-  const models = launchModels?.length ? launchModels : (session?.available_models || []);
+  // Scoped, not raw: `available_models` is the ACTIVE session's catalog, and
+  // this modal is showing the LAUNCH provider's picker.
+  const models = launchModels?.length
+    ? launchModels
+    : modelsForProvider(prov, session?.available_models || [], session?.provider);
   const settings = providerSettings(prov);
   const launchDraft = readLocalUiState(state.localUiStore).sessionDraft || {};
   const fields = {
