@@ -41,7 +41,11 @@ pub(crate) struct ThreadRuntime {
 }
 
 impl ThreadRuntime {
-    pub(crate) fn placeholder(thread_id: &str, now: u64) -> Self {
+    /// `transcript_revision` is a value the caller drew from
+    /// `RelayState::next_transcript_revision`, never a literal. Seeding a rebuilt
+    /// runtime at 0 is what used to rewind a thread under a live client and make
+    /// it drop every delta that followed.
+    pub(crate) fn placeholder(thread_id: &str, now: u64, transcript_revision: u64) -> Self {
         Self {
             summary: Some(ThreadSummaryView {
                 id: thread_id.to_string(),
@@ -70,7 +74,7 @@ impl ThreadRuntime {
             approval_policy: String::new(),
             sandbox: String::new(),
             reasoning_effort: String::new(),
-            transcript_revision: 0,
+            transcript_revision,
             transcript: Vec::new(),
             provider_history_cursor: None,
             provider_history_paged: false,
@@ -89,6 +93,7 @@ impl ThreadRuntime {
         sandbox: &str,
         effort: &str,
         now: u64,
+        transcript_revision: u64,
     ) -> Self {
         Self {
             current_status: thread.status.clone(),
@@ -106,7 +111,7 @@ impl ThreadRuntime {
             liveness_timed_out: false,
             liveness_stop_requested: false,
             active_flags: Vec::new(),
-            transcript_revision: 0,
+            transcript_revision,
             transcript: Vec::new(),
             provider_history_cursor: None,
             provider_history_paged: false,
@@ -124,6 +129,7 @@ impl ThreadRuntime {
         effort: &str,
         model: &str,
         now: u64,
+        transcript_revision: u64,
     ) -> Self {
         let transcript = data
             .transcript
@@ -173,7 +179,7 @@ impl ThreadRuntime {
             liveness_timed_out: false,
             liveness_stop_requested: false,
             active_flags: data.active_flags,
-            transcript_revision: 0,
+            transcript_revision,
             transcript,
             provider_history_cursor: None,
             provider_history_paged: false,
@@ -329,7 +335,10 @@ impl ThreadRuntime {
         self.last_update_at = now;
     }
 
-    pub(crate) fn merge_fresh_history(&mut self, fresh: ThreadRuntime) {
+    /// Returns whether the transcript changed; see `merge_transcript_records` —
+    /// the caller assigns the new revision.
+    #[must_use]
+    pub(crate) fn merge_fresh_history(&mut self, fresh: ThreadRuntime) -> bool {
         self.summary = fresh.summary;
         self.current_cwd = fresh.current_cwd;
         self.approval_policy = fresh.approval_policy;
@@ -363,10 +372,16 @@ impl ThreadRuntime {
             self.provider_history_cursor = None;
             self.provider_history_paged = false;
         }
-        self.merge_transcript_records(fresh.transcript);
+        self.merge_transcript_records(fresh.transcript)
     }
 
-    pub(crate) fn merge_transcript_records(&mut self, records: Vec<TranscriptRecord>) {
+    /// Returns whether the transcript actually changed. The caller owns the
+    /// revision: it must draw a fresh one from `RelayState::next_transcript_revision`
+    /// and assign it. This deliberately does NOT bump `transcript_revision` itself —
+    /// doing so used to mint a number off a private per-thread counter that another
+    /// thread had already been given.
+    #[must_use]
+    pub(crate) fn merge_transcript_records(&mut self, records: Vec<TranscriptRecord>) -> bool {
         let mut changed = false;
         for record in records {
             match self
@@ -386,9 +401,7 @@ impl ThreadRuntime {
                 }
             }
         }
-        if changed {
-            self.transcript_revision = self.transcript_revision.wrapping_add(1);
-        }
+        changed
     }
 
     fn has_equivalent_user_message(&self, entry: &TranscriptRecord) -> bool {
@@ -509,6 +522,7 @@ mod tests {
             "ro",
             "high",
             0,
+            0,
         )
     }
 
@@ -525,13 +539,13 @@ mod tests {
         rt.active_turn_id = Some("turn-1".to_string());
         assert!(rt.is_working(), "a turn id keeps is_working() true");
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
             "first idle re-read keeps the turn (could be the pre-status-event window)"
         );
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
@@ -550,7 +564,7 @@ mod tests {
         assert!(rt.active_turn_id.is_none());
         assert!(rt.is_working(), "a working status alone makes it working");
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
 
         assert_eq!(rt.current_status, "idle");
         assert!(rt.active_turn_id.is_none());
@@ -575,7 +589,7 @@ mod tests {
 
         // Fresh read can't confirm liveness (Claude reports idle); it must not end
         // the turn the relay knows is live.
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
 
         assert_eq!(rt.active_turn_id.as_deref(), Some("turn-1"));
         assert!(
@@ -595,7 +609,7 @@ mod tests {
         assert!(rt.is_working());
 
         // Claude reports idle on every read_thread; resume happens twice.
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
@@ -603,7 +617,7 @@ mod tests {
         );
         assert!(rt.is_working());
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
@@ -622,7 +636,7 @@ mod tests {
 
         // A still-working fresh read carries no turn id (provider reads don't), but
         // we must not drop the running turn — it's restored via the bg buffer path.
-        rt.merge_fresh_history(runtime("t1", "active"));
+        let _ = rt.merge_fresh_history(runtime("t1", "active"));
 
         assert_eq!(rt.active_turn_id.as_deref(), Some("turn-1"));
         assert!(rt.is_working());
@@ -634,7 +648,7 @@ mod tests {
         rt.provider_history_paged = true;
         rt.provider_history_cursor = Some(4096);
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
 
         assert!(!rt.provider_history_paged);
         assert_eq!(rt.provider_history_cursor, None);
@@ -698,7 +712,7 @@ mod tests {
             transcript: Vec::new(),
         };
 
-        let rt = ThreadRuntime::from_sync_data(data, "untrusted", "ro", "high", "model", 0);
+        let rt = ThreadRuntime::from_sync_data(data, "untrusted", "ro", "high", "model", 0, 0);
 
         assert!(
             rt.active_turn_id.is_none(),

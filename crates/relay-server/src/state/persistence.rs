@@ -15,6 +15,19 @@ use super::{
 
 const PERSISTENCE_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Headroom added to the transcript clock when it is persisted, so the value on
+/// disk always sits AHEAD of every revision actually handed out.
+///
+/// Saving is debounced, and several paths advance the clock without scheduling a
+/// save at all (a cold transcript read materializing a runtime, for one). Without
+/// headroom a hard exit between a bump and the next save would restart the clock
+/// below revisions clients already hold, and re-issue them — the one thing the
+/// protocol cannot tolerate. Overshooting instead is free: the clock is a u64
+/// logical counter with no meaning beyond its ordering, so skipping ahead a few
+/// thousand costs nothing, while replaying a single number silently drops
+/// transcript content.
+const TRANSCRIPT_CLOCK_PERSIST_HEADROOM: u64 = 10_000;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct PersistedRelayState {
     pub(super) schema_version: u32,
@@ -117,6 +130,23 @@ pub(super) struct PersistedRelayState {
     /// the next mutation. `#[serde(default)]` → 0 for pre-Projects state files.
     #[serde(default)]
     pub(super) projects_revision: u64,
+    /// High-water mark of the shared transcript revision clock. Persisted so a
+    /// restart resumes ABOVE every revision already handed out: a browser tab that
+    /// survives the restart still holds its old revision and drops anything at or
+    /// below it, so a clock that restarted at 0 would leave that tab silently deaf
+    /// until it climbed back.
+    ///
+    /// Stored with `TRANSCRIPT_CLOCK_PERSIST_HEADROOM` added, so a crash between a
+    /// bump and the next debounced save still resumes above what went out.
+    ///
+    /// `#[serde(default)]` → 0 for state files written before the clock existed.
+    /// Upgrading from one of those restarts the clock below whatever revision a
+    /// still-open page holds, so that page goes stale until the clock climbs past
+    /// it. Deliberately not worked around: the live tail is never served from the
+    /// client's page cache (`shared/caching-transcript-fetcher.js` RED LINE), so a
+    /// reload re-seeds the revision from the server and clears it outright.
+    #[serde(default)]
+    pub(super) transcript_clock: u64,
 }
 
 impl PersistedRelayState {
@@ -213,6 +243,9 @@ impl PersistedRelayState {
                 .map(|(thread_id, name)| (thread_id.clone(), name.clone()))
                 .collect(),
             projects_revision: relay.projects_revision,
+            transcript_clock: relay
+                .transcript_clock()
+                .saturating_add(TRANSCRIPT_CLOCK_PERSIST_HEADROOM),
         }
     }
 

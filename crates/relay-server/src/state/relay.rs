@@ -238,6 +238,20 @@ pub struct RelayState {
     /// stalling the relay — the snapshot that follows repairs any gap.
     delta_tx: broadcast::Sender<TranscriptDeltaEvent>,
     revision: u64,
+    /// The one clock every transcript revision is drawn from, via
+    /// `next_transcript_revision`. Relay-global and persisted, so a revision is
+    /// unique across threads and never repeats across a restart.
+    ///
+    /// A client treats the revision as proof it has missed nothing: it accepts a
+    /// delta whose `base_revision` matches what it holds and discards one whose
+    /// `revision` is below it. Both halves of that break if a number can be
+    /// reused, so no other code may mint one — `transcript_revision` on
+    /// `RelayState` and on `ThreadRuntime` are *copies* of a value this handed
+    /// out, never counters in their own right.
+    transcript_clock: u64,
+    /// The selected thread's transcript revision, mirrored for `snapshot()` and
+    /// for the legacy no-active-thread transcript. A copy of a `transcript_clock`
+    /// value — never incremented on its own.
     transcript_revision: u64,
     security: SecurityProfile,
     pub provider_connected: bool,
@@ -448,6 +462,7 @@ impl RelayState {
             change_tx,
             delta_tx,
             revision: 0,
+            transcript_clock: 0,
             transcript_revision: 0,
             security,
             provider_connected: false,
@@ -719,10 +734,28 @@ impl RelayState {
         self.enqueue_push(job);
     }
 
+    pub(crate) fn transcript_clock(&self) -> u64 {
+        self.transcript_clock
+    }
+
+    /// Hand out the next transcript revision. This is the ONLY place a transcript
+    /// revision is minted; everything else copies what this returns.
+    ///
+    /// Saturating rather than wrapping on purpose: wrapping would let the clock
+    /// walk back under a client's cursor, and a client that sees the number rewind
+    /// discards content. Saturating instead parks at the ceiling, which costs gap
+    /// detection but never data. A real relay reaches neither.
+    pub(super) fn next_transcript_revision(&mut self) -> u64 {
+        self.transcript_clock = self.transcript_clock.saturating_add(1);
+        self.transcript_clock
+    }
+
     pub(super) fn bump_transcript_revision(&mut self) -> (u64, u64) {
         let Some(thread_id) = self.active_thread_id.clone() else {
+            // Legacy no-active-thread transcript. It draws from the same clock as
+            // every thread, so it can never mint a number a thread also uses.
             let base_revision = self.transcript_revision;
-            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            self.transcript_revision = self.next_transcript_revision();
             return (base_revision, self.transcript_revision);
         };
 
@@ -737,10 +770,23 @@ impl RelayState {
         // the runtime via `ThreadRuntime::from_sync_data`/`merge_fresh_history`
         // and never calls this, so a mere session selection won't reorder.
         self.touch_thread_last_activity(thread_id);
-        let runtime = self.ensure_runtime_for_thread(thread_id);
+        // Materialize BEFORE drawing the revision. Creating a runtime draws one of
+        // its own to seed it, so allocating first would leave the seed above the
+        // revision being issued and emit a delta whose base is ahead of it.
+        //
+        // Guarded because this is the streaming-delta hot path and
+        // `ensure_runtime_for_thread` scans and clones from `self.threads` even when
+        // the runtime already exists.
+        if !self.runtimes.contains_key(thread_id) {
+            self.ensure_runtime_for_thread(thread_id);
+        }
+        let revision = self.next_transcript_revision();
+        let runtime = self
+            .runtimes
+            .get_mut(thread_id)
+            .expect("runtime materialized above");
         let base_revision = runtime.transcript_revision;
-        runtime.transcript_revision = runtime.transcript_revision.wrapping_add(1);
-        let revision = runtime.transcript_revision;
+        runtime.transcript_revision = revision;
         if self.active_thread_id.as_deref() == Some(thread_id) {
             self.transcript_revision = revision;
         }
@@ -1357,6 +1403,12 @@ impl RelayState {
                 }
                 Some(existing) => {
                     runtime.turn_revision = runtime.turn_revision.max(existing.turn_revision);
+                    // Same reason turn_revision is folded: a client may already track
+                    // real_id, and the pending runtime can be behind it on the shared
+                    // clock. Adopting pending's revision verbatim would rewind it.
+                    runtime.transcript_revision = runtime
+                        .transcript_revision
+                        .max(existing.transcript_revision);
                     self.runtimes.insert(real_id.to_string(), runtime);
                 }
                 None => {
@@ -2335,10 +2387,17 @@ impl RelayState {
             .iter()
             .find(|thread| thread.id == thread_id)
             .cloned();
+        // Draw the revision only when we are actually about to build a runtime, and
+        // before the closure borrows `self`.
+        let seed_revision = if self.runtimes.contains_key(thread_id) {
+            0
+        } else {
+            self.next_transcript_revision()
+        };
         self.runtimes
             .entry(thread_id.to_string())
             .or_insert_with(|| {
-                let mut runtime = ThreadRuntime::placeholder(thread_id, now);
+                let mut runtime = ThreadRuntime::placeholder(thread_id, now, seed_revision);
                 if let Some(summary) = summary {
                     runtime.current_status = summary.status.clone();
                     runtime.current_cwd = summary.cwd.clone();
@@ -2364,7 +2423,12 @@ impl RelayState {
 
     pub(crate) fn sync_selected_runtime_to_fields(&mut self) {
         let Some(runtime) = self.selected_runtime().cloned() else {
-            self.transcript_revision = 0;
+            // Park at the clock, not 0. A snapshot reporting 0 for a thread a client
+            // tracks at N is rejected as stale — and a rejected snapshot is also the
+            // repair the client needed. Every issued revision is <= the clock, so
+            // this is the lowest value that is still safe, and it is stable until
+            // the next transition.
+            self.transcript_revision = self.transcript_clock;
             self.active_turn_id = None;
             self.current_status = "idle".to_string();
             self.current_phase = None;
@@ -2399,7 +2463,13 @@ impl RelayState {
             return;
         }
         let now = unix_now();
-        let mut runtime = ThreadRuntime::placeholder(&thread_id, now);
+        // Draw from the clock rather than adopting the mirror. The mirror is 0 on a
+        // freshly restored relay (and can even hold the OUTGOING thread's value when
+        // a provider reassigns `active_thread_id` directly), so adopting it would
+        // seed this thread below a revision its client already holds — and a client
+        // that far ahead rejects the repairing snapshot too, not just the deltas.
+        let seed_revision = self.next_transcript_revision();
+        let mut runtime = ThreadRuntime::placeholder(&thread_id, now, seed_revision);
         if let Some(summary) = self
             .threads
             .iter()
@@ -2425,7 +2495,6 @@ impl RelayState {
         runtime.approval_policy = self.approval_policy.clone();
         runtime.sandbox = self.sandbox.clone();
         runtime.reasoning_effort = self.reasoning_effort.clone();
-        runtime.transcript_revision = self.transcript_revision;
         runtime.transcript = self.transcript.clone();
         runtime.apply_states = self.apply_states.clone();
         runtime.pending_approvals = self
@@ -2567,6 +2636,12 @@ impl RelayState {
         };
         let (review_activity_total, review_blocked) = self.review_activity_summary();
         let selected = self.selected_runtime();
+        // The mirror, NOT the live clock. This value is a client-side cache key, so
+        // it may only move when the transcript it describes moves; reading the clock
+        // here would churn it on every poll as unrelated background threads stream.
+        // The mirror is kept at or above the high-water mark by the transitions that
+        // would otherwise leave it at 0 (see `sync_selected_runtime_to_fields`,
+        // `clear_active_session`, `apply_persisted`).
         let transcript_revision = selected
             .map(|runtime| runtime.transcript_revision)
             .unwrap_or(self.transcript_revision);
@@ -2738,6 +2813,7 @@ impl RelayState {
         self.materialize_selected_runtime_from_fields();
         self.assign_active_controller(device_id, now);
         self.active_thread_id = Some(thread_id.clone());
+        let transcript_revision = self.next_transcript_revision();
         self.runtimes.insert(
             thread_id.clone(),
             ThreadRuntime::new(
@@ -2748,6 +2824,7 @@ impl RelayState {
                 sandbox,
                 effort,
                 now,
+                transcript_revision,
             ),
         );
         self.remember_thread_settings(&thread_id, approval_policy, sandbox, effort, model);
@@ -2783,6 +2860,7 @@ impl RelayState {
             runtime.reasoning_effort = effort.to_string();
             runtime.touch(now);
         } else {
+            let transcript_revision = self.next_transcript_revision();
             self.runtimes.insert(
                 thread_id.clone(),
                 ThreadRuntime::new(
@@ -2793,6 +2871,7 @@ impl RelayState {
                     sandbox,
                     effort,
                     now,
+                    transcript_revision,
                 ),
             );
         }
@@ -2818,6 +2897,7 @@ impl RelayState {
     ) {
         let now = unix_now();
         let thread_id = thread.id.clone();
+        let transcript_revision = self.next_transcript_revision();
         self.runtimes.insert(
             thread_id.clone(),
             ThreadRuntime::new(
@@ -2828,6 +2908,7 @@ impl RelayState {
                 sandbox,
                 effort,
                 now,
+                transcript_revision,
             ),
         );
         self.remember_thread_settings(&thread_id, approval_policy, sandbox, effort, model);
@@ -2877,6 +2958,7 @@ impl RelayState {
             return;
         }
         let now = unix_now();
+        let transcript_revision = self.next_transcript_revision();
         let runtime = ThreadRuntime::from_sync_data(
             data.clone(),
             approval_policy,
@@ -2884,6 +2966,7 @@ impl RelayState {
             effort,
             model,
             now,
+            transcript_revision,
         );
         self.runtimes.insert(thread_id.clone(), runtime);
         if remember_settings {
@@ -2979,6 +3062,7 @@ impl RelayState {
         self.materialize_selected_runtime_from_fields();
         self.assign_active_controller(device_id, now);
         self.active_thread_id = Some(thread_id.clone());
+        let transcript_revision = self.next_transcript_revision();
         let runtime = ThreadRuntime::from_sync_data(
             data.clone(),
             approval_policy,
@@ -2986,11 +3070,23 @@ impl RelayState {
             effort,
             &model_for_runtime,
             now,
+            transcript_revision,
         );
-        if let Some(existing) = self.runtimes.get_mut(&thread_id) {
-            existing.merge_fresh_history(runtime);
-        } else {
-            self.runtimes.insert(thread_id.clone(), runtime);
+        // A re-read rebuilds this thread's transcript. Whether it merges into a live
+        // runtime or replaces a dropped one, the revision must move FORWARD: a client
+        // that sees it advance repairs the gap, whereas one that sees it rewind
+        // silently discards every delta until the counter climbs back.
+        let changed = match self.runtimes.get_mut(&thread_id) {
+            Some(existing) => existing.merge_fresh_history(runtime),
+            None => {
+                self.runtimes.insert(thread_id.clone(), runtime);
+                false
+            }
+        };
+        if changed {
+            if let Some(existing) = self.runtimes.get_mut(&thread_id) {
+                existing.transcript_revision = transcript_revision;
+            }
         }
         self.remember_thread_settings(
             &thread_id,
@@ -3019,6 +3115,11 @@ impl RelayState {
         } else {
             settings.model.clone()
         };
+        // Resume the clock before drawing from it — this function restores the clock
+        // itself further down, and allocating first would seed the restored thread
+        // from a clock that has not yet caught up to its high-water mark.
+        self.transcript_clock = self.transcript_clock.max(persisted.transcript_clock);
+        let transcript_revision = self.next_transcript_revision();
         let runtime = ThreadRuntime::from_sync_data(
             data.clone(),
             &settings.approval_policy,
@@ -3026,6 +3127,7 @@ impl RelayState {
             &settings.reasoning_effort,
             &model,
             now,
+            transcript_revision,
         );
         self.runtimes.insert(thread_id.clone(), runtime);
         self.thread_settings = persisted.thread_settings.clone();
@@ -3050,6 +3152,15 @@ impl RelayState {
         {
             self.projects_revision = 1;
         }
+        // Resume the shared transcript clock at its high-water mark. `max` rather than
+        // assignment so a restore can only ever move it forward — restoring twice, or
+        // restoring an older state file over a clock that has already issued
+        // revisions, must not hand the same number out again.
+        self.transcript_clock = self.transcript_clock.max(persisted.transcript_clock);
+        // The restored active thread has no runtime yet, so the snapshot falls back
+        // to the mirror. Start it at the high-water mark rather than 0, or the first
+        // snapshot after a restart is below what a surviving client holds.
+        self.transcript_revision = self.transcript_clock;
         self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
@@ -4103,6 +4214,15 @@ impl RelayState {
         {
             self.projects_revision = 1;
         }
+        // Resume the shared transcript clock at its high-water mark. `max` rather than
+        // assignment so a restore can only ever move it forward — restoring twice, or
+        // restoring an older state file over a clock that has already issued
+        // revisions, must not hand the same number out again.
+        self.transcript_clock = self.transcript_clock.max(persisted.transcript_clock);
+        // The restored active thread has no runtime yet, so the snapshot falls back
+        // to the mirror. Start it at the high-water mark rather than 0, or the first
+        // snapshot after a restart is below what a surviving client holds.
+        self.transcript_revision = self.transcript_clock;
         self.allowed_roots = persisted.allowed_roots.clone();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
@@ -4155,7 +4275,7 @@ impl RelayState {
         self.current_tool = None;
         self.last_progress_at = None;
         self.active_flags.clear();
-        self.transcript_revision = 0;
+        self.transcript_revision = self.transcript_clock;
         self.transcript.clear();
         self.apply_states.clear();
         self.pending_approvals.clear();

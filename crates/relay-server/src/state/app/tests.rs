@@ -3397,6 +3397,10 @@ got {}",
         // Models a provider that is down: `list_threads` errors, and the merge is
         // expected to carry on with the remaining providers rather than failing.
         list_threads_should_fail: Arc<AtomicBool>,
+        // Reproduces the cold-page race: a stream event lands and builds the
+        // runtime WHILE the relay is awaiting this provider's page read, so the
+        // page the relay gets back is already stale by the time it is served.
+        advance_runtime_during_page_read: Arc<AtomicBool>,
     }
 
     impl RecordingProvider {
@@ -3425,6 +3429,7 @@ got {}",
                 consumes_initial_prompt: Arc::new(AtomicBool::new(false)),
                 start_turn_should_fail: Arc::new(AtomicBool::new(false)),
                 list_threads_should_fail: Arc::new(AtomicBool::new(false)),
+                advance_runtime_during_page_read: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -3582,6 +3587,22 @@ got {}",
             thread_id: &str,
             before: Option<usize>,
         ) -> Result<Option<crate::provider::ThreadTranscriptPageData>, String> {
+            if self
+                .advance_runtime_during_page_read
+                .load(Ordering::Relaxed)
+            {
+                // A live event arrives while the relay is parked on this await.
+                let mut relay = self.state.write().await;
+                relay.upsert_transcript_item_for_thread(
+                    thread_id,
+                    "live-entry".to_string(),
+                    crate::protocol::TranscriptEntryKind::AgentText,
+                    Some("streamed while the page read was in flight".to_string()),
+                    "completed".to_string(),
+                    Some("live-turn".to_string()),
+                    None,
+                );
+            }
             Ok(self
                 .transcript_pages
                 .lock()
@@ -4449,6 +4470,158 @@ got {}",
                 .as_ref()
                 .and_then(|summary| summary.name.clone()),
             expected_name
+        );
+    }
+
+    /// A transcript page must report the revision of the runtime it was built
+    /// from. The paged provider-history branch used to hard-code 0 while its
+    /// sibling branches read the runtime — invisible only for as long as a fresh
+    /// runtime also started at 0. A client that adopts a page revision of 0 for a
+    /// runtime sitting at N then rejects every delta as stale.
+    #[tokio::test]
+    async fn a_cold_paged_transcript_page_reports_the_runtimes_revision() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, _codex, claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = claude.thread_summary("claude-paged-revision", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(thread.id.clone(), thread.clone());
+        {
+            let mut pages = claude.transcript_pages.lock().await;
+            pages.insert(
+                (thread.id.clone(), None),
+                crate::provider::ThreadTranscriptPageData {
+                    sync: crate::provider::ThreadSyncData {
+                        thread: thread.clone(),
+                        status: "idle".to_string(),
+                        active_flags: Vec::new(),
+                        transcript: vec![crate::protocol::TranscriptEntryView {
+                            item_id: Some("tail".to_string()),
+                            kind: crate::protocol::TranscriptEntryKind::AgentText,
+                            text: Some("tail".to_string()),
+                            status: "completed".to_string(),
+                            turn_id: Some("tail".to_string()),
+                            tool: None,
+                            content_state: crate::protocol::TranscriptContentState::Full,
+                        }],
+                    },
+                    prev_cursor: Some(123),
+                    paged: true,
+                },
+            );
+        }
+        app.relay.write().await.threads = vec![thread.clone()];
+
+        let tail = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: thread.id.clone(),
+                cursor: None,
+                before: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("cold tail page");
+        assert_eq!(
+            tail.prev_cursor,
+            Some(123),
+            "precondition: took the paged branch"
+        );
+
+        let relay = app.relay.read().await;
+        let runtime_revision = relay
+            .runtime_for_thread(&thread.id)
+            .expect("paged runtime")
+            .transcript_revision;
+        assert!(
+            runtime_revision > 0,
+            "precondition: the hydrated runtime drew a revision from the shared clock"
+        );
+        assert_eq!(
+            tail.revision, runtime_revision,
+            "the page claims revision {} but the runtime it was built from is at {}",
+            tail.revision, runtime_revision
+        );
+    }
+
+    /// A page's `revision` is a claim about WHICH state its entries came from.
+    /// `runtime_missing` is decided before the provider await, so a stream event can
+    /// build and advance the runtime while that read is in flight. Serving the now
+    /// stale provider entries under the runtime's current revision tells the client
+    /// "you are caught up at R" while withholding what R actually contains — and
+    /// because the chain then lines up, no gap repair ever fires.
+    #[tokio::test]
+    async fn a_cold_page_that_lost_the_hydration_race_does_not_claim_a_revision_it_does_not_cover()
+    {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, _codex, claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = claude.thread_summary("claude-raced-thread", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(thread.id.clone(), thread.clone());
+        {
+            let mut pages = claude.transcript_pages.lock().await;
+            pages.insert(
+                (thread.id.clone(), None),
+                crate::provider::ThreadTranscriptPageData {
+                    sync: crate::provider::ThreadSyncData {
+                        thread: thread.clone(),
+                        status: "idle".to_string(),
+                        active_flags: Vec::new(),
+                        transcript: vec![crate::protocol::TranscriptEntryView {
+                            item_id: Some("stale-tail".to_string()),
+                            kind: crate::protocol::TranscriptEntryKind::AgentText,
+                            text: Some("stale".to_string()),
+                            status: "completed".to_string(),
+                            turn_id: Some("stale-tail".to_string()),
+                            tool: None,
+                            content_state: crate::protocol::TranscriptContentState::Full,
+                        }],
+                    },
+                    prev_cursor: Some(123),
+                    paged: true,
+                },
+            );
+        }
+        app.relay.write().await.threads = vec![thread.clone()];
+        claude
+            .advance_runtime_during_page_read
+            .store(true, Ordering::Relaxed);
+
+        let page = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: thread.id.clone(),
+                cursor: None,
+                before: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("cold tail page");
+
+        let runtime_revision = {
+            let relay = app.relay.read().await;
+            relay
+                .runtime_for_thread(&thread.id)
+                .expect("runtime")
+                .transcript_revision
+        };
+        let covers_live_entry = page
+            .entries
+            .iter()
+            .any(|entry| entry.item_id.as_deref() == Some("live-entry"));
+        assert!(
+            page.revision < runtime_revision || covers_live_entry,
+            "the page claims revision {} (runtime is at {runtime_revision}) but omits              the entry that revision includes; the client would believe it is caught              up and never repair",
+            page.revision
         );
     }
 

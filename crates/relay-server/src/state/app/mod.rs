@@ -368,6 +368,30 @@ impl AppState {
             relay.notify();
         }
 
+        // Reserve the transcript clock on disk BEFORE anything can issue a revision.
+        //
+        // The headroom in `PersistedRelayState::from_relay` only protects the run
+        // that wrote it. Without this, a relay that restores, hands out revisions,
+        // and then dies before its own first debounced save leaves the file still
+        // holding the PREVIOUS run's value — so the next start reads the same number
+        // and hands the same revisions out a second time. Awaited, and ahead of
+        // `spawn_providers`, so the file leads before any event can arrive.
+        //
+        // Best-effort: a relay that cannot write its state file still has to run.
+        if restored_state.is_some() {
+            let reserved = {
+                let relay = relay.read().await;
+                PersistedRelayState::from_relay(&relay)
+            };
+            if let Err(error) = persistence.save(&reserved).await {
+                let mut relay = relay.write().await;
+                relay.push_log(
+                    "warn",
+                    format!("failed to reserve transcript clock on startup: {error}"),
+                );
+            }
+        }
+
         {
             let mut relay = relay.write().await;
             relay.push_log("info", security.summary());
