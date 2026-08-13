@@ -905,8 +905,15 @@ test("the compact row is opt-in — the transcript keeps its original card marku
 
   const transcript = renderToStaticMarkup(React.createElement(FileChangeDiff, { tool }));
   assert.doesNotMatch(transcript, /diff-file-glyph/, "the transcript card gains no glyph column");
-  assert.doesNotMatch(transcript, /diff-file-dir/, "the transcript card keeps one whole path");
-  assert.match(transcript, /<strong class="diff-file-section-name">src\/deep\/a\.txt<\/strong>/);
+  // This assertion used to be the opposite — "the transcript card keeps one
+  // whole path". That was a real decision, and it was right for the surface it
+  // was made on: a 760px desktop column shows these paths in full, so splitting
+  // them bought nothing. It stopped being right on remote, where the column
+  // relaxes to the viewport and `.diff-file-section-name` ellipsised from the
+  // END, dropping the basename first. Both surfaces now use the rail's split.
+  // The glyph column above stays rail-only: that one IS just for the rail.
+  assert.match(transcript, /diff-file-dir[^>]*>src\/deep\/</);
+  assert.match(transcript, /diff-file-base[^>]*>a\.txt</);
 });
 
 // Which half of the path survives a narrow rail is a design decision, not an

@@ -13,6 +13,7 @@ import {
   observeElementRect,
 } from "@tanstack/virtual-core";
 import { CHECK_SVG, COPY_SVG, FORK_SVG, SPARKLES_SVG } from "../svg.js";
+import { approvalKindLabel } from "./approval-labels.js";
 import { providerIconSvg } from "./provider-icons.js";
 import { computeForkableItemIds, isForkableEntry } from "./transcript-fork.js";
 import {
@@ -82,11 +83,22 @@ function commandExpandKey(itemId) {
   return itemId ? `command:${itemId}` : "";
 }
 
-function transcriptEntryDomAttrs(entry, className, extras = null, { justPrepended = false } = {}) {
+// `inGroup` marks an entry that is being shown because the user opened a tool
+// or reasoning group above it. It only paints: the entry keeps its own article,
+// its own item id and its own place in the flat node list, because that list is
+// what the virtualizer measures and what scroll anchoring addresses. See
+// frontend/transcript-group-rail.test.mjs.
+function transcriptEntryDomAttrs(
+  entry,
+  className,
+  extras = null,
+  { justPrepended = false, inGroup = false } = {}
+) {
   const itemId = entry?.item_id || entry?.id || "";
-  const finalClassName = justPrepended
-    ? `${className} chat-message-just-prepended`
-    : className;
+  let finalClassName = inGroup ? `${className} is-group-member` : className;
+  if (justPrepended) {
+    finalClassName = `${finalClassName} chat-message-just-prepended`;
+  }
   return {
     className: finalClassName,
     ...(itemId ? { "data-transcript-entry-id": itemId } : {}),
@@ -277,7 +289,7 @@ function AgentEntryImpl({ entry, isJustPrepended = false, isForkable = false, pr
 
 const AgentEntry = React.memo(AgentEntryImpl);
 
-function CommandEntry({ entry, isJustPrepended = false, options = null }) {
+function CommandEntry({ entry, isJustPrepended = false, options = null, inGroup = false }) {
   const itemId = entry.item_id || "";
   const expandKey = itemId ? `entry:${itemId}` : commandExpandKey(itemId);
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
@@ -290,6 +302,7 @@ function CommandEntry({ entry, isJustPrepended = false, options = null }) {
     "article",
     transcriptEntryDomAttrs(entry, "chat-message chat-message-system", null, {
       justPrepended: isJustPrepended,
+      inGroup,
     }),
     h(
       "div",
@@ -320,12 +333,13 @@ function CommandEntry({ entry, isJustPrepended = false, options = null }) {
   );
 }
 
-function ReasoningEntryImpl({ entry, isJustPrepended = false }) {
+function ReasoningEntryImpl({ entry, isJustPrepended = false, inGroup = false }) {
   const hasText = Boolean(String(entry.text || "").trim());
   return h(
     "article",
     transcriptEntryDomAttrs(entry, "chat-message chat-message-system", null, {
       justPrepended: isJustPrepended,
+      inGroup,
     }),
     h(
       "div",
@@ -548,7 +562,18 @@ function FileDiffSection({
       h(
         "div",
         { className: "diff-file-section-primary" },
-        h("strong", { className: "diff-file-section-name" }, displayPath),
+        // Same dir/base split as the rail. This used to be one flat string,
+        // deliberately — which held while the transcript column was wide enough
+        // to show a path whole. On remote the column relaxes to the viewport
+        // and `.diff-file-section-name` ellipsises from the END, so the
+        // basename — the thing actually being scanned for — was the first part
+        // to disappear. See frontend/shared/diff-file-name.test.mjs.
+        h(
+          "span",
+          { className: "diff-file-section-name" },
+          dir ? h("span", { className: "diff-file-dir" }, dir) : null,
+          h("span", { className: "diff-file-base" }, base)
+        ),
         added > 0 ? h("span", { className: "file-change-chip-add" }, `+${added}`) : null,
         removed > 0 ? h("span", { className: "file-change-chip-del" }, `-${removed}`) : null
       )
@@ -1260,7 +1285,7 @@ function AskUserQuestionStep({
   );
 }
 
-function GenericToolEntry({ entry, isJustPrepended = false, options = null }) {
+function GenericToolEntry({ entry, isJustPrepended = false, options = null, inGroup = false }) {
   const itemId = entry.item_id || "";
   const expandKey = itemId ? `entry:${itemId}` : "";
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
@@ -1309,7 +1334,7 @@ function GenericToolEntry({ entry, isJustPrepended = false, options = null }) {
       entry,
       `chat-message chat-message-system chat-message-tool${isFileChange ? " chat-message-file-change" : ""}`,
       null,
-      { justPrepended: isJustPrepended }
+      { justPrepended: isJustPrepended, inGroup }
     ),
     h(
       "div",
@@ -1409,13 +1434,13 @@ function GenericToolEntry({ entry, isJustPrepended = false, options = null }) {
   );
 }
 
-function ToolEntry({ entry, isJustPrepended = false, options = null }) {
+function ToolEntry({ entry, isJustPrepended = false, options = null, inGroup = false }) {
   const detailEntry = resolveTranscriptDetailEntry(entry, options);
   const tool = (detailEntry || entry)?.tool || entry?.tool || {};
   if (isAskUserQuestionTool(tool)) {
     return h(AskUserEntry, { entry, isJustPrepended, options });
   }
-  return h(GenericToolEntry, { entry, isJustPrepended, options });
+  return h(GenericToolEntry, { entry, isJustPrepended, options, inGroup });
 }
 
 // A turn that ended in failure. The relay injects this (kind "error", status
@@ -1892,6 +1917,7 @@ export function TranscriptEntry({
   isJustPrepended = false,
   isLatestUser = false,
   options = null,
+  inGroup = false,
 }) {
   // An omitted-content entry must never render its clipped shell or an
   // "(empty)" body — show the unified loading placeholder until hydration
@@ -1918,13 +1944,13 @@ export function TranscriptEntry({
     });
   }
   if (kind === "command") {
-    return h(CommandEntry, { entry, isJustPrepended, options });
+    return h(CommandEntry, { entry, isJustPrepended, options, inGroup });
   }
   if (kind === "tool_call") {
-    return h(ToolEntry, { entry, isJustPrepended, options });
+    return h(ToolEntry, { entry, isJustPrepended, options, inGroup });
   }
   if (kind === "reasoning") {
-    return h(ReasoningEntry, { entry, isJustPrepended });
+    return h(ReasoningEntry, { entry, isJustPrepended, inGroup });
   }
   if (kind === "error") {
     return h(ErrorEntry, { entry, isJustPrepended });
@@ -1937,6 +1963,7 @@ export function ApprovalCard({ approval, options = null }) {
   const approvalCommandExpandKey = approval.request_id ? `approval:${approval.request_id}:command` : "";
   const contextExpandKey = approval.request_id ? `approval:${approval.request_id}:context` : "";
   const permissionsExpandKey = approval.request_id ? `approval:${approval.request_id}:permissions` : "";
+  const approvalKind = approvalKindLabel(approval.kind);
 
   return h(
     "article",
@@ -1951,13 +1978,35 @@ export function ApprovalCard({ approval, options = null }) {
         "div",
         { className: "message-meta" },
         h("strong", null, "Approval required"),
-        h("span", null, approval.kind)
+        // Named in words, and in its own element: printing the wire enum here
+        // put "command_execution" on screen, run into the label because
+        // `.message-meta` is not a flex row. See frontend/approval-card.test.mjs.
+        approvalKind
+          ? h("span", { className: "approval-kind" }, approvalKind)
+          : null
       ),
       h("h3", { className: "approval-title" }, approval.summary),
       // No provider name: the card carries no provider field, and guessing one
       // told every non-Codex user their agent was Codex.
       h("p", { className: "approval-copy" }, approval.detail || "The agent is waiting for a remote approval."),
-      approval.cwd ? h("p", { className: "approval-copy" }, `cwd: ${approval.cwd}`) : null,
+      // The working directory is the best available answer to "what can this
+      // touch", so it reads as scope rather than as a third line of prose in
+      // the same style as the explanation above it.
+      approval.cwd
+        ? h(
+            "div",
+            { className: "approval-scope" },
+            h(
+              "span",
+              // The exact value, not just the field name: this is the blast
+              // radius of a decision being authorised, so it has to stay
+              // recoverable even where the layout is tightest.
+              { className: "approval-scope-chip", title: `Working directory: ${approval.cwd}` },
+              h("span", { className: "approval-scope-label" }, "cwd"),
+              h("span", { className: "approval-scope-path" }, approval.cwd)
+            )
+          )
+        : null,
       approval.command
         ? h(ExpandableBlock, {
             className: "message-pre",
@@ -2210,6 +2259,9 @@ export function TranscriptContent({
           nodes.push(
             h(TranscriptEntry, {
               entry: memberEntry,
+              // Painted as a rail row: this member is on screen only because
+              // the group chip above it is open.
+              inGroup: true,
               isJustPrepended: Boolean(memberId && justPrependedItemIds.has(memberId)),
               isLatestUser: false,
               key:
@@ -2237,6 +2289,9 @@ export function TranscriptContent({
           nodes.push(
             h(TranscriptEntry, {
               entry: memberEntry,
+              // Painted as a rail row: this member is on screen only because
+              // the group chip above it is open.
+              inGroup: true,
               isJustPrepended: Boolean(memberId && justPrependedItemIds.has(memberId)),
               isLatestUser: false,
               key:

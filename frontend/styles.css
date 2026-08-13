@@ -279,6 +279,16 @@ html, body {
   min-height: 100%;
   width: 100%;
   overflow-x: clip;
+  /* Mobile WebKit otherwise picks its own font multiplier for any scroll
+   * container much wider than the viewport, and applies it to that block
+   * alone. `.diff-line { min-width: max-content }` makes every diff row far
+   * wider than a phone, so the diff view got silently enlarged while the text
+   * around it stayed put — the "remote font randomly gets bigger" report. The
+   * viewport meta stops Android font boosting but not this; only
+   * text-size-adjust does. Kept at the root so the next wide scroller cannot
+   * reintroduce it. See frontend/text-autosize-guard.test.mjs. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
@@ -2185,6 +2195,18 @@ input:focus, textarea:focus, select:focus {
   flex: none;
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+/* "Finished, but the lead hasn't read it yet" — the state that keeps a 3/3 run
+ * from advancing. Warn-toned because it is something waiting on someone, not an
+ * error: the sub-task itself succeeded. */
+.task-subtask-digest {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  font-size: var(--text-xs);
+  white-space: nowrap;
 }
 .task-unresolved ul {
   margin: 0;
