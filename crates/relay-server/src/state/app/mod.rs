@@ -23,12 +23,12 @@ use crate::{
         PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
         ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
         ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
-        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-        SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput,
-        TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
-        ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView, ThreadTranscriptResponse,
-        ThreadsResponse, ToolCallView, TranscriptDeltaEvent, UpdateSessionSettingsInput,
-        WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
+        RepairWorkspaceInput, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput,
+        SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput,
+        SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
+        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView,
+        ThreadTranscriptResponse, ThreadsResponse, ToolCallView, TranscriptDeltaEvent,
+        UpdateSessionSettingsInput, WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -807,6 +807,31 @@ in thread {thread_id}: {error}"
     async fn expire_stale_controller_if_needed(&self) {
         let mut relay = self.relay.write().await;
         expire_controller_if_needed(&mut relay);
+    }
+
+    /// Re-decide whether a thread's workspace is still on disk, and park the answer on
+    /// its runtime for the lock-held readers (`snapshot`, `read_loaded_thread_state`).
+    ///
+    /// The `stat` happens HERE, on an async path with no relay lock held, and only where
+    /// the workspace was about to be used anyway: opening a thread, resuming one, sending
+    /// into one, repairing one. That is what keeps a blocking filesystem call off the
+    /// notify path — see `ThreadRuntime::workspace_missing`.
+    pub(super) async fn refresh_workspace_verdict(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+    ) -> Option<crate::protocol::WorkspaceRepairView> {
+        let verdict = worktree::plan_workspace_repair(cwd);
+        let mut relay = self.relay.write().await;
+        let runtime = relay.ensure_runtime_for_thread(thread_id);
+        if runtime.workspace_missing == verdict {
+            return verdict;
+        }
+        runtime.workspace_missing = verdict.clone();
+        // A change either raises the banner or takes it down; both are things every
+        // attached surface has to repaint for.
+        relay.notify();
+        verdict
     }
 
     async fn ensure_thread_runtime_loaded(

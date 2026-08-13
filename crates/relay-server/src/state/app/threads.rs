@@ -375,6 +375,64 @@ impl AppState {
     ///     agent for the relay-wide lease, and must work while a turn is running;
     ///   * an id that is not currently loaded into the thread list is still renamable;
     ///   * a reviewer thread is not, because it is hidden from navigation entirely.
+    /// Make a thread's vanished workspace exist again, at the exact path it recorded.
+    ///
+    /// Nothing here tries to be clever about WHERE: a Claude session is archived under the
+    /// project directory derived from its cwd and `resume` resolves through that same
+    /// derivation, so a session resumed from any other directory fails with a bare "an
+    /// error occurred during execution". Re-creating the recorded path is not one repair
+    /// among several — it is the only one that works.
+    pub async fn repair_thread_workspace(
+        &self,
+        thread_id: &str,
+        input: RepairWorkspaceInput,
+    ) -> Result<SessionSnapshot, String> {
+        let device_id = require_device_id(input.device_id)?;
+        let (recorded, device_scope, allowed_roots) = {
+            let relay = self.relay.read().await;
+            (
+                relay
+                    .thread_cwd(thread_id)
+                    .ok_or_else(|| format!("thread `{thread_id}` has no workspace on record"))?,
+                relay.device_path_scope(&device_id),
+                relay.allowed_roots.clone(),
+            )
+        };
+        let Some(plan) = super::worktree::plan_workspace_repair(&recorded) else {
+            // Idempotent on purpose. There is a real gap between the verdict a surface was
+            // shown and the press that follows it — another device may have repaired it,
+            // the user may have re-created the directory by hand, two taps may race — and
+            // in every one of those the postcondition the caller asked for already holds.
+            // Reporting failure there puts an error on a button that worked.
+            self.refresh_workspace_verdict(thread_id, &recorded).await;
+            return Ok(self.snapshot().await);
+        };
+
+        // Every tree the repair touches is scope-checked before the first mutation, so a
+        // refusal leaves the repository exactly as it was. The scope is read once, above,
+        // rather than re-locking the relay inside the guard: the guard is held across
+        // awaits, and taking the lock there would deadlock the snapshot at the end.
+        let guard =
+            move |path: &str| ensure_path_within_device_scope(path, &device_scope, &allowed_roots);
+        super::worktree::repair_workspace(&plan, &guard).await?;
+        // The directory is back: re-decide now rather than leaving the banner up until
+        // something else happens to look.
+        self.refresh_workspace_verdict(thread_id, &recorded).await;
+
+        {
+            let mut relay = self.relay.write().await;
+            relay.push_log(
+                "info",
+                format!(
+                    "Re-created the {} workspace {} for thread {thread_id}.",
+                    plan.kind, plan.recorded_cwd
+                ),
+            );
+            relay.notify();
+        }
+        Ok(self.snapshot().await)
+    }
+
     pub async fn rename_thread(
         &self,
         thread_id: &str,

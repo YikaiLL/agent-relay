@@ -223,15 +223,31 @@ export function DeviceMetaPanel({ model }) {
   );
 }
 
-export function ControlBanner({ model, onTakeOver = null }) {
+export function ControlBanner({ model, onRepairWorkspace = null, onTakeOver = null }) {
   if (model.hidden) {
     return null;
   }
 
+  // `{ label, pending, error, kind, threadId }` when the viewed thread's workspace is
+  // gone — see remote/workspace-repair.js. The banner is one slot, so this and Take over
+  // are mutually exclusive by construction: the model never offers both.
+  const repair = model.repair || null;
+
   return h(
     React.Fragment,
     null,
-    h("span", { className: "control-summary" }, model.summary),
+    h(
+      "span",
+      {
+        className: "control-summary",
+        // The summary carries a recorded cwd shortened from the middle to survive a
+        // phone; this puts the whole path back within reach.
+        title: model.summaryTitle || undefined,
+      },
+      model.summary
+    ),
+    // Stays mounted (hidden) rather than swapped out, so nothing that resolves
+    // `#remote-take-over-button` loses its element when the repair banner takes over.
     h(
       "button",
       {
@@ -242,7 +258,36 @@ export function ControlBanner({ model, onTakeOver = null }) {
         type: "button",
       },
       "Take over"
-    )
+    ),
+    repair
+      ? h(
+        "button",
+        {
+          className: "control-button",
+          disabled: repair.pending,
+          id: "remote-workspace-repair-button",
+          onClick: () => onRepairWorkspace?.(repair.threadId),
+          type: "button",
+        },
+        repair.label
+      )
+      : null,
+    // Which branch comes back with the worktree, or what re-creating a folder buys. Only
+    // the repair banner shows a hint line — the compact bar has no room otherwise.
+    // `flexBasis` inline because the banner's own class has no full-width hint rule.
+    repair
+      ? h(
+        "p",
+        { className: "control-hint", style: { flexBasis: "100%", margin: 0 } },
+        model.hint
+      )
+      : null,
+    // The relay's own failure text, verbatim, on its own line. Swallowing it would put
+    // the user back where this change started: an action that stops working with nothing
+    // on screen to say why.
+    repair?.error
+      ? h("p", { className: "control-banner-error", role: "alert" }, repair.error)
+      : null
   );
 }
 

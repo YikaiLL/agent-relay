@@ -95,6 +95,7 @@ fn make_snapshot() -> SessionSnapshot {
         active_flags: vec![],
         thread_activity: vec![],
         current_cwd: "/tmp/project".to_string(),
+        workspace_missing: None,
         model: "gpt-5.4".to_string(),
         available_models: vec![],
         approval_policy: "untrusted".to_string(),

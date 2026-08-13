@@ -984,3 +984,147 @@ test("start emits an actionable error (no crash) when the native binary is broke
     await worker.close();
   }
 });
+
+// ── workspace cwd preflight ──────────────────────────────────────────────────
+// A thread keeps the cwd it was born in forever, but that directory can be
+// REMOVED (a `git worktree` deleted once its work landed). Spawning into a
+// missing cwd fails with a bare ENOENT, which the real SDK misreports as a
+// NATIVE BINARY problem:
+//
+//   "Claude Code native binary at .../claude exists but failed to launch. This
+//    usually means the binary does not match this system's libc ..."
+//
+// That message sends anyone debugging it at the install instead of at the
+// vanished directory. The worker must refuse BEFORE the SDK is asked to spawn,
+// naming the path. These tests run through the fake-SDK seam on purpose: the cwd
+// is real filesystem state whatever SDK module is loaded, so the preflight must
+// hold there too (unlike the native-binary check, which has nothing to vet).
+
+async function removedWorkspace() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sealwire-gone-"));
+  await rm(dir, { recursive: true, force: true });
+  return dir;
+}
+
+function assertNamesMissingWorkspace(message, dir) {
+  assert.ok(
+    message.includes(dir),
+    `error must name the missing workspace ${dir}, got: ${message}`,
+  );
+  assert.match(message, /no longer exists/);
+  // Never the SDK's misleading native-binary story.
+  assert.doesNotMatch(message, /libc|pathToClaudeCodeExecutable|native binary/i);
+}
+
+test("start into a removed workspace names the directory, not the binary", async () => {
+  const gone = await removedWorkspace();
+  const worker = spawnWorker();
+  try {
+    worker.send({ ...START_DEFAULT, cwd: gone });
+    const res = await worker.waitFor(isErrorResponseFor("start-1"), {
+      label: "start error response",
+    });
+    assertNamesMissingWorkspace(res.error.message, gone);
+    assert.equal(
+      worker.queries().length,
+      0,
+      "the preflight must run BEFORE the SDK is asked to spawn anything",
+    );
+  } finally {
+    await worker.close();
+  }
+});
+
+test("resume into a removed workspace names the directory", async () => {
+  const gone = await removedWorkspace();
+  const worker = spawnWorker();
+  try {
+    worker.send({
+      type: "resume",
+      id: "resume-1",
+      provider_session_id: "sess-gone",
+      cwd: gone,
+      prompt: "pick this back up",
+    });
+    const res = await worker.waitFor(isErrorResponseFor("resume-1"), {
+      label: "resume error response",
+    });
+    assertNamesMissingWorkspace(res.error.message, gone);
+    assert.equal(worker.queries().length, 0, "resume must not reach the SDK");
+  } finally {
+    await worker.close();
+  }
+});
+
+test("model/list against a removed workspace names the directory", async () => {
+  const gone = await removedWorkspace();
+  const worker = spawnWorker();
+  try {
+    worker.send({ type: "model/list", id: "models-gone", cwd: gone });
+    const res = await worker.waitFor(isErrorResponseFor("models-gone"), {
+      label: "model/list error response",
+    });
+    assertNamesMissingWorkspace(res.error.message, gone);
+    assert.equal(worker.queries().length, 0, "model/list must not reach the SDK");
+  } finally {
+    await worker.close();
+  }
+});
+
+test("send into a removed workspace reports the missing directory", async () => {
+  const gone = await removedWorkspace();
+  const worker = spawnWorker();
+  try {
+    worker.send({
+      type: "send",
+      provider_session_id: "sess-gone",
+      cwd: gone,
+      permissionMode: "default",
+      prompt: "keep going",
+    });
+    const err = await worker.waitFor((event) => event.type === "error", {
+      label: "send error event",
+    });
+    assertNamesMissingWorkspace(err.message, gone);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("a cwd that is a FILE fails like a missing workspace", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sealwire-file-cwd-"));
+  const filePath = path.join(dir, "not-a-directory");
+  await writeFile(filePath, "i am a file\n");
+  const worker = spawnWorker();
+  try {
+    worker.send({ ...START_DEFAULT, cwd: filePath });
+    const res = await worker.waitFor(isErrorResponseFor("start-1"), {
+      label: "start error response",
+    });
+    assertNamesMissingWorkspace(res.error.message, filePath);
+    assert.equal(worker.queries().length, 0, "a file cwd must not reach the SDK");
+  } finally {
+    await worker.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an absent cwd still means 'use the worker's own cwd' (not a failure)", async () => {
+  const worker = spawnWorker();
+  try {
+    // No `cwd` key at all, and an explicitly empty one: both are existing valid
+    // cases the preflight must leave alone.
+    worker.send({ ...START_DEFAULT, cwd: undefined });
+    await worker.waitFor(isStarted("sess-1"), { label: "session_started (no cwd)" });
+    await worker.waitFor(isDone, { label: "done (no cwd)" });
+
+    worker.send({ type: "model/list", id: "models-empty-cwd", cwd: "" });
+    const res = await worker.waitFor(
+      (event) => event.type === "response" && event.id === "models-empty-cwd",
+      { label: "model/list response (empty cwd)" },
+    );
+    assert.equal(res.ok, true, `empty cwd must stay valid, got ${JSON.stringify(res)}`);
+  } finally {
+    await worker.close();
+  }
+});

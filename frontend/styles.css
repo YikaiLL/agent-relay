@@ -3071,11 +3071,32 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* Wraps only so the workspace-repair failure below can take a full line of its
+   * own; summary + button still share the first line. */
+  flex-wrap: wrap;
   gap: 12px;
   animation: none;
   font-size: var(--text-ui);
 }
 .control-summary { margin: 0; font-weight: var(--weight-medium); font-size: var(--text-ui); color: var(--text-primary); }
+/* The workspace-repair summary carries a full recorded cwd, which is routinely
+ * wider than the bar. Keep the banner one line and let the element ellipsize —
+ * the whole path stays reachable through its `title`. */
+.control-banner-compact .control-summary {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.control-banner-error {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--err-fg);
+  overflow-wrap: anywhere;
+}
 .control-hint { margin: 4px 0 0; font-size: var(--text-sm); color: var(--text-secondary); overflow-wrap: anywhere; }
 .control-banner-compact .control-button {
   font-size: var(--text-sm);

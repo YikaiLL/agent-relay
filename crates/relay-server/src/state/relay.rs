@@ -2623,6 +2623,10 @@ impl RelayState {
         let current_cwd = selected
             .map(|runtime| runtime.current_cwd.clone())
             .unwrap_or_else(|| self.current_cwd.clone());
+        // A field read, never a `stat`: see `ThreadRuntime::workspace_missing`. This
+        // function runs under the relay lock on every notify, and a blocking filesystem
+        // call here would stall every session rather than one banner.
+        let workspace_missing = selected.and_then(|runtime| runtime.workspace_missing.clone());
         let model = selected
             .map(|runtime| runtime.model.clone())
             .unwrap_or_else(|| self.model.clone());
@@ -2691,6 +2695,7 @@ impl RelayState {
             active_flags,
             thread_activity: self.thread_activity_view(),
             current_cwd,
+            workspace_missing,
             model,
             available_models: self.available_models.clone(),
             approval_policy,

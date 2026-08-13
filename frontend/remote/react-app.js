@@ -2220,6 +2220,11 @@ function RemoteApp() {
           onTakeOver() {
             void handlers.onTakeOver();
           },
+          // The banner passes the thread it is describing, not "the current one": a
+          // repair must target the session whose path the user just read.
+          onRepairWorkspace(threadId) {
+            void handlers.onRepairWorkspace?.(threadId);
+          },
           onUpdateSessionSettings(payload) {
             const provider = session?.provider;
             if (provider && payload) {
@@ -2922,6 +2927,7 @@ function RemoteThreadPanel({
   onEnsureFileChangeDetail,
   onSubmitDecision,
   onSubmitAskUserAnswers,
+  onRepairWorkspace,
   onTakeOver,
   onUpdateSessionSettings,
   pendingAskUserQuestions,
@@ -3003,6 +3009,7 @@ function RemoteThreadPanel({
       },
       h(ControlBanner, {
         model: controlBannerModel,
+        onRepairWorkspace,
         onTakeOver,
       })
     ),
