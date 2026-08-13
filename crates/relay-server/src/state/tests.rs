@@ -283,6 +283,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             active_flags: Vec::new(),
             thread_activity: Vec::new(),
             current_cwd: "/tmp/project".to_string(),
+            workspace_missing: None,
             model: DEFAULT_MODEL.to_string(),
             available_models: Vec::new(),
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),

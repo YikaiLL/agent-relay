@@ -89,19 +89,19 @@ export function createTranscriptController(ctx) {
   });
 
   async function fetchTranscriptPage(threadId, { before = null } = {}) {
-    if (!queryClient) {
-      return fetchCachedTranscriptPage({ threadId, before });
-    }
+    const page = queryClient
+      ? await queryClient.fetchQuery(
+        createThreadTranscriptPageQueryOptions({
+          before,
+          fetchPage: fetchCachedTranscriptPage,
+          scope: "local",
+          surface: "local",
+          threadId,
+        })
+      )
+      : await fetchCachedTranscriptPage({ threadId, before });
 
-    return queryClient.fetchQuery(
-      createThreadTranscriptPageQueryOptions({
-        before,
-        fetchPage: fetchCachedTranscriptPage,
-        scope: "local",
-        surface: "local",
-        threadId,
-      })
-    );
+    return page;
   }
 
   async function ensureConversationTranscript(session = state.session) {

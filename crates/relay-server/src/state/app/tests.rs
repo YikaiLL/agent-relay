@@ -4127,7 +4127,13 @@ got {}",
         // what the healed thread inherits. Healing binds the strictest policy
         // instead, and the snapshot says so, so the UI cannot claim write
         // access the thread does not have.
-        let app = build_fake_codex_app("/tmp/project").await;
+        // A REAL directory, not a stand-in path: a send now refuses a workspace that is
+        // not on disk (see `a_send_into_a_vanished_workspace_is_refused_visibly_…`), so a
+        // fixture cwd that never existed would exercise that refusal instead of the
+        // cold-hydration heal this test is about.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = build_fake_codex_app(&cwd).await;
         pair_device(&app, "device-1", Vec::new()).await;
         let thread_id = "thread-imported";
         {
@@ -4139,7 +4145,7 @@ got {}",
                 id: thread_id.to_string(),
                 name: Some("imported codex thread".to_string()),
                 preview: String::new(),
-                cwd: "/tmp/project".to_string(),
+                cwd: cwd.clone(),
                 updated_at: unix_now(),
                 source: "codex".to_string(),
                 status: "idle".to_string(),
@@ -4148,6 +4154,13 @@ got {}",
                 forked_from: None,
                 renamed: false,
             }];
+            // The runtime carries the live cwd too, so the send reads it from here rather
+            // than from `thread/read`. The fake app-server answers every read with a
+            // hardcoded `/tmp/project` (208 fixtures in this crate lean on that string),
+            // and a send now refuses a workspace that is not on disk — so without this the
+            // test would exercise the vanished-workspace refusal instead of the cold
+            // hydration heal it exists to pin.
+            relay.ensure_runtime_for_thread(thread_id).current_cwd = cwd.clone();
         }
 
         let snapshot = app
@@ -9074,6 +9087,343 @@ got {}",
                 "a blank query ({blank:?}) must behave as no query at all"
             );
         }
+    }
+
+    /// A thread carries the cwd it was born in forever, and that directory can stop
+    /// existing — an agent `git worktree` is removed once its work lands, and the thread
+    /// that lived in it keeps pointing at the vanished path.
+    ///
+    /// What that used to do: the send reached the provider, the provider spawned into a
+    /// path with no inode, and the OS answered ENOENT — which the Claude SDK reports as
+    /// "native binary exists but failed to launch … musl/glibc mismatch", a message that
+    /// sends anyone reading it in completely the wrong direction. Nothing landed in the
+    /// transcript at all, so the user saw their own message and then silence, and pressing
+    /// it again did the same thing. That is the "一直被中断，按继续也没用" report.
+    ///
+    /// So the workspace is checked BEFORE the provider is asked to do anything, and the
+    /// refusal is written where the user is already looking: the transcript.
+    #[tokio::test]
+    async fn a_send_into_a_vanished_workspace_is_refused_visibly_instead_of_reaching_the_provider()
+    {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(thread.id.clone());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+
+        // The workspace disappears the way `git worktree remove` takes one out.
+        drop(project);
+
+        let error = app
+            .send_message(SendMessageInput {
+                text: "继续".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .expect_err(
+                "the send must FAIL, so the composer keeps the draft: both surfaces clear \
+                 their input and drop image attachments on success, and a message recorded \
+                 here reached no provider — a later \"continue\" would be continuing from \
+                 something the agent never saw",
+            );
+        assert!(
+            error.contains(&cwd),
+            "the returned error must name the directory that is gone: {error}"
+        );
+
+        assert!(
+            codex.turn_thread_ids.lock().await.is_empty(),
+            "a turn must never be started in a workspace that no longer exists"
+        );
+
+        let state = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: thread.id.clone(),
+                before: None,
+                cursor: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("a broken workspace must not make the thread unreadable")
+            .thread_state
+            .expect("a first page carries the thread state");
+        let missing = state.workspace_missing.expect(
+            "the thread state must say the workspace is gone, so a surface can offer \
+             the repair instead of a dead composer",
+        );
+        assert_eq!(missing.recorded_cwd, cwd);
+
+        let relay = app.relay.read().await;
+        let transcript = &relay
+            .runtime_for_thread(&thread.id)
+            .expect("the target thread keeps its runtime")
+            .transcript;
+
+        assert!(
+            !transcript.iter().any(|entry| {
+                entry.kind == crate::protocol::TranscriptEntryKind::UserText
+                    && entry.text.as_deref() == Some("继续")
+            }),
+            "the refused message must NOT be recorded: the transcript would then show text \
+             (and silently drop images) that no provider ever received: {transcript:?}"
+        );
+
+        let error = transcript
+            .iter()
+            .find(|entry| entry.kind == crate::protocol::TranscriptEntryKind::Error)
+            .expect(
+                "a vanished workspace must be reported IN the transcript — a toast that \
+                 disappears is what made this look like nothing happened at all",
+            );
+        let text = error.text.clone().unwrap_or_default();
+        assert!(
+            text.contains(&cwd),
+            "the error must name the directory that is gone, so the user can see WHICH \
+             workspace died: {text}"
+        );
+    }
+
+    /// Opening the thread is how the user REACHES the repair, so opening must not be the
+    /// thing that fails. Resuming asks the provider to materialize a session in the cwd —
+    /// which, for Claude, spawns the CLI there and dies at ENOENT — so a thread whose
+    /// workspace vanished would refuse to open at all, and the banner offering to rebuild
+    /// it would have nowhere to render. The provider is simply not asked.
+    #[tokio::test]
+    async fn a_thread_whose_workspace_vanished_still_opens_so_the_repair_is_reachable() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+
+        drop(project);
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: thread.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            })
+            .await
+            .expect("a thread with a dead workspace must still open — the repair lives in its UI");
+
+        assert_eq!(
+            snapshot.active_thread_id.as_deref(),
+            Some(thread.id.as_str())
+        );
+        assert!(
+            codex.resume_thread_ids.lock().await.is_empty(),
+            "the provider must not be asked to materialize a session in a directory that \
+             is not there"
+        );
+    }
+
+    /// The state after every relay restart: the thread exists in the cached list, but
+    /// nothing has hydrated it yet. That is exactly when a user comes back to a worktree
+    /// that was cleaned up while they were away — and the path that every other test in
+    /// this file hid, by seeding a runtime first.
+    ///
+    /// It matters because the provider read is not inert. ACP answers `read_thread` with
+    /// `session/load` IN the recorded cwd, so a cold thread whose workspace vanished used
+    /// to fail inside the provider — raw error, no banner, nothing in the transcript —
+    /// before any of this could refuse it. The cached thread row already carries the cwd,
+    /// so the decision costs no round trip and happens first.
+    #[tokio::test]
+    async fn a_cold_thread_with_no_runtime_is_refused_before_its_provider_is_touched() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-cold", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            // The cached LIST only — deliberately no runtime, the way a restarted relay
+            // knows a thread it has not opened yet.
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+        }
+        drop(project);
+        let reads_before = codex.read_thread_calls.load(Ordering::Relaxed);
+
+        let error = app
+            .send_message(SendMessageInput {
+                text: "继续".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .expect_err("a cold thread with a dead workspace must be refused, not hydrated");
+        assert!(
+            error.contains(&cwd),
+            "the refusal must name the directory: {error}"
+        );
+        assert_eq!(
+            codex.read_thread_calls.load(Ordering::Relaxed),
+            reads_before,
+            "the provider must not be read at all: for ACP that read runs session/load IN \
+             the workspace that is gone"
+        );
+        assert!(codex.turn_thread_ids.lock().await.is_empty());
+
+        // And the same thread still OPENS, because opening is how the repair is reached.
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: thread.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            })
+            .await
+            .expect("a cold thread with a dead workspace must still open");
+        assert!(
+            snapshot
+                .workspace_missing
+                .as_ref()
+                .is_some_and(|missing| missing.recorded_cwd == cwd),
+            "the snapshot must carry the verdict, so the banner needs no extra round trip"
+        );
+        assert!(codex.resume_thread_ids.lock().await.is_empty());
+    }
+
+    /// The whole point of the banner: one press and the thread is usable again. Anything
+    /// short of "a send now reaches the provider" is a button that only looks like a fix.
+    #[tokio::test]
+    async fn repairing_the_workspace_puts_the_thread_back_to_work() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(thread.id.clone());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+        drop(project);
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("re-creating a vanished workspace should succeed");
+
+        app.send_message(SendMessageInput {
+            text: "继续".to_string(),
+            model: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .expect("send after repair");
+
+        assert_eq!(
+            *codex.turn_thread_ids.lock().await,
+            vec![thread.id.clone()],
+            "after the repair the turn must actually reach the provider"
+        );
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect(
+            "repairing an already-live workspace must SUCCEED: there is a real gap between \
+             the verdict a surface was shown and the press that follows it (another device \
+             repaired it, the user made the directory by hand, two taps raced), and in every \
+             one of those the postcondition already holds",
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A device confined to one project must not be able to make the relay write outside
+    /// it — the repair creates directories, so it is a write like any other.
+    #[tokio::test]
+    async fn repairing_a_workspace_outside_the_devices_scope_is_refused() {
+        let project = TempDir::new().expect("project tempdir");
+        let scope = TempDir::new().expect("scope tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(
+            &app,
+            "device-1",
+            vec![scope.path().to_string_lossy().to_string()],
+        )
+        .await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+        drop(project);
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect_err("a scoped device must not re-create a workspace outside its scope");
+        assert!(
+            !std::path::Path::new(&cwd).exists(),
+            "a refused repair must leave nothing behind"
+        );
     }
 }
 

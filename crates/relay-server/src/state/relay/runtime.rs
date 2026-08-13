@@ -26,6 +26,16 @@ pub(crate) struct ThreadRuntime {
     pub(crate) liveness_stop_requested: bool,
     pub(crate) active_flags: Vec<String>,
     pub(crate) current_cwd: String,
+    /// The last answer to "is `current_cwd` still a directory?", or `None` for "it is
+    /// there" / "nobody has looked yet".
+    ///
+    /// CACHED, not computed on read. Deciding it means a `stat`, and the two readers —
+    /// `RelayState::snapshot` and `read_loaded_thread_state` — both run holding the relay
+    /// lock on the hot notify path: a stat that blocks there (a disconnected network
+    /// mount, autofs) would freeze every session, not one banner. So the filesystem is
+    /// touched only on the async paths that were going to touch the workspace anyway
+    /// (open, resume, send, repair) and the verdict is parked here for readers.
+    pub(crate) workspace_missing: Option<crate::protocol::WorkspaceRepairView>,
     pub(crate) model: String,
     pub(crate) approval_policy: String,
     pub(crate) sandbox: String,
@@ -78,6 +88,7 @@ impl ThreadRuntime {
             pending_approvals: HashMap::new(),
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
+            workspace_missing: None,
         }
     }
 
@@ -114,6 +125,7 @@ impl ThreadRuntime {
             pending_approvals: HashMap::new(),
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
+            workspace_missing: None,
         }
     }
 
@@ -181,6 +193,7 @@ impl ThreadRuntime {
             pending_approvals: HashMap::new(),
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
+            workspace_missing: None,
         }
     }
 

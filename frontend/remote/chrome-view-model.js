@@ -15,6 +15,24 @@ import {
 } from "../progress-verbs.js";
 import { sessionIsWorking } from "../shared/thread-attention.js";
 import { describeSessionStatus } from "../shared/session-status.js";
+import {
+  normalizeWorkspaceRepairPlan,
+  readWorkspaceRepair,
+  workspaceRepairAction,
+  workspaceRepairHint,
+  workspaceRepairSummary,
+} from "./workspace-repair.js";
+
+// Nothing is claiming the banner. Every branch returns this SHAPE (never a subset) so
+// the renderer can read `repair`/`summaryTitle` without guarding each field.
+const NO_CONTROL_BANNER = Object.freeze({
+  hidden: true,
+  hint: "",
+  repair: null,
+  summary: "",
+  summaryTitle: "",
+  takeOverHidden: true,
+});
 
 function isSessionOffline(currentState, session) {
   return Boolean(
@@ -280,12 +298,7 @@ export function selectStatusBadgeRenderModel(currentState, session = currentStat
 
 export function selectResetChromeRenderModel(currentState) {
   return {
-    controlBanner: {
-      hidden: true,
-      hint: "",
-      summary: "",
-      takeOverHidden: true,
-    },
+    controlBanner: { ...NO_CONTROL_BANNER },
     header: {
       sessionPath: "",
       subtitle: workspaceSubtitle(currentState),
@@ -330,7 +343,22 @@ function selectSessionMetaRenderModel(currentState, session) {
   };
 }
 
+/**
+ * The banner slot has several claimants and exactly one button, so the priority lives
+ * HERE — one ordered function — rather than spread across the renderer.
+ *
+ * The missing workspace is FIRST, ahead of every control-related claimant. Take-over
+ * and the background session's "stop it or take over" both offer to move this device
+ * into the session, and there is nothing to move into: the directory the thread records
+ * is gone, so a send dies before it reaches the provider. Offering "Take over" there
+ * hands the user a button that cannot help and hides the one that can.
+ */
 function selectControlBannerRenderModel(currentState, session) {
+  const repairBanner = selectWorkspaceRepairBanner(currentState, session);
+  if (repairBanner) {
+    return repairBanner;
+  }
+
   const activeUnderReview = isReviewInProgressForThread(session, session.active_thread_id);
   const activeUnderWorkflow = isWorkflowInProgressForThread(session, session.active_thread_id);
   const activeLockedByAgent = activeUnderReview || activeUnderWorkflow;
@@ -339,7 +367,9 @@ function selectControlBannerRenderModel(currentState, session) {
     return {
       hidden: false,
       hint: "This background session is still running. Stop it or take over to continue here.",
+      repair: null,
       summary: "Background session is running",
+      summaryTitle: "",
       takeOverHidden: false,
     };
   }
@@ -348,21 +378,11 @@ function selectControlBannerRenderModel(currentState, session) {
     || !session.active_controller_device_id
     || (!sessionWorking && !activeLockedByAgent)
   ) {
-    return {
-      hidden: true,
-      hint: "",
-      summary: "",
-      takeOverHidden: true,
-    };
+    return { ...NO_CONTROL_BANNER };
   }
 
   if (isCurrentDeviceActiveController({ remoteAuth: currentState.remoteAuth, session })) {
-    return {
-      hidden: true,
-      hint: "",
-      summary: "",
-      takeOverHidden: true,
-    };
+    return { ...NO_CONTROL_BANNER };
   }
 
   // Only the thread actually owned by review/workflow is off-limits for take-over.
@@ -373,8 +393,47 @@ function selectControlBannerRenderModel(currentState, session) {
         ? "This session is locked by Code Flow; it unlocks when the workflow finishes."
         : "This session is being reviewed; it unlocks when the review finishes."
       : "Read-only for sending until you take over. Approvals can still be handled here.",
+    repair: null,
     summary: `Controlled by ${controllerLabel(currentState, session.active_controller_device_id)}`,
+    summaryTitle: "",
     takeOverHidden: activeLockedByAgent,
+  };
+}
+
+/**
+ * The viewed thread's workspace is gone → the repair banner, or `null` when there is
+ * nothing wrong (in which case the control banner decides as it always did).
+ *
+ * The verdict comes straight off the snapshot — the relay decides it on the paths that
+ * touch the workspace and caches it on the thread runtime — while the BUTTON's state
+ * (in flight, last failure) is keyed by thread, so a repair settling after the user
+ * swiped away cannot brand the wrong session as broken.
+ */
+function selectWorkspaceRepairBanner(currentState, session) {
+  const threadId = session?.active_thread_id || "";
+  if (!threadId) {
+    return null;
+  }
+
+  const record = readWorkspaceRepair(currentState, threadId);
+  const plan = normalizeWorkspaceRepairPlan(session?.workspace_missing);
+  if (!plan) {
+    return null;
+  }
+
+  const { summary, summaryTitle } = workspaceRepairSummary(plan);
+  return {
+    hidden: false,
+    hint: workspaceRepairHint(plan),
+    repair: workspaceRepairAction(plan, {
+      error: record.error,
+      pending: record.pending,
+      threadId,
+    }),
+    summary,
+    summaryTitle,
+    // There is nothing to take over into until the directory exists again.
+    takeOverHidden: true,
   };
 }
 

@@ -36,6 +36,7 @@ fn make_snapshot() -> SessionSnapshot {
         active_flags: vec![],
         thread_activity: vec![],
         current_cwd: "/tmp/project".to_string(),
+        workspace_missing: None,
         model: "gpt-5.4".to_string(),
         available_models: vec![],
         approval_policy: "untrusted".to_string(),
@@ -1074,6 +1075,48 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
     assert_eq!(
         carried["thread_project_id"]["thread-1"], "proj-1",
         "the device needs membership to group sessions by project"
+    );
+}
+
+/// Locks the `repair_workspace` wire contract, including the two properties that are
+/// easy to lose in a refactor and only fail on a device: `bind_device` must stamp the
+/// actor without dropping the thread selector, and the action must NOT require the
+/// session claim. A phone looking at a session whose workspace vanished has to be able
+/// to un-brick it without first stealing the active-controller lease from the desktop.
+#[test]
+fn repair_workspace_round_trips_and_needs_no_session_claim() {
+    let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "repair_workspace",
+        "thread_id": "thread-1",
+        "input": {}
+    }))
+    .expect("repair_workspace should parse with an empty input");
+    assert_eq!(request.kind(), RemoteActionKind::RepairWorkspace);
+    assert_eq!(
+        RemoteActionKind::RepairWorkspace.as_str(),
+        "repair_workspace"
+    );
+
+    match request.bind_device("device-9".to_string()) {
+        RemoteActionRequest::RepairWorkspace { thread_id, input } => {
+            assert_eq!(thread_id, "thread-1");
+            assert_eq!(
+                input.device_id.as_deref(),
+                Some("device-9"),
+                "the server stamps the actor; a device cannot claim to be another"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    assert!(matches!(
+        remote_action_result_kind(RemoteActionKind::RepairWorkspace),
+        RemoteActionResultKind::RemoteActionAck
+    ));
+    assert!(
+        !requires_session_claim(RemoteActionKind::RepairWorkspace),
+        "re-creating a directory runs no turn; demanding the lease would make the \
+         repair unreachable from the device most likely to notice the problem"
     );
 }
 

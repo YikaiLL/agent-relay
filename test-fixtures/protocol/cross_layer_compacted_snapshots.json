@@ -73,7 +73,8 @@
     ],
     "transcript_revision": 3,
     "transcript_truncated": true,
-    "workflows_revision": 0
+    "workflows_revision": 0,
+    "workspace_missing": null
   },
   "remote_omitted_authoritative_entries": [
     {
@@ -159,6 +160,7 @@
     ],
     "transcript_revision": 3,
     "transcript_truncated": true,
-    "workflows_revision": 0
+    "workflows_revision": 0,
+    "workspace_missing": null
   }
 }

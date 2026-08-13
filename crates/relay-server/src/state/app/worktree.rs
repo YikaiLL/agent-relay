@@ -179,6 +179,137 @@ pub(crate) async fn provision_task_worktree(
     })
 }
 
+/// Directory holding the agent CLI's own linked worktrees, alongside this relay's.
+const AGENT_DIR: &str = ".claude";
+/// Branch prefix the agent CLI gives the worktrees it parks in `.claude/worktrees`.
+const AGENT_BRANCH_PREFIX: &str = "worktree-";
+
+/// The branch a re-created worktree at `path` should carry, if `path` sits in a
+/// linked-worktree slot: `<repo>/.sealwire/worktrees/<slug>` (this relay's task trees,
+/// branch `task/<slug>`) or `<repo>/.claude/worktrees/<slug>` (the agent CLI's, branch
+/// `worktree-<slug>`).
+///
+/// Shape-only, and deliberately so. The directory is GONE — there is nothing left on disk
+/// to inspect — and git is no help either: a worktree taken out with `git worktree remove`
+/// leaves no administrative entry behind at all. Only an `rm -rf`'d one keeps being listed
+/// (as `prunable`), so asking the repository answers "never heard of it" for precisely the
+/// tidy case. What survives is the path convention, which both of these tools own.
+fn worktree_slot_branch(path: &str) -> Option<String> {
+    let path = Path::new(path);
+    let slug = path.file_name()?.to_str()?;
+    if slug.is_empty() {
+        return None;
+    }
+    let worktrees = path.parent()?;
+    if worktrees.file_name()?.to_str()? != WORKTREES_SUBDIR {
+        return None;
+    }
+    let prefix = match worktrees.parent()?.file_name()?.to_str()? {
+        SEALWIRE_DIR => TASK_BRANCH_PREFIX,
+        AGENT_DIR => AGENT_BRANCH_PREFIX,
+        _ => return None,
+    };
+    Some(format!("{prefix}{slug}"))
+}
+
+/// What it would take to make a thread's recorded workspace exist again, or `None` when
+/// it exists already and there is nothing to repair.
+///
+/// Cheap by design (one `is_dir`, then string work): every thread-state read calls this.
+pub(crate) fn plan_workspace_repair(
+    recorded: &str,
+) -> Option<crate::protocol::WorkspaceRepairView> {
+    if recorded.is_empty() || dir_exists(recorded) {
+        return None;
+    }
+    let repo_root = enclosing_repo_root(recorded).filter(|root| dir_exists(root));
+    // A worktree can only be re-created by the repository that would own it. Without a
+    // surviving repo the honest offer is the plain directory, even in a worktree-shaped
+    // slot: `git worktree add` has nothing to run in.
+    let branch = repo_root
+        .as_ref()
+        .and_then(|_| worktree_slot_branch(recorded));
+    Some(crate::protocol::WorkspaceRepairView {
+        recorded_cwd: recorded.to_string(),
+        kind: if branch.is_some() {
+            "worktree"
+        } else {
+            "folder"
+        }
+        .to_string(),
+        repo_root,
+        branch,
+    })
+}
+
+/// Make `plan.recorded_cwd` exist again, exactly where it was recorded.
+///
+/// Moving the thread somewhere live is NOT an option here, however tempting: a Claude
+/// session is archived under the project directory derived from its cwd and `resume`
+/// resolves through that same derivation, so a session resumed from any other directory
+/// dies with a bare "an error occurred during execution". The recorded path is the only
+/// address that works.
+///
+/// `path_guard` is called on every tree this is about to touch, BEFORE the first mutation
+/// — same contract as `provision_task_worktree`, for the same reason.
+pub(crate) async fn repair_workspace(
+    plan: &crate::protocol::WorkspaceRepairView,
+    path_guard: &(dyn Fn(&str) -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    let path = plan.recorded_cwd.as_str();
+    path_guard(path)?;
+    if dir_exists(path) {
+        // Someone else (or the user, by hand) already fixed it. Not an error: the
+        // postcondition the caller wants is "this directory exists".
+        return Ok(());
+    }
+
+    let (Some(repo_root), Some(branch)) = (plan.repo_root.as_deref(), plan.branch.as_deref())
+    else {
+        return tokio::fs::create_dir_all(path)
+            .await
+            .map_err(|error| format!("failed to create {path}: {error}"));
+    };
+
+    let origin = LiveWorkspace::from_path(repo_root)
+        .ok_or_else(|| format!("{repo_root} no longer exists either"))?;
+    let main = repo_main_worktree(&origin).await?;
+    path_guard(main.as_str())?;
+    if let Some(common) = git_common_dir(&main).await {
+        path_guard(&common)?;
+    }
+    ensure_sealwire_excluded(&main).await;
+
+    // The branch is the deliverable. If it survived the worktree's removal, check that
+    // branch out here rather than forking a second copy of it from HEAD and quietly
+    // stranding the commits the user is trying to get back to.
+    if git_ok(
+        &main,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    {
+        let output =
+            run_git_capture(&main, &["-c", NO_HOOKS, "worktree", "add", path, branch]).await?;
+        if output.status.success() {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to re-create the worktree at {path} on {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    // The branch went with the worktree, so there is nothing to return to — give the
+    // rebuilt tree a fresh branch of the same name off the repo's current HEAD.
+    create_worktree(&main, branch, path, "HEAD").await
+}
+
 /// Remove a task worktree's directory, leaving its branch and commits alone.
 ///
 /// Never `--force`: a dirty tree means unreviewed agent work, and silently
@@ -589,6 +720,141 @@ mod tests {
 
     fn allow_all() -> impl Fn(&str) -> Result<(), String> {
         |_: &str| Ok(())
+    }
+
+    /// A workspace that still exists is not a problem to be solved. This is the hot path —
+    /// every thread-state read calls it — so "nothing to do" has to be the cheap answer.
+    #[tokio::test]
+    async fn a_live_workspace_has_nothing_to_repair() {
+        let (_repo, root) = init_repo().await;
+        assert!(plan_workspace_repair(&root).is_none());
+        assert!(
+            plan_workspace_repair("").is_none(),
+            "a thread with no recorded workspace is not a BROKEN one"
+        );
+    }
+
+    /// The repair offered has to match what vanished. A task worktree rebuilt as an empty
+    /// directory would resume into a tree with no repository and no branch — every `git`
+    /// the agent runs then fails, which is a second, quieter version of the same bug.
+    #[tokio::test]
+    async fn a_vanished_task_worktree_is_planned_as_a_worktree_with_its_branch_back() {
+        let (_repo, root) = init_repo().await;
+        let main = workspace(&root);
+        let created = provision_task_worktree(&main, "beautiful ui", None, &allow_all())
+            .await
+            .expect("provisioning should succeed");
+        remove_task_worktree(&main, &created.path)
+            .await
+            .expect("removal should succeed");
+
+        let plan = plan_workspace_repair(&created.path).expect("a removed worktree needs repair");
+        assert_eq!(plan.kind, "worktree");
+        assert_eq!(plan.repo_root.as_deref(), Some(root.as_str()));
+        assert_eq!(
+            plan.branch.as_deref(),
+            Some(created.branch.as_str()),
+            "the rebuilt tree must return to the branch the work is on, not a new one"
+        );
+    }
+
+    /// git is NOT the evidence here, and this pins why: `git worktree remove` leaves no
+    /// administrative entry at all, so the repository cannot be asked. The path convention
+    /// is what survives — and only inside a repo that still exists, since `worktree add`
+    /// has nothing to run in otherwise.
+    #[tokio::test]
+    async fn a_worktree_shaped_path_outside_any_repo_is_only_ever_a_folder() {
+        let dir = TempDir::new().expect("tmpdir");
+        let orphan = dir
+            .path()
+            .join(SEALWIRE_DIR)
+            .join(WORKTREES_SUBDIR)
+            .join("slug")
+            .to_string_lossy()
+            .into_owned();
+
+        let plan = plan_workspace_repair(&orphan).expect("a missing directory needs repair");
+        assert_eq!(
+            plan.kind, "folder",
+            "worktree SHAPE without a repository is not a worktree"
+        );
+        assert!(plan.branch.is_none());
+    }
+
+    #[tokio::test]
+    async fn repairing_a_vanished_task_worktree_checks_its_branch_back_out() {
+        let (_repo, root) = init_repo().await;
+        let main = workspace(&root);
+        let created = provision_task_worktree(&main, "beautiful ui", None, &allow_all())
+            .await
+            .expect("provisioning should succeed");
+        // Work the user would lose if the repair forked a fresh branch instead.
+        std::fs::write(Path::new(&created.path).join("kept.txt"), "work\n").unwrap();
+        run_in(Path::new(&created.path), &["add", "kept.txt"]).await;
+        run_in(
+            Path::new(&created.path),
+            &["commit", "-q", "-m", "task work"],
+        )
+        .await;
+        remove_task_worktree(&main, &created.path)
+            .await
+            .expect("removal should succeed");
+
+        let plan = plan_workspace_repair(&created.path).expect("plan");
+        repair_workspace(&plan, &allow_all())
+            .await
+            .expect("repair should succeed");
+
+        assert!(
+            dir_exists(&created.path),
+            "the recorded path must exist again"
+        );
+        let rebuilt = workspace(&created.path);
+        assert_eq!(
+            git_line(&rebuilt, &["rev-parse", "--abbrev-ref", "HEAD"]).await,
+            Some(created.branch.clone()),
+            "the rebuilt worktree must be ON the task branch"
+        );
+        assert!(
+            Path::new(&created.path).join("kept.txt").exists(),
+            "the commits the user is trying to get back to must be there"
+        );
+    }
+
+    /// Nothing to fork from, so there is nothing to check out — but the thread still has to
+    /// become usable, because the provider only cares that the path exists.
+    #[tokio::test]
+    async fn repairing_a_plain_missing_directory_just_creates_it() {
+        let dir = TempDir::new().expect("tmpdir");
+        let gone = dir
+            .path()
+            .join("nested")
+            .join("gone")
+            .to_string_lossy()
+            .into_owned();
+
+        let plan = plan_workspace_repair(&gone).expect("plan");
+        assert_eq!(plan.kind, "folder");
+        repair_workspace(&plan, &allow_all())
+            .await
+            .expect("repair should succeed");
+        assert!(dir_exists(&gone));
+    }
+
+    /// The guard is the whole reason `repair_workspace` takes one. A scoped device must not
+    /// be able to make the relay write outside its scope — and a refusal must leave nothing
+    /// behind.
+    #[tokio::test]
+    async fn a_refused_scope_creates_nothing() {
+        let dir = TempDir::new().expect("tmpdir");
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        let plan = plan_workspace_repair(&gone).expect("plan");
+
+        let error = repair_workspace(&plan, &|_: &str| Err("out of scope".to_string()))
+            .await
+            .expect_err("a refused path must not be created");
+        assert_eq!(error, "out of scope");
+        assert!(!dir_exists(&gone));
     }
 
     #[tokio::test]
