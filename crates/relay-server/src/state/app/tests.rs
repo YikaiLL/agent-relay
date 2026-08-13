@@ -3031,7 +3031,7 @@ got {}",
         );
 
         // Model the REAL fresh-boot state: apply_persisted leaves active_thread_id
-        // SET, provider startup leaves the global provider on the last-spawned
+        // SET, provider startup leaves the global provider on the preferred
         // provider (claude_code), the startup refresh stamped Claude's catalog, and
         // the relay thread/runtime caches are empty (not persisted). Critically,
         // active_thread_id stays set — clearing it would hide the
@@ -3059,7 +3059,7 @@ got {}",
         // and the Codex model catalog loaded (no Claude leakage).
         assert_eq!(
             snapshot.provider, "codex",
-            "a restored Codex session must come back as codex, not the last-spawned provider"
+            "a restored Codex session must come back as codex, not the boot-default provider"
         );
         assert_eq!(
             snapshot.active_thread_id.as_deref(),
@@ -3862,6 +3862,92 @@ got {}",
         );
     }
 
+    #[tokio::test]
+    async fn an_approval_receipt_names_the_provider_that_actually_got_it() {
+        // The receipt said "sent to Codex." for every provider. A Cursor user
+        // denying a plan, or a Claude user approving an edit, was told their
+        // decision went somewhere it did not — on the one surface whose whole
+        // job is to report what just happened to a permission.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let codex_thread = codex.thread_summary("codex-thread", cwd);
+        let claude_thread = claude.thread_summary("claude-thread", cwd);
+        codex
+            .threads
+            .lock()
+            .await
+            .insert(codex_thread.id.clone(), codex_thread.clone());
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+
+        let pending = |request_id: &str, thread_id: &str| PendingApproval {
+            request_id: request_id.to_string(),
+            raw_request_id: serde_json::json!(request_id),
+            kind: ApprovalKind::Command,
+            thread_id: thread_id.to_string(),
+            summary: "Run command".to_string(),
+            detail: None,
+            command: Some("true".to_string()),
+            cwd: Some(cwd.to_string()),
+            context_preview: None,
+            requested_permissions: None,
+            available_decisions: vec!["approve".to_string(), "deny".to_string()],
+            supports_session_scope: false,
+        };
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(codex_thread.id.clone());
+            relay.threads = vec![codex_thread, claude_thread];
+            relay
+                .pending_approvals
+                .insert("a-codex".to_string(), pending("a-codex", "codex-thread"));
+            relay
+                .pending_approvals
+                .insert("a-claude".to_string(), pending("a-claude", "claude-thread"));
+        }
+
+        let decide = |request_id: &'static str, decision| {
+            let app = &app;
+            async move {
+                app.decide_approval(
+                    request_id,
+                    ApprovalDecisionInput {
+                        decision,
+                        scope: Some(ApprovalScope::Once),
+                        device_id: Some("device-1".to_string()),
+                    },
+                )
+                .await
+                .expect("decision should route")
+                .message
+            }
+        };
+
+        let claude_message = decide("a-claude", ApprovalDecision::Deny).await;
+        assert!(
+            claude_message.contains("Claude Code"),
+            "a denial routed to claude must say so: {claude_message}"
+        );
+        assert!(
+            !claude_message.contains("Codex"),
+            "the receipt named the wrong provider: {claude_message}"
+        );
+
+        // And the provider that IS Codex still reads correctly.
+        let codex_message = decide("a-codex", ApprovalDecision::Approve).await;
+        assert!(
+            codex_message.contains("Codex"),
+            "wrong provider named: {codex_message}"
+        );
+    }
+
     // P0b: a send carrying an explicit thread_id must take over that thread and
     // start the turn ON it — even when a different thread is currently active.
     // This is what closes the wrong-thread send race: the send targets the thread
@@ -4062,7 +4148,13 @@ got {}",
         // what the healed thread inherits. Healing binds the strictest policy
         // instead, and the snapshot says so, so the UI cannot claim write
         // access the thread does not have.
-        let app = build_fake_codex_app("/tmp/project").await;
+        // A REAL directory, not a stand-in path: a send now refuses a workspace that is
+        // not on disk (see `a_send_into_a_vanished_workspace_is_refused_visibly_…`), so a
+        // fixture cwd that never existed would exercise that refusal instead of the
+        // cold-hydration heal this test is about.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = build_fake_codex_app(&cwd).await;
         pair_device(&app, "device-1", Vec::new()).await;
         let thread_id = "thread-imported";
         {
@@ -4074,7 +4166,7 @@ got {}",
                 id: thread_id.to_string(),
                 name: Some("imported codex thread".to_string()),
                 preview: String::new(),
-                cwd: "/tmp/project".to_string(),
+                cwd: cwd.clone(),
                 updated_at: unix_now(),
                 source: "codex".to_string(),
                 status: "idle".to_string(),
@@ -4083,6 +4175,13 @@ got {}",
                 forked_from: None,
                 renamed: false,
             }];
+            // The runtime carries the live cwd too, so the send reads it from here rather
+            // than from `thread/read`. The fake app-server answers every read with a
+            // hardcoded `/tmp/project` (208 fixtures in this crate lean on that string),
+            // and a send now refuses a workspace that is not on disk — so without this the
+            // test would exercise the vanished-workspace refusal instead of the cold
+            // hydration heal it exists to pin.
+            relay.ensure_runtime_for_thread(thread_id).current_cwd = cwd.clone();
         }
 
         let snapshot = app
@@ -9161,6 +9260,343 @@ got {}",
                 "a blank query ({blank:?}) must behave as no query at all"
             );
         }
+    }
+
+    /// A thread carries the cwd it was born in forever, and that directory can stop
+    /// existing — an agent `git worktree` is removed once its work lands, and the thread
+    /// that lived in it keeps pointing at the vanished path.
+    ///
+    /// What that used to do: the send reached the provider, the provider spawned into a
+    /// path with no inode, and the OS answered ENOENT — which the Claude SDK reports as
+    /// "native binary exists but failed to launch … musl/glibc mismatch", a message that
+    /// sends anyone reading it in completely the wrong direction. Nothing landed in the
+    /// transcript at all, so the user saw their own message and then silence, and pressing
+    /// it again did the same thing. That is the "一直被中断，按继续也没用" report.
+    ///
+    /// So the workspace is checked BEFORE the provider is asked to do anything, and the
+    /// refusal is written where the user is already looking: the transcript.
+    #[tokio::test]
+    async fn a_send_into_a_vanished_workspace_is_refused_visibly_instead_of_reaching_the_provider()
+    {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(thread.id.clone());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+
+        // The workspace disappears the way `git worktree remove` takes one out.
+        drop(project);
+
+        let error = app
+            .send_message(SendMessageInput {
+                text: "继续".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .expect_err(
+                "the send must FAIL, so the composer keeps the draft: both surfaces clear \
+                 their input and drop image attachments on success, and a message recorded \
+                 here reached no provider — a later \"continue\" would be continuing from \
+                 something the agent never saw",
+            );
+        assert!(
+            error.contains(&cwd),
+            "the returned error must name the directory that is gone: {error}"
+        );
+
+        assert!(
+            codex.turn_thread_ids.lock().await.is_empty(),
+            "a turn must never be started in a workspace that no longer exists"
+        );
+
+        let state = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: thread.id.clone(),
+                before: None,
+                cursor: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("a broken workspace must not make the thread unreadable")
+            .thread_state
+            .expect("a first page carries the thread state");
+        let missing = state.workspace_missing.expect(
+            "the thread state must say the workspace is gone, so a surface can offer \
+             the repair instead of a dead composer",
+        );
+        assert_eq!(missing.recorded_cwd, cwd);
+
+        let relay = app.relay.read().await;
+        let transcript = &relay
+            .runtime_for_thread(&thread.id)
+            .expect("the target thread keeps its runtime")
+            .transcript;
+
+        assert!(
+            !transcript.iter().any(|entry| {
+                entry.kind == crate::protocol::TranscriptEntryKind::UserText
+                    && entry.text.as_deref() == Some("继续")
+            }),
+            "the refused message must NOT be recorded: the transcript would then show text \
+             (and silently drop images) that no provider ever received: {transcript:?}"
+        );
+
+        let error = transcript
+            .iter()
+            .find(|entry| entry.kind == crate::protocol::TranscriptEntryKind::Error)
+            .expect(
+                "a vanished workspace must be reported IN the transcript — a toast that \
+                 disappears is what made this look like nothing happened at all",
+            );
+        let text = error.text.clone().unwrap_or_default();
+        assert!(
+            text.contains(&cwd),
+            "the error must name the directory that is gone, so the user can see WHICH \
+             workspace died: {text}"
+        );
+    }
+
+    /// Opening the thread is how the user REACHES the repair, so opening must not be the
+    /// thing that fails. Resuming asks the provider to materialize a session in the cwd —
+    /// which, for Claude, spawns the CLI there and dies at ENOENT — so a thread whose
+    /// workspace vanished would refuse to open at all, and the banner offering to rebuild
+    /// it would have nowhere to render. The provider is simply not asked.
+    #[tokio::test]
+    async fn a_thread_whose_workspace_vanished_still_opens_so_the_repair_is_reachable() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+
+        drop(project);
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: thread.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            })
+            .await
+            .expect("a thread with a dead workspace must still open — the repair lives in its UI");
+
+        assert_eq!(
+            snapshot.active_thread_id.as_deref(),
+            Some(thread.id.as_str())
+        );
+        assert!(
+            codex.resume_thread_ids.lock().await.is_empty(),
+            "the provider must not be asked to materialize a session in a directory that \
+             is not there"
+        );
+    }
+
+    /// The state after every relay restart: the thread exists in the cached list, but
+    /// nothing has hydrated it yet. That is exactly when a user comes back to a worktree
+    /// that was cleaned up while they were away — and the path that every other test in
+    /// this file hid, by seeding a runtime first.
+    ///
+    /// It matters because the provider read is not inert. ACP answers `read_thread` with
+    /// `session/load` IN the recorded cwd, so a cold thread whose workspace vanished used
+    /// to fail inside the provider — raw error, no banner, nothing in the transcript —
+    /// before any of this could refuse it. The cached thread row already carries the cwd,
+    /// so the decision costs no round trip and happens first.
+    #[tokio::test]
+    async fn a_cold_thread_with_no_runtime_is_refused_before_its_provider_is_touched() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-cold", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            // The cached LIST only — deliberately no runtime, the way a restarted relay
+            // knows a thread it has not opened yet.
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+        }
+        drop(project);
+        let reads_before = codex.read_thread_calls.load(Ordering::Relaxed);
+
+        let error = app
+            .send_message(SendMessageInput {
+                text: "继续".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .expect_err("a cold thread with a dead workspace must be refused, not hydrated");
+        assert!(
+            error.contains(&cwd),
+            "the refusal must name the directory: {error}"
+        );
+        assert_eq!(
+            codex.read_thread_calls.load(Ordering::Relaxed),
+            reads_before,
+            "the provider must not be read at all: for ACP that read runs session/load IN \
+             the workspace that is gone"
+        );
+        assert!(codex.turn_thread_ids.lock().await.is_empty());
+
+        // And the same thread still OPENS, because opening is how the repair is reached.
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: thread.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            })
+            .await
+            .expect("a cold thread with a dead workspace must still open");
+        assert!(
+            snapshot
+                .workspace_missing
+                .as_ref()
+                .is_some_and(|missing| missing.recorded_cwd == cwd),
+            "the snapshot must carry the verdict, so the banner needs no extra round trip"
+        );
+        assert!(codex.resume_thread_ids.lock().await.is_empty());
+    }
+
+    /// The whole point of the banner: one press and the thread is usable again. Anything
+    /// short of "a send now reaches the provider" is a button that only looks like a fix.
+    #[tokio::test]
+    async fn repairing_the_workspace_puts_the_thread_back_to_work() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(thread.id.clone());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+        drop(project);
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("re-creating a vanished workspace should succeed");
+
+        app.send_message(SendMessageInput {
+            text: "继续".to_string(),
+            model: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .expect("send after repair");
+
+        assert_eq!(
+            *codex.turn_thread_ids.lock().await,
+            vec![thread.id.clone()],
+            "after the repair the turn must actually reach the provider"
+        );
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect(
+            "repairing an already-live workspace must SUCCEED: there is a real gap between \
+             the verdict a surface was shown and the press that follows it (another device \
+             repaired it, the user made the directory by hand, two taps raced), and in every \
+             one of those the postcondition already holds",
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A device confined to one project must not be able to make the relay write outside
+    /// it — the repair creates directories, so it is a write like any other.
+    #[tokio::test]
+    async fn repairing_a_workspace_outside_the_devices_scope_is_refused() {
+        let project = TempDir::new().expect("project tempdir");
+        let scope = TempDir::new().expect("scope tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(
+            &app,
+            "device-1",
+            vec![scope.path().to_string_lossy().to_string()],
+        )
+        .await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+        drop(project);
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect_err("a scoped device must not re-create a workspace outside its scope");
+        assert!(
+            !std::path::Path::new(&cwd).exists(),
+            "a refused repair must leave nothing behind"
+        );
     }
 }
 
@@ -20351,5 +20787,515 @@ mod local_snapshot_sharing {
             "the fresh build must repopulate the cache, not bypass and abandon it"
         );
         assert!(Arc::ptr_eq(&connecting, &later_waiter));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A provider whose model catalog only becomes knowable once it has been asked
+// to do something — which is ACP's actual shape: `cursor-agent acp` has no
+// `model/list` method at all, and the catalog rides along on `session/new` and
+// `session/load` responses. On the first-ever boot in a workspace there is no
+// cached catalog, so the relay asks before the bridge can possibly answer.
+// ---------------------------------------------------------------------------
+mod late_catalog_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{watch, Mutex, RwLock};
+
+    use crate::protocol::{
+        ApprovalDecisionInput, ResumeSessionInput, ThreadSummaryView, TranscriptEntryView,
+    };
+    use crate::provider::ProviderBridge;
+    use crate::state::{
+        unix_now, AppState, PendingApproval, RelayState, SecurityProfile, DEFAULT_MODEL,
+    };
+
+    struct LateCatalogProvider {
+        name: &'static str,
+        threads: Mutex<HashMap<String, ThreadSummaryView>>,
+        /// Flips once a session operation has happened, exactly as the ACP
+        /// bridge's in-memory catalog is populated by `absorb_catalog`.
+        catalog_known: Mutex<bool>,
+        /// Whether this provider's catalog contains the id `DEFAULT_MODEL`
+        /// happens to be. Codex does — for it "gpt-5.5" is a real, choosable
+        /// model. Cursor does not. That difference is the whole discriminator.
+        offers_seed_named_model: bool,
+    }
+
+    impl LateCatalogProvider {
+        fn new(name: &'static str, cwd: &str) -> Self {
+            let mut threads = HashMap::new();
+            threads.insert(
+                "late-thread".to_string(),
+                ThreadSummaryView {
+                    id: "late-thread".to_string(),
+                    name: Some("late".to_string()),
+                    preview: String::new(),
+                    cwd: cwd.to_string(),
+                    updated_at: unix_now(),
+                    source: name.to_string(),
+                    status: "idle".to_string(),
+                    model_provider: name.to_string(),
+                    provider: name.to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+            );
+            Self {
+                name,
+                threads: Mutex::new(threads),
+                catalog_known: Mutex::new(false),
+                offers_seed_named_model: false,
+            }
+        }
+
+        fn offering_seed_named_model(name: &'static str, cwd: &str) -> Self {
+            Self {
+                offers_seed_named_model: true,
+                ..Self::new(name, cwd)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderBridge for LateCatalogProvider {
+        async fn list_threads(&self, _limit: usize) -> Result<Vec<ThreadSummaryView>, String> {
+            Ok(self.threads.lock().await.values().cloned().collect())
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::protocol::ModelOptionView>, String> {
+            if !*self.catalog_known.lock().await {
+                // "Answered before it was ready" — the relay treats an empty
+                // list as a soft miss and keeps whatever it had.
+                return Ok(Vec::new());
+            }
+            let option = |model: &str, is_default: bool| crate::protocol::ModelOptionView {
+                model: model.to_string(),
+                display_name: model.to_string(),
+                supported_reasoning_efforts: vec!["medium".to_string()],
+                default_reasoning_effort: "medium".to_string(),
+                is_default,
+                hidden: false,
+                provider: self.name.to_string(),
+            };
+            let mut catalog = vec![option("agent-default", true)];
+            if self.offers_seed_named_model {
+                catalog.push(option(DEFAULT_MODEL, false));
+            }
+            Ok(catalog)
+        }
+
+        async fn start_thread(
+            &self,
+            cwd: &str,
+            _model: &str,
+            _approval_policy: &str,
+            _sandbox: &str,
+            _initial_prompt: Option<&str>,
+        ) -> Result<crate::provider::StartThreadResult, String> {
+            // ACP learns its catalog from the `session/new` response, i.e. only
+            // once the thread has actually been created.
+            *self.catalog_known.lock().await = true;
+            let thread = ThreadSummaryView {
+                id: "late-new-thread".to_string(),
+                name: Some("late new".to_string()),
+                preview: String::new(),
+                cwd: cwd.to_string(),
+                updated_at: unix_now(),
+                source: self.name.to_string(),
+                status: "idle".to_string(),
+                model_provider: self.name.to_string(),
+                provider: self.name.to_string(),
+                forked_from: None,
+                renamed: false,
+            };
+            self.threads
+                .lock()
+                .await
+                .insert(thread.id.clone(), thread.clone());
+            Ok(crate::provider::StartThreadResult {
+                thread,
+                consumed_initial_prompt: false,
+                initial_user_message: None,
+                started_turn_id: None,
+            })
+        }
+
+        async fn resume_thread(&self, _t: &str, _a: &str, _s: &str) -> Result<(), String> {
+            *self.catalog_known.lock().await = true;
+            Ok(())
+        }
+
+        async fn read_thread(
+            &self,
+            thread_id: &str,
+        ) -> Result<crate::provider::ThreadSyncData, String> {
+            // The session read is what teaches the bridge its catalog.
+            *self.catalog_known.lock().await = true;
+            let thread = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| format!("thread '{thread_id}' not found"))?;
+            Ok(crate::provider::ThreadSyncData {
+                thread,
+                status: "idle".to_string(),
+                active_flags: Vec::new(),
+                transcript: Vec::new(),
+            })
+        }
+
+        async fn read_thread_entry_detail(
+            &self,
+            _t: &str,
+            _i: &str,
+        ) -> Result<Option<TranscriptEntryView>, String> {
+            Ok(None)
+        }
+
+        async fn archive_thread(&self, _t: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn delete_thread_permanently(
+            &self,
+            _t: &str,
+        ) -> Result<crate::codex_local::LocalThreadDeleteSummary, String> {
+            Err("unsupported".to_string())
+        }
+
+        async fn start_turn(
+            &self,
+            _t: &str,
+            _x: &str,
+            _m: &str,
+            _e: &str,
+            _i: &[crate::provider::ProviderImage],
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn request_turn_stop(&self, _t: &str, _u: Option<&str>) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn respond_to_approval(
+            &self,
+            _p: &PendingApproval,
+            _i: &ApprovalDecisionInput,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn respond_to_ask_user_question(
+            &self,
+            _r: &str,
+            _a: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn a_thread_never_records_the_global_seed_model_of_another_provider() {
+        // `DEFAULT_MODEL` is "gpt-5.5" — a provider-agnostic SEED that happens to
+        // be Codex's id, and which `set_available_models` also uses as its
+        // "nobody has chosen yet" sentinel. On a first-ever boot the relay asks a
+        // provider for its catalog before that provider can answer, gets nothing,
+        // falls back to the seed, and records Codex's model id on a thread that
+        // is not Codex's — then persists it, so it survives every later restart.
+        //
+        // Measured on a real cursor relay: process 1 reports `gpt-5.5`, process 2
+        // (catalog now cached on disk) reports the provider's real default. The
+        // live e2e's "model must survive a relay restart" is what caught it.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+        }
+
+        // Cold: the bridge cannot answer yet.
+        assert!(
+            bridge.list_models().await.expect("list").is_empty(),
+            "precondition: the catalog is not knowable before a session op"
+        );
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_ne!(
+            snapshot.model, DEFAULT_MODEL,
+            "the relay recorded another provider's model id because it asked \
+             before the bridge could answer"
+        );
+        assert_eq!(
+            snapshot.model, "agent-default",
+            "once the provider has been consulted, its own default is what counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_thread_never_records_the_global_seed_model_either() {
+        // The sibling of the resume case. A provider that publishes its catalog
+        // on thread creation cannot answer beforehand, so the model the relay
+        // picks for `start_thread` is the seed — and without healing afterwards
+        // that seed is what gets recorded and persisted on the new thread.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+        }
+
+        let snapshot = app
+            .start_session(crate::protocol::StartSessionInput {
+                cwd: Some(cwd.to_string()),
+                initial_prompt: None,
+                model: None,
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("start should succeed");
+
+        assert_ne!(
+            snapshot.model, DEFAULT_MODEL,
+            "a brand-new thread recorded another provider's seed model id"
+        );
+        assert_eq!(snapshot.model, "agent-default");
+    }
+
+    #[tokio::test]
+    async fn a_deliberately_chosen_model_is_not_overwritten_just_because_it_looks_like_the_seed() {
+        // The trap in the cold-run fix. `DEFAULT_MODEL` is "gpt-5.5" — for Codex
+        // that is not a seed at all, it is a real model a user can pick. So
+        // "this value equals DEFAULT_MODEL" does NOT mean "the relay invented
+        // it": it may be exactly what the user chose for this thread.
+        //
+        // Two threads on one provider, one pinned to the seed-named model and
+        // the global sitting on the other. Resuming the pinned thread must not
+        // adopt the global.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // The user pinned THIS thread to the seed-named model...
+            relay.remember_thread_settings(
+                "late-thread",
+                "untrusted",
+                "workspace-write",
+                "medium",
+                DEFAULT_MODEL,
+            );
+            // ...while the relay's global model is something else entirely.
+            relay.model = "agent-default".to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "resuming silently replaced the model this thread was pinned to"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_requested_model_is_not_overwritten_either() {
+        // Same trap on the start path, and worse: here the id was typed by the
+        // user in this very request.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            relay.model = "agent-default".to_string();
+        }
+
+        let snapshot = app
+            .start_session(crate::protocol::StartSessionInput {
+                cwd: Some(cwd.to_string()),
+                initial_prompt: None,
+                model: Some(DEFAULT_MODEL.to_string()),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("start should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "the model the caller explicitly asked for was replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_catalog_failure_is_not_treated_as_an_invented_model() {
+        // `catalog_was_unknown` was a false proxy for "the relay invented this".
+        // `load_provider_model_catalog` returns `None` for three different
+        // reasons, and only one of them justifies healing: the provider has no
+        // catalog YET (the ACP case), it answered empty ("not ready"), or the
+        // call errored. Codex's app-server produces the latter two when it is
+        // busy or restarting — and codex genuinely offers the id `DEFAULT_MODEL`
+        // happens to be, so healing there discards the user's actual model.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        // A provider whose catalog CONTAINS the seed-named id, i.e. codex.
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // The user's global choice IS the seed-named model. No per-thread
+            // setting exists, so the resume falls back to it — which is not the
+            // relay inventing anything, it is the user's choice arriving by the
+            // only route it has.
+            relay.model = DEFAULT_MODEL.to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "a catalog read that merely failed is not evidence the model was invented"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_model_is_healed_even_when_it_is_not_the_seed() {
+        // The other half of the same mistake: the heal also gated on
+        // `model == DEFAULT_MODEL`, so it only ever fired on a brand-new relay.
+        // After any codex use — or a global restored from disk — the fallback
+        // carries codex's REAL id, and a cursor thread recorded and persisted
+        // that instead. Nothing about `DEFAULT_MODEL` is special here; what
+        // matters is that the provider does not offer the id.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        // A provider whose catalog does NOT contain it, i.e. cursor.
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // A warm relay: the global is another provider's real model id.
+            relay.model = "gpt-5.5-codex".to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, "agent-default",
+            "a foreign model id the relay fell back to must not be recorded on this thread"
+        );
     }
 }

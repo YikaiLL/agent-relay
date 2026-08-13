@@ -31,13 +31,18 @@ impl AppState {
             }
         }
         let requested_model = non_empty(input.model);
+        // An id the CALLER named is never healed, even when it happens to equal
+        // `DEFAULT_MODEL`.
+        let model_was_requested = requested_model.is_some();
         let approval_policy = non_empty(input.approval_policy).unwrap_or(defaults.approval_policy);
         let sandbox = non_empty(input.sandbox).unwrap_or(defaults.sandbox);
         let (provider_name, bridge) = self.resolve_provider(input.provider.as_deref())?;
         let provider_models = self
             .load_provider_model_catalog(provider_name, bridge)
             .await;
-        let model = resolve_provider_model(
+        // `mut`: healed below, once the provider has had a chance to publish a
+        // catalog it could not publish before the thread existed.
+        let mut model = resolve_provider_model(
             provider_name,
             &provider_models,
             requested_model,
@@ -71,11 +76,39 @@ impl AppState {
         let initial_user_message = start_result.initial_user_message.clone();
         let started_turn_id = start_result.started_turn_id.clone();
 
+        // Same re-ask as `resume_session_inner`: a provider that publishes its
+        // catalog on the `session/new` response could not answer before the
+        // thread existed, so the model chosen above was picked with no catalog
+        // to check it against. Ask again now that the thread is real.
+        let provider_models = match provider_models {
+            Some(models) => Some(models),
+            None => {
+                self.load_provider_model_catalog(provider_name, bridge)
+                    .await
+            }
+        };
+
         {
             let mut relay = self.relay.write().await;
             relay.set_provider_name(provider_name.to_string());
             if let Some(models) = provider_models {
+                let invented = !model_was_requested && !models.iter().any(|m| m.model == model);
                 relay.set_available_models(models);
+                // Heal ONLY the value the relay itself invented, and read that
+                // off the catalog rather than off the seed constant.
+                //
+                // "It equals `DEFAULT_MODEL`" is not the same question: that id
+                // is "gpt-5.5", which for Codex is a real, choosable model — so
+                // the test fired on a choice, and *only* on a brand-new relay,
+                // missing the case where the fallback carried another provider's
+                // real id. "The provider does not offer it" separates the two
+                // exactly. A caller-named id is left alone either way; absent
+                // from a catalog is deliberately not treated as invalid for
+                // those (see `resolve_provider_model`).
+                if invented {
+                    // The initial turn below uses the same healed value.
+                    model = relay.model.clone();
+                }
             }
             let turn_revision = relay.thread_turn_revision(&started_thread_id);
             relay.activate_started_thread(
@@ -217,12 +250,48 @@ impl AppState {
             })
             .or_else(|| default_effort_for_model(&provider_models, &defaults.model))
             .unwrap_or(defaults.reasoning_effort);
-        let model = remembered_settings
+        // Split out so the heal below can tell "this thread is pinned to that
+        // model" from "we fell back to the relay's global because nothing else
+        // was known". Merged, the two are indistinguishable.
+        let remembered_model = remembered_settings
             .as_ref()
             .map(|settings| settings.model.clone())
-            .filter(|model| !model.is_empty())
-            .unwrap_or(defaults.model);
-        let preview = bridge.read_thread(&input.thread_id).await?;
+            .filter(|model| !model.is_empty());
+        let model = remembered_model.clone().unwrap_or(defaults.model);
+        // Armed BEFORE the provider is asked anything, from the cached thread row, so the
+        // verdict is already on the runtime no matter how the read below goes.
+        let cached_cwd = {
+            let relay = self.relay.read().await;
+            relay.thread_cwd(&input.thread_id)
+        };
+        let known_missing = match cached_cwd.as_deref() {
+            Some(cwd) => self
+                .refresh_workspace_verdict(&input.thread_id, cwd)
+                .await
+                .is_some(),
+            None => false,
+        };
+
+        // Opening a thread is how the user REACHES the repair, so opening must not be the
+        // thing that fails. `read_thread` is inert for the providers that serve history off
+        // disk, but not for all of them — ACP issues `session/load` with the recorded cwd —
+        // so a dead workspace can fail the read itself, with a raw provider error and no
+        // banner. When that happens and the workspace is the known reason, open the thread
+        // anyway: history is unavailable, the repair is not.
+        let preview = match bridge.read_thread(&input.thread_id).await {
+            Ok(preview) => preview,
+            Err(error) if known_missing => {
+                self.open_thread_without_its_provider(
+                    &input.thread_id,
+                    cached_cwd.as_deref().unwrap_or_default(),
+                    &device_id,
+                    &error,
+                )
+                .await;
+                return Ok(self.snapshot().await);
+            }
+            Err(error) => return Err(error),
+        };
         {
             let relay = self.relay.read().await;
             let device_scope = relay.device_path_scope(&device_id);
@@ -245,16 +314,67 @@ impl AppState {
             }
         }
 
-        bridge
-            .resume_thread(&input.thread_id, &approval_policy, &sandbox)
-            .await?;
+        // Opening the thread is how the user REACHES the repair, so opening must not be
+        // the thing that fails. Resuming asks the provider to materialize a session IN the
+        // cwd — for Claude that spawns the CLI there, which dies at ENOENT — so a thread
+        // whose workspace vanished would refuse to open at all and the banner offering to
+        // rebuild it would have nowhere to render. The transcript reads off disk and needs
+        // no live session, so skipping the resume costs nothing here: `workspace_missing`
+        // on the thread state is what the surface acts on, and the send path refuses again
+        // (visibly) if the user types anyway.
+        // Second look, for a thread the relay had never heard of above: its cwd is only
+        // knowable after the provider read.
+        if self
+            .refresh_workspace_verdict(&input.thread_id, &preview.thread.cwd)
+            .await
+            .is_none()
+        {
+            bridge
+                .resume_thread(&input.thread_id, &approval_policy, &sandbox)
+                .await?;
+        }
 
         let thread_data = bridge.read_thread(&input.thread_id).await?;
+
+        // Ask for the catalog again if the first attempt came back empty.
+        //
+        // Not every provider can answer before it has done something: ACP has no
+        // catalog method at all — `cursor-agent acp` publishes its models only on
+        // the `session/new` / `session/load` responses, which the bridge caches.
+        // On the first boot in a workspace there is no cached catalog yet, so the
+        // question above is asked before the bridge could possibly answer, and
+        // the relay falls back to `DEFAULT_MODEL` — a provider-agnostic seed that
+        // happens to be Codex's id. By here the bridge has been through a read
+        // and a resume, so it knows. The re-ask is an in-memory read for ACP and
+        // is skipped entirely for providers that answered the first time.
+        let provider_models = match provider_models {
+            Some(models) => Some(models),
+            None => {
+                self.load_provider_model_catalog(provider_name, bridge)
+                    .await
+            }
+        };
+
         {
             let mut relay = self.relay.write().await;
             relay.set_provider_name(provider_name.to_string());
+            // `set_available_models` heals the relay's model when it is still
+            // the untouched seed. Recording the seed on the thread here would
+            // undo that immediately — and persist another provider's model id,
+            // which then survives every later restart. Guarded on a catalog
+            // actually landing, so a deliberate no-catalog normalisation stands.
+            let mut model = model;
             if let Some(models) = provider_models {
+                // Only the value the relay invented — i.e. one it fell back to
+                // and this provider does not offer. A thread PINNED to a model
+                // keeps it even when the catalog has since dropped it, and a
+                // catalog read that merely failed is not evidence of anything.
+                let invented =
+                    remembered_model.is_none() && !models.iter().any(|m| m.model == model);
                 relay.set_available_models(models);
+                if invented {
+                    model = relay.model.clone();
+                }
             }
             // Fold the provider's reported last-activity time into the honest
             // sort key. Only Claude's `read_thread` reports a resume-safe value
@@ -517,6 +637,27 @@ impl AppState {
                 return Err("that thread is busy with a turn; wait for it to finish".to_string());
             }
         }
+        // BEFORE the provider is touched at all. `ensure_thread_runtime_loaded` reads the
+        // thread from its provider to hydrate a cold runtime, and that read is not inert:
+        // ACP issues `session/load` with the recorded cwd, so a thread whose workspace
+        // vanished would fail there — with a raw provider error, no banner, and nothing in
+        // the transcript — before ever reaching the refusal below. That is the state after
+        // every relay restart, which is exactly when a user comes back to a dead worktree.
+        //
+        // The cached thread row carries the cwd, so this costs no provider round trip. A
+        // thread the relay has never heard of has no cwd here and falls through to the
+        // check after hydration.
+        if let Some(recorded) = {
+            let relay = self.relay.read().await;
+            relay.thread_cwd(&target_thread)
+        } {
+            if let Some(reason) = self
+                .refuse_send_into_missing_workspace(&target_thread, &recorded)
+                .await
+            {
+                return Err(reason);
+            }
+        }
         self.ensure_thread_runtime_loaded(&target_thread, &device_id)
             .await?;
         let (target_thread, remembered_settings, runtime_cwd) = {
@@ -653,6 +794,28 @@ impl AppState {
             }
             relay.thread_turn_revision(&target_thread)
         };
+        // The workspace is checked HERE, on the way to the provider, because past this
+        // point the failure stops being legible. A thread keeps the cwd it was born in
+        // forever and that directory can stop existing — an agent worktree is removed once
+        // its work lands — and every provider then dies at spawn with ENOENT. The Claude
+        // SDK renders that as "native binary exists but failed to launch … musl/glibc
+        // mismatch", which is not remotely what happened, and none of it reaches the
+        // transcript: the user sees their own message and then nothing, forever, however
+        // many times they press it again.
+        //
+        // The refusal is written INTO the transcript (a toast the user scrolls past is how
+        // this looked like nothing at all), and then returned as an error so the composer
+        // keeps the draft. Recording the message here instead would be worse than the bug:
+        // the client clears its input and attachments on success, so the transcript would
+        // show text — and silently drop images — that no provider ever received, and a
+        // later "continue" would be continuing from something the agent never saw.
+        if let Some(reason) = self
+            .refuse_send_into_missing_workspace(&target_thread, &target_cwd)
+            .await
+        {
+            return Err(reason);
+        }
+
         let turn_id = bridge
             .start_turn(&target_thread, &text, &model, &effort, images)
             .await?;
@@ -685,6 +848,77 @@ impl AppState {
         }
 
         Ok(self.snapshot().await)
+    }
+
+    /// Make a thread current when its provider cannot describe it, because its workspace
+    /// is gone. The transcript is whatever the relay already had (usually nothing) and the
+    /// banner comes from the verdict already parked on the runtime — enough to reach the
+    /// repair, which is the only thing that can move this thread forward.
+    async fn open_thread_without_its_provider(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+        device_id: &str,
+        provider_error: &str,
+    ) {
+        let mut relay = self.relay.write().await;
+        let runtime = relay.ensure_runtime_for_thread(thread_id);
+        if runtime.current_cwd.is_empty() {
+            runtime.current_cwd = cwd.to_string();
+        }
+        relay.focus_thread_runtime(thread_id, device_id);
+        relay.push_log(
+            "warn",
+            format!(
+                "Opened thread {thread_id} without its provider: its workspace {cwd} is \
+                 gone ({provider_error})."
+            ),
+        );
+        relay.notify();
+    }
+
+    /// Refuse a send whose workspace is gone, writing the refusal where the user is
+    /// already looking. `None` means the workspace is fine and the send may proceed.
+    ///
+    /// The message itself is NOT recorded. The clients clear their composer — text and
+    /// image attachments — on a successful send, so recording it would show a transcript
+    /// the provider never received and drop the images outright, and a later "continue"
+    /// would be continuing from something the agent never saw. Returning the error keeps
+    /// the draft where the user can send it again once the workspace is back.
+    async fn refuse_send_into_missing_workspace(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+    ) -> Option<String> {
+        let plan = self.refresh_workspace_verdict(thread_id, cwd).await?;
+        let reason = format!(
+            "This thread's workspace {} no longer exists, so nothing can run in it. \
+             Re-create it, then send again.",
+            plan.recorded_cwd
+        );
+        let mut relay = self.relay.write().await;
+        relay.upsert_transcript_item_for_thread(
+            thread_id,
+            // Unique per attempt, so pressing send twice leaves two records rather than
+            // one that silently overwrites the first.
+            format!(
+                "workspace-missing:{}-{}",
+                unix_now(),
+                super::review::random_suffix()
+            ),
+            crate::protocol::TranscriptEntryKind::Error,
+            Some(reason.clone()),
+            "failed".to_string(),
+            None,
+            None,
+        );
+        relay.enqueue_error_push(thread_id, reason.clone());
+        relay.push_log(
+            "warn",
+            format!("Refused a send to thread {thread_id}: its workspace {cwd} is gone."),
+        );
+        relay.notify();
+        Some(reason)
     }
 
     pub async fn stop_active_turn(&self, input: StopTurnInput) -> Result<SessionSnapshot, String> {

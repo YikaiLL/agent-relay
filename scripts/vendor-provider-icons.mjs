@@ -23,6 +23,7 @@ const ROOT = process.cwd();
 const SOURCES = [
   { provider: "claude_code", file: "claude-color.svg", note: "Anthropic starburst" },
   { provider: "codex", file: "openai.svg", note: "OpenAI knot" },
+  { provider: "cursor", file: "cursor.svg", note: "Cursor cube" },
 ];
 
 function packageDir() {

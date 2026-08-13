@@ -26,6 +26,13 @@ import {
   createTranscriptPageFetcher,
 } from "./transcript/api.js";
 import { transcriptPageCache } from "./transcript/page-cache-instance.js";
+import {
+  dispatchWorkspaceRepair,
+  readWorkspaceRepair,
+  setWorkspaceRepairError,
+  setWorkspaceRepairPending,
+  workspaceRepairResolved,
+} from "./workspace-repair.js";
 import { withThreadError } from "../shared/composer-errors.js";
 import { createCachingTranscriptPageFetcher } from "../shared/caching-transcript-fetcher.js";
 import { providerLabel } from "../shared/provider-labels.js";
@@ -62,7 +69,8 @@ import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
 import { isWorkingThreadStatus } from "../shared/thread-status.js";
 import { createFrameRenderQueue } from "./frame-render-queue.js";
 
-const fetchRawTranscriptPage = createTranscriptPageFetcher(dispatchOrRecover);
+const fetchTranscriptPageOverBroker = createTranscriptPageFetcher(dispatchOrRecover);
+const fetchRawTranscriptPage = fetchTranscriptPageOverBroker;
 const fetchTranscriptEntryDetailRequest =
   createTranscriptEntryDetailFetcher(dispatchOrRecover);
 
@@ -115,15 +123,64 @@ function remoteQueryScope() {
 }
 
 function fetchTranscriptPage({ threadId, before }) {
-  return remoteQueryClient.fetchQuery(
-    createThreadTranscriptPageQueryOptions({
-      before,
-      fetchPage: fetchCachedTranscriptPage,
-      scope: remoteQueryScope(),
-      surface: "remote",
-      threadId,
-    })
-  );
+  return remoteQueryClient
+    .fetchQuery(
+      createThreadTranscriptPageQueryOptions({
+        before,
+        fetchPage: fetchCachedTranscriptPage,
+        scope: remoteQueryScope(),
+        surface: "remote",
+        threadId,
+      })
+    );
+}
+
+// The repair records live on a Map hanging off `state`, so mutating them is invisible to
+// `useSyncExternalStore`. Re-publish the same Map through the store to bump the snapshot
+// identity and repaint the banner.
+function publishWorkspaceRepair() {
+  patchRemoteState({ workspaceRepairByThread: state.workspaceRepairByThread || new Map() });
+}
+
+/**
+ * Ask the relay to make this thread's recorded workspace exist again.
+ *
+ * Ack-only over the broker and claim-free by design: a phone must be able to un-brick a
+ * session it is merely viewing, without stealing the active-controller lease.
+ */
+export async function repairRemoteWorkspace(threadId) {
+  const targetThreadId = threadId || state.session?.active_thread_id || null;
+  if (!targetThreadId) {
+    renderLog("There is no session whose workspace could be re-created.");
+    return false;
+  }
+
+  setWorkspaceRepairPending(state, targetThreadId, true);
+  publishWorkspaceRepair();
+
+  try {
+    await dispatchWorkspaceRepair(dispatchOrRecover, targetThreadId);
+    // Clear now rather than waiting for the next tail fetch: the relay has just confirmed
+    // the directory exists, and a banner still claiming otherwise would be a lie with a
+    // button on it. The refresh below replaces this with the relay's own verdict.
+    workspaceRepairResolved(state, targetThreadId);
+    publishWorkspaceRepair();
+    renderLog(`Re-created the workspace for session ${targetThreadId}.`);
+    lastWorkspaceVerdictProbeKey = "";
+    void fetchRawTranscriptPage({ threadId: targetThreadId, before: null }).catch(() => {});
+    return true;
+  } catch (error) {
+    // The relay's own message, kept whole — "the repository … no longer exists either" is
+    // the difference between a user who knows what to do and one who does not.
+    setWorkspaceRepairError(
+      state,
+      targetThreadId,
+      error.message || "Failed to re-create the workspace"
+    );
+    publishWorkspaceRepair();
+    renderLog(`Workspace repair failed: ${error.message}`);
+    return false;
+  }
 }
 
 function transcriptDeltaKindToEntryKind(deltaKind) {
@@ -2062,6 +2119,13 @@ export function clearSessionRuntime() {
   invalidateViewOnlyNavigation();
   state.realSession = null;
   clearTranscriptHydration(state);
+  // Thread ids are only unique within one relay, so a repair marked in flight (or failed)
+  // against thread X here would attach itself to a different relay's thread X after a
+  // switch or a re-pair — a button stuck spinning, or someone else's error under it.
+  // The verdict itself needs no clearing: it rides the snapshot, so the new relay's first
+  // one replaces it.
+  state.workspaceRepairByThread = new Map();
+  publishWorkspaceRepair();
 }
 
 async function sendHeartbeat() {

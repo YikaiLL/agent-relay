@@ -50,6 +50,7 @@ import {
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
 import { selectOwningContext } from "../shared/session-view-state.js";
+import { shouldShowAuditEntry } from "../shared/audit-log.js";
 import { syncComposerError } from "./composer-error.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
@@ -145,6 +146,8 @@ import {
   workflowRunsForThread,
 } from "../shared/workflow-state.js";
 import { projectViewOnlySession } from "./view-only-thread.js";
+import { selectControlBannerModel } from "./control-banner.js";
+import { readWorkspaceRepair } from "./workspace-repair.js";
 import { canComposeThread, composerButtonState } from "../shared/thread-compose.js";
 import { saveLastEffort } from "../shared/last-used-settings.js";
 import {
@@ -1168,47 +1171,57 @@ export function createSessionRenderer({
     );
   }
 
+  // What the banner shows is decided in local/control-banner.js — including that a
+  // missing workspace outranks take-over. This function only paints it.
+  //
+  // NOTE ON THE COMPOSER: it stays enabled while the workspace is missing, on
+  // purpose. A send is harmless now (the relay keeps the message and appends a
+  // visible error naming the directory instead of reaching the provider), and this
+  // banner's `workspace_missing` is only as fresh as the last tail fetch. Disabling
+  // the composer would make a STALE "missing" unfalsifiable: a user who re-created
+  // the directory by hand would be locked out of a workspace that is actually back,
+  // with no action left that could prove it. A send is exactly that proof — it
+  // re-fetches the tail, so it either goes through or re-states the problem in the
+  // transcript. The banner is the fast path; the composer is the one that self-heals.
   function renderControlBanner(session) {
     const activeUnderReview = isReviewInProgressForThread(session, session.active_thread_id);
     const activeUnderWorkflow = isWorkflowInProgressForThread(session, session.active_thread_id);
     const activeLockedByAgent = activeUnderReview || activeUnderWorkflow;
-    const sessionWorking = sessionIsWorking(session);
-    if (session.view_only && sessionWorking && !activeLockedByAgent) {
-      controlBanner.hidden = false;
-      renderReactContent(
-        controlBanner,
-        h(ControlBannerContent, {
-          hint: "This background session is still running. Stop it or take over to continue here.",
-          showTakeOver: true,
-          summary: "Background session is running",
-        })
-      );
-      return;
-    }
-    if (
-      !session.active_thread_id
-      || !isViewingConversation(session)
-      || !session.active_controller_device_id
-      || isCurrentDeviceActiveController(session)
-      || (!sessionWorking && !activeLockedByAgent)
-    ) {
+    const repair = readWorkspaceRepair(state, session.active_thread_id);
+    const model = selectControlBannerModel({
+      controllerName: session.active_controller_device_id
+        ? controllerLabel(session.active_controller_device_id)
+        : "",
+      hasActiveThread: Boolean(session.active_thread_id),
+      hasController: Boolean(session.active_controller_device_id),
+      isController: isCurrentDeviceActiveController(session),
+      // Review/workflow owns this turn sequence while non-terminal.
+      lockedByAgent: activeLockedByAgent,
+      lockedByWorkflow: activeUnderWorkflow,
+      repairError: repair.error,
+      repairPending: repair.pending,
+      sessionWorking: sessionIsWorking(session),
+      viewingConversation: isViewingConversation(session),
+      viewOnly: Boolean(session.view_only),
+      // Straight off the snapshot: the relay decides this on the paths that touch the
+      // workspace and caches it on the thread runtime, so every render already has it.
+      workspaceMissing: session.workspace_missing,
+    });
+
+    if (model.hidden) {
       controlBanner.hidden = true;
       return;
     }
 
     controlBanner.hidden = false;
-    // Only the thread actually owned by review/workflow is off-limits for take-over.
     renderReactContent(
       controlBanner,
       h(ControlBannerContent, {
-        hint: activeLockedByAgent
-          ? activeUnderWorkflow
-            ? "This session is locked by Code Flow; it unlocks when the workflow finishes."
-            : "This session is being reviewed; it unlocks when the review finishes."
-          : "You can still approve from this device. Take over when you want to type or continue the session.",
-        // Review/workflow owns this turn sequence while non-terminal.
-        showTakeOver: !activeLockedByAgent,
-        summary: `Another device has control (${controllerLabel(session.active_controller_device_id)})`,
+        hint: model.hint,
+        repair: model.repair,
+        showTakeOver: model.showTakeOver,
+        summary: model.summary,
+        summaryTitle: model.summaryTitle,
       })
     );
   }
@@ -2199,19 +2212,6 @@ export function createSessionRenderer({
     }
 
     return "neutral";
-  }
-
-  function shouldShowAuditEntry(entry) {
-    const kind = String(entry?.kind || "").toLowerCase();
-    const message = String(entry?.message || "");
-
-    if (kind !== "codex") {
-      return true;
-    }
-
-    return /approval|pair|revoke|connected|disconnected|take over|control|broker|session/i.test(
-      message
-    );
   }
 
   return {

@@ -532,7 +532,9 @@ impl RelayState {
             push_vapid_public_key: None,
             push_attention: PushAttentionTracker::new(),
         };
-        state.push_log("info", "Relay booted. Waiting for Codex app-server.");
+        // Provider-neutral: which bridges are configured is decided later (and a
+        // relay running only Cursor is not waiting for Codex at all).
+        state.push_log("info", "Relay booted. Waiting for an agent provider.");
         state
     }
 
@@ -1565,6 +1567,24 @@ impl RelayState {
                 && (job.parent_thread_id == thread_id
                     || job.reviewer_thread_id.as_deref() == Some(thread_id))
         })
+    }
+
+    /// Whether an approval parked on `thread_id` could ever reach a person.
+    ///
+    /// A reviewer, workflow or team thread is driven by the relay, not by a
+    /// user: `decide_approval` refuses a decision on one, and the review waiter
+    /// treats a pending approval on its thread as an outright failure. So a card
+    /// parked there is not "waiting" — it is a run already broken.
+    ///
+    /// A bridge with a *mandatory* question (a shell command needs a yes or a
+    /// no) should still park, and let the owning run's policy resolve it. This
+    /// exists for the other case: an approval the bridge could reasonably answer
+    /// itself, where parking would turn a normal event into a failure. See the
+    /// ACP bridge's `cursor/create_plan` handling.
+    pub(crate) fn approval_can_reach_a_user(&self, thread_id: &str) -> bool {
+        !self.is_thread_review_locked(thread_id)
+            && !self.is_thread_or_cwd_workflow_locked(thread_id)
+            && !self.is_thread_or_cwd_team_locked(thread_id)
     }
 
     /// Whether `thread_id` is owned by a non-terminal workflow run (its parent OR
@@ -2678,6 +2698,10 @@ impl RelayState {
         let current_cwd = selected
             .map(|runtime| runtime.current_cwd.clone())
             .unwrap_or_else(|| self.current_cwd.clone());
+        // A field read, never a `stat`: see `ThreadRuntime::workspace_missing`. This
+        // function runs under the relay lock on every notify, and a blocking filesystem
+        // call here would stall every session rather than one banner.
+        let workspace_missing = selected.and_then(|runtime| runtime.workspace_missing.clone());
         let model = selected
             .map(|runtime| runtime.model.clone())
             .unwrap_or_else(|| self.model.clone());
@@ -2746,6 +2770,7 @@ impl RelayState {
             active_flags,
             thread_activity: self.thread_activity_view(),
             current_cwd,
+            workspace_missing,
             model,
             available_models: self.available_models.clone(),
             approval_policy,

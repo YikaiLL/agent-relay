@@ -352,6 +352,12 @@ const state = {
   // loadViewOnlyTranscript() below; paginated by loadOlderViewOnlyTranscript().
   viewOnlyThread: null,
   viewOnlyGeneration: 0,
+  // Per-thread "your workspace is gone" state, keyed by thread id:
+  // `{ workspaceMissing, pending, error }` (see local/workspace-repair.js). Written
+  // from each transcript TAIL response — `workspace_missing` rides `thread_state`,
+  // which no session snapshot carries — and read by the control banner, which turns
+  // into the repair action instead of a take-over the user cannot use.
+  workspaceRepairByThread: new Map(),
   // True while a composer submit is in flight.
   // Freezes the composer and rejects re-entry so a draft edit / navigation /
   // double-submit during the async request can't change or duplicate the send.
@@ -1450,6 +1456,7 @@ const {
   startSession,
   submitDecision,
   takeOverControl,
+  repairWorkspace,
   toggleTranscriptEntry,
   toggleTranscriptExpandKey,
   applyFileChange,
@@ -2427,7 +2434,13 @@ document.addEventListener("input", (event) => {
   handleLaunchFieldInput(target.id, target.value);
 });
 
+// The banner is one slot with one button, but which button it is depends on why the
+// banner is up (see local/control-banner.js), so both are bound here by id.
 controlBanner?.addEventListener("click", (event) => {
+  if (event.target.closest("#workspace-repair-button")) {
+    void repairWorkspace();
+    return;
+  }
   if (!event.target.closest("#take-over-button")) {
     return;
   }
@@ -4188,17 +4201,6 @@ function classifyAuditEntry(entry) {
   }
 
   return "neutral";
-}
-
-function shouldShowAuditEntry(entry) {
-  const kind = String(entry?.kind || "").toLowerCase();
-  const message = String(entry?.message || "");
-
-  if (kind !== "codex") {
-    return true;
-  }
-
-  return /approval|pair|revoke|connected|disconnected|take over|control|broker|session/i.test(message);
 }
 
 function isCurrentDeviceActiveController(session) {

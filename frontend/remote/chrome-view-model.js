@@ -15,6 +15,24 @@ import {
 } from "../progress-verbs.js";
 import { sessionIsWorking } from "../shared/thread-attention.js";
 import { describeSessionStatus } from "../shared/session-status.js";
+import {
+  normalizeWorkspaceRepairPlan,
+  readWorkspaceRepair,
+  workspaceRepairAction,
+  workspaceRepairHint,
+  workspaceRepairSummary,
+} from "./workspace-repair.js";
+
+// Nothing is claiming the banner. Every branch returns this SHAPE (never a subset) so
+// the renderer can read `repair`/`summaryTitle` without guarding each field.
+const NO_CONTROL_BANNER = Object.freeze({
+  hidden: true,
+  hint: "",
+  repair: null,
+  summary: "",
+  summaryTitle: "",
+  takeOverHidden: true,
+});
 
 function isSessionOffline(currentState, session) {
   return Boolean(
@@ -48,18 +66,15 @@ export function selectSessionChromeRenderModel(currentState, session) {
     ? workspaceBasename(session.current_cwd)
     : workspaceTitle(currentState);
   const headerPath = currentHeaderPath(currentState, session);
-  const headerSubtitle = headerPath || workspaceSubtitle(currentState);
 
   return {
     agentWorkingIndicator: deriveAgentWorkingIndicator(currentState, session, approval),
     controlBanner: selectControlBannerRenderModel(currentState, session),
     header: {
-      modelLabel: sessionModelLabel(session),
-      modelTitle: sessionModelTitle(session),
       sessionPath: headerPath,
-      subtitle: headerSubtitle,
-      subtitleHidden: !headerSubtitle,
-      subtitleTitle: headerPath || headerSubtitle,
+      subtitle: "",
+      subtitleHidden: true,
+      subtitleTitle: "",
       title: hasActiveSession ? workspaceName : workspaceTitle(currentState),
       titleTitle: session.current_cwd || "",
     },
@@ -70,32 +85,40 @@ export function selectSessionChromeRenderModel(currentState, session) {
 
 function deriveStatusBadge(currentState, session, approval) {
   if (approval) {
-    return { label: "Approval required", tone: "alert" };
+    return headerStatusBadge("Approval required", "alert");
   }
   if (selectedRelayNeedsRepair(currentState)) {
-    return { label: "Re-pair required", tone: "alert" };
+    return headerStatusBadge("Re-pair required", "alert");
   }
   if (isSessionOffline(currentState, session)) {
-    return { label: "Offline", tone: "offline" };
+    return headerStatusBadge("Offline", "offline");
   }
   // Surface the under-review state in the header (parity with local) — the remote
   // surface previously only froze the composer, so a remote user had no "Review in
   // progress / blocked" indicator. Shared helper → identical wording/tone to local.
   if (isWorkflowBlocked(session)) {
-    return { label: "Code Flow blocked — action needed", tone: "alert" };
+    return headerStatusBadge("Code Flow blocked — action needed", "alert");
   }
   const review = reviewStatusBadge(session, session.active_thread_id);
   if (review) {
-    return review;
+    return headerStatusBadge(review.label, review.tone);
   }
   if (isWorkflowInProgressForThread(session, session.active_thread_id)) {
-    return { label: "Code Flow in progress", tone: "alert" };
+    return headerStatusBadge("Code Flow in progress", "alert");
   }
   // Task wording comes from the shared session-status seam so it matches the local
   // surface (No active task / Idle / Working) instead of a remote-only Standby/Live.
   // Provider/transport outage is handled above by isSessionOffline — broader than the
   // seam's provider-only `providers` subject — so we borrow only the TASK subject here.
-  return { label: describeSessionStatus(session).task.label, tone: "ready" };
+  return quietStatusBadge(describeSessionStatus(session).task.label);
+}
+
+function headerStatusBadge(label, tone) {
+  return { label, tone, headerVisible: true };
+}
+
+function quietStatusBadge(label, tone = "ready") {
+  return { label, tone, headerVisible: false };
 }
 
 function deriveAgentWorkingIndicator(currentState, session, approval) {
@@ -133,11 +156,12 @@ export function selectDeviceChromeRenderModel(currentState) {
   const cards = [];
   if (showPairingCard) {
     const ticket = currentState.pairingTicket;
+    const badge = pairingBadge(currentState);
     cards.push({
       badges: [
         {
-          label: pairingBadgeText(currentState),
-          tone: pairingBadgeTone(currentState),
+          label: badge.label,
+          tone: badge.tone,
         },
       ],
       metaLines: [
@@ -229,12 +253,12 @@ export function buildProviderStatusModel(session) {
 
 export function selectStatusBadgeRenderModel(currentState, session = currentState.session) {
   if (selectedRelayNeedsRepair(currentState)) {
-    return { label: "Re-pair required", tone: "alert" };
+    return headerStatusBadge("Re-pair required", "alert");
   }
 
   if (session) {
     if (session.pending_approvals?.length) {
-      return { label: "Approval required", tone: "alert" };
+      return headerStatusBadge("Approval required", "alert");
     }
 
     if (
@@ -243,10 +267,10 @@ export function selectStatusBadgeRenderModel(currentState, session = currentStat
       || !currentState.socketConnected
       || !session.provider_connected
     ) {
-      return { label: "Offline", tone: "offline" };
+      return headerStatusBadge("Offline", "offline");
     }
 
-    return { label: session.current_status || "Ready", tone: "ready" };
+    return quietStatusBadge(session.current_status || "Ready");
   }
 
   if (currentState.remoteAuth && (
@@ -254,38 +278,27 @@ export function selectStatusBadgeRenderModel(currentState, session = currentStat
       || currentState.serverConnectionMessage
       || (currentState.socketConnected && !currentState.relayConnected && currentState.relayConnectionMessage)
   )) {
-    return { label: "Server disconnected", tone: "offline" };
+    return headerStatusBadge("Server disconnected", "offline");
   }
 
   if (currentState.socketConnected) {
-    return { label: "Connected", tone: "ready" };
+    return quietStatusBadge("Connected");
   }
 
   if (currentState.pairingTicket) {
-    return {
-      label: pairingBadgeText(currentState),
-      tone: pairingBadgeTone(currentState),
-    };
+    return pairingBadge(currentState);
   }
 
   if (!currentState.remoteAuth && currentState.relayDirectory?.length) {
-    return { label: "Home", tone: "ready" };
+    return quietStatusBadge("Home");
   }
 
-  return {
-    label: currentState.remoteAuth ? "Connecting" : "Offline",
-    tone: "offline",
-  };
+  return headerStatusBadge(currentState.remoteAuth ? "Connecting" : "Offline", "offline");
 }
 
 export function selectResetChromeRenderModel(currentState) {
   return {
-    controlBanner: {
-      hidden: true,
-      hint: "",
-      summary: "",
-      takeOverHidden: true,
-    },
+    controlBanner: { ...NO_CONTROL_BANNER },
     header: {
       sessionPath: "",
       subtitle: workspaceSubtitle(currentState),
@@ -330,25 +343,22 @@ function selectSessionMetaRenderModel(currentState, session) {
   };
 }
 
-function sessionModelLabel(session) {
-  if (!session?.active_thread_id || !session.model) {
-    return null;
-  }
-
-  const provider = providerLabel(session.provider);
-  return provider ? `${provider} · ${session.model}` : session.model;
-}
-
-function sessionModelTitle(session) {
-  if (!sessionModelLabel(session)) {
-    return "";
-  }
-  return session.reasoning_effort
-    ? `${sessionModelLabel(session)} · effort ${session.reasoning_effort}`
-    : sessionModelLabel(session);
-}
-
+/**
+ * The banner slot has several claimants and exactly one button, so the priority lives
+ * HERE — one ordered function — rather than spread across the renderer.
+ *
+ * The missing workspace is FIRST, ahead of every control-related claimant. Take-over
+ * and the background session's "stop it or take over" both offer to move this device
+ * into the session, and there is nothing to move into: the directory the thread records
+ * is gone, so a send dies before it reaches the provider. Offering "Take over" there
+ * hands the user a button that cannot help and hides the one that can.
+ */
 function selectControlBannerRenderModel(currentState, session) {
+  const repairBanner = selectWorkspaceRepairBanner(currentState, session);
+  if (repairBanner) {
+    return repairBanner;
+  }
+
   const activeUnderReview = isReviewInProgressForThread(session, session.active_thread_id);
   const activeUnderWorkflow = isWorkflowInProgressForThread(session, session.active_thread_id);
   const activeLockedByAgent = activeUnderReview || activeUnderWorkflow;
@@ -357,7 +367,9 @@ function selectControlBannerRenderModel(currentState, session) {
     return {
       hidden: false,
       hint: "This background session is still running. Stop it or take over to continue here.",
+      repair: null,
       summary: "Background session is running",
+      summaryTitle: "",
       takeOverHidden: false,
     };
   }
@@ -366,21 +378,11 @@ function selectControlBannerRenderModel(currentState, session) {
     || !session.active_controller_device_id
     || (!sessionWorking && !activeLockedByAgent)
   ) {
-    return {
-      hidden: true,
-      hint: "",
-      summary: "",
-      takeOverHidden: true,
-    };
+    return { ...NO_CONTROL_BANNER };
   }
 
   if (isCurrentDeviceActiveController({ remoteAuth: currentState.remoteAuth, session })) {
-    return {
-      hidden: true,
-      hint: "",
-      summary: "",
-      takeOverHidden: true,
-    };
+    return { ...NO_CONTROL_BANNER };
   }
 
   // Only the thread actually owned by review/workflow is off-limits for take-over.
@@ -391,8 +393,47 @@ function selectControlBannerRenderModel(currentState, session) {
         ? "This session is locked by Code Flow; it unlocks when the workflow finishes."
         : "This session is being reviewed; it unlocks when the review finishes."
       : "Read-only for sending until you take over. Approvals can still be handled here.",
+    repair: null,
     summary: `Controlled by ${controllerLabel(currentState, session.active_controller_device_id)}`,
+    summaryTitle: "",
     takeOverHidden: activeLockedByAgent,
+  };
+}
+
+/**
+ * The viewed thread's workspace is gone → the repair banner, or `null` when there is
+ * nothing wrong (in which case the control banner decides as it always did).
+ *
+ * The verdict comes straight off the snapshot — the relay decides it on the paths that
+ * touch the workspace and caches it on the thread runtime — while the BUTTON's state
+ * (in flight, last failure) is keyed by thread, so a repair settling after the user
+ * swiped away cannot brand the wrong session as broken.
+ */
+function selectWorkspaceRepairBanner(currentState, session) {
+  const threadId = session?.active_thread_id || "";
+  if (!threadId) {
+    return null;
+  }
+
+  const record = readWorkspaceRepair(currentState, threadId);
+  const plan = normalizeWorkspaceRepairPlan(session?.workspace_missing);
+  if (!plan) {
+    return null;
+  }
+
+  const { summary, summaryTitle } = workspaceRepairSummary(plan);
+  return {
+    hidden: false,
+    hint: workspaceRepairHint(plan),
+    repair: workspaceRepairAction(plan, {
+      error: record.error,
+      pending: record.pending,
+      threadId,
+    }),
+    summary,
+    summaryTitle,
+    // There is nothing to take over into until the directory exists again.
+    takeOverHidden: true,
   };
 }
 
@@ -565,9 +606,10 @@ function currentStatusLabel(currentState, session = currentState.session) {
       return "Offline";
     }
 
-    // Same task language as the folded header pill and the local overview — the details
-    // panel must not show a raw provider word ("idle"/"active") while everything else reads
-    // "Idle"/"Working". Approval / offline / re-pair are handled above; this is the live tail.
+    // Same task language as the alert-only header badge and the local overview — the
+    // details panel must not show a raw provider word ("idle"/"active") while
+    // everything else reads "Idle"/"Working". Approval / offline / re-pair are
+    // handled above; this is the live tail.
     return describeSessionStatus(session).task.label;
   }
 
@@ -576,7 +618,7 @@ function currentStatusLabel(currentState, session = currentState.session) {
   }
 
   if (currentState.pairingTicket) {
-    return pairingBadgeText(currentState);
+    return pairingBadge(currentState).label;
   }
 
   if (!currentState.remoteAuth && currentState.relayDirectory?.length) {
@@ -606,24 +648,14 @@ function pairingCopy(currentState) {
   return "This page is connecting to the broker with the scanned pairing ticket. You should not need to press Pair again.";
 }
 
-function pairingBadgeText(currentState) {
+function pairingBadge(currentState) {
   if (currentState.pairingPhase === "error") {
-    return "Pairing failed";
+    return headerStatusBadge("Pairing failed", "alert");
   }
   if (currentState.pairingPhase === "requesting") {
-    return "Approval pending";
+    return headerStatusBadge("Approval pending", "ready");
   }
-  return "Pairing…";
-}
-
-function pairingBadgeTone(currentState) {
-  if (currentState.pairingPhase === "error") {
-    return "alert";
-  }
-  if (currentState.pairingPhase === "requesting") {
-    return "ready";
-  }
-  return "alert";
+  return headerStatusBadge("Pairing…", "alert");
 }
 
 function pairingButtonLabel(currentState) {
@@ -633,7 +665,7 @@ function pairingButtonLabel(currentState) {
   return "Pairing...";
 }
 
-function selectedRelayNeedsRepair(currentState) {
+export function selectedRelayNeedsRepair(currentState) {
   return Boolean(
     currentState.remoteAuth &&
       (currentState.remoteAuth.payloadSecret === null ||

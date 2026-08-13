@@ -49,6 +49,7 @@ export function startSelfHostedBroker({
   return spawnManagedProcess("broker", command, args, {
     BIND_HOST: bindHost,
     PORT: String(brokerPort),
+    RELAY_BROKER_AUTH_MODE: "self_hosted",
     RELAY_BROKER_TICKET_SECRET: ticketSecret,
     ...extraEnv,
   });

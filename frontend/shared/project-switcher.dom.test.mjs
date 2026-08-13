@@ -184,11 +184,9 @@ test("Escape closes the menu without letting the key reach the surface behind it
   view.cleanup();
 });
 
-// Remote hosts this control in its SIDEBAR while its chat header already owns an
-// `<h1 id="remote-workspace-title">`. Rendering the heading there would put two page
-// headings on one screen — the same duplication local's header rule exists to
-// prevent, one surface over. So the heading is opt-out, and opting out has to leave
-// a control that still works rather than a stripped one.
+// Remote also hosts this control as a compact SIDEBAR icon. That placement already has
+// surrounding chrome, so it opts out of the heading wrapper while keeping the same menu
+// behavior as the full header switcher.
 test("renderHeading:false drops the heading element and keeps the control whole", () => {
   const view = mount({ activeProjectId: "proj_pay", onCreateProject() {}, renderHeading: false });
 

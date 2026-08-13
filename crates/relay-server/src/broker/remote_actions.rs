@@ -11,11 +11,11 @@ use crate::{
         AskUserQuestionDetailResponse, DevicesResponse, ForkSessionInput, HeartbeatInput,
         ModelOptionView, ProjectActionInput, ProjectsResponse, ReadThreadEntriesInput,
         ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
-        RequestReviewInput, ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot,
-        StartSessionInput, StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput,
-        TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-        ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WatchThreadsInput,
-        WorkflowActionInput, WorkflowsResponse, WorkspaceDiffResponse,
+        RepairWorkspaceInput, RequestReviewInput, ResumeSessionInput, ReviewsResponse,
+        SendMessageInput, SessionSnapshot, StartSessionInput, StartWorkflowInput, StopTurnInput,
+        SubmitAskUserAnswerInput, TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse,
+        ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput,
+        WatchThreadsInput, WorkflowActionInput, WorkflowsResponse, WorkspaceDiffResponse,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
@@ -112,6 +112,14 @@ pub(super) enum RemoteActionRequest {
     RenameThread {
         thread_id: String,
         input: RenameThreadInput,
+    },
+    /// Re-create a session's vanished workspace. Relay-owned like `RenameThread`: it
+    /// creates a directory (or runs `git worktree add`) on the host and never reaches a
+    /// provider, so it needs no session claim — a phone must be able to un-brick a session
+    /// it is merely looking at.
+    RepairWorkspace {
+        thread_id: String,
+        input: RepairWorkspaceInput,
     },
     FetchWorkspaceDiff {
         #[serde(default)]
@@ -212,6 +220,7 @@ impl RemoteActionRequest {
             Self::ApplyFileChange { .. } => RemoteActionKind::ApplyFileChange,
             Self::ProjectAction { .. } => RemoteActionKind::ProjectAction,
             Self::RenameThread { .. } => RemoteActionKind::RenameThread,
+            Self::RepairWorkspace { .. } => RemoteActionKind::RepairWorkspace,
             Self::FetchWorkspaceDiff { .. } => RemoteActionKind::FetchWorkspaceDiff,
             Self::FetchReviews { .. } => RemoteActionKind::FetchReviews,
             Self::FetchWorkflows { .. } => RemoteActionKind::FetchWorkflows,
@@ -315,6 +324,13 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::RenameThread { thread_id, input }
             }
+            Self::RepairWorkspace {
+                thread_id,
+                mut input,
+            } => {
+                input.device_id = Some(device_id);
+                Self::RepairWorkspace { thread_id, input }
+            }
             Self::FetchWorkspaceDiff {
                 thread_id,
                 root,
@@ -411,6 +427,7 @@ pub(super) enum RemoteActionKind {
     ApplyFileChange,
     ProjectAction,
     RenameThread,
+    RepairWorkspace,
     FetchWorkspaceDiff,
     FetchReviews,
     FetchWorkflows,
@@ -451,6 +468,7 @@ impl RemoteActionKind {
             Self::ApplyFileChange => "apply_file_change",
             Self::ProjectAction => "project_action",
             Self::RenameThread => "rename_thread",
+            Self::RepairWorkspace => "repair_workspace",
             Self::FetchWorkspaceDiff => "fetch_workspace_diff",
             Self::FetchReviews => "fetch_reviews",
             Self::FetchWorkflows => "fetch_workflows",
@@ -1277,6 +1295,12 @@ async fn execute_remote_action(
         // about the rename from the bumped `threads_revision` on the next snapshot.
         RemoteActionRequest::RenameThread { thread_id, input } => state
             .rename_thread(&thread_id, input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
+        // Ack-only, like RenameThread: the repair's own receipt is the fresh snapshot,
+        // which every client is about to be sent anyway.
+        RemoteActionRequest::RepairWorkspace { thread_id, input } => state
+            .repair_thread_workspace(&thread_id, input)
             .await
             .map(|_| RemoteActionOutcome::default()),
         RemoteActionRequest::FetchWorkspaceDiff {
@@ -2541,6 +2565,7 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         | RemoteActionKind::ApplyFileChange
         | RemoteActionKind::ProjectAction
         | RemoteActionKind::RenameThread
+        | RemoteActionKind::RepairWorkspace
         | RemoteActionKind::RequestReview
         | RemoteActionKind::StartWorkflow
         | RemoteActionKind::ResolveReview

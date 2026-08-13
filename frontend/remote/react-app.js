@@ -49,7 +49,9 @@ import {
   selectResetChromeRenderModel,
   selectSessionChromeRenderModel,
   selectStatusBadgeRenderModel,
+  selectedRelayNeedsRepair,
 } from "./chrome-view-model.js";
+import { selectRemoteHeaderProjectSwitcherModel } from "./header-project-switcher-model.js";
 import { deriveSessionRuntime } from "./session-runtime.js";
 import {
   closeRemoteNavigation,
@@ -208,6 +210,7 @@ import {
 import {
   BackArrowIcon,
   ComposeIcon,
+  ProjectTagIcon,
   ToggleLeftPanelIcon,
   ToggleRightPanelIcon,
 } from "../shared/panel-icons.js";
@@ -752,7 +755,9 @@ function RemoteApp() {
     }
   };
   const hasRelay = Boolean(currentState.remoteAuth);
-  const hasUsableRelay = Boolean(currentState.remoteAuth?.payloadSecret);
+  const hasUsableRelay = Boolean(
+    currentState.remoteAuth?.payloadSecret && !selectedRelayNeedsRepair(currentState)
+  );
   const sessionChromeModel = session
     ? selectSessionChromeRenderModel({ ...currentState, progressVerb }, session)
     : null;
@@ -2097,6 +2102,16 @@ function RemoteApp() {
           currentState,
           deviceChromeModel,
           headerModel,
+          activeProjectId,
+          hasUsableRelay,
+          projects: remoteProjects.projects,
+          projectsError: remoteProjects.error,
+          projectsLoaded: remoteProjects.loaded,
+          projectsReady: remoteProjectsReady,
+          onCreateProject: createRemoteProjectFromToolbar,
+          onDeleteProject: handleDeleteRemoteProject,
+          onRenameProject: handleRenameRemoteProject,
+          onSelectProject: setActiveProject,
           onOpenInfo() {
             remoteUiStore.getState().setRemoteInfoModalOpen(true);
           },
@@ -2204,6 +2219,11 @@ function RemoteApp() {
           },
           onTakeOver() {
             void handlers.onTakeOver();
+          },
+          // The banner passes the thread it is describing, not "the current one": a
+          // repair must target the session whose path the user just read.
+          onRepairWorkspace(threadId) {
+            void handlers.onRepairWorkspace?.(threadId);
           },
           onUpdateSessionSettings(payload) {
             const provider = session?.provider;
@@ -2493,7 +2513,11 @@ function RemoteSidebar({
           onSelectProject,
           projects,
           renderHeading: false,
-          triggerIcon: h(RemoteProjectIcon),
+          // The same tag the tree marks project groups with. This used to be a
+          // bespoke folder outline, on the reasoning that a second mark at 16px
+          // would be noise — which held only while projects and cwds shared a
+          // glyph. They no longer do, so a folder here would name the wrong kind.
+          triggerIcon: h(ProjectTagIcon),
         }),
         // No `shortcutHint`: remote is a phone surface with no ⌘F to promise.
         h(SidebarSearchToggle, { open: searchOpen, onToggle: onSetSearchOpen }),
@@ -2697,29 +2721,6 @@ function RemoteSidebar({
   );
 }
 
-// Geometry is a plain folder outline rather than anything project-specific: the
-// drawer already spends its folder glyph on cwd groups, and at 16px a second bespoke
-// mark would just be noise. What identifies this control is its position beside search
-// and the bell, plus `is-active` when a project is pinned.
-function RemoteProjectIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "16",
-      viewBox: "0 0 24 24",
-      width: "16",
-      stroke: "currentColor",
-      strokeWidth: "1.8",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M3 7.5h6l2 2h10v9.5H3z" }),
-    h("path", { d: "M3 7.5V5h5.5l2 2.5" })
-  );
-}
-
 // The pinned project, named once. Carries the same activity roll-up the group header
 // it replaced used to show, because "which project has something going on" is the one
 // thing the header said that the chip would otherwise drop.
@@ -2765,15 +2766,48 @@ function RemoteHeader({
   currentState,
   deviceChromeModel,
   headerModel,
+  activeProjectId,
+  hasUsableRelay = false,
+  projects = [],
+  projectsError = null,
+  projectsLoaded = false,
+  projectsReady = false,
+  onCreateProject,
+  onDeleteProject,
   onOpenInfo,
   onOpenStartSession,
+  onRenameProject,
   onReturnHome,
+  onSelectProject,
   onToggleNavigation,
   statusBadgeModel,
 }) {
   const usesDrawer = currentState.remoteNavMode === "drawer";
   const navOpen = currentState.remoteNavOpen;
   const navLabel = navOpen ? "Close sidebar" : "Open sidebar";
+  const {
+    label: switcherLabel,
+    labelTooltip: switcherTooltip,
+  } = selectRemoteHeaderProjectSwitcherModel({
+    activeProjectId,
+    headerModel,
+    projects,
+    projectsError,
+    projectsLoaded,
+  });
+  const titleNode = hasUsableRelay
+    ? h(ProjectSwitcher, {
+        activeProjectId,
+        label: switcherLabel,
+        labelTooltip: switcherTooltip,
+        onCreateProject: projectsReady ? onCreateProject : null,
+        onDeleteProject: projectsReady ? onDeleteProject : null,
+        onRenameProject: projectsReady ? onRenameProject : null,
+        onSelectProject,
+        projects,
+        titleId: "remote-workspace-title",
+      })
+    : null;
 
   return h(
     "header",
@@ -2848,8 +2882,9 @@ function RemoteHeader({
         { className: "chat-heading", id: "remote-chat-heading" },
         h(WorkspaceHeading, {
           header: headerModel,
-          statusBadge: statusBadgeModel,
           onOpenInfo,
+          statusBadge: statusBadgeModel,
+          titleNode,
         })
       )
     ),
@@ -2892,6 +2927,7 @@ function RemoteThreadPanel({
   onEnsureFileChangeDetail,
   onSubmitDecision,
   onSubmitAskUserAnswers,
+  onRepairWorkspace,
   onTakeOver,
   onUpdateSessionSettings,
   pendingAskUserQuestions,
@@ -2973,6 +3009,7 @@ function RemoteThreadPanel({
       },
       h(ControlBanner, {
         model: controlBannerModel,
+        onRepairWorkspace,
         onTakeOver,
       })
     ),

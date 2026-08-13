@@ -1,3 +1,4 @@
+mod acp;
 mod auth;
 mod broker;
 mod claude;
@@ -44,15 +45,16 @@ use protocol::{
     DevicesResponse, ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView,
     PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
     ProjectActionInput, ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput,
-    ReadThreadTranscriptInput, RenameThreadInput, RequestReviewInput, RequestReviewReceipt,
-    ResumeSessionInput, ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse,
-    RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, SessionSnapshotCompactProfile,
-    StartSessionInput, StartTeamInput, StartTeamReceipt, StartWorkflowInput, StartWorkflowReceipt,
-    StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, TeamActionInput, TeamActionReceipt,
-    TeamsResponse, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse,
-    ThreadRenameReceipt, ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse,
-    TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput,
-    WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse,
+    ReadThreadTranscriptInput, RenameThreadInput, RepairWorkspaceInput, RequestReviewInput,
+    RequestReviewReceipt, ResumeSessionInput, ReviewActionInput, ReviewDeleteReceipt,
+    ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+    SessionSnapshotCompactProfile, StartSessionInput, StartTeamInput, StartTeamReceipt,
+    StartWorkflowInput, StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput,
+    TakeOverInput, TeamActionInput, TeamActionReceipt, TeamsResponse, ThreadArchiveReceipt,
+    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadTranscriptResponse,
+    ThreadsQuery, ThreadsResponse, TranscriptDeltaEvent, UpdateSessionSettingsInput,
+    WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse,
+    WorkspaceDiffResponse,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -330,6 +332,10 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/allowed-roots", post(update_allowed_roots))
         .route("/api/projects", get(fetch_projects).post(project_action))
         .route("/api/devices", get(list_devices))
+        .route(
+            "/api/threads/:thread_id/workspace/repair",
+            post(repair_thread_workspace),
+        )
         .route("/api/threads/:thread_id/rename", post(rename_thread))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
@@ -897,6 +903,29 @@ async fn rename_thread(
         // Every failure here is a rejected REQUEST (name too long, reviewer thread,
         // limit reached) — the rename never touches a provider, so there is no upstream
         // to blame with a 502.
+        .map_err(bad_request)
+}
+
+/// Re-create a thread's vanished workspace, then hand back the fresh snapshot so the
+/// caller's banner turns back into a composer without a second round trip.
+async fn repair_thread_workspace(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+    // Optional body: the repair carries no choices (the recorded path is the only one
+    // that can work), so an absent body is a complete request, not a degraded one.
+    body: Option<Json<RepairWorkspaceInput>>,
+) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    let input = body.map(|Json(input)| input).unwrap_or_default();
+    context
+        .app
+        .repair_thread_workspace(&thread_id, input)
+        .await
+        .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
+        // Nothing upstream is involved — this creates a directory (or runs `git worktree
+        // add`) on this host. A failure is this request's, so it is never a 502.
         .map_err(bad_request)
 }
 

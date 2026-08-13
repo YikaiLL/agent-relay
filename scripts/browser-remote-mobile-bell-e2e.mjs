@@ -464,25 +464,25 @@ async function main() {
     // already-open menu closes it, and the option wait below would then hang for the
     // full timeout pointing at the wrong thing.
     const openSwitcherMenu = async () => {
-      await page.waitForSelector(".project-switcher-trigger", {
+      await page.waitForSelector(".sidebar .project-switcher-trigger", {
         state: "visible",
         timeout: TIMEOUT_MS,
       });
       const alreadyOpen = await page.evaluate(
         () =>
-          document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded")
+          document.querySelector(".sidebar .project-switcher-trigger")?.getAttribute("aria-expanded")
           === "true"
       );
       if (!alreadyOpen) {
-        await page.tap(".project-switcher-trigger");
+        await page.tap(".sidebar .project-switcher-trigger");
       }
-      await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+      await page.waitForSelector(".sidebar .project-switcher-menu", { timeout: TIMEOUT_MS });
     };
 
     const chooseSwitcherOption = async (label) => {
       await openSwitcherMenu();
       await page
-        .locator(".project-switcher-option", { hasText: new RegExp(`^${label}$`) })
+        .locator(".sidebar .project-switcher-option", { hasText: new RegExp(`^${label}$`) })
         .first()
         .tap({ timeout: TIMEOUT_MS });
       // Settle on the CHIP, not on a timer: the menu closes immediately while the list
@@ -725,7 +725,7 @@ async function main() {
       await page.setViewportSize({ width, height: 844 });
       await openSwitcherMenu();
       const box = await page.evaluate(() => {
-        const menu = document.querySelector(".project-switcher-menu");
+        const menu = document.querySelector(".sidebar .project-switcher-menu");
         const drawer = document.querySelector(".remote-app-shell .sidebar");
         const m = menu.getBoundingClientRect();
         const d = drawer.getBoundingClientRect();
@@ -738,7 +738,7 @@ async function main() {
       );
       // Escape rather than a blind tap: the trigger may be under the open menu.
       await page.keyboard.press("Escape");
-      await page.waitForSelector(".project-switcher-menu", { state: "detached", timeout: TIMEOUT_MS });
+      await page.waitForSelector(".sidebar .project-switcher-menu", { state: "detached", timeout: TIMEOUT_MS });
     }
     await page.setViewportSize(MOBILE_VIEWPORT);
 
@@ -808,7 +808,7 @@ async function main() {
     }
     assert.equal(
       await page.evaluate(() =>
-        document.querySelector(".project-switcher-trigger")?.classList.contains("is-active")
+        document.querySelector(".sidebar .project-switcher-trigger")?.classList.contains("is-active")
       ),
       false,
       "and the icon must not stay lit for a project that no longer exists"
@@ -976,7 +976,7 @@ async function main() {
     await chooseSwitcherOption("Alpha project");
     await openSwitcherMenu();
     await page
-      .locator(".project-switcher-option", { hasText: /^Delete project$/ })
+      .locator(".sidebar .project-switcher-option", { hasText: /^Delete project$/ })
       .first()
       .tap({ timeout: TIMEOUT_MS });
 
@@ -989,7 +989,7 @@ async function main() {
     });
     assert.equal(
       await page.evaluate(() =>
-        document.querySelector(".project-switcher-trigger")?.classList.contains("is-active")
+        document.querySelector(".sidebar .project-switcher-trigger")?.classList.contains("is-active")
       ),
       false,
       "the top-bar icon must not stay lit for a project that no longer exists"
@@ -997,7 +997,7 @@ async function main() {
     await openSwitcherMenu();
     assert.equal(
       await page.evaluate(() =>
-        document.querySelector(".project-switcher-option.is-active")?.textContent?.trim()
+        document.querySelector(".sidebar .project-switcher-option.is-active")?.textContent?.trim()
       ),
       "Default Workspace",
       "and the menu marks where you actually are"

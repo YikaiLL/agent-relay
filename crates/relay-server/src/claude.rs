@@ -152,7 +152,6 @@ impl ClaudeCodeBridge {
         {
             let mut relay = bridge.state.write().await;
             relay.set_provider_connection("claude_code", true);
-            relay.set_provider_name("claude_code".to_string());
             relay.push_log("info", "Claude Code worker connected.");
             relay.notify();
         }

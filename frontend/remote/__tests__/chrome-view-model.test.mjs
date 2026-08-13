@@ -121,6 +121,7 @@ test("selectSessionChromeRenderModel prioritizes re-pair over offline for expire
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Re-pair required");
   assert.equal(model.statusBadge.tone, "alert");
+  assert.equal(model.statusBadge.headerVisible, true);
 });
 
 test("selectSessionChromeRenderModel derives header, status, and control banner", () => {
@@ -162,10 +163,13 @@ test("selectSessionChromeRenderModel derives header, status, and control banner"
   const model = selectSessionChromeRenderModel(state, session);
 
   assert.equal(model.header.title, "agent-relay");
-  assert.equal(model.header.subtitle, "/Users/luchi/git/agent-relay");
-  assert.equal(model.header.modelLabel, "Codex · gpt-5.4");
-  assert.equal(model.header.modelTitle, "Codex · gpt-5.4 · effort medium");
+  assert.equal(model.header.sessionPath, "/Users/luchi/git/agent-relay");
+  assert.equal(model.header.subtitle, "");
+  assert.equal(model.header.subtitleHidden, true);
+  assert.equal("modelLabel" in model.header, false);
+  assert.equal("modelTitle" in model.header, false);
   assert.equal(model.statusBadge.label, "Idle");
+  assert.equal(model.statusBadge.headerVisible, false);
   assert.equal(model.agentWorkingIndicator.hidden, true);
   assert.equal(model.controlBanner.hidden, true);
   assert.equal(model.controlBanner.takeOverHidden, true);
@@ -174,7 +178,7 @@ test("selectSessionChromeRenderModel derives header, status, and control banner"
   assert.equal(model.sessionMeta.chips.find((chip) => chip.label === "Model").value, "gpt-5.4");
   assert.equal(model.sessionMeta.chips.find((chip) => chip.label === "Effort").value, "medium");
   assert.equal(model.sessionMeta.chips.find((chip) => chip.label === "Control").value, "Available");
-  // The details "Status" chip speaks the same task language as the header pill / local
+  // The details "Status" chip speaks the same task language as the header badge / local
   // overview (Idle here), not a raw provider word ("idle").
   assert.equal(model.sessionMeta.chips.find((chip) => chip.label === "Status").value, "Idle");
 });
@@ -263,6 +267,7 @@ test("remote status badge surfaces 'Review in progress' when the active thread i
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Review in progress");
   assert.equal(model.statusBadge.tone, "alert");
+  assert.equal(model.statusBadge.headerVisible, true);
 });
 
 test("remote status badge surfaces 'Review blocked' regardless of which thread is active", () => {
@@ -280,6 +285,7 @@ test("remote status badge surfaces 'Review blocked' regardless of which thread i
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Review blocked — action needed");
   assert.equal(model.statusBadge.tone, "alert");
+  assert.equal(model.statusBadge.headerVisible, true);
 });
 
 test("remote status badge surfaces blocked Code Flow regardless of which thread is active", () => {
@@ -296,6 +302,7 @@ test("remote status badge surfaces blocked Code Flow regardless of which thread 
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Code Flow blocked — action needed");
   assert.equal(model.statusBadge.tone, "alert");
+  assert.equal(model.statusBadge.headerVisible, true);
 });
 
 test("remote status badge shows the active thread's own task (Idle), not a review label, when a review runs on a non-active thread", () => {
@@ -312,6 +319,7 @@ test("remote status badge shows the active thread's own task (Idle), not a revie
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Idle");
   assert.equal(model.statusBadge.tone, "ready");
+  assert.equal(model.statusBadge.headerVisible, false);
 });
 
 test("remote status badge reads 'No active task' with no active thread (task subject via the shared seam)", () => {
@@ -325,6 +333,7 @@ test("remote status badge reads 'No active task' with no active thread (task sub
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "No active task");
   assert.equal(model.statusBadge.tone, "ready");
+  assert.equal(model.statusBadge.headerVisible, false);
 });
 
 test("remote control banner allows take over when the review is on another thread", () => {
@@ -369,6 +378,7 @@ test("remote control banner hides take over while the active thread is owned by 
   const model = selectSessionChromeRenderModel(state, session);
 
   assert.equal(model.statusBadge.label, "Code Flow in progress");
+  assert.equal(model.statusBadge.headerVisible, true);
   assert.equal(model.controlBanner.hidden, false);
   assert.equal(model.controlBanner.takeOverHidden, true);
   assert.match(model.controlBanner.hint, /Code Flow/);
@@ -404,7 +414,7 @@ test("selectStatusBadgeRenderModel falls back to home and pairing states without
       session: null,
       socketConnected: false,
     }),
-    { label: "Approval pending", tone: "ready" }
+    { label: "Approval pending", tone: "ready", headerVisible: true }
   );
 
   assert.deepEqual(
@@ -417,7 +427,7 @@ test("selectStatusBadgeRenderModel falls back to home and pairing states without
       session: null,
       socketConnected: false,
     }),
-    { label: "Home", tone: "ready" }
+    { label: "Home", tone: "ready", headerVisible: false }
   );
 });
 
@@ -456,6 +466,7 @@ test("selectSessionChromeRenderModel surfaces phase verb in the working indicato
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Working");
   assert.equal(model.statusBadge.tone, "ready");
+  assert.equal(model.statusBadge.headerVisible, false);
   assert.equal(model.agentWorkingIndicator.hidden, false);
   assert.equal(model.agentWorkingIndicator.label, "Pondering…");
   assert.equal(model.agentWorkingIndicator.tone, "ready");
@@ -485,6 +496,7 @@ test("selectSessionChromeRenderModel surfaces tool gerund in the working indicat
 
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Working");
+  assert.equal(model.statusBadge.headerVisible, false);
   assert.equal(model.agentWorkingIndicator.label, "Bashing…");
 });
 
@@ -514,6 +526,7 @@ test("selectSessionChromeRenderModel flips to Stalled? when last_progress_at goe
   const model = selectSessionChromeRenderModel(state, session);
   assert.equal(model.statusBadge.label, "Working");
   assert.equal(model.statusBadge.tone, "ready");
+  assert.equal(model.statusBadge.headerVisible, false);
   assert.equal(model.agentWorkingIndicator.hidden, false);
   assert.equal(model.agentWorkingIndicator.label, "Stalled?");
   assert.equal(model.agentWorkingIndicator.tone, "alert");
@@ -532,7 +545,7 @@ test("selectStatusBadgeRenderModel shows disconnected server state", () => {
       session: null,
       socketConnected: true,
     }),
-    { label: "Server disconnected", tone: "offline" }
+    { label: "Server disconnected", tone: "offline", headerVisible: true }
   );
 
   assert.deepEqual(
@@ -547,7 +560,7 @@ test("selectStatusBadgeRenderModel shows disconnected server state", () => {
       session: null,
       socketConnected: false,
     }),
-    { label: "Server disconnected", tone: "offline" }
+    { label: "Server disconnected", tone: "offline", headerVisible: true }
   );
 });
 

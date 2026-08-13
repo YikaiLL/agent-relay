@@ -342,7 +342,6 @@ impl CodexBridge {
         {
             let mut relay = bridge.state.write().await;
             relay.set_provider_connection(provider_key, true);
-            relay.set_provider_name(provider_key.to_string());
             relay.push_log("info", format!("Connected to {display_name} app-server."));
             relay.notify();
         }

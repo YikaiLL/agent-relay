@@ -198,10 +198,37 @@ pub trait ProviderBridge: Send + Sync {
     }
 }
 
+/// Which bridge implementation backs a provider entry.
+///
+/// This is *data on the entry*, not something inferred from the key. It used to
+/// be inferred, with `spawn_provider` falling through to `CodexBridge` for any
+/// unrecognized key — so a new provider that wasn't codex-app-server-compatible
+/// would spawn the wrong bridge and fail in a way that pointed nowhere near the
+/// cause. Making it an enum means the match is exhaustive and the compiler
+/// catches a missing arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    /// `codex app-server` — JSON-RPC over stdio, natively multi-session.
+    Codex,
+    /// The Node worker wrapping `@anthropic-ai/claude-agent-sdk`.
+    ClaudeCode,
+    /// Agent Client Protocol over stdio (`cursor-agent acp`, and any other ACP
+    /// agent — the bridge is parameterized, not vendor-specific).
+    Acp,
+    /// In-process test double.
+    Fake,
+}
+
 struct ProviderEntry {
     binary_name: &'static str,
     display_name: &'static str,
     provider_key: &'static str,
+    kind: ProviderKind,
+    /// Argv passed to `binary_name` to put it in protocol mode. Empty for
+    /// bridges that build their own command line.
+    launch_args: &'static [&'static str],
+    /// Extra names accepted in `AGENT_PROVIDERS` beyond the key and binary name.
+    aliases: &'static [&'static str],
 }
 
 /// Static per-provider identity captured while spawning, one entry per
@@ -243,11 +270,25 @@ const DEFAULT_PROVIDERS: &[ProviderEntry] = &[
         binary_name: "codex",
         display_name: "Codex",
         provider_key: "codex",
+        kind: ProviderKind::Codex,
+        launch_args: &["app-server"],
+        aliases: &[],
     },
     ProviderEntry {
         binary_name: "claude",
         display_name: "Claude Code",
         provider_key: "claude_code",
+        kind: ProviderKind::ClaudeCode,
+        launch_args: &[],
+        aliases: &["claude-code"],
+    },
+    ProviderEntry {
+        binary_name: "cursor-agent",
+        display_name: "Cursor",
+        provider_key: "cursor",
+        kind: ProviderKind::Acp,
+        launch_args: &["acp"],
+        aliases: &["cursor-agent", "cursor_agent"],
     },
 ];
 
@@ -255,7 +296,51 @@ const FAKE_PROVIDER: ProviderEntry = ProviderEntry {
     binary_name: "fake",
     display_name: "Fake",
     provider_key: "fake",
+    kind: ProviderKind::Fake,
+    launch_args: &[],
+    aliases: &[],
 };
+
+/// Which provider a fresh relay adopts as its own, in preference order.
+///
+/// Only providers with an opinion belong here; anything else falls back to
+/// registry order. Claude is first because that is what a relay with everything
+/// installed has always reported, and changing it would move every new user's
+/// default agent without anyone deciding to.
+const DEFAULT_PROVIDER_PREFERENCE: &[&str] = &["claude_code", "codex"];
+
+/// Pick the relay's provider from the ones that actually spawned.
+///
+/// This used to be emergent rather than chosen: each bridge called
+/// `set_provider_name` as it started, so the winner was whichever provider sat
+/// last in the registry loop. That silently made the answer a function of
+/// registry ORDER — so adding a provider to the end of the list, or adding the
+/// "missing" call to one that lacked it, would reassign every fresh relay's
+/// default agent as a side effect. It also left a cursor-only relay reporting no
+/// provider at all, because the ACP bridge never made the call.
+///
+/// `spawned` must be in registry order so the fallback is stable.
+pub(crate) fn preferred_default_provider<'a>(spawned: &[&'a str]) -> Option<&'a str> {
+    DEFAULT_PROVIDER_PREFERENCE
+        .iter()
+        .find_map(|preferred| spawned.iter().find(|key| key == &preferred).copied())
+        .or_else(|| spawned.first().copied())
+}
+
+/// The human-facing name for a provider key, for messages a user reads.
+///
+/// The registry already carries one per provider; without a lookup, call sites
+/// end up hardcoding a single vendor's name and telling everyone else's users
+/// something false. Falls back to the key so a provider added to the registry
+/// but not here degrades to "cursor" rather than to a lie.
+pub fn provider_display_name(provider_key: &str) -> &str {
+    DEFAULT_PROVIDERS
+        .iter()
+        .chain(std::iter::once(&FAKE_PROVIDER))
+        .find(|entry| entry.provider_key == provider_key)
+        .map(|entry| entry.display_name)
+        .unwrap_or(provider_key)
+}
 
 const PROVIDER_START_TIMEOUT_SECS: u64 = 30;
 
@@ -267,20 +352,25 @@ fn provider_start_timeout_secs() -> u64 {
 }
 
 fn configured_providers() -> Vec<&'static ProviderEntry> {
-    let names = std::env::var("AGENT_PROVIDERS")
-        .ok()
-        .and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
-        .unwrap_or_else(|| String::new());
+    let names = std::env::var("AGENT_PROVIDERS").unwrap_or_default();
+    select_providers(&names)
+}
 
-    if names.is_empty() {
-        return DEFAULT_PROVIDERS.iter().collect();
-    }
-
+/// Resolve an `AGENT_PROVIDERS` value to entries. Split out from the env read so
+/// it is testable without mutating process-global state (env is shared across
+/// the test binary's threads).
+///
+/// An empty value means "the defaults"; `fake` is reachable only by naming it.
+fn select_providers(names: &str) -> Vec<&'static ProviderEntry> {
     let requested: Vec<&str> = names
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
+
+    if requested.is_empty() {
+        return DEFAULT_PROVIDERS.iter().collect();
+    }
 
     DEFAULT_PROVIDERS
         .iter()
@@ -289,10 +379,7 @@ fn configured_providers() -> Vec<&'static ProviderEntry> {
             requested.iter().any(|name| {
                 *name == entry.provider_key
                     || *name == entry.binary_name
-                    || *name == "fake" && entry.provider_key == "fake"
-                    || *name == "claude-code" && entry.provider_key == "claude_code"
-                    || *name == "claude_code" && entry.provider_key == "claude_code"
-                    || *name == "claude" && entry.provider_key == "claude_code"
+                    || entry.aliases.contains(name)
             })
         })
         .collect()
@@ -345,6 +432,19 @@ pub async fn spawn_providers(
         });
     }
 
+    // Decide the relay's provider ONCE, here, from what actually came up — the
+    // bridges no longer each claim it on the way past. `status_base` is built in
+    // registry order, so the fallback is stable.
+    let spawned: Vec<&str> = status_base
+        .iter()
+        .filter(|base| base.spawn_error.is_none())
+        .map(|base| base.provider_key.as_str())
+        .collect();
+    if let Some(default_provider) = preferred_default_provider(&spawned) {
+        let mut relay = state.write().await;
+        relay.set_provider_name(default_provider.to_string());
+    }
+
     (providers, status_base)
 }
 
@@ -352,10 +452,24 @@ async fn spawn_provider(
     entry: &'static ProviderEntry,
     state: Arc<RwLock<RelayState>>,
 ) -> Result<Arc<dyn ProviderBridge>, String> {
-    match entry.provider_key {
-        "fake" => bridge_arc(crate::fake_provider::FakeProviderBridge::spawn(state).await),
-        "claude_code" => bridge_arc(crate::claude::ClaudeCodeBridge::spawn(state).await),
-        _ => bridge_arc(
+    // Exhaustive on purpose — no `_` arm. A new `ProviderKind` must be handled
+    // here explicitly rather than silently inheriting another bridge.
+    match entry.kind {
+        ProviderKind::Fake => {
+            bridge_arc(crate::fake_provider::FakeProviderBridge::spawn(state).await)
+        }
+        ProviderKind::ClaudeCode => bridge_arc(crate::claude::ClaudeCodeBridge::spawn(state).await),
+        ProviderKind::Acp => bridge_arc(
+            crate::acp::AcpBridge::spawn(
+                state,
+                entry.binary_name,
+                entry.launch_args,
+                entry.display_name,
+                entry.provider_key,
+            )
+            .await,
+        ),
+        ProviderKind::Codex => bridge_arc(
             crate::codex::CodexBridge::spawn(
                 state,
                 entry.binary_name,
@@ -372,6 +486,155 @@ where
     T: ProviderBridge + 'static,
 {
     result.map(|bridge| Arc::new(bridge) as Arc<dyn ProviderBridge>)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_provider_is_declared_not_an_accident_of_spawn_order() {
+        // It used to be whichever provider called `set_provider_name` last
+        // during boot. That is not a decision anyone made: it is the tail of a
+        // `for` loop over the registry. Three measured consequences (2026-08-12,
+        // fresh relay, `snapshot.provider`):
+        //
+        //   all three installed  -> "claude_code"   (only because cursor, which
+        //                                            sorts last, never called it)
+        //   cursor only          -> ""              <- a working relay reporting
+        //                                              no provider at all
+        //   codex + cursor       -> "codex"
+        //
+        // Adding the missing call to the ACP bridge — the "obvious" symmetry fix
+        // — would have silently moved the all-three default from Claude to
+        // Cursor, because Cursor is last in the registry. The order has to be
+        // declared instead.
+        assert_eq!(
+            preferred_default_provider(&["codex", "claude_code", "cursor"]),
+            Some("claude_code"),
+            "Claude stays the default when it is available"
+        );
+        assert_eq!(
+            preferred_default_provider(&["cursor", "claude_code", "codex"]),
+            Some("claude_code"),
+            "the answer must not depend on the order things spawned in"
+        );
+
+        // The case that was broken: a relay with a working provider reported none.
+        assert_eq!(preferred_default_provider(&["cursor"]), Some("cursor"));
+
+        assert_eq!(
+            preferred_default_provider(&["codex", "cursor"]),
+            Some("codex")
+        );
+        // Nothing preferred spawned: fall back to what did, in registry order.
+        assert_eq!(
+            preferred_default_provider(&["cursor", "fake"]),
+            Some("cursor")
+        );
+        assert_eq!(preferred_default_provider(&[]), None);
+    }
+
+    fn entry(key: &str) -> &'static ProviderEntry {
+        DEFAULT_PROVIDERS
+            .iter()
+            .chain(std::iter::once(&FAKE_PROVIDER))
+            .find(|entry| entry.provider_key == key)
+            .unwrap_or_else(|| panic!("no provider entry for `{key}`"))
+    }
+
+    #[test]
+    fn every_entry_declares_the_bridge_it_wants() {
+        // The regression guard for the old `_ => CodexBridge` fallthrough: a
+        // provider that is not codex-app-server-compatible must never resolve
+        // to the Codex bridge just because nothing else matched its key.
+        assert_eq!(entry("codex").kind, ProviderKind::Codex);
+        assert_eq!(entry("claude_code").kind, ProviderKind::ClaudeCode);
+        assert_eq!(entry("cursor").kind, ProviderKind::Acp);
+        assert_eq!(entry("fake").kind, ProviderKind::Fake);
+    }
+
+    #[test]
+    fn protocol_mode_bridges_declare_launch_args() {
+        // `codex` and `cursor-agent` both default to an interactive TUI; without
+        // the subcommand the bridge would attach to a terminal UI and hang
+        // rather than speak a protocol.
+        for entry in DEFAULT_PROVIDERS {
+            if matches!(entry.kind, ProviderKind::Codex | ProviderKind::Acp) {
+                assert!(
+                    !entry.launch_args.is_empty(),
+                    "`{}` needs launch args to enter protocol mode",
+                    entry.provider_key
+                );
+            }
+        }
+        assert_eq!(entry("cursor").launch_args, &["acp"]);
+    }
+
+    #[test]
+    fn provider_keys_and_binaries_are_unique() {
+        let all: Vec<_> = DEFAULT_PROVIDERS
+            .iter()
+            .chain(std::iter::once(&FAKE_PROVIDER))
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a.provider_key, b.provider_key);
+                assert_ne!(a.binary_name, b.binary_name);
+                // An alias must not collide with another provider's key, or
+                // `AGENT_PROVIDERS` would select two bridges for one name.
+                assert!(!a.aliases.contains(&b.provider_key));
+                assert!(!b.aliases.contains(&a.provider_key));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_selection_is_the_defaults_and_never_fake() {
+        let keys: Vec<_> = select_providers("")
+            .iter()
+            .map(|e| e.provider_key)
+            .collect();
+        assert_eq!(keys, vec!["codex", "claude_code", "cursor"]);
+        assert!(select_providers("   ")
+            .iter()
+            .all(|e| e.provider_key != "fake"));
+    }
+
+    #[test]
+    fn selection_accepts_keys_binaries_and_aliases() {
+        let by_key: Vec<_> = select_providers("cursor")
+            .iter()
+            .map(|e| e.provider_key)
+            .collect();
+        assert_eq!(by_key, vec!["cursor"]);
+
+        let by_binary: Vec<_> = select_providers("cursor-agent")
+            .iter()
+            .map(|e| e.provider_key)
+            .collect();
+        assert_eq!(by_binary, vec!["cursor"]);
+
+        // Pre-existing claude aliases must keep working.
+        for name in ["claude", "claude-code", "claude_code"] {
+            let keys: Vec<_> = select_providers(name)
+                .iter()
+                .map(|e| e.provider_key)
+                .collect();
+            assert_eq!(keys, vec!["claude_code"], "alias `{name}` regressed");
+        }
+
+        let multi: Vec<_> = select_providers("fake, cursor")
+            .iter()
+            .map(|e| e.provider_key)
+            .collect();
+        assert_eq!(multi, vec!["cursor", "fake"]);
+    }
+
+    #[test]
+    fn unknown_names_select_nothing_rather_than_defaulting() {
+        assert!(select_providers("gemini").is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -832,7 +832,7 @@ test("renderEntryMarkup enriches a path-only closed section from a new-file diff
     expandedKeys: new Set(["entry:turn-diff:new-file"]),
   });
 
-  assert.match(markup, /file_changes\.rs<\/strong>/);
+  assert.match(markup, /diff-file-base[^>]*>file_changes\.rs</);
   assert.match(markup, /crates\/relay-server\/src\/file_changes\.rs/);
   assert.doesNotMatch(markup, /diff-line diff-line-add/);
   assert.doesNotMatch(markup, /diff-line-number/);
@@ -881,7 +881,7 @@ test("renderEntryMarkup keeps raw created-file content out of a closed section",
     expandedKeys: new Set(["entry:file-change:raw-add"]),
   });
 
-  assert.match(markup, /file-diff-ui-smoke-test\.md<\/strong>/);
+  assert.match(markup, /diff-file-base[^>]*>file-diff-ui-smoke-test\.md</);
   assert.doesNotMatch(markup, /file-change-chip-del">-4/);
   assert.doesNotMatch(markup, /diff-line diff-line-add/);
 });
@@ -914,8 +914,19 @@ test("renderEntryMarkup shows workspace-relative file paths for absolute paths",
 
   assert.match(markup, /crates\/relay-server\/src\/codex\.rs/);
   assert.match(markup, /crates\/relay-server\/src\/state\/relay\/transcript\.rs/);
-  assert.doesNotMatch(markup, /<strong class="diff-file-section-name">src\/codex\.rs<\/strong>/);
-  assert.doesNotMatch(markup, /<strong class="diff-file-section-name">\/Users\/luchi\/git\/agent-relay\/crates\/relay-server\/src\/codex\.rs<\/strong>/);
+  // Asserted against the directory half specifically. These were written when
+  // the header was one <strong> holding the whole path; left as-is they would
+  // now pass no matter what the header rendered, since that element is gone.
+  assert.doesNotMatch(
+    markup,
+    /class="diff-file-dir">src\/</,
+    "the shared prefix must not be stripped down to a bare src/"
+  );
+  assert.doesNotMatch(
+    markup,
+    /class="diff-file-dir">\/Users\//,
+    "the absolute prefix must not survive into the displayed directory"
+  );
 });
 
 test("renderEntryMarkup shows workspace-relative path for a single absolute file within current cwd", () => {
@@ -941,7 +952,13 @@ test("renderEntryMarkup shows workspace-relative path for a single absolute file
   });
 
   assert.match(markup, /file-diff-ui-smoke-test\.md/);
-  assert.doesNotMatch(markup, /<strong class="diff-file-section-name">\/Users\/luchi\/git\/agent-relay\/file-diff-ui-smoke-test\.md<\/strong>/);
+  // A cwd-relative single file has no directory half left at all, so the dir
+  // span must be absent rather than present-and-empty.
+  assert.doesNotMatch(
+    markup,
+    /class="diff-file-dir"/,
+    "a file at the cwd root should render no directory element"
+  );
 });
 
 test("renderEntryMarkup preserves absolute path outside current cwd", () => {
@@ -1146,6 +1163,21 @@ test("renderEntryMarkup expands tool details from fetched entry data", () => {
   assert.match(expandedMarkup, /tool-log-pre">{&quot;text&quot;:&quot;file contents&quot;}/);
 });
 
+test("an approval card with no detail does not attribute the wait to Codex", () => {
+  // The fallback copy was "Codex is waiting for a remote approval." — shown on
+  // every provider's card. A Cursor plan or a Claude edit is not Codex waiting,
+  // and the card carries no provider field to name one, so it must not guess.
+  const markup = renderApprovalMarkup({
+    kind: "plan",
+    summary: "Add delta line",
+    detail: "",
+    supports_session_scope: false,
+  });
+
+  assert.doesNotMatch(markup, /Codex/);
+  assert.match(markup, /waiting for a remote approval/);
+});
+
 test("renderApprovalMarkup includes session-scope actions and escapes requested permissions", () => {
   const markup = renderApprovalMarkup({
     kind: "command",
@@ -1165,7 +1197,10 @@ test("renderApprovalMarkup includes session-scope actions and escapes requested 
   assert.match(markup, /uv run migrate/);
   assert.match(markup, /frontend\/shared\/transcript-react\.js/);
   assert.match(markup, /&lt;unsafe&gt;/);
-  assert.match(markup, /cwd: \/tmp\/project/);
+  // Was /cwd: \/tmp\/project/ when the working directory was a line of prose.
+  // Same intent — the cwd must reach the screen — against the scope chip it
+  // now renders into. See frontend/approval-card.test.mjs.
+  assert.match(markup, /class="approval-scope-path">\/tmp\/project</);
 });
 
 test("renderApprovalMarkup collapses large command and permission payloads", () => {

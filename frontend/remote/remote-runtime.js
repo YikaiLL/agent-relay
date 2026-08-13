@@ -8,7 +8,7 @@ import { mountIosInstallHint } from "./ios-install.js";
 import { registerRemotePwa } from "./pwa.js";
 import { renderLog } from "./session-surface.js";
 import { sidebarGestureDebugEnabled } from "./sidebar-debug-flag.js";
-import { applyFileChange, applySessionSnapshot, applyTranscriptDelta, applyTranscriptEvent, cancelRemoteThreadSearch, cancelRemoteThreadsPoll, clearSessionRuntime, deleteRemoteReview, fetchAskUserQuestionDetail, fetchRemoteProviderModels, fetchRemoteProviders, fetchRemoteThreadTranscript, fetchTranscriptEntryDetail, forkRemoteSession, probeRemoteThreadsExist, refreshRemoteThreads, requestRemoteReview, resolveRemoteReview, resolveRemoteWorkflow, resumeRemoteSession, sendMessage, startRemoteSession, startRemoteWorkflow, stopActiveTurn, submitAskUserAnswer, submitDecision, syncRemoteSnapshot, takeOverControl, updateRemoteSessionSettings, viewRemoteThread } from "./session-ops.js";
+import { applyFileChange, applySessionSnapshot, applyTranscriptDelta, applyTranscriptEvent, cancelRemoteThreadSearch, cancelRemoteThreadsPoll, clearSessionRuntime, deleteRemoteReview, fetchAskUserQuestionDetail, fetchRemoteProviderModels, fetchRemoteProviders, fetchRemoteThreadTranscript, fetchTranscriptEntryDetail, forkRemoteSession, probeRemoteThreadsExist, refreshRemoteThreads, repairRemoteWorkspace, requestRemoteReview, resolveRemoteReview, resolveRemoteWorkflow, resumeRemoteSession, sendMessage, startRemoteSession, startRemoteWorkflow, stopActiveTurn, submitAskUserAnswer, submitDecision, syncRemoteSnapshot, takeOverControl, updateRemoteSessionSettings, viewRemoteThread } from "./session-ops.js";
 import { clearActiveRelaySelection, ensureDeviceIdentity, hydrateStoredRemoteSecrets, selectRelayProfile, state } from "./state.js";
 import { applyRemoteSurfacePatch, createResetRemoteSurfaceStatePatch } from "./surface-state.js";
 
@@ -257,6 +257,9 @@ export function createRemoteAppHandlers() {
     },
     onTakeOver() {
       return takeOverControl();
+    },
+    onRepairWorkspace(threadId) {
+      return repairRemoteWorkspace(threadId);
     },
     onUpdateSessionSettings(payload) {
       return updateRemoteSessionSettings(payload);

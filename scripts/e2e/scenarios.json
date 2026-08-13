@@ -10,6 +10,7 @@
       "local-allowed-roots",
       "local-file-diff",
       "local-file-diff-cards",
+      "local-file-diff-path",
       "local-command-group",
       "local-history-scroll",
       "local-drawer-scroll",
@@ -36,6 +37,7 @@
       "local-allowed-roots",
       "local-file-diff",
       "local-file-diff-cards",
+      "local-file-diff-path",
       "local-command-group",
       "local-history-scroll",
       "local-drawer-scroll",
@@ -244,6 +246,17 @@
       "coverage": [
         "file-diff",
         "file-diff-cards"
+      ]
+    },
+    "local-file-diff-path": {
+      "script": "browser-local-file-diff-path-e2e.mjs",
+      "tier": "core",
+      "provider": "fake-compatible",
+      "transport": "local",
+      "coverage": [
+        "file-diff",
+        "file-diff-path",
+        "responsive"
       ]
     },
     "local-command-group": {

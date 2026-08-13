@@ -44,6 +44,13 @@ import { readThreadListUi } from "../../shared/thread-list-store.js";
 import { shouldRenderThreadListLoadingPlaceholder } from "../../shared/thread-list-state.js";
 import { syncLiveTranscriptEntryDetailsFromSnapshot } from "../transcript/details.js";
 import {
+  readWorkspaceRepair,
+  repairThreadWorkspace,
+  setWorkspaceRepairError,
+  setWorkspaceRepairPending,
+  workspaceRepairResolved,
+} from "../workspace-repair.js";
+import {
   clearTranscriptHydration,
   restoreHydratedTranscript,
   switchTranscriptHydrationThread,
@@ -706,6 +713,52 @@ export function createLifecycleController(ctx) {
     }
   }
 
+  /// Make the VIEWED thread's recorded workspace exist again (mkdir, or `git worktree
+  /// add` back onto the branch it was born on), then take the fresh snapshot the
+  /// relay hands back.
+  ///
+  /// The thread is not moved anywhere: a Claude session is archived under the project
+  /// directory derived from its cwd and `resume` resolves through that same
+  /// derivation, so the recorded path is the only address that can work. The relay
+  /// decides what to run — this only asks.
+  async function repairWorkspace() {
+    const threadId = viewedThreadId();
+    if (!threadId) {
+      logLine("There is no session whose workspace could be re-created.");
+      return;
+    }
+    // The verdict rides the snapshot; the store holds only this button's own state.
+    const missing = state.session?.workspace_missing;
+    if (!missing || readWorkspaceRepair(state, threadId).pending) {
+      return;
+    }
+
+    const recorded = missing.recorded_cwd || "";
+    setWorkspaceRepairPending(state, threadId, true);
+    if (state.session) {
+      renderSession(state.session);
+    }
+    logLine(`Re-creating this session's workspace ${recorded}`);
+
+    try {
+      const snapshot = await repairThreadWorkspace(apiFetch, threadId, state.deviceId);
+      // Clear BEFORE rendering the snapshot: the snapshot carries no workspace
+      // verdict of its own (`workspace_missing` rides a thread's transcript tail),
+      // so the banner would otherwise sit there until the next tail fetch.
+      workspaceRepairResolved(state, threadId);
+      applySessionSnapshot(snapshot);
+      logLine(`Workspace ${recorded} is back; this session can run again.`);
+    } catch (error) {
+      // The relay's own words, on the banner and in the log. It is the only thing
+      // that can tell the user whether to retry or go fix the repository by hand.
+      setWorkspaceRepairError(state, threadId, error.message);
+      if (state.session) {
+        renderSession(state.session);
+      }
+      logLine(`Workspace repair failed: ${error.message}`);
+    }
+  }
+
   /// Render a session snapshot.
   ///
   /// `transcriptMayPredateWrite` marks a response whose transcript may have been
@@ -966,6 +1019,7 @@ export function createLifecycleController(ctx) {
     resolveWorkflow,
     deleteReview,
     stopActiveTurn,
+    repairWorkspace,
     applySessionSnapshot,
     fetchThreadList,
   };

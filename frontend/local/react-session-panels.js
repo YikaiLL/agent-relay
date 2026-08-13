@@ -112,13 +112,31 @@ export function SessionMetaPanel({ chips = [], emptyMessage = "" }) {
 
 export function ControlBannerContent({
   hint: _hint,
+  // `{ label, pending, error }` when the viewed thread's workspace is missing — see
+  // local/control-banner.js. The banner is one slot, so this and Take over are
+  // mutually exclusive by construction: the model never sets both.
+  repair = null,
   showTakeOver = false,
   summary,
+  summaryTitle = "",
 }) {
   return h(
     React.Fragment,
     null,
-    h("span", { className: "control-summary", id: "control-summary" }, summary),
+    h(
+      "span",
+      {
+        className: "control-summary",
+        id: "control-summary",
+        // A recorded cwd is long enough to overflow the bar; CSS ellipsizes it and
+        // this puts the whole path back within reach.
+        title: summaryTitle || undefined,
+      },
+      summary
+    ),
+    // The take-over button stays mounted (hidden) rather than swapped out: the
+    // click handler in app.js binds by id on the banner, and dom.js resolves
+    // `#take-over-button` once at boot.
     h(
       "button",
       {
@@ -128,6 +146,24 @@ export function ControlBannerContent({
         type: "button",
       },
       "Take over"
-    )
+    ),
+    repair
+      ? h(
+        "button",
+        {
+          className: "control-button",
+          disabled: repair.pending,
+          id: "workspace-repair-button",
+          type: "button",
+        },
+        repair.label
+      )
+      : null,
+    // The relay's own failure text, kept verbatim on its own line. Swallowing it
+    // would put the user back where this change started: an action that stops
+    // working with nothing on screen to say why.
+    repair?.error
+      ? h("p", { className: "control-banner-error", role: "alert" }, repair.error)
+      : null
   );
 }

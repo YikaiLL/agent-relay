@@ -125,6 +125,12 @@ pub struct SessionSnapshot {
     /// viewed (the rest of this snapshot describes only the active thread).
     pub thread_activity: Vec<ThreadActivityView>,
     pub current_cwd: String,
+    /// Set only when `current_cwd` is gone, so every surface can swap the composer's
+    /// banner for a repair action through the channel it already consumes. Rides the
+    /// snapshot rather than being probed for, the same reason
+    /// `provider_fork_capabilities` does.
+    #[serde(default)]
+    pub workspace_missing: Option<WorkspaceRepairView>,
     pub model: String,
     pub available_models: Vec<ModelOptionView>,
     pub approval_policy: String,
@@ -1898,11 +1904,38 @@ pub struct ThreadEntryDetailResponse {
     pub chunk: Option<ThreadEntryDetailChunk>,
 }
 
+/// A thread whose recorded workspace no longer exists on disk, and what it would take
+/// to make it exist again.
+///
+/// This is a TOMBSTONE, not a substitute: `resolve_workspace_cwd` may hand a read-only
+/// caller (the diff panel, a reviewer) a provably-related workspace to look at, but a
+/// provider session cannot be moved. The Claude SDK archives a session under the project
+/// directory derived from its cwd and resolves `resume` through that same derivation, so
+/// resuming one from anywhere else fails with a bare "an error occurred during execution".
+/// The only repair is to make the recorded path exist again — which is what `kind`
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRepairView {
+    /// The path the thread records, which is not a directory right now.
+    pub recorded_cwd: String,
+    /// `folder` — nothing but an empty directory is missing — or `worktree`, when the
+    /// path sits in a linked-worktree slot of a repository that still exists.
+    pub kind: String,
+    /// The repository whose tree contained `recorded_cwd`. `None` when nothing provably
+    /// related is in reach, in which case `kind` is always `folder`.
+    pub repo_root: Option<String>,
+    /// The branch a re-created worktree would check out. Only set for `worktree`.
+    pub branch: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadStateView {
     pub thread_id: String,
     pub provider: String,
     pub current_cwd: String,
+    /// Set only when `current_cwd` is gone. Every surface reads this to swap the
+    /// composer's banner for a repair action instead of letting a send die at spawn.
+    pub workspace_missing: Option<WorkspaceRepairView>,
     pub current_status: String,
     pub active_turn_id: Option<String>,
     pub current_phase: Option<String>,
@@ -2085,6 +2118,17 @@ pub struct ThreadArchiveReceipt {
 pub struct ThreadDeleteReceipt {
     pub thread_id: String,
     pub message: String,
+}
+
+/// Re-create a thread's recorded workspace. Carries no target path on purpose: the only
+/// path that can work is the one the thread already records (see `repair_thread_workspace`),
+/// so letting a client name one would only invite a repair that resumes into nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepairWorkspaceInput {
+    /// Actor for the log line. Stamped SERVER-side on the broker path; client-supplied
+    /// only on the local surface.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 /// Body of the session rename endpoint.

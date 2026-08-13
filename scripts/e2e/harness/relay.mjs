@@ -66,6 +66,7 @@ export function startSelfHostedRelay({
     RELAY_STATE_PATH: relayStatePath,
     RELAY_BROKER_URL: `ws://127.0.0.1:${brokerPort}`,
     RELAY_BROKER_PUBLIC_URL: `ws://${lanIp}:${brokerPort}`,
+    RELAY_BROKER_AUTH_MODE: "self_hosted",
     RELAY_BROKER_CHANNEL_ID: brokerRoomId,
     RELAY_BROKER_PEER_ID: peerId,
     RELAY_BROKER_TICKET_SECRET: ticketSecret,

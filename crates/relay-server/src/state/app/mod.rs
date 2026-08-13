@@ -23,12 +23,12 @@ use crate::{
         PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
         ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
         ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
-        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-        SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput,
-        TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
-        ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView, ThreadTranscriptResponse,
-        ThreadsResponse, ToolCallView, TranscriptDeltaEvent, UpdateSessionSettingsInput,
-        WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
+        RepairWorkspaceInput, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput,
+        SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput,
+        SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
+        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView,
+        ThreadTranscriptResponse, ThreadsResponse, ToolCallView, TranscriptDeltaEvent,
+        UpdateSessionSettingsInput, WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -419,7 +419,8 @@ impl AppState {
 
         if providers.is_empty() {
             return Err(
-                "no agent providers are available; install codex or claude CLI".to_string(),
+                "no agent providers are available; install the codex, claude or cursor-agent CLI"
+                    .to_string(),
             );
         }
 
@@ -832,6 +833,31 @@ in thread {thread_id}: {error}"
         expire_controller_if_needed(&mut relay);
     }
 
+    /// Re-decide whether a thread's workspace is still on disk, and park the answer on
+    /// its runtime for the lock-held readers (`snapshot`, `read_loaded_thread_state`).
+    ///
+    /// The `stat` happens HERE, on an async path with no relay lock held, and only where
+    /// the workspace was about to be used anyway: opening a thread, resuming one, sending
+    /// into one, repairing one. That is what keeps a blocking filesystem call off the
+    /// notify path — see `ThreadRuntime::workspace_missing`.
+    pub(super) async fn refresh_workspace_verdict(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+    ) -> Option<crate::protocol::WorkspaceRepairView> {
+        let verdict = worktree::plan_workspace_repair(cwd);
+        let mut relay = self.relay.write().await;
+        let runtime = relay.ensure_runtime_for_thread(thread_id);
+        if runtime.workspace_missing == verdict {
+            return verdict;
+        }
+        runtime.workspace_missing = verdict.clone();
+        // A change either raises the banner or takes it down; both are things every
+        // attached surface has to repaint for.
+        relay.notify();
+        verdict
+    }
+
     async fn ensure_thread_runtime_loaded(
         &self,
         thread_id: &str,
@@ -911,7 +937,7 @@ in thread {thread_id}: {error}"
 
         // Resolve + resume the restored active thread. Try the PERSISTED provider
         // FIRST — it's robust against a cold `list_threads` at restart, which would
-        // otherwise mis-route the thread to the boot-default (last-spawned)
+        // otherwise mis-route the thread to the boot-default (preferred)
         // provider. Fall back to probing every provider by thread id when the
         // persisted provider is gone (removed/renamed → not in the map) OR resuming
         // on it fails (a stale/wrong persisted value) — so a bad persisted provider
@@ -943,7 +969,7 @@ in thread {thread_id}: {error}"
         // Genuine provider-list probe — NOT `find_thread_provider`, which would
         // short-circuit to the relay's ACTIVE provider. At boot the persisted
         // thread is already marked active (apply_persisted) with the untrusted
-        // last-spawned provider, so that shortcut returns the wrong provider and
+        // boot-default provider, so that shortcut returns the wrong provider and
         // never actually probes the thread lists.
         if restored.is_none() {
             if let Some((name, bridge)) = self.probe_thread_provider(&thread_id).await {
@@ -1010,7 +1036,7 @@ in thread {thread_id}: {error}"
     /// provider whose listing contains it. Unlike `find_thread_provider`, this
     /// does NOT short-circuit to the relay's active provider — restore needs a
     /// genuine probe because at boot the persisted thread is already marked active
-    /// with the untrusted last-spawned provider, which that shortcut would return.
+    /// with the untrusted boot-default provider, which that shortcut would return.
     async fn probe_thread_provider(
         &self,
         thread_id: &str,

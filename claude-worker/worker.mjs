@@ -318,6 +318,36 @@ function ensureClaudeBinaryHealthy() {
   claudeBinaryHealthy = true;
 }
 
+// Preflight, the other half: the SDK spawns that binary WITH `cwd` set to the
+// thread's recorded workspace, and a thread keeps the cwd it was born in forever
+// — including after that directory is removed (a `git worktree` deleted once its
+// work landed). Spawning into a missing cwd fails with a bare ENOENT, which the
+// SDK misreports as a problem with the binary itself: "Claude Code native binary
+// at .../claude exists but failed to launch ... does not match this system's
+// libc ... Specify a matching binary with options.pathToClaudeCodeExecutable."
+// That story points debugging at the install instead of at the vanished
+// directory, so refuse first and name the path. No suggested fix here on
+// purpose: the relay UI owns the repair action.
+//
+// Deliberately NOT skipped under CLAUDE_WORKER_SDK_MODULE the way the binary
+// check is — a custom SDK module ships no native binary to vet, but the cwd is
+// real filesystem state whichever module is loaded (which also keeps this
+// testable through that seam).
+async function ensureWorkspaceCwdUsable(cwd) {
+  // Empty/absent means "inherit the worker's own cwd" — a valid, always-live case.
+  if (!cwd) return;
+  let info = null;
+  try {
+    info = await stat(cwd);
+  } catch {
+    info = null;
+  }
+  // A path that exists but is a file is the same failure: no directory to run in.
+  if (!info?.isDirectory()) {
+    throw new Error(`workspace directory ${cwd} no longer exists`);
+  }
+}
+
 // claude-agent-sdk 0.3.x removed `unstable_v2_createSession`/`resumeSession`,
 // which returned a persistent session exposing `{ send, stream, close }`. The
 // streaming `query()` API replaces them: the returned Query is itself the
@@ -325,7 +355,11 @@ function ensureClaudeBinaryHealthy() {
 // iterable we push user messages onto (our `send()`). This shim re-creates the
 // small surface the worker relies on so the command loop below is unchanged.
 // `resume` (a prior session id) is passed through `options.resume`.
-function createWorkerSession(sdk, options, resume) {
+//
+// Async only because of the cwd preflight below: both preflights live here, at
+// the one seam every session spawn goes through, so a future call site cannot
+// route around them.
+async function createWorkerSession(sdk, options, resume) {
   const queue = [];
   let wake = null;
   let ended = false;
@@ -346,6 +380,7 @@ function createWorkerSession(sdk, options, resume) {
   }
 
   ensureClaudeBinaryHealthy();
+  await ensureWorkspaceCwdUsable(options?.cwd);
   const query = sdk.query({
     prompt: inputStream(),
     options: resume ? { ...options, resume } : options,
@@ -465,6 +500,7 @@ async function readSupportedModels(sdk, cmd) {
   }
 
   ensureClaudeBinaryHealthy();
+  await ensureWorkspaceCwdUsable(cmd.cwd);
   const query = sdk.query({
     prompt: idlePrompt(),
     options: { cwd: cmd.cwd || process.cwd() },
@@ -986,7 +1022,7 @@ async function ensureLiveSession(
   entry.stopOperation = null;
   entry.cancelFlag = { current: false };
   entry.fileDiffTracker = createFileDiffTracker(entry.options.cwd || entry.cwd);
-  entry.session = createWorkerSession(sdk, entry.options, resumeId || undefined);
+  entry.session = await createWorkerSession(sdk, entry.options, resumeId || undefined);
   startSessionStream(sessions, entry, context);
 }
 
@@ -1110,7 +1146,7 @@ async function main() {
         sessions.set(entry.key, entry);
 
         try {
-          entry.session = createWorkerSession(sdk, entry.options);
+          entry.session = await createWorkerSession(sdk, entry.options);
 
           if (cmd.prompt || cmd.images?.length) {
             const userTurn = createUserTurn(cmd.prompt, {

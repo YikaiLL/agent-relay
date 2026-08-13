@@ -290,6 +290,31 @@ function SubTaskRow({ task, isCurrent }) {
         ? h("span", { className: "task-subtask-summary" }, task.result_summary)
         : null
     ),
+    // Finished is not the same as folded in. The run leaves this phase only
+    // once every sub-task is `digested` (state/app/team.rs:2451-2492), so a
+    // settled-but-undigested sub-task is what holds an apparently-complete run
+    // in place — and nothing else on screen says so.
+    //
+    // The wording is deliberately about the RUN, not about who is holding it.
+    // `digested` flips only after BOTH the lead read-out and the worktree
+    // checkpoint commit, and skipped sub-tasks bypass the lead entirely
+    // ("Skipped sub-tasks have nothing to report", team.rs:2459). Naming the
+    // lead here would be wrong for skipped tasks, and wrong for any task whose
+    // lead turn is already done but whose commit is still running.
+    //
+    // Keyed off terminal status AND !digested: `digested` is false for a
+    // sub-task's whole working life, so the flag alone would mark every row
+    // from the moment the run starts.
+    isTerminalSubTaskStatus(task.status) && !task.digested
+      ? h(
+          "span",
+          {
+            className: "task-subtask-digest",
+            title: "Finished — the run has not folded this sub-task in yet",
+          },
+          "finalizing"
+        )
+      : null,
     task.rounds_used
       ? h(
           "span",

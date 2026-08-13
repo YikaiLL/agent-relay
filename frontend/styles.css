@@ -166,6 +166,14 @@
   --provider-codex-bg: rgba(84, 133, 196, 0.20);
   --provider-codex-border: color-mix(in srgb, #5485c4 24%, var(--border-subtle));
   --provider-codex-fill: color-mix(in srgb, #5485c4 18%, transparent);
+  /* Cursor's own mark is monochrome, so the badge hue is ours to choose: violet
+     is the nearest free slot between Claude's orange and Codex's blue. Measured
+     6.73:1 on this surface (Claude 9.84, Codex 4.25), so it sits inside the
+     range the other two already occupy. */
+  --provider-cursor-fg: #b39ddb;
+  --provider-cursor-bg: rgba(124, 58, 237, 0.20);
+  --provider-cursor-border: color-mix(in srgb, #7c3aed 24%, var(--border-subtle));
+  --provider-cursor-fill: color-mix(in srgb, #7c3aed 18%, transparent);
 
   /* Agent MARKS (transcript avatar, session tab) — distinct from the chip
      colours above. Both vendored svgs inherit currentColor, so these tokens are
@@ -251,6 +259,11 @@
     --provider-codex-bg: rgba(55, 109, 175, 0.12);
     --provider-codex-border: color-mix(in srgb, #376daf 35%, var(--border-subtle));
     --provider-codex-fill: color-mix(in srgb, #376daf 12%, transparent);
+    /* Darkened for the same reason as the two above; 7.10:1 on white. */
+    --provider-cursor-fg: #6d28d9;
+    --provider-cursor-bg: rgba(124, 58, 237, 0.12);
+    --provider-cursor-border: color-mix(in srgb, #7c3aed 35%, var(--border-subtle));
+    --provider-cursor-fill: color-mix(in srgb, #7c3aed 12%, transparent);
 }
 
 * {
@@ -266,6 +279,16 @@ html, body {
   min-height: 100%;
   width: 100%;
   overflow-x: clip;
+  /* Mobile WebKit otherwise picks its own font multiplier for any scroll
+   * container much wider than the viewport, and applies it to that block
+   * alone. `.diff-line { min-width: max-content }` makes every diff row far
+   * wider than a phone, so the diff view got silently enlarged while the text
+   * around it stayed put — the "remote font randomly gets bigger" report. The
+   * viewport meta stops Android font boosting but not this; only
+   * text-size-adjust does. Kept at the root so the next wide scroller cannot
+   * reintroduce it. See frontend/text-autosize-guard.test.mjs. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
@@ -1104,27 +1127,33 @@ input:focus, textarea:focus, select:focus {
   color: var(--err-fg);
 }
 
+/* The slot for the group's kind mark — a folder or a tag, drawn in
+   shared/panel-icons.js and chosen from `group.projectId`.
+
+   This used to BE the glyph: a bordered 16x11 rect with a `::before` tab, drawn
+   here in CSS. Two things were wrong with that. The tab is 4px tall, so at this
+   size it washed out and the mark read as a rounded blob rather than a folder;
+   and one CSS-drawn shape cannot vary by kind, so a project and a working
+   directory shipped the same icon in a column that shows them side by side.
+
+   It is now a plain 16px box holding an <svg> stroked with `currentColor`, which
+   is what lets the two selection rules below recolour the whole mark by setting
+   `color` alone. The old glyph carried its outline in `border-color`, which does
+   NOT inherit — so `.thread-group-header-project.is-active`, which set only
+   `color`, was a silent no-op and an active project's icon stayed grey.
+   `thread-group-icon-style-guard.test.mjs` holds that shut. */
 .thread-group-icon {
-  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 16px;
-  height: 11px;
-  border: 1.5px solid var(--text-tertiary);
-  border-radius: 3px;
+  height: 16px;
   flex: 0 0 auto;
-  opacity: 0.9;
+  color: var(--text-tertiary);
 }
 
-.thread-group-icon::before {
-  content: "";
-  position: absolute;
-  top: -4px;
-  left: 1px;
-  width: 7px;
-  height: 4px;
-  border: 1.5px solid var(--text-tertiary);
-  border-bottom: 0;
-  border-radius: 3px 3px 0 0;
-  background: var(--bg-surface);
+.thread-group-icon svg {
+  display: block;
 }
 
 /* A section header, not content. It used to sit at body size and 600 — bigger
@@ -1206,11 +1235,12 @@ input:focus, textarea:focus, select:focus {
   border-color: transparent;
 }
 
+/* One property, because the mark is stroked with `currentColor` now. The three
+   selectors and the paired `border-color` this replaced were both load-bearing
+   against the old CSS-drawn glyph, whose outline `color` could not reach. */
 .thread-group.is-selected-workspace .thread-group-name,
-.thread-group.is-selected-workspace .thread-group-icon,
-.thread-group.is-selected-workspace .thread-group-icon::before {
+.thread-group.is-selected-workspace .thread-group-icon {
   color: var(--accent-primary);
-  border-color: var(--accent-primary);
 }
 
 .conversation-item {
@@ -1269,6 +1299,10 @@ input:focus, textarea:focus, select:focus {
 .conversation-provider-badge.is-codex {
   color: var(--provider-codex-fg);
   background: var(--provider-codex-bg);
+}
+.conversation-provider-badge.is-cursor {
+  color: var(--provider-cursor-fg);
+  background: var(--provider-cursor-bg);
 }
 .conversation-item:hover {
   background: var(--surface-2);
@@ -1433,6 +1467,11 @@ input:focus, textarea:focus, select:focus {
   color: var(--provider-codex-fg);
   border-color: var(--provider-codex-border);
   background: var(--provider-codex-fill);
+}
+.thread-provider-badge.is-cursor {
+  color: var(--provider-cursor-fg);
+  border-color: var(--provider-cursor-border);
+  background: var(--provider-cursor-fill);
 }
 .conversation-preview {
   display: none;
@@ -2157,6 +2196,18 @@ input:focus, textarea:focus, select:focus {
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
+/* "Finished, but the lead hasn't read it yet" — the state that keeps a 3/3 run
+ * from advancing. Warn-toned because it is something waiting on someone, not an
+ * error: the sub-task itself succeeded. */
+.task-subtask-digest {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
 .task-unresolved ul {
   margin: 0;
   padding-left: 18px;
@@ -2486,15 +2537,10 @@ input:focus, textarea:focus, select:focus {
   display: none;
 }
 
-/* Local surface only — `.local-frame` wraps the local shell; remote has no such
-   wrapper, so remote is left entirely on its own (cwd-centric) header design for now.
-   Unifying remote's header is a deliberate follow-up (its title/subtitle/badge differ
-   by design). Both rules here are driven by LOCAL-only header changes:
-   - The title is now the arbitrary-length thread label, so it must truncate instead
-     of shoving the info button or blowing out the header grid.
-   - The subtitle is human status text ("read-only · saved session"), so it reads as
-     sans; mono made it look wide and terminal-ish. */
-.local-frame .chat-heading h1 {
+/* The header title is allowed to be arbitrary project text. It must truncate before
+   it shoves the info button or blows out the header grid. */
+.local-frame .chat-heading h1,
+.remote-chat-shell .chat-heading h1 {
   min-width: 0;
   max-width: min(60vw, 640px);
   white-space: nowrap;
@@ -3047,11 +3093,32 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* Wraps only so the workspace-repair failure below can take a full line of its
+   * own; summary + button still share the first line. */
+  flex-wrap: wrap;
   gap: 12px;
   animation: none;
   font-size: var(--text-ui);
 }
 .control-summary { margin: 0; font-weight: var(--weight-medium); font-size: var(--text-ui); color: var(--text-primary); }
+/* The workspace-repair summary carries a full recorded cwd, which is routinely
+ * wider than the bar. Keep the banner one line and let the element ellipsize —
+ * the whole path stays reachable through its `title`. */
+.control-banner-compact .control-summary {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.control-banner-error {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--err-fg);
+  overflow-wrap: anywhere;
+}
 .control-hint { margin: 4px 0 0; font-size: var(--text-sm); color: var(--text-secondary); overflow-wrap: anywhere; }
 .control-banner-compact .control-button {
   font-size: var(--text-sm);
@@ -6115,9 +6182,13 @@ body.is-resizing-panel {
   color: var(--accent-primary);
 }
 /* The selected project decides which tab set a new session joins, so it needs to be
- * visible at a glance. */
+ * visible at a glance — and for a long time it wasn't. This named
+ * `.thread-group-icon::before`, the tab of the CSS-drawn folder, and set `color` on
+ * it; that glyph was painted with `border-color`, which `color` does not touch and
+ * which does not inherit. The rule looked handled and did nothing. The mark is an
+ * <svg> on `currentColor` now, so `color` on the slot moves the whole thing. */
 .thread-group-header-project.is-active .thread-group-name,
-.thread-group-header-project.is-active .thread-group-icon::before {
+.thread-group-header-project.is-active .thread-group-icon {
   color: var(--accent-primary);
 }
 
@@ -6157,20 +6228,15 @@ body.is-resizing-panel {
  * heading held plain text. It now holds this button, whose LABEL owns the
  * ellipsis, and clipping at both levels truncates the text before the button has
  * spent the width it was given. One clipper, and it is the label. */
-.local-frame .chat-heading h1.project-switcher-heading {
+.local-frame .chat-heading h1.project-switcher-heading,
+.remote-chat-shell .chat-heading h1.project-switcher-heading {
   max-width: none;
   overflow: visible;
 }
 
-/* Remote's placement: NOT a row above the list. Switching projects is a
- * low-frequency act on a phone — the drawer defaults to sessions and search/filter
- * are the fast paths — so the control is one icon beside search and the bell, and the
- * pinned state is reported by a quiet chip instead of a heading.
- *
- * It is also not in the chat header: at 390px that title row carries a status badge,
- * a model badge and an info button, and a trigger measured there got 58px for a 144px
- * label. A control whose entire job is to name where you are cannot live where it can
- * only render "Defa…". */
+/* Remote sidebar placement: the chat header carries the full project switcher on the
+ * session surface, while the drawer keeps a compact icon beside search and the bell
+ * for quick project changes from the navigation list. */
 /* The top-bar menu is anchored to the TOP BAR, not to its 32px trigger.
  *
  * Anchoring it to the button cannot work at drawer widths and the side makes no
@@ -6265,6 +6331,7 @@ body.is-resizing-panel {
   justify-content: flex-start;
   gap: 6px;
   min-width: 0;
+  max-width: 100%;
   border: 0;
   padding: 2px 6px;
   margin-left: -6px;
@@ -6284,6 +6351,7 @@ body.is-resizing-panel {
 }
 
 .project-switcher-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
