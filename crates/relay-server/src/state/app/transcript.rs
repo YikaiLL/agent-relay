@@ -117,8 +117,16 @@ impl AppState {
                 let entries = page.sync.transcript.clone();
                 let paged = page.paged;
                 let prev_cursor = page.prev_cursor;
+                // A page has to carry the revision of the runtime it was built from,
+                // or the client cannot chain the deltas that follow it.
+                let hydrated_revision;
+                // `runtime_missing` was decided before the provider await above, so a
+                // stream event may have built the runtime in the meantime — making the
+                // page we just fetched stale relative to it.
+                let lost_hydration_race;
                 {
                     let mut relay = self.relay.write().await;
+                    lost_hydration_race = relay.runtime_for_thread(&input.thread_id).is_some();
                     if settings.is_some() {
                         relay.hydrate_background_runtime(
                             page.sync,
@@ -139,15 +147,20 @@ impl AppState {
                     let runtime = relay.ensure_runtime_for_thread(&input.thread_id);
                     runtime.provider_history_paged = paged;
                     runtime.provider_history_cursor = prev_cursor;
+                    hydrated_revision = runtime.transcript_revision;
                 }
-                let mut response = if paged {
+                let mut response = if paged && !lost_hydration_race {
                     ThreadTranscriptResponse::from_provider_page(
                         input.thread_id.clone(),
                         entries,
                         prev_cursor,
-                        0,
+                        hydrated_revision,
                     )
                 } else {
+                    // Either the provider returned a whole history, or we lost the
+                    // race and these entries no longer describe `hydrated_revision`.
+                    // Serve the runtime instead, so the entries and the revision that
+                    // stamps them come from one state.
                     let relay = self.relay.read().await;
                     relay
                         .runtime_for_thread(&input.thread_id)

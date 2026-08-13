@@ -26,10 +26,10 @@ import assert from "node:assert/strict";
 //
 // The fix is scoped to this one response rather than to snapshot ordering in
 // general: this response is stale BY CONSTRUCTION, which is a fact about the
-// endpoint, not an inference from arrival order. Ordering snapshots across
-// transports needs a clock the wire does not carry — `transcript_revision` is a
-// per-process logical clock that restarts at 0, so comparing it across a relay
-// restart freezes an open page on dead state.
+// endpoint, not an inference from arrival order — so the guard holds regardless
+// of what the revision counter does. (`transcript_revision` used to restart at 0
+// per process, which made cross-restart comparison unsafe; it is now a single
+// persisted monotonic clock. The guard never relied on it either way.)
 //
 // lifecycle.js transitively imports dom.js, which queries the document at
 // import time — stub it the same way send-error.test.mjs does.

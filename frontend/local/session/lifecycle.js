@@ -782,10 +782,15 @@ export function createLifecycleController(ctx) {
   /// So the rule is additive rather than a pin: the response may ADD entries to
   /// the transcript, it may never REMOVE them. Both providers come out right
   /// without the client having to know which one it is talking to, and without
-  /// ordering snapshots across transports — which is an inference the wire
-  /// cannot support (`transcript_revision` is a per-process logical clock that
-  /// `ThreadRuntime::from_sync_data` re-seeds at 0, so ordering by it freezes a
-  /// page on dead state after a relay restart).
+  /// ordering snapshots across transports. The guard rests on the response being
+  /// stale BY CONSTRUCTION — a fact about the endpoint — not on comparing
+  /// revisions.
+  ///
+  /// (`transcript_revision` USED to be a per-process counter that
+  /// `ThreadRuntime::from_sync_data` re-seeded at 0, which made ordering by it
+  /// actively unsafe across a relay restart. It is now one relay-global,
+  /// persisted, monotonic clock, so the comparison would be sound. The guard
+  /// still does not need it, and nothing here depends on that ordering.)
   ///
   /// Scoped to the thread the surface is already showing: for any OTHER thread —
   /// notably a deferred-start Claude thread the send itself just promoted — the

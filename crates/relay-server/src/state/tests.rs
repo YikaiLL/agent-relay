@@ -90,6 +90,7 @@ fn test_persisted_state() -> PersistedRelayState {
         thread_project_id: Default::default(),
         thread_custom_name: Default::default(),
         projects_revision: 0,
+        transcript_clock: 0,
     }
 }
 
@@ -1315,13 +1316,22 @@ fn clear_active_session_clears_selected_runtime_mirror() {
         "turn-1".to_string(),
     );
     assert_eq!(relay.snapshot().transcript.len(), 1);
+    let reported_before = relay.snapshot().transcript_revision;
 
     relay.clear_active_session();
 
     let snapshot = relay.snapshot();
     assert!(snapshot.active_thread_id.is_none());
     assert!(snapshot.transcript.is_empty());
-    assert_eq!(snapshot.transcript_revision, 0);
+    // The empty transcript above is the cleared mirror. Its revision, though, may
+    // not be reported below one already issued — the snapshot falls back to the
+    // clock, not the cleared mirror. A snapshot is how a client repairs, and one
+    // that moves backwards gets rejected.
+    assert!(
+        snapshot.transcript_revision >= reported_before,
+        "clearing reported revision {} after {reported_before}",
+        snapshot.transcript_revision
+    );
 }
 
 #[test]
@@ -4471,6 +4481,7 @@ mod paged_history_merge_tests {
             "workspace-write",
             "medium",
             1,
+            0,
         )
     }
 
@@ -4550,6 +4561,7 @@ mod paged_history_merge_tests {
             "workspace-write",
             "medium",
             1,
+            0,
         );
 
         // Newest page first: only the tool_result was on it.
@@ -5583,4 +5595,530 @@ mod watched_threads {
             "a revoked device must not remain a delta target"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript revision: one shared monotonic clock.
+//
+// The transcript revision is the client's only proof that it has not missed a
+// delta: it accepts a delta when `base_revision` matches the revision it holds,
+// and drops one whose `revision` is below it (frontend/remote/session-ops.js
+// `shouldAcceptTranscriptRevision`). That contract only holds if the revision a
+// thread reports NEVER goes backwards. These tests pin that invariant at each
+// place the relay hands out a revision.
+// ---------------------------------------------------------------------------
+
+/// Every revision the relay issues must be unique across threads, because they
+/// all have to come from one clock. Two threads minting their own 1, 2, 3...
+/// means a client that switches threads can hold a revision the other thread is
+/// about to re-issue.
+#[test]
+fn transcript_revisions_are_unique_across_threads() {
+    let mut relay = test_state();
+    let mut seen = std::collections::HashSet::new();
+
+    for _ in 0..3 {
+        for thread_id in ["thread-a", "thread-b"] {
+            let (_base, revision) = relay.bump_thread_transcript_revision(thread_id);
+            assert!(
+                seen.insert(revision),
+                "revision {revision} was handed out twice (second time to {thread_id}); \
+                 per-thread counters are not one shared clock"
+            );
+        }
+    }
+}
+
+/// A thread's revision must survive a relay restart. A browser tab that held
+/// revision N before the restart drops every delta below N, so a restored
+/// runtime that restarts at 0 goes silently deaf until the counter climbs back.
+#[test]
+fn transcript_revision_survives_a_relay_restart() {
+    let mut relay = test_state();
+    for _ in 0..5 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let before_restart = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+    assert!(before_restart > 0, "precondition: revision advanced");
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+
+    let (_base, after_restart) = restored.bump_thread_transcript_revision("thread-1");
+    assert!(
+        after_restart > before_restart,
+        "after a restart thread-1 issued revision {after_restart}, which is not above \
+         the {before_restart} a live client still holds — every delta up to \
+         {before_restart} will be dropped as stale"
+    );
+}
+
+/// Re-reading history rebuilds the runtime. That must not rewind the revision:
+/// the client needs to see the number move FORWARD so it repairs the gap, rather
+/// than see it move backward and silently discard the deltas that follow.
+#[test]
+fn rehydrating_a_thread_does_not_rewind_its_transcript_revision() {
+    let mut relay = test_state();
+    for _ in 0..4 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let before = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+    assert!(before > 0, "precondition: revision advanced");
+
+    // Drop the runtime the way an eviction / cold re-read does, then let the
+    // relay rebuild it from a fresh provider history read.
+    relay.runtimes.remove("thread-1");
+    relay.load_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-1", "/tmp/project"),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+            transcript: vec![TranscriptEntryView {
+                item_id: Some("item-1".to_string()),
+                kind: TranscriptEntryKind::AgentText,
+                text: Some("hello".to_string()),
+                status: "completed".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                tool: None,
+                content_state: crate::protocol::TranscriptContentState::Full,
+            }],
+        },
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        DEFAULT_MODEL,
+        "device-a",
+    );
+
+    let after = relay
+        .runtime_for_thread("thread-1")
+        .expect("rehydrated runtime")
+        .transcript_revision;
+    assert!(
+        after >= before,
+        "rehydration rewound thread-1 from revision {before} to {after}; a client \
+         holding {before} would drop every delta that follows"
+    );
+}
+
+/// `merge_fresh_history` mutates the transcript, so it has to draw its new
+/// revision from the same clock as every other mutation. If it bumps a private
+/// per-thread counter it can mint a revision another thread already used.
+#[test]
+fn merging_fresh_history_draws_from_the_shared_revision_clock() {
+    let mut relay = test_state();
+    // Advance the shared clock well past thread-1's own counter using a
+    // different thread.
+    let mut highest = 0;
+    for _ in 0..6 {
+        let (_base, revision) = relay.bump_thread_transcript_revision("thread-other");
+        highest = highest.max(revision);
+    }
+    let (_base, thread_one) = relay.bump_thread_transcript_revision("thread-1");
+    highest = highest.max(thread_one);
+
+    // A history re-read that genuinely adds an entry must move the revision
+    // forward relative to everything issued so far.
+    relay.load_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-1", "/tmp/project"),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+            transcript: vec![TranscriptEntryView {
+                item_id: Some("fresh-item".to_string()),
+                kind: TranscriptEntryKind::AgentText,
+                text: Some("fresh".to_string()),
+                status: "completed".to_string(),
+                turn_id: Some("turn-2".to_string()),
+                tool: None,
+                content_state: crate::protocol::TranscriptContentState::Full,
+            }],
+        },
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        DEFAULT_MODEL,
+        "device-a",
+    );
+
+    let merged = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+    assert!(
+        merged > highest,
+        "merge_fresh_history issued revision {merged}, but the shared clock had \
+         already handed out {highest} — it is bumping a private counter"
+    );
+}
+
+/// Every delta must carry `base_revision < revision`. The pair is a *chain*: the
+/// client matches `base_revision` against what it holds and then adopts
+/// `revision`. A bump that hands back a revision at or below its own base tells
+/// the client to move backwards, and it responds by discarding the delta.
+#[test]
+fn a_bump_always_reports_a_base_below_the_revision_it_issues() {
+    let mut relay = test_state();
+
+    // Includes the very first bump on a thread with no runtime yet — that path
+    // has to create the runtime AND issue a revision, so it is the easiest one to
+    // get out of order.
+    for round in 0..3 {
+        for thread_id in ["thread-a", "thread-b"] {
+            let (base_revision, revision) = relay.bump_thread_transcript_revision(thread_id);
+            assert!(
+                base_revision < revision,
+                "round {round}: {thread_id} issued base_revision {base_revision} with \
+                 revision {revision}; a delta that does not move forward is dropped \
+                 by the client"
+            );
+        }
+    }
+}
+
+/// Restoring a relay whose ACTIVE thread has no runtime yet must not seed that
+/// thread at 0. The active thread is rebuilt lazily by
+/// `materialize_selected_runtime_from_fields`, which runs in the window between
+/// `apply_persisted` and `restore_persisted_session` — a window any provider
+/// event or client poll can land in.
+#[test]
+fn restoring_an_active_thread_does_not_seed_it_below_the_clock() {
+    let mut relay = test_state();
+    relay.active_thread_id = Some("thread-1".to_string());
+    for _ in 0..5 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let before_restart = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+    assert_eq!(
+        restored.active_thread_id.as_deref(),
+        Some("thread-1"),
+        "precondition: the active thread was restored"
+    );
+
+    // Lazily materialize it, the way a provider event arriving before
+    // `restore_persisted_session` would.
+    let seeded = restored
+        .ensure_runtime_for_thread("thread-1")
+        .transcript_revision;
+    assert!(
+        seeded >= before_restart,
+        "the restored active thread was seeded at revision {seeded}, below the \
+         {before_restart} a surviving client still holds — that client rejects both \
+         the deltas AND the snapshot that would have repaired it"
+    );
+}
+
+/// Persistence is debounced, and several paths advance the clock without
+/// scheduling a save at all. So the persisted value must sit AHEAD of the
+/// revisions already issued: a hard crash must make the clock skip forward, never
+/// replay numbers it has already handed out.
+#[test]
+fn a_crash_after_the_last_save_does_not_replay_issued_revisions() {
+    let mut relay = test_state();
+    for _ in 0..3 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+
+    // The last successful save.
+    let persisted = PersistedRelayState::from_relay(&relay);
+
+    // The relay keeps running and keeps issuing revisions, then dies before the
+    // next save lands.
+    let mut highest_issued = 0;
+    for _ in 0..100 {
+        let (_base, revision) = relay.bump_thread_transcript_revision("thread-1");
+        highest_issued = highest_issued.max(revision);
+    }
+
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+    let (_base, first_after_restart) = restored.bump_thread_transcript_revision("thread-1");
+    assert!(
+        first_after_restart > highest_issued,
+        "after a crash the relay re-issued revision {first_after_restart}, but \
+         {highest_issued} had already gone out to clients — the persisted clock \
+         needs headroom for revisions minted since the last save"
+    );
+}
+
+/// Promoting a deferred thread onto its real id must not rewind the real id's
+/// revision. `turn_revision` is already max-folded here; the transcript revision
+/// has to be too.
+#[test]
+fn promoting_a_background_thread_does_not_rewind_the_real_threads_revision() {
+    let mut relay = test_state();
+    // The pending runtime was created first, so it sits BEHIND on the shared clock.
+    relay.bump_thread_transcript_revision("claude-pending-1");
+    // The event stream then built a real-id runtime and advanced it past pending.
+    for _ in 0..4 {
+        relay.bump_thread_transcript_revision("real-id");
+    }
+    let real_before = relay
+        .runtime_for_thread("real-id")
+        .expect("real runtime")
+        .transcript_revision;
+    // Pending carries the longer transcript, so promotion keeps pending's runtime.
+    relay
+        .runtimes
+        .get_mut("claude-pending-1")
+        .expect("pending runtime")
+        .transcript = vec![
+        TranscriptRecord {
+            item_id: "a".to_string(),
+            kind: TranscriptEntryKind::AgentText,
+            text: Some("a".to_string()),
+            status: "completed".to_string(),
+            turn_id: None,
+            tool: None,
+        },
+        TranscriptRecord {
+            item_id: "b".to_string(),
+            kind: TranscriptEntryKind::AgentText,
+            text: Some("b".to_string()),
+            status: "completed".to_string(),
+            turn_id: None,
+            tool: None,
+        },
+    ];
+
+    relay.promote_background_thread("claude-pending-1", "real-id");
+
+    let real_after = relay
+        .runtime_for_thread("real-id")
+        .expect("promoted runtime")
+        .transcript_revision;
+    assert!(
+        real_after >= real_before,
+        "promotion rewound real-id from revision {real_before} to {real_after}; a \
+         client tracking real-id would discard everything until the clock caught up"
+    );
+}
+
+/// `restore_thread_data` restores the clock itself, so it must do that BEFORE it
+/// draws a revision — otherwise the restored thread is seeded from a clock that
+/// has not yet resumed.
+#[test]
+fn restore_thread_data_resumes_the_clock_before_it_draws_from_it() {
+    let mut relay = test_state();
+    let mut persisted = test_persisted_state();
+    persisted.transcript_clock = 900;
+
+    relay.restore_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-1", "/tmp/project"),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+            transcript: Vec::new(),
+        },
+        &persisted,
+    );
+
+    let seeded = relay
+        .runtime_for_thread("thread-1")
+        .expect("restored runtime")
+        .transcript_revision;
+    assert!(
+        seeded > 900,
+        "the restored thread was seeded at revision {seeded}, at or below the \
+         persisted clock high-water mark of 900"
+    );
+}
+
+/// `snapshot()` falls back to the mirror when the active thread has no runtime,
+/// and the mirror is 0 on a freshly restored relay. A snapshot is the client's
+/// repair path, so one reporting a revision below what the client holds gets
+/// rejected — taking the repair with it.
+#[test]
+fn a_snapshot_never_reports_a_revision_below_one_already_issued() {
+    let mut relay = test_state();
+    relay.active_thread_id = Some("thread-1".to_string());
+    for _ in 0..5 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let reported_before = relay.snapshot().transcript_revision;
+    assert!(reported_before > 0, "precondition: a revision was reported");
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+
+    let reported_after = restored.snapshot().transcript_revision;
+    assert!(
+        reported_after >= reported_before,
+        "the same thread reported revision {reported_before}, then {reported_after} \
+         after a restart; a client holding {reported_before} rejects that snapshot — \
+         and the snapshot was its way out"
+    );
+}
+
+/// End-to-end over the REAL mutation API, with two threads interleaved — the
+/// shape a client actually sees on the wire.
+///
+/// The unit tests above drive `bump_thread_transcript_revision` directly, so they
+/// would not catch a mutation path that emits a stale or out-of-order meta. This
+/// replays the contract a surface applies: per thread, each delta's
+/// `base_revision` must equal the previous delta's `revision` for THAT thread
+/// (the chain), and no revision may ever be reused across threads.
+#[test]
+fn interleaved_threads_emit_an_unbroken_per_thread_chain() {
+    let mut relay = test_state();
+    let mut last_revision: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    let mut all_revisions = std::collections::HashSet::new();
+
+    for round in 0..6 {
+        for thread_id in ["thread-a", "thread-b"] {
+            // Alternate the two mutation kinds a real turn produces.
+            let meta = if round % 2 == 0 {
+                relay.upsert_transcript_item_for_thread(
+                    thread_id,
+                    format!("{thread_id}-item-{round}"),
+                    TranscriptEntryKind::AgentText,
+                    Some("hello".to_string()),
+                    "in_progress".to_string(),
+                    Some(format!("turn-{round}")),
+                    None,
+                )
+            } else {
+                relay.append_agent_delta_for_thread(
+                    thread_id,
+                    &format!("{thread_id}-item-{}", round - 1),
+                    " more",
+                    &format!("turn-{}", round - 1),
+                )
+            };
+
+            assert!(
+                meta.base_revision < meta.revision,
+                "round {round} {thread_id}: base {} is not below revision {}",
+                meta.base_revision,
+                meta.revision
+            );
+            if let Some(previous) = last_revision.get(thread_id) {
+                assert_eq!(
+                    meta.base_revision, *previous,
+                    "round {round} {thread_id}: chain broken — base_revision {} does \
+                     not match this thread's previous revision {previous}; the client \
+                     would treat every following delta as a gap",
+                    meta.base_revision
+                );
+            }
+            assert!(
+                all_revisions.insert(meta.revision),
+                "round {round} {thread_id}: revision {} was already issued to some \
+                 thread",
+                meta.revision
+            );
+            last_revision.insert(thread_id, meta.revision);
+        }
+    }
+}
+
+/// The snapshot's `transcript_revision` is a cache key: the surface re-fetches the
+/// transcript whenever it advances past what it last fetched at
+/// (`transcript-hydration-store.js`, "cap the omitted/preview re-fetch to once per
+/// revision"). So it must only move when the transcript it describes moves.
+/// Reading the live global clock would make it churn on every poll as unrelated
+/// background threads stream, re-arming that fetch each time.
+#[test]
+fn the_snapshot_revision_does_not_churn_on_unrelated_thread_activity() {
+    let mut relay = test_state();
+    // No active thread — the branch that falls back off the selected runtime.
+    assert!(relay.active_thread_id.is_none());
+    let first = relay.snapshot().transcript_revision;
+
+    // A background thread streams. Nothing about the snapshot's own transcript
+    // changed.
+    for _ in 0..3 {
+        relay.bump_thread_transcript_revision("background-thread");
+    }
+
+    let second = relay.snapshot().transcript_revision;
+    assert_eq!(
+        first, second,
+        "the snapshot revision moved from {first} to {second} because another \
+         thread streamed; the surface reads that as 'my transcript changed' and \
+         re-fetches on every poll"
+    );
+}
+
+/// A SECOND crash must not replay revisions either.
+///
+/// The headroom is added when state is written, so it only protects the run that
+/// did the writing. If a restored relay issues revisions and dies before its own
+/// first debounced save, the next start reads the SAME stale value and hands the
+/// same numbers out again. The startup reservation (a save taken right after
+/// restore, before anything can issue) is what closes that.
+#[test]
+fn a_crash_before_the_first_save_after_a_restore_does_not_replay() {
+    let mut first = test_state();
+    for _ in 0..3 {
+        first.bump_thread_transcript_revision("thread-1");
+    }
+    let after_first_run = PersistedRelayState::from_relay(&first);
+
+    // Second run restores, then reserves on disk before serving.
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut second = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    second.apply_persisted(&after_first_run);
+    let startup_reservation = PersistedRelayState::from_relay(&second);
+    // It then issues revisions and dies before any later save.
+    let mut issued_by_second = Vec::new();
+    for _ in 0..5 {
+        let (_base, revision) = second.bump_thread_transcript_revision("thread-1");
+        issued_by_second.push(revision);
+    }
+
+    // Third run reads what the second run reserved at startup.
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut third = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    third.apply_persisted(&startup_reservation);
+    let (_base, first_after_second_crash) = third.bump_thread_transcript_revision("thread-1");
+
+    assert!(
+        !issued_by_second.contains(&first_after_second_crash),
+        "the third run re-issued revision {first_after_second_crash}, which the \
+         second run had already handed out ({issued_by_second:?})"
+    );
 }
