@@ -15,7 +15,15 @@ export default [
       "node_modules/**",
       "target/**",
       "src-tauri/target/**",
+      // `dist*/**` only matches at the repo root; bundled output also shows up
+      // nested (e.g. design/beautiful-ui/dist), and a minified React bundle
+      // trips `no-undef` on things like __REACT_DEVTOOLS_GLOBAL_HOOK__.
       "dist*/**",
+      "**/dist/**",
+      // Gitignored maintainer scratch, like `markdown/`. CI checks out a tree
+      // without it, so linting it locally only produces noise CI never sees —
+      // and noise in a tripwire is how a real `no-undef` gets scrolled past.
+      "design/**",
       "**/*.min.js",
     ],
   },

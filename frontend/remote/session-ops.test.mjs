@@ -2436,6 +2436,104 @@ test("a failed remote send records the reason for the composer, not just the log
   assert.match(String(state.composerErrors?.["thread-2"]), /socket write failed/);
 });
 
+test("a workspace repair the relay accepted is reported as success, not as a script error", async (t) => {
+  activeBrowser || installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { repairRemoteWorkspace } = await import("./session-ops.js");
+  const { readWorkspaceRepair } = await import("./workspace-repair.js");
+
+  // Tests in this file share one module-level `state`, and the socket stub below
+  // answers exactly two actions for one hard-coded thread. Left installed it would
+  // silently become the transport for every later test that does not bring its own
+  // — they would hang waiting for a reply it never sends. Restored from `t.after`
+  // rather than the end of the body so a failed assertion cannot skip it.
+  const previousSocket = state.socket;
+  const previousSession = state.session;
+  t.after(() => {
+    state.socket = previousSocket;
+    state.session = previousSession;
+    state.pendingActions.clear();
+  });
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: "claim-token-1",
+    sessionClaimExpiresAt: Math.floor(Date.now() / 1000) + 300,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  state.workspaceRepairByThread = new Map();
+  state.session = { active_thread_id: "thread-repair-1", available_models: [], model: "fake-echo" };
+
+  const dispatched = [];
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      const requestType = frame.payload.request?.type;
+      dispatched.push(requestType);
+      setImmediate(async () => {
+        // Answer BOTH actions. The refresh this repair kicks off is deduplicated by
+        // an in-flight key, so leaving it unanswered parks a promise that never
+        // settles and every later test asking for the same page waits on it.
+        if (requestType === "fetch_thread_transcript") {
+          await handleRemoteBrokerPayload({
+            kind: "remote_action_result",
+            action_id: frame.payload.action_id,
+            action: "fetch_thread_transcript",
+            ok: true,
+            snapshot: {},
+            thread_transcript: {
+              thread_id: "thread-repair-1",
+              entries: [],
+              has_more: false,
+              next_before: null,
+            },
+          });
+          return;
+        }
+        await handleRemoteBrokerPayload({
+          kind: "remote_session_result",
+          action_id: frame.payload.action_id,
+          action: "repair_workspace",
+          ok: true,
+        });
+      });
+    },
+  };
+
+  const repaired = await repairRemoteWorkspace("thread-repair-1");
+
+  // The relay accepted the repair — the directory is back. Anything this function
+  // does AFTER that point runs inside its own try block, so a throw there is
+  // caught by the failure path and reported as if the repair itself had failed:
+  // the user is told to go fix a workspace that is already fixed, and the
+  // transcript refresh that would have cleared the banner never runs.
+  assert.equal(repaired, true, "a repair the relay accepted must report success");
+  // The refresh is not incidental: the banner goes away on the relay's own verdict
+  // in the next transcript payload, so a repair that never reaches this line leaves
+  // a "workspace is gone" banner sitting over a workspace that is back.
+  assert.deepEqual(dispatched, ["repair_workspace", "fetch_thread_transcript"]);
+  assert.equal(
+    readWorkspaceRepair(state, "thread-repair-1").error,
+    "",
+    "a successful repair must leave no error on the banner"
+  );
+});
+
 test("applyTranscriptDelta updates existing transcript entries using text and status fields", async () => {
   activeBrowser || installBrowserStubs();
 

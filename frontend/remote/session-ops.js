@@ -166,7 +166,12 @@ export async function repairRemoteWorkspace(threadId) {
     workspaceRepairResolved(state, targetThreadId);
     publishWorkspaceRepair();
     renderLog(`Re-created the workspace for session ${targetThreadId}.`);
-    lastWorkspaceVerdictProbeKey = "";
+    // No client-side probe cache to invalidate here: the verdict rides
+    // `snapshot.workspace_missing` (see shared/workspace-repair.js), so the refresh
+    // below is the whole of it. An assignment to a stray `lastWorkspaceVerdictProbeKey`
+    // outlived the design that had one, and being inside this try meant the
+    // ReferenceError it threw in strict mode was caught below and reported as a failed
+    // repair — of a workspace the relay had just rebuilt.
     void fetchRawTranscriptPage({ threadId: targetThreadId, before: null }).catch(() => {});
     return true;
   } catch (error) {
