@@ -34,6 +34,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { prepareSeededCodexHome } from "./e2e-codex-home.mjs";
 import { launchBrowser } from "./e2e/harness/browser.mjs";
+import { openSessionsDrawer } from "./e2e/harness/drawer.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import { dumpProcessLogs, stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
@@ -114,15 +115,7 @@ async function approveFor(relayPort, threadId) {
 }
 
 // The sessions list lives in a collapsed <details> drawer off the conversation view.
-async function openDrawer(page) {
-  await page.evaluate(() => {
-    const drawer = document.querySelector(".sidebar-drawer");
-    if (drawer && !drawer.open) {
-      drawer.open = true;
-      drawer.dispatchEvent(new Event("toggle"));
-    }
-  });
-}
+const openDrawer = (page) => openSessionsDrawer(page, { timeoutMs: TIMEOUT_MS });
 
 const rowTitles = (page) =>
   page.evaluate(() =>

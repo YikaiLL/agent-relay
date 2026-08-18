@@ -16,6 +16,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { DEFAULT_WORKSPACE_LABEL } from "../frontend/local/header-labels.js";
 import { prepareSeededCodexHome } from "./e2e-codex-home.mjs";
 import { launchBrowser } from "./e2e/harness/browser.mjs";
+import { openSessionsDrawer } from "./e2e/harness/drawer.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import { dumpProcessLogs, stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
@@ -53,16 +54,9 @@ async function waitForMembership(relayPort, threadId, expectedProjectId) {
 }
 
 // The sessions/projects list lives in a collapsed <details> drawer off the
-// conversation view — open it so its rows are laid out.
-async function openDrawer(page) {
-  await page.evaluate(() => {
-    const drawer = document.querySelector(".sidebar-drawer");
-    if (drawer && !drawer.open) {
-      drawer.open = true;
-      drawer.dispatchEvent(new Event("toggle"));
-    }
-  });
-}
+// conversation view — open it so its rows are laid out. Shared, because opening it
+// by assigning `.open` races the store that owns the flag; see the harness note.
+const openDrawer = (page) => openSessionsDrawer(page, { timeoutMs: TIMEOUT_MS });
 
 const projectNames = (page) =>
   page.evaluate(() =>
