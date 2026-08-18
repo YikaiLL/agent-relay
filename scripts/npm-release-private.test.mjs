@@ -81,23 +81,61 @@ test("every platform we publish gets a binary built with the private crate linke
   );
 });
 
-test("a release with no deploy key fails loudly instead of publishing a stubbed binary", async () => {
+test("the private crate is read with a short-lived token scoped to that one repository", async () => {
   const workflow = stripComments(await releaseWorkflow());
 
-  assert.match(workflow, /RELAY_PRIVATE_DEPLOY_KEY/);
-  assert.match(workflow, /repository: sealwire\/sealwire-private/);
+  // A GitHub App installation token, not a deploy key and not a PAT: it expires
+  // in an hour, it is revocable on its own, and `repositories:` keeps it unable
+  // to read anything but the private crate even if the run is compromised.
+  const mint = stepMatching(await releaseWorkflow(), /create-github-app-token/);
+  assert.ok(mint, "the release does not mint a token for the private crate");
+  // `client-id`, not the legacy `app-id` the action still accepts.
+  assert.match(mint, /client-id: \$\{\{ secrets\.RELAY_PRIVATE_APP_CLIENT_ID \}\}/);
+  assert.match(mint, /private-key: \$\{\{ secrets\.RELAY_PRIVATE_APP_KEY \}\}/);
+  assert.match(
+    mint,
+    /repositories: sealwire-private/,
+    "an unscoped token would read every repository the app is installed on"
+  );
 
-  // The CI idiom — skip the private half when the secret is absent — is exactly
-  // what must NOT appear here.
+  const checkout = stepMatching(await releaseWorkflow(), /repository: sealwire\/sealwire-private/);
+  assert.ok(checkout, "no private-crate checkout step");
+  assert.match(checkout, /token: \$\{\{ steps\.[\w-]+\.outputs\.token \}\}/);
+
+  // Deploy keys are disabled by org policy, and a bare PAT would be scoped to a
+  // person rather than to this job.
+  assert.doesNotMatch(workflow, /ssh-key:/);
+  assert.doesNotMatch(workflow, /RELAY_PRIVATE_DEPLOY_KEY/);
+});
+
+test("a release with no private-crate credentials fails loudly instead of publishing a stubbed binary", async () => {
+  const workflow = stripComments(await releaseWorkflow());
+
+  // Rust CI skips the private half when the credentials are absent, and that is
+  // right THERE: forks get no secrets and it only costs coverage. The same skip
+  // here would publish a binary with no orchestration engines, from a green run.
   assert.doesNotMatch(
     workflow,
-    /if: env\.PRIVATE_KEY != ''/,
+    /if: env\.PRIVATE_APP_CLIENT_ID != ''/,
     "release must not silently skip the private crate the way Rust CI does"
   );
 
   const gate = stepMatching(await releaseWorkflow(), /exit 1/);
-  assert.ok(gate, "no step fails the release when the deploy key is missing");
-  assert.match(gate, /PRIVATE_KEY/);
+  assert.ok(gate, "no step fails the release when the app credentials are missing");
+  assert.match(gate, /PRIVATE_APP_CLIENT_ID/);
+  assert.match(gate, /PRIVATE_APP_KEY/);
+});
+
+test("Rust CI keeps skipping the private crate rather than failing on a fork", async () => {
+  // The asymmetry with the release is deliberate, and it is easy to "fix" by
+  // making both sides behave the same. Pinned here so that either direction of
+  // that change has to be argued for: a fork PR carries no secrets, and a CI
+  // that failed on them would be red for every outside contributor forever.
+  const ci = await readFile(path.join(repoRoot, ".github/workflows/rust-ci.yml"), "utf8");
+
+  assert.match(ci, /if: env\.PRIVATE_APP_CLIENT_ID != '' && github\.event_name != 'pull_request'/);
+  assert.match(ci, /create-github-app-token/);
+  assert.doesNotMatch(ci, /RELAY_PRIVATE_DEPLOY_KEY/);
 });
 
 test("the private-crate build runs under bash so the Windows runner does not use pwsh", async () => {

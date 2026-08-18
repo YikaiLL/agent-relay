@@ -58,7 +58,7 @@ jobs:
     # Job level, not step level: a step's own `if` is evaluated before its `env`
     # block exists, so guarding on the secret only works from here.
     env:
-      PRIVATE_KEY: ${{ secrets.RELAY_PRIVATE_DEPLOY_KEY }}
+      PRIVATE_APP_CLIENT_ID: ${{ secrets.RELAY_PRIVATE_APP_CLIENT_ID }}
 
     steps:
       - name: Checkout
@@ -103,17 +103,27 @@ jobs:
       # so the moment anyone else has write access, a PR could print the private
       # crate into a public build log. Push, schedule and manual runs cover the
       # same code a moment later, which is the cheaper side of the trade.
+      - name: Mint a private-crate token
+        id: private-token
+        if: env.PRIVATE_APP_CLIENT_ID != '' && github.event_name != 'pull_request'
+        uses: actions/create-github-app-token@v2
+        with:
+          client-id: ${{ secrets.RELAY_PRIVATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELAY_PRIVATE_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: sealwire-private
+
       - name: Checkout private crate
         id: private
-        if: env.PRIVATE_KEY != '' && github.event_name != 'pull_request'
+        if: steps.private-token.outcome == 'success'
         uses: actions/checkout@v5
         with:
           repository: sealwire/sealwire-private
-          ssh-key: ${{ secrets.RELAY_PRIVATE_DEPLOY_KEY }}
+          token: ${{ steps.private-token.outputs.token }}
           path: .private
 
       - name: cargo test (with private crate)
-        if: env.PRIVATE_KEY != '' && github.event_name != 'pull_request' && steps.private.outcome == 'success'
+        if: steps.private.outcome == 'success'
         env:
           RELAY_PRIVATE_PATH: ${{ github.workspace }}/.private
         run: scripts/with-private.sh cargo test --workspace --features relay-server/private
@@ -126,7 +136,7 @@ jobs:
     # Job level so a step's `if` can read it — a step's own `env` is not in scope
     # for its own condition.
     env:
-      PRIVATE_KEY: ${{ secrets.RELAY_PRIVATE_DEPLOY_KEY }}
+      PRIVATE_APP_CLIENT_ID: ${{ secrets.RELAY_PRIVATE_APP_CLIENT_ID }}
 
     steps:
       - name: Checkout
@@ -165,13 +175,23 @@ jobs:
       # Needs the real private crate: against the public stub the suite skips
       # itself, which would be a green tick asserting nothing. NOT on
       # `pull_request` — see the note on the same guard in the `rust` job.
+      - name: Mint a private-crate token
+        id: private-token
+        if: env.PRIVATE_APP_CLIENT_ID != '' && github.event_name != 'pull_request'
+        uses: actions/create-github-app-token@v2
+        with:
+          client-id: ${{ secrets.RELAY_PRIVATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELAY_PRIVATE_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: sealwire-private
+
       - name: Checkout private crate
         id: private
-        if: env.PRIVATE_KEY != '' && github.event_name != 'pull_request'
+        if: steps.private-token.outcome == 'success'
         uses: actions/checkout@v5
         with:
           repository: sealwire/sealwire-private
-          ssh-key: ${{ secrets.RELAY_PRIVATE_DEPLOY_KEY }}
+          token: ${{ steps.private-token.outputs.token }}
           path: .private
 
       - name: Task team e2e
