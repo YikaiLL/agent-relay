@@ -103,10 +103,23 @@ jobs:
       # so the moment anyone else has write access, a PR could print the private
       # crate into a public build log. Push, schedule and manual runs cover the
       # same code a moment later, which is the cheaper side of the trade.
+      #
+      # `continue-on-error` on both private steps, and it is load-bearing rather
+      # than defensive. The `if:` above only covers credentials that are ABSENT.
+      # Credentials that are present but cannot mint — the app not installed on
+      # the private repository, a rotated key, an org policy — fail the step, and
+      # a failed step fails the job: a configuration fault would take `cargo
+      # fmt`, `cargo check` and the whole public suite red with it, reporting
+      # itself as if the code were broken. It is also what makes the gates below
+      # mean anything: `steps.<id>.outcome` is by definition the result BEFORE
+      # continue-on-error is applied, so an `outcome == 'success'` gate is only
+      # reachable on a step allowed to fail. Without these two lines the gates
+      # read as a graceful skip and behave as a hard stop.
       - name: Mint a private-crate token
         id: private-token
         if: env.PRIVATE_APP_CLIENT_ID != '' && github.event_name != 'pull_request'
-        uses: actions/create-github-app-token@v2
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ secrets.RELAY_PRIVATE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELAY_PRIVATE_APP_KEY }}
@@ -116,11 +129,21 @@ jobs:
       - name: Checkout private crate
         id: private
         if: steps.private-token.outcome == 'success'
+        continue-on-error: true
         uses: actions/checkout@v5
         with:
           repository: sealwire/sealwire-private
           token: ${{ steps.private-token.outputs.token }}
           path: .private
+
+      # The price of the skip above is that the team suite runs nowhere and the
+      # tick is still green, which is indistinguishable from a healthy build
+      # unless the run says so. Only on the path where credentials were present
+      # and did not work — on a fork the steps are skipped, not failed, and no
+      # private coverage was ever expected there.
+      - name: Warn that the private crate was skipped
+        if: steps.private-token.outcome == 'failure' || steps.private.outcome == 'failure'
+        run: echo "::warning::Could not read the private crate, so the task-team suite did not run. Read the failed step above — the mint step's inputs, the RELAY_PRIVATE_APP_* secrets, or the app's installation on sealwire-private."
 
       - name: cargo test (with private crate)
         if: steps.private.outcome == 'success'
@@ -175,10 +198,15 @@ jobs:
       # Needs the real private crate: against the public stub the suite skips
       # itself, which would be a green tick asserting nothing. NOT on
       # `pull_request` — see the note on the same guard in the `rust` job.
+      #
+      # Both tolerate failure — see the note on the same pair in the `rust` job:
+      # without it a credential fault fails the job outright and the
+      # `outcome`-gated steps below never run to notice.
       - name: Mint a private-crate token
         id: private-token
         if: env.PRIVATE_APP_CLIENT_ID != '' && github.event_name != 'pull_request'
-        uses: actions/create-github-app-token@v2
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ secrets.RELAY_PRIVATE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELAY_PRIVATE_APP_KEY }}
@@ -188,11 +216,19 @@ jobs:
       - name: Checkout private crate
         id: private
         if: steps.private-token.outcome == 'success'
+        continue-on-error: true
         uses: actions/checkout@v5
         with:
           repository: sealwire/sealwire-private
           token: ${{ steps.private-token.outputs.token }}
           path: .private
+
+      # Worth more here than in the `rust` job: the fallback below still runs the
+      # suite, against the public stub, where it skips itself — a green tick
+      # asserting nothing unless the run admits which half it ran.
+      - name: Warn that the private crate was skipped
+        if: steps.private-token.outcome == 'failure' || steps.private.outcome == 'failure'
+        run: echo "::warning::Could not read the private crate, so the task-team e2e ran against the public stub and skipped itself. Read the failed step above — the mint step's inputs, the RELAY_PRIVATE_APP_* secrets, or the app's installation on sealwire-private."
 
       - name: Task team e2e
         env:

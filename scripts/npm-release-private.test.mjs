@@ -36,6 +36,10 @@ async function releaseWorkflow() {
   return await readFile(path.join(repoRoot, ".github/workflows/npm-release.yml"), "utf8");
 }
 
+async function ciWorkflow() {
+  return await readFile(path.join(repoRoot, ".github/workflows/rust-ci.yml"), "utf8");
+}
+
 function stripComments(yaml) {
   return yaml
     .split("\n")
@@ -54,6 +58,10 @@ function steps(yaml) {
 
 function stepMatching(yaml, pattern) {
   return steps(yaml).find((step) => pattern.test(step));
+}
+
+function stepsMatching(yaml, pattern) {
+  return steps(yaml).filter((step) => pattern.test(step));
 }
 
 test("every platform we publish gets a binary built with the private crate linked in", async () => {
@@ -136,6 +144,102 @@ test("Rust CI keeps skipping the private crate rather than failing on a fork", a
   assert.match(ci, /if: env\.PRIVATE_APP_CLIENT_ID != '' && github\.event_name != 'pull_request'/);
   assert.match(ci, /create-github-app-token/);
   assert.doesNotMatch(ci, /RELAY_PRIVATE_DEPLOY_KEY/);
+});
+
+test("the token action is pinned to a major version that accepts `client-id`", async () => {
+  // `client-id` arrived in v3, where `app-id` picked up a deprecation notice —
+  // which is the advice the workflows were written against. v2 does not know
+  // the input AT ALL: it ignores it as unexpected, finds no `app-id`, and dies
+  // with "[@octokit/auth-app] appId option is required".
+  //
+  // Worth pinning because of how that failure reads. Nothing in it mentions the
+  // input or the version; it names an app credential, so it looks exactly like a
+  // missing secret or an app that was never installed, and it sent the first
+  // investigation after both. The credentials and the installation were correct
+  // the whole time. The input name and the major version are one decision, and
+  // splitting them is silent.
+  const mints = [
+    ...stepsMatching(await ciWorkflow(), /create-github-app-token/),
+    ...stepsMatching(await releaseWorkflow(), /create-github-app-token/),
+  ];
+  assert.equal(mints.length, 3, "expected both CI jobs and the release to mint a token");
+
+  for (const mint of mints) {
+    const major = Number(mint.match(/create-github-app-token@v(\d+)/)?.[1]);
+    assert.ok(major, "the token action is not pinned to a major version");
+    assert.match(mint, /client-id:/, "minting must use the current spelling");
+    assert.ok(
+      major >= 3,
+      `create-github-app-token@v${major} does not accept 'client-id' — it would ignore it ` +
+        `and fail asking for an appId`
+    );
+  }
+});
+
+test("credentials that cannot mint a token skip the private half instead of failing Rust CI", async () => {
+  // The `if:` guard only covers credentials that are ABSENT — a fork PR, or
+  // Dependabot. Credentials that are PRESENT but cannot mint (the app not
+  // installed on the private repository, a rotated key, an org policy) fail the
+  // step, and a failed step fails the job: a configuration fault would take
+  // `cargo fmt`, `cargo check` and the entire public test suite red with it and
+  // report itself as if the code were broken. That is what happened on the
+  // first run after the app-token switch — for the version mismatch pinned
+  // above, with the credentials and the app installation correct throughout.
+  //
+  // `continue-on-error` is also the line that makes the gate below mean
+  // anything: `steps.<id>.outcome` is BY DEFINITION the result before
+  // continue-on-error is applied, so a downstream `outcome == 'success'` gate is
+  // only ever reachable on a step that is allowed to fail in the first place.
+  // Without it the gate reads as a graceful skip and behaves as a hard stop.
+  const ci = await ciWorkflow();
+  const mints = stepsMatching(ci, /create-github-app-token/);
+  assert.equal(mints.length, 2, "expected the rust and relay-http-e2e jobs to each mint a token");
+
+  // The checkout for the same reason: an app that mints but was never granted
+  // the private repository 404s one step later, which is the same fault class
+  // arriving one step further down.
+  const checkouts = stepsMatching(ci, /repository: sealwire\/sealwire-private/);
+  assert.equal(checkouts.length, 2, "expected both jobs to check the private crate out");
+
+  for (const step of [...mints, ...checkouts]) {
+    assert.match(
+      step,
+      /continue-on-error: true/,
+      "a private-crate step that cannot fail softly takes the whole job red, including every " +
+        "step that never needed the private crate"
+    );
+  }
+});
+
+test("a skipped private half is announced rather than silently green", async () => {
+  // The cost of the skip above: the task-team suite runs nowhere and CI is still
+  // green. Acceptable only while the run says so out loud — otherwise a broken
+  // app installation looks exactly like a healthy build, forever.
+  const notices = stepsMatching(await ciWorkflow(), /::warning::/);
+  assert.equal(notices.length, 2, "expected both private-crate jobs to flag a skipped mint");
+
+  for (const notice of notices) {
+    assert.match(
+      notice,
+      /if: steps\.private-token\.outcome == 'failure'/,
+      "the warning must fire exactly when the mint failed, not on the fork path where the step " +
+        "is skipped and no coverage was ever expected"
+    );
+  }
+});
+
+test("the release refuses a failed mint rather than tolerating it the way Rust CI does", async () => {
+  // The same asymmetry the tests above pin, at the one step that could quietly
+  // erase it: `continue-on-error` on the release's mint would sail past the
+  // credential gate and publish the stub anyway.
+  const mint = stepMatching(await releaseWorkflow(), /create-github-app-token/);
+
+  assert.ok(mint, "the release does not mint a token for the private crate");
+  assert.doesNotMatch(
+    mint,
+    /continue-on-error/,
+    "a release that tolerates a failed mint publishes a binary with no orchestration engines"
+  );
 });
 
 test("the private-crate build runs under bash so the Windows runner does not use pwsh", async () => {

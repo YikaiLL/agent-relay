@@ -79,7 +79,7 @@ jobs:
       # the app could be installed on more later.
       - name: Mint a private-crate token
         id: private-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           client-id: ${{ secrets.RELAY_PRIVATE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELAY_PRIVATE_APP_KEY }}
