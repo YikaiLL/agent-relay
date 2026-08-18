@@ -30,25 +30,54 @@ jobs:
             runner: macos-15
             cargo_target: x86_64-apple-darwin
             executable: relay-server
-          # Temporarily Mac-only: Linux and Windows targets are commented out
-          # until there's capacity to test them. Re-enable to resume publishing
-          # those platform binaries.
-          # - target: linux-arm64
-          #   runner: ubuntu-24.04-arm
-          #   cargo_target: aarch64-unknown-linux-gnu
-          #   executable: relay-server
-          # - target: linux-x64
-          #   runner: ubuntu-latest
-          #   cargo_target: x86_64-unknown-linux-gnu
-          #   executable: relay-server
-          # - target: win32-x64
-          #   runner: windows-latest
-          #   cargo_target: x86_64-pc-windows-msvc
-          #   executable: relay-server.exe
+          # Every platform gets a prebuilt binary, because only a prebuilt binary
+          # carries the private crate. The source fallback in the launcher builds
+          # the public stub, so a platform missing from this matrix ships a relay
+          # whose task teams refuse — and does it silently, at the moment a user
+          # first tries to start one.
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            cargo_target: aarch64-unknown-linux-gnu
+            executable: relay-server
+          - target: linux-x64
+            runner: ubuntu-latest
+            cargo_target: x86_64-unknown-linux-gnu
+            executable: relay-server
+          - target: win32-x64
+            runner: windows-latest
+            cargo_target: x86_64-pc-windows-msvc
+            executable: relay-server.exe
+
+    # Job level, not step level: a step's own `if` is evaluated before its `env`
+    # block exists, so a step cannot read a secret through `env` in its own
+    # condition.
+    env:
+      PRIVATE_KEY: ${{ secrets.RELAY_PRIVATE_DEPLOY_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # Rust CI skips the private crate when the secret is absent, and that is
+      # right there: it costs coverage on forks and nothing else. Here the same
+      # skip would publish a binary with no orchestration engines to every user,
+      # from a workflow run that is green — the failure would surface as "task
+      # teams don't work" long after the release. So this one stops.
+      - name: Require the private deploy key
+        shell: bash
+        run: |
+          if [ -z "${PRIVATE_KEY:-}" ]; then
+            echo "::error::RELAY_PRIVATE_DEPLOY_KEY is not set. A release built without the private crate ships a relay whose task lists and task teams refuse at runtime. See PRIVATE_CRATE.md."
+            exit 1
+          fi
+          echo "private deploy key present"
+
+      - name: Checkout private crate
+        uses: actions/checkout@v5
+        with:
+          repository: sealwire/sealwire-private
+          ssh-key: ${{ secrets.RELAY_PRIVATE_DEPLOY_KEY }}
+          path: .private
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -70,8 +99,14 @@ jobs:
       - name: Build embedded web assets
         run: npm run build
 
+      # `shell: bash` on every runner, not just the Unix ones: with-private.sh is
+      # a bash script and the Windows runner defaults to pwsh, which would fail
+      # to run it at all.
       - name: Build relay-server
-        run: cargo build --release -p relay-server --target ${{ matrix.cargo_target }}
+        shell: bash
+        env:
+          RELAY_PRIVATE_PATH: ${{ github.workspace }}/.private
+        run: scripts/with-private.sh cargo build --release -p relay-server --target ${{ matrix.cargo_target }} --features private
 
       - name: Stage binary
         shell: bash
@@ -86,6 +121,15 @@ jobs:
           path: dist-bin/${{ matrix.target }}/${{ matrix.executable }}
           if-no-files-found: error
 
+  # A SEPARATE job from the build on purpose, and it must stay that way. The
+  # package's `files` allow-list includes `crates/**` — for the launcher's
+  # build-from-source fallback — and that allow-list beats .gitignore, so a pack
+  # that runs while with-private.sh has the real sources swapped in uploads them
+  # to npm, where a publish cannot be taken back. Merging these two jobs to skip
+  # the artifact round-trip would put the private checkout and `npm publish` in
+  # one workspace. This job checks out clean: the crate here is the stub, and the
+  # engines ship only as compiled code inside the binaries it downloads.
+  # `prepublishOnly` runs scripts/check-no-private.sh as the backstop.
   publish:
     name: publish-npm
     needs: build-binary

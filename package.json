@@ -65,6 +65,7 @@
     "build": "vite build",
     "build:relay": "cargo build -p relay-server",
     "prepack": "npm run build",
+    "prepublishOnly": "scripts/check-no-private.sh",
     "preview": "vite preview --host",
     "smoke:pairing": "node scripts/pairing-smoke.mjs",
     "test:browser:smoke": "npm run build && node scripts/browser-page-smoke-e2e.mjs",
