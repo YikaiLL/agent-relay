@@ -504,7 +504,32 @@ async function main() {
       { timeout: TIMEOUT_MS }
     );
     await waitForFocusedTab(page, THREAD_ACTIVE);
+    // Tag the tab before closing it, and wait for one that is NOT tagged.
+    //
+    // Every cheaper wait is satisfied by the frame before the close: the thread
+    // id is the same on both sides of the round trip, and so is the focus, so
+    // `waitForFocusedTab` returns while the strip is still holding the tab we
+    // just asked it to close. The assertion then samples an unsynchronised DOM
+    // and reads whichever of the three states it lands on — the old tab, the
+    // beat where the strip is empty, or the re-created tab. Locally it lands on
+    // the first and passes WITHOUT EVER OBSERVING THE RE-CREATION this step
+    // exists to pin; on a loaded runner it lands on the empty beat (~2ms here,
+    // wider under load) and fails with `[]`, which is what CI saw.
+    //
+    // The re-creation unmounts the tab and mounts a new element, so an untagged
+    // tab is the one signal that means the round trip actually completed.
+    await page.$eval(`.session-tab[data-thread-id="${THREAD_ACTIVE}"]`, (node) => {
+      node.dataset.e2eClosedTab = "1";
+    });
     await page.click(`.session-tab[data-thread-id="${THREAD_ACTIVE}"] .session-tab-close`);
+    await page.waitForFunction(
+      (id) => {
+        const tab = document.querySelector(`.session-tab[data-thread-id="${id}"]`);
+        return Boolean(tab) && tab.dataset.e2eClosedTab !== "1";
+      },
+      THREAD_ACTIVE,
+      { timeout: TIMEOUT_MS }
+    );
     await waitForFocusedTab(page, THREAD_ACTIVE);
     assert.deepEqual(
       await tabThreadIds(page),
