@@ -5,6 +5,8 @@ use std::{
 };
 
 use super::*;
+// The relay itself no longer writes to a socket directly (see `writer.rs`), so this
+// module needs its own `SinkExt` for the fake broker it stands up.
 use crate::protocol::{
     SendMessageInput, ThreadTranscriptResponse, TranscriptEntryKind, TranscriptEntryView,
 };
@@ -14,6 +16,7 @@ use crate::state::{
 use axum::{extract::Path, routing::post, Json, Router};
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
+use futures_util::sink::SinkExt;
 use rand::{rngs::StdRng, SeedableRng};
 use relay_broker::public_control::{
     ClientGrantRequest, ClientGrantResponse, DeviceGrantBulkRevokeRequest,
@@ -1778,4 +1781,293 @@ fn a_pairing_result_is_addressed_to_one_peer_and_never_broadcast() {
             "{secret} must be sealed inside the envelope, not readable in the frame"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Broker session integration: does a paced chunk train still deafen the relay?
+//
+// The unit tests around `publish_chunk_train` and `drive_writer` pin the pieces. This
+// drives the REAL session loop (`run_broker_session_with_liveness`) against a real
+// websocket, because the defect being guarded was never visible in a piece: it was the
+// coupling between them. `handle_server_message` is awaited inline in the `select!` arm
+// that reads the socket, so publishing a reply used to stop the relay reading anything
+// at all — from any surface — for the length of that reply.
+//
+// Slow by nature (a real socket, a real git diff, and real 250ms pacing), so it is
+// opt-in the way the live-provider tests are: set AGENT_RELAY_BROKER_SESSION_E2E=1.
+// ---------------------------------------------------------------------------
+
+fn broker_session_e2e_enabled() -> bool {
+    std::env::var("AGENT_RELAY_BROKER_SESSION_E2E")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// A workspace whose `git diff HEAD` is comfortably past
+/// `MAX_BROKER_TEXT_FRAME_BYTES`, so `fetch_workspace_diff` has to chunk its reply.
+fn workspace_with_a_large_diff() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("tmpdir");
+    let root = dir.path();
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git should run");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    run(&["init", "-q", "."]);
+    run(&["config", "user.email", "test@example.test"]);
+    run(&["config", "user.name", "test"]);
+    let baseline: String = (0..4000).map(|i| format!("original line {i}\n")).collect();
+    std::fs::write(root.join("big.txt"), baseline).expect("baseline written");
+    run(&["add", "-A"]);
+    run(&["commit", "-qm", "baseline"]);
+    let modified: String = (0..4000)
+        .map(|i| format!("MODIFIED line {i} with padding to widen the diff\n"))
+        .collect();
+    std::fs::write(root.join("big.txt"), modified).expect("modification written");
+    dir
+}
+
+/// Managed mode so the test can build plaintext action frames by hand. The chunked
+/// publish path under test is shared with the encrypted one — both reach
+/// `publish_remote_action_result_chunks` — so this exercises the same coupling.
+async fn managed_broker_state(cwd: &str) -> AppState {
+    let (change_tx, _) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        cwd.to_string(),
+        change_tx.clone(),
+        SecurityProfile::managed(),
+    )));
+    relay.write().await.paired_devices.insert(
+        "phone-1".to_string(),
+        crate::state::PairedDevice {
+            device_id: "phone-1".to_string(),
+            label: "phone-1".to_string(),
+            payload_secret: "secret".to_string(),
+            device_verify_key: "verify".to_string(),
+            created_at: 1,
+            last_seen_at: Some(1),
+            last_peer_id: None,
+            broker_join_ticket_expires_at: None,
+            path_scope: Vec::new(),
+        },
+    );
+    AppState::from_parts(relay, HashMap::new(), change_tx)
+}
+
+/// What the fake broker saw, with arrival times, so the test can talk about latency
+/// rather than just ordering.
+#[derive(Default)]
+struct BrokerObservations {
+    frames: Vec<(String, std::time::Instant)>,
+}
+
+impl BrokerObservations {
+    fn kinds(&self) -> Vec<String> {
+        self.frames.iter().map(|(kind, _)| kind.clone()).collect()
+    }
+
+    fn count_of(&self, kind: &str) -> usize {
+        self.frames.iter().filter(|(seen, _)| seen == kind).count()
+    }
+
+    fn first_at(&self, kind: &str) -> Option<std::time::Instant> {
+        self.frames
+            .iter()
+            .find(|(seen, _)| seen == kind)
+            .map(|(_, at)| *at)
+    }
+}
+
+fn surface_peer(peer_id: &str, device_id: &str) -> relay_broker::protocol::PeerSummary {
+    relay_broker::protocol::PeerSummary {
+        peer_id: peer_id.to_string(),
+        role: PeerRole::Surface,
+        device_id: Some(device_id.to_string()),
+    }
+}
+
+fn plain_action_frame(from_peer_id: &str, action_id: &str, request: serde_json::Value) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": "message",
+        "channel_id": "room-e2e",
+        "from_peer_id": from_peer_id,
+        "from_role": "surface",
+        "payload": {
+            "kind": "remote_action",
+            "protocol_version": 1,
+            "action_id": action_id,
+            "device_id": "phone-1",
+            "request": request,
+        }
+    }))
+    .expect("action frame serializes")
+}
+
+/// A surface that leaves mid-reply must not cost every other surface the rest of that
+/// reply's pacing.
+///
+/// Surface A asks for a workspace diff big enough to be chunked (~10 chunks, 250ms
+/// apart — about 2.3s of pacing). While that reply is going out, A leaves and B asks a
+/// question. Two things must hold, and before this work neither did:
+///
+///   * B is answered promptly, because the relay is still READING. Previously the
+///     session loop awaited the whole chunked publish inline, so B's frame sat unread
+///     on the socket until A's reply had finished.
+///   * A's train stops, because the departure is now observable while the train paces.
+///     Previously the presence frame announcing it could not be read until afterwards,
+///     which is what made the first attempt at this fix a no-op.
+#[tokio::test]
+async fn a_departing_surface_does_not_stall_the_relay_for_everyone_else() {
+    if !broker_session_e2e_enabled() {
+        eprintln!("skipping: set AGENT_RELAY_BROKER_SESSION_E2E=1 to run the broker session e2e");
+        return;
+    }
+
+    let workspace = workspace_with_a_large_diff();
+    let cwd = workspace.path().to_string_lossy().to_string();
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should resolve");
+    let observations = Arc::new(std::sync::Mutex::new(BrokerObservations::default()));
+    let broker_view = Arc::clone(&observations);
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("broker should accept");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+
+        // Both surfaces are in the room, so the relay records them as online — which is
+        // what later makes A's departure an *observed* one.
+        let welcome = ServerMessage::Welcome {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            channel_id: "room-e2e".to_string(),
+            peer_id: "relay-e2e".to_string(),
+            peers: vec![
+                surface_peer("surface-a", "phone-1"),
+                surface_peer("surface-b", "phone-1"),
+            ],
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&welcome).expect("welcome serializes"),
+            ))
+            .await
+            .expect("welcome sends");
+
+        // A asks for the big diff.
+        socket
+            .send(Message::Text(plain_action_frame(
+                "surface-a",
+                "action-diff",
+                serde_json::json!({ "type": "fetch_workspace_diff" }),
+            )))
+            .await
+            .expect("diff request sends");
+
+        let mut announced_departure = false;
+        while let Some(frame) = socket.next().await {
+            let Ok(frame) = frame else { break };
+            match frame {
+                Message::Ping(payload) => {
+                    let _ = socket.send(Message::Pong(payload)).await;
+                }
+                Message::Close(_) => break,
+                Message::Text(text) => {
+                    let kind = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("payload")
+                                .and_then(|payload| payload.get("kind"))
+                                .and_then(|kind| kind.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    broker_view
+                        .lock()
+                        .unwrap()
+                        .frames
+                        .push((kind.clone(), std::time::Instant::now()));
+
+                    // The moment A's reply starts streaming, A goes away and B asks
+                    // something. This is the interleaving the old code could not serve.
+                    if kind == "remote_action_result_chunk" && !announced_departure {
+                        announced_departure = true;
+                        let left = ServerMessage::Presence {
+                            channel_id: "room-e2e".to_string(),
+                            kind: PresenceKind::Left,
+                            peer: surface_peer("surface-a", "phone-1"),
+                        };
+                        socket
+                            .send(Message::Text(
+                                serde_json::to_string(&left).expect("presence serializes"),
+                            ))
+                            .await
+                            .expect("presence sends");
+                        socket
+                            .send(Message::Text(plain_action_frame(
+                                "surface-b",
+                                "action-threads",
+                                serde_json::json!({ "type": "list_threads", "query": { "limit": 5 } }),
+                            )))
+                            .await
+                            .expect("second request sends");
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let config = heartbeat_test_config(format!("ws://{address}")).await;
+    let state = managed_broker_state(&cwd).await;
+    let mut change_rx = state.subscribe();
+
+    let _session = tokio::time::timeout(
+        Duration::from_secs(3),
+        run_broker_session_with_liveness(
+            &state,
+            &mut change_rx,
+            &config,
+            BrokerLivenessConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(30),
+            },
+        ),
+    )
+    .await;
+
+    let seen = observations.lock().unwrap();
+    let kinds = seen.kinds();
+
+    let first_chunk_at = seen
+        .first_at("remote_action_result_chunk")
+        .expect("the diff reply must be chunked; saw {kinds:?}");
+    let threads_at = seen
+        .first_at("remote_threads_result")
+        .unwrap_or_else(|| panic!("surface B was never answered at all; saw {kinds:?}"));
+
+    let b_waited = threads_at.saturating_duration_since(first_chunk_at);
+    assert!(
+        b_waited < Duration::from_millis(750),
+        "surface B waited {}ms behind another surface's chunked reply. The reply paces \
+         ~2.3s, so anything near that means the relay stopped reading while it wrote — \
+         the exact stall this test exists for. Frames: {kinds:?}",
+        b_waited.as_millis()
+    );
+
+    let chunks = seen.count_of("remote_action_result_chunk");
+    assert!(
+        chunks < 8,
+        "surface A left after its first chunk, so its train should have been abandoned; \
+         got {chunks} chunks. Frames: {kinds:?}"
+    );
 }

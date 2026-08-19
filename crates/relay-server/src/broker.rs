@@ -4,6 +4,7 @@ mod crypto;
 mod protocol;
 mod remote_actions;
 mod session_claim;
+mod writer;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use futures_util::{sink::SinkExt, stream::StreamExt};
+use futures_util::stream::StreamExt;
 use rand::{Rng, RngCore};
 use relay_broker::auth::{BrokerAuthMode, BROKER_AUTH_MODE_ENV};
 use relay_broker::join_ticket::unix_now;
@@ -46,6 +47,7 @@ use self::protocol::{
 use self::remote_actions::RemoteActionRequest;
 use self::remote_actions::{handle_encrypted_remote_action, handle_remote_action};
 use self::session_claim::{issue_session_claim, verify_session_claim};
+use self::writer::{spawn_broker_writer, BrokerWriter};
 #[cfg(test)]
 use relay_broker::protocol::BROKER_PROTOCOL_VERSION;
 
@@ -856,7 +858,13 @@ async fn run_broker_session_with_liveness(
     let (socket, _) = connect_async(connect_url.as_str()).await.map_err(|error| {
         BrokerSessionError::before_connected(format!("failed to connect to broker: {error}"))
     })?;
-    let (mut sender, mut receiver) = socket.split();
+    let (sink, mut receiver) = socket.split();
+    // The write half moves into its own task. Nothing on the read path may ever await a
+    // socket write again: that coupling is what let a paced chunk train block the relay
+    // from reading for seconds at a time. See `writer.rs`.
+    // The guard aborts the writer on every exit path from this session. The socket is
+    // the session: a writer left draining into a dead socket can outlive its reconnect.
+    let (writer, mut writer_error, _writer_guard) = spawn_broker_writer(sink, state.clone());
 
     let welcome = receiver
         .next()
@@ -920,7 +928,7 @@ async fn run_broker_session_with_liveness(
             format!("Connected to broker room {}.", config.broker_room_id()),
         )
         .await;
-    publish_pending_broker_messages(&mut sender, state)
+    publish_pending_broker_messages(&writer, state)
         .await
         .map_err(|error| {
             BrokerSessionError::after_connected(
@@ -928,14 +936,12 @@ async fn run_broker_session_with_liveness(
                 connected_at,
             )
         })?;
-    publish_snapshot(&mut sender, state)
-        .await
-        .map_err(|error| {
-            BrokerSessionError::after_connected(
-                format!("initial broker publish failed: {error}"),
-                connected_at,
-            )
-        })?;
+    publish_snapshot(&writer, state).await.map_err(|error| {
+        BrokerSessionError::after_connected(
+            format!("initial broker publish failed: {error}"),
+            connected_at,
+        )
+    })?;
     let mut snapshot_publish_gate =
         SnapshotPublishGate::new(Duration::from_millis(SNAPSHOT_PUBLISH_MIN_INTERVAL_MILLIS));
     snapshot_publish_gate.mark_published(Instant::now());
@@ -956,9 +962,17 @@ async fn run_broker_session_with_liveness(
 
     loop {
         tokio::select! {
+            // The socket is the session, so a write failure still ends it. It now
+            // arrives here instead of as the return value of a publish call, because
+            // publishing is a hand-off to the writer task.
+            writer_failed = &mut writer_error => {
+                let error = writer_failed
+                    .unwrap_or_else(|_| "broker writer task stopped".to_string());
+                return Err(BrokerSessionError::after_connected(error, connected_at));
+            }
             changed = change_rx.changed() => {
                 changed.map_err(|_| BrokerSessionError::after_connected("relay change channel closed", connected_at))?;
-                let deltas = drain_pending_broker_messages_for_publish(&mut sender, state)
+                let deltas = drain_pending_broker_messages_for_publish(&writer, state)
                     .await
                     .map_err(|error| BrokerSessionError::after_connected(format!("broker direct publish failed: {error}"), connected_at))?;
                 if !deltas.is_empty() {
@@ -977,13 +991,12 @@ async fn run_broker_session_with_liveness(
                     !pending_transcript_deltas.is_empty(),
                 ) {
                     SnapshotPublishDecision::PublishSnapshot => {
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::FlushTranscriptDeltasThenPublishSnapshot => {
-                        flush_pending_transcript_deltas(
-                            &mut sender,
+                        flush_pending_transcript_deltas(&writer,
                             state,
                             &mut pending_transcript_deltas,
                         )
@@ -994,7 +1007,7 @@ async fn run_broker_session_with_liveness(
                                 connected_at,
                             )
                         })?;
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
@@ -1005,7 +1018,7 @@ async fn run_broker_session_with_liveness(
             }
             () = &mut pending_transcript_delta_timer, if !pending_transcript_deltas.is_empty() => {
                 let deltas = std::mem::take(&mut pending_transcript_deltas);
-                pending_transcript_deltas = publish_transcript_delta_batch(&mut sender, state, deltas)
+                pending_transcript_deltas = publish_transcript_delta_batch(&writer, state, deltas)
                     .await
                     .map_err(|error| BrokerSessionError::after_connected(format!("broker transcript delta publish failed: {error}"), connected_at))?;
                 if !pending_transcript_deltas.is_empty() {
@@ -1022,13 +1035,12 @@ async fn run_broker_session_with_liveness(
                     !pending_transcript_deltas.is_empty(),
                 ) {
                     SnapshotPublishDecision::PublishSnapshot => {
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::FlushTranscriptDeltasThenPublishSnapshot => {
-                        flush_pending_transcript_deltas(
-                            &mut sender,
+                        flush_pending_transcript_deltas(&writer,
                             state,
                             &mut pending_transcript_deltas,
                         )
@@ -1039,7 +1051,7 @@ async fn run_broker_session_with_liveness(
                                 connected_at,
                             )
                         })?;
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
@@ -1057,8 +1069,8 @@ async fn run_broker_session_with_liveness(
                 }
                 heartbeat_seq = heartbeat_seq.wrapping_add(1);
                 let payload = heartbeat_seq.to_be_bytes().to_vec();
-                sender
-                    .send(Message::Ping(payload.clone()))
+                writer
+                    .send_now(Message::Ping(payload.clone()))
                     .await
                     .map_err(|error| BrokerSessionError::after_connected(format!("broker heartbeat ping failed: {error}"), connected_at))?;
                 debug!(heartbeat_seq, "sent broker heartbeat ping");
@@ -1093,7 +1105,7 @@ async fn run_broker_session_with_liveness(
                 {
                     let message_name = server_message_name(&message);
                     let started_at = Instant::now();
-                    let outcome = handle_server_message(state, &mut sender, message)
+                    let outcome = handle_server_message(state, &writer, message)
                         .await
                         .map_err(|error| BrokerSessionError::after_connected(error, connected_at))?;
                     let elapsed_ms = started_at.elapsed().as_millis();
@@ -1133,7 +1145,7 @@ fn decode_server_frame(frame: Message) -> Result<Option<ServerMessage>, String> 
 
 async fn handle_server_message(
     state: &AppState,
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     message: ServerMessage,
 ) -> Result<ServerMessageOutcome, String> {
     match message {
@@ -1200,7 +1212,7 @@ async fn handle_server_message(
                 Some(InboundBrokerPayload::PairingRequest {
                     pairing_id,
                     envelope,
-                }) => handle_pairing_request(state, sender, from_peer_id, pairing_id, envelope)
+                }) => handle_pairing_request(state, writer, from_peer_id, pairing_id, envelope)
                     .await
                     .map(|()| ServerMessageOutcome::Continue),
                 Some(InboundBrokerPayload::RemoteAction {
@@ -1210,7 +1222,7 @@ async fn handle_server_message(
                     request,
                 }) => handle_remote_action(
                     state,
-                    sender,
+                    writer,
                     from_peer_id,
                     action_id,
                     session_claim,
@@ -1226,7 +1238,7 @@ async fn handle_server_message(
                     envelope,
                 }) => handle_encrypted_remote_action(
                     state,
-                    sender,
+                    writer,
                     from_peer_id,
                     action_id,
                     session_claim,
@@ -1251,7 +1263,7 @@ async fn handle_server_message(
 
 async fn handle_pairing_request(
     state: &AppState,
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     from_peer_id: String,
     pairing_id: String,
     envelope: EncryptedEnvelope,
@@ -1321,7 +1333,7 @@ async fn handle_pairing_request(
         }
     };
     if let Some(result) = replay_result {
-        publish_pairing_result(sender, result).await?;
+        publish_pairing_result(writer, result).await?;
         state
             .push_runtime_log(
                 "info",
@@ -1379,10 +1391,7 @@ fn server_message_name(message: &ServerMessage) -> &'static str {
     }
 }
 
-async fn publish_snapshot(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
-    state: &AppState,
-) -> Result<(), String> {
+async fn publish_snapshot(writer: &BrokerWriter, state: &AppState) -> Result<(), String> {
     let snapshot = state.snapshot().await;
     let broker_can_read_content = state.broker_can_read_content().await;
     let compacted = snapshot
@@ -1406,7 +1415,7 @@ async fn publish_snapshot(
     );
     if broker_can_read_content {
         publish_payload(
-            sender,
+            writer,
             OutboundBrokerPayload::SessionSnapshot {
                 snapshot: compacted,
             },
@@ -1453,24 +1462,24 @@ async fn publish_snapshot(
             }),
         });
     }
-    publish_targeted_messages(sender, messages).await?;
+    publish_targeted_messages(writer, messages).await?;
 
     Ok(())
 }
 
 async fn publish_pending_broker_messages(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
 ) -> Result<(), String> {
-    let deltas = drain_pending_broker_messages_for_publish(sender, state).await?;
+    let deltas = drain_pending_broker_messages_for_publish(writer, state).await?;
     for delta in coalesce_transcript_deltas(deltas) {
-        publish_transcript_delta(sender, state, delta).await?;
+        publish_transcript_delta(writer, state, delta).await?;
     }
     Ok(())
 }
 
 async fn drain_pending_broker_messages_for_publish(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
 ) -> Result<Vec<PendingTranscriptDelta>, String> {
     let messages = state.drain_pending_broker_messages().await;
@@ -1492,7 +1501,7 @@ async fn drain_pending_broker_messages_for_publish(
     for message in messages {
         match message {
             BrokerPendingMessage::PairingResult(result) => {
-                publish_pairing_result(sender, result).await?;
+                publish_pairing_result(writer, result).await?;
             }
             BrokerPendingMessage::TranscriptDelta(delta) => transcript_deltas.push(delta),
         }
@@ -1501,7 +1510,7 @@ async fn drain_pending_broker_messages_for_publish(
 }
 
 async fn publish_transcript_delta_batch(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
     deltas: Vec<PendingTranscriptDelta>,
 ) -> Result<Vec<PendingTranscriptDelta>, String> {
@@ -1515,7 +1524,7 @@ async fn publish_transcript_delta_batch(
 
     let mut delta_count = 0;
     for delta in deltas {
-        publish_transcript_delta(sender, state, delta).await?;
+        publish_transcript_delta(writer, state, delta).await?;
         delta_count += 1;
     }
     if delta_count > 0 {
@@ -1525,13 +1534,13 @@ async fn publish_transcript_delta_batch(
 }
 
 async fn flush_pending_transcript_deltas(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
     pending_transcript_deltas: &mut Vec<PendingTranscriptDelta>,
 ) -> Result<(), String> {
     let mut deltas = std::mem::take(pending_transcript_deltas);
     while !deltas.is_empty() {
-        deltas = publish_transcript_delta_batch(sender, state, deltas).await?;
+        deltas = publish_transcript_delta_batch(writer, state, deltas).await?;
     }
     Ok(())
 }
@@ -1644,7 +1653,7 @@ fn build_transcript_delta_messages(
 }
 
 async fn publish_transcript_delta(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
     delta: PendingTranscriptDelta,
 ) -> Result<(), String> {
@@ -1688,7 +1697,7 @@ async fn publish_transcript_delta(
     );
 
     let messages = build_transcript_delta_messages(targets, broker_can_read_content, &delta)?;
-    publish_targeted_messages(sender, messages).await?;
+    publish_targeted_messages(writer, messages).await?;
 
     Ok(())
 }
@@ -1733,16 +1742,16 @@ fn pairing_result_targeted_message(
 }
 
 async fn publish_pairing_result(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     result: crate::state::PendingPairingResult,
 ) -> Result<(), String> {
-    publish_targeted_messages(sender, vec![pairing_result_targeted_message(result)?]).await
+    publish_targeted_messages(writer, vec![pairing_result_targeted_message(result)?]).await
 }
 
 async fn publish_payload(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     payload: OutboundBrokerPayload,
-) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+) -> Result<(), String> {
     let summary = summarize_outbound_payload(&payload);
     let frame_text = frame_text_for_payload(&payload);
     let frame_bytes = frame_text.len();
@@ -1764,11 +1773,17 @@ async fn publish_payload(
             "broker payload exceeds websocket text frame limit before send"
         );
     }
-    sender.send(Message::Text(frame_text)).await
+    writer.send_now(Message::Text(frame_text)).await
+}
+
+/// Serialize a payload into the frame the writer will send, without sending it.
+/// Used to build a chunk train up front so the writer can pace it.
+fn frame_message_for_payload(payload: &OutboundBrokerPayload) -> Message {
+    Message::Text(frame_text_for_payload(payload))
 }
 
 async fn publish_targeted_messages(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     messages: Vec<TargetedBrokerMessage>,
 ) -> Result<(), String> {
     if messages.is_empty() {
@@ -1786,7 +1801,7 @@ async fn publish_targeted_messages(
             && frame_bytes_for_payload(&candidate_payload) > MAX_BROKER_TEXT_FRAME_BYTES
         {
             let payload = OutboundBrokerPayload::TargetedMessages { messages: batch };
-            publish_payload(sender, payload)
+            publish_payload(writer, payload)
                 .await
                 .map_err(|error| error.to_string())?;
             batch = vec![message];
@@ -1797,7 +1812,7 @@ async fn publish_targeted_messages(
 
     if !batch.is_empty() {
         publish_payload(
-            sender,
+            writer,
             OutboundBrokerPayload::TargetedMessages { messages: batch },
         )
         .await

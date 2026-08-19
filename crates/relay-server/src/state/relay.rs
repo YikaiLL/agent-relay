@@ -3705,6 +3705,15 @@ impl RelayState {
         self.online_surface_peer_ids.insert(peer_id.to_string())
     }
 
+    /// Whether this surface is still in the room, as of the last presence frame.
+    ///
+    /// Read by the broker writer to abandon a chunked reply whose surface has left.
+    /// Only meaningful because the read loop no longer blocks while the writer paces
+    /// (see `broker/writer.rs`): before that, presence could not change mid-train.
+    pub fn surface_peer_is_online(&self, peer_id: &str) -> bool {
+        self.online_surface_peer_ids.contains(peer_id)
+    }
+
     pub fn mark_surface_peer_offline(&mut self, peer_id: &str) -> bool {
         self.online_surface_peer_devices.remove(peer_id);
         let removed = self.online_surface_peer_ids.remove(peer_id);

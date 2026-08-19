@@ -67,7 +67,23 @@ use tracing::{debug, warn};
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const DEFAULT_PUBLIC_API_RATE_LIMIT_PER_MINUTE: usize = 120;
 const DEFAULT_JOIN_RATE_LIMIT_PER_MINUTE: usize = 40;
+/// Publish allowance for a surface peer: a browser tab sending user-driven actions.
 const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
+/// Publish allowance for a relay peer, which is first-party and an order of magnitude
+/// busier than a surface.
+///
+/// A relay's own constants put it far past the surface budget: transcript deltas are
+/// batched into a 100ms window (up to 10 publishes a second while streaming), snapshots
+/// get their own 500ms floor (2 a second), and a chunked action reply paces at 4 a
+/// second on top. The surface allowance is 4 a second in total, so a streaming relay
+/// used to spend most of its time over the line — and going over is silent: the frame is
+/// dropped and the socket stays open. Dropped transcript deltas are lost content;
+/// dropped chunks cost the client a 15-second timeout, because a chunked reply resolves
+/// only once every chunk lands.
+///
+/// 20 a second leaves headroom above the relay's own worst case without giving an
+/// abusive peer a bigger hole: a surface is still held to the budget above.
+const DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 1_200;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
@@ -79,6 +95,7 @@ const DEVICE_SESSION_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 400;
 const PUBLIC_API_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE";
 const JOIN_RATE_LIMIT_ENV: &str = "RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE";
 const PUBLISH_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE";
+const RELAY_PUBLISH_RATE_LIMIT_ENV: &str = "RELAY_BROKER_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE";
 const MAX_CONNECTIONS_PER_IP_ENV: &str = "RELAY_BROKER_MAX_CONNECTIONS_PER_IP";
 const MAX_TEXT_FRAME_BYTES_ENV: &str = "RELAY_BROKER_MAX_TEXT_FRAME_BYTES";
 const IDLE_TIMEOUT_SECS_ENV: &str = "RELAY_BROKER_IDLE_TIMEOUT_SECS";
@@ -421,6 +438,7 @@ struct BrokerHardeningConfig {
     public_api_rate_limit_per_minute: usize,
     join_rate_limit_per_minute: usize,
     publish_rate_limit_per_minute: usize,
+    relay_publish_rate_limit_per_minute: usize,
     max_connections_per_ip: usize,
     max_text_frame_bytes: usize,
     idle_timeout: Duration,
@@ -478,6 +496,7 @@ impl Default for BrokerHardeningConfig {
             public_api_rate_limit_per_minute: DEFAULT_PUBLIC_API_RATE_LIMIT_PER_MINUTE,
             join_rate_limit_per_minute: DEFAULT_JOIN_RATE_LIMIT_PER_MINUTE,
             publish_rate_limit_per_minute: DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE,
+            relay_publish_rate_limit_per_minute: DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE,
             max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
             max_text_frame_bytes: DEFAULT_MAX_TEXT_FRAME_BYTES,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
@@ -499,6 +518,10 @@ impl BrokerHardeningConfig {
             publish_rate_limit_per_minute: parse_usize_env(
                 PUBLISH_RATE_LIMIT_ENV,
                 DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE,
+            )?,
+            relay_publish_rate_limit_per_minute: parse_usize_env(
+                RELAY_PUBLISH_RATE_LIMIT_ENV,
+                DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE,
             )?,
             max_connections_per_ip: parse_usize_env(
                 MAX_CONNECTIONS_PER_IP_ENV,
@@ -2136,7 +2159,17 @@ async fn handle_socket(
                                     .rate_limiter
                                     .allow(
                                         format!("publish:{channel_id}:{peer_id}"),
-                                        state.hardening.config.publish_rate_limit_per_minute,
+                                        match query.role {
+                                            protocol::PeerRole::Relay => {
+                                                state
+                                                    .hardening
+                                                    .config
+                                                    .relay_publish_rate_limit_per_minute
+                                            }
+                                            protocol::PeerRole::Surface => {
+                                                state.hardening.config.publish_rate_limit_per_minute
+                                            }
+                                        },
                                     )
                                     .await
                                 {

@@ -866,3 +866,131 @@ test("handleRemoteBrokerPayload does not apply snapshot for claim_challenge acti
 
   assert.equal(snapshotApplied, false);
 });
+
+// A surface receives every other surface's frames: the broker broadcasts remote
+// action results and filters nothing, by design (`must_not_be_broadcast` in
+// crates/relay-broker/src/state.rs lists only `encrypted_pairing_result`). That is
+// fine as long as discarding one is FREE. It was not: the discard path logged, and
+// `renderLog` is a `patchRemoteState`, which notifies the store that drives
+// `useSyncExternalStore` — i.e. a full re-render of RemoteApp per frame thrown away.
+//
+// A real boot trace showed 21 such frames arriving before the first frame addressed
+// to this surface, each one a chunk of another surface's `fetch_workspace_diff`.
+test("a frame addressed to another surface does not notify the remote store", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+
+  try {
+    // One chunked action result belonging to a DIFFERENT surface of the same device.
+    for (let index = 0; index < 12; index += 1) {
+      await handleRemoteBrokerPayload({
+        kind: "encrypted_remote_action_result_chunk",
+        action_id: "action-for-another-surface",
+        action: "fetch_workspace_diff",
+        chunk_index: index,
+        chunk_count: 12,
+        target_peer_id: "surface-other",
+        device_id: "device-1",
+        // Never reached: the payload is filtered before any decrypt.
+        envelope: "envelope-that-must-not-be-opened",
+      });
+    }
+    await handleRemoteBrokerPayload({
+      kind: "encrypted_remote_action_result",
+      action_id: "action-for-another-surface",
+      target_peer_id: "surface-other",
+      device_id: "device-1",
+      envelope: "envelope-that-must-not-be-opened",
+    });
+  } finally {
+    unsubscribe();
+  }
+
+  assert.equal(
+    notifications,
+    0,
+    "discarding another surface's frames must not notify the store: every "
+      + "notification is a full RemoteApp re-render for a frame we throw away"
+  );
+});
+
+// The suppression above is a gate, not a deletion. If the flag does not actually
+// restore the trace, the diagnostics are gone for good and nobody debugging broker
+// routing would find that out until they needed them.
+test("verbose broker logging restores the discarded-frame trace", async () => {
+  installBrowserStubs();
+  globalThis.window.__agentRelayVerboseBrokerLogs = true;
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+
+  try {
+    await handleRemoteBrokerPayload({
+      kind: "encrypted_remote_action_result_chunk",
+      action_id: "action-for-another-surface",
+      action: "fetch_workspace_diff",
+      chunk_index: 0,
+      chunk_count: 12,
+      target_peer_id: "surface-other",
+      device_id: "device-1",
+      envelope: "envelope-that-must-not-be-opened",
+    });
+  } finally {
+    unsubscribe();
+    delete globalThis.window.__agentRelayVerboseBrokerLogs;
+  }
+
+  assert.equal(
+    notifications,
+    1,
+    "with the flag on, the routing trace must come back — otherwise the gate is a delete"
+  );
+});

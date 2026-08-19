@@ -1277,3 +1277,83 @@ async fn list_threads_action_carries_the_search_query() {
         "no query still returns the ordinary page"
     );
 }
+
+/// Publishing a chunked reply must not cost the caller the reply's pacing.
+///
+/// `broker.rs` awaits `handle_server_message` INLINE in the `select!` arm that reads the
+/// broker socket, and a chunked action reply is published from inside that handler. So
+/// for as long as this function takes, the relay reads NOTHING: not another surface's
+/// `fetch_thread_transcript`, not a `claim_challenge`, not even the presence frame
+/// saying the surface it is answering has gone away.
+///
+/// It used to sleep `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS` between every
+/// chunk, so a 21-chunk reply — a real trace had exactly that, one
+/// `fetch_workspace_diff` — blinded the relay for ~5 seconds. Users experienced it as
+/// "I clicked and nothing happened, then a while later everything arrived at once".
+///
+/// Runs on a paused clock, so the assertion is about the pacing this call performs, not
+/// about how fast the machine is: a paused runtime auto-advances time whenever the task
+/// sleeps, which means a version that still paces inline reports the full ~5s here.
+#[tokio::test(start_paused = true)]
+async fn queueing_a_chunk_train_does_not_block_the_read_loop() {
+    use crate::state::{RelayState, SecurityProfile};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    let (change_tx, _rx) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        "/tmp/chunk-train-test".to_string(),
+        change_tx.clone(),
+        SecurityProfile::private(),
+    )));
+    relay.write().await.mark_surface_peer_online("surface-1");
+    let state = AppState::from_parts(relay, HashMap::new(), change_tx);
+
+    let (writer, _now_queue, mut queued) = super::super::writer::test_writer();
+    let chunks = workspace_diff_chunks("surface-1", 21);
+
+    let started_at = tokio::time::Instant::now();
+    publish_remote_action_result_chunks(&state, &writer, chunks, "test chunk train", "surface-1")
+        .await
+        .expect("queueing a train succeeds");
+    let blocked_for = started_at.elapsed();
+
+    assert!(
+        blocked_for < Duration::from_millis(50),
+        "handing off a 21-chunk reply must be a queue push, not {}ms of blocked read \
+         loop — the pacing belongs to the writer task",
+        blocked_for.as_millis()
+    );
+
+    let frame = queued
+        .try_recv()
+        .expect("the train must actually be queued");
+    assert_eq!(frame.chunks.len(), 21, "every chunk is handed over");
+    assert_eq!(
+        frame.interval,
+        Duration::from_millis(REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS),
+        "and the writer is told the pacing to apply"
+    );
+    assert_eq!(
+        frame.watch_target.as_deref(),
+        Some("surface-1"),
+        "a surface observed online at queue time is watched, so its train can be \
+         abandoned if it leaves"
+    );
+}
+
+fn workspace_diff_chunks(target_peer_id: &str, chunk_count: usize) -> Vec<OutboundBrokerPayload> {
+    (0..chunk_count)
+        .map(
+            |chunk_index| OutboundBrokerPayload::RemoteActionResultChunk {
+                action_id: "action-1".to_string(),
+                target_peer_id: target_peer_id.to_string(),
+                action: RemoteActionKind::FetchWorkspaceDiff,
+                chunk_index,
+                chunk_count,
+                data_base64: "cGF5bG9hZA==".to_string(),
+            },
+        )
+        .collect()
+}

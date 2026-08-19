@@ -1,8 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use futures_util::stream::SplitSink;
 use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, Duration, Instant};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::{
@@ -25,10 +23,12 @@ use crate::{
 
 use super::{
     crypto::{decrypt_json, encrypt_json, EncryptedEnvelope},
-    issue_session_claim,
+    frame_message_for_payload, issue_session_claim,
     protocol::{frame_bytes_for_payload, OutboundBrokerPayload},
     publish_payload, verify_device_claim_challenge_proof, verify_device_claim_init_proof,
-    verify_session_claim, BrokerSocket, MAX_BROKER_TEXT_FRAME_BYTES,
+    verify_session_claim,
+    writer::{BrokerWriter, TrainHandoff},
+    MAX_BROKER_TEXT_FRAME_BYTES,
 };
 
 const SESSION_CONTROL_REQUIRED_ERROR: &str =
@@ -37,7 +37,6 @@ const REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES: usize = 32_768;
 const REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES: usize = 1_024;
 const REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS: u64 = 250;
 const REMOTE_ACTION_SLOW_WARN_MILLIS: u128 = 1_000;
-const REMOTE_ACTION_CHUNK_SLOW_WARN_MILLIS: u128 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -522,6 +521,46 @@ struct RemoteActionResultPlaintext {
     error: Option<String>,
 }
 
+/// What a client is told when its reply cannot be queued.
+///
+/// Deliberately explicit and recoverable: the alternative is silence, and a chunked
+/// reply resolves only once every chunk lands, so silence costs the client its full
+/// 15-second timeout.
+const REMOTE_ACTION_BUSY_ERROR: &str =
+    "the relay already has too many large replies in flight; retry this request";
+
+fn busy_remote_action_result(
+    kind: RemoteActionResultKind,
+    action: RemoteActionKind,
+) -> RemoteActionResultPlaintext {
+    RemoteActionResultPlaintext {
+        kind,
+        action,
+        ok: false,
+        snapshot: None,
+        receipt: None,
+        ask_user_answer_receipt: None,
+        providers: None,
+        models: None,
+        threads: None,
+        thread_entries: None,
+        thread_entry_detail: None,
+        thread_transcript: None,
+        workspace_diff: None,
+        reviews: None,
+        workflows: None,
+        devices: None,
+        projects: None,
+        ask_user_question_detail: None,
+        session_claim: None,
+        session_claim_expires_at: None,
+        claim_challenge_id: None,
+        claim_challenge: None,
+        claim_challenge_expires_at: None,
+        error: Some(REMOTE_ACTION_BUSY_ERROR.to_string()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum RemoteActionResultKind {
@@ -587,7 +626,7 @@ pub(super) struct RemoteActionOutcome {
 
 pub(super) async fn handle_remote_action(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     from_peer_id: String,
     action_id: String,
     session_claim: Option<String>,
@@ -644,7 +683,8 @@ pub(super) async fn handle_remote_action(
             let snapshot = state.snapshot().await;
             let result_device_id = device_id.unwrap_or_else(|| "unknown-device".to_string());
             return publish_plain_remote_action_result(
-                sender,
+                state,
+                writer,
                 from_peer_id,
                 action_id,
                 action_kind,
@@ -675,7 +715,8 @@ pub(super) async fn handle_remote_action(
         Ok(RemoteActionReplayDecision::Execute) => {}
         Ok(RemoteActionReplayDecision::Replay(cached)) => {
             return replay_plain_remote_action_result(
-                sender,
+                state,
+                writer,
                 from_peer_id,
                 action_id,
                 action_kind,
@@ -712,7 +753,8 @@ pub(super) async fn handle_remote_action(
                 .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
                 .await;
             return replay_plain_remote_action_result(
-                sender,
+                state,
+                writer,
                 from_peer_id,
                 action_id,
                 action_kind,
@@ -793,9 +835,15 @@ pub(super) async fn handle_remote_action(
     state
         .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
         .await;
-    let replay_result =
-        replay_plain_remote_action_result(sender, from_peer_id, action_id, action_kind, cached)
-            .await;
+    let replay_result = replay_plain_remote_action_result(
+        state,
+        writer,
+        from_peer_id,
+        action_id,
+        action_kind,
+        cached,
+    )
+    .await;
     let elapsed_ms = action_started_at.elapsed().as_millis();
     if elapsed_ms >= REMOTE_ACTION_SLOW_WARN_MILLIS {
         warn!(
@@ -817,7 +865,7 @@ pub(super) async fn handle_remote_action(
 
 pub(super) async fn handle_encrypted_remote_action(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     from_peer_id: String,
     action_id: String,
     session_claim: Option<String>,
@@ -860,7 +908,7 @@ pub(super) async fn handle_encrypted_remote_action(
             let snapshot = state.snapshot().await;
             if let Err(publish_error) = publish_remote_action_result_private(
                 state,
-                sender,
+                writer,
                 from_peer_id,
                 device_id,
                 action_id,
@@ -929,7 +977,7 @@ pub(super) async fn handle_encrypted_remote_action(
         Ok(RemoteActionReplayDecision::Replay(cached)) => {
             return replay_encrypted_remote_action_result(
                 state,
-                sender,
+                writer,
                 from_peer_id,
                 device_id,
                 action_id,
@@ -968,7 +1016,7 @@ pub(super) async fn handle_encrypted_remote_action(
                 .await;
             return replay_encrypted_remote_action_result(
                 state,
-                sender,
+                writer,
                 from_peer_id,
                 device_id,
                 action_id,
@@ -1049,7 +1097,7 @@ pub(super) async fn handle_encrypted_remote_action(
 
     let replay_result = replay_encrypted_remote_action_result(
         state,
-        sender,
+        writer,
         from_peer_id,
         device_id,
         action_id,
@@ -1650,7 +1698,8 @@ fn ask_user_answer_error_message(error: AskUserAnswerError) -> String {
 }
 
 async fn publish_plain_remote_action_result(
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    state: &AppState,
+    writer: &BrokerWriter,
     target_peer_id: String,
     action_id: String,
     action: RemoteActionKind,
@@ -1764,7 +1813,7 @@ async fn publish_plain_remote_action_result(
     let frame_bytes = frame_bytes_for_payload(&payload);
     log_remote_action_result_sizes("plaintext", action, &size_breakdown, None, frame_bytes);
     if frame_bytes <= MAX_BROKER_TEXT_FRAME_BYTES {
-        return publish_payload(sender, payload)
+        return publish_payload(writer, payload)
             .await
             .map_err(|error| format!("broker action result publish failed: {error}"));
     }
@@ -1778,42 +1827,71 @@ async fn publish_plain_remote_action_result(
         chunk_count = chunk_payloads.len(),
         "falling back to chunked remote action result transport"
     );
-    publish_remote_action_result_chunks(sender, chunk_payloads, "broker action result chunk")
-        .await?;
+    if publish_remote_action_result_chunks(
+        state,
+        writer,
+        chunk_payloads,
+        "broker action result chunk",
+        &target_peer_id,
+    )
+    .await?
+        == TrainHandoff::Busy
+    {
+        let busy = busy_remote_action_result(plaintext.kind, action);
+        let payload = build_plain_remote_action_result_payload(&action_id, &target_peer_id, &busy)?;
+        return publish_payload(writer, payload)
+            .await
+            .map_err(|error| format!("busy remote action result publish failed: {error}"));
+    }
     Ok(())
 }
 
+/// Hand a chunked action reply to the writer, paced but not awaited.
+///
+/// This used to publish every chunk here, sleeping
+/// `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS` between them. Because
+/// `broker.rs` awaits `handle_server_message` INLINE in the `select!` arm that reads
+/// the socket, a 21-chunk reply meant ~5 seconds during which the relay read nothing
+/// from any surface. The pacing now happens in the writer task, so this returns as
+/// soon as the train is queued and the read loop keeps serving everyone else.
 async fn publish_remote_action_result_chunks(
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    state: &AppState,
+    writer: &BrokerWriter,
     chunk_payloads: Vec<OutboundBrokerPayload>,
     error_context: &str,
-) -> Result<(), String> {
+    target_peer_id: &str,
+) -> Result<TrainHandoff, String> {
     let chunk_count = chunk_payloads.len();
     info!(
         chunk_count,
         publish_interval_ms = REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS,
-        "publishing broker remote action result chunks"
+        "queueing broker remote action result chunks"
     );
-    for (index, payload) in chunk_payloads.into_iter().enumerate() {
-        let chunk_started_at = Instant::now();
-        publish_payload(sender, payload)
-            .await
-            .map_err(|error| format!("{error_context} publish failed: {error}"))?;
-        let elapsed_ms = chunk_started_at.elapsed().as_millis();
-        if elapsed_ms >= REMOTE_ACTION_CHUNK_SLOW_WARN_MILLIS {
-            warn!(
-                chunk_index = index,
-                chunk_count, elapsed_ms, "broker remote action result chunk publish was slow"
-            );
-        }
-        if index + 1 < chunk_count {
-            sleep(Duration::from_millis(
-                REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS,
-            ))
-            .await;
-        }
+    let chunks = chunk_payloads
+        .iter()
+        .map(frame_message_for_payload)
+        .collect::<Vec<_>>();
+    // Probe ONCE, here, while we still know the request we are answering just arrived
+    // from this peer. Recording "it was here" is what later lets the writer distinguish
+    // an observed departure from a presence set that never knew about it.
+    let watch_target = state
+        .surface_peer_is_online(target_peer_id)
+        .await
+        .then(|| target_peer_id.to_string());
+    let handoff = writer
+        .send_train(
+            chunks,
+            Duration::from_millis(REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS),
+            watch_target,
+        )
+        .map_err(|error| format!("{error_context} publish failed: {error}"))?;
+    if handoff == TrainHandoff::Busy {
+        warn!(
+            chunk_count,
+            error_context, "refusing a chunked reply: too many large replies outstanding"
+        );
     }
-    Ok(())
+    Ok(handoff)
 }
 
 fn build_plain_remote_action_result_payload(
@@ -1898,14 +1976,16 @@ fn build_plain_remote_action_result_payload(
 }
 
 async fn replay_plain_remote_action_result(
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    state: &AppState,
+    writer: &BrokerWriter,
     target_peer_id: String,
     action_id: String,
     action: RemoteActionKind,
     cached: CachedRemoteActionResult,
 ) -> Result<(), String> {
     publish_plain_remote_action_result(
-        sender,
+        state,
+        writer,
         target_peer_id,
         action_id,
         action,
@@ -1940,7 +2020,7 @@ async fn replay_plain_remote_action_result(
 
 async fn publish_remote_action_result_private(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     target_peer_id: String,
     device_id: String,
     action_id: String,
@@ -2071,7 +2151,7 @@ async fn publish_remote_action_result_private(
         frame_bytes,
     );
     if frame_bytes <= MAX_BROKER_TEXT_FRAME_BYTES {
-        return publish_payload(sender, payload)
+        return publish_payload(writer, payload)
             .await
             .map_err(|error| format!("encrypted broker action result publish failed: {error}"));
     }
@@ -2090,17 +2170,37 @@ async fn publish_remote_action_result_private(
         chunk_count = chunk_payloads.len(),
         "falling back to chunked remote action result transport"
     );
-    publish_remote_action_result_chunks(
-        sender,
+    if publish_remote_action_result_chunks(
+        state,
+        writer,
         chunk_payloads,
         "encrypted broker action result chunk",
+        &target_peer_id,
     )
-    .await
+    .await?
+        == TrainHandoff::Busy
+    {
+        let busy = busy_remote_action_result(plaintext.kind, action);
+        let envelope = encrypt_json(&secret, &busy)
+            .map_err(|error| format!("failed to seal busy remote action result: {error}"))?;
+        return publish_payload(
+            writer,
+            OutboundBrokerPayload::EncryptedRemoteActionResult {
+                action_id,
+                target_peer_id,
+                device_id,
+                envelope,
+            },
+        )
+        .await
+        .map_err(|error| format!("busy remote action result publish failed: {error}"));
+    }
+    Ok(())
 }
 
 async fn replay_encrypted_remote_action_result(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     target_peer_id: String,
     device_id: String,
     action_id: String,
@@ -2109,7 +2209,7 @@ async fn replay_encrypted_remote_action_result(
 ) -> Result<(), String> {
     publish_remote_action_result_private(
         state,
-        sender,
+        writer,
         target_peer_id,
         device_id,
         action_id,

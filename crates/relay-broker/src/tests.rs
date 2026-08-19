@@ -3133,7 +3133,11 @@ async fn websocket_publish_rate_limit_rejects_messages_without_closing_socket() 
     let address = spawn_app_with(
         BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
         BrokerHardeningConfig {
+            // This peer joins as a relay, so it is the relay budget that has to be
+            // squeezed to provoke the limit — surfaces and relays have separate
+            // allowances (see `DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE`).
             publish_rate_limit_per_minute: 1,
+            relay_publish_rate_limit_per_minute: 1,
             ..BrokerHardeningConfig::default()
         },
         SecurityHeadersConfig::default(),
@@ -4266,4 +4270,114 @@ async fn admin_stats_requires_valid_token_and_returns_stats() {
             .any(|r| r["relay_id"] == serde_json::json!(enrolled.relay_id)),
         "the enrolled relay must appear in the stats rows"
     );
+}
+
+/// A relay publishing at the cadence it is *designed* for must not be throttled.
+///
+/// The relay's own constants put it well past the shared 240/minute allowance:
+/// `TRANSCRIPT_DELTA_PUBLISH_WINDOW_MILLIS = 100` is up to 10 publishes a second during
+/// streaming, plus up to 2 snapshots a second, plus a chunked action reply's 4 a second.
+/// The allowance is 4 a second in total.
+///
+/// Exceeding it is not a soft failure: the broker drops the frame and keeps the socket
+/// open, and the relay only slows its *snapshots* in response — transcript deltas keep
+/// being sent and keep being discarded. A client then waits on content that was thrown
+/// away. Chunked action replies are worse, because a client resolves one only after
+/// every chunk lands, so a single dropped chunk costs it the full 15-second timeout.
+///
+/// The allowance exists to stop an abusive peer, and a relay is a first-party peer whose
+/// legitimate traffic is an order of magnitude above a surface's. So the two get
+/// separate budgets rather than the relay being squeezed into the surface's.
+#[tokio::test]
+async fn a_relays_designed_publish_cadence_is_not_rate_limited() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay socket should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    let publish_frame = serde_json::to_string(&ClientMessage::Publish {
+        protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+        payload: json!({"ciphertext":"abc"}),
+    })
+    .expect("client frame should serialize");
+
+    // Comfortably past the surface allowance, and still under a minute of the relay's
+    // real streaming rate.
+    for _ in 0..300 {
+        relay
+            .send(Message::Text(publish_frame.clone()))
+            .await
+            .expect("publish should send");
+    }
+
+    // Nobody else is in the room, so the only thing that can come back is an error.
+    let unexpected = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        next_server_message(&mut relay),
+    )
+    .await;
+    assert!(
+        unexpected.is_err(),
+        "the relay was rate limited at its own designed cadence: {unexpected:?}. The \
+         broker drops those frames silently, so this is lost transcript content and \
+         chunked replies the client can only time out on."
+    );
+}
+
+/// …and a surface is still held to the tighter budget, so the split above is a
+/// separation of concerns rather than a way to switch the protection off.
+#[tokio::test]
+async fn a_surface_is_still_held_to_the_tighter_publish_budget() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            publish_rate_limit_per_minute: 2,
+            ..BrokerHardeningConfig::default()
+        },
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let surface_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::device_surface_join("room-a", "device-1", None),
+    );
+
+    let (mut surface, _) = connect_async(&surface_url)
+        .await
+        .expect("surface socket should connect");
+    let _welcome = next_server_message(&mut surface).await;
+
+    let publish_frame = serde_json::to_string(&ClientMessage::Publish {
+        protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+        payload: json!({"ciphertext":"abc"}),
+    })
+    .expect("client frame should serialize");
+    for _ in 0..4 {
+        surface
+            .send(Message::Text(publish_frame.clone()))
+            .await
+            .expect("publish should send");
+    }
+
+    match next_server_message(&mut surface).await {
+        ServerMessage::Error { code, .. } => assert_eq!(code, "rate_limited"),
+        other => panic!("a surface over its budget must still be limited, got {other:?}"),
+    }
 }

@@ -24,6 +24,14 @@ impl SecurityProfile {
         Self::for_mode(SecurityMode::Private)
     }
 
+    /// Managed mode, where the broker may read content and surfaces speak plaintext
+    /// remote actions. Used by the broker session integration test, which needs to
+    /// build action frames by hand.
+    #[cfg(test)]
+    pub(crate) fn managed() -> Self {
+        Self::for_mode(SecurityMode::Managed)
+    }
+
     pub(crate) fn mode(self) -> SecurityMode {
         self.mode
     }

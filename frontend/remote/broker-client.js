@@ -722,6 +722,23 @@ function logInboundBrokerMessage(frame) {
   if (isHighVolumeBrokerPayloadKind(kind) && !isVerboseBrokerLoggingEnabled()) {
     return;
   }
+  // This runs BEFORE anything knows whether the frame is ours, and the broker
+  // broadcasts every remote action result and session snapshot to the whole room
+  // (see `must_not_be_broadcast` in crates/relay-broker/src/state.rs). `renderLog`
+  // is a `patchRemoteState`, so logging an unaddressed frame here bought a full
+  // RemoteApp re-render for something the next filter throws away — a dozen of them
+  // per chunked `fetch_workspace_diff` belonging to some other surface.
+  //
+  // Frames with no `target_peer_id` are genuinely for everyone (presence, relay
+  // status) and still log. Only another surface's mail goes quiet, and the verbose
+  // flag brings it back for anyone debugging broker routing.
+  if (
+    payload.target_peer_id
+    && payload.target_peer_id !== state.socketPeerId
+    && !isVerboseBrokerLoggingEnabled()
+  ) {
+    return;
+  }
   const message = `[broker-inbound] from=${frame.from_peer_id || "-"} role=${frame.from_role || "-"} kind=${kind} target=${payload.target_peer_id || "-"} device=${payload.device_id || "-"} socket=${state.socketPeerId || "-"} localDevice=${state.remoteAuth?.deviceId || "-"}`;
   renderLog(message);
   // TODO(remote-monitor-debug): Remove this console mirror once broker routing is stable.

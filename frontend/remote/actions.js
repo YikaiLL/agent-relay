@@ -373,7 +373,20 @@ async function handleEncryptedRemoteActionResultChunk(payload) {
 }
 
 function logIgnoredEncryptedPayload(kind, payload) {
-  if (isHighVolumeEncryptedPayloadKind(kind) && !isVerboseBrokerLoggingEnabled()) {
+  // Discarding a frame must be FREE. The broker broadcasts remote action results
+  // and session snapshots to every peer in the room and leaves the filtering to
+  // each surface (`must_not_be_broadcast` in crates/relay-broker/src/state.rs lists
+  // only `encrypted_pairing_result`), so every surface sees every other surface's
+  // traffic. `renderLog` is a `patchRemoteState`, which notifies the store behind
+  // `useSyncExternalStore` — so logging here cost one full RemoteApp re-render per
+  // frame we then threw away. A real boot trace showed 21 of them, all chunks of
+  // another surface's `fetch_workspace_diff`, arriving before the first frame
+  // addressed to this surface.
+  //
+  // The gate is now the whole function, not just the high-volume kinds: a frame
+  // that is not for us is by definition not this surface's business, and anyone
+  // debugging broker routing turns on `window.__agentRelayVerboseBrokerLogs`.
+  if (!isVerboseBrokerLoggingEnabled()) {
     return;
   }
   const peerMatches = payload.target_peer_id === state.socketPeerId;
