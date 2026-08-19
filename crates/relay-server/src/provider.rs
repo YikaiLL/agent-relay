@@ -125,6 +125,21 @@ pub trait ProviderBridge: Send + Sync {
     fn fork_capability(&self) -> ProviderForkCapability {
         ProviderForkCapability::REPLAY_ONLY
     }
+
+    /// Must agree with `archive_thread`, which is why the default is `false`:
+    /// there is no default archive to inherit, so a bridge that has not written
+    /// one cannot have it advertised on its behalf.
+    ///
+    /// Archive is genuinely rare — Codex has a `thread/archive` RPC, ACP has no
+    /// archive method at all, and Claude's bridge refuses. The relay has no
+    /// stand-in to offer either: "archive" here means removing the thread from
+    /// local history, and dropping the row without the provider forgetting it
+    /// just means the next `list_threads` fetches it straight back. Surfaces
+    /// gate the affordance on this rather than offering a control that reports
+    /// success and changes nothing.
+    fn supports_archive(&self) -> bool {
+        false
+    }
     async fn resume_thread(
         &self,
         thread_id: &str,

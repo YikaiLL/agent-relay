@@ -251,6 +251,28 @@ pub(crate) fn fork_capability_views(
     views
 }
 
+/// Archive capability, derived at construction for the same reason fork's is:
+/// it is a property of which bridges exist, not of any session. A path that
+/// forgets to seed it publishes an empty list — and since a provider missing
+/// from the list is read as "no evidence it cannot archive", that degrades to
+/// today's behaviour (the action offered) rather than to a silently missing
+/// control.
+pub(crate) fn archive_capability_views(
+    providers: &HashMap<String, Arc<dyn ProviderBridge>>,
+) -> Vec<crate::protocol::ProviderArchiveCapabilityView> {
+    let mut views = providers
+        .iter()
+        .map(
+            |(name, bridge)| crate::protocol::ProviderArchiveCapabilityView {
+                provider: name.clone(),
+                native_archive: bridge.supports_archive(),
+            },
+        )
+        .collect::<Vec<_>>();
+    views.sort_by(|a, b| a.provider.cmp(&b.provider));
+    views
+}
+
 /// Test-only: build a status base from an already-spawned providers map (every
 /// entry `spawn_error: None`). Real `AppState::new` gets its base straight from
 /// `spawn_providers`, which is the only path that also knows about *failed*
@@ -291,6 +313,7 @@ impl AppState {
     ) -> Self {
         if let Ok(mut state) = relay.try_write() {
             state.set_provider_fork_capabilities(fork_capability_views(&providers));
+            state.set_provider_archive_capabilities(archive_capability_views(&providers));
             state.set_provider_status_base(provider_status_base_from_map(&providers));
         }
 
@@ -432,6 +455,7 @@ impl AppState {
                 format!("Agent providers initialized: {:?}", provider_names),
             );
             relay.set_provider_fork_capabilities(fork_capability_views(&providers));
+            relay.set_provider_archive_capabilities(archive_capability_views(&providers));
             relay.set_provider_status_base(provider_status_base);
             relay.notify();
         }

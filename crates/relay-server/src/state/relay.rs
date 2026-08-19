@@ -294,6 +294,10 @@ pub struct RelayState {
     /// snapshot so both surfaces learn fork capability through the channel they
     /// already consume, instead of inferring it from provider names.
     pub(super) provider_fork_capabilities: Vec<crate::protocol::ProviderForkCapabilityView>,
+    /// Same shape and lifetime as `provider_fork_capabilities`, for archive:
+    /// most bridges have no archive at all, and a surface that guesses from the
+    /// provider name offers a control that silently changes nothing.
+    pub(super) provider_archive_capabilities: Vec<crate::protocol::ProviderArchiveCapabilityView>,
     /// Static per-provider identity + spawn outcome, one entry per configured
     /// provider (in configured order). Combined with `provider_connections` at
     /// snapshot time to derive the live `provider_status` panel — including
@@ -490,6 +494,7 @@ impl RelayState {
             thread_forked_from: HashMap::new(),
             thread_promoted_from: HashMap::new(),
             provider_fork_capabilities: Vec::new(),
+            provider_archive_capabilities: Vec::new(),
             provider_status_base: Vec::new(),
             thread_last_activity_at: HashMap::new(),
             projects: HashMap::new(),
@@ -2739,6 +2744,7 @@ impl RelayState {
 
         SessionSnapshot {
             provider_fork_capabilities: self.provider_fork_capabilities.clone(),
+            provider_archive_capabilities: self.provider_archive_capabilities.clone(),
             provider_status: self.provider_status_view(),
             revision: self.revision,
             transcript_revision,
@@ -3376,6 +3382,13 @@ impl RelayState {
         self.provider_fork_capabilities = capabilities;
     }
 
+    pub fn set_provider_archive_capabilities(
+        &mut self,
+        capabilities: Vec<crate::protocol::ProviderArchiveCapabilityView>,
+    ) {
+        self.provider_archive_capabilities = capabilities;
+    }
+
     pub fn set_provider_status_base(&mut self, base: Vec<crate::provider::ProviderStatusBase>) {
         self.provider_status_base = base;
     }
@@ -3484,8 +3497,12 @@ impl RelayState {
             .is_some_and(ThreadRuntime::has_live_turn)
             || (is_active && self.active_thread_has_live_turn());
         if running {
+            // No provider name: this is reached by every provider, and naming
+            // one tells most users their session is held by an agent they are
+            // not running. (The `cannot archive` prefix is load-bearing — the
+            // HTTP handler keys the 400-vs-502 split on it.)
             return Err(
-                "cannot archive the active session while Codex is still running".to_string(),
+                "cannot archive the active session while the agent is still running".to_string(),
             );
         }
 
@@ -3500,8 +3517,10 @@ impl RelayState {
             .is_some_and(ThreadRuntime::has_live_turn)
             || (is_active && self.active_thread_has_live_turn());
         if running {
+            // Same reasoning as `can_archive_thread` above, and the
+            // `cannot permanently delete` prefix is load-bearing the same way.
             return Err(
-                "cannot permanently delete the active session while Codex is still running"
+                "cannot permanently delete the active session while the agent is still running"
                     .to_string(),
             );
         }

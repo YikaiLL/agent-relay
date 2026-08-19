@@ -619,6 +619,12 @@ impl ProviderBridge for FakeProviderBridge {
         }))
     }
 
+    // The test double stands in for a provider that CAN archive (Codex), so the
+    // archive paths stay exercisable without a real one.
+    fn supports_archive(&self) -> bool {
+        true
+    }
+
     async fn archive_thread(&self, thread_id: &str) -> Result<(), String> {
         self.threads.lock().await.remove(thread_id);
         Ok(())

@@ -201,6 +201,8 @@ import {
   resolveForkSourceThread,
   threadIsBusyForFork,
 } from "./shared/fork-fields.js";
+import { providerSupportsArchive } from "./shared/thread-actions-model.js";
+import { reportDestructiveActionFailure } from "./shared/destructive-action-failure.js";
 import {
   buildReviewingThreadSet,
   isReviewInProgressForThread,
@@ -3741,16 +3743,35 @@ function openThreadContextMenu(threadId, clientX, clientY) {
   const isActive = state.session?.active_thread_id === threadId;
   const isRunningActiveSession =
     isActive && Boolean(state.session?.active_turn_id);
+  const contextThread = resolveActiveThread(threadId);
   if (forkThreadButton) {
     // Background threads can be mid-turn too, and the relay rejects those as
     // well — gate on the same rule the server uses, not just "is active".
-    const contextThread = resolveActiveThread(threadId);
     const forkBlocked = threadIsBusy(contextThread);
     forkThreadButton.disabled = forkBlocked;
     forkThreadButton.textContent = forkBlocked
       ? "Running session cannot be forked"
       : "Fork session";
   }
+  // Hidden, not disabled: a provider without an archive will never grow one at
+  // runtime, so there is nothing for the user to wait for. (Disabled is for
+  // "momentarily unavailable", which is what the running-session case below is.)
+  // Cursor is why this exists — ACP has no archive method, so the action used to
+  // report success and hand the session back on the very next list.
+  //
+  // `resolveActiveThread` misses the active session when history has not loaded
+  // or pagination left it out, so fall back to the snapshot's own provider
+  // before giving up. An unresolved provider leaves the action ALONE rather than
+  // hiding it: this decides whether a control exists, and guessing "no" would
+  // make a working Codex archive vanish on a slow list.
+  const contextProvider =
+    contextThread?.provider || (isActive ? state.session?.provider : "") || "";
+  archiveThreadButton.hidden =
+    Boolean(contextProvider)
+    && !providerSupportsArchive({
+      provider: contextProvider,
+      capabilities: state.session?.provider_archive_capabilities || [],
+    });
   archiveThreadButton.disabled = isRunningActiveSession;
   archiveThreadButton.textContent = isRunningActiveSession
     ? "Running session cannot be archived"
@@ -3975,7 +3996,16 @@ async function archiveThreadFromContextMenu() {
     await loadThreads("post-archive refresh");
     logLine(payload.data?.message || `Archived local session ${shortId(threadId)}.`);
   } catch (error) {
-    logLine(`Failed to archive local session: ${error.message}`);
+    // Both channels: the log for the record, a modal so the user sees it. A
+    // refused archive leaves the row exactly where it was, which is
+    // indistinguishable from the button doing nothing.
+    reportDestructiveActionFailure({
+      action: "archive",
+      title,
+      error,
+      log: logLine,
+      notify: (message) => window.alert(message),
+    });
   }
 }
 
@@ -4050,7 +4080,17 @@ async function deleteThreadFromContextMenu() {
     await loadSession("post-delete refresh");
     logLine(payload.data?.message || `Deleted local session ${shortId(threadId)} permanently.`);
   } catch (error) {
-    logLine(`Failed to permanently delete local session: ${error.message}`);
+    // See the archive path above. This matters more now that delete really
+    // deletes: it has genuine failure modes (directory already gone, a
+    // permissions error, a session held by a running turn) where it previously
+    // had exactly one, constant, one.
+    reportDestructiveActionFailure({
+      action: "delete",
+      title,
+      error,
+      log: logLine,
+      notify: (message) => window.alert(message),
+    });
   }
 }
 

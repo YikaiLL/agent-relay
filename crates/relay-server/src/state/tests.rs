@@ -256,6 +256,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         ok,
         snapshot: Some(SessionSnapshot {
             provider_fork_capabilities: Vec::new(),
+            provider_archive_capabilities: Vec::new(),
             provider_status: Vec::new(),
             revision: 7,
             transcript_revision: 3,
@@ -3269,7 +3270,19 @@ fn active_running_thread_cannot_be_archived() {
         .can_archive_thread("thread-1")
         .expect_err("running active thread should not be archivable");
 
-    assert!(error.contains("Codex is still running"));
+    // The `cannot archive` prefix is what the HTTP handler keys its 400-vs-502
+    // split on, so it is part of the contract rather than prose.
+    assert!(
+        error.starts_with("cannot archive"),
+        "the refusal must stay classifiable as a bad request, got: {error}"
+    );
+    assert!(error.contains("still running"));
+    // Every provider reaches this guard, so naming one would tell most users
+    // their session is held by an agent they are not running.
+    assert!(
+        !error.contains("Codex"),
+        "the refusal must not name one vendor, got: {error}"
+    );
     assert_eq!(relay.threads.len(), 1);
     assert_eq!(relay.threads[0].id, "thread-1");
 }
@@ -3302,7 +3315,17 @@ fn active_running_thread_cannot_be_deleted() {
         .can_delete_thread("thread-1")
         .expect_err("running active thread should not be deletable");
 
-    assert!(error.contains("Codex is still running"));
+    // Same contract as the archive guard above: the prefix drives the status
+    // code, and the message must not name a vendor every provider is not.
+    assert!(
+        error.starts_with("cannot permanently delete"),
+        "the refusal must stay classifiable as a bad request, got: {error}"
+    );
+    assert!(error.contains("still running"));
+    assert!(
+        !error.contains("Codex"),
+        "the refusal must not name one vendor, got: {error}"
+    );
     assert_eq!(relay.threads.len(), 1);
     assert_eq!(relay.threads[0].id, "thread-1");
 }

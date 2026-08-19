@@ -2,7 +2,10 @@
 //
 // Read-only on purpose: it never sends a prompt, so it costs no tokens and can
 // be run on any machine that has `cursor-agent` installed and logged in. With no
-// local Cursor sessions it skips rather than fails.
+// local Cursor sessions it skips rather than fails. It runs against the user's
+// REAL sessions, so nothing here may be destructive — deleting a session is
+// covered by `npm run test:cursor:delete`, which clones a throwaway one into an
+// isolated `CURSOR_CONFIG_DIR` first.
 //
 // What it is actually pinning — the things that are expensive to get wrong:
 //   * the bridge reaches `connected` (spawn → initialize → authenticate)
@@ -132,11 +135,30 @@ async function main() {
         models: models.length,
       };
 
-      const deletePayload = await postEnvelope(
+      // Archive, not delete. ACP has no archive method and the bridge refuses,
+      // so this is safe to fire at one of the user's real sessions — it is the
+      // check that the refusal is still a refusal, and that the relay has not
+      // gone back to reporting the success it used to (drop the row, then hand
+      // the same session back on the very next `session/list`).
+      //
+      // Delete is deliberately NOT exercised here. It is real now, and it works
+      // on the local Cursor store — firing it at a real session from a
+      // "read-only on purpose" test would destroy the user's data. It has its
+      // own hermetic test against a throwaway clone in an isolated
+      // `CURSOR_CONFIG_DIR`: `npm run test:cursor:delete`.
+      const archivePayload = await postEnvelope(
         first.port,
-        `/api/threads/${encodeURIComponent(thread.id)}/delete`
+        `/api/threads/${encodeURIComponent(thread.id)}/archive`
       );
-      assert.equal(deletePayload.ok, false, "cursor delete should report as unsupported");
+      assert.equal(archivePayload.ok, false, "cursor archive should report as unsupported");
+      // The reason, not just the failure. `ok === false` alone would still pass
+      // if archive started failing for an unrelated cause (a routing error, a
+      // busy session), which would quietly stop testing the thing this asserts.
+      assert.match(
+        archivePayload.error?.message || "",
+        /does not support archiving/i,
+        `archive must fail AS unsupported: ${archivePayload.error?.message}`
+      );
     } finally {
       await stopManagedProcess(first.relay);
     }
