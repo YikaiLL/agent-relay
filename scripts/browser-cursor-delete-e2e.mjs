@@ -28,6 +28,7 @@ import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { launchBrowser } from "./e2e/harness/browser.mjs";
+import { openSessionsDrawer } from "./e2e/harness/drawer.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
@@ -225,20 +226,13 @@ async function waitForAlert(state, timeoutMs = TIMEOUT_MS) {
   throw new Error("timed out waiting for a visible failure notice (none was shown)");
 }
 
-/// The sessions list lives in a collapsed `<details>` drawer off the
-/// conversation view (same helper as browser-local-search-filter-e2e).
-async function openDrawer(page) {
-  await page.evaluate(() => {
-    const drawer = document.querySelector(".sidebar-drawer");
-    if (drawer && !drawer.open) {
-      drawer.open = true;
-      drawer.dispatchEvent(new Event("toggle"));
-    }
-  });
-}
-
 async function waitForVisibleThreadRow(page, threadId) {
-  await openDrawer(page);
+  // The sessions list lives in a collapsed `<details>` drawer off the
+  // conversation view. Use the shared helper, NOT a direct `.open` assignment:
+  // the open state is owned by the thread-list store, so setting the property
+  // opens the element while the store still thinks it is shut and the next
+  // render closes it again — see scripts/e2e/harness/drawer.mjs.
+  await openSessionsDrawer(page, { timeoutMs: TIMEOUT_MS });
   const row = page.locator(`#threads-list [data-thread-id="${threadId}"]`).first();
   await row.waitFor({ state: "visible", timeout: TIMEOUT_MS });
   await row.scrollIntoViewIfNeeded({ timeout: TIMEOUT_MS });
