@@ -67,6 +67,24 @@ const NOW_QUEUE_CAPACITY: usize = 512;
 /// a queue.
 const TRAIN_QUEUE_CAPACITY: usize = 1;
 
+/// How many frames the writer will emit in any 60-second window.
+///
+/// The broker enforces its own allowance per peer and, when a peer goes over, it
+/// **drops the frame and keeps the socket open** — see the `rate_limited` branch in
+/// `crates/relay-broker/src/lib.rs`. Nothing about that is recoverable from here: a
+/// dropped transcript delta is content the client never learns about, and a dropped
+/// chunk costs the client its whole 15-second action timeout, because a chunked reply
+/// resolves only once every chunk has landed.
+///
+/// So the relay paces itself instead of finding out the hard way. This sits below
+/// `DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE` (1200) to leave room for the two
+/// windows disagreeing at their edges, and comfortably above what the relay actually
+/// needs at full tilt: 10 transcript deltas + 2 snapshots + 4 chunks a second is ~960 a
+/// minute. Waiting here should therefore be rare; when it does happen, a slightly late
+/// frame beats a silently discarded one.
+const OUTBOUND_RATE_LIMIT_PER_MINUTE: usize = 1_100;
+const OUTBOUND_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
 /// A single frame taking longer than this to reach the socket means the connection is
 /// congested. Previously warned per chunk from the action path; it belongs here now,
 /// where the actual write happens.
@@ -257,6 +275,9 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
     // is the orderly path, not the guarantee.
     let mut now_closed = false;
     let mut train_closed = false;
+    // Send times inside the current window, oldest first. Mirrors the broker's own
+    // sliding window so the two agree about what "a minute" means.
+    let mut recent_sends: VecDeque<Instant> = VecDeque::new();
 
     loop {
         // 1. A train chunk that is already due. This is the ONLY place a chunk is
@@ -280,6 +301,7 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
                 }
             }
             if let Some(chunk) = train.pop_front() {
+                await_outbound_allowance(&mut recent_sends).await;
                 sink.send_frame(chunk).await?;
             }
             next_chunk_at = advance_train(&train, train_interval);
@@ -290,6 +312,7 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
         //    during the pacing gap instead of queueing behind every chunk.
         match now_rx.try_recv() {
             Ok(message) => {
+                await_outbound_allowance(&mut recent_sends).await;
                 sink.send_frame(message).await?;
                 continue;
             }
@@ -327,7 +350,10 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
             tokio::select! {
                 biased;
                 received = now_rx.recv() => match received {
-                    Some(message) => sink.send_frame(message).await?,
+                    Some(message) => {
+                        await_outbound_allowance(&mut recent_sends).await;
+                        sink.send_frame(message).await?;
+                    }
                     None => now_closed = true,
                 },
                 () = sleep_until(deadline) => {}
@@ -354,7 +380,10 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
         }
         if train_closed {
             match now_rx.recv().await {
-                Some(message) => sink.send_frame(message).await?,
+                Some(message) => {
+                    await_outbound_allowance(&mut recent_sends).await;
+                    sink.send_frame(message).await?;
+                }
                 None => return Ok(()),
             }
             continue;
@@ -362,7 +391,10 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
 
         tokio::select! {
             received = now_rx.recv() => match received {
-                Some(message) => sink.send_frame(message).await?,
+                Some(message) => {
+                    await_outbound_allowance(&mut recent_sends).await;
+                    sink.send_frame(message).await?;
+                }
                 None => now_closed = true,
             },
             received = train_rx.recv() => match received {
@@ -376,6 +408,31 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
                 None => train_closed = true,
             },
         }
+    }
+}
+
+/// Hold until sending one more frame keeps the last 60 seconds inside the allowance,
+/// then record the send.
+async fn await_outbound_allowance(recent_sends: &mut VecDeque<Instant>) {
+    loop {
+        let now = Instant::now();
+        while recent_sends
+            .front()
+            .is_some_and(|sent_at| now.duration_since(*sent_at) >= OUTBOUND_RATE_LIMIT_WINDOW)
+        {
+            recent_sends.pop_front();
+        }
+        if recent_sends.len() < OUTBOUND_RATE_LIMIT_PER_MINUTE {
+            recent_sends.push_back(now);
+            return;
+        }
+        // Full: wait for the oldest send to age out of the window.
+        let oldest = *recent_sends.front().expect("the window is full");
+        warn!(
+            queued_in_window = recent_sends.len(),
+            "holding a broker frame to stay inside the publish allowance"
+        );
+        sleep_until(oldest + OUTBOUND_RATE_LIMIT_WINDOW).await;
     }
 }
 

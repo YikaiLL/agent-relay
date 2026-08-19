@@ -410,3 +410,53 @@ async fn a_saturated_train_queue_reports_busy_instead_of_parking_the_caller() {
          park the relay's only reader until the queue drains"
     );
 }
+
+/// The relay must not out-run the broker's publish allowance.
+///
+/// Going over is silent: the broker drops the frame and keeps the socket open
+/// (`crates/relay-broker/src/lib.rs`, the `rate_limited` branch `continue`s). A dropped
+/// transcript delta is lost content; a dropped chunk costs the client its full
+/// 15-second timeout, because a chunked reply resolves only once every chunk lands.
+/// Neither is recoverable, and neither is visible.
+///
+/// The writer is now the single point every outbound frame passes through, which makes
+/// it the only place this can be enforced. Slowing down is always recoverable; being
+/// silently discarded is not.
+#[tokio::test(start_paused = true)]
+async fn the_writer_stays_under_the_brokers_publish_allowance() {
+    let (written, sink) = recorder();
+    let (now_tx, now_rx) = mpsc::channel(4096);
+    let (_train_tx, train_rx) = mpsc::channel(1);
+    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, always_online()));
+
+    let started_at = Instant::now();
+    for index in 0..(OUTBOUND_RATE_LIMIT_PER_MINUTE + 20) {
+        now_tx
+            .send(text(&format!("frame-{index}")))
+            .await
+            .expect("frame should queue");
+    }
+
+    // Let the writer run as far as its own limiter allows within the window.
+    tokio::time::sleep(Duration::from_secs(59)).await;
+    let within_window = written.lock().unwrap().len();
+    assert!(
+        within_window <= OUTBOUND_RATE_LIMIT_PER_MINUTE,
+        "wrote {within_window} frames inside one 60s window, over the {OUTBOUND_RATE_LIMIT_PER_MINUTE} \
+         budget — the broker would have silently dropped the excess"
+    );
+
+    // And the surplus is delayed, not dropped: it goes out once the window rolls.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after_window = written.lock().unwrap().len();
+    assert!(
+        after_window > within_window,
+        "the frames held back by the limiter must still be sent once there is room; \
+         held {within_window}, then {after_window}"
+    );
+    let _ = started_at;
+
+    drop(now_tx);
+    drop(_train_tx);
+    let _ = writer.await;
+}
