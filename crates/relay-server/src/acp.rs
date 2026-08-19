@@ -1354,19 +1354,34 @@ impl ProviderBridge for AcpBridge {
     }
 
     async fn archive_thread(&self, _thread_id: &str) -> Result<(), String> {
-        // No ACP method. Claude's bridge is a no-op here too — the relay hides
-        // the thread on its own side.
-        Ok(())
-    }
-
-    async fn delete_thread_permanently(
-        &self,
-        _thread_id: &str,
-    ) -> Result<LocalThreadDeleteSummary, String> {
+        // No ACP method, and no relay-side stand-in either. This used to answer
+        // `Ok(())` on the theory that the relay hides the thread on its own
+        // side, but archive only drops the row from the in-memory list — the
+        // very next `session/list` handed it straight back, so the user got a
+        // "Session archived" message next to a session that had not moved.
+        // Refusing is what `supports_archive` reports, and the surfaces gate on
+        // that; this is the backstop for a caller that asks anyway.
         Err(format!(
-            "{} does not support deleting sessions over ACP",
+            "{} does not support archiving sessions",
             self.display_name
         ))
+    }
+
+    /// ACP itself has no delete, so this goes to the vendor's local store —
+    /// see [`crate::acp_local`]. Blocking file I/O, so it is handed to the
+    /// blocking pool the same way Codex's local delete is.
+    async fn delete_thread_permanently(
+        &self,
+        thread_id: &str,
+    ) -> Result<LocalThreadDeleteSummary, String> {
+        let provider_name = self.provider_name;
+        let display_name = self.display_name;
+        let thread_id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::acp_local::delete_thread_permanently(provider_name, display_name, &thread_id)
+        })
+        .await
+        .map_err(|error| format!("local ACP session delete task failed: {error}"))?
     }
 
     async fn start_turn(

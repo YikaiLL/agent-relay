@@ -1,4 +1,5 @@
 mod acp;
+mod acp_local;
 mod auth;
 mod broker;
 mod claude;

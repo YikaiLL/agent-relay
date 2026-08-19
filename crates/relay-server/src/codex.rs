@@ -113,6 +113,12 @@ impl ProviderBridge for CodexBridge {
         ProviderForkCapability::NATIVE_TIP_ONLY
     }
 
+    // `thread/archive` is a real app-server method: Codex moves the rollout into
+    // `archived_sessions`, so the thread stops coming back from `list_threads`.
+    fn supports_archive(&self) -> bool {
+        true
+    }
+
     async fn resume_thread(
         &self,
         thread_id: &str,

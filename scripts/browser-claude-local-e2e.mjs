@@ -166,26 +166,34 @@ async function main() {
     );
     await page.click("#delete-thread-button");
 
-    page.once("dialog", (dialog) => dialog.accept());
+    // Archive is NOT offered for Claude: its bridge has no archive, and the relay
+    // has no stand-in — "archive" means dropping the thread from local history,
+    // which without the provider forgetting it just means the next list fetches
+    // it back. This used to be an enabled button whose only effect was a line in
+    // #client-log that nobody has open, i.e. a control that looked broken. The
+    // menu now gates on the relay's `provider_archive_capabilities`.
     await renderedThread.click({ button: "right" });
     await page.waitForFunction(
-      () => {
-        const menu = document.querySelector("#thread-context-menu");
-        const button = document.querySelector("#archive-thread-button");
-        return Boolean(menu && !menu.hidden && button && !button.disabled);
-      },
+      () => document.querySelector("#thread-context-menu")?.hidden === false,
       null,
       { timeout: LOCAL_TIMEOUT_MS }
     );
-    await page.click("#archive-thread-button");
-    await page.waitForFunction(
-      () => {
-        const log = document.querySelector("#client-log")?.textContent || "";
-        return /Failed to archive local session: .*archive is not supported/i.test(log);
-      },
-      null,
-      { timeout: LOCAL_TIMEOUT_MS }
+    const archiveOffered = await page.evaluate(
+      () => document.querySelector("#archive-thread-button")?.hidden === false
     );
+    assert.equal(archiveOffered, false, "Claude Code must not offer archive: its bridge has none");
+    // Fork and rename are still there, so this is the archive row being gated —
+    // not the menu failing to populate.
+    const stillOffered = await page.evaluate(() => ({
+      fork: document.querySelector("#fork-thread-button")?.hidden === false,
+      rename: document.querySelector("#rename-thread-button")?.hidden === false,
+    }));
+    assert.deepEqual(
+      stillOffered,
+      { fork: true, rename: true },
+      "the rest of the session menu must still be offered"
+    );
+    await page.keyboard.press("Escape");
 
     const relaySession = await fetchEnvelope(relayPort, "/api/session");
     assert.equal(relaySession.data?.provider, "claude_code");

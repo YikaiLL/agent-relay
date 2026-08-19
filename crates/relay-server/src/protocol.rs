@@ -87,6 +87,11 @@ pub struct SessionSnapshot {
     /// through the channel they already consume (no extra remote action).
     #[serde(default)]
     pub provider_fork_capabilities: Vec<ProviderForkCapabilityView>,
+    /// Which providers can archive. Static per relay process and carried for the
+    /// same reason as `provider_fork_capabilities`: the surfaces have to gate the
+    /// affordance on what the bridge does, not on the provider's name.
+    #[serde(default)]
+    pub provider_archive_capabilities: Vec<ProviderArchiveCapabilityView>,
     /// Per-provider health (incl. providers that failed to spawn). Rides the
     /// snapshot for the same reason as `provider_fork_capabilities`, but its
     /// `status`/`connected` are recomputed live so drops/reconnects stream.
@@ -2055,6 +2060,20 @@ pub struct ProviderForkCapabilityView {
     /// The native fork accepts a branch point. Codex `thread/fork` is tip-only;
     /// the Claude SDK takes `upToMessageId`.
     pub native_fork_at_message: bool,
+}
+
+/// Whether a provider's bridge can archive a thread at all. Same reasoning as
+/// `ProviderForkCapabilityView`: inferring it from provider NAMES is how a
+/// surface ends up offering an action that cannot happen. Cursor is the case
+/// that forced this — ACP has no archive method, so the control reported
+/// success and the session came straight back on the next list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderArchiveCapabilityView {
+    pub provider: String,
+    /// The bridge implements a real `archive_thread` (vs. refusing). There is no
+    /// relay-side fallback: without the provider forgetting the thread, dropping
+    /// the row just means the next list fetches it back.
+    pub native_archive: bool,
 }
 
 /// Health of a single *configured* provider, derived live at snapshot time.

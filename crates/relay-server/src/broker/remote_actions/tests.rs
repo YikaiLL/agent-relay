@@ -8,6 +8,7 @@ use crate::protocol::{
 fn make_snapshot() -> SessionSnapshot {
     SessionSnapshot {
         provider_fork_capabilities: Vec::new(),
+        provider_archive_capabilities: Vec::new(),
         provider_status: Vec::new(),
         revision: 7,
         transcript_revision: 3,
