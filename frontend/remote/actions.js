@@ -540,7 +540,7 @@ function handleRemoteActionResultChunk(actionId, chunk) {
     chunkIndex < 0 ||
     chunkCount <= 0 ||
     chunkIndex >= chunkCount ||
-    typeof chunk?.data_base64 !== "string"
+    typeof chunk?.data !== "string"
   ) {
     rejectPendingAction(actionId, new Error("remote action chunk is malformed"));
     return;
@@ -566,7 +566,7 @@ function handleRemoteActionResultChunk(actionId, chunk) {
   if (advancedTransfer) {
     pendingChunks.receivedCount += 1;
   }
-  pendingChunks.chunks[chunkIndex] = chunk.data_base64;
+  pendingChunks.chunks[chunkIndex] = chunk.data;
   // A chunk that ADVANCES the transfer is proof the relay is alive and still working on
   // this reply, so the deadline restarts. A repeat of one already held is not: renewing
   // on those would hand a stalled action an unlimited lease, kept alive forever by a
@@ -593,30 +593,21 @@ function handleRemoteActionResultChunk(actionId, chunk) {
   }
 }
 
+// Chunks are text slices of the serialized result, split on character boundaries by the
+// relay, so reassembly is plain concatenation. They used to be base64 of byte slices,
+// which cost a whole extra 4/3 expansion on the wire — on top of the base64 the encrypted
+// transport already applies to the ciphertext — for an encoding the payload never needed:
+// what is being chunked is JSON text to begin with.
 function reassembleRemoteActionResultChunks(chunks) {
-  const parts = chunks.map((chunk, index) => {
+  let serialized = "";
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
     if (typeof chunk !== "string") {
       throw new Error(`remote action result chunk ${index + 1} is missing`);
     }
-    return decodeBase64ToBytes(chunk);
-  });
-  const totalBytes = parts.reduce((sum, part) => sum + part.length, 0);
-  const bytes = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const part of parts) {
-    bytes.set(part, offset);
-    offset += part.length;
+    serialized += chunk;
   }
-  return JSON.parse(new TextDecoder().decode(bytes));
-}
-
-function decodeBase64ToBytes(value) {
-  const binary = window.atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
+  return JSON.parse(serialized);
 }
 
 function clearPendingActionChunks(actionId) {

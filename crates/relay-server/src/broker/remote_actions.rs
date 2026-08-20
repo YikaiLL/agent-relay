@@ -33,8 +33,14 @@ use super::{
 
 const SESSION_CONTROL_REQUIRED_ERROR: &str =
     "broker transport auth only grants room access; session claim is missing or expired";
-const REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES: usize = 32_768;
-const REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES: usize = 1_024;
+/// Target size of one chunk, in **characters** of the serialized JSON.
+///
+/// Characters, not bytes, because a chunk now travels as JSON text rather than base64 —
+/// see `split_on_char_boundaries`. For ASCII content (the overwhelming majority of a
+/// transcript) the two are the same, and the resulting frame is ~25% smaller than the
+/// old double-base64 encoding produced.
+const REMOTE_ACTION_RESULT_CHUNK_TARGET_CHARS: usize = 32_768;
+const REMOTE_ACTION_RESULT_CHUNK_MIN_CHARS: usize = 1_024;
 /// Gap between chunks of one reply.
 ///
 /// This used to be 250ms, chosen when every peer shared a 4-publishes-a-second budget.
@@ -43,7 +49,7 @@ const REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES: usize = 1_024;
 /// could never arrive at all. Relays now have their own, far larger allowance, and the
 /// writer interleaves ordinary traffic into these gaps rather than being blocked by
 /// them, so the gap only needs to be big enough to stay interleavable.
-const REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS: u64 = 50;
+pub(super) const REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS: u64 = 50;
 const REMOTE_ACTION_SLOW_WARN_MILLIS: u128 = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,7 +592,12 @@ struct RemoteActionResultChunkPlaintext {
     action: RemoteActionKind,
     chunk_index: usize,
     chunk_count: usize,
-    data_base64: String,
+    /// A slice of the serialized result as **text**.
+    ///
+    /// Was `data_base64`. The value being chunked is already JSON, so base64'ing it before
+    /// wrapping it in another JSON document (which is then encrypted and base64'd again)
+    /// paid for the encoding twice — ~1.78x the payload on the wire instead of ~1.35x.
+    data: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2251,30 +2262,104 @@ async fn replay_encrypted_remote_action_result(
     .await
 }
 
+/// Split `value` into pieces of at most `max_chars` characters without ever splitting a
+/// character.
+///
+/// Chunking used to slice raw bytes, which is safe only because the pieces were then
+/// base64'd. Sending the JSON *text* instead removes that encoding — and with it the
+/// freedom to cut anywhere, since a byte slice can land mid-character and produce invalid
+/// UTF-8 that no client can reassemble.
+fn split_on_char_boundaries(value: &str, max_chars: usize) -> Vec<&str> {
+    let max_chars = max_chars.max(1);
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut chars_in_piece = 0;
+    for (index, _) in value.char_indices() {
+        if chars_in_piece == max_chars {
+            pieces.push(&value[start..index]);
+            start = index;
+            chars_in_piece = 0;
+        }
+        chars_in_piece += 1;
+    }
+    pieces.push(&value[start..]);
+    pieces
+}
+
+/// Shrink the chunk size until **every** piece produces a frame within the broker's limit.
+///
+/// Checking only the first piece would be enough for uniform byte slices, which is what
+/// this used to produce. Character-boundary pieces are not uniform: a piece dense in
+/// multi-byte characters, or one dense in the quotes and backslashes that JSON escapes,
+/// serializes larger than its neighbours. Sampling one and assuming the rest match is how
+/// an oversized frame reaches the broker and gets the whole session torn down.
+fn fit_chunks<'a, F>(
+    serialized: &'a str,
+    target_chars: usize,
+    mut frame_bytes: F,
+) -> Option<Vec<&'a str>>
+where
+    F: FnMut(&str, usize, usize) -> usize,
+{
+    let total_chars = serialized.chars().count();
+    let mut chunk_chars = total_chars.min(target_chars).max(1);
+    loop {
+        let pieces = split_on_char_boundaries(serialized, chunk_chars);
+        let chunk_count = pieces.len();
+        let last_index = chunk_count.saturating_sub(1);
+        let largest = pieces
+            .iter()
+            // The last index, not the first: `chunk_index` is serialized as a number, and
+            // a three-digit index is two bytes wider than a one-digit one.
+            .map(|piece| frame_bytes(piece, last_index, chunk_count))
+            .max()
+            .unwrap_or(0);
+        if largest <= MAX_BROKER_TEXT_FRAME_BYTES {
+            return Some(pieces);
+        }
+        if chunk_chars <= REMOTE_ACTION_RESULT_CHUNK_MIN_CHARS {
+            return None;
+        }
+        chunk_chars = (chunk_chars / 2).max(REMOTE_ACTION_RESULT_CHUNK_MIN_CHARS);
+    }
+}
+
 fn build_plain_remote_action_result_chunk_payloads(
     action_id: &str,
     target_peer_id: &str,
     plaintext: &RemoteActionResultPlaintext,
 ) -> Result<Vec<OutboundBrokerPayload>, String> {
-    let serialized = serialized_json_vec(plaintext)?;
-    let chunk_size = fit_plain_remote_action_result_chunk_size(
-        action_id,
-        target_peer_id,
-        plaintext.action,
+    let serialized = serialized_json_string(plaintext)?;
+    let pieces = fit_chunks(
         &serialized,
-    )?;
-    let chunk_count = serialized.len().div_ceil(chunk_size);
-    Ok(serialized
-        .chunks(chunk_size)
-        .enumerate()
-        .map(
-            |(chunk_index, chunk)| OutboundBrokerPayload::RemoteActionResultChunk {
+        REMOTE_ACTION_RESULT_CHUNK_TARGET_CHARS,
+        |piece, chunk_index, chunk_count| {
+            frame_bytes_for_payload(&OutboundBrokerPayload::RemoteActionResultChunk {
                 action_id: action_id.to_string(),
                 target_peer_id: target_peer_id.to_string(),
                 action: plaintext.action,
                 chunk_index,
                 chunk_count,
-                data_base64: STANDARD.encode(chunk),
+                data: piece.to_string(),
+            })
+        },
+    )
+    .ok_or_else(|| {
+        "remote action result chunk payload still exceeds broker frame limit".to_string()
+    })?;
+
+    let chunk_count = pieces.len();
+    Ok(pieces
+        .into_iter()
+        .enumerate()
+        .map(
+            |(chunk_index, piece)| OutboundBrokerPayload::RemoteActionResultChunk {
+                action_id: action_id.to_string(),
+                target_peer_id: target_peer_id.to_string(),
+                action: plaintext.action,
+                chunk_index,
+                chunk_count,
+                data: piece.to_string(),
             },
         )
         .collect())
@@ -2287,20 +2372,56 @@ fn build_encrypted_remote_action_result_chunk_payloads(
     secret: &str,
     plaintext: &RemoteActionResultPlaintext,
 ) -> Result<Vec<OutboundBrokerPayload>, String> {
-    let serialized = serialized_json_vec(plaintext)?;
-    let chunk_size = fit_encrypted_remote_action_result_chunk_size(
-        action_id,
-        target_peer_id,
-        device_id,
-        secret,
-        plaintext.action,
+    let serialized = serialized_json_string(plaintext)?;
+    // Fitting has to encrypt each candidate, because the ciphertext length is what ends up
+    // on the wire and only encryption reveals it.
+    let mut fit_error: Option<String> = None;
+    let pieces = fit_chunks(
         &serialized,
-    )?;
-    let chunk_count = serialized.len().div_ceil(chunk_size);
-    serialized
-        .chunks(chunk_size)
+        REMOTE_ACTION_RESULT_CHUNK_TARGET_CHARS,
+        |piece, chunk_index, chunk_count| {
+            match encrypt_json(
+                secret,
+                &RemoteActionResultChunkPlaintext {
+                    action_id: action_id.to_string(),
+                    action: plaintext.action,
+                    chunk_index,
+                    chunk_count,
+                    data: piece.to_string(),
+                },
+            ) {
+                Ok(envelope) => frame_bytes_for_payload(
+                    &OutboundBrokerPayload::EncryptedRemoteActionResultChunk {
+                        action_id: action_id.to_string(),
+                        target_peer_id: target_peer_id.to_string(),
+                        device_id: device_id.to_string(),
+                        action: plaintext.action,
+                        chunk_index,
+                        chunk_count,
+                        envelope,
+                    },
+                ),
+                Err(error) => {
+                    fit_error.get_or_insert(error);
+                    // Force the caller to shrink rather than silently accept a size it
+                    // could not actually measure.
+                    usize::MAX
+                }
+            }
+        },
+    );
+    if let Some(error) = fit_error {
+        return Err(error);
+    }
+    let pieces = pieces.ok_or_else(|| {
+        "encrypted remote action result chunk payload still exceeds broker frame limit".to_string()
+    })?;
+
+    let chunk_count = pieces.len();
+    pieces
+        .into_iter()
         .enumerate()
-        .map(|(chunk_index, chunk)| {
+        .map(|(chunk_index, piece)| {
             let envelope = encrypt_json(
                 secret,
                 &RemoteActionResultChunkPlaintext {
@@ -2308,7 +2429,7 @@ fn build_encrypted_remote_action_result_chunk_payloads(
                     action: plaintext.action,
                     chunk_index,
                     chunk_count,
-                    data_base64: STANDARD.encode(chunk),
+                    data: piece.to_string(),
                 },
             )?;
             Ok(OutboundBrokerPayload::EncryptedRemoteActionResultChunk {
@@ -2322,86 +2443,6 @@ fn build_encrypted_remote_action_result_chunk_payloads(
             })
         })
         .collect()
-}
-
-fn fit_plain_remote_action_result_chunk_size(
-    action_id: &str,
-    target_peer_id: &str,
-    action: RemoteActionKind,
-    serialized: &[u8],
-) -> Result<usize, String> {
-    let mut chunk_size = serialized
-        .len()
-        .min(REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES)
-        .max(1);
-    loop {
-        let chunk_count = serialized.len().div_ceil(chunk_size);
-        let sample = &serialized[..serialized.len().min(chunk_size)];
-        let payload = OutboundBrokerPayload::RemoteActionResultChunk {
-            action_id: action_id.to_string(),
-            target_peer_id: target_peer_id.to_string(),
-            action,
-            chunk_index: 0,
-            chunk_count,
-            data_base64: STANDARD.encode(sample),
-        };
-        if frame_bytes_for_payload(&payload) <= MAX_BROKER_TEXT_FRAME_BYTES {
-            return Ok(chunk_size);
-        }
-        if chunk_size <= REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES {
-            return Err(
-                "remote action result chunk payload still exceeds broker frame limit".to_string(),
-            );
-        }
-        chunk_size = (chunk_size / 2).max(REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES);
-    }
-}
-
-fn fit_encrypted_remote_action_result_chunk_size(
-    action_id: &str,
-    target_peer_id: &str,
-    device_id: &str,
-    secret: &str,
-    action: RemoteActionKind,
-    serialized: &[u8],
-) -> Result<usize, String> {
-    let mut chunk_size = serialized
-        .len()
-        .min(REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES)
-        .max(1);
-    loop {
-        let chunk_count = serialized.len().div_ceil(chunk_size);
-        let sample = &serialized[..serialized.len().min(chunk_size)];
-        let envelope = encrypt_json(
-            secret,
-            &RemoteActionResultChunkPlaintext {
-                action_id: action_id.to_string(),
-                action,
-                chunk_index: 0,
-                chunk_count,
-                data_base64: STANDARD.encode(sample),
-            },
-        )?;
-        let payload = OutboundBrokerPayload::EncryptedRemoteActionResultChunk {
-            action_id: action_id.to_string(),
-            target_peer_id: target_peer_id.to_string(),
-            device_id: device_id.to_string(),
-            action,
-            chunk_index: 0,
-            chunk_count,
-            envelope,
-        };
-        if frame_bytes_for_payload(&payload) <= MAX_BROKER_TEXT_FRAME_BYTES {
-            return Ok(chunk_size);
-        }
-        if chunk_size <= REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES {
-            return Err(
-                "encrypted remote action result chunk payload still exceeds broker frame limit"
-                    .to_string(),
-            );
-        }
-        chunk_size = (chunk_size / 2).max(REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES);
-    }
 }
 
 fn cached_remote_action_result(
@@ -2594,6 +2635,13 @@ fn serialized_json_bytes<T: Serialize>(value: &T) -> usize {
 
 fn serialized_json_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(value)
+        .map_err(|error| format!("serialize remote action result failed: {error}"))
+}
+
+/// The serialized result as text, so it can be chunked on character boundaries and sent
+/// without a base64 layer.
+fn serialized_json_string<T: Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value)
         .map_err(|error| format!("serialize remote action result failed: {error}"))
 }
 

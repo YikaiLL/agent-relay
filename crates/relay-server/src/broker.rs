@@ -64,7 +64,13 @@ const TRANSCRIPT_DELTA_PUBLISH_WINDOW_MILLIS: u64 = 100;
 const BROKER_MESSAGE_HANDLER_SLOW_WARN_MILLIS: u128 = 1_000;
 pub(crate) const RELAY_BROKER_IDENTITY_PATH_ENV: &str = "RELAY_BROKER_IDENTITY_PATH";
 const MAX_BROKER_TEXT_FRAME_BYTES: usize = 65_536;
-const RELAY_PROTOCOL_VERSION: u64 = 1;
+/// Bumped to 2 when chunked action results stopped base64'ing their payload: the field
+/// `data_base64` became `data` and now carries JSON text rather than base64 of bytes. A
+/// client that still expects `data_base64` rejects a v2 payload and tells the user to
+/// refresh — which is the whole fix, since the surface bundle is served by the broker —
+/// instead of silently failing to reassemble and sitting out the action deadline.
+const RELAY_PROTOCOL_VERSION: u64 = 2;
+
 type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone, Debug)]
@@ -1191,7 +1197,31 @@ async fn handle_server_message(
                 return Ok(());
             }
 
-            match parse_inbound_payload(payload)? {
+            // A payload this relay cannot parse costs the SURFACE its request, not the
+            // room its session.
+            //
+            // This used to propagate, and `handle_server_message`'s error ends the whole
+            // broker session — so one authenticated surface sending something malformed
+            // disconnected every other surface, and the reconnect resynced a full
+            // snapshot. Version skew is the likeliest trigger (see
+            // `SUPPORTED_INBOUND_RELAY_PROTOCOL_VERSIONS`), but any junk frame did it.
+            //
+            // Errors that genuinely mean the CONNECTION is unusable — a dropped socket, a
+            // `rate_limited` admission that a frame was discarded — still end the session
+            // below. This narrows only the "one bad message" case.
+            let parsed = match parse_inbound_payload(payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    warn!(
+                        from_peer_id,
+                        %error,
+                        "ignoring an unparseable surface payload; the session continues"
+                    );
+                    return Ok(());
+                }
+            };
+            let from_peer_id_for_log = from_peer_id.clone();
+            let outcome = match parsed {
                 Some(InboundBrokerPayload::PairingRequest {
                     pairing_id,
                     envelope,
@@ -1233,7 +1263,30 @@ async fn handle_server_message(
                     .await
                 }
                 None => Ok(()),
+            };
+
+            // A handler's failure belongs to the surface that caused it, not to the room.
+            //
+            // Parsing is not the only way a surface's message can fail, and refusing it is
+            // not even unusual: plaintext remote actions are rejected in private mode,
+            // which is the DEFAULT, so an ordinary misconfigured client produces one of
+            // these on every request. Propagating it ends `run_broker_session`, which
+            // disconnects every other surface in the room and resyncs a full snapshot on
+            // the way back — repeatable at will by whoever sent the message.
+            //
+            // Nothing that genuinely requires a reconnect is lost by swallowing this:
+            // - a dead writer has its own `select!` arm in the session loop, which is
+            //   where write failures have arrived since publishing became a hand-off;
+            // - a broker `rate_limited` is a `ServerMessage::Error`, handled in the arm
+            //   below and still fatal on purpose.
+            if let Err(error) = outcome {
+                warn!(
+                    from_peer_id = from_peer_id_for_log,
+                    %error,
+                    "a surface's message failed; answering nothing and keeping the session"
+                );
             }
+            Ok(())
         }
         ServerMessage::Error { code, message } => {
             if code == "rate_limited" {

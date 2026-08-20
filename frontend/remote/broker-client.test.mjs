@@ -2350,7 +2350,9 @@ test("an inbound frame for another surface does not notify the remote store", as
           from_role: "relay",
           payload: {
             kind: "encrypted_remote_action_result_chunk",
-            protocol_version: 1,
+            // Relay payload version (2), not the broker frame version above (1). An
+            // unsupported payload version is logged, and logging is what this test counts.
+            protocol_version: 2,
             action_id: "action-for-another-surface",
             action: "fetch_workspace_diff",
             chunk_index: index,

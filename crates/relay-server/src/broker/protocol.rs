@@ -142,7 +142,9 @@ pub(super) enum OutboundBrokerPayload {
         action: RemoteActionKind,
         chunk_index: usize,
         chunk_count: usize,
-        data_base64: String,
+        /// A text slice of the serialized result. Was `data_base64`; see
+        /// `RemoteActionResultChunkPlaintext::data`.
+        data: String,
     },
     EncryptedSessionSnapshot {
         target_peer_id: String,

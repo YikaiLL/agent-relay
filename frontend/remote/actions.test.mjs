@@ -414,11 +414,14 @@ test("encrypted remote action result chunks reassemble before resolving", async 
             prev_cursor: 10,
           },
         };
-        const bytes = new TextEncoder().encode(JSON.stringify(result));
-        const midpoint = Math.ceil(bytes.length / 2);
+        // Text slices, not byte slices: chunks travel as JSON text now, so reassembly is
+        // string concatenation. Deliberately delivered out of order — the relay paces
+        // them, but nothing guarantees arrival order.
+        const serialized = JSON.stringify(result);
+        const midpoint = Math.ceil(serialized.length / 2);
         const chunks = [
-          { chunk_index: 1, data: bytes.slice(midpoint) },
-          { chunk_index: 0, data: bytes.slice(0, midpoint) },
+          { chunk_index: 1, data: serialized.slice(midpoint) },
+          { chunk_index: 0, data: serialized.slice(0, midpoint) },
         ];
         for (const chunk of chunks) {
           const envelope = await encryptJson("payload-secret-1", {
@@ -426,7 +429,7 @@ test("encrypted remote action result chunks reassemble before resolving", async 
             action: "fetch_thread_transcript",
             chunk_index: chunk.chunk_index,
             chunk_count: chunks.length,
-            data_base64: Buffer.from(chunk.data).toString("base64"),
+            data: chunk.data,
           });
           await handleRemoteBrokerPayload({
             kind: "encrypted_remote_action_result_chunk",
@@ -1053,7 +1056,7 @@ test("each chunk of a reply extends the action deadline", async () => {
     action: "fetch_workspace_diff",
     chunk_index: 0,
     chunk_count: 61,
-    data_base64: "cGF5bG9hZA==",
+    data: "payload",
   });
   globalThis.window.setTimeout = realSetTimeout;
 
@@ -1106,7 +1109,7 @@ test("this surface's own chunks do not each re-render the app", async () => {
         action: "fetch_workspace_diff",
         chunk_index: index,
         chunk_count: 21,
-        data_base64: "cGF5bG9hZA==",
+        data: "payload",
       })
     );
   }
@@ -1190,7 +1193,7 @@ test("a repeated chunk does not renew the action deadline", async () => {
       action: "fetch_workspace_diff",
       chunk_index: 0,
       chunk_count: 61,
-      data_base64: "cGF5bG9hZA==",
+      data: "payload",
     });
 
   await sendChunkZero();
@@ -1369,3 +1372,4 @@ test("a relay leaving suspends action deadlines rather than failing them", async
     "and the action must be kept so it can be resent under the same id"
   );
 });
+

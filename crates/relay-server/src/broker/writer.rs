@@ -291,6 +291,14 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
     let mut train_interval = Duration::ZERO;
     let mut train_watch_target: Option<String> = None;
     let mut next_chunk_at: Option<Instant> = None;
+    // When the last chunk went out, across ALL trains rather than the current one.
+    //
+    // Pacing exists to keep the relay's publish rate under the broker's allowance, and an
+    // interval applied only within a train does not do that: a train's last chunk used to
+    // be followed immediately by the next train's first, so back-to-back replies published
+    // at up to double the advertised rate. Carrying the instant across the boundary is what
+    // makes the interval a rate rather than a within-train detail.
+    let mut last_chunk_at: Option<Instant> = None;
     // Closure of either channel means the session dropped its handle. The writer then
     // finishes the reply it has already accepted and stops — it does NOT wait for more.
     // Lifecycle is `BrokerWriterGuard`'s job: it aborts this task when the session ends,
@@ -329,6 +337,9 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
             }
             if let Some(chunk) = train.pop_front() {
                 sink.send_frame(chunk).await?;
+                // Recorded after the write, matching `advance_train`: the interval is
+                // measured from when a chunk actually left, not from when it was picked up.
+                last_chunk_at = Some(Instant::now());
             }
             next_chunk_at = advance_train(&train, train_interval);
             continue;
@@ -352,6 +363,7 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
                         &mut train_interval,
                         &mut train_watch_target,
                         &mut next_chunk_at,
+                        last_chunk_at,
                     );
                     continue;
                 }
@@ -426,6 +438,7 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
                     &mut train_interval,
                     &mut train_watch_target,
                     &mut next_chunk_at,
+                    last_chunk_at,
                 ),
                 None => train_closed = true,
             },
@@ -447,6 +460,7 @@ fn accept_train(
     train_interval: &mut Duration,
     train_watch_target: &mut Option<String>,
     next_chunk_at: &mut Option<Instant>,
+    last_chunk_at: Option<Instant>,
 ) {
     debug_assert!(
         train.is_empty(),
@@ -456,8 +470,19 @@ fn accept_train(
     train.extend(frame.chunks);
     *train_interval = frame.interval;
     *train_watch_target = frame.watch_target;
-    // The first chunk of a fresh train is due immediately.
-    *next_chunk_at = Some(Instant::now());
+    // Due as soon as PACING allows, which is not necessarily now: the previous train's last
+    // chunk may have gone out moments ago, and the interval is a publish rate rather than a
+    // within-train detail. After an idle spell the deadline is already past, so this is
+    // still immediate in the common case.
+    //
+    // Note this only moves when the first chunk is *sent*. Acceptance itself still happens
+    // eagerly, before ordinary traffic is drained, so a backlog still cannot postpone a
+    // queued reply.
+    let now = Instant::now();
+    *next_chunk_at = Some(match last_chunk_at {
+        Some(last) => (last + frame.interval).max(now),
+        None => now,
+    });
     info!(
         queued_chunks = queued,
         interval_ms = frame.interval.as_millis() as u64,

@@ -615,3 +615,144 @@ async fn a_train_starts_even_while_ordinary_traffic_keeps_arriving() {
          went out; a backlog must not postpone a reply the client is timing"
     );
 }
+
+/// Records when each frame went out, so pacing can be asserted rather than just ordering.
+struct TimingSink {
+    written: Arc<Mutex<Vec<(String, Duration)>>>,
+    start: Instant,
+}
+
+impl FrameSink for TimingSink {
+    async fn send_frame(&mut self, message: Message) -> Result<(), String> {
+        if let Message::Text(text) = message {
+            let at = Instant::now().duration_since(self.start);
+            self.written.lock().unwrap().push((text, at));
+        }
+        Ok(())
+    }
+}
+
+/// Pacing must hold ACROSS trains, not just inside one.
+///
+/// The interval exists to keep the relay's publish rate under the broker's allowance. It
+/// was applied only between chunks of the same train: `advance_train` returns `None` on the
+/// last chunk, and `accept_train` then marks the next train's first chunk due *immediately*.
+/// Back-to-back two-chunk replies therefore went out at t=0, 250, 250, 500, 500… — two
+/// frames per interval, double the rate the pacing advertises, and the byte budget on the
+/// broker is sized against that advertised rate.
+///
+/// A reply that fits one frame never becomes a train at all, so two chunks is the smallest
+/// real train and this is the worst case rather than a contrived one.
+#[tokio::test(start_paused = true)]
+async fn pacing_holds_across_train_boundaries() {
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let sink = TimingSink {
+        written: Arc::clone(&written),
+        start: Instant::now(),
+    };
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
+    let (now_tx, now_rx) = mpsc::channel(64);
+    let (train_tx, train_rx) = mpsc::channel(1);
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
+
+    // Two consecutive replies, each the smallest a real train can be.
+    train_tx
+        .send(plain_train(train_of("a-", 2), 250))
+        .await
+        .expect("first train should queue");
+    train_tx
+        .send(plain_train(train_of("b-", 2), 250))
+        .await
+        .expect("second train should queue");
+
+    drop(now_tx);
+    drop(train_tx);
+    writer
+        .await
+        .expect("writer joins")
+        .expect("writer succeeds");
+
+    let written = written.lock().unwrap().clone();
+    assert_eq!(
+        written.len(),
+        4,
+        "every chunk must still arrive: {written:?}"
+    );
+
+    for pair in written.windows(2) {
+        let (previous_label, previous_at) = &pair[0];
+        let (label, at) = &pair[1];
+        let gap = at.saturating_sub(*previous_at);
+        assert!(
+            gap >= Duration::from_millis(250),
+            "`{previous_label}` -> `{label}` were only {}ms apart, but the train interval \
+             is 250ms. Pacing that lapses at a train boundary means the relay publishes at \
+             up to double its advertised rate, which is the rate the broker's byte budget \
+             is sized against. Order was {written:?}",
+            gap.as_millis()
+        );
+    }
+}
+
+/// This relay's publish cadence must stay inside the broker's shipped byte budget.
+///
+/// The broker crate has its own version of this arithmetic, but it can only guess at the
+/// cadence — it has no access to `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS`, so
+/// it hardcodes the interval and would stay green if this crate sped up. This is the
+/// authoritative check: it reads the real cadence, the real frame cap, and the broker's
+/// real default, so changing any one of the three has to confront the other two.
+///
+/// Being refused is fatal for a relay — the `rate_limited` arm ends the session and
+/// resyncs a full snapshot — so the budget has to sit well clear of what this relay can
+/// actually emit, not merely above it.
+#[test]
+fn this_relays_publish_cadence_stays_inside_the_brokers_byte_budget() {
+    use crate::broker::remote_actions::REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS;
+    use crate::broker::MAX_BROKER_TEXT_FRAME_BYTES;
+
+    let frames_per_minute =
+        (1_000 / REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS as usize) * 60;
+    // Every chunk frame is capped, because the chunk builders shrink a chunk until its
+    // frame fits. Cap x cadence is therefore an upper bound on the chunk train, not an
+    // estimate — and pacing now holds across train boundaries (see
+    // `pacing_holds_across_train_boundaries`), so the cadence is the real ceiling rather
+    // than double it.
+    let chunk_train_ceiling_per_minute = MAX_BROKER_TEXT_FRAME_BYTES * frames_per_minute;
+
+    assert!(
+        relay_broker::DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE >= chunk_train_ceiling_per_minute * 6,
+        "this relay can emit up to {chunk_train_ceiling_per_minute} B/min of chunked \
+         replies ({frames_per_minute} frames a minute at the {MAX_BROKER_TEXT_FRAME_BYTES} \
+         byte frame cap), and the broker ships a {} B/min budget. That leaves too little \
+         room for transcript deltas and snapshots running alongside — and a refused \
+         publish ends the session and resyncs.",
+        relay_broker::DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE
+    );
+}
+
+/// This relay's fixed frame size must fit inside the smallest cap any broker can enforce.
+///
+/// relay-server compiles `MAX_BROKER_TEXT_FRAME_BYTES` in and fits every chunk against it,
+/// with no way to learn what the broker it connects to was configured with. The broker's
+/// job is therefore to guarantee a floor; this asserts the relay stays under it. Raise the
+/// relay's constant without raising `MIN_MAX_TEXT_FRAME_BYTES` and every large reply
+/// becomes `frame_too_large` — which closes the socket, so the reconnect replays the same
+/// result and fails the same way.
+#[test]
+fn this_relays_frame_size_fits_the_brokers_guaranteed_minimum() {
+    use crate::broker::MAX_BROKER_TEXT_FRAME_BYTES;
+
+    assert!(
+        MAX_BROKER_TEXT_FRAME_BYTES <= relay_broker::MIN_MAX_TEXT_FRAME_BYTES,
+        "this relay fits chunks to {MAX_BROKER_TEXT_FRAME_BYTES} bytes but a broker only \
+         guarantees it will accept {}. The relay cannot negotiate the cap, so the excess \
+         is not throttled — it is refused, and refused again on every replay.",
+        relay_broker::MIN_MAX_TEXT_FRAME_BYTES
+    );
+}
