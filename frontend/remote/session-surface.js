@@ -1,4 +1,5 @@
 import {
+  isVerboseBrokerLoggingEnabled,
   renderLog as appendClientLog,
 } from "./client-log.js";
 import { state } from "./state.js";
@@ -21,6 +22,8 @@ export function renderSession(session) {
 export function renderLog(message) {
   appendClientLog(message);
 }
+
+export { isVerboseBrokerLoggingEnabled };
 
 export function isCurrentDeviceActiveController(session) {
   return isRemoteController({

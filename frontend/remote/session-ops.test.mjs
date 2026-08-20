@@ -4526,3 +4526,139 @@ test("a delta for a thread that is neither live nor pinned is still ignored", as
   clearSessionRuntime();
   state.socket = null;
 });
+
+// `applySessionSnapshot` ended with a TODO-marked debug line, and building that line
+// read `scrollTop` / `scrollHeight` / `clientHeight` off the live transcript element.
+// Reading `scrollHeight` forces a synchronous layout of the whole transcript subtree,
+// and the `renderLog` that followed is a `patchRemoteState` — a full RemoteApp
+// re-render. Both were paid on EVERY snapshot, including the identical idle snapshots
+// a relay repeats for a thread this surface is not even displaying (a real trace showed
+// `status=idle turn=- entries=3` arriving over and over with byte-identical geometry).
+test("applying a snapshot does not force a layout just to build a debug line", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { applySessionSnapshot } = await import("./session-ops.js");
+  const { setRemoteTranscriptElement } = await import("./ui-refs.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  seedTranscriptHydrationState(state);
+
+  const geometryReads = { scrollTop: 0, scrollHeight: 0, clientHeight: 0 };
+  setRemoteTranscriptElement({
+    get scrollTop() {
+      geometryReads.scrollTop += 1;
+      return 0;
+    },
+    get scrollHeight() {
+      geometryReads.scrollHeight += 1;
+      return 1000;
+    },
+    get clientHeight() {
+      geometryReads.clientHeight += 1;
+      return 500;
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  });
+
+  try {
+    applySessionSnapshot({
+      active_thread_id: "thread-a",
+      current_status: "idle",
+      active_turn_id: null,
+      transcript: [],
+      transcript_truncated: false,
+      transcript_revision: 1,
+      revision: 1,
+    });
+  } finally {
+    setRemoteTranscriptElement(null);
+  }
+
+  assert.equal(
+    geometryReads.scrollHeight,
+    0,
+    "reading scrollHeight forces a synchronous layout of the whole transcript; a "
+      + "debug string is not worth one on every snapshot"
+  );
+});
+
+// The companion to the suppression above: the geometry read and the trace must both
+// come back when someone is actually debugging snapshot scroll restoration.
+test("verbose broker logging restores the snapshot scroll trace", async () => {
+  installBrowserStubs();
+  globalThis.window.__agentRelayVerboseBrokerLogs = true;
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { applySessionSnapshot } = await import("./session-ops.js");
+  const { setRemoteTranscriptElement } = await import("./ui-refs.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  seedTranscriptHydrationState(state);
+
+  let scrollHeightReads = 0;
+  setRemoteTranscriptElement({
+    get scrollTop() { return 0; },
+    get scrollHeight() {
+      scrollHeightReads += 1;
+      return 1000;
+    },
+    get clientHeight() { return 500; },
+    addEventListener() {},
+    removeEventListener() {},
+  });
+
+  try {
+    applySessionSnapshot({
+      active_thread_id: "thread-a",
+      current_status: "idle",
+      active_turn_id: null,
+      transcript: [],
+      transcript_truncated: false,
+      transcript_revision: 1,
+      revision: 1,
+    });
+  } finally {
+    setRemoteTranscriptElement(null);
+    delete globalThis.window.__agentRelayVerboseBrokerLogs;
+  }
+
+  assert.equal(
+    scrollHeightReads,
+    1,
+    "with the flag on the trace must come back — otherwise the gate is a delete"
+  );
+});

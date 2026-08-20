@@ -480,6 +480,13 @@ impl BrokerState {
     }
 }
 
+// Egress is NOT accounted here. An earlier revision returned a fan-out count from this
+// module and estimated egress from it at the publish site; that model assumed the targets
+// of a `targeted_messages` wrapper received similar-sized payloads, and reported half the
+// true figure for one large delivered payload beside one tiny undelivered one. Egress is
+// now counted in `send_message`, the single place a `ServerMessage` becomes bytes, where
+// the real serialized length is already known.
+
 #[derive(serde::Deserialize)]
 struct TargetedMessagesPayload {
     messages: Vec<TargetedMessagePayload>,

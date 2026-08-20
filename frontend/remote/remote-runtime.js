@@ -1,4 +1,4 @@
-import { clearClaimLifecycle, configureRemoteActions, handleRemoteBrokerPayload, recoverRemoteSession, rejectPendingActions } from "./actions.js";
+import { clearClaimLifecycle, configureRemoteActions, handleRemoteBrokerPayload, recoverRemoteSession, rejectPendingActions, resendPendingActions, suspendPendingActionDeadlines } from "./actions.js";
 import { closeBrokerSocket, configureBrokerClient, connectBroker, refreshRelayDirectory } from "./broker-client.js";
 import { replaceRemoteIdentity } from "./identity-change.js";
 import { initializeRemoteNavigation, openRemoteNavigation } from "./navigation.js";
@@ -56,9 +56,22 @@ export function ensureRemoteRuntimeConfigured() {
       rejectPendingActions("broker socket disconnected");
     },
     onRelayPresence(kind, peer) {
-      if (kind === "joined" && peer?.role === "relay" && state.remoteAuth) {
-        void recoverRemoteSession("relay joined");
+      if (peer?.role !== "relay" || !state.remoteAuth) {
+        return;
       }
+      if (kind === "joined") {
+        void recoverRemoteSession("relay joined");
+        // Anything still unanswered is asked again under its ORIGINAL action id, so a
+        // reply lost while the relay was away is served from its replay cache rather
+        // than by running the action a second time.
+        void resendPendingActions();
+        return;
+      }
+      // The relay ending its own session — which is what a dropped publish now causes —
+      // leaves this browser's socket up, so nothing else here notices. Without this the
+      // pending action just waits out its deadline and reports a failure the user is
+      // liable to answer by redoing a write.
+      suspendPendingActionDeadlines();
     },
   });
 

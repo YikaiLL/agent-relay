@@ -5,6 +5,7 @@ import {
 } from "./actions.js";
 import {
   isCurrentDeviceActiveController,
+  isVerboseBrokerLoggingEnabled,
   renderLog,
   renderSession,
 } from "./session-surface.js";
@@ -718,6 +719,14 @@ export function applySessionSnapshot(snapshot) {
     notifyThreadEvents(events);
   } catch (error) {
     renderLog(`[thread-attention] ingest failed: ${error?.message || error}`);
+  }
+  // Everything below is diagnostics, and it is not cheap: reading `scrollHeight`
+  // forces a synchronous layout of the whole transcript subtree, and `renderLog` is a
+  // `patchRemoteState` — a full RemoteApp re-render. Both were paid on EVERY snapshot,
+  // including the identical idle snapshots a relay repeats for a thread this surface
+  // is not even displaying. Behind the flag, a snapshot costs neither.
+  if (!isVerboseBrokerLoggingEnabled()) {
+    return;
   }
   const scrollTop = remoteUiRefs.remoteTranscript?.scrollTop || 0;
   const scrollHeight = remoteUiRefs.remoteTranscript?.scrollHeight || 0;

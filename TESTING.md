@@ -17,6 +17,23 @@ CI currently runs:
 - `cargo check --workspace`
 - `cargo test --workspace`
 
+## Opt-in slow tests
+
+Some tests are too slow or too timing-dependent for every run, so they are gated behind
+an environment variable and skip silently without it. They are not run by CI.
+
+```bash
+# Broker session end-to-end: drives the real relay broker session loop against an
+# in-process fake broker over a real websocket. One surface requests a chunked reply
+# (a >64KB workspace diff), leaves mid-reply, and a second surface asks a question.
+# Asserts the second surface is answered promptly and the abandoned reply stops.
+# ~3s, and needs `git` on PATH.
+AGENT_RELAY_BROKER_SESSION_E2E=1 cargo test -p relay-server a_departing_surface
+
+# Live Claude provider checks (needs a logged-in Claude CLI).
+AGENT_RELAY_LIVE_CLAUDE_E2E=1 cargo test -p relay-server
+```
+
 ## Browser E2E
 
 Useful browser E2E commands:

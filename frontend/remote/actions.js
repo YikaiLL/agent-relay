@@ -75,6 +75,10 @@ export async function handleRemoteBrokerPayload(payload) {
   }
 
   if (kind === "session_snapshot") {
+    if (!isVerboseBrokerLoggingEnabled()) {
+      onApplySessionSnapshot(payload.snapshot);
+      return;
+    }
     const message = `[scroll-source] kind=session_snapshot entries=${payload.snapshot?.transcript?.length || 0} truncated=${payload.snapshot?.transcript_truncated ? "1" : "0"} has_truncated=${Object.prototype.hasOwnProperty.call(payload.snapshot || {}, "transcript_truncated") ? "1" : "0"} thread=${payload.snapshot?.active_thread_id || "-"} status=${payload.snapshot?.current_status || "-"}`;
     renderLog(message);
     // TODO(remote-monitor-debug): Remove this console mirror once snapshot routing is stable.
@@ -373,7 +377,20 @@ async function handleEncryptedRemoteActionResultChunk(payload) {
 }
 
 function logIgnoredEncryptedPayload(kind, payload) {
-  if (isHighVolumeEncryptedPayloadKind(kind) && !isVerboseBrokerLoggingEnabled()) {
+  // Discarding a frame must be FREE. The broker broadcasts remote action results
+  // and session snapshots to every peer in the room and leaves the filtering to
+  // each surface (`must_not_be_broadcast` in crates/relay-broker/src/state.rs lists
+  // only `encrypted_pairing_result`), so every surface sees every other surface's
+  // traffic. `renderLog` is a `patchRemoteState`, which notifies the store behind
+  // `useSyncExternalStore` — so logging here cost one full RemoteApp re-render per
+  // frame we then threw away. A real boot trace showed 21 of them, all chunks of
+  // another surface's `fetch_workspace_diff`, arriving before the first frame
+  // addressed to this surface.
+  //
+  // The gate is now the whole function, not just the high-volume kinds: a frame
+  // that is not for us is by definition not this surface's business, and anyone
+  // debugging broker routing turns on `window.__agentRelayVerboseBrokerLogs`.
+  if (!isVerboseBrokerLoggingEnabled()) {
     return;
   }
   const peerMatches = payload.target_peer_id === state.socketPeerId;
@@ -395,6 +412,9 @@ function logAcceptedEncryptedPayload(kind, payload) {
 }
 
 function logDecryptedSessionSnapshot(kind, snapshot) {
+  if (!isVerboseBrokerLoggingEnabled()) {
+    return;
+  }
   const message = `[broker-decrypt] kind=${kind} thread=${snapshot?.active_thread_id || "-"} entries=${snapshot?.transcript?.length || 0} truncated=${snapshot?.transcript_truncated ? "1" : "0"} status=${snapshot?.current_status || "-"} turn=${snapshot?.active_turn_id || "-"}`;
   renderLog(message);
   // TODO(remote-monitor-debug): Remove this console mirror once broker routing is stable.
@@ -411,8 +431,15 @@ function logDecryptedTranscriptDelta(delta) {
   console.log(message);
 }
 
+/// Kinds that arrive in bursts, where one log line per frame means one full RemoteApp
+/// re-render per frame. Chunked action replies belong here for the same reason
+/// transcript deltas do: a single workspace diff is tens of frames, and each one was
+/// costing a render on the accepted path even when the reply was for this very surface.
 function isHighVolumeEncryptedPayloadKind(kind) {
-  return kind === "encrypted_transcript_delta" || kind === "encrypted_transcript_event";
+  return kind === "encrypted_transcript_delta"
+    || kind === "encrypted_transcript_event"
+    || kind === "encrypted_remote_action_result_chunk"
+    || kind === "encrypted_session_snapshot";
 }
 
 function isTranscriptEventKind(kind) {
@@ -513,7 +540,7 @@ function handleRemoteActionResultChunk(actionId, chunk) {
     chunkIndex < 0 ||
     chunkCount <= 0 ||
     chunkIndex >= chunkCount ||
-    typeof chunk?.data_base64 !== "string"
+    typeof chunk?.data !== "string"
   ) {
     rejectPendingAction(actionId, new Error("remote action chunk is malformed"));
     return;
@@ -535,10 +562,22 @@ function handleRemoteActionResultChunk(actionId, chunk) {
     return;
   }
 
-  if (pendingChunks.chunks[chunkIndex] == null) {
+  const advancedTransfer = pendingChunks.chunks[chunkIndex] == null;
+  if (advancedTransfer) {
     pendingChunks.receivedCount += 1;
   }
-  pendingChunks.chunks[chunkIndex] = chunk.data_base64;
+  pendingChunks.chunks[chunkIndex] = chunk.data;
+  // A chunk that ADVANCES the transfer is proof the relay is alive and still working on
+  // this reply, so the deadline restarts. A repeat of one already held is not: renewing
+  // on those would hand a stalled action an unlimited lease, kept alive forever by a
+  // peer re-sending the same frame. It was armed once when the request went out and never moved,
+  // which put a hard ceiling on how large a reply could ever be: the relay paces chunks
+  // 250ms apart, so 61 of them consume the whole budget before the last one lands, and
+  // a workspace diff is allowed to be far bigger than that. The deadline is meant to
+  // catch a stalled transfer, not to cap a healthy one.
+  if (advancedTransfer) {
+    extendPendingActionDeadline(actionId);
+  }
 
   if (pendingChunks.receivedCount !== chunkCount) {
     return;
@@ -554,30 +593,21 @@ function handleRemoteActionResultChunk(actionId, chunk) {
   }
 }
 
+// Chunks are text slices of the serialized result, split on character boundaries by the
+// relay, so reassembly is plain concatenation. They used to be base64 of byte slices,
+// which cost a whole extra 4/3 expansion on the wire — on top of the base64 the encrypted
+// transport already applies to the ciphertext — for an encoding the payload never needed:
+// what is being chunked is JSON text to begin with.
 function reassembleRemoteActionResultChunks(chunks) {
-  const parts = chunks.map((chunk, index) => {
+  let serialized = "";
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
     if (typeof chunk !== "string") {
       throw new Error(`remote action result chunk ${index + 1} is missing`);
     }
-    return decodeBase64ToBytes(chunk);
-  });
-  const totalBytes = parts.reduce((sum, part) => sum + part.length, 0);
-  const bytes = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const part of parts) {
-    bytes.set(part, offset);
-    offset += part.length;
+    serialized += chunk;
   }
-  return JSON.parse(new TextDecoder().decode(bytes));
-}
-
-function decodeBase64ToBytes(value) {
-  const binary = window.atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
+  return JSON.parse(serialized);
 }
 
 function clearPendingActionChunks(actionId) {
@@ -618,28 +648,10 @@ async function dispatchRemoteAction(actionType, request) {
   }
 
   const actionId = makeActionId(actionType);
-  const resultPromise = registerPendingAction(actionId, actionType);
+  const resultPromise = registerPendingAction(actionId, actionType, request);
 
   try {
-    if (actionType === "claim_challenge") {
-      sendBrokerFrame(await buildClaimChallengePayload(actionId));
-      return await resultPromise;
-    }
-
-    if (actionType === "claim_device") {
-      sendBrokerFrame(await buildClaimDevicePayload(actionId, request));
-      return await resultPromise;
-    }
-
-    if (requiresSessionClaim(actionType) && !state.remoteAuth.sessionClaim) {
-      throw new Error("device is not claimed yet");
-    }
-
-    sendBrokerFrame(
-      requiresSessionClaim(actionType)
-        ? await buildClaimedActionPayload(actionId, actionType, request)
-        : await buildDeviceActionPayload(actionId, actionType, request)
-    );
+    await sendRemoteActionFrame(actionId, actionType, request);
     return await resultPromise;
   } catch (error) {
     const pending = state.pendingActions.get(actionId);
@@ -798,7 +810,84 @@ async function buildDeviceActionPayload(actionId, actionType, request) {
   };
 }
 
-function registerPendingAction(actionId, actionType) {
+/// Build and send the frame for one action attempt.
+///
+/// Separate from `dispatchRemoteAction` so a resend can reproduce the request under its
+/// ORIGINAL action id — see `resendPendingActions`.
+async function sendRemoteActionFrame(actionId, actionType, request) {
+  if (actionType === "claim_challenge") {
+    sendBrokerFrame(await buildClaimChallengePayload(actionId));
+    return;
+  }
+  if (actionType === "claim_device") {
+    sendBrokerFrame(await buildClaimDevicePayload(actionId, request));
+    return;
+  }
+  if (requiresSessionClaim(actionType) && !state.remoteAuth.sessionClaim) {
+    throw new Error("device is not claimed yet");
+  }
+  sendBrokerFrame(
+    requiresSessionClaim(actionType)
+      ? await buildClaimedActionPayload(actionId, actionType, request)
+      : await buildDeviceActionPayload(actionId, actionType, request)
+  );
+}
+
+/// Stand down the deadlines of everything still in flight, without failing anything.
+///
+/// Used when the relay leaves the room: we know precisely why no reply is coming, so
+/// letting the deadline fire would report a failure the user is likely to answer by
+/// redoing the action — and a redo mints a new action id, which misses the relay's
+/// replay cache and can execute a write for the second time. The honest state here is
+/// "outcome unknown until the relay is back", so the attempt is kept and resent under
+/// its own id by `resendPendingActions`.
+export function suspendPendingActionDeadlines() {
+  for (const pending of state.pendingActions.values()) {
+    window.clearTimeout(pending.timeoutId);
+    pending.timeoutId = null;
+  }
+}
+
+/// Ask again for every reply we are still waiting on, under the same action ids.
+///
+/// Reusing the id is the whole point, and it is what makes this safe for writes. The
+/// relay caches a completed result under `(device_id, action_id)` and replays it rather
+/// than re-executing, so a `send_message` whose reply was lost is answered from that
+/// cache instead of being sent twice. A fresh id would miss the cache and run it again.
+///
+/// If the original is still executing, the relay recognises the duplicate and stays
+/// quiet; its own reply is still addressed to this surface and still arrives.
+export async function resendPendingActions() {
+  const attempts = [...state.pendingActions.entries()];
+  for (const [actionId, pending] of attempts) {
+    if (!pending || pending.actionType === "claim_challenge") {
+      continue;
+    }
+    try {
+      await sendRemoteActionFrame(actionId, pending.actionType, pending.request);
+      extendPendingActionDeadline(actionId);
+    } catch (error) {
+      rejectPendingAction(actionId, error);
+    }
+  }
+}
+
+/// Restart the deadline for an action that is demonstrably still being answered.
+function extendPendingActionDeadline(actionId) {
+  const pending = state.pendingActions.get(actionId);
+  if (!pending) {
+    return;
+  }
+  window.clearTimeout(pending.timeoutId);
+  pending.timeoutId = window.setTimeout(() => {
+    rejectPendingAction(
+      actionId,
+      new Error(`remote ${pending.actionType} timed out waiting for relay response`)
+    );
+  }, REMOTE_ACTION_TIMEOUT_MS);
+}
+
+function registerPendingAction(actionId, actionType, request) {
   return new Promise((resolve, reject) => {
     const timeoutId = window.setTimeout(() => {
       rejectPendingAction(
@@ -809,6 +898,8 @@ function registerPendingAction(actionId, actionType) {
 
     state.pendingActions.set(actionId, {
       actionType,
+      // Kept so the attempt can be reproduced verbatim under the same id.
+      request,
       timeoutId,
       reject,
       resolve,

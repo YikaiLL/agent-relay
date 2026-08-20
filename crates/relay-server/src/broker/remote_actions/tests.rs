@@ -1278,3 +1278,231 @@ async fn list_threads_action_carries_the_search_query() {
         "no query still returns the ordinary page"
     );
 }
+
+/// Publishing a chunked reply must not cost the caller the reply's pacing.
+///
+/// `broker.rs` awaits `handle_server_message` INLINE in the `select!` arm that reads the
+/// broker socket, and a chunked action reply is published from inside that handler. So
+/// for as long as this function takes, the relay reads NOTHING: not another surface's
+/// `fetch_thread_transcript`, not a `claim_challenge`, not even the presence frame
+/// saying the surface it is answering has gone away.
+///
+/// It used to sleep `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS` between every
+/// chunk, so a 21-chunk reply — a real trace had exactly that, one
+/// `fetch_workspace_diff` — blinded the relay for ~5 seconds. Users experienced it as
+/// "I clicked and nothing happened, then a while later everything arrived at once".
+///
+/// Runs on a paused clock, so the assertion is about the pacing this call performs, not
+/// about how fast the machine is: a paused runtime auto-advances time whenever the task
+/// sleeps, which means a version that still paces inline reports the full ~5s here.
+#[tokio::test(start_paused = true)]
+async fn queueing_a_chunk_train_does_not_block_the_read_loop() {
+    use crate::state::{RelayState, SecurityProfile};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    let (change_tx, _rx) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        "/tmp/chunk-train-test".to_string(),
+        change_tx.clone(),
+        SecurityProfile::private(),
+    )));
+    relay.write().await.mark_surface_peer_online("surface-1");
+    let state = AppState::from_parts(relay, HashMap::new(), change_tx);
+
+    let (writer, _now_queue, mut queued) = super::super::writer::test_writer();
+    let chunks = workspace_diff_chunks("surface-1", 21);
+
+    let started_at = tokio::time::Instant::now();
+    publish_remote_action_result_chunks(&state, &writer, chunks, "test chunk train", "surface-1")
+        .await
+        .expect("queueing a train succeeds");
+    let blocked_for = started_at.elapsed();
+
+    assert!(
+        blocked_for < Duration::from_millis(50),
+        "handing off a 21-chunk reply must be a queue push, not {}ms of blocked read \
+         loop — the pacing belongs to the writer task",
+        blocked_for.as_millis()
+    );
+
+    let frame = queued
+        .try_recv()
+        .expect("the train must actually be queued");
+    assert_eq!(frame.chunks.len(), 21, "every chunk is handed over");
+    assert_eq!(
+        frame.interval,
+        Duration::from_millis(REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS),
+        "and the writer is told the pacing to apply"
+    );
+    assert_eq!(
+        frame.watch_target.as_deref(),
+        Some("surface-1"),
+        "a surface observed online at queue time is watched, so its train can be \
+         abandoned if it leaves"
+    );
+}
+
+fn workspace_diff_chunks(target_peer_id: &str, chunk_count: usize) -> Vec<OutboundBrokerPayload> {
+    (0..chunk_count)
+        .map(
+            |chunk_index| OutboundBrokerPayload::RemoteActionResultChunk {
+                action_id: "action-1".to_string(),
+                target_peer_id: target_peer_id.to_string(),
+                action: RemoteActionKind::FetchWorkspaceDiff,
+                chunk_index,
+                chunk_count,
+                data: "payload".to_string(),
+            },
+        )
+        .collect()
+}
+
+/// A chunked reply must not pay for base64 twice.
+///
+/// The encrypted chunk path used to base64 the chunk into `data_base64`, wrap that in
+/// JSON, encrypt it, and base64 the ciphertext **again** — two 4/3 expansions, so the wire
+/// cost was ~1.78x the payload. The inner encoding was never needed: the thing being
+/// chunked is already JSON *text*, so it can travel as a JSON string provided the split
+/// respects character boundaries.
+///
+/// This is a real cost, not a theoretical one — the broker's egress is billed per GB, and
+/// chunked replies are the largest thing the relay sends.
+#[test]
+fn a_chunked_reply_does_not_pay_for_base64_twice() {
+    let plaintext = make_large_thread_transcript_plaintext();
+    let payload_bytes = serde_json::to_vec(&plaintext)
+        .expect("plaintext serializes")
+        .len();
+
+    let encrypted = build_encrypted_remote_action_result_chunk_payloads(
+        "action-1",
+        "surface-1",
+        "device-1",
+        "payload-secret",
+        &plaintext,
+    )
+    .expect("encrypted chunk payloads");
+    let encrypted_wire: usize = encrypted.iter().map(frame_bytes_for_payload).sum();
+    let encrypted_ratio = encrypted_wire as f64 / payload_bytes as f64;
+
+    assert!(
+        encrypted_ratio < 1.45,
+        "an encrypted chunked reply cost {encrypted_ratio:.3}x its payload ({encrypted_wire} \
+         bytes on the wire for {payload_bytes} bytes of result). One base64 layer is \
+         unavoidable for ciphertext; a second one is pure waste, and at ~1.78x it is a \
+         quarter of the bandwidth bill for the largest thing the relay sends."
+    );
+
+    let plain =
+        build_plain_remote_action_result_chunk_payloads("action-1", "surface-1", &plaintext)
+            .expect("plain chunk payloads");
+    let plain_wire: usize = plain.iter().map(frame_bytes_for_payload).sum();
+    let plain_ratio = plain_wire as f64 / payload_bytes as f64;
+
+    assert!(
+        plain_ratio < 1.15,
+        "a plaintext chunked reply cost {plain_ratio:.3}x its payload ({plain_wire} bytes \
+         for {payload_bytes}). Nothing is encrypted here, so there is no ciphertext to \
+         encode — the chunks are JSON text and should travel as text."
+    );
+}
+
+/// Build the same large transcript, but out of text that makes chunking hard: multi-byte
+/// characters, and the characters JSON has to escape.
+fn make_unicode_heavy_transcript_plaintext() -> RemoteActionResultPlaintext {
+    // Every ingredient that can make a chunk serialize larger than its neighbours:
+    // 3-byte CJK, 4-byte emoji (a surrogate pair in the browser), combining marks, and
+    // quotes/backslashes/newlines/tabs that JSON expands to two characters each.
+    let nasty = "日本語のテキスト🙂🇯🇵é\"quoted\"\\back\\slash\n\ttab—dash";
+    // Deliberately FRONT-LOADED WITH ASCII. A uniformly nasty fixture is not a test of
+    // anything: every piece serializes alike, so sampling one and assuming the rest match
+    // gives the right answer by accident. The cheap prefix makes the first piece
+    // unrepresentative, so only a fit loop that measures every piece keeps the later,
+    // far heavier ones inside the frame limit.
+    let mut body = "plain ascii filler. ".repeat(4_000);
+    body.push_str(&nasty.repeat(4_000));
+    let mut plaintext = make_large_thread_transcript_plaintext();
+    if let Some(transcript) = plaintext.thread_transcript.as_mut() {
+        for entry in transcript.entries.iter_mut() {
+            entry.text = Some(body.clone());
+        }
+    }
+    plaintext
+}
+
+/// Chunking on character boundaries must survive text that is not one byte per character.
+///
+/// The old encoding sliced raw bytes and base64'd them, so every chunk was the same size
+/// and could not split a character. Sending text instead buys ~25% of the bandwidth back
+/// and costs exactly this: a slice can land mid-character (producing bytes no client can
+/// decode), and pieces vary in serialized size because multi-byte characters and
+/// JSON-escaped ones cost more. Fitting the frame by sampling one chunk and assuming the
+/// rest match is how an oversized frame reaches the broker — which discards it and, since
+/// this relay treats that as fatal, tears the session down.
+#[test]
+fn unicode_and_escape_heavy_chunks_stay_within_the_frame_limit_and_round_trip() {
+    let plaintext = make_unicode_heavy_transcript_plaintext();
+    let expected = serde_json::to_value(&plaintext).expect("plaintext serializes");
+
+    let plain =
+        build_plain_remote_action_result_chunk_payloads("action-1", "surface-1", &plaintext)
+            .expect("plain chunk payloads");
+    assert!(plain.len() > 1, "the fixture must actually chunk");
+
+    let mut reassembled = String::new();
+    for payload in &plain {
+        assert!(
+            frame_bytes_for_payload(payload) <= MAX_BROKER_TEXT_FRAME_BYTES,
+            "a chunk of multi-byte / escape-heavy text produced an oversized frame. The \
+             fit loop has to measure EVERY piece: character-boundary pieces are not \
+             uniform, and the broker drops an over-limit frame, which this relay treats \
+             as fatal."
+        );
+        match payload {
+            OutboundBrokerPayload::RemoteActionResultChunk { data, .. } => {
+                reassembled.push_str(data)
+            }
+            other => panic!("expected a plain chunk, got {other:?}"),
+        }
+    }
+    // Exactly what the browser does: concatenate the pieces and parse the result.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&reassembled).expect("reassembled chunks must be valid JSON");
+    assert_eq!(
+        parsed, expected,
+        "reassembling the chunks must reproduce the result byte for byte; a split that \
+         landed mid-character would corrupt it here"
+    );
+
+    // The encrypted path fits against ciphertext length, so it needs its own coverage.
+    let encrypted = build_encrypted_remote_action_result_chunk_payloads(
+        "action-1",
+        "surface-1",
+        "device-1",
+        "payload-secret",
+        &plaintext,
+    )
+    .expect("encrypted chunk payloads");
+    assert!(encrypted.len() > 1);
+    let mut decrypted = String::new();
+    for payload in &encrypted {
+        assert!(
+            frame_bytes_for_payload(payload) <= MAX_BROKER_TEXT_FRAME_BYTES,
+            "an encrypted chunk of multi-byte / escape-heavy text produced an oversized frame"
+        );
+        match payload {
+            OutboundBrokerPayload::EncryptedRemoteActionResultChunk { envelope, .. } => {
+                let chunk: RemoteActionResultChunkPlaintext =
+                    crate::broker::crypto::decrypt_json("payload-secret", envelope)
+                        .expect("chunk decrypts");
+                decrypted.push_str(&chunk.data);
+            }
+            other => panic!("expected an encrypted chunk, got {other:?}"),
+        }
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&decrypted).expect("decrypted chunks must reassemble into JSON");
+    assert_eq!(parsed, expected);
+}

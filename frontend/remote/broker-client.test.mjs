@@ -2287,3 +2287,92 @@ test("a stale attempt cannot overwrite persisted client authorization", async ()
   );
   assert.equal(state.remoteAuth, null, "nor device credentials");
 });
+
+// The companion to actions.js's ignore path. `[broker-inbound]` is logged BEFORE
+// anything knows whether the frame is for this surface, so every frame broadcast to
+// the room — including all of another surface's chunked action results — paid a
+// `renderLog`, i.e. a `patchRemoteState`, i.e. a full RemoteApp re-render. The
+// high-volume mute list only covered `transcript_delta` / `encrypted_transcript_delta`,
+// so `encrypted_remote_action_result_chunk` (a dozen frames per workspace diff) went
+// through at full price.
+test("an inbound frame for another surface does not notify the remote store", async () => {
+  installBrowserStubs();
+  globalThis.fetch = async () => ({ ok: true, async json() { return {}; } });
+  globalThis.window.location.href = "https://remote.example.test/#pairing=abc";
+  globalThis.window.history.replaceState = () => {};
+
+  const { state, subscribeRemoteState } = await import("./state.js");
+  const { configureBrokerClient, connectBroker } = await import("./broker-client.js");
+
+  state.remoteAuth = null;
+  seedSocketState(state);
+  seedPairingState(state, {
+    pairingPhase: "requesting",
+    pairingTicket: {
+      broker_url: "ws://broker.example.test",
+      broker_channel_id: "pairing-room",
+      relay_peer_id: "relay-peer",
+      security_mode: "private",
+      pairing_id: "pair-inbound-noise",
+      pairing_secret: "secret",
+      pairing_join_ticket: "pairing-join-ticket",
+      expires_at: Math.floor(Date.now() / 1000) + 120,
+    },
+  });
+
+  configureBrokerClient({ async onBrokerPayload() {} });
+  await connectBroker("pairing");
+  const socket = FakeWebSocket.instances.at(-1);
+  socket.emit("open", {});
+  socket.emit("message", {
+    data: JSON.stringify({
+      type: "welcome",
+      protocol_version: 1,
+      channel_id: "pairing-room",
+      peer_id: "surface-mine",
+      peers: [{ peer_id: "relay-peer", role: "relay" }],
+    }),
+  });
+  await waitFor(() => state.socketPeerId === "surface-mine");
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+
+  try {
+    // One chunked action result belonging to a different surface of this device.
+    for (let index = 0; index < 12; index += 1) {
+      socket.emit("message", {
+        data: JSON.stringify({
+          type: "message",
+          from_peer_id: "relay-peer",
+          from_role: "relay",
+          payload: {
+            kind: "encrypted_remote_action_result_chunk",
+            // Relay payload version (2), not the broker frame version above (1). An
+            // unsupported payload version is logged, and logging is what this test counts.
+            protocol_version: 2,
+            action_id: "action-for-another-surface",
+            action: "fetch_workspace_diff",
+            chunk_index: index,
+            chunk_count: 12,
+            target_peer_id: "surface-other",
+            device_id: "device-1",
+            envelope: "envelope-that-must-not-be-opened",
+          },
+        }),
+      });
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    unsubscribe();
+  }
+
+  assert.equal(
+    notifications,
+    0,
+    "an inbound frame addressed elsewhere must not notify the store: every "
+      + "notification is a full RemoteApp re-render for a frame we throw away"
+  );
+});
