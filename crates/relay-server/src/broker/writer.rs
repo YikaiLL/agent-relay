@@ -67,23 +67,15 @@ const NOW_QUEUE_CAPACITY: usize = 512;
 /// a queue.
 const TRAIN_QUEUE_CAPACITY: usize = 1;
 
-/// How many frames the writer will emit in any 60-second window.
+/// Heartbeat pings waiting to go out.
 ///
-/// The broker enforces its own allowance per peer and, when a peer goes over, it
-/// **drops the frame and keeps the socket open** — see the `rate_limited` branch in
-/// `crates/relay-broker/src/lib.rs`. Nothing about that is recoverable from here: a
-/// dropped transcript delta is content the client never learns about, and a dropped
-/// chunk costs the client its whole 15-second action timeout, because a chunked reply
-/// resolves only once every chunk has landed.
-///
-/// So the relay paces itself instead of finding out the hard way. This sits below
-/// `DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE` (1200) to leave room for the two
-/// windows disagreeing at their edges, and comfortably above what the relay actually
-/// needs at full tilt: 10 transcript deltas + 2 snapshots + 4 chunks a second is ~960 a
-/// minute. Waiting here should therefore be rare; when it does happen, a slightly late
-/// frame beats a silently discarded one.
-const OUTBOUND_RATE_LIMIT_PER_MINUTE: usize = 1_100;
-const OUTBOUND_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// Their own lane, ahead of everything else, for two reasons. The broker's publish
+/// allowance only counts `ClientMessage::Publish` frames — a websocket Ping is a control
+/// frame it answers separately — so a ping is never the thing that puts this relay over
+/// a limit and must never be delayed on that account. And the session arms its pong
+/// deadline when it *hands over* a ping, so a ping stuck behind a queue of snapshots
+/// reads as a dead peer and tears down a perfectly healthy session.
+const PING_QUEUE_CAPACITY: usize = 4;
 
 /// A single frame taking longer than this to reach the socket means the connection is
 /// congested. Previously warned per chunk from the action path; it belongs here now,
@@ -136,11 +128,26 @@ impl SurfacePresence for AppState {
 /// function.
 #[derive(Clone)]
 pub(super) struct BrokerWriter {
+    ping_tx: mpsc::Sender<Message>,
     now_tx: mpsc::Sender<Message>,
     train_tx: mpsc::Sender<TrainFrame>,
 }
 
 impl BrokerWriter {
+    /// Enqueue a heartbeat ping, which jumps every other queue. See
+    /// `PING_QUEUE_CAPACITY`.
+    pub(super) fn send_ping(&self, message: Message) -> Result<(), String> {
+        match self.ping_tx.try_send(message) {
+            Ok(()) => Ok(()),
+            // Four unanswered pings already queued means the socket is not draining;
+            // the pong timeout is the right thing to let fire.
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err("broker writer task has stopped".to_string())
+            }
+        }
+    }
+
     /// Enqueue one ordinary frame.
     pub(super) async fn send_now(&self, message: Message) -> Result<(), String> {
         self.now_tx
@@ -207,17 +214,22 @@ pub(super) fn spawn_broker_writer(
     sink: SplitSink<BrokerSocket, Message>,
     presence: AppState,
 ) -> (BrokerWriter, oneshot::Receiver<String>, BrokerWriterGuard) {
+    let (ping_tx, ping_rx) = mpsc::channel(PING_QUEUE_CAPACITY);
     let (now_tx, now_rx) = mpsc::channel(NOW_QUEUE_CAPACITY);
     let (train_tx, train_rx) = mpsc::channel(TRAIN_QUEUE_CAPACITY);
     let (error_tx, error_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        if let Err(error) = drive_writer(now_rx, train_rx, sink, presence).await {
+        if let Err(error) = drive_writer(ping_rx, now_rx, train_rx, sink, presence).await {
             // Nobody left to tell is fine: it means the session already ended.
             let _ = error_tx.send(error);
         }
     });
     (
-        BrokerWriter { now_tx, train_tx },
+        BrokerWriter {
+            ping_tx,
+            now_tx,
+            train_tx,
+        },
         error_rx,
         BrokerWriterGuard(task),
     )
@@ -252,13 +264,24 @@ pub(super) fn test_writer() -> (
     mpsc::Receiver<Message>,
     mpsc::Receiver<TrainFrame>,
 ) {
+    let (ping_tx, _ping_rx) = mpsc::channel(PING_QUEUE_CAPACITY);
     let (now_tx, now_rx) = mpsc::channel(NOW_QUEUE_CAPACITY);
     let (train_tx, train_rx) = mpsc::channel(TRAIN_QUEUE_CAPACITY);
-    (BrokerWriter { now_tx, train_tx }, now_rx, train_rx)
+    std::mem::forget(_ping_rx);
+    (
+        BrokerWriter {
+            ping_tx,
+            now_tx,
+            train_tx,
+        },
+        now_rx,
+        train_rx,
+    )
 }
 
 /// The scheduling policy, generic over where frames go and where presence comes from.
 pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
+    mut ping_rx: mpsc::Receiver<Message>,
     mut now_rx: mpsc::Receiver<Message>,
     mut train_rx: mpsc::Receiver<TrainFrame>,
     mut sink: S,
@@ -275,11 +298,15 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
     // is the orderly path, not the guarantee.
     let mut now_closed = false;
     let mut train_closed = false;
-    // Send times inside the current window, oldest first. Mirrors the broker's own
-    // sliding window so the two agree about what "a minute" means.
-    let mut recent_sends: VecDeque<Instant> = VecDeque::new();
 
     loop {
+        // 0. Heartbeat pings first, unconditionally. They keep the session alive and
+        //    cost nothing against the broker's publish allowance.
+        if let Ok(ping) = ping_rx.try_recv() {
+            sink.send_frame(ping).await?;
+            continue;
+        }
+
         // 1. A train chunk that is already due. This is the ONLY place a chunk is
         //    written, so the departure check below cannot be bypassed by whichever
         //    branch happened to notice the deadline first.
@@ -301,7 +328,6 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
                 }
             }
             if let Some(chunk) = train.pop_front() {
-                await_outbound_allowance(&mut recent_sends).await;
                 sink.send_frame(chunk).await?;
             }
             next_chunk_at = advance_train(&train, train_interval);
@@ -312,7 +338,6 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
         //    during the pacing gap instead of queueing behind every chunk.
         match now_rx.try_recv() {
             Ok(message) => {
-                await_outbound_allowance(&mut recent_sends).await;
                 sink.send_frame(message).await?;
                 continue;
             }
@@ -349,10 +374,14 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
             }
             tokio::select! {
                 biased;
+                received = ping_rx.recv() => {
+                    if let Some(ping) = received {
+                        sink.send_frame(ping).await?;
+                    }
+                }
                 received = now_rx.recv() => match received {
                     Some(message) => {
-                        await_outbound_allowance(&mut recent_sends).await;
-                        sink.send_frame(message).await?;
+                                sink.send_frame(message).await?;
                     }
                     None => now_closed = true,
                 },
@@ -365,39 +394,26 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
         if now_closed && train_closed {
             return Ok(());
         }
-        if now_closed {
-            match train_rx.recv().await {
-                Some(frame) => accept_train(
-                    frame,
-                    &mut train,
-                    &mut train_interval,
-                    &mut train_watch_target,
-                    &mut next_chunk_at,
-                ),
-                None => return Ok(()),
-            }
-            continue;
-        }
-        if train_closed {
-            match now_rx.recv().await {
-                Some(message) => {
-                    await_outbound_allowance(&mut recent_sends).await;
-                    sink.send_frame(message).await?;
-                }
-                None => return Ok(()),
-            }
-            continue;
-        }
 
+        // Every waiting path below must keep listening for pings. The idle wait is the
+        // one the relay spends almost all its time in, so a version of this select
+        // without the ping arm does not merely delay a heartbeat — it never notices one
+        // until some other frame happens to wake the loop, and the session tears itself
+        // down over a connection that was fine.
         tokio::select! {
-            received = now_rx.recv() => match received {
+            biased;
+            received = ping_rx.recv() => {
+                if let Some(ping) = received {
+                    sink.send_frame(ping).await?;
+                }
+            }
+            received = now_rx.recv(), if !now_closed => match received {
                 Some(message) => {
-                    await_outbound_allowance(&mut recent_sends).await;
                     sink.send_frame(message).await?;
                 }
                 None => now_closed = true,
             },
-            received = train_rx.recv() => match received {
+            received = train_rx.recv(), if !train_closed => match received {
                 Some(frame) => accept_train(
                     frame,
                     &mut train,
@@ -408,31 +424,6 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
                 None => train_closed = true,
             },
         }
-    }
-}
-
-/// Hold until sending one more frame keeps the last 60 seconds inside the allowance,
-/// then record the send.
-async fn await_outbound_allowance(recent_sends: &mut VecDeque<Instant>) {
-    loop {
-        let now = Instant::now();
-        while recent_sends
-            .front()
-            .is_some_and(|sent_at| now.duration_since(*sent_at) >= OUTBOUND_RATE_LIMIT_WINDOW)
-        {
-            recent_sends.pop_front();
-        }
-        if recent_sends.len() < OUTBOUND_RATE_LIMIT_PER_MINUTE {
-            recent_sends.push_back(now);
-            return;
-        }
-        // Full: wait for the oldest send to age out of the window.
-        let oldest = *recent_sends.front().expect("the window is full");
-        warn!(
-            queued_in_window = recent_sends.len(),
-            "holding a broker frame to stay inside the publish allowance"
-        );
-        sleep_until(oldest + OUTBOUND_RATE_LIMIT_WINDOW).await;
     }
 }
 

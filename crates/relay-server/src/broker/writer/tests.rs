@@ -14,8 +14,10 @@ impl FrameSink for RecordingSink {
         if let Some(error) = &self.fail_with {
             return Err(error.clone());
         }
-        if let Message::Text(text) = message {
-            self.written.lock().unwrap().push(text);
+        match message {
+            Message::Text(text) => self.written.lock().unwrap().push(text),
+            Message::Ping(_) => self.written.lock().unwrap().push("PING".to_string()),
+            _ => {}
         }
         Ok(())
     }
@@ -88,9 +90,16 @@ fn plain_train(chunks: Vec<Message>, interval_ms: u64) -> TrainFrame {
 #[tokio::test(start_paused = true)]
 async fn ordinary_traffic_goes_out_during_a_trains_pacing_gap() {
     let (written, sink) = recorder();
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (train_tx, train_rx) = mpsc::channel(1);
-    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, always_online()));
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
 
     train_tx
         .send(plain_train(train_of("chunk-", 5), 250))
@@ -132,9 +141,16 @@ async fn ordinary_traffic_goes_out_during_a_trains_pacing_gap() {
 #[tokio::test(start_paused = true)]
 async fn a_train_still_completes_under_sustained_ordinary_traffic() {
     let (written, sink) = recorder();
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (train_tx, train_rx) = mpsc::channel(1);
-    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, always_online()));
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
 
     train_tx
         .send(plain_train(train_of("chunk-", 4), 100))
@@ -172,9 +188,16 @@ async fn a_train_still_completes_under_sustained_ordinary_traffic() {
 #[tokio::test(start_paused = true)]
 async fn a_train_keeps_its_chunk_order() {
     let (written, sink) = recorder();
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (train_tx, train_rx) = mpsc::channel(1);
-    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, always_online()));
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
 
     train_tx
         .send(plain_train(train_of("chunk-", 21), 250))
@@ -204,9 +227,16 @@ async fn a_train_keeps_its_chunk_order() {
 #[tokio::test(start_paused = true)]
 async fn a_third_train_waits_instead_of_growing_the_backlog() {
     let (_written, sink) = recorder();
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (train_tx, train_rx) = mpsc::channel(TRAIN_QUEUE_CAPACITY);
-    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, always_online()));
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
 
     // One becomes resident in the writer, one waits in the channel.
     train_tx
@@ -245,9 +275,16 @@ async fn a_third_train_waits_instead_of_growing_the_backlog() {
 async fn a_train_stops_once_its_surface_is_seen_to_leave() {
     let (written, sink) = recorder();
     let presence = always_online();
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (train_tx, train_rx) = mpsc::channel(1);
-    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, presence.clone()));
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        presence.clone(),
+    ));
 
     train_tx
         .send(TrainFrame {
@@ -289,9 +326,10 @@ async fn a_train_for_a_surface_never_seen_online_is_delivered_whole() {
     let presence = FakePresence {
         online: Arc::new(Mutex::new(false)),
     };
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (train_tx, train_rx) = mpsc::channel(1);
-    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, presence));
+    let writer = tokio::spawn(drive_writer(ping_rx, now_rx, train_rx, sink, presence));
 
     train_tx
         .send(plain_train(train_of("chunk-", 6), 250))
@@ -314,9 +352,11 @@ async fn a_train_for_a_surface_never_seen_online_is_delivered_whole() {
 /// A write failure ends the writer, which is how the session learns the socket is gone.
 #[tokio::test(start_paused = true)]
 async fn a_failed_write_stops_the_writer() {
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (_train_tx, train_rx) = mpsc::channel(1);
     let writer = tokio::spawn(drive_writer(
+        ping_rx,
         now_rx,
         train_rx,
         RecordingSink {
@@ -347,9 +387,16 @@ async fn a_failed_write_stops_the_writer() {
 /// the property the guard depends on.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_writer_can_be_cancelled_when_its_session_ends() {
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
     let (now_tx, now_rx) = mpsc::channel(64);
     let (train_tx, train_rx) = mpsc::channel(1);
-    let task = tokio::spawn(drive_writer(now_rx, train_rx, StalledSink, always_online()));
+    let task = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        StalledSink,
+        always_online(),
+    ));
 
     now_tx
         .send(text("frame-that-never-lands"))
@@ -411,52 +458,106 @@ async fn a_saturated_train_queue_reports_busy_instead_of_parking_the_caller() {
     );
 }
 
-/// The relay must not out-run the broker's publish allowance.
+/// A heartbeat ping must not wait behind data.
 ///
-/// Going over is silent: the broker drops the frame and keeps the socket open
-/// (`crates/relay-broker/src/lib.rs`, the `rate_limited` branch `continue`s). A dropped
-/// transcript delta is lost content; a dropped chunk costs the client its full
-/// 15-second timeout, because a chunked reply resolves only once every chunk lands.
-/// Neither is recoverable, and neither is visible.
+/// Two independent reasons, both of which cost a healthy session:
 ///
-/// The writer is now the single point every outbound frame passes through, which makes
-/// it the only place this can be enforced. Slowing down is always recoverable; being
-/// silently discarded is not.
+///   * The broker's publish allowance counts only `ClientMessage::Publish` frames — a
+///     websocket Ping is a control frame it answers separately — so a ping is never
+///     what puts this relay over a limit, and delaying it buys nothing.
+///   * The session arms its pong deadline when it *hands a ping over*, not when the
+///     ping reaches the socket. A ping queued behind a burst of snapshots therefore
+///     reads as a dead peer, and the session tears itself down while the connection is
+///     perfectly fine — taking every queued frame with it, since the guard aborts the
+///     writer on the way out.
 #[tokio::test(start_paused = true)]
-async fn the_writer_stays_under_the_brokers_publish_allowance() {
+async fn a_heartbeat_ping_overtakes_queued_data() {
     let (written, sink) = recorder();
-    let (now_tx, now_rx) = mpsc::channel(4096);
-    let (_train_tx, train_rx) = mpsc::channel(1);
-    let writer = tokio::spawn(drive_writer(now_rx, train_rx, sink, always_online()));
+    let (ping_tx, ping_rx) = mpsc::channel(4);
+    let (now_tx, now_rx) = mpsc::channel(64);
+    let (train_tx, train_rx) = mpsc::channel(1);
 
-    let started_at = Instant::now();
-    for index in 0..(OUTBOUND_RATE_LIMIT_PER_MINUTE + 20) {
+    // Queue data first, and a train, so every other lane has work waiting.
+    for index in 0..40 {
         now_tx
-            .send(text(&format!("frame-{index}")))
+            .send(text(&format!("snapshot-{index}")))
             .await
-            .expect("frame should queue");
+            .expect("data should queue");
     }
+    train_tx
+        .send(plain_train(train_of("chunk-", 10), 250))
+        .await
+        .expect("train should queue");
+    ping_tx
+        .send(Message::Ping(vec![7]))
+        .await
+        .expect("ping should queue");
 
-    // Let the writer run as far as its own limiter allows within the window.
-    tokio::time::sleep(Duration::from_secs(59)).await;
-    let within_window = written.lock().unwrap().len();
-    assert!(
-        within_window <= OUTBOUND_RATE_LIMIT_PER_MINUTE,
-        "wrote {within_window} frames inside one 60s window, over the {OUTBOUND_RATE_LIMIT_PER_MINUTE} \
-         budget — the broker would have silently dropped the excess"
-    );
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
+    tokio::time::sleep(Duration::from_millis(1)).await;
 
-    // And the surplus is delayed, not dropped: it goes out once the window rolls.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let after_window = written.lock().unwrap().len();
-    assert!(
-        after_window > within_window,
-        "the frames held back by the limiter must still be sent once there is room; \
-         held {within_window}, then {after_window}"
-    );
-    let _ = started_at;
-
+    let seen = written.lock().unwrap().len();
+    drop(ping_tx);
     drop(now_tx);
-    drop(_train_tx);
+    drop(train_tx);
     let _ = writer.await;
+
+    let written = written.lock().unwrap().clone();
+    let ping_at = written
+        .iter()
+        .position(|entry| entry == "PING")
+        .unwrap_or_else(|| panic!("the ping must be sent at all; got {written:?}"));
+    assert_eq!(
+        ping_at, 0,
+        "the ping must go out before the queued snapshots, not after {ping_at} of them"
+    );
+    let _ = seen;
+}
+
+/// …including when the writer is idle, which is where it spends almost all its time.
+///
+/// The overtaking test above pre-queues data, so it only proves the ping wins a race it
+/// was already in. The idle wait is a different code path, and a version of it that
+/// forgets the ping arm does not merely delay a heartbeat: nothing notices the ping
+/// until some unrelated frame happens to wake the loop, so a quiet, healthy connection
+/// times out on its own pong deadline. That is how this was actually broken.
+#[tokio::test(start_paused = true)]
+async fn an_idle_writer_still_notices_a_ping() {
+    let (written, sink) = recorder();
+    let (ping_tx, ping_rx) = mpsc::channel(4);
+    let (now_tx, now_rx) = mpsc::channel(64);
+    let (train_tx, train_rx) = mpsc::channel(1);
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
+
+    // Let the writer settle into its idle wait with nothing queued at all.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ping_tx
+        .send(Message::Ping(vec![1]))
+        .await
+        .expect("ping should queue");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let seen = written.lock().unwrap().clone();
+    drop(ping_tx);
+    drop(now_tx);
+    drop(train_tx);
+    let _ = writer.await;
+
+    assert_eq!(
+        seen,
+        vec!["PING".to_string()],
+        "an idle writer must wake for a ping without needing other traffic to nudge it"
+    );
 }

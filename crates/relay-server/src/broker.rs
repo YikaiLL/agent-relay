@@ -1070,8 +1070,7 @@ async fn run_broker_session_with_liveness(
                 heartbeat_seq = heartbeat_seq.wrapping_add(1);
                 let payload = heartbeat_seq.to_be_bytes().to_vec();
                 writer
-                    .send_now(Message::Ping(payload.clone()))
-                    .await
+                    .send_ping(Message::Ping(payload.clone()))
                     .map_err(|error| BrokerSessionError::after_connected(format!("broker heartbeat ping failed: {error}"), connected_at))?;
                 debug!(heartbeat_seq, "sent broker heartbeat ping");
                 awaiting_pong = Some(payload);

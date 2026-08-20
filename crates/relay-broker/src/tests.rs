@@ -4381,3 +4381,33 @@ async fn a_surface_is_still_held_to_the_tighter_publish_budget() {
         other => panic!("a surface over its budget must still be limited, got {other:?}"),
     }
 }
+
+/// Splitting the publish allowance must not quietly widen a deployment that had
+/// deliberately tightened it.
+///
+/// `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE` used to govern every peer. An operator
+/// who set it low did so on purpose, and an upgrade that promotes relays to the much
+/// larger relay default would be a hardening setting weakening itself on their behalf.
+/// So the generic limit keeps governing relays until they opt into the split.
+#[test]
+fn an_explicit_generic_publish_limit_still_governs_relays() {
+    assert_eq!(
+        resolve_relay_publish_rate_limit(None, Some("60")).expect("limit parses"),
+        60,
+        "an operator who tightened the generic limit must keep it for relays too"
+    );
+    assert_eq!(
+        resolve_relay_publish_rate_limit(Some("900"), Some("60")).expect("limit parses"),
+        900,
+        "setting the relay limit is how they opt into the split"
+    );
+    assert_eq!(
+        resolve_relay_publish_rate_limit(None, None).expect("limit parses"),
+        DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE,
+        "an untouched deployment gets the relay default"
+    );
+    assert!(
+        resolve_relay_publish_rate_limit(None, Some("nonsense")).is_err(),
+        "a malformed limit must fail loudly rather than fall back to a wider default"
+    );
+}

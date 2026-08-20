@@ -519,10 +519,7 @@ impl BrokerHardeningConfig {
                 PUBLISH_RATE_LIMIT_ENV,
                 DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE,
             )?,
-            relay_publish_rate_limit_per_minute: parse_usize_env(
-                RELAY_PUBLISH_RATE_LIMIT_ENV,
-                DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE,
-            )?,
+            relay_publish_rate_limit_per_minute: relay_publish_rate_limit_from_env()?,
             max_connections_per_ip: parse_usize_env(
                 MAX_CONNECTIONS_PER_IP_ENV,
                 DEFAULT_MAX_CONNECTIONS_PER_IP,
@@ -2695,6 +2692,40 @@ fn parse_u64_env(name: &str, default: u64) -> Result<u64, String> {
             .map_err(|error| format!("{name} must be a positive integer: {error}")),
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid utf-8")),
+    }
+}
+
+/// The relay's publish allowance, with a migration path.
+///
+/// Before relays and surfaces had separate budgets, `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE`
+/// governed every peer. An operator who deliberately tightened it would otherwise find
+/// relays silently promoted to the far larger relay default on upgrade — a hardening
+/// setting quietly weakening itself is the wrong way round. So an explicitly configured
+/// generic limit keeps governing relays too, until the operator opts into the split by
+/// setting the relay-specific variable.
+fn relay_publish_rate_limit_from_env() -> Result<usize, String> {
+    resolve_relay_publish_rate_limit(
+        std::env::var(RELAY_PUBLISH_RATE_LIMIT_ENV).ok().as_deref(),
+        std::env::var(PUBLISH_RATE_LIMIT_ENV).ok().as_deref(),
+    )
+}
+
+/// Split out from the environment so the migration rule can be tested without mutating
+/// process-wide state that the concurrent server tests also read.
+fn resolve_relay_publish_rate_limit(
+    relay_setting: Option<&str>,
+    generic_setting: Option<&str>,
+) -> Result<usize, String> {
+    let parse = |name: &str, value: &str| {
+        value
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| format!("{name} must be a positive integer: {error}"))
+    };
+    match (relay_setting, generic_setting) {
+        (Some(relay), _) => parse(RELAY_PUBLISH_RATE_LIMIT_ENV, relay),
+        (None, Some(generic)) => parse(PUBLISH_RATE_LIMIT_ENV, generic),
+        (None, None) => Ok(DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE),
     }
 }
 
