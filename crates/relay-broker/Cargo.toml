@@ -26,3 +26,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
+# `test-util` is NOT part of tokio's `full`, and time-dependent metrics need paused time
+# to be tested without sleeping through a real minute.
+tokio = { workspace = true, features = ["test-util"] }
