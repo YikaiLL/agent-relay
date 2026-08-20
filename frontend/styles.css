@@ -451,6 +451,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 :root {
   --sidebar-width: 300px;
   --right-rail-width: 320px;
+  /* The sidebar's leading gutter, set by something the app does not draw: on the
+     desktop window the close button is the first thing on this edge, so every row in
+     the column starts where it starts — traffic lights, collapse toggle and the
+     Sessions/Tasks pills on one left edge instead of three.
+
+     13px is MEASURED, not derived. A 2x window capture puts the close button's first
+     painted pixel at device x=26 and its centre at CSS 20.0, i.e. a 14px-wide button
+     whose left edge lands on 13. Deriving it instead — "12px buttons, centre at 20,
+     so 14" — is what shipped first, and it was off by exactly the 1px the eye picks
+     up when a pill sits under a circle. Re-measure before changing it; do not
+     recompute it from remembered button sizes.
+     Guarded by frontend/sidebar-gutter-style-guard.test.mjs. */
+  --sidebar-gutter: 13px;
 }
 
 /* Outer frame: the 64px icon rail sits OUTSIDE the .app-shell grid so none of the
@@ -641,7 +654,10 @@ body.is-resizing-panel .right-rail {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  padding: 20px;
+  /* Horizontal padding is the gutter token, not a number: it is the ONLY inset
+     between the window edge and every row in this column, so a child that adds its
+     own re-opens the ragged left edge this replaced. */
+  padding: 20px var(--sidebar-gutter);
   background-color: var(--bg-surface);
   border-right: 1px solid var(--border-subtle);
   color: var(--text-secondary);
@@ -6562,11 +6578,15 @@ body.is-resizing-panel {
    Navigation position is not an action, so it does not get the accent — and the
    selected row must not reuse the raised/shadowed pill, which is the app's
    button treatment. */
+/* No horizontal margin. It used to carry 10px, which stacked on the sidebar's own
+   padding and started these two pills further in than every other row in the column
+   — including the collapse toggle directly above them. The sidebar's gutter is the
+   only inset now; this rule sets vertical rhythm and nothing else. */
 .sidebar-nav {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  margin: 2px 10px 10px;
+  margin: 2px 0 10px;
 }
 .sidebar-nav-row {
   display: flex;
