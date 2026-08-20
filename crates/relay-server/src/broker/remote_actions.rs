@@ -35,7 +35,15 @@ const SESSION_CONTROL_REQUIRED_ERROR: &str =
     "broker transport auth only grants room access; session claim is missing or expired";
 const REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES: usize = 32_768;
 const REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES: usize = 1_024;
-const REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS: u64 = 250;
+/// Gap between chunks of one reply.
+///
+/// This used to be 250ms, chosen when every peer shared a 4-publishes-a-second budget.
+/// At that pace 61 chunks take the client's entire 15-second action deadline before the
+/// last one lands, so a large-but-legitimate reply — a workspace diff may be megabytes —
+/// could never arrive at all. Relays now have their own, far larger allowance, and the
+/// writer interleaves ordinary traffic into these gaps rather than being blocked by
+/// them, so the gap only needs to be big enough to stay interleavable.
+const REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS: u64 = 50;
 const REMOTE_ACTION_SLOW_WARN_MILLIS: u128 = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

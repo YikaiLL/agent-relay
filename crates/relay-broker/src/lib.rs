@@ -69,21 +69,21 @@ const DEFAULT_PUBLIC_API_RATE_LIMIT_PER_MINUTE: usize = 120;
 const DEFAULT_JOIN_RATE_LIMIT_PER_MINUTE: usize = 40;
 /// Publish allowance for a surface peer: a browser tab sending user-driven actions.
 const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
-/// Publish allowance for a relay peer, which is first-party and an order of magnitude
-/// busier than a surface.
+/// Publish allowance for a relay peer, which is first-party and not traffic-shaped by
+/// this limiter.
 ///
-/// A relay's own constants put it far past the surface budget: transcript deltas are
-/// batched into a 100ms window (up to 10 publishes a second while streaming), snapshots
-/// get their own 500ms floor (2 a second), and a chunked action reply paces at 4 a
-/// second on top. The surface allowance is 4 a second in total, so a streaming relay
-/// used to spend most of its time over the line — and going over is silent: the frame is
-/// dropped and the socket stays open. Dropped transcript deltas are lost content;
-/// dropped chunks cost the client a 15-second timeout, because a chunked reply resolves
-/// only once every chunk lands.
+/// Derived from what a relay can legitimately emit rather than guessed. Transcript
+/// deltas drain on a 100ms timer and publish one frame each, up to
+/// `MAX_DELTAS_PER_DRAIN = 50` per drain — 500 a second — and every watched thread
+/// streams at once, so a busy relay is nowhere near a surface's 4-a-second budget.
 ///
-/// 20 a second leaves headroom above the relay's own worst case without giving an
-/// abusive peer a bigger hole: a surface is still held to the budget above.
-const DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 1_200;
+/// Going over is silent: the broker drops the frame and keeps the socket open. A
+/// dropped transcript delta the client can repair (it notices the gap and refetches);
+/// a dropped chunk it cannot, and costs a full action timeout. So for a relay this
+/// limit is a runaway backstop, not a shaper — it should sit above anything real
+/// traffic can produce. Surfaces, which are the actual abuse surface, keep the tight
+/// budget above.
+const DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 30_000;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;

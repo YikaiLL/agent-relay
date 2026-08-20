@@ -561,3 +561,57 @@ async fn an_idle_writer_still_notices_a_ping() {
         "an idle writer must wake for a ping without needing other traffic to nudge it"
     );
 }
+
+/// A reply must start streaming even while ordinary traffic keeps arriving.
+///
+/// The writer drains an ordinary frame and loops, and only looks for a new train when
+/// the ordinary queue is momentarily empty. A slow socket, a reconnect's delta backlog,
+/// or plain sustained snapshot traffic can therefore keep a queued reply from ever being
+/// *accepted* — and the client, which cannot see any of this, just times out.
+///
+/// The neighbouring "sustained traffic" test queues the train first, so it only proves a
+/// train already under way survives noise. This is the order that actually breaks:
+/// noise first, train second.
+#[tokio::test(start_paused = true)]
+async fn a_train_starts_even_while_ordinary_traffic_keeps_arriving() {
+    let (written, sink) = recorder();
+    let (_ping_tx, ping_rx) = mpsc::channel(4);
+    let (now_tx, now_rx) = mpsc::channel(512);
+    let (train_tx, train_rx) = mpsc::channel(1);
+
+    // A backlog is already waiting when the reply is queued behind it.
+    for index in 0..200 {
+        now_tx
+            .send(text(&format!("noise-{index}")))
+            .await
+            .expect("noise should queue");
+    }
+    train_tx
+        .send(plain_train(train_of("chunk-", 5), 250))
+        .await
+        .expect("train should queue");
+
+    let writer = tokio::spawn(drive_writer(
+        ping_rx,
+        now_rx,
+        train_rx,
+        sink,
+        always_online(),
+    ));
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let seen = written.lock().unwrap().clone();
+    drop(now_tx);
+    drop(train_tx);
+    let _ = writer.await;
+
+    let first_chunk_at = seen
+        .iter()
+        .position(|entry| entry.starts_with("chunk-"))
+        .unwrap_or_else(|| panic!("the reply never started; wrote {} frames", seen.len()));
+    assert!(
+        first_chunk_at < 20,
+        "the reply waited behind {first_chunk_at} ordinary frames before its first chunk \
+         went out; a backlog must not postpone a reply the client is timing"
+    );
+}

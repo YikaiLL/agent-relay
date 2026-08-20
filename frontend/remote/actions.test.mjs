@@ -994,3 +994,148 @@ test("verbose broker logging restores the discarded-frame trace", async () => {
     "with the flag on, the routing trace must come back — otherwise the gate is a delete"
   );
 });
+
+// A chunked reply is paced by the relay, so its wall time scales with the payload. The
+// action deadline was armed once when the request went out and never moved, which makes
+// a large-but-legitimate reply *deterministically* undeliverable: chunks are ~32KiB and
+// paced 250ms apart, so 61 of them take the full 15s budget on their own. A ~2MB
+// workspace diff reaches that, and the relay will happily produce a 4MB one.
+//
+// A chunk arriving is proof the relay is alive and working. The deadline should catch a
+// STALLED transfer, not put a ceiling on a healthy one.
+test("each chunk of a reply extends the action deadline", async () => {
+  const browser = installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  // Stand in for a dispatched action awaiting its reply.
+  let rejected = null;
+  const timers = [];
+  const realSetTimeout = globalThis.window.setTimeout;
+  globalThis.window.setTimeout = (callback, delay) => {
+    timers.push({ callback, delay });
+    return timers.length;
+  };
+  state.pendingActions.set("action-big", {
+    actionType: "fetch_workspace_diff",
+    timeoutId: 0,
+    reject: (error) => {
+      rejected = error;
+    },
+    resolve: () => {},
+  });
+
+  const armedBefore = timers.length;
+  await handleRemoteBrokerPayload({
+    kind: "remote_action_result_chunk",
+    action_id: "action-big",
+    action: "fetch_workspace_diff",
+    chunk_index: 0,
+    chunk_count: 61,
+    data_base64: "cGF5bG9hZA==",
+  });
+  globalThis.window.setTimeout = realSetTimeout;
+
+  assert.equal(rejected, null, "a chunk must not settle the action");
+  assert.ok(
+    timers.length > armedBefore,
+    "a chunk must re-arm the action deadline: without that, a reply the relay paces "
+      + "over more than 15s can never be delivered no matter how healthy the link is"
+  );
+  void browser;
+});
+
+// The earlier fix only stopped OTHER surfaces' frames from re-rendering the app. A
+// reply addressed to this surface still logged on the accepted path, and
+// `encrypted_remote_action_result_chunk` was never in the high-volume mute list — so a
+// 21-chunk workspace diff meant for this very tab still cost 21 full RemoteApp
+// re-renders here, plus another 21 from the inbound log in broker-client.
+test("this surface's own chunks do not each re-render the app", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  const { encryptJson } = await import("./crypto.js");
+  const envelopes = [];
+  for (let index = 0; index < 12; index += 1) {
+    envelopes.push(
+      await encryptJson("payload-secret-1", {
+        action_id: "action-mine",
+        action: "fetch_workspace_diff",
+        chunk_index: index,
+        chunk_count: 21,
+        data_base64: "cGF5bG9hZA==",
+      })
+    );
+  }
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+
+  try {
+    for (let index = 0; index < 12; index += 1) {
+      await handleRemoteBrokerPayload({
+        kind: "encrypted_remote_action_result_chunk",
+        action_id: "action-mine",
+        action: "fetch_workspace_diff",
+        chunk_index: index,
+        chunk_count: 21,
+        target_peer_id: "surface-mine",
+        device_id: "device-1",
+        envelope: envelopes[index],
+      });
+    }
+  } finally {
+    unsubscribe();
+  }
+
+  assert.equal(
+    notifications,
+    0,
+    "streaming a reply to this surface must not re-render the whole app once per chunk"
+  );
+});

@@ -745,8 +745,13 @@ function logInboundBrokerMessage(frame) {
   console.log(message);
 }
 
+/// See the note on the matching list in `actions.js`: these arrive in bursts, and one
+/// log line per frame is one full RemoteApp re-render per frame.
 function isHighVolumeBrokerPayloadKind(kind) {
-  return kind === "transcript_delta" || kind === "encrypted_transcript_delta";
+  return kind === "transcript_delta"
+    || kind === "encrypted_transcript_delta"
+    || kind === "remote_action_result_chunk"
+    || kind === "encrypted_remote_action_result_chunk";
 }
 
 function isVerboseBrokerLoggingEnabled() {

@@ -334,20 +334,15 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
             continue;
         }
 
-        // 2. Ordinary traffic, which is what "overtakes the train" means: it goes out
-        //    during the pacing gap instead of queueing behind every chunk.
-        match now_rx.try_recv() {
-            Ok(message) => {
-                sink.send_frame(message).await?;
-                continue;
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => now_closed = true,
-            Err(mpsc::error::TryRecvError::Empty) => {}
-        }
-
-        // 3. Take on a new train only when the previous one is done. Leaving the next
-        //    train in its channel is what bounds the backlog: the producer waits there
-        //    rather than piling megabytes into this task.
+        // 2. Take on a waiting reply BEFORE draining ordinary traffic. Accepting one
+        //    sends nothing — it only makes its first chunk due, so step 1 can start
+        //    interleaving it with the ordinary frames below. Draining first instead
+        //    meant a backlog (a slow socket, a reconnect's delta catch-up, plain
+        //    sustained snapshots) could keep a queued reply from ever being accepted,
+        //    while the client sat there timing it.
+        //
+        //    Still only one at a time: leaving the next in its channel is what bounds
+        //    the backlog, and what keeps `watch_target` describing exactly one reply.
         if train.is_empty() {
             match train_rx.try_recv() {
                 Ok(frame) => {
@@ -363,6 +358,17 @@ pub(super) async fn drive_writer<S: FrameSink, P: SurfacePresence>(
                 Err(mpsc::error::TryRecvError::Disconnected) => train_closed = true,
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
+        }
+
+        // 3. Ordinary traffic, which is what "overtakes the train" means: it goes out
+        //    during the pacing gap instead of queueing behind every chunk.
+        match now_rx.try_recv() {
+            Ok(message) => {
+                sink.send_frame(message).await?;
+                continue;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => now_closed = true,
+            Err(mpsc::error::TryRecvError::Empty) => {}
         }
 
         // 4. Wait for whichever comes first.

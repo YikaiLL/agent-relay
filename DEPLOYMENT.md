@@ -333,7 +333,7 @@ Optional hardening env:
 - `RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE`
 - `RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE`
 - `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE` — surface peers (default 240)
-- `RELAY_BROKER_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE` — relay peers (default 1200).
+- `RELAY_BROKER_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE` — relay peers (default 30000).
   Relays are first-party and an order of magnitude busier than a surface: transcript
   deltas alone batch into a 100ms window. Going over is **silent** — the broker drops
   the frame and keeps the socket open — which costs transcript content and makes

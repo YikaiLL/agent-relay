@@ -424,8 +424,14 @@ function logDecryptedTranscriptDelta(delta) {
   console.log(message);
 }
 
+/// Kinds that arrive in bursts, where one log line per frame means one full RemoteApp
+/// re-render per frame. Chunked action replies belong here for the same reason
+/// transcript deltas do: a single workspace diff is tens of frames, and each one was
+/// costing a render on the accepted path even when the reply was for this very surface.
 function isHighVolumeEncryptedPayloadKind(kind) {
-  return kind === "encrypted_transcript_delta" || kind === "encrypted_transcript_event";
+  return kind === "encrypted_transcript_delta"
+    || kind === "encrypted_transcript_event"
+    || kind === "encrypted_remote_action_result_chunk";
 }
 
 function isTranscriptEventKind(kind) {
@@ -552,6 +558,13 @@ function handleRemoteActionResultChunk(actionId, chunk) {
     pendingChunks.receivedCount += 1;
   }
   pendingChunks.chunks[chunkIndex] = chunk.data_base64;
+  // A chunk is proof the relay is alive and still working on this reply, so the
+  // deadline restarts. It was armed once when the request went out and never moved,
+  // which put a hard ceiling on how large a reply could ever be: the relay paces chunks
+  // 250ms apart, so 61 of them consume the whole budget before the last one lands, and
+  // a workspace diff is allowed to be far bigger than that. The deadline is meant to
+  // catch a stalled transfer, not to cap a healthy one.
+  extendPendingActionDeadline(actionId);
 
   if (pendingChunks.receivedCount !== chunkCount) {
     return;
@@ -809,6 +822,21 @@ async function buildDeviceActionPayload(actionId, actionType, request) {
       ...request,
     }),
   };
+}
+
+/// Restart the deadline for an action that is demonstrably still being answered.
+function extendPendingActionDeadline(actionId) {
+  const pending = state.pendingActions.get(actionId);
+  if (!pending) {
+    return;
+  }
+  window.clearTimeout(pending.timeoutId);
+  pending.timeoutId = window.setTimeout(() => {
+    rejectPendingAction(
+      actionId,
+      new Error(`remote ${pending.actionType} timed out waiting for relay response`)
+    );
+  }, REMOTE_ACTION_TIMEOUT_MS);
 }
 
 function registerPendingAction(actionId, actionType) {
