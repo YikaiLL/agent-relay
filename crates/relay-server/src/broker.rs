@@ -60,7 +60,6 @@ const PUBLIC_RELAY_AUTH_REQUEST_RETRY_SECS: u64 = 5;
 const PUBLIC_RELAY_REGISTRATION_SCHEMA_VERSION: u32 = 1;
 const PUBLIC_RELAY_IDENTITY_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_PUBLISH_MIN_INTERVAL_MILLIS: u64 = 500;
-const BROKER_RATE_LIMIT_SNAPSHOT_COOLDOWN_SECS: u64 = 5;
 const TRANSCRIPT_DELTA_PUBLISH_WINDOW_MILLIS: u64 = 100;
 const BROKER_MESSAGE_HANDLER_SLOW_WARN_MILLIS: u128 = 1_000;
 pub(crate) const RELAY_BROKER_IDENTITY_PATH_ENV: &str = "RELAY_BROKER_IDENTITY_PATH";
@@ -177,11 +176,6 @@ fn snapshot_publish_decision(
         Ok(()) => SnapshotPublishDecision::PublishSnapshot,
         Err(deadline) => SnapshotPublishDecision::DelayUntil(deadline),
     }
-}
-
-enum ServerMessageOutcome {
-    Continue,
-    RateLimited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1104,7 +1098,7 @@ async fn run_broker_session_with_liveness(
                 {
                     let message_name = server_message_name(&message);
                     let started_at = Instant::now();
-                    let outcome = handle_server_message(state, &writer, message)
+                    handle_server_message(state, &writer, message)
                         .await
                         .map_err(|error| BrokerSessionError::after_connected(error, connected_at))?;
                     let elapsed_ms = started_at.elapsed().as_millis();
@@ -1114,15 +1108,6 @@ async fn run_broker_session_with_liveness(
                             elapsed_ms,
                             "broker server message handling was slow"
                         );
-                    }
-                    match outcome {
-                        ServerMessageOutcome::Continue => {}
-                        ServerMessageOutcome::RateLimited => {
-                            let deadline = Instant::now()
-                                + Duration::from_secs(BROKER_RATE_LIMIT_SNAPSHOT_COOLDOWN_SECS);
-                            snapshot_publish_gate.defer_until(deadline);
-                            pending_snapshot_timer.as_mut().reset(deadline);
-                        }
                     }
                 }
             }
@@ -1146,12 +1131,11 @@ async fn handle_server_message(
     state: &AppState,
     writer: &BrokerWriter,
     message: ServerMessage,
-) -> Result<ServerMessageOutcome, String> {
+) -> Result<(), String> {
     match message {
         ServerMessage::Welcome {
             protocol_version, ..
-        } => validate_broker_protocol_version(protocol_version)
-            .map(|()| ServerMessageOutcome::Continue),
+        } => validate_broker_protocol_version(protocol_version),
         ServerMessage::Presence {
             channel_id,
             kind,
@@ -1190,7 +1174,7 @@ async fn handle_server_message(
                     )
                     .await;
             }
-            Ok(ServerMessageOutcome::Continue)
+            Ok(())
         }
         ServerMessage::Message {
             from_peer_id,
@@ -1204,58 +1188,63 @@ async fn handle_server_message(
                     ?from_role,
                     "ignoring broker message from non-surface peer"
                 );
-                return Ok(ServerMessageOutcome::Continue);
+                return Ok(());
             }
 
             match parse_inbound_payload(payload)? {
                 Some(InboundBrokerPayload::PairingRequest {
                     pairing_id,
                     envelope,
-                }) => handle_pairing_request(state, writer, from_peer_id, pairing_id, envelope)
-                    .await
-                    .map(|()| ServerMessageOutcome::Continue),
+                }) => {
+                    handle_pairing_request(state, writer, from_peer_id, pairing_id, envelope).await
+                }
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
                     session_claim,
                     device_id,
                     request,
-                }) => handle_remote_action(
-                    state,
-                    writer,
-                    from_peer_id,
-                    action_id,
-                    session_claim,
-                    device_id,
-                    request,
-                )
-                .await
-                .map(|()| ServerMessageOutcome::Continue),
+                }) => {
+                    handle_remote_action(
+                        state,
+                        writer,
+                        from_peer_id,
+                        action_id,
+                        session_claim,
+                        device_id,
+                        request,
+                    )
+                    .await
+                }
                 Some(InboundBrokerPayload::EncryptedRemoteAction {
                     action_id,
                     session_claim,
                     device_id,
                     envelope,
-                }) => handle_encrypted_remote_action(
-                    state,
-                    writer,
-                    from_peer_id,
-                    action_id,
-                    session_claim,
-                    device_id,
-                    envelope,
-                )
-                .await
-                .map(|()| ServerMessageOutcome::Continue),
-                None => Ok(ServerMessageOutcome::Continue),
+                }) => {
+                    handle_encrypted_remote_action(
+                        state,
+                        writer,
+                        from_peer_id,
+                        action_id,
+                        session_claim,
+                        device_id,
+                        envelope,
+                    )
+                    .await
+                }
+                None => Ok(()),
             }
         }
         ServerMessage::Error { code, message } => {
             if code == "rate_limited" {
-                warn!(%message, "broker requested publish backpressure");
-                Ok(ServerMessageOutcome::RateLimited)
-            } else {
-                Err(message)
+                // Not backpressure — an admission that a frame was already discarded,
+                // with no way to learn which. Deferring the next snapshot cannot bring
+                // it back. Ending the session reconnects and resyncs, and the surface
+                // fails its in-flight actions on the disconnect instead of waiting out
+                // a deadline for chunks that will never arrive.
+                warn!(%message, "broker dropped a publish; ending the session to resync");
             }
+            Err(message)
         }
     }
 }

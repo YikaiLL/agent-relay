@@ -751,7 +751,9 @@ function isHighVolumeBrokerPayloadKind(kind) {
   return kind === "transcript_delta"
     || kind === "encrypted_transcript_delta"
     || kind === "remote_action_result_chunk"
-    || kind === "encrypted_remote_action_result_chunk";
+    || kind === "encrypted_remote_action_result_chunk"
+    || kind === "session_snapshot"
+    || kind === "encrypted_session_snapshot";
 }
 
 function isVerboseBrokerLoggingEnabled() {

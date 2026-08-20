@@ -2071,3 +2071,78 @@ async fn a_departing_surface_does_not_stall_the_relay_for_everyone_else() {
          got {chunks} chunks. Frames: {kinds:?}"
     );
 }
+
+/// A dropped publish must never pass unnoticed.
+///
+/// The broker's answer to an over-budget peer is to discard that frame and keep the
+/// socket open. The relay used to treat the resulting `rate_limited` as mild
+/// backpressure and merely delay its next snapshot — but nothing about that recovers
+/// the frame that was already thrown away, and the relay cannot even tell which one it
+/// was. A discarded transcript delta the client can repair; a discarded chunk it
+/// cannot, and the reply it belongs to can then only time out.
+///
+/// So it is fatal. The session ends, reconnects, and resyncs — and the surface fails its
+/// in-flight actions immediately on the disconnect rather than waiting out a deadline
+/// for chunks that will never come. A visible, self-healing reconnect beats silent
+/// corruption; the allowance is sized so this should not happen in the first place.
+#[tokio::test]
+async fn a_dropped_publish_ends_the_session_instead_of_passing_unnoticed() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should resolve");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("broker should accept");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        let welcome = ServerMessage::Welcome {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            channel_id: "room-stalled".to_string(),
+            peer_id: "relay-stalled".to_string(),
+            peers: Vec::new(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&welcome).expect("welcome serializes"),
+            ))
+            .await
+            .expect("welcome sends");
+        let rate_limited = ServerMessage::Error {
+            code: "rate_limited".to_string(),
+            message: "broker publish rate limit exceeded for this peer".to_string(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&rate_limited).expect("error serializes"),
+            ))
+            .await
+            .expect("error sends");
+        std::future::pending::<()>().await;
+    });
+
+    let config = heartbeat_test_config(format!("ws://{address}")).await;
+    let state = broker_test_state();
+    let mut change_rx = state.subscribe();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_broker_session_with_liveness(
+            &state,
+            &mut change_rx,
+            &config,
+            BrokerLivenessConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(30),
+            },
+        ),
+    )
+    .await
+    .expect("the session must not sit there after a frame was dropped");
+
+    assert!(
+        outcome.is_err(),
+        "a dropped publish must end the session so it reconnects and resyncs, rather \
+         than continuing with a hole in what the surface received"
+    );
+}

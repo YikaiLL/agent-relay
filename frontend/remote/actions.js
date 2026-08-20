@@ -75,6 +75,10 @@ export async function handleRemoteBrokerPayload(payload) {
   }
 
   if (kind === "session_snapshot") {
+    if (!isVerboseBrokerLoggingEnabled()) {
+      onApplySessionSnapshot(payload.snapshot);
+      return;
+    }
     const message = `[scroll-source] kind=session_snapshot entries=${payload.snapshot?.transcript?.length || 0} truncated=${payload.snapshot?.transcript_truncated ? "1" : "0"} has_truncated=${Object.prototype.hasOwnProperty.call(payload.snapshot || {}, "transcript_truncated") ? "1" : "0"} thread=${payload.snapshot?.active_thread_id || "-"} status=${payload.snapshot?.current_status || "-"}`;
     renderLog(message);
     // TODO(remote-monitor-debug): Remove this console mirror once snapshot routing is stable.
@@ -408,6 +412,9 @@ function logAcceptedEncryptedPayload(kind, payload) {
 }
 
 function logDecryptedSessionSnapshot(kind, snapshot) {
+  if (!isVerboseBrokerLoggingEnabled()) {
+    return;
+  }
   const message = `[broker-decrypt] kind=${kind} thread=${snapshot?.active_thread_id || "-"} entries=${snapshot?.transcript?.length || 0} truncated=${snapshot?.transcript_truncated ? "1" : "0"} status=${snapshot?.current_status || "-"} turn=${snapshot?.active_turn_id || "-"}`;
   renderLog(message);
   // TODO(remote-monitor-debug): Remove this console mirror once broker routing is stable.
@@ -431,7 +438,8 @@ function logDecryptedTranscriptDelta(delta) {
 function isHighVolumeEncryptedPayloadKind(kind) {
   return kind === "encrypted_transcript_delta"
     || kind === "encrypted_transcript_event"
-    || kind === "encrypted_remote_action_result_chunk";
+    || kind === "encrypted_remote_action_result_chunk"
+    || kind === "encrypted_session_snapshot";
 }
 
 function isTranscriptEventKind(kind) {
@@ -554,17 +562,22 @@ function handleRemoteActionResultChunk(actionId, chunk) {
     return;
   }
 
-  if (pendingChunks.chunks[chunkIndex] == null) {
+  const advancedTransfer = pendingChunks.chunks[chunkIndex] == null;
+  if (advancedTransfer) {
     pendingChunks.receivedCount += 1;
   }
   pendingChunks.chunks[chunkIndex] = chunk.data_base64;
-  // A chunk is proof the relay is alive and still working on this reply, so the
-  // deadline restarts. It was armed once when the request went out and never moved,
+  // A chunk that ADVANCES the transfer is proof the relay is alive and still working on
+  // this reply, so the deadline restarts. A repeat of one already held is not: renewing
+  // on those would hand a stalled action an unlimited lease, kept alive forever by a
+  // peer re-sending the same frame. It was armed once when the request went out and never moved,
   // which put a hard ceiling on how large a reply could ever be: the relay paces chunks
   // 250ms apart, so 61 of them consume the whole budget before the last one lands, and
   // a workspace diff is allowed to be far bigger than that. The deadline is meant to
   // catch a stalled transfer, not to cap a healthy one.
-  extendPendingActionDeadline(actionId);
+  if (advancedTransfer) {
+    extendPendingActionDeadline(actionId);
+  }
 
   if (pendingChunks.receivedCount !== chunkCount) {
     return;

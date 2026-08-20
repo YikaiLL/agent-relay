@@ -1139,3 +1139,130 @@ test("this surface's own chunks do not each re-render the app", async () => {
     "streaming a reply to this surface must not re-render the whole app once per chunk"
   );
 });
+
+// Extending the deadline on every chunk, rather than on every chunk that advances the
+// transfer, hands a stalled action an unlimited lease: a peer that re-sends chunk 0
+// forever keeps the action alive and its partial buffer retained, and it never fails.
+// Only progress should count as proof of life.
+test("a repeated chunk does not renew the action deadline", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  const timers = [];
+  const realSetTimeout = globalThis.window.setTimeout;
+  globalThis.window.setTimeout = (callback, delay) => {
+    timers.push({ callback, delay });
+    return timers.length;
+  };
+  state.pendingActions.set("action-stalled", {
+    actionType: "fetch_workspace_diff",
+    timeoutId: 0,
+    reject: () => {},
+    resolve: () => {},
+  });
+
+  const sendChunkZero = () =>
+    handleRemoteBrokerPayload({
+      kind: "remote_action_result_chunk",
+      action_id: "action-stalled",
+      action: "fetch_workspace_diff",
+      chunk_index: 0,
+      chunk_count: 61,
+      data_base64: "cGF5bG9hZA==",
+    });
+
+  await sendChunkZero();
+  const afterFirst = timers.length;
+  await sendChunkZero();
+  await sendChunkZero();
+  globalThis.window.setTimeout = realSetTimeout;
+
+  assert.equal(
+    timers.length,
+    afterFirst,
+    "re-sending a chunk already held must not buy the action another full deadline"
+  );
+});
+
+// Snapshots for this surface still logged on three separate paths — inbound, accepted,
+// and decrypted — each one a `patchRemoteState`, i.e. a full RemoteApp re-render. A
+// snapshot can arrive every 500ms, so an active session was paying several whole-app
+// renders a second purely for tracing. Applying the snapshot legitimately notifies the
+// store; the tracing around it should not.
+test("this surface's own snapshots do not re-render the app just to be traced", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { configureRemoteActions, handleRemoteBrokerPayload } = await import("./actions.js");
+  const { encryptJson } = await import("./crypto.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+
+  // The snapshot is swallowed, so anything the store hears is tracing, not rendering.
+  configureRemoteActions({ onApplySessionSnapshot() {} });
+  const envelope = await encryptJson("payload-secret-1", {
+    active_thread_id: "thread-a",
+    current_status: "idle",
+    transcript: [],
+  });
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+  try {
+    await handleRemoteBrokerPayload({
+      kind: "encrypted_session_snapshot",
+      target_peer_id: "surface-mine",
+      device_id: "device-1",
+      envelope,
+    });
+  } finally {
+    unsubscribe();
+  }
+
+  assert.equal(
+    notifications,
+    0,
+    "tracing a snapshot must not re-render the whole app; at one snapshot per 500ms "
+      + "that is several full renders a second spent on diagnostics"
+  );
+});

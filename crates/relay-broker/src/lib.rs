@@ -80,10 +80,17 @@ const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
 /// Going over is silent: the broker drops the frame and keeps the socket open. A
 /// dropped transcript delta the client can repair (it notices the gap and refetches);
 /// a dropped chunk it cannot, and costs a full action timeout. So for a relay this
-/// limit is a runaway backstop, not a shaper — it should sit above anything real
-/// traffic can produce. Surfaces, which are the actual abuse surface, keep the tight
-/// budget above.
-const DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 30_000;
+/// limit is a runaway backstop, not a shaper — it must sit above the SUM of what real
+/// traffic produces, not merely above its largest component: deltas at 500/s, a chunked
+/// reply at 20/s, and snapshots at 2/s together already exceed the delta bound alone.
+/// Surfaces, which are the actual abuse surface, keep the tight budget above.
+///
+/// Crossing it is no longer silent — the relay treats a dropped publish as fatal and
+/// resyncs — so this number decides how often that costs a reconnect, not whether data
+/// can vanish. What it does NOT bound is bytes: 36000 frames of up to 64KiB is a lot of
+/// bandwidth for one peer, and a byte-rate limit is the right control for that. It does
+/// not exist yet.
+const DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 36_000;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
