@@ -657,28 +657,10 @@ async function dispatchRemoteAction(actionType, request) {
   }
 
   const actionId = makeActionId(actionType);
-  const resultPromise = registerPendingAction(actionId, actionType);
+  const resultPromise = registerPendingAction(actionId, actionType, request);
 
   try {
-    if (actionType === "claim_challenge") {
-      sendBrokerFrame(await buildClaimChallengePayload(actionId));
-      return await resultPromise;
-    }
-
-    if (actionType === "claim_device") {
-      sendBrokerFrame(await buildClaimDevicePayload(actionId, request));
-      return await resultPromise;
-    }
-
-    if (requiresSessionClaim(actionType) && !state.remoteAuth.sessionClaim) {
-      throw new Error("device is not claimed yet");
-    }
-
-    sendBrokerFrame(
-      requiresSessionClaim(actionType)
-        ? await buildClaimedActionPayload(actionId, actionType, request)
-        : await buildDeviceActionPayload(actionId, actionType, request)
-    );
+    await sendRemoteActionFrame(actionId, actionType, request);
     return await resultPromise;
   } catch (error) {
     const pending = state.pendingActions.get(actionId);
@@ -837,6 +819,68 @@ async function buildDeviceActionPayload(actionId, actionType, request) {
   };
 }
 
+/// Build and send the frame for one action attempt.
+///
+/// Separate from `dispatchRemoteAction` so a resend can reproduce the request under its
+/// ORIGINAL action id — see `resendPendingActions`.
+async function sendRemoteActionFrame(actionId, actionType, request) {
+  if (actionType === "claim_challenge") {
+    sendBrokerFrame(await buildClaimChallengePayload(actionId));
+    return;
+  }
+  if (actionType === "claim_device") {
+    sendBrokerFrame(await buildClaimDevicePayload(actionId, request));
+    return;
+  }
+  if (requiresSessionClaim(actionType) && !state.remoteAuth.sessionClaim) {
+    throw new Error("device is not claimed yet");
+  }
+  sendBrokerFrame(
+    requiresSessionClaim(actionType)
+      ? await buildClaimedActionPayload(actionId, actionType, request)
+      : await buildDeviceActionPayload(actionId, actionType, request)
+  );
+}
+
+/// Stand down the deadlines of everything still in flight, without failing anything.
+///
+/// Used when the relay leaves the room: we know precisely why no reply is coming, so
+/// letting the deadline fire would report a failure the user is likely to answer by
+/// redoing the action — and a redo mints a new action id, which misses the relay's
+/// replay cache and can execute a write for the second time. The honest state here is
+/// "outcome unknown until the relay is back", so the attempt is kept and resent under
+/// its own id by `resendPendingActions`.
+export function suspendPendingActionDeadlines() {
+  for (const pending of state.pendingActions.values()) {
+    window.clearTimeout(pending.timeoutId);
+    pending.timeoutId = null;
+  }
+}
+
+/// Ask again for every reply we are still waiting on, under the same action ids.
+///
+/// Reusing the id is the whole point, and it is what makes this safe for writes. The
+/// relay caches a completed result under `(device_id, action_id)` and replays it rather
+/// than re-executing, so a `send_message` whose reply was lost is answered from that
+/// cache instead of being sent twice. A fresh id would miss the cache and run it again.
+///
+/// If the original is still executing, the relay recognises the duplicate and stays
+/// quiet; its own reply is still addressed to this surface and still arrives.
+export async function resendPendingActions() {
+  const attempts = [...state.pendingActions.entries()];
+  for (const [actionId, pending] of attempts) {
+    if (!pending || pending.actionType === "claim_challenge") {
+      continue;
+    }
+    try {
+      await sendRemoteActionFrame(actionId, pending.actionType, pending.request);
+      extendPendingActionDeadline(actionId);
+    } catch (error) {
+      rejectPendingAction(actionId, error);
+    }
+  }
+}
+
 /// Restart the deadline for an action that is demonstrably still being answered.
 function extendPendingActionDeadline(actionId) {
   const pending = state.pendingActions.get(actionId);
@@ -852,7 +896,7 @@ function extendPendingActionDeadline(actionId) {
   }, REMOTE_ACTION_TIMEOUT_MS);
 }
 
-function registerPendingAction(actionId, actionType) {
+function registerPendingAction(actionId, actionType, request) {
   return new Promise((resolve, reject) => {
     const timeoutId = window.setTimeout(() => {
       rejectPendingAction(
@@ -863,6 +907,8 @@ function registerPendingAction(actionId, actionType) {
 
     state.pendingActions.set(actionId, {
       actionType,
+      // Kept so the attempt can be reproduced verbatim under the same id.
+      request,
       timeoutId,
       reject,
       resolve,

@@ -1266,3 +1266,106 @@ test("this surface's own snapshots do not re-render the app just to be traced", 
       + "that is several full renders a second spent on diagnostics"
   );
 });
+
+// When a reply is lost, the client must be able to ask again WITHOUT the relay running
+// the action a second time. The relay already supports exactly that: it caches a
+// completed result under `(device_id, action_id)` and replays it instead of
+// re-executing. But it can only do so if the client asks with the SAME action id — and
+// the client minted a fresh one every time, so a retry of a write that had already
+// succeeded would have sent the message, or applied the file change, twice.
+test("resending an unanswered action reuses its original action id", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { dispatchOrRecover, resendPendingActions } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  const sentActionIds = [];
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      // Never answered: this models the reply that got dropped.
+      sentActionIds.push(frame.payload?.action_id);
+    },
+  };
+
+  // Not awaited: the point is that it never settles.
+  const pending = dispatchOrRecover("fetch_workspace_diff", {}).catch(() => {});
+  await nextTick();
+  assert.equal(sentActionIds.length, 1, "the action should have been sent once");
+
+  await resendPendingActions();
+  await nextTick();
+
+  assert.equal(sentActionIds.length, 2, "an unanswered action should be resent");
+  assert.equal(
+    sentActionIds[1],
+    sentActionIds[0],
+    "the resend must carry the ORIGINAL action id, so the relay replays its cached "
+      + "result instead of executing the action a second time"
+  );
+  void pending;
+});
+
+// While the relay is away we know exactly why a reply has not come, so letting the
+// deadline fire is worse than useless: the action reports failure, the user redoes it,
+// and the redo mints a NEW action id that misses the relay's replay cache — which is
+// how a write gets executed twice. The pending action instead waits for the relay to
+// come back, and is resent under its own id then.
+test("a relay leaving suspends action deadlines rather than failing them", async () => {
+  installBrowserStubs();
+
+  const { state } = await import("./state.js");
+  const { suspendPendingActionDeadlines } = await import("./actions.js");
+
+  state.pendingActions.clear();
+  const cleared = [];
+  const realClearTimeout = globalThis.window.clearTimeout;
+  globalThis.window.clearTimeout = (id) => {
+    cleared.push(id);
+  };
+
+  let rejected = false;
+  state.pendingActions.set("action-writing", {
+    actionType: "send_message",
+    request: { text: "hello" },
+    timeoutId: 4242,
+    reject: () => {
+      rejected = true;
+    },
+    resolve: () => {},
+  });
+
+  suspendPendingActionDeadlines();
+  globalThis.window.clearTimeout = realClearTimeout;
+
+  assert.equal(rejected, false, "a relay leaving must not fail the action");
+  assert.ok(
+    cleared.includes(4242),
+    "its deadline must be stood down while we know the relay is gone"
+  );
+  assert.ok(
+    state.pendingActions.has("action-writing"),
+    "and the action must be kept so it can be resent under the same id"
+  );
+});
