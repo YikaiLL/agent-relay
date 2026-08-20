@@ -85,11 +85,15 @@ const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
 /// reply at 20/s, and snapshots at 2/s together already exceed the delta bound alone.
 /// Surfaces, which are the actual abuse surface, keep the tight budget above.
 ///
-/// Crossing it is no longer silent — the relay treats a dropped publish as fatal and
-/// resyncs — so this number decides how often that costs a reconnect, not whether data
-/// can vanish. What it does NOT bound is bytes: 36000 frames of up to 64KiB is a lot of
-/// bandwidth for one peer, and a byte-rate limit is the right control for that. It does
-/// not exist yet.
+/// Crossing it is no longer silent: the relay treats a dropped publish as fatal and
+/// reconnects. So this number decides how often that costs a reconnect — set it below
+/// real traffic and the relay will flap, because the broker's window is keyed by peer
+/// and does not reset when the relay reconnects into it.
+///
+/// What it does NOT bound is bytes. 36000 frames of up to 64KiB is ~2.2GiB a minute for
+/// one peer, and non-targeted payloads fan out to every peer in the room on top of
+/// that. A frame count is a poor proxy for bandwidth; a byte-rate limit is the right
+/// control and does not exist yet.
 const DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 36_000;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;

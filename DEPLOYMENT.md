@@ -335,9 +335,12 @@ Optional hardening env:
 - `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE` — surface peers (default 240)
 - `RELAY_BROKER_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE` — relay peers (default 36000).
   Relays are first-party and an order of magnitude busier than a surface: transcript
-  deltas alone batch into a 100ms window. Going over is **silent** — the broker drops
-  the frame and keeps the socket open — which costs transcript content and makes
-  chunked replies time out on the client, so do not tighten this without reason.
+  deltas alone batch into a 100ms window and publish one frame each. Going over makes
+  the broker **drop that frame**, which the relay treats as fatal: it ends the session
+  and reconnects to resync rather than carry on with a hole in what the surface
+  received. Setting this below real traffic therefore causes repeated reconnects, not
+  just slowdown — and the broker's window is keyed by peer, so it does not reset when
+  the relay reconnects. It bounds frames, not bytes (~2.2GiB/min at this default).
   Leaving it unset while the generic limit above **is** set keeps the generic limit
   governing relays, so an already-tightened deployment is not widened by upgrading.
 - `RELAY_BROKER_MAX_CONNECTIONS_PER_IP`
