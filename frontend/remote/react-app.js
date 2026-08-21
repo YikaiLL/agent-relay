@@ -10,6 +10,7 @@ import React, {
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { fetchBuildInfo } from "../shared/build-badge.js";
+import { StartSessionSplitButton } from "../shared/start-session-split-button.js";
 import { ClientLog } from "../shared/client-log.js";
 import { createAskUserQuestionDetailLoader } from "../shared/ask-user-question-detail-loader.js";
 import {
@@ -2355,6 +2356,31 @@ function findThreadNameInGroups(groups, threadId) {
 // The bell has no pills on either surface — turning it on re-groups the list by state,
 // and the bucket headers underneath already carry those four labels.
 
+// Switching agent is not just "set provider": the model, the reasoning effort and the
+// approval policy are all per-agent, so the draft has to move together or the dialog opens
+// with one agent selected and another agent's model still in the box. Hoisted because two
+// controls now perform this switch — the dialog's own select and the sidebar split
+// button's menu — and they must not drift.
+function openRemoteStartSessionDialog() {
+  document.getElementById("remote-start-session-dialog")?.showModal();
+}
+
+function providerDraftPatch(uiState, value) {
+  const models = uiState.providerModels[value] || [];
+  const model = models.find((option) => option.is_default)?.model
+    || models[0]?.model
+    || defaultModelForProvider(value);
+  const storedEffort = loadLastEffort(value);
+  const storedApproval = loadLastApprovalPolicy(value);
+  const patch = {
+    effort: resolveReasoningEffortValue(models, model, storedEffort || uiState.sessionDraft.effort),
+    model,
+    provider: value,
+  };
+  if (storedApproval) patch.approvalPolicy = storedApproval;
+  return patch;
+}
+
 function RemoteSidebar({
   currentState,
   hasRelay,
@@ -2551,17 +2577,18 @@ function RemoteSidebar({
         "Manage"
       )
     ),
-    h(
-      "button",
-      {
-        className: "start-session-button",
-        disabled: !hasUsableRelay,
-        id: "remote-session-toggle",
-        onClick: () => document.getElementById("remote-start-session-dialog")?.showModal(),
-        type: "button",
+    h(StartSessionSplitButton, {
+      activeProvider: sessionPanelModel?.fields?.provider || "",
+      buttonId: "remote-session-toggle",
+      disabled: !hasUsableRelay,
+      menuId: "remote-start-session-agent-menu",
+      onStart: openRemoteStartSessionDialog,
+      onStartWithProvider(provider) {
+        updateSessionDraft(providerDraftPatch(remoteUiState, provider));
+        openRemoteStartSessionDialog();
       },
-      "New session"
-    ),
+      providerOptions: sessionPanelModel?.providerOptions || [],
+    }),
     // The Providers health panel used to sit here, between the primary action and
     // the relay list. It is now a Settings tab — the same place local files it.
     // Provider is per-session and immutable once a session starts, so nothing on
@@ -2591,23 +2618,7 @@ function RemoteSidebar({
         onFieldChange(field, value) {
           const uiState = remoteUiState;
           if (field === "provider") {
-            const models = uiState.providerModels[value] || [];
-            const model = models.find((option) => option.is_default)?.model
-              || models[0]?.model
-              || defaultModelForProvider(value);
-            const storedEffort = loadLastEffort(value);
-            const storedApproval = loadLastApprovalPolicy(value);
-            const patch = {
-              effort: resolveReasoningEffortValue(
-                models,
-                model,
-                storedEffort || uiState.sessionDraft.effort
-              ),
-              model,
-              provider: value,
-            };
-            if (storedApproval) patch.approvalPolicy = storedApproval;
-            updateSessionDraft(patch);
+            updateSessionDraft(providerDraftPatch(uiState, value));
             return;
           }
           if (field === "model") {

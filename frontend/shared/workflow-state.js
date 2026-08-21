@@ -1,6 +1,19 @@
 import { providerOptions } from "./provider-settings.js";
 import { isReviewInProgress, isThreadBusy } from "./review-state.js";
 
+// Code Flow is hidden from the UI for now — it is not part of the maintainer's working
+// loop, and its cards were competing with review results for the same panel.
+//
+// This is a PRESENTATION switch only. A workflow run that exists on the server still
+// locks its threads exactly as before (see workflowLockedThreadIds / isThreadBusy below);
+// turning the display off must not quietly turn the safety off with it, or a hidden run
+// would leave a thread locked with nothing on screen explaining why.
+//
+// It lives here, next to the vocabulary it gates, because there are THREE entry points
+// (the launcher, the run rows, and the right-rail tab's in-progress dot) and they have to
+// come back together. Flip to `true` to restore all of them.
+export const CODE_FLOW_ENABLED = false;
+
 const TERMINAL_WORKFLOW_STATUSES = new Set([
   "done",
   "escalated",

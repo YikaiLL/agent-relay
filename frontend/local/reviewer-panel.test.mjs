@@ -336,7 +336,15 @@ test("ReviewerPanel shows round progress + verdict for an iterative review", () 
     })
   );
   assert.match(html, /Round 1\/3/);
-  assert.match(html, /Verdict: needs_changes/);
+  // The verdict is the card's title now, so the visible word drops the "Verdict:" prefix
+  // that its own position already implies — but the prefix stays for screen readers, and
+  // the underscore is humanised for display only.
+  assert.match(html, /reviewer-job-verdict-label[^>]*>needs changes</);
+  assert.match(html, /sr-only[^>]*>Verdict: </);
+  // Tone rides a class, and the colour lands on the MARK rather than the word: dark
+  // --ok-fg is a passing mark (3.86:1) but a failing 4.5:1 word on this surface.
+  assert.match(html, /reviewer-job-verdict reviewer-job-verdict-warn/);
+  assert.match(html, /reviewer-job-verdict-mark/);
 });
 
 test("ReviewerPanel hides round/verdict for a single-shot review", () => {

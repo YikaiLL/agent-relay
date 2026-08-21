@@ -77,10 +77,6 @@ export function selectHeaderLabels({
     titleTooltip = DEFAULT_WORKSPACE_LABEL;
   }
 
-  // The New agent button belongs to a project, so it appears exactly where a
-  // project is being named — never in Sessions mode, never without a project.
-  const newAgentProjectId = inProjectsMode ? projectId || null : null;
-
   let subtitle;
   if (viewOnly && activeThreadId) {
     // A read-only saved session says so through the transcript itself (and the composer
@@ -98,5 +94,5 @@ export function selectHeaderLabels({
     subtitle = "no workspace selected";
   }
 
-  return { title, titleTooltip, subtitle, newAgentProjectId };
+  return { title, titleTooltip, subtitle };
 }

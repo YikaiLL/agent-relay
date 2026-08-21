@@ -37,7 +37,6 @@ import {
   sidebarSearchMount,
   transcript,
   workspaceSubtitle,
-  headerNewAgentButton,
   workspaceSuggestionsList,
 } from "./dom.js";
 import React from "react";
@@ -443,12 +442,6 @@ export function createSessionRenderer({
       labelTooltip: headerLabels.titleTooltip,
     });
     workspaceSubtitle.textContent = headerLabels.subtitle;
-    if (headerNewAgentButton) {
-      // The id rides on the element so the click handler in app.js doesn't have to
-      // re-derive which project the header is naming.
-      headerNewAgentButton.hidden = !headerLabels.newAgentProjectId;
-      headerNewAgentButton.dataset.projectId = headerLabels.newAgentProjectId || "";
-    }
 
     // Three-way main view: a live/read-only conversation always wins; otherwise, in
     // Projects mode with a selected project, the card overview replaces the console

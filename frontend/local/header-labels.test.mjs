@@ -40,37 +40,33 @@ const CONVERSATION = {
 // --- with a project selected ------------------------------------------------
 
 test("a selected project names the title", () => {
-  const { title, newAgentProjectId } = selectHeaderLabels({
+  const { title } = selectHeaderLabels({
     ...CONVERSATION,
     projectId: "proj-1",
     projectName: "Alpha",
   });
   assert.equal(title, "Alpha");
-  // The button is the project's own action, so it rides on the same decision.
-  assert.equal(newAgentProjectId, "proj-1");
 });
 
 test("no project selected is the default workspace", () => {
-  const { title, newAgentProjectId } = selectHeaderLabels({
+  const { title } = selectHeaderLabels({
     ...CONVERSATION,
     projectId: null,
     projectName: "",
   });
   assert.equal(title, DEFAULT_WORKSPACE_LABEL);
-  assert.equal(newAgentProjectId, null, "no project means no project action");
 });
 
 // --- with none selected -----------------------------------------------------
 
 test("the default workspace keeps the folder as the tooltip", () => {
-  const { title, titleTooltip, newAgentProjectId } = selectHeaderLabels({
+  const { title, titleTooltip } = selectHeaderLabels({
     ...CONVERSATION,
   });
   assert.equal(title, DEFAULT_WORKSPACE_LABEL);
   // The folder is not lost, it is demoted: the title has to name what the
   // switcher selects, and the full path was never readable at title size anyway.
   assert.equal(titleTooltip, "/Users/luchi/git/agent-relay");
-  assert.equal(newAgentProjectId, null);
 });
 
 // This used to assert the OPPOSITE — that a selected project must not leak into

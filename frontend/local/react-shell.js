@@ -14,7 +14,6 @@ import {
   ToggleRightPanelIcon,
 } from "../shared/panel-icons.js";
 import {
-  PLUS_SVG,
   CHEVRON_RIGHT_SVG,
   SETTINGS_SVG,
 } from "../svg.js";
@@ -72,7 +71,7 @@ function iconNode(svgMarkup, extraClass = "") {
   });
 }
 
-function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
+function Sidebar() {
   return h(
     "aside",
     // No `data-thread-view`: it gated the primary action on the Sessions/Projects
@@ -117,7 +116,7 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
     // count as props. `display: contents`, so `.sidebar-nav` stays a direct flex
     // child of the sidebar column and keeps its own margins.
     h("div", { className: "sidebar-nav-mount", id: "sidebar-nav" }),
-    h(LaunchPanel, { launchModel, onLaunchFieldChange, onLaunchStart }),
+    h(LaunchPanel),
     // The Task list, in the sidebar. Filled by renderSidebarTaskList(); CSS-gated
     // to the Tasks view, which also hides the launch panel and the thread drawer
     // below — one sidebar, two mutually exclusive bodies.
@@ -184,26 +183,16 @@ function AuthForm() {
   );
 }
 
-function LaunchPanel({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
-  const m = launchModel || {};
+// A mount, not the control. The split button's right half lists the AVAILABLE agents,
+// which this file cannot know: the provider catalogue is fetched after boot into
+// `state.providers`, and this shell renders exactly once (see the note above ThreadDrawer),
+// so a prop would be frozen empty forever. app.js owns the root and re-renders it, the
+// same arrangement the session tab strip already uses.
+function LaunchPanel() {
   return h(
     "section",
     { className: "launch-panel" },
-    h(
-      "div",
-      { className: "launch-actions" },
-      h(
-        "button",
-        {
-          className: "start-session-button",
-          id: "open-start-session-dialog",
-          onClick: () => document.getElementById("launch-start-session-dialog")?.setAttribute("open", ""),
-          type: "button",
-        },
-        iconNode(PLUS_SVG),
-        h("span", null, "New session")
-      )
-    ),
+    h("div", { className: "launch-actions", id: "start-session-split-mount" })
   );
 }
 
@@ -474,23 +463,6 @@ function ChatHeader() {
           "aria-label": "Settings",
         },
         iconNode(SETTINGS_SVG)
-      ),
-      // Shown only when the title is naming a PROJECT (see header-labels.js): starting
-      // an agent into a project is the action that belongs to one. render-session.js
-      // owns the hidden flag and the project id. Lives in the header actions — beside
-      // the panel toggle — rather than inline with the title, so it reads as an action
-      // and lines up with the other header controls.
-      h(
-        "button",
-        {
-          className: "header-new-agent-button",
-          hidden: true,
-          id: "header-new-agent",
-          type: "button",
-          title: "Start an agent in this project",
-        },
-        iconNode(PLUS_SVG),
-        h("span", null, "New agent")
       ),
       h(
         "button",
@@ -981,7 +953,7 @@ export function LocalShell({ launchModel = null, onLaunchFieldChange = null, onL
       h(
         "div",
         { className: "app-shell app-shell-with-rail", "data-view": "console" },
-        h(Sidebar, { launchModel, onLaunchFieldChange, onLaunchStart }),
+        h(Sidebar),
         h(ChatShell),
         h(WorkspaceChangesRail)
       )

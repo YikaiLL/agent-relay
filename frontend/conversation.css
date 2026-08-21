@@ -1372,7 +1372,7 @@
 .diff-file-section {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  background: var(--bg-base);
+  background: var(--on-panel);
   overflow: hidden;
 }
 
@@ -1448,7 +1448,7 @@
   max-height: 420px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  background: var(--bg-base);
+  background: var(--on-panel);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);

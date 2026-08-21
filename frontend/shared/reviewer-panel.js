@@ -8,6 +8,7 @@ import {
   reviewChipTone,
   reviewStatusLabel,
 } from "./review-state.js";
+import { CODE_FLOW_ENABLED } from "./workflow-state.js";
 
 const h = React.createElement;
 
@@ -15,6 +16,50 @@ const h = React.createElement;
 // cadence so the user can watch an in-progress (or stuck) reviewer. Terminal reviews
 // are fetched once. Kept modest because the remote surface fetches via the broker.
 const REVIEWER_PREVIEW_POLL_MS = 6000;
+
+// The verdict is the ONE thing the card exists to tell you, so it carries a mark as
+// well as a word. The mark matters beyond decoration: in dark mode `--ok-fg` measures
+// 3.86:1 on the card surface — enough for a MARK (>=3:1) but under the 4.5:1 a word
+// needs. DESIGN_LANGUAGE.md's rule for that case is "the word renders in text-primary,
+// the colour goes on the dot/icon", which is exactly this split. Light mode's `--ok-fg`
+// clears 5.52:1 and may colour the word too; the CSS handles that per theme.
+const VERDICT_TONE = {
+  approve: "ok",
+  needs_changes: "warn",
+  unsure: "neutral",
+};
+
+function verdictTone(verdict) {
+  return VERDICT_TONE[verdict] || "neutral";
+}
+
+// One circle, three glyphs — same silhouette so the row's rhythm doesn't shift when a
+// re-review flips the verdict. `currentColor` throughout, so the tone class on the
+// wrapper is the whole colour story (matching panel-icons.js's convention).
+function VerdictMark({ verdict }) {
+  const tone = verdictTone(verdict);
+  return h(
+    "svg",
+    {
+      "aria-hidden": "true",
+      className: "reviewer-job-verdict-mark",
+      fill: "none",
+      height: "18",
+      viewBox: "0 0 18 18",
+      width: "18",
+      stroke: "currentColor",
+      strokeWidth: "1.6",
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+    },
+    h("circle", { cx: "9", cy: "9", r: "8" }),
+    tone === "ok"
+      ? h("polyline", { points: "5.5 9.25 8 11.75 12.5 6.5" })
+      : tone === "warn"
+        ? h(React.Fragment, null, h("path", { d: "M9 5.25v4.5" }), h("path", { d: "M9 12.5h.01" }))
+        : h("path", { d: "M6.5 9h5" })
+  );
+}
 
 function entryText(entry) {
   if (entry?.text && entry.text.trim()) return entry.text.trim();
@@ -91,10 +136,13 @@ export function ReviewerPanel({
   panelId = "review-panel",
 }) {
   const hasJobs = reviewJobs.length > 0;
-  const hasWorkflowRuns = workflowRuns.length > 0;
+  // Both gated on the feature switch, so a thread that has ONLY hidden workflow runs falls
+  // through to the empty state's call to action rather than rendering a populated panel
+  // with nothing in it.
+  const hasWorkflowRuns = CODE_FLOW_ENABLED && workflowRuns.length > 0;
   const hasCards = hasJobs || hasWorkflowRuns;
   const canLaunch = typeof onRequestReview === "function";
-  const canLaunchWorkflow = typeof onStartWorkflow === "function";
+  const canLaunchWorkflow = CODE_FLOW_ENABLED && typeof onStartWorkflow === "function";
   // The launcher is ALWAYS rendered (when wiring exists) so the affordance is
   // discoverable; it's just disabled when a review can't be started right now.
   const launcher = () =>
@@ -161,13 +209,6 @@ export function ReviewerPanel({
       ? h(
           "div",
           { className: "reviewer-panel-list" },
-          ...workflowRuns.map((run) =>
-            h(WorkflowRunCard, {
-              key: run.id,
-              run,
-              onResolveWorkflow,
-            })
-          ),
           ...reviewJobs.map((job) =>
             h(ReviewerJobCard, {
               key: job.id,
@@ -187,7 +228,24 @@ export function ReviewerPanel({
               onDeleteReview,
               fetchReviewerTranscript,
             })
-          )
+          ),
+          // Runs trail the results, in their own group: a review card answers "what did
+          // it conclude", a run answers "what is happening right now". Interleaving them
+          // by nothing more than array order made the panel read as one undifferentiated
+          // stack where the two questions were indistinguishable.
+          hasWorkflowRuns
+            ? h(
+                "div",
+                { className: "reviewer-panel-runs" },
+                ...workflowRuns.map((run) =>
+                  h(WorkflowRunCard, {
+                    key: run.id,
+                    run,
+                    onResolveWorkflow,
+                  })
+                )
+              )
+            : null
         )
       : h(
           "div",
@@ -294,7 +352,16 @@ function ReviewerJobCard({
       h(
         "div",
         { className: "reviewer-job-identity" },
-        h("span", { className: "reviewer-job-provider" }, job.reviewer_provider || "reviewer"),
+        h(
+          "span",
+          {
+            className: "reviewer-job-provider",
+            // Drives the chip's brand hue in CSS, the same way the session tab's provider
+            // mark is keyed. Absent for an unknown provider, which falls back to neutral.
+            "data-provider": job.reviewer_provider || undefined,
+          },
+          job.reviewer_provider || "reviewer"
+        ),
         // A reused thread may inherit its model and not carry one on the job.
         job.reviewer_model
           ? h(
@@ -336,23 +403,21 @@ function ReviewerJobCard({
             )
           : null
       ),
-      // Right cluster: status + iterative-loop progress (when a budget was set).
-      h(
-        "div",
-        { className: "reviewer-job-meta" },
-        h(
-          "span",
-          { className: `reviewer-job-status reviewer-job-status-${reviewChipTone(job.status)}` },
-          reviewStatusLabel(job.status)
-        ),
-        job.max_rounds > 1
-          ? h(
+      // Right cluster: iterative-loop progress only (when a budget was set). The status
+      // label used to sit here too, which made "who reviewed" and "how it went" one
+      // undifferentiated strip; it now leads the outcome row below, next to the verdict
+      // it qualifies.
+      job.max_rounds > 1
+        ? h(
+            "div",
+            { className: "reviewer-job-meta" },
+            h(
               "span",
               { className: "reviewer-job-round" },
               `Round ${job.round || 0}/${job.max_rounds}`
             )
-          : null
-      )
+          )
+        : null
     ),
     // Revealed only when the header "i" is toggled on. Still truncated (CSS) with the
     // full value in the tooltip + aria-label so hovering reveals the whole thing.
@@ -367,9 +432,36 @@ function ReviewerJobCard({
           threadName
         )
       : null,
-    job.verdict && job.verdict !== "unknown"
-      ? h("p", { className: "reviewer-job-verdict" }, `Verdict: ${job.verdict}`)
-      : null,
+    // The outcome row: what the reviewer concluded, and where that conclusion is in its
+    // lifecycle. It renders even without a verdict, because a running review still has a
+    // status worth showing — in that case the pill simply sits alone.
+    h(
+      "div",
+      { className: "reviewer-job-outcome" },
+      job.verdict && job.verdict !== "unknown"
+        ? h(
+            "p",
+            {
+              className: `reviewer-job-verdict reviewer-job-verdict-${verdictTone(job.verdict)}`,
+            },
+            h(VerdictMark, { verdict: job.verdict }),
+            // The visible word drops the "Verdict:" prefix — the panel is already called
+            // Reviewer and this is now the card's title, so the label was naming what its
+            // own position says. Screen readers keep it.
+            h("span", { className: "sr-only" }, "Verdict: "),
+            h(
+              "span",
+              { className: "reviewer-job-verdict-label" },
+              String(job.verdict).replace(/_/g, " ")
+            )
+          )
+        : null,
+      h(
+        "span",
+        { className: `reviewer-job-status reviewer-job-status-${reviewChipTone(job.status)}` },
+        reviewStatusLabel(job.status)
+      )
+    ),
     job.error ? h("p", { className: "reviewer-job-error" }, job.error) : null,
     review.status === "loading" && !review.text
       ? h(

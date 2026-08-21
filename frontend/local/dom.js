@@ -90,7 +90,6 @@ export const threadProjectCurrentLabel = document.querySelector("#thread-project
 export const forkSessionDialogRoot = document.querySelector("#fork-session-dialog-root");
 export const pairedDevicesList = document.querySelector("#paired-devices-list");
 export const chatShell = document.querySelector(".chat-shell");
-export const headerNewAgentButton = document.querySelector("#header-new-agent");
 export const workspaceSubtitle = document.querySelector("#workspace-subtitle");
 export const workspaceSuggestionsList = document.querySelector("#workspace-suggestions");
 export const localModelBadge = document.querySelector("#local-model-badge");

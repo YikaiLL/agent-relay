@@ -34,7 +34,6 @@ import {
   forkSessionDialogRoot,
   forkThreadButton,
   goConsoleHomeButton,
-  headerNewAgentButton,
   launchStartSessionDialog,
   launchSettingsModal,
   loadDirectoryButton,
@@ -99,6 +98,7 @@ import {
 import React from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
+import { StartSessionSplitButton } from "./shared/start-session-split-button.js";
 import {
   createApiFetch,
   createAuthSession,
@@ -1426,6 +1426,7 @@ const {
 sessionViewController.subscribe((change) => {
   renderProjectSwitcher();
   renderSessionTabs();
+  renderStartSessionSplit();
   renderThreads();
   if (state.session) {
     renderSession(state.session);
@@ -2267,16 +2268,6 @@ function openSessionsScreen() {
 // into createSessionRenderer below. Four id-addressed listeners became two props, and
 // the rail can no longer offer a different set of destinations than the rows.
 
-// "New agent" in the header — the header only shows it while it is naming a
-// project (header-labels.js), and render-session stamps that project's id onto the
-// element, so this reuses the project overview's flow verbatim.
-headerNewAgentButton?.addEventListener("click", () => {
-  const projectId = headerNewAgentButton.dataset.projectId || "";
-  if (projectId) {
-    startProjectAgent(projectId);
-  }
-});
-
 threadsRefreshButton.addEventListener("click", () => {
   void loadThreads("manual refresh");
 });
@@ -2980,9 +2971,27 @@ function paintInitialSidebarChrome() {
 }
 paintInitialSidebarChrome();
 
+// The React sub-roots this module owns, declared HERE rather than beside the render
+// functions that use them, because `void boot();` on the next line runs boot()'s prologue
+// synchronously — in the middle of this module's evaluation. A `let` further down the file
+// is in its temporal dead zone at that moment, so a render call in that prologue throws
+// `Cannot access 'X' before initialization` and the app never paints. That is not a
+// hypothetical: renderStartSessionSplit() is boot()'s first statement.
+// Pinned by frontend/boot-tdz-guard.test.mjs.
+let sessionTabsRootHandle = null;
+let sessionTabsRootElement = null;
+let projectSwitcherRootHandle = null;
+let projectSwitcherRootElement = null;
+let startSessionSplitRootHandle = null;
+let startSessionSplitRootElement = null;
+
 void boot();
 
 async function boot() {
+  // Painted before anything is fetched: the LEFT half needs no catalogue, and the sidebar
+  // must not be missing its primary action while auth and providers settle. The caret
+  // half appears on the re-render below, once there is more than one agent to pick.
+  renderStartSessionSplit();
   apiTokenInput.value = state.apiToken;
   updateConnectionForm();
 
@@ -3230,6 +3239,8 @@ async function refreshProviderCatalogs(session) {
       if (providersResponse.ok && providersPayload.ok) {
         state.providers = normalizeProviderList(providersPayload.data);
         syncProviderSuggestions(liveProviderInput, state.providers, selectedProvider);
+        // The split button's agent menu is this same list.
+        renderStartSessionSplit();
       }
     }
     await Promise.all(state.providers.map(async (provider) => {
@@ -4431,10 +4442,6 @@ function renderClientLogLines(lines) {
 // Focusing a tab goes through `viewThread`, the view-only path. It must NOT call
 // resume_session, which moves the relay's single active thread for EVERY connected
 // client — a tab is a per-client view, not a claim on the relay.
-let sessionTabsRootHandle = null;
-let sessionTabsRootElement = null;
-let projectSwitcherRootHandle = null;
-let projectSwitcherRootElement = null;
 
 // The Project switcher above the tab strip. Its own sub-root for the same reason
 // the strip has one: the shell renders once, so anything data-driven needs its own.
@@ -4497,6 +4504,50 @@ function resolveTabThread(threadId) {
     // strip can hold tabs from several providers at once.
     provider: thread.provider || "",
   };
+}
+
+function openStartSessionDialog() {
+  document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+}
+
+// The sidebar's primary action. It lives in a mount rather than in react-shell.js because
+// its right half lists the AVAILABLE agents, and that catalogue is fetched after boot —
+// the shell renders once and could only ever hand it an empty array.
+function renderStartSessionSplit() {
+  const mount = document.getElementById("start-session-split-mount");
+  if (!mount) {
+    return;
+  }
+
+  if (startSessionSplitRootElement !== mount) {
+    startSessionSplitRootHandle?.unmount();
+    startSessionSplitRootHandle = createRoot(mount);
+    startSessionSplitRootElement = mount;
+  }
+
+  const select = document.getElementById("provider-input") || providerInput;
+  startSessionSplitRootHandle.render(
+    React.createElement(StartSessionSplitButton, {
+      buttonId: "open-start-session-dialog",
+      menuId: "start-session-agent-menu",
+      providerOptions: providerOptions(state.providers || []),
+      activeProvider:
+        select?.value || readLocalUiState(state.localUiStore).sessionDraft?.provider || "",
+      onStart: openStartSessionDialog,
+      onStartWithProvider: (provider) => {
+        // Routed through the dialog's OWN select, with a real change event, rather than
+        // by calling selectLaunchProvider directly. Three separate listeners hang off
+        // that event — the draft writer, the provider-catalogue refresh, and the
+        // model/effort sync — so going around it would leave the shortcut and the
+        // dialog's control disagreeing about which agent is selected.
+        if (select && select.value !== provider) {
+          select.value = provider;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        openStartSessionDialog();
+      },
+    })
+  );
 }
 
 function renderSessionTabs() {
