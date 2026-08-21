@@ -76,6 +76,8 @@ const CSP_CONNECT_SRC_ENV: &str = "RELAY_CSP_CONNECT_SRC";
 const ENABLE_HSTS_ENV: &str = "RELAY_ENABLE_HSTS";
 const HSTS_VALUE_ENV: &str = "RELAY_HSTS_VALUE";
 const LAUNCH_ID_ENV: &str = "SEALWIRE_LAUNCH_ID";
+/// Set by `sealwire --beta`.
+const SEALWIRE_BETA_ENV: &str = "SEALWIRE_BETA";
 const WEB_ROOT_ENV: &str = "RELAY_WEB_ROOT";
 const CSRF_HEADER_NAME: &str = "x-agent-relay-csrf";
 const CSRF_HEADER_VALUE: &str = "1";
@@ -274,6 +276,18 @@ async fn main() {
                 sealwire_private::TeamBrainImpl::default(),
             ))
     };
+
+    // Needs BOTH the user's opt-in and a build that can run the feature: on the
+    // flag alone a stub build gets a live Task screen wired to an engine that is
+    // not there.
+    let beta_features_enabled = parse_optional_bool_env(SEALWIRE_BETA_ENV)
+        .unwrap_or_else(|error| panic!("invalid {SEALWIRE_BETA_ENV}: {error}"))
+        && cfg!(feature = "private");
+    state.set_beta_features_enabled(beta_features_enabled).await;
+    if beta_features_enabled {
+        info!("beta features are ON for this launch (SEALWIRE_BETA)");
+    }
+
     let web_assets = default_web_assets();
     log_web_assets(&web_assets);
     let context = AppContext {

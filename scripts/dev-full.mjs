@@ -157,6 +157,18 @@ if (isStub) {
   relayArgs.push("--features", "private");
   console.log("[dev:full] private crate present — building with it");
 }
+
+// The dev loop runs with in-development features unlocked. Set SEALWIRE_BETA=0
+// to see the locked preview a plain `npx sealwire` gets.
+if (relayEnv.SEALWIRE_BETA === undefined) {
+  relayEnv.SEALWIRE_BETA = "1";
+}
+console.log(
+  relayEnv.SEALWIRE_BETA === "1"
+    ? "[dev:full] beta features ON (Tasks unlocked)"
+    : `[dev:full] beta features OFF (SEALWIRE_BETA=${relayEnv.SEALWIRE_BETA})`
+);
+
 spawnManaged("relay-server", "cargo", relayArgs, relayEnv);
 
 function runCommand(command, args, env) {

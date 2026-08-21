@@ -741,6 +741,16 @@ in thread {thread_id}: {error}"
         self.team_brain.is_some()
     }
 
+    /// Unlock in-development features. Call once at startup, before the state is shared.
+    pub async fn set_beta_features_enabled(&self, enabled: bool) {
+        self.relay.write().await.set_beta_features_enabled(enabled);
+    }
+
+    /// Whether in-development features are unlocked (`sealwire --beta`).
+    pub(crate) async fn beta_features_enabled(&self) -> bool {
+        self.relay.read().await.beta_features_enabled()
+    }
+
     /// The decision layer.
     ///
     /// Panics only if an unreachable state were reached: `start_team` refuses

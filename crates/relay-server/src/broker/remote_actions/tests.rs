@@ -23,6 +23,7 @@ fn make_snapshot() -> SessionSnapshot {
         e2ee_enabled: true,
         broker_can_read_content: false,
         audit_enabled: false,
+        beta_features_enabled: false,
         active_thread_id: Some("thread-1".to_string()),
         active_thread_promoted_from: None,
         active_controller_device_id: Some("device-1".to_string()),

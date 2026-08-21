@@ -298,6 +298,9 @@ pub struct RelayState {
     /// most bridges have no archive at all, and a surface that guesses from the
     /// provider name offers a control that silently changes nothing.
     pub(super) provider_archive_capabilities: Vec<crate::protocol::ProviderArchiveCapabilityView>,
+    /// Whether this relay was launched with `sealwire --beta`. Static per
+    /// process; carried on every snapshot so both surfaces can gate on it.
+    pub(super) beta_features_enabled: bool,
     /// Static per-provider identity + spawn outcome, one entry per configured
     /// provider (in configured order). Combined with `provider_connections` at
     /// snapshot time to derive the live `provider_status` panel — including
@@ -495,6 +498,7 @@ impl RelayState {
             thread_promoted_from: HashMap::new(),
             provider_fork_capabilities: Vec::new(),
             provider_archive_capabilities: Vec::new(),
+            beta_features_enabled: false,
             provider_status_base: Vec::new(),
             thread_last_activity_at: HashMap::new(),
             projects: HashMap::new(),
@@ -2759,6 +2763,7 @@ impl RelayState {
             e2ee_enabled: self.security.e2ee_enabled(),
             broker_can_read_content: self.security.broker_can_read_content(),
             audit_enabled: self.security.audit_enabled(),
+            beta_features_enabled: self.beta_features_enabled,
             active_thread_id: self.active_thread_id.clone(),
             active_thread_promoted_from: self
                 .active_thread_id
@@ -3391,6 +3396,14 @@ impl RelayState {
 
     pub fn set_provider_status_base(&mut self, base: Vec<crate::provider::ProviderStatusBase>) {
         self.provider_status_base = base;
+    }
+
+    pub fn set_beta_features_enabled(&mut self, enabled: bool) {
+        self.beta_features_enabled = enabled;
+    }
+
+    pub fn beta_features_enabled(&self) -> bool {
+        self.beta_features_enabled
     }
 
     /// Derive the live per-provider status panel: static spawn outcome folded

@@ -122,6 +122,7 @@ import {
   teamsRevisionOf,
 } from "../shared/task-team-model.js";
 import { loadSeenTasks } from "./task-seen-prefs.js";
+import { tasksLocked } from "../shared/beta-gate.js";
 import { TaskSidebarList, TaskTeamScreen } from "../shared/task-team-react.js";
 import { SidebarNav, SidebarNavRail } from "../shared/sidebar-nav.js";
 import {
@@ -533,7 +534,9 @@ export function createSessionRenderer({
     // open. It is revision-gated, so an unchanged run set costs nothing — and the
     // sidebar badge has to be able to say "a task is waiting on you" from wherever
     // the user happens to be, which is the whole point of walking away from one.
-    if (typeof fetchTeams === "function") {
+    // …unless Tasks is locked: the server returns an empty list, so this would
+    // be one request per revision for a feature the user cannot open.
+    if (typeof fetchTeams === "function" && !tasksLocked(session)) {
       void teamsCache.sync(
         teamsRevisionOf(session),
         () => fetchTeams(),
@@ -1878,9 +1881,15 @@ export function createSessionRenderer({
     // `loadSeenTasks()` is a localStorage read per render. It is a single small JSON
     // parse, and the alternative — caching it — needs an invalidation path for a value
     // the user changes by clicking, which is the more expensive kind of wrong.
+    const locked = tasksLocked(state.session);
     const props = {
       current: context.kind === "tasks" ? "tasks" : "sessions",
-      tasksWaitingCount: teamsNeedingYou(teamsCache.current().teams, loadSeenTasks()),
+      // Locked means nothing can be waiting on you.
+      tasksWaitingCount: teamsNeedingYou(
+        locked ? [] : teamsCache.current().teams,
+        loadSeenTasks()
+      ),
+      tasksBeta: locked,
       onOpenSessions: onOpenSessionsScreen,
       onOpenTasks: onOpenTasksScreen,
     };
@@ -1908,6 +1917,7 @@ export function createSessionRenderer({
         // two surfaces disagreeing about the same fetch.
         error: state.teamsError || null,
         selectedRunId: context.kind === "tasks" ? context.teamRunId || null : null,
+        locked: tasksLocked(state.session),
         onOpenTask: (teamRunId) => onOpenTask?.(teamRunId),
         onStartTask: () => onStartTask?.(),
       })
@@ -1932,6 +1942,9 @@ export function createSessionRenderer({
         // "still loading" apart from "there are no tasks".
         runs: loaded ? sortTeamRuns(teamsCache.current().teams) : null,
         selectedRunId: context.teamRunId || null,
+        // From the live snapshot, so a relay restarted without `--beta` re-blurs
+        // a screen the user is already standing on.
+        locked: tasksLocked(session),
         loading: !loaded,
         syncing: teamsCache.isSyncing(),
         error: state.teamsError || null,

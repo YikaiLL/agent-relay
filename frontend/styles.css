@@ -6955,6 +6955,18 @@ body.is-resizing-panel {
   font-weight: var(--weight-strong);
   text-align: center;
 }
+/* Marks a reachable but unfinished destination. Never appears with the waiting
+   badge: a locked build fetches no teams. */
+.sidebar-nav-beta {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border-soft);
+  color: var(--text-3);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-strong);
+  letter-spacing: 0.02em;
+}
 
 /* ===== Sidebar body switch =====
    One column, two mutually exclusive bodies. The launch panel and the session
@@ -7056,6 +7068,107 @@ body.is-resizing-panel {
 }
 @media (prefers-reduced-motion: reduce) {
   .task-sidebar-dot { animation: none !important; }
+}
+
+/* ===== Beta lock: the blurred "in development" preview =====
+   Presentation only — the gate is the relay refusing the endpoints and the client
+   never fetching (shared/beta-gate.js). Everything blurred here is invented. */
+.task-locked {
+  position: relative;
+  overflow: hidden;
+}
+.task-locked-scenery {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  align-content: center;
+  gap: 14px;
+  padding: 32px;
+  filter: blur(5px);
+  /* High: --surface-3 on the light theme's white main area has little contrast
+     left once blurred, and anything near 0.5 washes the field out entirely. */
+  opacity: 0.9;
+  /* `aria-hidden` covers assistive tech; this keeps it out of clicks and tab order. */
+  pointer-events: none;
+  user-select: none;
+}
+.task-locked-rows {
+  display: grid;
+  gap: 12px;
+  width: min(560px, 100%);
+  margin: 0 auto;
+}
+.task-locked-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-firm);
+  border-radius: var(--r-md);
+  background: var(--surface-3);
+}
+.task-locked-row-body {
+  display: grid;
+  gap: 4px;
+}
+.task-locked-row-title {
+  font-weight: var(--weight-strong);
+  color: var(--text-1);
+}
+.task-locked-row-meta {
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+.task-locked-bar {
+  height: 34px;
+  border-radius: var(--r-md);
+  background: var(--surface-3);
+  border: 1px solid var(--border-firm);
+}
+.task-locked-notice {
+  position: relative;
+  z-index: 1;
+  max-width: 44ch;
+  padding: 20px 22px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-2);
+  text-align: center;
+}
+.task-locked-title {
+  margin: 0 0 8px;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
+  color: var(--text-1);
+}
+.task-locked-lede {
+  margin: 0 0 10px;
+  color: var(--text-2);
+  line-height: var(--leading-relaxed);
+}
+.task-locked-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+.task-locked-hint code {
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+/* An unavoidable blur is a vestibular hazard; lean on opacity alone. */
+@media (prefers-reduced-motion: reduce) {
+  .task-locked-scenery {
+    filter: none;
+    opacity: 0.25;
+  }
+}
+/* The sidebar variant is a flow column, not an overlay. */
+.task-sidebar.task-locked .task-locked-scenery {
+  position: static;
+  padding: 12px;
+  gap: 10px;
 }
 
 /* ===== Task screen: the "no task selected" pane ===== */

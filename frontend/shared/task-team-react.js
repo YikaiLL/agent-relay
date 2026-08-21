@@ -66,6 +66,71 @@ function StatusPill({ status }) {
   );
 }
 
+// ---- the beta lock ---------------------------------------------------------
+
+/**
+ * What the Task screen looks like on a relay without `--beta`.
+ *
+ * The skeleton is invented — no datum here comes from the relay, and the caller
+ * never fetches while locked. Blur is one devtools click from gone, so the gate
+ * is that the data was never sent. `aria-hidden` keeps a screen reader from
+ * reading the fake titles out as the user's own.
+ */
+function TaskLockedPreview() {
+  // Enough rows to run past the card's edges; a skeleton hidden entirely behind
+  // it reads as an empty screen.
+  const rows = [
+    { title: "Rework the export pipeline", meta: "4/7 sub-tasks", tone: "running" },
+    { title: "Tighten the retry budget", meta: "Needs you", tone: "blocked" },
+    { title: "Split the settings drawer", meta: "Reviewing", tone: "running" },
+    { title: "Backfill the migration tests", meta: "6/6 sub-tasks", tone: "done" },
+    { title: "Trim the cold-start path", meta: "Planning", tone: "running" },
+    { title: "Retire the legacy uploader", meta: "2/9 sub-tasks", tone: "running" },
+  ];
+  return h(
+    "div",
+    { className: "task-screen task-screen-centered task-locked" },
+    h(
+      "div",
+      { className: "task-locked-scenery", "aria-hidden": "true" },
+      h(
+        "div",
+        { className: "task-locked-rows" },
+        ...rows.map((row, index) =>
+          h(
+            "div",
+            { key: index, className: "task-locked-row" },
+            h("span", { className: `task-sidebar-dot is-${row.tone}` }),
+            h(
+              "span",
+              { className: "task-locked-row-body" },
+              h("span", { className: "task-locked-row-title" }, row.title),
+              h("span", { className: "task-locked-row-meta" }, row.meta)
+            )
+          )
+        )
+      )
+    ),
+    h(
+      "div",
+      { className: "task-locked-notice", role: "status" },
+      h("h2", { className: "task-locked-title" }, "Tasks is in development"),
+      h(
+        "p",
+        { className: "task-locked-lede" },
+        "A task will be a written brief worked by a small team of agents, on its own branch, while you do something else. It is not finished yet, so it is switched off here."
+      ),
+      h(
+        "p",
+        { className: "task-locked-hint" },
+        "Building on sealwire? Relaunch with ",
+        h("code", null, "sealwire --beta"),
+        " to try it early."
+      )
+    )
+  );
+}
+
 // ---- list ------------------------------------------------------------------
 
 /**
@@ -153,7 +218,23 @@ export function TaskSidebarList({
   selectedRunId,
   onOpenTask,
   onStartTask,
+  locked = false,
 }) {
+  // No "+ New task" while locked — the server would refuse it.
+  if (locked) {
+    return h(
+      "div",
+      { className: "task-sidebar task-locked" },
+      h(
+        "div",
+        { className: "task-locked-scenery", "aria-hidden": "true" },
+        h("div", { className: "task-locked-bar" }),
+        h("div", { className: "task-locked-bar" }),
+        h("div", { className: "task-locked-bar" })
+      ),
+      h("p", { className: "task-sidebar-empty" }, "In development")
+    );
+  }
   const list = runs || [];
   return h(
     "div",
@@ -531,7 +612,12 @@ export function TaskTeamScreen({
   onStartTask,
   syncing = false,
   changesPanel = null,
+  locked = false,
 }) {
+  // Before the loading and not-found branches: nothing was ever fetched.
+  if (locked) {
+    return h(TaskLockedPreview);
+  }
   if (!selectedRunId) {
     return h(TaskWelcome, { runs, loading, error, onStartTask });
   }

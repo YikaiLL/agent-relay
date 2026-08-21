@@ -271,6 +271,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             e2ee_enabled: true,
             broker_can_read_content: false,
             audit_enabled: false,
+            beta_features_enabled: false,
             active_thread_id: Some("thread-1".to_string()),
             active_thread_promoted_from: None,
             active_controller_device_id: Some("device-a".to_string()),

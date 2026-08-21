@@ -125,7 +125,13 @@ function destinationProps(destination, current, onOpen) {
  * no nav at all rather than a lone inert row. Passing `onOpenTasks` is what makes the nav
  * appear, which keeps "the transport exists" and "the nav is offered" the same fact.
  */
-function useNavModel({ current, tasksWaitingCount, onOpenSessions, onOpenTasks }) {
+function useNavModel({
+  current,
+  tasksWaitingCount,
+  onOpenSessions,
+  onOpenTasks,
+  tasksBeta = false,
+}) {
   const destinations = reachableDestinations({
     sessions: onOpenSessions,
     tasks: onOpenTasks,
@@ -135,12 +141,15 @@ function useNavModel({ current, tasksWaitingCount, onOpenSessions, onOpenTasks }
     handlers: { sessions: onOpenSessions, tasks: onOpenTasks },
     current,
     waiting: waitingCount(tasksWaitingCount),
+    // Not the reachability rule above: a beta destination stays reachable, it
+    // just says so first.
+    tasksBeta: tasksBeta === true,
   };
 }
 
 /** Labelled rows, for an expanded sidebar. */
 export function SidebarNav(props = {}) {
-  const { destinations, handlers, current, waiting } = useNavModel(props);
+  const { destinations, handlers, current, waiting, tasksBeta } = useNavModel(props);
   if (!destinations.length) {
     return null;
   }
@@ -166,6 +175,10 @@ export function SidebarNav(props = {}) {
         // Only Tasks can be waited on, and only when something actually is.
         destination.key === "tasks" && waiting
           ? h("span", { className: "sidebar-nav-badge" }, String(waiting))
+          : null,
+        // Mutually exclusive with the badge: a locked build never fetches teams.
+        destination.key === "tasks" && tasksBeta
+          ? h("span", { className: "sidebar-nav-beta" }, "Beta")
           : null
       );
     })

@@ -106,6 +106,13 @@ pub struct SessionSnapshot {
     pub e2ee_enabled: bool,
     pub broker_can_read_content: bool,
     pub audit_enabled: bool,
+    /// Whether in-development features are unlocked (`sealwire --beta`). Static
+    /// per relay process.
+    ///
+    /// `#[serde(default)]` so absence reads as LOCKED — an older peer or a
+    /// replayed snapshot fails closed instead of unlocking an unfinished feature.
+    #[serde(default)]
+    pub beta_features_enabled: bool,
     pub active_thread_id: Option<String>,
     /// When the ACTIVE thread was promoted from a deferred `claude-pending-…`
     /// id at first send: that pending id. Authoritative promotion signal for

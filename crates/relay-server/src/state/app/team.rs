@@ -29,6 +29,11 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+/// What a locked relay says when someone reaches a task endpoint anyway.
+pub(crate) const TASKS_LOCKED_MESSAGE: &str =
+    "Tasks is still in development and is off in this build; relaunch with \
+`sealwire --beta` to try it";
+
 use crate::protocol::{
     StartTeamInput, StartTeamReceipt, TeamActionInput, TeamActionReceipt, TeamAwaitingView,
     TeamRunView, TeamSubTaskView, TeamsResponse,
@@ -553,6 +558,10 @@ over on resume"
 
     /// The HTTP entry point: resolve a wire request and start the run.
     pub async fn start_team(&self, input: StartTeamInput) -> Result<StartTeamReceipt, String> {
+        // Enforced server-side: the UI's blur is one devtools click from gone.
+        if !self.beta_features_enabled().await {
+            return Err(TASKS_LOCKED_MESSAGE.to_string());
+        }
         // Refuse at the door rather than recording a run this build cannot drive.
         if !self.has_team_brain() {
             return Err(
@@ -640,6 +649,11 @@ over on resume"
         action: TeamAction2,
         input: TeamActionInput,
     ) -> Result<TeamActionReceipt, String> {
+        // Gated too: a run recorded by an earlier `--beta` launch survives a
+        // plain relaunch, and pause/stop/resume would otherwise still drive it.
+        if !self.beta_features_enabled().await {
+            return Err(TASKS_LOCKED_MESSAGE.to_string());
+        }
         // Resolved BEFORE the action runs. Cancel makes the only run terminal, so
         // re-resolving afterwards finds nothing active and the receipt would name
         // no run at all — the one case where the id is most worth returning.
@@ -666,6 +680,14 @@ over on resume"
     /// Every recorded task, newest first.
     pub async fn teams(&self) -> TeamsResponse {
         let relay = self.relay.read().await;
+        // Runs from an earlier `--beta` launch persist on disk; a locked client
+        // must never receive them.
+        if !relay.beta_features_enabled() {
+            return TeamsResponse {
+                teams_revision: relay.teams_revision(),
+                teams: Vec::new(),
+            };
+        }
         let mut teams: Vec<TeamRunView> = relay.team_runs_snapshot().map(team_run_view).collect();
         teams.sort_by(|left, right| {
             right

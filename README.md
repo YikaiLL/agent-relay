@@ -141,9 +141,14 @@ sealwire cloud              # attach to the hosted public broker so a phone can 
 sealwire --broker https://broker.example.com   # use your own broker
 sealwire --port 8788 --host 127.0.0.1          # bind address / port
 sealwire --no-open          # don't open a browser
+sealwire --beta             # unlock in-development features (currently: Tasks)
 ```
 
 `sealwire --help` has the full list, including binary resolution and env vars.
+
+Unfinished features are off by default and show a blurred *in development*
+preview rather than being hidden; `--beta` (or `SEALWIRE_BETA=1`) turns them on
+and combines with any other flag.
 
 ## Development
 

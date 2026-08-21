@@ -10430,6 +10430,9 @@ mod review_tests {
             change_tx.clone(),
             SecurityProfile::private(),
         )));
+        // These exercise the FEATURE, not the gate; locked, the team suite would
+        // go green by never running. The gate's own tests are `beta_gate_tests`.
+        relay.write().await.set_beta_features_enabled(true);
         let mut bridges: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
         let mut map = HashMap::new();
         for name in provider_names {
@@ -21297,5 +21300,80 @@ mod late_catalog_tests {
             snapshot.model, "agent-default",
             "a foreign model id the relay fell back to must not be recorded on this thread"
         );
+    }
+}
+
+#[cfg(test)]
+mod beta_gate_tests {
+    //! The server half of the beta gate: the relay refuses the team endpoints and
+    //! reports the gate on the snapshot. The UI's blur is presentation only.
+
+    use super::super::*;
+    use crate::fake_provider::FakeProviderBridge;
+    use crate::protocol::StartTeamInput;
+    use crate::state::security::SecurityProfile;
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    async fn build_app() -> (AppState, Arc<RwLock<RelayState>>) {
+        let (change_tx, _keep) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            ".".to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = FakeProviderBridge::spawn(relay.clone())
+            .await
+            .expect("fake provider should spawn");
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("fake".to_string(), Arc::new(bridge));
+        (
+            AppState::from_parts(relay.clone(), providers, change_tx),
+            relay,
+        )
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_beta_locked_by_default() {
+        let (_app, relay) = build_app().await;
+        let snapshot = relay.read().await.snapshot();
+        assert!(
+            !snapshot.beta_features_enabled,
+            "a relay nobody opted in must describe itself as locked"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_beta_unlocked_once_enabled() {
+        let (_app, relay) = build_app().await;
+        relay.write().await.set_beta_features_enabled(true);
+        let snapshot = relay.read().await.snapshot();
+        assert!(snapshot.beta_features_enabled);
+    }
+
+    #[tokio::test]
+    async fn starting_a_task_is_refused_while_beta_is_locked() {
+        let (app, _relay) = build_app().await;
+        let error = app
+            .start_team(StartTeamInput {
+                title: "Rewrite the parser".to_string(),
+                device_id: Some("device-1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a locked relay must refuse to start a task");
+        assert!(
+            error.contains("development"),
+            "the refusal should name the reason the UI is showing; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_tasks_is_empty_while_beta_is_locked() {
+        let (app, _relay) = build_app().await;
+        // A locked client should never receive run data even if runs exist on
+        // disk from an earlier unlocked launch.
+        let response = app.teams().await;
+        assert!(response.teams.is_empty());
     }
 }
