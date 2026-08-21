@@ -43,7 +43,7 @@ const DESKTOP_VIEWPORT = { width: 1440, height: 900 };
 const TABLET_VIEWPORT = { width: 1280, height: 800 };
 const PHONE_VIEWPORT = { width: 390, height: 844 };
 
-function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) {
+function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD, tallTranscript }) {
   const REMOTE_STATE_STORAGE_KEY = "agent-relay.remote-state";
   const REMOTE_STATE_SCHEMA_VERSION = 1;
   const REMOTE_SECRET_DB_NAME = "agent-relay-secrets";
@@ -118,7 +118,18 @@ function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) 
       { provider: "codex", status: "connected", connected: true, display_name: "Codex" },
     ],
     transcript_truncated: false,
-    transcript: [],
+    // Long enough to make the remote column over-full, which is the precondition step
+    // 15 needs: with slack in the column the strip keeps its height regardless.
+    transcript: tallTranscript
+      ? Array.from({ length: 40 }, (_, index) => ({
+          item_id: `item-tall-${index}`,
+          kind: index % 2 === 0 ? "user_text" : "agent_text",
+          text: `Message ${index}. ${"a conversation long enough to overflow. ".repeat(6)}`,
+          status: "completed",
+          turn_id: "turn-e2e",
+          tool: null,
+        }))
+      : [],
     logs: [],
   };
 
@@ -156,6 +167,12 @@ function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) 
     };
   };
 
+  // Keep in step with broker-client.js. It drops a payload whose relay version it does
+  // not know via `renderLog`, so a stale fixture reaches no console: the page connects,
+  // sends its requests, and silently ignores every answer.
+  const BROKER_PROTOCOL_VERSION = 1;
+  const RELAY_PROTOCOL_VERSION = 2;
+
   class FakeWebSocket extends EventTarget {
     static OPEN = 1;
     constructor(url) {
@@ -166,7 +183,7 @@ function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) 
         this.dispatchEvent(new Event("open"));
         this.#emit({
           type: "welcome",
-          protocol_version: 1,
+          protocol_version: BROKER_PROTOCOL_VERSION,
           peer_id: "surface-e2e",
           channel_id: "room-e2e",
           peers: [{ peer_id: "relay-peer-e2e", role: "relay" }],
@@ -178,7 +195,11 @@ function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) 
         });
         this.#emit({
           type: "message",
-          payload: { protocol_version: 1, kind: "session_snapshot", snapshot },
+          payload: {
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            kind: "session_snapshot",
+            snapshot,
+          },
         });
       });
     }
@@ -256,7 +277,7 @@ function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) 
       this.#emit({
         type: "message",
         payload: {
-          protocol_version: 1,
+          protocol_version: RELAY_PROTOCOL_VERSION,
           kind: "remote_action_result",
           action_id: actionId,
           ...result,
@@ -270,7 +291,7 @@ function installFakeRelay({ relayId, threadActive, threadB, threadC, threadD }) 
   window.WebSocket = FakeWebSocket;
 }
 
-async function openSurface(browserContext, origin, label) {
+async function openSurface(browserContext, origin, label, { tallTranscript = false } = {}) {
   const page = await browserContext.newPage();
   attachPageDebugLogging(page, "remote", { prefix: `remote-desktop-tabs-e2e:${label}` });
   await page.addInitScript(installFakeRelay, {
@@ -279,6 +300,7 @@ async function openSurface(browserContext, origin, label) {
     threadB: THREAD_B,
     threadC: THREAD_C,
     threadD: THREAD_D,
+    tallTranscript,
   });
   await page.goto(`${origin}/`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(`#remote-threads-list [data-thread-id="${THREAD_B}"]`, {
@@ -335,6 +357,22 @@ async function tabThreadIds(page) {
   );
 }
 
+async function drawerProjectTagCount(page) {
+  return page.$$eval(".sidebar .project-switcher-top", (nodes) => nodes.length);
+}
+
+async function stripMetrics(page) {
+  return page.$eval(".session-tab-strip", (node) => {
+    const tab = node.querySelector(".session-tab");
+    return {
+      height: Math.round(node.getBoundingClientRect().height),
+      clientHeight: node.clientHeight,
+      scrollHeight: node.scrollHeight,
+      tabHeight: tab ? Math.round(tab.getBoundingClientRect().height) : 0,
+    };
+  });
+}
+
 async function main() {
   const server = await startStaticServer({
     rootDir: WEB_ROOT,
@@ -362,6 +400,21 @@ async function main() {
       await tabThreadIds(page),
       [THREAD_ACTIVE],
       "boot must open exactly one tab, for the session actually being shown"
+    );
+
+    // ---- 1b. The drawer's compact project tag is DRAWER-only. ----
+    // Remote renders the project switcher twice: the chat header's title, and a tag icon
+    // in the sidebar's top bar. The tag was written for the phone, where the drawer
+    // covers the header; on a desktop window both are on screen at once.
+    assert.equal(
+      await page.$$eval(".remote-chat-shell .project-switcher-trigger", (nodes) => nodes.length),
+      1,
+      "fixture check: the desktop header must carry the full project switcher"
+    );
+    assert.equal(
+      await drawerProjectTagCount(page),
+      0,
+      "a desktop window shows the header switcher, so the drawer must not repeat it as a tag"
     );
 
     // ---- 2. Opening sessions from the sidebar fills the strip. ----
@@ -663,6 +716,13 @@ async function main() {
       1,
       "a narrow but mouse-driven window keeps the strip — the gate is input, not width"
     );
+    // The other half of 1b: mouse-driven but drawer-shaped, so the drawer covers the
+    // header exactly as it does on a phone and the tag is the only switcher in reach.
+    assert.equal(
+      await drawerProjectTagCount(narrowPage),
+      1,
+      "a drawer-shaped window keeps the tag — the drawer covers the header's switcher"
+    );
     await narrowContext.close();
 
     // ---- 14. A phone, for completeness. ----
@@ -690,7 +750,58 @@ async function main() {
       0,
       "a phone must keep the plain single-session view"
     );
+    assert.equal(
+      await drawerProjectTagCount(phonePage),
+      1,
+      "a phone keeps the drawer's project tag — it is the surface the tag was written for"
+    );
     await phoneContext.close();
+
+    // ---- 15. The strip is CHROME: an over-full column must not eat its height. ----
+    // `.remote-chat-shell` is a flex COLUMN (local's `.chat-shell` is a grid, whose
+    // `auto` row gives the strip its height unconditionally — which is why this only
+    // showed on remote), and `.session-tab-strip`'s own `overflow-y: hidden` zeroes its
+    // automatic minimum size. So as a default `flex: 0 1 auto` child it was the one item
+    // in the column free to be crushed, and a long conversation crushed it.
+    const slackContext = await browser.newContext({ viewport: DESKTOP_VIEWPORT });
+    const slackPage = await openSurface(slackContext, origin, "slack-column");
+    await slackPage.waitForSelector(".session-tab-strip .session-tab", { timeout: TIMEOUT_MS });
+    const natural = await stripMetrics(slackPage);
+    await slackContext.close();
+
+    const overfullContext = await browser.newContext({ viewport: DESKTOP_VIEWPORT });
+    const overfullPage = await openSurface(overfullContext, origin, "overfull-column", {
+      tallTranscript: true,
+    });
+    await overfullPage.waitForSelector(".session-tab-strip .session-tab", { timeout: TIMEOUT_MS });
+    // Without a transcript that actually overflows there is no squeeze to observe, and
+    // every assertion below passes for the wrong reason.
+    await overfullPage.waitForFunction(
+      () => {
+        const thread = document.querySelector(".remote-chat-shell .chat-thread");
+        return Boolean(thread) && thread.scrollHeight > thread.clientHeight + 200;
+      },
+      undefined,
+      { timeout: TIMEOUT_MS }
+    );
+    const overfull = await stripMetrics(overfullPage);
+    await shoot(overfullPage, "remote-desktop-tabs-overfull-column");
+    await overfullContext.close();
+
+    assert.ok(
+      natural.tabHeight > 0 && natural.height >= natural.tabHeight,
+      `fixture check: the slack column must lay the strip out normally, got ${JSON.stringify(natural)}`
+    );
+    assert.deepEqual(
+      { height: overfull.height, tabHeight: overfull.tabHeight },
+      { height: natural.height, tabHeight: natural.tabHeight },
+      "the strip must be the same height whether or not the column below it overflows"
+    );
+    assert.equal(
+      overfull.clientHeight,
+      overfull.scrollHeight,
+      `an over-full column must not clip the strip's own content, got ${JSON.stringify(overfull)}`
+    );
 
     console.log("remote-desktop-tabs e2e: OK");
   } catch (error) {

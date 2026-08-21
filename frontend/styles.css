@@ -6165,6 +6165,10 @@ body.is-resizing-panel {
   display: flex;
   align-items: stretch;
   gap: 2px;
+  /* The `overflow` below zeroes this box's automatic minimum size, so in remote's flex
+   * column (local's is a grid) the default `flex: 0 1 auto` let a long conversation
+   * crush the whole strip to 8px. */
+  flex: none;
   padding: 4px 6px 0;
   overflow-x: auto;
   overflow-y: hidden;
