@@ -2531,21 +2531,27 @@ function RemoteSidebar({
         // them rather than a heading above the list. The name it would have displayed
         // lives on the chip below, which only exists while a project is actually
         // pinned.
-        h(ProjectSwitcher, {
-          activeProjectId,
-          className: "project-switcher-top",
-          onCreateProject: projectsReady ? () => onCreateProject() : null,
-          onDeleteProject: projectsReady ? onDeleteProject : null,
-          onRenameProject: projectsReady ? onRenameProject : null,
-          onSelectProject,
-          projects,
-          renderHeading: false,
-          // The same tag the tree marks project groups with. This used to be a
-          // bespoke folder outline, on the reasoning that a second mark at 16px
-          // would be noise — which held only while projects and cwds shared a
-          // glyph. They no longer do, so a folder here would name the wrong kind.
-          triggerIcon: h(ProjectTagIcon),
-        }),
+        //
+        // Drawer widths only: the chat header carries the full switcher at every width
+        // (RemoteHeader's `titleNode`), so this icon is that same control a second time
+        // unless the drawer is covering it.
+        usesDrawer
+          ? h(ProjectSwitcher, {
+              activeProjectId,
+              className: "project-switcher-top",
+              onCreateProject: projectsReady ? () => onCreateProject() : null,
+              onDeleteProject: projectsReady ? onDeleteProject : null,
+              onRenameProject: projectsReady ? onRenameProject : null,
+              onSelectProject,
+              projects,
+              renderHeading: false,
+              // The same tag the tree marks project groups with. This used to be a
+              // bespoke folder outline, on the reasoning that a second mark at 16px
+              // would be noise — which held only while projects and cwds shared a
+              // glyph. They no longer do, so a folder here would name the wrong kind.
+              triggerIcon: h(ProjectTagIcon),
+            })
+          : null,
         // No `shortcutHint`: remote is a phone surface with no ⌘F to promise.
         h(SidebarSearchToggle, { open: searchOpen, onToggle: onSetSearchOpen }),
         h(SidebarBellToggle, {
