@@ -1,5 +1,6 @@
 import React from "react";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
+import { ConversationHeadingBody } from "../shared/conversation-header.js";
 export { ConversationComposer as Composer } from "../shared/composer.js";
 export { SessionSettingsFields } from "../shared/session-settings-fields.js";
 import { formatTimestamp, shortId } from "./utils.js";
@@ -73,50 +74,47 @@ export function WorkspaceHeading({ header, statusBadge, onOpenInfo, titleNode = 
   const subtitle = header?.subtitle || "";
   const showStatus = shouldShowHeaderStatusBadge(statusBadge);
 
-  return h(
-    React.Fragment,
-    null,
-    h(
-      "div",
-      { className: "chat-heading-title-row" },
-      titleNode
-        ? titleNode
-        : h(
-            "h1",
-            {
-              id: "remote-workspace-title",
-              title: header?.titleTitle || "",
-            },
-            header?.title || "Pair this browser"
-          ),
-      showStatus
-        ? h(
-            "span",
-            {
-              "aria-label": statusBadge.label,
-              className: `status-badge status-badge-${statusBadge.tone} status-badge-compact`,
-              id: "remote-status-badge",
-              title: statusBadge.label,
-            },
-            compactStatusLabel(statusBadge.label)
-          )
-        : null,
-      onOpenInfo
-        ? h(
-            "button",
-            {
-              "aria-label": "Session details",
-              className: "header-icon-button chat-heading-info-button",
-              id: "remote-open-session-details",
-              onClick: onOpenInfo,
-              title: "Session details",
-              type: "button",
-            },
-            h(InfoIcon)
-          )
-        : null
-    ),
-    h(
+  // The title row + subtitle structure is shared with local now — this function is down to
+  // deciding WHICH nodes go in the slots, which is the part that is genuinely remote's
+  // (a status badge that can be absent, a pairing-aware fallback title).
+  return h(ConversationHeadingBody, {
+    titleNode: titleNode
+      ? titleNode
+      : h(
+          "h1",
+          {
+            id: "remote-workspace-title",
+            title: header?.titleTitle || "",
+          },
+          header?.title || "Pair this browser"
+        ),
+    statusNode: showStatus
+      ? h(
+          "span",
+          {
+            "aria-label": statusBadge.label,
+            className: `status-badge status-badge-${statusBadge.tone} status-badge-compact`,
+            id: "remote-status-badge",
+            title: statusBadge.label,
+          },
+          compactStatusLabel(statusBadge.label)
+        )
+      : null,
+    infoButton: onOpenInfo
+      ? h(
+          "button",
+          {
+            "aria-label": "Session details",
+            className: "header-icon-button chat-heading-info-button",
+            id: "remote-open-session-details",
+            onClick: onOpenInfo,
+            title: "Session details",
+            type: "button",
+          },
+          h(InfoIcon)
+        )
+      : null,
+    subtitleNode: h(
       "p",
       {
         className: "chat-subtitle",
@@ -125,8 +123,8 @@ export function WorkspaceHeading({ header, statusBadge, onOpenInfo, titleNode = 
         title: header?.subtitleTitle || subtitle,
       },
       subtitle
-    )
-  );
+    ),
+  });
 }
 
 export function SessionPanel({

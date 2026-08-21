@@ -5,14 +5,11 @@ import { RefreshButton } from "../shared/refresh-button.js";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
 import { SidebarBrand, SidebarCollapseToggle, SidebarResizeHandle } from "../shared/sidebar-chrome.js";
-// Panel/header glyphs. These four were byte-for-byte identical to remote's copies, which
-// differed only by a `Remote` prefix on the function name — see shared/panel-icons.js.
-import {
-  BackArrowIcon,
-  ComposeIcon,
-  ToggleLeftPanelIcon,
-  ToggleRightPanelIcon,
-} from "../shared/panel-icons.js";
+import { ConversationHeader, ConversationHeadingBody } from "../shared/conversation-header.js";
+// The back arrow, the compose mark and the left-panel toggle moved into
+// shared/conversation-header.js with the header markup that used them; only the right-rail
+// toggle is still drawn here, because the rail is not part of the shared header.
+import { ToggleRightPanelIcon } from "../shared/panel-icons.js";
 import {
   CHEVRON_RIGHT_SVG,
   SETTINGS_SVG,
@@ -371,78 +368,34 @@ function InfoIcon() {
 
 
 function ChatHeader() {
-  return h(
-    "header",
-    { className: "chat-header" },
-    h(
-      "div",
-      { className: "chat-header-leading" },
-      h(
-        "div",
-        { className: "chat-header-collapsed-actions" },
-        h(
-          "button",
-          {
-            "aria-label": "Show navigation panel",
-            className: "header-button header-panel-toggle header-panel-toggle-left",
-            id: "toggle-left-panel",
-            type: "button",
-            title: "Show navigation panel (⌘B)",
-          },
-          h(ToggleLeftPanelIcon)
-        ),
-        h(
-          "button",
-          {
-            "aria-label": "Start new session",
-            className: "header-button header-compose-button",
-            id: "new-session-compose-button",
-            type: "button",
-            title: "Start new session",
-          },
-          h(ComposeIcon)
-        )
-      ),
-      h(
+  return h(ConversationHeader, {
+    backButtonId: "go-console-home",
+    backLabel: "Back to console",
+    composeButtonId: "new-session-compose-button",
+    leftPanelToggleId: "toggle-left-panel",
+    // No handlers: every button in here is wired by id from app.js, which is what lets
+    // this render once and never take a changing prop.
+    heading: h(ConversationHeadingBody, {
+      // The Project switcher IS the header title — one control answering "where am I",
+      // not a title plus a switcher naming the same thing one row below it. Its own
+      // sub-root, filled by renderProjectSwitcher().
+      titleNode: h("div", { className: "project-switcher-mount", id: "project-switcher-mount" }),
+      infoButton: h(
         "button",
         {
-          className: "header-icon-button chat-heading-back-button",
-          hidden: true,
-          id: "go-console-home",
-          title: "Back to console",
-          "aria-label": "Back to console",
+          "aria-label": "Session details",
+          className: "header-icon-button chat-heading-info-button",
+          id: "open-session-details",
           type: "button",
+          title: "Session details",
         },
-        h(BackArrowIcon)
+        h(InfoIcon)
       ),
-      h(
-        "div",
-        { className: "chat-heading" },
-        h(
-          "div",
-          { className: "chat-heading-title-row" },
-          // The Project switcher IS the header title — one control answering
-          // "where am I", not a title plus a switcher naming the same thing one
-          // row below it. Its own sub-root, filled by renderProjectSwitcher().
-          h("div", { className: "project-switcher-mount", id: "project-switcher-mount" }),
-          h(
-            "button",
-            {
-              "aria-label": "Session details",
-              className: "header-icon-button chat-heading-info-button",
-              id: "open-session-details",
-              type: "button",
-              title: "Session details",
-            },
-            h(InfoIcon)
-          ),
-        ),
-        h("p", { className: "chat-subtitle", id: "workspace-subtitle" })
-      )
-    ),
-    h(
-      "div",
-      { className: "chat-header-actions" },
+      subtitleNode: h("p", { className: "chat-subtitle", id: "workspace-subtitle" }),
+    }),
+    actions: h(
+      React.Fragment,
+      null,
       h("span", {
         className: "model-badge-compact",
         hidden: true,
@@ -450,7 +403,7 @@ function ChatHeader() {
       }),
       h("span", { className: "status-badge", id: "status-badge" }, "Idle"),
       // Mobile-only Settings entry: the icon rail (which holds the gear) is hidden
-      // ≤960px, so this keeps Providers/Devices/Log/Appearance reachable in every
+      // <=960px, so this keeps Providers/Devices/Log/Appearance reachable in every
       // view (the header is always present, even in conversation where the sidebar
       // collapses). Hidden on desktop via CSS.
       h(
@@ -471,12 +424,12 @@ function ChatHeader() {
           className: "header-button header-panel-toggle header-panel-toggle-right",
           id: "toggle-right-panel",
           type: "button",
-          title: "Toggle side panel (⌥⌘B)",
+          title: "Toggle side panel (\u2325\u2318B)",
         },
         h(ToggleRightPanelIcon)
       )
-    )
-  );
+    ),
+  });
 }
 
 function OverviewStrip() {

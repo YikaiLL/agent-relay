@@ -2620,13 +2620,6 @@ input:focus, textarea:focus, select:focus {
   z-index: 3;
 }
 
-.chat-header-main {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
 .chat-heading {
   min-width: 0;
 }
@@ -4656,8 +4649,7 @@ input:focus, textarea:focus, select:focus {
     padding: 14px 16px 12px;
     gap: 12px;
   }
-  .chat-header-main {
-    align-items: center;
+  .chat-header-leading {
     gap: 10px;
   }
   .chat-heading h1 {
@@ -5142,6 +5134,9 @@ input:focus, textarea:focus, select:focus {
 .thread-group-header[data-group-kind="state"] .thread-group-icon {
   display: none;
 }
+/* One wrapper for both surfaces. This was `.chat-header-leading` on local and
+   `.chat-header-main` on remote, separately styled, and the only difference between the
+   two rules was a gap of 8px against 12px — nothing anyone chose. */
 .chat-header-leading {
   display: flex;
   align-items: center;

@@ -11,6 +11,7 @@ import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { fetchBuildInfo } from "../shared/build-badge.js";
 import { StartSessionSplitButton } from "../shared/start-session-split-button.js";
+import { ConversationHeader } from "../shared/conversation-header.js";
 import { ClientLog } from "../shared/client-log.js";
 import { createAskUserQuestionDetailLoader } from "../shared/ask-user-question-detail-loader.js";
 import {
@@ -2820,101 +2821,59 @@ function RemoteHeader({
       })
     : null;
 
-  return h(
-    "header",
-    { className: "chat-header" },
-    h(
-      "div",
-      { className: "chat-header-main" },
+  return h(ConversationHeader, {
+    // Remote-only: the drawer hamburger. Local has no drawer, so this slot is the one
+    // structural thing the two headers genuinely do not share.
+    navToggle: h(
+      "button",
+      {
+        "aria-expanded": String(navOpen),
+        "aria-label": navLabel,
+        className: "header-button remote-nav-toggle-button",
+        "data-nav-state": navOpen ? "open" : "closed",
+        hidden: !usesDrawer,
+        id: "remote-nav-toggle-button",
+        onClick: onToggleNavigation,
+        title: navLabel,
+        type: "button",
+      },
       h(
-        "button",
-        {
-          "aria-expanded": String(navOpen),
-          "aria-label": navLabel,
-          className: "header-button remote-nav-toggle-button",
-          "data-nav-state": navOpen ? "open" : "closed",
-          hidden: !usesDrawer,
-          id: "remote-nav-toggle-button",
-          onClick: onToggleNavigation,
-          title: navLabel,
-          type: "button",
-        },
-        h(
-          "span",
-          { className: "remote-nav-toggle-icon", "aria-hidden": "true" },
-          h("span", null),
-          h("span", null),
-          h("span", null)
-        ),
-        h("span", { className: "sr-only" }, "Toggle sidebar")
+        "span",
+        { className: "remote-nav-toggle-icon", "aria-hidden": "true" },
+        h("span", null),
+        h("span", null),
+        h("span", null)
       ),
-      h(
-        "div",
-        { className: "chat-header-collapsed-actions" },
-        h(
-          "button",
-          {
-            "aria-label": "Show navigation panel",
-            className: "header-button header-panel-toggle header-panel-toggle-left",
-            id: "remote-toggle-left-panel",
-            title: "Show navigation panel (⌘B)",
-            type: "button",
-          },
-          h(ToggleLeftPanelIcon)
-        ),
-        h(
-          "button",
-          {
-            "aria-label": "Start new session",
-            className: "header-button header-compose-button",
-            id: "remote-new-session-compose-button",
-            type: "button",
-            title: "Start new session",
-            onClick: onOpenStartSession,
-          },
-          h(ComposeIcon)
-        )
-      ),
-      h(
-        "button",
-        {
-          className: "header-icon-button chat-heading-back-button",
-          hidden: deviceChromeModel.homeButton.hidden,
-          id: "remote-home-button",
-          onClick: onReturnHome,
-          title: "All relays",
-          "aria-label": "All relays",
-          type: "button",
-        },
-        h(BackArrowIcon)
-      ),
-      h(
-        "div",
-        { className: "chat-heading", id: "remote-chat-heading" },
-        h(WorkspaceHeading, {
-          header: headerModel,
-          onOpenInfo,
-          statusBadge: statusBadgeModel,
-          titleNode,
-        })
-      )
+      h("span", { className: "sr-only" }, "Toggle sidebar")
     ),
-    h(
-      "div",
-      { className: "chat-header-actions" },
-      h(
-        "button",
-        {
-          "aria-label": "Toggle side panel",
-          className: "header-button header-panel-toggle header-panel-toggle-right",
-          id: "remote-toggle-right-panel",
-          title: "Toggle side panel (⌥⌘B)",
-          type: "button",
-        },
-        h(ToggleRightPanelIcon)
-      )
-    )
-  );
+    // The back button goes somewhere different here than on local — the relay list, not
+    // the console — which is why the label travels with the handler.
+    backButtonId: "remote-home-button",
+    backHidden: deviceChromeModel.homeButton.hidden,
+    backLabel: "All relays",
+    onBack: onReturnHome,
+    composeButtonId: "remote-new-session-compose-button",
+    onCompose: onOpenStartSession,
+    leftPanelToggleId: "remote-toggle-left-panel",
+    headingId: "remote-chat-heading",
+    heading: h(WorkspaceHeading, {
+      header: headerModel,
+      onOpenInfo,
+      statusBadge: statusBadgeModel,
+      titleNode,
+    }),
+    actions: h(
+      "button",
+      {
+        "aria-label": "Toggle side panel",
+        className: "header-button header-panel-toggle header-panel-toggle-right",
+        id: "remote-toggle-right-panel",
+        title: "Toggle side panel (\u2325\u2318B)",
+        type: "button",
+      },
+      h(ToggleRightPanelIcon)
+    ),
+  });
 }
 
 function RemoteThreadPanel({
