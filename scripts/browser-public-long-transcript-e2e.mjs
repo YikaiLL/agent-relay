@@ -144,6 +144,12 @@ async function main() {
           };
         };
 
+        // Keep in step with broker-client.js. It drops a payload whose relay version it
+        // does not know via `renderLog`, so a stale fixture reaches no console: the page
+        // connects, sends its requests, and silently ignores every answer.
+        const BROKER_PROTOCOL_VERSION = 1;
+        const RELAY_PROTOCOL_VERSION = 2;
+
         class FakeWebSocket extends EventTarget {
           static OPEN = 1;
 
@@ -155,7 +161,7 @@ async function main() {
               this.dispatchEvent(new Event("open"));
               this.#emit({
                 type: "welcome",
-                protocol_version: 1,
+                protocol_version: BROKER_PROTOCOL_VERSION,
                 peer_id: "surface-e2e",
                 channel_id: "room-e2e",
                 peers: [{ peer_id: "relay-peer-e2e", role: "relay" }],
@@ -168,7 +174,7 @@ async function main() {
               this.#emit({
                 type: "message",
                 payload: {
-                  protocol_version: 1,
+                  protocol_version: RELAY_PROTOCOL_VERSION,
                   kind: "session_snapshot",
                   snapshot: truncatedSnapshot,
                 },
@@ -229,7 +235,7 @@ async function main() {
                 this.#emit({
                   type: "message",
                   payload: {
-                    protocol_version: 1,
+                    protocol_version: RELAY_PROTOCOL_VERSION,
                     kind: "session_snapshot",
                     snapshot: truncatedSnapshot,
                   },
@@ -247,7 +253,7 @@ async function main() {
             this.#emit({
               type: "message",
               payload: {
-                protocol_version: 1,
+                protocol_version: RELAY_PROTOCOL_VERSION,
                 kind: "remote_action_result",
                 action_id: actionId,
                 ...result,
