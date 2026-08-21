@@ -1,8 +1,19 @@
-import { DEFAULT_WORKSPACE_LABEL } from "../shared/project-labels.js";
+import { DEFAULT_WORKSPACE_LABEL } from "./project-labels.js";
 
 // The session header's title + subtitle text as ONE pure decision — mirroring
 // status-badge.js, so the "what does the header say" rules live in a single tested
 // place instead of drifting across inline branches in renderHeader.
+//
+// SHARED, not local-only. It moved here when the two surfaces' headers were being
+// reconciled, and the move was cheap for a reason worth recording: the two headers had
+// already converged on the ANSWER without sharing the code. Both render the Project
+// switcher as the title, and both fall back to DEFAULT_WORKSPACE_LABEL through the
+// switcher's own `label || derivedLabel`. Remote's `workspaceTitle()` still exists and
+// still returns a relay label, but that value only reaches tooltips and the non-
+// conversation views — it is not what the header says while you are reading a session.
+//
+// So there was no product difference to settle here, only two copies of one decision.
+// What remains forked is the MARKUP around it, which is the thing to unify next.
 //
 // Product decisions encoded here (deliberate, not incidental):
 //

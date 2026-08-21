@@ -160,7 +160,7 @@ import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap } from "../shared/thread-activity.js";
 import { describeStatusChips } from "../shared/session-status.js";
 import { selectStatusBadge } from "./status-badge.js";
-import { selectHeaderLabels } from "./header-labels.js";
+import { selectHeaderLabels } from "../shared/header-labels.js";
 import { selectStandbyEmptyModel, buildStandbyEmptyActions } from "./standby-empty-state.js";
 import {
   findPendingInputRequestIds,
