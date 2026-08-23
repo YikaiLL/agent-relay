@@ -31,9 +31,18 @@ else
   exit 1
 fi
 
+# Unlocked like every other `npm run dev:*`; this script execs cargo itself so it
+# repeats what dev-full.mjs does. After the source, so an explicit 0 still wins.
+export SEALWIRE_BETA="${SEALWIRE_BETA:-1}"
+
 npm run build
 
 echo "restart-dev-cloud: starting relay-server at http://${BIND_HOST:-127.0.0.1}:${PORT:-8787}"
+if [ "$SEALWIRE_BETA" = "1" ]; then
+  echo "restart-dev-cloud: beta features ON (Tasks unlocked)"
+else
+  echo "restart-dev-cloud: beta features OFF (SEALWIRE_BETA=$SEALWIRE_BETA)"
+fi
 # The control URL is optional: the two-variable quickstart env sets only
 # RELAY_BROKER_URL and the relay derives the control URL from it. Guard the
 # expansion so `set -u` does not abort before the relay even starts.
