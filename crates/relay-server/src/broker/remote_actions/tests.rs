@@ -196,6 +196,47 @@ fn fork_session_action_round_trips_and_issues_session_claim() {
 }
 
 #[test]
+fn fetch_workspace_git_context_round_trips_and_binds_the_requesting_device() {
+    // The cwd here is CALLER-SUPPLIED, which is what makes the device stamp
+    // load-bearing rather than bookkeeping: `workspace_git_context` resolves the
+    // path scope from the device id, so a request that arrived without one
+    // stamped would be scope-checked against an empty scope.
+    let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "fetch_workspace_git_context",
+        "cwd": "/repo/checkout"
+    }))
+    .expect("fetch_workspace_git_context should parse");
+    assert_eq!(request.kind(), RemoteActionKind::FetchWorkspaceGitContext);
+    assert_eq!(
+        RemoteActionKind::FetchWorkspaceGitContext.as_str(),
+        "fetch_workspace_git_context"
+    );
+
+    match request.bind_device("device-9".to_string()) {
+        RemoteActionRequest::FetchWorkspaceGitContext { device_id, cwd } => {
+            assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert_eq!(
+                cwd.as_deref(),
+                Some("/repo/checkout"),
+                "bind_device must preserve the path being asked about"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+}
+
+#[test]
+fn fetch_workspace_git_context_is_read_only_and_needs_no_session_claim() {
+    // Same posture as fetch_workspace_diff and project_action: a paired device
+    // must be able to see what it is about to launch into without first taking
+    // control of whatever session happens to be running.
+    assert!(
+        !super::requires_session_claim(RemoteActionKind::FetchWorkspaceGitContext),
+        "reading a workspace's git standing must not require taking over a session"
+    );
+}
+
+#[test]
 fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
     // The client sends the viewed session's thread_id; bind_device must stamp the
     // requesting device WITHOUT dropping the selector (regression guard for the
@@ -353,6 +394,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -389,6 +431,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -488,6 +531,9 @@ fn remote_action_result_size_breakdown_reports_large_thread_transcript_payloads(
         Some(&thread_entries),
         None,
         Some(&thread_transcript),
+        // workspace_diff
+        None,
+        // workspace_git_context
         None,
         // reviews
         None,
@@ -545,6 +591,7 @@ fn make_large_thread_transcript_plaintext() -> RemoteActionResultPlaintext {
             thread_state: None,
         }),
         workspace_diff: None,
+        workspace_git_context: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -574,6 +621,7 @@ fn make_large_ask_user_detail_plaintext() -> RemoteActionResultPlaintext {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -943,6 +991,7 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
         reviews: Some(reviews),
         workflows: None,
         devices: None,
@@ -989,6 +1038,7 @@ fn plain_dedicated_workflows_and_devices_payloads_reach_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
         reviews: None,
         workflows: Some(crate::protocol::WorkflowsResponse {
             workflows_revision: 4,
@@ -1048,6 +1098,7 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -1077,6 +1128,66 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
     assert_eq!(
         carried["thread_project_id"]["thread-1"], "proj-1",
         "the device needs membership to group sessions by project"
+    );
+}
+
+#[test]
+fn plain_fetch_workspace_git_context_result_reaches_the_device() {
+    // The same silent-drop trap `reviews` and `projects` each fell into: the SEALED
+    // path serializes `RemoteActionResultPlaintext` wholesale, so a field missing
+    // from the plaintext envelope builder fails only on unsealed transport — the
+    // chip works when sealed and is blank when not. Request binding is covered
+    // elsewhere; this locks the RESULT path.
+    let result = RemoteActionResultPlaintext {
+        kind: remote_action_result_kind(RemoteActionKind::FetchWorkspaceGitContext),
+        action: RemoteActionKind::FetchWorkspaceGitContext,
+        ok: true,
+        snapshot: None,
+        receipt: None,
+        ask_user_answer_receipt: None,
+        providers: None,
+        models: None,
+        threads: None,
+        thread_entries: None,
+        thread_entry_detail: None,
+        thread_transcript: None,
+        workspace_diff: None,
+        workspace_git_context: Some(crate::protocol::WorkspaceGitContextView {
+            cwd: "/repo/checkout".to_string(),
+            is_repo: true,
+            branch: Some("main".to_string()),
+            detached: false,
+            dirty: true,
+        }),
+        reviews: None,
+        workflows: None,
+        devices: None,
+        projects: None,
+        ask_user_question_detail: None,
+        session_claim: None,
+        session_claim_expires_at: None,
+        claim_challenge_id: None,
+        claim_challenge: None,
+        claim_challenge_expires_at: None,
+        error: None,
+    };
+
+    let payload = build_plain_remote_action_result_payload("action-git", "surface-1", &result)
+        .expect("git context payload");
+    let json = serde_json::to_value(&payload).expect("serialize git context payload");
+    let carried = json
+        .get("workspace_git_context")
+        .unwrap_or(&serde_json::Value::Null)
+        .clone();
+    assert!(
+        !carried.is_null(),
+        "the plaintext envelope must carry `workspace_git_context`; got: {json}"
+    );
+    assert_eq!(carried["branch"], "main");
+    assert_eq!(carried["dirty"], true);
+    assert_eq!(
+        carried["cwd"], "/repo/checkout",
+        "the echoed cwd is what lets a client drop an answer about a directory it has moved off"
     );
 }
 
@@ -1233,6 +1344,7 @@ async fn list_threads_action_carries_the_search_query() {
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session");

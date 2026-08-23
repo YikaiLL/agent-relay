@@ -8,6 +8,8 @@ import {
   normalizeForkFields,
 } from "./fork-fields.js";
 import { providerLabel } from "./provider-labels.js";
+import { ProjectPicker } from "./project-picker.js";
+import { FORK_PROJECT_INHERIT, FORK_PROJECT_NONE } from "./fork-fields.js";
 
 const h = React.createElement;
 
@@ -54,6 +56,16 @@ export function ForkSessionDialog({
   approvalOptions = [],
   effortOptions = [],
   onRequestClose = null,
+  // Project membership. A fork with an untouched picker INHERITS its source's
+  // project server-side, which is what most forks want; the picker exists so a
+  // branch can be filed somewhere else, or nowhere.
+  projects = [],
+  threads = [],
+  threadProjectId = {},
+  threadActivity = null,
+  threadAttention = null,
+  threadReviewing = null,
+  onCreateProject = null,
   // Opt-in mount for pasted-image chips. Local passes an id; remote leaves it
   // null because a paired device cannot send image bytes at all.
   initialPromptAttachmentsId = null,
@@ -125,6 +137,26 @@ export function ForkSessionDialog({
             { className: "control-hint", "data-fork-mode": "native" },
             `Native ${providerLabel(targetProvider)} fork — full context is preserved.`
           ),
+      // The project the branch is filed under. `FORK_PROJECT_INHERIT` (null) is
+      // the untouched state and is NOT the same as choosing Default Workspace —
+      // the first omits the field so the relay resolves it from the source, the
+      // second sends the explicit-unassigned sentinel.
+      h(ProjectPicker, {
+        activeProjectId:
+          fields.projectId === FORK_PROJECT_INHERIT || fields.projectId === FORK_PROJECT_NONE
+            ? null
+            : fields.projectId,
+        label: "Project",
+        onCreateProject,
+        onSelectProject: (projectId) =>
+          onFieldChange?.("projectId", projectId === null ? FORK_PROJECT_NONE : projectId),
+        projects,
+        threadActivity,
+        threadAttention,
+        threadProjectId,
+        threadReviewing,
+        threads,
+      }),
       h(
         "label",
         { className: "field field-full" },

@@ -69,7 +69,7 @@ impl AppState {
         let up_to_item_id =
             normalize_fork_point(&source_data.transcript, requested_fork_point.as_deref());
 
-        let source_settings = {
+        let (source_settings, source_project_id) = {
             let relay = self.relay.read().await;
             // Re-check under the lock we will act on: the provider read above
             // is a multi-second await during which another paired device can
@@ -89,7 +89,36 @@ impl AppState {
             {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
             }
-            relay.remembered_thread_settings(&source_thread_id)
+            (
+                relay.remembered_thread_settings(&source_thread_id),
+                // Only a project that still EXISTS is inherited: a dangling
+                // membership (project deleted elsewhere) resolves to None here,
+                // so the fork lands Unassigned rather than re-creating a ghost.
+                relay
+                    .project_for_thread(&source_thread_id)
+                    .map(|project| project.id.clone()),
+            )
+        };
+
+        // Three states, not two:
+        //   None       -> inherit the source's project
+        //   Some("id") -> file into that project
+        //   Some("")   -> explicitly unassigned
+        //
+        // The empty string is the sentinel because `None` is already spoken for by
+        // inherit, so absence cannot also mean "no project" — and a fork dialog
+        // that offers "Default Workspace" has to be able to say it. `""` is safe
+        // to overload: project ids are always `proj_%016x`, so nothing legitimate
+        // produces it. Note this deliberately does NOT use `non_empty`, which
+        // collapses `Some("")` into `None` and would silently re-inherit.
+        //
+        // Resolved once, here, so the native and replay paths file the branch
+        // identically — they diverge on everything else and this is not a place
+        // they should differ.
+        let target_project_id = match input.project_id {
+            Some(explicit) if explicit.is_empty() => None,
+            Some(explicit) => Some(explicit),
+            None => source_project_id,
         };
 
         let target_provider_requested = non_empty(input.provider);
@@ -186,6 +215,7 @@ impl AppState {
                         &effort,
                         &device_id,
                         &source_thread_id,
+                        target_project_id.as_deref(),
                         user_prompt,
                         images,
                     )
@@ -217,6 +247,7 @@ impl AppState {
             &sandbox,
             &effort,
             &device_id,
+            target_project_id.as_deref(),
             replay_prompt,
             images,
         )
@@ -235,6 +266,7 @@ impl AppState {
         effort: &str,
         device_id: &str,
         source_thread_id: &str,
+        project_id: Option<&str>,
         user_prompt: Option<String>,
         images: Vec<ProviderImage>,
     ) -> Result<SessionSnapshot, String> {
@@ -255,6 +287,15 @@ impl AppState {
                 device_id,
             );
             relay.set_thread_forked_from(&forked_thread_id, source_thread_id);
+            if let Some(project_id) = project_id {
+                if super::projects::attach_new_thread_to_project(
+                    &mut relay,
+                    &forked_thread_id,
+                    project_id,
+                ) {
+                    relay.bump_projects_revision();
+                }
+            }
             relay.push_log(
                 "info",
                 format!(
@@ -300,6 +341,7 @@ impl AppState {
         sandbox: &str,
         effort: &str,
         device_id: &str,
+        project_id: Option<&str>,
         replay_prompt: String,
         images: Vec<ProviderImage>,
     ) -> Result<SessionSnapshot, String> {
@@ -358,6 +400,15 @@ impl AppState {
                 }
             }
             relay.set_thread_forked_from(&started_thread_id, source_thread_id);
+            if let Some(project_id) = project_id {
+                if super::projects::attach_new_thread_to_project(
+                    &mut relay,
+                    &started_thread_id,
+                    project_id,
+                ) {
+                    relay.bump_projects_revision();
+                }
+            }
             relay.push_log(
                 "info",
                 format!(

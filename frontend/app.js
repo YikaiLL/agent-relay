@@ -34,7 +34,6 @@ import {
   forkSessionDialogRoot,
   forkThreadButton,
   goConsoleHomeButton,
-  launchStartSessionDialog,
   launchSettingsModal,
   loadDirectoryButton,
   messageEffort,
@@ -62,7 +61,6 @@ import {
   startEffortInput,
   startEffortLabel,
   startPairingButton,
-  startPromptAttachments,
   startPromptInput,
   startSessionButton,
   statusBadge,
@@ -228,6 +226,8 @@ import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
 import { ProjectSwitcher } from "./shared/project-switcher.js";
+import { StartSessionDialog } from "./shared/start-session-dialog.js";
+import { selectWorkspaceSuggestionsModel } from "./shared/workspace-suggestions.js";
 import {
   layoutThreadIds,
 } from "./shared/tab-layout.js";
@@ -368,6 +368,9 @@ const state = {
   composerImageAttachments: [],
   nextComposerImageAttachmentId: 1,
   newSessionSubmitInFlight: false,
+  // Git standing of the launch dialog's chosen directory; null when unknown or
+  // when the directory is not a repo.
+  launchGitContext: null,
   newSessionImageAttachments: [],
   nextNewSessionImageAttachmentId: 1,
   forkImageAttachments: [],
@@ -426,7 +429,6 @@ const state = {
   // that project's id so the freshly-created thread can be auto-assigned to it. Set at
   // "New agent" time, consumed once by the next start, and cleared by any plain
   // new-session opener so a normal launch never inherits a stale project.
-  pendingProjectAssignment: null,
   threadHistoryScrollTop: 0,
   // Sessions this browser archived/deleted. History entries outlive threads, so
   // back/forward can land on a `?thread=` that no longer exists; without a tombstone
@@ -562,6 +564,9 @@ projectsStore.subscribe((projectsState) => {
   state.projectsLoading = projectsState.loading;
   state.projectsError = projectsState.error;
   state.projectsLoaded = projectsState.loaded;
+  // The launch dialog's project chip reads this list; without a nudge a project
+  // created or refreshed while the dialog is open never appears in its menu.
+  renderLaunchSessionDialogIfOpen();
   if (!projectsState.loaded) {
     reconciledProjectSignature = null;
   }
@@ -702,7 +707,7 @@ leftPanelControl.subscribe(({ isOpen }) => {
   document.body.classList.toggle("sidebar-collapsed", !isOpen);
 });
 newSessionComposeButton?.addEventListener("click", () => {
-  document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+  openStartSessionDialog();
 });
 
 const rightPanelControl = createPanelControl({
@@ -1688,6 +1693,32 @@ async function createProjectFromToolbar() {
   }
 }
 
+// Create a project from INSIDE a launch dialog.
+//
+// Deliberately not `createProjectFromToolbar`: that one navigates to the new
+// project's overview, which from a modal means the dialog is left floating over
+// a page the user did not ask to visit — and, worse, the draft's `projectId` was
+// never updated, so pressing Start immediately afterwards filed the session
+// nowhere. Creating a project here is a step INSIDE choosing one, so the only
+// correct outcome is that it becomes the selection.
+async function createProjectForLaunchDraft(setProjectId) {
+  const name = promptProjectName();
+  if (!name) {
+    return;
+  }
+  try {
+    const before = state.projects || [];
+    const receipt = await createProject(apiFetch, name);
+    const projectId = pickNewProjectId(before, receipt?.projects);
+    if (projectId) {
+      setProjectId(projectId);
+    }
+    logLine(`Created project "${name}".`);
+  } catch (error) {
+    logLine(`Failed to create project: ${error.message}`);
+  }
+}
+
 // Rename a Project from its group header (Projects view). Prompt pre-filled with the
 // current name; refresh rides the projects_revision snapshot bump like every mutation.
 async function renameProjectFromHeader(projectId, currentName) {
@@ -2134,8 +2165,11 @@ goConsoleHomeButton?.addEventListener("click", goConsoleHome);
 // Remember which project the next Start belongs to, then open the launcher. Shared
 // by the project overview's "New agent" and the chat header's.
 function startProjectAgent(projectId) {
-  state.pendingProjectAssignment = projectId || null;
-  document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+  // No more `pendingProjectAssignment`: the project rides ON the start request
+  // now, so there is nothing to remember and nothing to reconcile afterwards.
+  // The old two-step could also silently lose the filing when the follow-up
+  // assign failed, and remote could never copy it at all.
+  openStartSessionDialog({ projectId: projectId || null });
 }
 
 /**
@@ -2345,88 +2379,49 @@ window.addEventListener("popstate", (event) => {
   );
 });
 
-directoryForm?.addEventListener("submit", (event) => {
-  event.preventDefault();
-  void clearThreadRoute();
-  setSelectedCwd(cwdInput.value.trim());
-  void loadThreads("directory change");
-});
+// The `#directory-form` submit listener that used to sit here is gone with the
+// form. The old dialog wrapped its workspace field in a form whose Load button
+// re-grouped the session list by directory; the redesign has a combobox that
+// commits on pick, and the sidebar already lists every workspace's sessions.
 
-// A plain new-session opener (launcher, header compose, empty-state CTA) resets any
-// pending project assignment, so a session started from the normal launcher never
-// inherits a project the user only glanced at via "New agent".
-document.addEventListener("click", (event) => {
-  const el = event.target instanceof Element ? event.target : null;
-  if (!el) return;
-  if (
-    el.closest("#open-start-session-dialog") ||
-    el.closest("#new-session-compose-button") ||
-    el.closest("[data-start-session]")
-  ) {
-    state.pendingProjectAssignment = null;
-  }
-});
-
-document.addEventListener("click", (event) => {
-  const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-  if (!target?.closest("#start-session-button")) {
-    return;
-  }
+// Submit the launch dialog.
+//
+// Called by the dialog itself rather than by a delegated document click on
+// `#start-session-button`. That listener, and the "clear the pending project"
+// listener that had to run beside it, are both gone: the project now rides on
+// the start request, so there is no cross-click state to remember or to clear.
+async function submitStartSession() {
   if (state.newSessionSubmitInFlight) {
     return;
   }
-  // Consume any pending "New agent" project synchronously (so a failed/cancelled
-  // start can't leave it dangling), then assign the freshly-created thread once
-  // startSession resolves with its id.
-  const assignToProject = state.pendingProjectAssignment;
-  state.pendingProjectAssignment = null;
   const imageAttachments = state.newSessionImageAttachments.slice();
   state.newSessionSubmitInFlight = true;
   renderNewSessionImageAttachments();
-  void startSession(imageAttachments).then((newThreadId) => {
+  renderLaunchSessionDialogIfOpen();
+  try {
+    const newThreadId = await startSession(imageAttachments);
     if (newThreadId) {
       const sentIds = new Set(imageAttachments.map((attachment) => attachment.id));
       state.newSessionImageAttachments = state.newSessionImageAttachments.filter(
         (attachment) => !sentIds.has(attachment.id)
       );
     }
-    if (newThreadId && assignToProject) {
-      void assignNewSessionToProject(newThreadId, assignToProject);
-    }
-  }).finally(() => {
+  } finally {
     state.newSessionSubmitInFlight = false;
     renderNewSessionImageAttachments();
-  });
-});
+    renderLaunchSessionDialogIfOpen();
+  }
+}
 
 // Assign a just-started session to the project its "New agent" button belongs to. The
 // membership change rides the snapshot's projects_revision bump (assign calls notify),
 // same as every other project mutation, so the sidebar/overview refresh on their own.
-async function assignNewSessionToProject(threadId, projectId) {
-  try {
-    await assignThreadToProject(apiFetch, threadId, projectId);
-    const name = (state.projects || []).find((project) => project.id === projectId)?.name || "project";
-    logLine(`Added the new session to "${name}".`);
-  } catch (error) {
-    logLine(`Started the session, but couldn't add it to the project: ${error.message}`);
-  }
-}
 
-document.addEventListener("change", (event) => {
-  const target = event.target;
-  if (!(target instanceof HTMLSelectElement) && !(target instanceof HTMLTextAreaElement) && !(target instanceof HTMLInputElement)) {
-    return;
-  }
-  handleLaunchFieldInput(target.id, target.value);
-});
-
-document.addEventListener("input", (event) => {
-  const target = event.target;
-  if (!(target instanceof HTMLTextAreaElement) && !(target instanceof HTMLInputElement)) {
-    return;
-  }
-  handleLaunchFieldInput(target.id, target.value);
-});
+// The two document-level `change`/`input` listeners that used to sit here are
+// gone. They existed to catch edits to the launch dialog's native controls by
+// element id — a delegated listener on the whole document, firing for every
+// input on the surface, to feed a form that could not tell the store what it had
+// changed. The dialog is controlled now and reports its own changes.
 
 // The banner is one slot with one button, but which button it is depends on why the
 // banner is up (see local/control-banner.js), so both are bound here by id.
@@ -2477,9 +2472,14 @@ function clearComposerImageAttachments() {
 }
 
 function renderNewSessionImageAttachments() {
-  if (!startPromptAttachments) return;
-  startPromptAttachments.replaceChildren();
-  startPromptAttachments.hidden = state.newSessionImageAttachments.length === 0;
+  // Resolved live. dom.js's module-level query ran at boot, before the dialog
+  // existed, so it captured null forever — this returned early every time and a
+  // pasted image became INVISIBLE while still riding along on submit. That is a
+  // send-something-you-did-not-mean-to bug, not a cosmetic one.
+  const mount = document.getElementById("start-prompt-attachments");
+  if (!mount) return;
+  mount.replaceChildren();
+  mount.hidden = state.newSessionImageAttachments.length === 0;
 
   for (const attachment of state.newSessionImageAttachments) {
     const chip = document.createElement("span");
@@ -2500,7 +2500,7 @@ function renderNewSessionImageAttachments() {
     remove.textContent = "×";
     chip.append(remove);
 
-    startPromptAttachments.append(chip);
+    mount.append(chip);
   }
 }
 
@@ -2594,23 +2594,19 @@ document.addEventListener("click", (event) => {
   document.getElementById(FORK_PROMPT_INPUT_ID)?.focus();
 });
 
-// Treat each opening as a fresh attachment draft. In particular, reopening
-// after dismissing the dialog or after a failed start cannot silently carry a
-// screenshot into an unrelated workspace/session. An in-flight start already
-// captured its own attachment slice before the dialog closed.
-if (launchStartSessionDialog && typeof MutationObserver === "function") {
-  const newSessionDialogObserver = new MutationObserver(() => {
-    if (launchStartSessionDialog.hasAttribute("open")) {
-      clearNewSessionImageAttachments();
-    }
-  });
-  newSessionDialogObserver.observe(launchStartSessionDialog, {
-    attributeFilter: ["open"],
-    attributes: true,
-  });
-}
+// Attachment drafts are reset in openStartSessionDialog(). This used to be a
+// MutationObserver watching the dialog's `open` attribute, which depended on the
+// element existing at boot and on the attribute being toggled by hand — neither
+// is true now that the dialog is rendered on demand and opened with showModal().
 
-startPromptInput?.addEventListener("paste", (event) => {
+// Delegated, not bound to the element: the launch dialog is rendered on demand
+// now, so there is nothing to attach a listener to at boot. Same shape as the
+// fork dialog's paste handler, which already had to solve this.
+document.addEventListener("paste", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target?.closest("#launch-start-session-dialog-start-prompt")) {
+    return;
+  }
   const files = pastedImageFiles(event.clipboardData);
   if (files.length === 0) return;
   event.preventDefault();
@@ -2636,7 +2632,10 @@ startPromptInput?.addEventListener("paste", (event) => {
   }
 });
 
-startPromptAttachments?.addEventListener("click", (event) => {
+// Delegated: the mount is created with the dialog, so there is nothing to bind to
+// at boot. Bound to the element, this listener never attached at all and the
+// remove buttons on the chips did nothing.
+document.addEventListener("click", (event) => {
   const button =
     event.target instanceof Element
       ? event.target.closest("[data-remove-new-session-image-attachment]")
@@ -2646,7 +2645,7 @@ startPromptAttachments?.addEventListener("click", (event) => {
     (attachment) => attachment.id !== button.dataset.removeNewSessionImageAttachment
   );
   renderNewSessionImageAttachments();
-  startPromptInput.focus();
+  document.getElementById("launch-start-session-dialog-start-prompt")?.focus();
 });
 
 messageInput?.addEventListener("paste", (event) => {
@@ -2750,15 +2749,11 @@ messageForm.addEventListener("submit", (event) => {
   void runComposerSubmit();
 });
 
-providerInput?.addEventListener("change", () => {
-  void selectLaunchProvider(providerInput.value);
-});
-
-modelInput?.addEventListener("change", () => {
-  const provider = providerInput?.value || state.session?.provider || "codex";
-  const models = modelsForProvider(provider, state.session?.available_models || []);
-  syncEffortSuggestions(startEffortInput, models, modelInput.value, startEffortInput.value, provider);
-});
+// The launch dialog's `#provider-input` / `#model-input` change listeners used to
+// sit here. Both elements are gone — Provider and Model are one pill now, and the
+// dialog reports its own changes through onSelectModel — so these could never
+// attach again. Left in place they read as live wiring and would send the next
+// reader looking for selects that do not exist.
 
 messageModel?.addEventListener("change", () => {
   // Keep the chip's logo on the model the user just picked. Unconditional and
@@ -2845,7 +2840,7 @@ transcript.addEventListener("click", (event) => {
       const promptInput = document.getElementById("start-prompt");
       if (promptInput) promptInput.value = seedPrompt;
     }
-    document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+    openStartSessionDialog();
     return;
   }
 
@@ -2982,6 +2977,8 @@ let sessionTabsRootHandle = null;
 let sessionTabsRootElement = null;
 let projectSwitcherRootHandle = null;
 let projectSwitcherRootElement = null;
+let launchDialogRootHandle = null;
+let launchDialogRootElement = null;
 let startSessionSplitRootHandle = null;
 let startSessionSplitRootElement = null;
 
@@ -3251,6 +3248,9 @@ async function refreshProviderCatalogs(session) {
         state.providerModels[provider] = payload.data || [];
       }
     }));
+    // The merged Model pill is built from these catalogues. Opening the dialog
+    // before they land left an empty menu that never refilled.
+    renderLaunchSessionDialogIfOpen();
     const provider = selectedProvider || defaultProvider(state.providers);
     const liveModelInput = document.getElementById("model-input") || modelInput;
     const liveStartEffortInput = document.getElementById("start-effort") || startEffortInput;
@@ -3368,53 +3368,129 @@ function modelsForProvider(
   return scopedProviderModels(provider, state.providerModels, fallbackProvider, fallbackModels);
 }
 
-function handleLaunchFieldInput(id, value) {
-  const fieldById = {
-    "approval-policy-input": "approvalPolicy",
-    "cwd-input": "cwd",
-    "model-input": "model",
-    "provider-input": "provider",
-    "sandbox-input": "sandbox",
-    "start-effort": "effort",
-    "start-prompt": "initialPrompt",
-  };
-  const field = fieldById[id];
+// Apply one launch-dialog field change.
+//
+// Takes a FIELD NAME now, not an element id. The dialog is controlled, so the
+// id→field lookup this used to start with described a DOM that no longer exists:
+// there are no `#provider-input` / `#model-input` selects to map from.
+//
+// Provider changes still cascade, because model and effort are per-provider — but
+// the cascade is now pure state. It used to also write `.value` onto three live
+// `<select>` elements and re-populate their `<option>`s imperatively, which is
+// what made the dialog impossible to render from data.
+function handleLaunchFieldInput(field, value) {
   if (!field) {
     return;
   }
-  state.localUiStore.getState().setSessionDraftField(field, value);
+  const ui = state.localUiStore.getState();
+  ui.setSessionDraftField(field, value);
+
   const draftProvider = readLocalUiState(state.localUiStore).sessionDraft?.provider || "codex";
   if (field === "effort") saveLastEffort(draftProvider, value);
   if (field === "approvalPolicy") saveLastApprovalPolicy(draftProvider, value);
-  if (field !== "provider") {
-    return;
+
+  if (field === "cwd") {
+    void refreshLaunchGitContext(value);
   }
 
-  const session = state.session || {};
-  void refreshProviderCatalogs(session);
-  const nextModels = modelsForProvider(value, session.available_models || [], session.provider);
-  const liveModelInput = document.getElementById("model-input") || modelInput;
-  const liveStartEffortInput = document.getElementById("start-effort") || startEffortInput;
-  const liveApprovalInput = document.getElementById("approval-policy-input") || approvalPolicyInput;
-  const nextModel = defaultModelForProvider(value);
-  const storedEffort = loadLastEffort(value);
-  const storedApproval = loadLastApprovalPolicy(value);
-  if (storedApproval) {
-    state.localUiStore.getState().setSessionDraftField("approvalPolicy", storedApproval);
-    if (liveApprovalInput) liveApprovalInput.value = storedApproval;
+  if (field === "provider") {
+    // A provider switch invalidates the model and the two settings that are
+    // resolved per provider. Restore what this provider was last used with
+    // rather than leaving the previous provider's values in place.
+    void refreshProviderCatalogs(state.session || {});
+    const storedApproval = loadLastApprovalPolicy(value);
+    const storedEffort = loadLastEffort(value);
+    if (storedApproval) ui.setSessionDraftField("approvalPolicy", storedApproval);
+    if (storedEffort) ui.setSessionDraftField("effort", storedEffort);
   }
-  if (storedEffort) {
-    state.localUiStore.getState().setSessionDraftField("effort", storedEffort);
-  }
-  syncLaunchSettingLabels(value);
-  syncModelSuggestions(liveModelInput, nextModels, nextModel);
-  syncEffortSuggestions(
-    liveStartEffortInput,
-    nextModels,
-    nextModel,
-    storedEffort || liveStartEffortInput?.value || "",
-    value
+
+  renderLaunchSessionDialog();
+}
+
+// Apply a merged-pill model selection: provider, model and effort in one step.
+//
+// Effort is the reason this cannot be two field changes. Levels are per MODEL
+// (`supported_reasoning_efforts`), so switching from a Codex model on `xhigh` to
+// a Claude model that offers only high/max must re-resolve it — the relay does
+// not correct an explicitly-supplied effort, it honours it.
+// The catalogue's default model for a provider, falling back to the static
+// per-provider guess only while the catalogue is still cold. The static value is
+// a seed, not an answer — it can name a model the provider does not currently
+// offer.
+function defaultModelForProviderCatalog(provider) {
+  const models = state.providerModels[provider] || [];
+  return (
+    models.find((option) => option.is_default)?.model
+    || models[0]?.model
+    || defaultModelForProvider(provider)
   );
+}
+
+function handleLaunchModelSelection({ provider, model }) {
+  const ui = state.localUiStore.getState();
+  const previousProvider = readLocalUiState(state.localUiStore).sessionDraft?.provider || "";
+  if (provider && provider !== previousProvider) {
+    ui.setSessionDraftField("provider", provider);
+    const storedApproval = loadLastApprovalPolicy(provider);
+    if (storedApproval) ui.setSessionDraftField("approvalPolicy", storedApproval);
+    void refreshProviderCatalogs(state.session || {});
+  }
+  ui.setSessionDraftField("model", model);
+
+  const draft = readLocalUiState(state.localUiStore).sessionDraft || {};
+  const models = state.providerModels[provider] || [];
+  // Clamp against the NEW model's catalogue. Falls back to the model's own
+  // default when the current level is not offered.
+  const effort = resolveReasoningEffortValue(models, model, draft.effort);
+  if (effort !== draft.effort) {
+    ui.setSessionDraftField("effort", effort);
+    saveLastEffort(provider, effort);
+  }
+  renderLaunchSessionDialog();
+}
+
+// The git chip's data for the chosen directory.
+//
+// Debounced and generation-guarded: the workspace field is free text, so probing
+// per keystroke would spawn a git subprocess per character, and out-of-order
+// replies would label the current directory with a previous one's branch. The
+// relay echoes the cwd it answered ABOUT, so a stale reply is dropped by
+// comparing it rather than by trusting arrival order.
+let launchGitContextGeneration = 0;
+let launchGitContextTimer = null;
+async function refreshLaunchGitContext(cwd) {
+  const generation = ++launchGitContextGeneration;
+  if (launchGitContextTimer) clearTimeout(launchGitContextTimer);
+  const target = String(cwd || "").trim();
+  // Drop the previous directory's answer the moment a new one is chosen. Keeping
+  // it until the reply lands showed path B wearing path A's branch for a debounce
+  // plus a round trip.
+  state.launchGitContext = null;
+  renderLaunchSessionDialogIfOpen();
+  if (!target) {
+    return;
+  }
+  launchGitContextTimer = setTimeout(async () => {
+    try {
+      const response = await apiFetch(
+        `/api/workspace/git-context?cwd=${encodeURIComponent(target)}`
+      );
+      const payload = await response.json();
+      if (generation !== launchGitContextGeneration) return;
+      // The generation counter above is what makes a stale answer safe to drop,
+      // so this does NOT also require the echoed path to equal what was typed.
+      // It cannot: the relay answers about the NORMALIZED cwd, so `~/project`, a
+      // trailing slash, or a symlinked prefix — all of which this field accepts —
+      // came back under a different spelling and the valid git state was thrown
+      // away.
+      state.launchGitContext = !response.ok || !payload.ok ? null : payload.data || null;
+    } catch {
+      // A failed probe is not worth surfacing: the chip is an extra, and the
+      // dialog is fully usable without it.
+      if (generation === launchGitContextGeneration) state.launchGitContext = null;
+    }
+    renderLaunchSessionDialog();
+  }, 250);
 }
 
 function syncLaunchSettingsModal(session, provider, launchModels, activeProvider) {
@@ -3503,7 +3579,11 @@ function syncEffortSuggestions(select, models, selectedModel, selectedEffort, pr
 function setSelectedCwd(cwd) {
   state.threadListStore.getState().setSelectedCwd(cwd);
   state.selectedCwd = readThreadListUi(state.threadListStore).selectedCwd;
-  cwdInput.value = state.selectedCwd;
+  // The workspace field used to be a permanent `#cwd-input` in the static shell,
+  // so this could write straight to it. It is now a combobox inside a dialog
+  // that only exists while open, and the value lives in the draft — mirror it
+  // there instead, and let the dialog re-render from that.
+  state.localUiStore?.getState?.().setSessionDraftField?.("cwd", state.selectedCwd);
 }
 
 function resolveActiveThread(threadId) {
@@ -3547,6 +3627,16 @@ function renderForkSessionDialog() {
     approvalOptions: settings.approvalOptions,
     effortOptions: buildReasoningEffortOptions(models, selectedModel, provider),
     forkCapabilities: state.session?.provider_fork_capabilities || [],
+    // Project membership for the fork's own picker. Untouched, the field stays on
+    // the inherit sentinel and the relay resolves it from the source thread.
+    onCreateProject() {
+      void createProjectForLaunchDraft((projectId) =>
+        handleForkDialogFieldChange("projectId", projectId)
+      );
+    },
+    projects: state.projects || [],
+    threadProjectId: state.threadProjectId || {},
+    threads: state.threads || [],
     onFieldChange: handleForkDialogFieldChange,
     onFork: submitForkDialog,
     onRequestClose: closeForkDialog,
@@ -4450,6 +4540,89 @@ function renderClientLogLines(lines) {
 // last labels are remembered because navigation and Projects-store changes also
 // re-render this control, and they have no opinion about the title.
 let lastSwitcherLabels = { label: "", labelTooltip: "" };
+// The launch dialog's own sub-root. Mirrors renderProjectSwitcher: the shell
+// renders once, so anything whose props change needs a root that can re-render.
+//
+// Called on open and again whenever the draft, the project list or the provider
+// catalogues change — the dialog is fully controlled now, so a value that is not
+// re-rendered is a value the user cannot change.
+function renderLaunchSessionDialog() {
+  const mount = document.getElementById("launch-dialog-root");
+  if (!mount) {
+    return;
+  }
+  if (launchDialogRootElement !== mount) {
+    launchDialogRootHandle?.unmount();
+    launchDialogRootHandle = createRoot(mount);
+    launchDialogRootElement = mount;
+  }
+
+  const draft = readLocalUiState(state.localUiStore).sessionDraft || {};
+  const provider = draft.provider || defaultProvider(state.providers);
+  const models = state.providerModels[provider] || [];
+  const model = draft.model || defaultModelForProvider(provider);
+
+  launchDialogRootHandle.render(
+    React.createElement(StartSessionDialog, {
+      approvalOptions: providerSettings(provider).approvalOptions,
+      effortOptions: buildReasoningEffortOptions(models, model, provider),
+      fields: {
+        ...draft,
+        cwd: draft.cwd || state.selectedCwd || state.session?.current_cwd || "",
+        model,
+        provider,
+      },
+      gitContext: state.launchGitContext,
+      id: "launch-start-session-dialog",
+      initialPromptAttachmentsId: "start-prompt-attachments",
+      onCreateProject() {
+        void createProjectForLaunchDraft((projectId) =>
+          handleLaunchFieldInput("projectId", projectId)
+        );
+      },
+      onFieldChange: handleLaunchFieldInput,
+      onSelectModel: handleLaunchModelSelection,
+      onRequestClose() {
+        clearNewSessionImageAttachments();
+      },
+      onStart() {
+        void submitStartSession();
+      },
+      projects: state.projects || [],
+      providerModels: state.providerModels,
+      providers: state.providers || [],
+      // Matches remote. Claude supports deferred start: the relay accepts a
+      // session with no initial prompt and promotes it on the first composer
+      // message. Leaving the shared default (true) here disabled Start for an
+      // empty Claude prompt on local only — an inconsistency between the two
+      // surfaces AND a regression against being able to open an idle session.
+      requireInitialPrompt: false,
+      startPending: Boolean(state.newSessionSubmitInFlight),
+      threadProjectId: state.threadProjectId || {},
+      threads: state.threads || [],
+      workspaceSuggestions: selectWorkspaceSuggestionsModel({
+        selectedCwd: state.selectedCwd || "",
+        session: state.session,
+        threads: state.threads || [],
+      }),
+    })
+  );
+}
+
+// Re-render the launch dialog only when it is actually open.
+//
+// The dialog is CONTROLLED, so anything that arrives asynchronously — the
+// provider catalogues, the Projects payload, the in-flight start flag — is
+// invisible until something re-renders it. Opening the dialog before the
+// catalogues land used to leave an empty model menu forever, and reopening
+// during an in-flight start left the button stuck on "Starting…" until the user
+// happened to touch a field.
+function renderLaunchSessionDialogIfOpen() {
+  if (document.getElementById("launch-start-session-dialog")?.open) {
+    renderLaunchSessionDialog();
+  }
+}
+
 function renderProjectSwitcher(labels = null) {
   if (labels) {
     lastSwitcherLabels = labels;
@@ -4506,8 +4679,70 @@ function resolveTabThread(threadId) {
   };
 }
 
-function openStartSessionDialog() {
-  document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+function openStartSessionDialog({ projectId = undefined } = {}) {
+  // Seed the project chip from wherever the user IS, unless a caller named one
+  // (the project overview's "New agent" launches INTO its own project). Done at
+  // open time, not on every render: re-seeding per render would overwrite a
+  // choice made inside the dialog the moment anything else re-rendered.
+  const context = sessionViewStore.getState().location.context;
+  const seeded =
+    projectId !== undefined
+      ? projectId
+      : context?.kind === "project"
+        ? context.projectId
+        : null;
+  const ui = state.localUiStore.getState();
+  ui.setSessionDraftField("projectId", seeded || null);
+  // Seed the fields the dialog would otherwise only DISPLAY a fallback for.
+  // Submit reads the draft, so a value that exists solely as a render-time
+  // fallback would reach the relay as an empty string.
+  const draft = readLocalUiState(state.localUiStore).sessionDraft || {};
+  if (!draft.cwd) {
+    ui.setSessionDraftField(
+      "cwd",
+      state.selectedCwd || state.session?.current_cwd || ""
+    );
+  }
+  // Repair the provider against what the relay ACTUALLY offers, not just fill it
+  // when empty. The draft's default is "codex", which is wrong on a relay that
+  // does not run Codex — the dialog would offer a provider that is not there and
+  // the start fails with "agent provider 'codex' is not available". The old
+  // dialog got this for free: `syncProviderSuggestions` repopulated the <select>
+  // and snapped its value to an available option. Nothing does that now, so it
+  // has to be explicit.
+  const available = state.providers || [];
+  const provider =
+    draft.provider && available.includes(draft.provider)
+      ? draft.provider
+      : defaultProvider(available);
+  if (provider !== draft.provider) {
+    ui.setSessionDraftField("provider", provider);
+    // The model belongs to the provider that was just replaced, so it cannot
+    // survive the swap.
+    ui.setSessionDraftField("model", defaultModelForProvider(provider));
+  } else if (!draft.model) {
+    ui.setSessionDraftField("model", defaultModelForProvider(provider));
+  }
+  void refreshLaunchGitContext(
+    readLocalUiState(state.localUiStore).sessionDraft?.cwd || ""
+  );
+  // Each opening is a fresh attachment draft: reopening after a dismiss or a
+  // failed start must not carry a screenshot into an unrelated workspace. This
+  // used to be a MutationObserver on the dialog's `open` attribute, which only
+  // worked while the element existed at boot and was toggled by hand.
+  clearNewSessionImageAttachments();
+  // flushSync, because showModal() below needs the element to EXIST. createRoot's
+  // render is async, so on the first open the dialog was still uncommitted when
+  // showModal() ran — the click did nothing and nothing threw. Same reason the
+  // fork dialog flushes before it opens.
+  flushSync(() => renderLaunchSessionDialog());
+  // The attachments mount only exists once the dialog has rendered, so paint it
+  // after the flush rather than before.
+  renderNewSessionImageAttachments();
+  // showModal(), not setAttribute("open"): the redesign has a real backdrop, and
+  // only a modal dialog gets `::backdrop` or the Escape close-request the pickers
+  // inside it cooperate with.
+  document.getElementById("launch-start-session-dialog")?.showModal();
 }
 
 // The sidebar's primary action. It lives in a mount rather than in react-shell.js because
@@ -4525,25 +4760,24 @@ function renderStartSessionSplit() {
     startSessionSplitRootElement = mount;
   }
 
-  const select = document.getElementById("provider-input") || providerInput;
   startSessionSplitRootHandle.render(
     React.createElement(StartSessionSplitButton, {
       buttonId: "open-start-session-dialog",
       menuId: "start-session-agent-menu",
       providerOptions: providerOptions(state.providers || []),
-      activeProvider:
-        select?.value || readLocalUiState(state.localUiStore).sessionDraft?.provider || "",
-      onStart: openStartSessionDialog,
+      activeProvider: readLocalUiState(state.localUiStore).sessionDraft?.provider || "",
+      onStart: () => openStartSessionDialog(),
       onStartWithProvider: (provider) => {
-        // Routed through the dialog's OWN select, with a real change event, rather than
-        // by calling selectLaunchProvider directly. Three separate listeners hang off
-        // that event — the draft writer, the provider-catalogue refresh, and the
-        // model/effort sync — so going around it would leave the shortcut and the
-        // dialog's control disagreeing about which agent is selected.
-        if (select && select.value !== provider) {
-          select.value = provider;
-          select.dispatchEvent(new Event("change", { bubbles: true }));
-        }
+        // Through the SAME atomic handler the Model pill uses. Two sequential
+        // field changes were wrong for the same reason they are wrong in the
+        // dialog: effort is model-specific, so switching to a provider with no
+        // remembered effort kept the previous model's level (a Codex `xhigh`
+        // landing on a model that only offers high/max). This also picks the
+        // catalogue's default model rather than the static per-provider guess.
+        handleLaunchModelSelection({
+          model: defaultModelForProviderCatalog(provider),
+          provider,
+        });
         openStartSessionDialog();
       },
     })

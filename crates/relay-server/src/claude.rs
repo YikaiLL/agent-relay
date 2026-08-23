@@ -2304,6 +2304,7 @@ mod tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("claude_code".to_string()),
+                project_id: None,
             })
             .await
             .expect("deferred start should succeed");
@@ -2348,6 +2349,7 @@ mod tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("claude_code".to_string()),
+                project_id: None,
             })
             .await
             .expect("second deferred start should succeed");
@@ -2432,6 +2434,7 @@ mod tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("claude_code".to_string()),
+                project_id: None,
             })
             .await
             .expect("deferred start should succeed");

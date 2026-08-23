@@ -130,6 +130,7 @@ export function WorkspaceHeading({ header, statusBadge, onOpenInfo, titleNode = 
 export function SessionPanel({
   model,
   onFieldChange = null,
+  onSelectModel = null,
   onStartSession = null,
 }) {
   if (!model.hasRemoteAuth) {
@@ -147,19 +148,31 @@ export function SessionPanel({
 
   return h(StartSessionDialog, {
     id: "remote-start-session-dialog",
-    cwd: model.fields.cwd,
-    onCwdChange: (value) => onFieldChange?.("cwd", value),
+    // `cwd` now travels inside `fields` like every other value, so the dialog has
+    // one shape of input instead of one field plus a special case.
     fields: model.fields,
     onFieldChange,
+    onSelectModel,
     onStart: onStartSession,
     startPending: model.startPending,
     workspaceSuggestions: model.workspaceSuggestions,
-    providerOptions: model.providerOptions,
-    models: model.models,
+    gitContext: model.gitContext,
+    // The merged Model pill needs every provider's catalog, not just the
+    // selected one's. Remote already pre-fetches them all on connect.
+    providers: model.providers,
+    providerModels: model.providerModels,
     modelsStatus: model.modelsStatus,
     approvalOptions: model.approvalOptions,
     effortOptions,
-    settingsPrefix: "remote-launch",
+    projects: model.projects,
+    threads: model.threads,
+    threadProjectId: model.threadProjectId,
+    threadActivity: model.threadActivity,
+    threadAttention: model.threadAttention,
+    threadReviewing: model.threadReviewing,
+    onCreateProject: model.onCreateProject,
+    // Remote passes no attachment mount: a paired device cannot send image
+    // bytes, so the placeholder must not invite a paste.
     // Mirror local: Claude supports deferred start — the relay accepts no
     // initial prompt and promotes the session on the first composer message.
     requireInitialPrompt: false,

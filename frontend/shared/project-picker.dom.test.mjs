@@ -1,0 +1,173 @@
+// The project picker as it behaves INSIDE a modal dialog.
+//
+// The top-bar switcher's contract is covered by project-switcher.dom.test.mjs.
+// What is different here — and the reason this is a separate control rather than
+// the switcher with another class name — is that the menu opens inside a
+// `<dialog>` opened with showModal(). That changes exactly one thing, and it is
+// the thing worth pinning: Escape.
+//
+// A modal dialog treats Escape as a close request. So the FIRST Escape, while the
+// project menu is open, must close only the menu; the dialog behind it must
+// survive. Otherwise picking a project and changing your mind throws away the
+// prompt you already typed.
+import test from "node:test";
+import assert from "node:assert/strict";
+import { JSDOM } from "jsdom";
+
+const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/" });
+global.window = dom.window;
+global.document = dom.window.document;
+global.HTMLElement = dom.window.HTMLElement;
+global.Node = dom.window.Node;
+global.IS_REACT_ACT_ENVIRONMENT = true;
+
+const React = (await import("react")).default;
+const { act } = await import("react");
+const { createRoot } = await import("react-dom/client");
+const { ProjectPicker } = await import("./project-picker.js");
+const { DEFAULT_WORKSPACE_LABEL } = await import("./project-labels.js");
+
+const PROJECTS = [
+  { id: "proj_pay", name: "Payments rework" },
+  { id: "proj_docs", name: "Docs" },
+];
+
+function mount(props = {}) {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  act(() => {
+    root.render(React.createElement(ProjectPicker, { projects: PROJECTS, ...props }));
+  });
+  return {
+    host,
+    cleanup() {
+      act(() => root.unmount());
+      host.remove();
+    },
+  };
+}
+
+const trigger = (host) => host.querySelector(".project-picker-trigger");
+const menu = (host) => host.querySelector(".project-switcher-menu");
+const optionLabel = (node) =>
+  node.querySelector(".project-switcher-option-label")?.textContent ?? node.textContent;
+
+function open(host) {
+  act(() => {
+    trigger(host).dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+  });
+}
+
+function pressEscape() {
+  const event = new dom.window.KeyboardEvent("keydown", {
+    bubbles: true,
+    cancelable: true,
+    key: "Escape",
+  });
+  act(() => {
+    document.dispatchEvent(event);
+  });
+  return event;
+}
+
+test("the chip names the active project", () => {
+  const view = mount({ activeProjectId: "proj_pay" });
+  assert.match(trigger(view.host).textContent, /Payments rework/);
+  view.cleanup();
+});
+
+test("with no project chosen the chip reads as the default workspace", () => {
+  const view = mount({ activeProjectId: null });
+  assert.match(trigger(view.host).textContent, new RegExp(DEFAULT_WORKSPACE_LABEL));
+  view.cleanup();
+});
+
+test("choosing a project reports its id and closes the menu", () => {
+  const chosen = [];
+  const view = mount({ activeProjectId: null, onSelectProject: (id) => chosen.push(id) });
+  open(view.host);
+  const row = [...view.host.querySelectorAll(".project-switcher-option")].find(
+    (candidate) => optionLabel(candidate) === "Docs"
+  );
+  act(() => {
+    row.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+  });
+
+  assert.deepEqual(chosen, ["proj_docs"]);
+  assert.equal(menu(view.host), null);
+  view.cleanup();
+});
+
+test("Escape closes the menu and is prevented, so the dialog behind it stays open", () => {
+  // preventDefault is the actual mechanism: a modal dialog closes on Escape via
+  // the browser's close-request handling, and the only way to keep the dialog
+  // open while consuming the key for the menu is to cancel the event.
+  const view = mount({ activeProjectId: null });
+  open(view.host);
+  assert.ok(menu(view.host), "precondition: the menu is open");
+
+  const event = pressEscape();
+
+  assert.equal(menu(view.host), null, "the menu closes");
+  assert.equal(event.defaultPrevented, true, "and the key is consumed, not passed to the dialog");
+  view.cleanup();
+});
+
+test("Escape with the menu shut is left alone, so it still closes the dialog", () => {
+  // The mirror of the case above, and the one that is easy to lose: swallowing
+  // Escape unconditionally would trap the user in a dialog they cannot dismiss
+  // with the keyboard.
+  const view = mount({ activeProjectId: null });
+
+  const event = pressEscape();
+
+  assert.equal(event.defaultPrevented, false, "a closed picker must not consume Escape");
+  view.cleanup();
+});
+
+test("clicking outside closes the menu", () => {
+  const view = mount({ activeProjectId: null });
+  open(view.host);
+  act(() => {
+    document.body.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true }));
+  });
+  assert.equal(menu(view.host), null);
+  view.cleanup();
+});
+
+test("rows carry the activity subtitle the picker is for", () => {
+  const view = mount({
+    activeProjectId: null,
+    threadProjectId: { t1: "proj_pay", t2: "proj_pay" },
+    threads: [
+      { id: "t1", updated_at: 1_700_000_000 },
+      { id: "t2", updated_at: 1_700_000_000 },
+    ],
+    threadActivity: new Map([["t1", { tool: "bash" }]]),
+  });
+  open(view.host);
+  const row = [...view.host.querySelectorAll(".project-switcher-option")].find(
+    (candidate) => optionLabel(candidate) === "Payments rework"
+  );
+
+  assert.equal(
+    row.querySelector(".project-switcher-option-subtitle").textContent,
+    "2 sessions · 1 running"
+  );
+  view.cleanup();
+});
+
+test("creating a project is offered when the surface supports it", () => {
+  const created = [];
+  const view = mount({ activeProjectId: null, onCreateProject: () => created.push(true) });
+  open(view.host);
+  const create = view.host.querySelector(".project-switcher-create");
+  act(() => {
+    create.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+  });
+
+  assert.deepEqual(created, [true]);
+  assert.equal(menu(view.host), null, "and the menu closes behind it");
+  view.cleanup();
+});

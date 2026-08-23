@@ -12,6 +12,19 @@ import { isWorkingThreadStatus } from "./thread-status.js";
 
 export const INHERIT = "";
 
+// The fork's project has THREE states, and the wire encodes them as:
+//   absent   -> inherit the source thread's project (the default)
+//   "proj_x" -> file into that project
+//   ""       -> explicitly unassigned (Default Workspace)
+//
+// Absence is already spoken for by inherit, so it cannot also mean "no project" —
+// without a distinct third value a fork could never be moved OUT of its source's
+// project. Project ids are always `proj_%016x`, so the empty string is safe to
+// overload. `FORK_PROJECT_INHERIT` is null rather than undefined so the dialog's
+// picker has a concrete value to hold and compare.
+export const FORK_PROJECT_INHERIT = null;
+export const FORK_PROJECT_NONE = "__fork_project_none__";
+
 function firstCatalogModel(models) {
   if (!Array.isArray(models) || !models.length) return INHERIT;
   return models.find((option) => option?.is_default)?.model || models[0]?.model || INHERIT;
@@ -29,6 +42,10 @@ export function defaultForkFields({ thread = null, models = [], session = null }
     // a cross-provider seed (a codex model id on a Claude fork) would be sent
     // verbatim to the wrong bridge.
     model: firstCatalogModel(models),
+    // Untouched = inherit the source thread's project. Not the source's actual
+    // id: sending that would defeat the relay's own resolution and would go
+    // stale if the source moved project in between.
+    projectId: FORK_PROJECT_INHERIT,
     provider,
     sandbox: INHERIT,
     sourceThreadId: thread?.id || "",
@@ -245,6 +262,14 @@ function isUnresolvableCodexLiveForkPoint(upToItemId) {
   return /^msg_/.test(String(upToItemId ?? ""));
 }
 
+// Map the picker's held value onto the wire's three states.
+function forkProjectPayload(projectId) {
+  if (projectId === FORK_PROJECT_INHERIT || projectId === undefined) {
+    return {};
+  }
+  return { project_id: projectId === FORK_PROJECT_NONE ? "" : projectId };
+}
+
 export function forkFieldsToPayload(fields) {
   const upToItemId = orNull(fields?.upToItemId);
   return {
@@ -272,5 +297,7 @@ export function forkFieldsToPayload(fields) {
     sandbox: orNull(fields?.sandbox),
     effort: orNull(fields?.effort),
     provider: orNull(fields?.provider),
+    // Omitted, not nulled, when untouched: the relay reads absence as "inherit".
+    ...forkProjectPayload(fields?.projectId),
   };
 }

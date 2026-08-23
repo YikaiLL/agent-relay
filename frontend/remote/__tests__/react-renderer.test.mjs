@@ -166,15 +166,15 @@ test("WorkspaceHeading can show a ready-toned important status", () => {
   assert.match(markup, /Approval/);
 });
 
-test("SessionPanel renders provider and model selects with correct field bindings", () => {
-  const fieldsCalled = [];
-  const onFieldChange = (field, value) => {
-    fieldsCalled.push({ field, value });
-  };
-
+// Provider and Model are ONE control now, so the two `remote-launch-*` selects
+// this used to pin are gone. What remains worth pinning at this layer is that
+// remote hands the dialog the shape it expects: the whole per-provider catalog
+// map rather than one flattened list, and its own dialog id.
+test("SessionPanel wires remote's per-provider catalogs into the merged model pill", () => {
   const markup = renderToStaticMarkup(
     h(SessionPanel, {
       model: {
+        approvalOptions: [{ label: "Ask first", value: "untrusted" }],
         effortOptions: [
           { label: "Low", value: "low" },
           { label: "Medium", value: "medium" },
@@ -185,39 +185,54 @@ test("SessionPanel renders provider and model selects with correct field binding
           effort: "medium",
           initialPrompt: "",
           model: "gpt-5.5",
+          projectId: null,
           provider: "codex",
           sandbox: "workspace-write",
         },
         hasRemoteAuth: true,
         hasUsableRelay: true,
-        providerOptions: [
-          { label: "Codex", value: "codex" },
-          { label: "Claude Code", value: "claude_code" },
-        ],
+        providers: ["codex", "claude_code"],
+        providerModels: {
+          codex: [{ model: "gpt-5.5", display_name: "GPT-5.5", is_default: true }],
+          claude_code: [{ model: "claude-sonnet-4-6", display_name: "Sonnet" }],
+        },
+        projects: [],
         startPending: false,
-        models: [
-          { model: "gpt-5.5", display_name: "GPT-5.5", provider: "" },
-          { model: "claude-sonnet-4-6", display_name: "Sonnet", provider: "anthropic" },
-        ],
         workspaceSuggestions: [],
       },
-      onFieldChange,
+      onFieldChange: () => {},
     })
   );
 
-  // Renders both provider and model selects
-  assert.match(markup, /id="remote-launch-provider-input"/);
-  assert.match(markup, /id="remote-launch-model-input"/);
+  assert.match(markup, /id="remote-start-session-dialog"/);
+  // The closed pill names provider and model together — after the merge it is
+  // the only thing naming the provider at all.
+  assert.match(markup, /Codex · GPT-5\.5/);
+  assert.match(markup, /id="remote-start-session-dialog-model"/);
+  // And the project chip is present, which is the whole point of the parity work:
+  // a phone can file a session into a project at creation time.
+  assert.match(markup, /class="project-picker-trigger"/);
+});
 
-  // Provider select shows both options with correct values
-  assert.match(markup, /<option[^>]*value="codex"[^>]*>Codex<\/option>/);
-  assert.match(markup, /<option[^>]*value="claude_code"[^>]*>Claude Code<\/option>/);
+test("SessionPanel does not offer an attachment mount, which a paired device cannot use", () => {
+  const markup = renderToStaticMarkup(
+    h(SessionPanel, {
+      model: {
+        approvalOptions: [],
+        effortOptions: [],
+        fields: { cwd: "/tmp/project", initialPrompt: "", model: "gpt-5.5", provider: "codex" },
+        hasRemoteAuth: true,
+        hasUsableRelay: true,
+        providers: ["codex"],
+        providerModels: { codex: [] },
+        projects: [],
+        startPending: false,
+        workspaceSuggestions: [],
+      },
+      onFieldChange: () => {},
+    })
+  );
 
-  // Provider select has correct current value
-  assert.match(markup, /<select[^>]*id="remote-launch-provider-input"[^>]*>/);
-  assert.match(markup, /value="codex"/);
-
-  // Model select shows all models from the model list
-  assert.match(markup, /GPT-5\.5/);
-  assert.match(markup, /Sonnet/);
+  assert.doesNotMatch(markup, /composer-attachments/);
+  assert.doesNotMatch(markup, /Paste an image/);
 });

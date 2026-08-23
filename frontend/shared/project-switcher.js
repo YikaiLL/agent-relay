@@ -29,6 +29,8 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { DEFAULT_WORKSPACE_LABEL } from "./project-labels.js";
+import { ProjectMenu } from "./project-menu-react.js";
+import { buildProjectPickerRows } from "./project-picker-model.js";
 
 const h = React.createElement;
 
@@ -53,6 +55,14 @@ export function ProjectSwitcher({
   onRenameProject = null,
   onSelectProject = null,
   projects = [],
+  // Live signals for the rows' second line ("4 sessions · 2 running"). All
+  // optional: a surface that has not wired them up yet still gets names, just
+  // without the activity summary.
+  threads = [],
+  threadProjectId = {},
+  threadActivity = null,
+  threadAttention = null,
+  threadReviewing = null,
   // Whether this control is the PAGE HEADING. True in the local and remote chat
   // headers, where the switcher replaced the title outright. False for compact
   // placements such as remote's drawer icon, where surrounding chrome already names
@@ -175,88 +185,39 @@ export function ProjectSwitcher({
       ? h("h1", { className: "project-switcher-heading" }, triggerButton)
       : triggerButton,
     open
-      ? h(
-          "div",
-          { className: "project-switcher-menu", id: menuId, role: "menu" },
-          h(
-            "button",
-            {
-              className:
-                "project-switcher-option"
-                + (resolvedProjectId ? "" : " is-active"),
-              onClick: () => choose(null),
-              role: "menuitem",
-              type: "button",
-            },
-            DEFAULT_WORKSPACE_LABEL
-          ),
-          projects.map((project) =>
-            h(
-              "button",
-              {
-                className:
-                  "project-switcher-option"
-                  + (project.id === resolvedProjectId ? " is-active" : ""),
-                "data-project-id": project.id,
-                key: project.id,
-                onClick: () => choose(project.id),
-                role: "menuitem",
-                type: "button",
-              },
-              project.name || project.id
-            )
-          ),
-          onCreateProject
-            ? h(
-                "button",
-                {
-                  className: "project-switcher-option project-switcher-create",
-                  onClick: () => {
-                    close();
-                    onCreateProject();
-                  },
-                  role: "menuitem",
-                  type: "button",
-                },
-                createLabel
-              )
+      ? h(ProjectMenu, {
+          activeProject,
+          createLabel,
+          id: menuId,
+          onCreateProject: onCreateProject
+            ? () => {
+                close();
+                onCreateProject();
+              }
             : null,
-          // Destructive pair last and behind their own divider, never mixed into the
-          // list of places you can navigate to. Only for the ACTIVE project: the menu
-          // names many projects but can only act on the one you are in, and a rename
-          // that silently applied to a different row would be unrecoverable.
-          activeProject && onRenameProject
-            ? h(
-                "button",
-                {
-                  className: "project-switcher-option project-switcher-manage",
-                  onClick: () => {
-                    close();
-                    onRenameProject(activeProject.id, activeProject.name || activeProject.id);
-                  },
-                  role: "menuitem",
-                  type: "button",
-                },
-                "Rename project"
-              )
+          onDeleteProject: onDeleteProject
+            ? (projectId, name) => {
+                close();
+                onDeleteProject(projectId, name);
+              }
             : null,
-          activeProject && onDeleteProject
-            ? h(
-                "button",
-                {
-                  className:
-                    "project-switcher-option project-switcher-manage project-switcher-danger",
-                  onClick: () => {
-                    close();
-                    onDeleteProject(activeProject.id, activeProject.name || activeProject.id);
-                  },
-                  role: "menuitem",
-                  type: "button",
-                },
-                "Delete project"
-              )
-            : null
-        )
+          onRenameProject: onRenameProject
+            ? (projectId, name) => {
+                close();
+                onRenameProject(projectId, name);
+              }
+            : null,
+          onSelect: choose,
+          rows: buildProjectPickerRows({
+            activeProjectId: resolvedProjectId,
+            projects,
+            threadActivity,
+            threadAttention,
+            threadProjectId,
+            threadReviewing,
+            threads,
+          }),
+        })
       : null
   );
 }

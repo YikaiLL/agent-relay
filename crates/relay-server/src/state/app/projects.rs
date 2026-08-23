@@ -7,6 +7,48 @@ const MAX_PROJECTS: usize = 256;
 const MAX_PROJECT_NAME_CHARS: usize = 200;
 const MAX_PROJECT_MEMBERSHIPS: usize = 10_000;
 
+/// File a freshly-created thread into a project, as part of starting or forking it.
+///
+/// Deliberately best-effort, and that is the whole design of it: the user asked for
+/// a SESSION, and the project is filing. A project deleted on another device between
+/// opening the dialog and pressing Start must not cost them the session — they would
+/// have no way to tell an unknown-project refusal from a failed launch, and the
+/// session they wanted is the expensive half. So a refusal is logged and the thread
+/// stays Unassigned, which is exactly where it would have landed before this existed.
+///
+/// Shares `MAX_PROJECT_MEMBERSHIPS` with the manual assign path so creation cannot be
+/// used to walk around the cap.
+///
+/// Returns whether membership changed, so the caller only bumps `projects_revision`
+/// when clients actually have something to refetch.
+pub(super) fn attach_new_thread_to_project(
+    relay: &mut RelayState,
+    thread_id: &str,
+    project_id: &str,
+) -> bool {
+    if !relay.thread_project_id.contains_key(thread_id)
+        && relay.thread_project_id.len() >= MAX_PROJECT_MEMBERSHIPS
+    {
+        relay.push_log(
+            "warn",
+            format!(
+                "Session {thread_id} started outside project {project_id}: membership limit reached ({MAX_PROJECT_MEMBERSHIPS})"
+            ),
+        );
+        return false;
+    }
+    match relay.assign_thread_to_project(thread_id, project_id) {
+        Ok(()) => true,
+        Err(error) => {
+            relay.push_log(
+                "warn",
+                format!("Session {thread_id} started outside project {project_id}: {error}"),
+            );
+            false
+        }
+    }
+}
+
 impl AppState {
     /// Manual Projects write path: create / rename / delete a Project, or assign /
     /// unassign a session. Returns the full post-action project list + membership so

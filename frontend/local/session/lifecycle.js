@@ -80,6 +80,16 @@ export function createLifecycleController(ctx) {
     liveElement,
     isViewingConversation,
   } = ctx;
+  // The launch dialog's field values. A ctx seam rather than a direct store
+  // import so the controller stays constructible in a test without standing up
+  // the whole local UI store.
+  const readSessionDraft = () => ctx.readSessionDraft?.() || {};
+  // Where to put the cursor when the start is refused for want of a directory.
+  // The dialog owns its own markup now, so the controller asks rather than
+  // reaching for an element id it would have to keep in step.
+  const focusWorkspaceField = () =>
+    ctx.focusWorkspaceField?.()
+    ?? document.getElementById("launch-start-session-dialog-cwd")?.focus();
   // What the user is looking at right now: the routed/pinned thread, else the
   // active one. Same expression as app.js and render-session.js, so a failure's
   // visibility follows one notion of "current thread" across the surface.
@@ -206,29 +216,25 @@ export function createLifecycleController(ctx) {
   }
 
   async function startSession(imageAttachments = []) {
-    const liveCwdInput = liveElement("cwd-input", cwdInput);
-    const liveStartPromptInput = liveElement("start-prompt", startPromptInput);
-    const liveProviderInput = liveElement("provider-input", providerInput);
-    const liveModelInput = liveElement("model-input", modelInput);
-    const liveApprovalPolicyInput = liveElement("approval-policy-input", approvalPolicyInput);
-    // sandbox-input was removed from the UI when the file-access dropdown
-    // was collapsed into the permission level. Fall back to workspace-write
-    // so the session-start protocol stays unchanged.
-    const liveSandboxInput = liveElement("sandbox-input", sandboxInput);
-    const sandboxValue = liveSandboxInput?.value || "workspace-write";
-    const liveStartEffortInput = liveElement("start-effort", startEffortInput);
-    const cwd = liveCwdInput.value.trim();
+    // Read the DRAFT, not the DOM.
+    //
+    // This used to re-read `.value` off eight live elements looked up by id at
+    // submit time, which coupled the request body to the dialog's markup by
+    // nothing stronger than a string. The dialog is controlled now and its values
+    // live in the store; `start-session-payload.test.mjs` pins the resulting
+    // request across the change.
+    const draft = readSessionDraft();
+    const cwd = String(draft.cwd || "").trim();
 
     if (!cwd) {
       logLine("Choose a directory before starting a session.");
-      liveCwdInput.focus();
+      focusWorkspaceField();
       return null;
     }
-
     setSelectedCwd(cwd);
     setStartControlsBusy(true);
     // Name the provider being started — not a hardcoded "Codex".
-    const agentName = providerLabel(liveProviderInput?.value) || "agent";
+    const agentName = providerLabel(draft.provider) || "agent";
     logLine(`Starting a new ${agentName} session in ${cwd}`);
 
     try {
@@ -244,13 +250,18 @@ export function createLifecycleController(ctx) {
         },
         body: JSON.stringify({
           cwd,
-          initial_prompt: liveStartPromptInput.value.trim() || null,
-          model: liveModelInput.value.trim() || null,
-          approval_policy: liveApprovalPolicyInput.value,
-          sandbox: sandboxValue,
-          effort: liveStartEffortInput.value,
+          initial_prompt: String(draft.initialPrompt || "").trim() || null,
+          model: String(draft.model || "").trim() || null,
+          approval_policy: draft.approvalPolicy,
+          // The file-access dropdown was collapsed into the permission level; the
+          // draft still carries the value so the start protocol is unchanged.
+          sandbox: draft.sandbox || "workspace-write",
+          effort: draft.effort,
           device_id: state.deviceId,
-          provider: liveProviderInput?.value || null,
+          provider: draft.provider || null,
+          // Filed server-side as part of the start, so local and remote reach the
+          // same place. Explicit null means the Default Workspace.
+          project_id: draft.projectId || null,
           images,
         }),
       });

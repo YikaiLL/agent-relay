@@ -16,6 +16,9 @@ export function createDefaultSessionDraft(provider = "codex") {
     initialPrompt: "",
     provider,
     model: defaultModelForProvider(provider),
+    // Which project the new session is filed under. Seeded from the project the
+    // UI is currently in when the dialog opens; null is the Default Workspace.
+    projectId: null,
     sandbox: "workspace-write",
   };
 }
@@ -40,6 +43,9 @@ export function createRemoteUiStore(initialState = {}) {
     },
     remoteInfoModalOpen: false,
     settingsModalOpen: false,
+    // Git standing of the launch dialog's chosen directory; null when unknown or
+    // when the directory is not a repo.
+    launchGitContext: null,
     providerModels: {},
     // Per-provider catalog fetch status: "loading" | "ready" | "error".
     // Lets the new-session dialog show a truthful state instead of silently
@@ -129,6 +135,9 @@ export function createRemoteUiStore(initialState = {}) {
         settingsModalOpen: Boolean(open),
       });
     },
+    setLaunchGitContext(context) {
+      set({ launchGitContext: context || null });
+    },
     setProviderModels(provider, models) {
       set((state) => ({
         providerModels: {
@@ -169,6 +178,16 @@ export function createRemoteUiStore(initialState = {}) {
       set({
         sendPending: Boolean(value),
       });
+    },
+    // Apply several draft fields as ONE transition. Provider, model and effort
+    // are a single decision — the effort levels are model-specific and the model
+    // belongs to a provider — so setting them one at a time leaves the draft in
+    // states that are not valid requests, and each intermediate state is
+    // observable by subscribers.
+    patchSessionDraft(patch) {
+      set((state) => ({
+        sessionDraft: { ...state.sessionDraft, ...(patch || {}) },
+      }));
     },
     setSessionDraftField(field, value) {
       set((state) => ({

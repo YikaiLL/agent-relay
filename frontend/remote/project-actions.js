@@ -46,3 +46,16 @@ export const renameRemoteThread = (threadId, name) =>
     thread_id: threadId,
     input: { name: name ?? null },
   });
+
+/**
+ * The git standing of a workspace path, for the launch dialog's `main · clean` chip.
+ *
+ * Read-only and not claim-gated, like `fetch_projects` and `fetch_workspace_diff`: a
+ * paired device must be able to see what it is about to launch into without taking
+ * control of whatever session happens to be running. Filed here rather than in
+ * session-ops.js because it is a launch-dialog concern, not a session-lifecycle one.
+ */
+export async function fetchRemoteWorkspaceGitContext(cwd) {
+  const result = await dispatchOrRecover("fetch_workspace_git_context", { cwd });
+  return result?.workspace_git_context || null;
+}

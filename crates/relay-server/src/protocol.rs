@@ -1534,6 +1534,39 @@ pub struct WorkspaceRootView {
     pub is_main: bool,
 }
 
+/// The git standing of a workspace path, for the one-line chip next to a chosen
+/// working directory (`main · clean`).
+///
+/// Deliberately tiny and derived on demand: it answers only what the launch dialog
+/// renders, and every field degrades to a neutral value rather than an error, so a
+/// directory that is not a repo (or not there yet) is a normal answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkspaceGitContextView {
+    /// The path this answer is ABOUT, normalized the same way the relay normalizes
+    /// every cwd. Echoed so a client that changed its selection while the probe was
+    /// in flight can drop a stale answer instead of labelling the new directory with
+    /// the old one's branch.
+    pub cwd: String,
+    /// `git rev-parse --is-inside-work-tree`. False covers "not a repo", "bare repo"
+    /// and "directory does not exist" alike — the chip has nothing to say for any of
+    /// them, and collapsing them keeps the answer from doubling as a probe.
+    pub is_repo: bool,
+    /// Short branch name (`refs/heads/` stripped), matching `WorkspaceRootView::branch`.
+    /// `None` for a detached HEAD, for a repo with no commits yet, and for anything
+    /// that is not a repo.
+    pub branch: Option<String>,
+    /// HEAD points at a commit, not a branch. Distinct from `branch: None` because a
+    /// detached checkout is a state worth naming, and because `rev-parse --abbrev-ref
+    /// HEAD` reports it as the literal string `HEAD` — which must never reach the UI
+    /// as a branch name.
+    pub detached: bool,
+    /// The working tree has uncommitted changes, INCLUDING untracked files. False when
+    /// clean, when this is not a repo, and when the check could not be completed —
+    /// the chip's job is to warn, so an unknown answer stays silent rather than
+    /// claiming changes that may not exist.
+    pub dirty: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceDiffResponse {
     pub cwd: String,
@@ -2404,6 +2437,19 @@ pub struct StartSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
+    /// Project the new thread joins, chosen in the launch dialog.
+    ///
+    /// Carried on the start input rather than assigned afterwards because the
+    /// two surfaces cannot share a client-side two-step: local can read the new
+    /// thread id off its HTTP response and follow up with a `ProjectAction`,
+    /// but the broker's `start_session` returns no id, so a paired device has
+    /// nothing to assign. Resolving it here is the only place both surfaces
+    /// reach.
+    ///
+    /// `#[serde(default)]` so older clients — and every caller that does not
+    /// care — keep working unchanged; absent means Unassigned, as before.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2421,6 +2467,28 @@ pub struct ForkSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
+    /// Project the fork joins. THREE states, because two are not enough:
+    ///
+    /// | value          | meaning                                          |
+    /// |----------------|--------------------------------------------------|
+    /// | absent / null  | inherit the source thread's project (the default)|
+    /// | `"proj_…"`     | file the fork into that project                  |
+    /// | `""`           | explicitly unassigned (no project)               |
+    ///
+    /// Absence is already spoken for by *inherit* — branching a conversation
+    /// should not silently drop it out of the group it belongs to, which is what
+    /// forking did before this field existed — so it cannot also mean "no
+    /// project". Without a distinct third value a fork could never be moved OUT
+    /// of its source's project.
+    ///
+    /// The empty string is safe to overload as that third value: project ids are
+    /// always `proj_%016x` (see `create_project`), so nothing legitimate produces
+    /// it. Clients must send `""`, not null, to unassign.
+    ///
+    /// Note this differs from `StartSessionInput`, where absent means *unassigned*
+    /// — there is no source to inherit from there.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -13,6 +13,7 @@ import {
   normalizeForkFields,
   resolveForkSourceThread,
   threadIsBusyForFork,
+  FORK_PROJECT_NONE,
 } from "./fork-fields.js";
 
 const CLAUDE_MODELS = [
@@ -491,4 +492,26 @@ test("the drop rule stays anchored to the `msg_` prefix, not to a substring", ()
     forkPointIsTip: true,
   });
   assert.equal(payload.up_to_item_id, "acp-msg_1");
+});
+
+test("fork payload omits project_id entirely when the field is untouched", () => {
+  // Absence is INHERIT on the wire (see ForkSessionInput). It is therefore the
+  // only correct thing to send for a fork whose project the user never touched —
+  // sending null would read as "explicitly unassigned" if the sentinel were ever
+  // relaxed, and sending the source's id would defeat server-side resolution.
+  const payload = forkFieldsToPayload({ sourceThreadId: "t1" });
+  assert.equal("project_id" in payload, false);
+});
+
+test("fork payload carries an explicitly chosen project", () => {
+  const payload = forkFieldsToPayload({ sourceThreadId: "t1", projectId: "proj_00ff" });
+  assert.equal(payload.project_id, "proj_00ff");
+});
+
+test("choosing the default workspace sends the explicit-unassigned sentinel", () => {
+  // The three states are: absent = inherit, "id" = that project, "" = no project.
+  // Null is NOT usable for the third, because absent already means inherit — so
+  // a fork could otherwise never be moved OUT of its source's project.
+  const payload = forkFieldsToPayload({ sourceThreadId: "t1", projectId: FORK_PROJECT_NONE });
+  assert.equal(payload.project_id, "");
 });
