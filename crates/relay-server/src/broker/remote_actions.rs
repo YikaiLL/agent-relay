@@ -12,8 +12,9 @@ use crate::{
         RepairWorkspaceInput, RequestReviewInput, ResumeSessionInput, ReviewsResponse,
         SendMessageInput, SessionSnapshot, StartSessionInput, StartWorkflowInput, StopTurnInput,
         SubmitAskUserAnswerInput, TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse,
-        ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput,
-        WatchThreadsInput, WorkflowActionInput, WorkflowsResponse, WorkspaceDiffResponse,
+        ThreadSettingsView, ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse,
+        UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput, WorkflowsResponse,
+        WorkspaceDiffResponse, WorkspaceGitContextView,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
@@ -134,6 +135,21 @@ pub(super) enum RemoteActionRequest {
         thread_id: String,
         input: RepairWorkspaceInput,
     },
+    /// The path comes from the CLIENT, so the scope check in `workspace_git_context`
+    /// is what keeps this from being an existence oracle. It reads `device_id`.
+    FetchWorkspaceGitContext {
+        #[serde(default)]
+        device_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// What a fork of this thread would inherit. An in-memory map read, unlike the
+    /// transcript response that also carries settings but pays a provider fetch.
+    FetchThreadSettings {
+        #[serde(default)]
+        device_id: Option<String>,
+        thread_id: String,
+    },
     FetchWorkspaceDiff {
         #[serde(default)]
         device_id: Option<String>,
@@ -235,6 +251,8 @@ impl RemoteActionRequest {
             Self::RenameThread { .. } => RemoteActionKind::RenameThread,
             Self::RepairWorkspace { .. } => RemoteActionKind::RepairWorkspace,
             Self::FetchWorkspaceDiff { .. } => RemoteActionKind::FetchWorkspaceDiff,
+            Self::FetchWorkspaceGitContext { .. } => RemoteActionKind::FetchWorkspaceGitContext,
+            Self::FetchThreadSettings { .. } => RemoteActionKind::FetchThreadSettings,
             Self::FetchReviews { .. } => RemoteActionKind::FetchReviews,
             Self::FetchWorkflows { .. } => RemoteActionKind::FetchWorkflows,
             Self::FetchDevices { .. } => RemoteActionKind::FetchDevices,
@@ -357,6 +375,15 @@ impl RemoteActionRequest {
                 root,
                 auto_root,
             },
+            Self::FetchWorkspaceGitContext { cwd, .. } => Self::FetchWorkspaceGitContext {
+                device_id: Some(device_id),
+                // Preserve the path being asked about; only device_id is stamped.
+                cwd,
+            },
+            Self::FetchThreadSettings { thread_id, .. } => Self::FetchThreadSettings {
+                device_id: Some(device_id),
+                thread_id,
+            },
             Self::FetchReviews { .. } => Self::FetchReviews {
                 device_id: Some(device_id),
             },
@@ -442,6 +469,8 @@ pub(super) enum RemoteActionKind {
     RenameThread,
     RepairWorkspace,
     FetchWorkspaceDiff,
+    FetchWorkspaceGitContext,
+    FetchThreadSettings,
     FetchReviews,
     FetchWorkflows,
     FetchDevices,
@@ -483,6 +512,8 @@ impl RemoteActionKind {
             Self::RenameThread => "rename_thread",
             Self::RepairWorkspace => "repair_workspace",
             Self::FetchWorkspaceDiff => "fetch_workspace_diff",
+            Self::FetchWorkspaceGitContext => "fetch_workspace_git_context",
+            Self::FetchThreadSettings => "fetch_thread_settings",
             Self::FetchReviews => "fetch_reviews",
             Self::FetchWorkflows => "fetch_workflows",
             Self::FetchDevices => "fetch_devices",
@@ -517,6 +548,10 @@ struct RemoteActionResultPlaintext {
     thread_entry_detail: Option<ThreadEntryDetailResponse>,
     thread_transcript: Option<ThreadTranscriptResponse>,
     workspace_diff: Option<WorkspaceDiffResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_git_context: Option<WorkspaceGitContextView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_settings: Option<ThreadSettingsView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<ReviewsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -561,6 +596,8 @@ fn busy_remote_action_result(
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -609,6 +646,8 @@ struct RemoteActionResultSizeBreakdown {
     thread_entry_detail_bytes: usize,
     thread_transcript_bytes: usize,
     workspace_diff_bytes: usize,
+    workspace_git_context_bytes: usize,
+    thread_settings_bytes: usize,
     reviews_bytes: usize,
     workflows_bytes: usize,
     devices_bytes: usize,
@@ -631,6 +670,8 @@ pub(super) struct RemoteActionOutcome {
     pub(super) thread_entry_detail: Option<ThreadEntryDetailResponse>,
     pub(super) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(super) workspace_diff: Option<WorkspaceDiffResponse>,
+    pub(super) workspace_git_context: Option<WorkspaceGitContextView>,
+    pub(super) thread_settings: Option<ThreadSettingsView>,
     pub(super) reviews: Option<ReviewsResponse>,
     pub(super) workflows: Option<WorkflowsResponse>,
     pub(super) devices: Option<DevicesResponse>,
@@ -1382,6 +1423,23 @@ async fn execute_remote_action(
                 workspace_diff: Some(workspace_diff),
                 ..RemoteActionOutcome::default()
             }),
+        RemoteActionRequest::FetchThreadSettings {
+            device_id,
+            thread_id,
+        } => state
+            .thread_settings_view(device_id, &thread_id)
+            .await
+            .map(|thread_settings| RemoteActionOutcome {
+                thread_settings: Some(thread_settings),
+                ..RemoteActionOutcome::default()
+            }),
+        RemoteActionRequest::FetchWorkspaceGitContext { device_id, cwd } => state
+            .workspace_git_context(device_id, cwd.unwrap_or_default())
+            .await
+            .map(|workspace_git_context| RemoteActionOutcome {
+                workspace_git_context: Some(workspace_git_context),
+                ..RemoteActionOutcome::default()
+            }),
         RemoteActionRequest::FetchReviews { device_id } => Ok(RemoteActionOutcome {
             // The dedicated, UNCOMPACTED reviewer-panel payload (cards + reviewer threads +
             // revision). Read-only; not gated on a session claim, but SCOPED to the
@@ -1461,6 +1519,8 @@ fn remote_action_emits_info_log(action: RemoteActionKind) -> bool {
             | RemoteActionKind::FetchThreadEntryDetail
             | RemoteActionKind::FetchThreadTranscript
             | RemoteActionKind::FetchWorkspaceDiff
+            | RemoteActionKind::FetchWorkspaceGitContext
+            | RemoteActionKind::FetchThreadSettings
             | RemoteActionKind::FetchReviews
             | RemoteActionKind::FetchWorkflows
             | RemoteActionKind::FetchDevices
@@ -1765,6 +1825,8 @@ async fn publish_plain_remote_action_result(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -1789,6 +1851,8 @@ async fn publish_plain_remote_action_result(
         thread_entry_detail.as_ref(),
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
+        workspace_git_context.as_ref(),
+        thread_settings.as_ref(),
         reviews.as_ref(),
         workflows.as_ref(),
         devices.as_ref(),
@@ -1815,6 +1879,8 @@ async fn publish_plain_remote_action_result(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -1983,6 +2049,8 @@ fn build_plain_remote_action_result_payload(
                 thread_entry_detail: result.thread_entry_detail.clone(),
                 thread_transcript: result.thread_transcript.clone(),
                 workspace_diff: result.workspace_diff.clone(),
+                workspace_git_context: result.workspace_git_context.clone(),
+                thread_settings: result.thread_settings.clone(),
                 reviews: result.reviews.clone(),
                 workflows: result.workflows.clone(),
                 devices: result.devices.clone(),
@@ -2019,6 +2087,8 @@ async fn replay_plain_remote_action_result(
             thread_entry_detail: cached.thread_entry_detail,
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
+            workspace_git_context: cached.workspace_git_context,
+            thread_settings: cached.thread_settings,
             reviews: cached.reviews,
             workflows: cached.workflows,
             devices: cached.devices,
@@ -2087,6 +2157,8 @@ async fn publish_remote_action_result_private(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -2115,6 +2187,8 @@ async fn publish_remote_action_result_private(
         thread_entry_detail.as_ref(),
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
+        workspace_git_context.as_ref(),
+        thread_settings.as_ref(),
         reviews.as_ref(),
         workflows.as_ref(),
         devices.as_ref(),
@@ -2141,6 +2215,8 @@ async fn publish_remote_action_result_private(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -2244,6 +2320,8 @@ async fn replay_encrypted_remote_action_result(
             thread_entry_detail: cached.thread_entry_detail,
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
+            workspace_git_context: cached.workspace_git_context,
+            thread_settings: cached.thread_settings,
             reviews: cached.reviews,
             workflows: cached.workflows,
             devices: cached.devices,
@@ -2469,6 +2547,8 @@ fn cached_remote_action_result(
         thread_entry_detail: outcome.thread_entry_detail,
         thread_transcript: outcome.thread_transcript,
         workspace_diff: outcome.workspace_diff,
+        workspace_git_context: outcome.workspace_git_context,
+        thread_settings: outcome.thread_settings,
         reviews: outcome.reviews,
         workflows: outcome.workflows,
         devices: outcome.devices,
@@ -2496,6 +2576,8 @@ fn measure_remote_action_result_sizes(
     thread_entry_detail: Option<&ThreadEntryDetailResponse>,
     thread_transcript: Option<&ThreadTranscriptResponse>,
     workspace_diff: Option<&WorkspaceDiffResponse>,
+    workspace_git_context: Option<&WorkspaceGitContextView>,
+    thread_settings: Option<&ThreadSettingsView>,
     reviews: Option<&ReviewsResponse>,
     workflows: Option<&WorkflowsResponse>,
     devices: Option<&DevicesResponse>,
@@ -2521,6 +2603,8 @@ fn measure_remote_action_result_sizes(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -2541,6 +2625,8 @@ fn measure_remote_action_result_sizes(
         thread_entry_detail_bytes: maybe_serialized_json_bytes(thread_entry_detail),
         thread_transcript_bytes: maybe_serialized_json_bytes(thread_transcript),
         workspace_diff_bytes: maybe_serialized_json_bytes(workspace_diff),
+        workspace_git_context_bytes: maybe_serialized_json_bytes(workspace_git_context),
+        thread_settings_bytes: maybe_serialized_json_bytes(thread_settings),
         reviews_bytes: maybe_serialized_json_bytes(reviews),
         workflows_bytes: maybe_serialized_json_bytes(workflows),
         devices_bytes: maybe_serialized_json_bytes(devices),
@@ -2664,6 +2750,8 @@ struct RemoteActionResultPlaintextRef<'a> {
     thread_entry_detail: Option<&'a ThreadEntryDetailResponse>,
     thread_transcript: Option<&'a ThreadTranscriptResponse>,
     workspace_diff: Option<&'a WorkspaceDiffResponse>,
+    workspace_git_context: Option<&'a WorkspaceGitContextView>,
+    thread_settings: Option<&'a ThreadSettingsView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<&'a ReviewsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2707,6 +2795,8 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         | RemoteActionKind::FetchThreadEntryDetail
         | RemoteActionKind::FetchThreadTranscript
         | RemoteActionKind::FetchWorkspaceDiff
+        | RemoteActionKind::FetchWorkspaceGitContext
+        | RemoteActionKind::FetchThreadSettings
         | RemoteActionKind::FetchReviews
         | RemoteActionKind::FetchWorkflows
         | RemoteActionKind::FetchDevices

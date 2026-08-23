@@ -2110,6 +2110,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session");
@@ -2773,6 +2774,473 @@ got {}",
             })
             .await
             .is_ok());
+    }
+
+    /// Must be the SAME resolution `fork_session` performs, or the dialog
+    /// advertises one thing and the fork does another.
+    #[tokio::test]
+    async fn thread_settings_report_what_a_fork_would_actually_inherit() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: Some("fake-echo".to_string()),
+            effort: Some("high".to_string()),
+            approval_policy: Some("never".to_string()),
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        let settings = app
+            .thread_settings_view(Some("device-1".to_string()), &thread_id)
+            .await
+            .expect("settings");
+
+        assert!(settings.remembered, "the relay ran this thread");
+        assert_eq!(settings.model, "fake-echo");
+        assert_eq!(settings.reasoning_effort, "high");
+        assert_eq!(settings.approval_policy, "never");
+    }
+
+    /// Local is already authorized and names no device; `allowed_roots` still bind
+    /// the read. Remote never takes this branch — `bind_device` stamps an id.
+    #[tokio::test]
+    async fn thread_settings_are_readable_without_a_device_id() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: Some("fake-echo".to_string()),
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        let settings = app
+            .thread_settings_view(None, &thread_id)
+            .await
+            .expect("readable without a device id");
+        assert_eq!(settings.model, "fake-echo");
+    }
+
+    /// Still usable — a fork WILL get these — but flagged, so the dialog does not
+    /// claim a choice the user never made.
+    #[tokio::test]
+    async fn an_unrecorded_thread_reports_relay_defaults_and_says_so() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let settings = app
+            .thread_settings_view(Some("device-1".to_string()), "never-seen-thread")
+            .await
+            .expect("settings");
+
+        assert!(!settings.remembered);
+        assert!(
+            !settings.approval_policy.is_empty(),
+            "a usable value is still returned, because a fork would get one"
+        );
+    }
+
+    /// At SUBMIT time, not when the dialog opened — otherwise tightening the
+    /// source's permissions elsewhere is undone by a fork already in progress.
+    #[tokio::test]
+    async fn an_omitted_fork_setting_uses_the_sources_value_at_submit_time() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: Some("never".to_string()),
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        // What the dialog would have shown when it opened.
+        let at_open = app
+            .thread_settings_view(None, &source_thread_id)
+            .await
+            .expect("settings");
+        assert_eq!(at_open.approval_policy, "never");
+
+        // Another device tightens the source while the dialog sits open.
+        {
+            let mut relay = app.relay.write().await;
+            relay.remember_thread_settings(
+                &source_thread_id,
+                "untrusted",
+                "read-only",
+                "medium",
+                "fake-echo",
+            );
+        }
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id: source_thread_id.clone(),
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: None,
+        })
+        .await
+        .expect("fork_session");
+
+        let forked = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        let settings = app
+            .thread_settings_view(None, &forked)
+            .await
+            .expect("fork settings");
+        assert_eq!(
+            settings.approval_policy, "untrusted",
+            "the fork must take the TIGHTENED policy, not the one the dialog read"
+        );
+        assert_eq!(settings.sandbox, "read-only");
+    }
+
+    async fn project_with_session(cwd: &str) -> (AppState, TempDir, TempDir, String) {
+        let (app, p, o) = build_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "Small improvement".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create project");
+        let project_id = receipt.projects[0].id.clone();
+        (app, p, o, project_id)
+    }
+
+    /// Server-side, because remote cannot fake it client-side: its broker
+    /// `start_session` returns no thread id for a phone to follow up on.
+    #[tokio::test]
+    async fn start_session_assigns_the_new_thread_to_the_requested_project() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, project_id) = project_with_session(&cwd).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(project_id.clone()),
+        })
+        .await
+        .expect("start_session");
+
+        let listed = app.list_threads(50, None).await.expect("list");
+        let thread_id = listed.threads[0].id.clone();
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay.project_for_thread(&thread_id).map(|p| p.id.clone()),
+            Some(project_id),
+            "the started thread must be a member of the project it was started into"
+        );
+    }
+
+    /// A project deleted on another device mid-dialog must not cost the user the
+    /// session they asked for.
+    #[tokio::test]
+    async fn an_unknown_project_id_still_starts_the_session_unassigned() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some("proj_deadbeefdeadbeef".to_string()),
+        })
+        .await
+        .expect("start_session must survive a stale project id");
+
+        let listed = app.list_threads(50, None).await.expect("list");
+        let thread_id = listed.threads[0].id.clone();
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay.project_for_thread(&thread_id).map(|p| p.id.clone()),
+            None
+        );
+    }
+
+    /// Fork assigned no project at all before this, so branching a project session
+    /// dropped it into Unassigned.
+    #[tokio::test]
+    async fn fork_inherits_the_source_threads_project_by_default() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, project_id) = project_with_session(&cwd).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(project_id.clone()),
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id: source_thread_id.clone(),
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: None,
+        })
+        .await
+        .expect("fork_session");
+
+        let forked_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        assert_ne!(
+            forked_thread_id, source_thread_id,
+            "precondition: a new thread"
+        );
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay
+                .project_for_thread(&forked_thread_id)
+                .map(|p| p.id.clone()),
+            Some(project_id),
+            "a fork stays in the project its source belongs to"
+        );
+    }
+
+    /// `None` already means inherit, so it cannot also mean "none". Ids are always
+    /// `proj_%016x`, so the empty string is safe as the third value.
+    #[tokio::test]
+    async fn an_empty_fork_project_files_the_branch_out_of_the_source_project() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, project_id) = project_with_session(&cwd).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(project_id.clone()),
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id,
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: Some(String::new()),
+        })
+        .await
+        .expect("fork_session");
+
+        let forked_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay
+                .project_for_thread(&forked_thread_id)
+                .map(|p| p.id.clone()),
+            None,
+            "an explicit empty project must NOT fall back to inheriting the source's"
+        );
+    }
+
+    /// ...but an explicit project on the fork input overrides that inheritance,
+    /// so the fork dialog's picker can redirect the branch elsewhere.
+    #[tokio::test]
+    async fn an_explicit_fork_project_overrides_the_inherited_one() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, source_project) = project_with_session(&cwd).await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "UI Redesign".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create second project");
+        let other_project = receipt
+            .projects
+            .iter()
+            .find(|p| p.name == "UI Redesign")
+            .expect("second project")
+            .id
+            .clone();
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(source_project),
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id,
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: Some(other_project.clone()),
+        })
+        .await
+        .expect("fork_session");
+
+        let forked_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay
+                .project_for_thread(&forked_thread_id)
+                .map(|p| p.id.clone()),
+            Some(other_project)
+        );
     }
 
     async fn build_status_app(cwd: &str, read_status: &str) -> (AppState, TempDir, TempDir) {
@@ -4023,6 +4491,7 @@ got {}",
                     effort: None,
                     device_id: Some("device-1".to_string()),
                     provider: Some("codex".to_string()),
+                    project_id: None,
                 },
                 vec![image.clone()],
             )
@@ -4058,6 +4527,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -6335,6 +6805,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect_err("start_session outside scope should fail");
@@ -6353,6 +6824,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session inside scope should succeed");
@@ -6377,6 +6849,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("unscoped device should succeed within relay roots");
@@ -6457,6 +6930,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("EARLY-MARKER first goal".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6498,6 +6972,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork at message");
@@ -6550,6 +7025,7 @@ got {}",
                 sandbox: Some("read-only".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("restricted work".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6567,6 +7043,7 @@ got {}",
             sandbox: Some("danger-full-access".to_string()),
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start permissive session");
@@ -6583,6 +7060,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork inherits");
@@ -6617,6 +7095,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("source work".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6637,6 +7116,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect("replay fork");
@@ -6675,6 +7155,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("some work".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6693,6 +7174,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect_err("unknown fork point must not silently fork the whole thread");
@@ -6718,6 +7200,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("source goal: build fork support".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6736,6 +7219,7 @@ got {}",
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
                 up_to_item_id: None,
+                project_id: None,
             })
             .await
             .expect("fork source");
@@ -6804,6 +7288,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -6867,6 +7352,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -6924,6 +7410,7 @@ got {}",
                     effort: None,
                     device_id: Some("device-1".to_string()),
                     provider: Some("codex".to_string()),
+                    project_id: None,
                 },
                 vec![ProviderImage {
                     media_type: "image/png".to_string(),
@@ -6988,6 +7475,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -7038,6 +7526,7 @@ got {}",
             effort: None,
             device_id: Some("device-1".to_string()),
             provider: Some("codex".to_string()),
+            project_id: None,
         })
         .await
         .expect("fork without a prompt should succeed");
@@ -7121,6 +7610,7 @@ got {}",
                 sandbox: None,
                 provider: Some("statusy".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -7140,6 +7630,7 @@ got {}",
                 sandbox: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("statusy".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork");
@@ -7180,6 +7671,7 @@ got {}",
                 sandbox: None,
                 provider: Some("statusy".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -7199,6 +7691,7 @@ got {}",
                 sandbox: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("statusy".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork with an explicit model");
@@ -7231,6 +7724,7 @@ got {}",
                 sandbox: None,
                 provider: Some("alpha".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -7248,6 +7742,7 @@ got {}",
                 sandbox: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("beta".to_string()),
+                project_id: None,
             })
             .await
             .expect("cross-provider fork");
@@ -7306,6 +7801,7 @@ got {}",
                 sandbox: None,
                 provider: Some("beta".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start beta session")
@@ -7328,6 +7824,7 @@ got {}",
                 sandbox: None,
                 provider: Some("alpha".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start alpha session")
@@ -7423,6 +7920,7 @@ got {}",
                 sandbox: None,
                 provider: Some("beta".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start beta session")
@@ -7440,6 +7938,7 @@ got {}",
             sandbox: None,
             provider: Some("alpha".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start alpha session");
@@ -7508,6 +8007,7 @@ got {}",
                 sandbox: None,
                 provider: Some("statusy".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -7524,6 +8024,7 @@ got {}",
             effort: None,
             device_id: Some("device-1".to_string()),
             provider: Some("statusy".to_string()),
+            project_id: None,
         })
         .await
         .expect("a saved (notLoaded) thread must be forkable");
@@ -7549,6 +8050,7 @@ got {}",
                 sandbox: None,
                 provider: Some(forked.to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start quiet thread");
@@ -7564,6 +8066,7 @@ got {}",
             sandbox: None,
             provider: Some(busy.to_string()),
             initial_prompt: Some("keep this turn running briefly".to_string()),
+            project_id: None,
         })
         .await
         .expect("start busy thread");
@@ -7579,6 +8082,7 @@ got {}",
             effort: None,
             device_id: Some("device-1".to_string()),
             provider: Some(forked.to_string()),
+            project_id: None,
         })
         .await
         .unwrap_or_else(|error| {
@@ -7613,6 +8117,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("keep this turn running briefly".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -7630,6 +8135,7 @@ got {}",
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
                 up_to_item_id: None,
+                project_id: None,
             })
             .await
             .expect_err("running source must not fork");
@@ -7662,6 +8168,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7677,6 +8184,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7796,6 +8304,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("Hellooo".to_string()),
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7814,6 +8323,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7874,6 +8384,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7905,6 +8416,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7973,6 +8485,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start");
@@ -8014,6 +8527,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -8049,6 +8563,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -8141,6 +8656,7 @@ got {}",
                 sandbox: None,
                 provider: Some("consumed-initial".to_string()),
                 initial_prompt: Some("finish before start returns".to_string()),
+                project_id: None,
             })
             .await
             .expect("start consumed initial prompt");
@@ -8187,6 +8703,7 @@ got {}",
                 sandbox: None,
                 provider: Some("consumed-initial".to_string()),
                 initial_prompt: Some("Hellooo".to_string()),
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -8225,6 +8742,7 @@ got {}",
                 sandbox: None,
                 provider: Some("consumed-initial".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -8304,6 +8822,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("wide device should start session");
@@ -8347,6 +8866,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("wide device should start session");
@@ -8400,6 +8920,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("wide device should start session");
@@ -8651,6 +9172,7 @@ got {}",
                 sandbox: None,
                 provider: Some("codex".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("codex inherited default alias should normalize to a concrete model");
@@ -8703,6 +9225,7 @@ got {}",
             sandbox: None,
             provider: Some("claude_code".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("claude resolves \"default\" and should start successfully");
@@ -8848,6 +9371,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session");
@@ -10461,6 +10985,7 @@ mod review_tests {
                 sandbox: None,
                 provider: Some(provider.to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("parent session should start");
@@ -12958,6 +13483,7 @@ settings update: {error}"
                 sandbox: None,
                 provider: Some("codex".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect_err("new same-cwd session must be locked while workflow runs");
@@ -14715,6 +15241,7 @@ settings update: {error}"
                 sandbox: None,
                 provider: Some("codex".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("starting another session must be allowed during a review");
@@ -21098,6 +21625,7 @@ mod late_catalog_tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("late".to_string()),
+                project_id: None,
             })
             .await
             .expect("start should succeed");
@@ -21196,6 +21724,7 @@ mod late_catalog_tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("late".to_string()),
+                project_id: None,
             })
             .await
             .expect("start should succeed");

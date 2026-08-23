@@ -110,6 +110,16 @@ impl AppState {
                     model = relay.model.clone();
                 }
             }
+            // Before the notify() below, so the session does not visibly jump groups.
+            if let Some(project_id) = non_empty(input.project_id.clone()) {
+                if super::projects::attach_new_thread_to_project(
+                    &mut relay,
+                    &started_thread_id,
+                    &project_id,
+                ) {
+                    relay.bump_projects_revision();
+                }
+            }
             let turn_revision = relay.thread_turn_revision(&started_thread_id);
             relay.activate_started_thread(
                 start_result.thread,

@@ -52,10 +52,10 @@ use protocol::{
     SessionSnapshotCompactProfile, StartSessionInput, StartTeamInput, StartTeamReceipt,
     StartWorkflowInput, StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput,
     TakeOverInput, TeamActionInput, TeamActionReceipt, TeamsResponse, ThreadArchiveReceipt,
-    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadTranscriptResponse,
-    ThreadsQuery, ThreadsResponse, TranscriptDeltaEvent, UpdateSessionSettingsInput,
-    WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse,
-    WorkspaceDiffResponse,
+    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadSettingsView,
+    ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, TranscriptDeltaEvent,
+    UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt,
+    WorkflowsResponse, WorkspaceDiffResponse, WorkspaceGitContextView,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -118,6 +118,13 @@ struct ThreadTranscriptQuery {
 struct ThreadEntryDetailQuery {
     field: Option<String>,
     cursor: Option<usize>,
+}
+
+/// `device_id` for a plain thread-addressed read. Optional so the local surface
+/// can call without one; `thread_settings_view` scopes on whatever it gets.
+#[derive(Debug, Deserialize)]
+struct DeviceQuery {
+    device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +344,8 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         )
         .route("/api/session", get(session_snapshot))
         .route("/api/workspace/diff", get(workspace_diff))
+        .route("/api/workspace/git-context", get(workspace_git_context))
+        .route("/api/threads/:thread_id/settings", get(thread_settings))
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
         .route("/api/threads/:thread_id/transcript", get(thread_transcript))
@@ -650,6 +659,48 @@ async fn workspace_diff(
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(|error| classify_session_error(error))
+}
+
+/// `cwd` is required and caller-supplied: no fallback to the relay's active cwd,
+/// because answering about a different directory is worse than an error.
+#[derive(Debug, Deserialize)]
+struct WorkspaceGitContextQuery {
+    cwd: String,
+}
+
+async fn workspace_git_context(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<WorkspaceGitContextQuery>,
+) -> Result<Json<ApiEnvelope<WorkspaceGitContextView>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .workspace_git_context(None, query.cwd)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        // Both failures are the caller's, so 400. `classify_session_error` would file
+        // the scope refusal as `bad_gateway` — a client mistake reported as ours.
+        .map_err(bad_request)
+}
+
+/// What a fork of this thread would inherit. Read-only, in-memory, and scoped to
+/// the thread's own workspace by `thread_settings_view`.
+async fn thread_settings(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+    Query(query): Query<DeviceQuery>,
+) -> Result<Json<ApiEnvelope<ThreadSettingsView>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .thread_settings_view(query.device_id, &thread_id)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        .map_err(bad_request)
 }
 
 /// Query for `/api/stream`. `device_id` identifies the surface so its declared thread

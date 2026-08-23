@@ -26,9 +26,10 @@ use crate::{
         RepairWorkspaceInput, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput,
         SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput,
         SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
-        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView,
-        ThreadTranscriptResponse, ThreadsResponse, ToolCallView, TranscriptDeltaEvent,
-        UpdateSessionSettingsInput, WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
+        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadSettingsView,
+        ThreadStateView, ThreadTranscriptResponse, ThreadsResponse, ToolCallView,
+        TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput, WorkspaceDiffResponse,
+        WorkspaceGitContextView, WorkspaceRootView,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -215,6 +216,7 @@ const MAX_THREAD_ID_BYTES: usize = 256;
 mod approvals;
 mod broker;
 mod fork;
+mod git_context;
 mod pairing;
 mod port;
 mod projects;

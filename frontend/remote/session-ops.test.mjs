@@ -2093,6 +2093,114 @@ test("startRemoteSession re-enables the start button when the relay does not rep
   assert.equal(await pending, false);
 });
 
+test("startRemoteSession carries the chosen project so a phone can file a session too", async () => {
+  // Remote cannot do what local used to: its start_session returns no thread id,
+  // so the start input is the only place a phone can name a project.
+  const browser = activeBrowser || installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { startRemoteSession } = await import("./session-ops.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+
+  const sent = [];
+  state.socket = {
+    readyState: 1,
+    send(raw) {
+      sent.push(JSON.parse(raw));
+    },
+  };
+
+  const pending = startRemoteSession({
+    approvalPolicy: "on-request",
+    cwd: "/tmp/demo",
+    effort: "medium",
+    initialPrompt: "",
+    model: "gpt-5.4",
+    projectId: "proj_00ff",
+    sandbox: "workspace-write",
+  });
+  browser.runTimers();
+  await pending;
+
+  const input = sent
+    .map((frame) => frame?.payload?.request?.input)
+    .find((candidate) => candidate && "project_id" in candidate);
+  assert.ok(input, "the start action must carry an input with a project_id");
+  assert.equal(input.project_id, "proj_00ff");
+});
+
+test("an unfiled remote session sends a null project rather than omitting it", async () => {
+  // Absent and null both mean unassigned today, but sending the key means the wire
+  // always shows what the dialog decided.
+  const browser = activeBrowser || installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { startRemoteSession } = await import("./session-ops.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+
+  const sent = [];
+  state.socket = {
+    readyState: 1,
+    send(raw) {
+      sent.push(JSON.parse(raw));
+    },
+  };
+
+  const pending = startRemoteSession({
+    approvalPolicy: "on-request",
+    cwd: "/tmp/demo",
+    effort: "medium",
+    initialPrompt: "",
+    model: "gpt-5.4",
+    projectId: null,
+    sandbox: "workspace-write",
+  });
+  browser.runTimers();
+  await pending;
+
+  const input = sent
+    .map((frame) => frame?.payload?.request?.input)
+    .find((candidate) => candidate && "project_id" in candidate);
+  assert.ok(input, "the key must be present even when nothing is chosen");
+  assert.equal(input.project_id, null);
+});
+
 test("refreshRemoteThreads clears loading state and records an error when the relay does not reply", async () => {
   const browser = activeBrowser || installBrowserStubs();
 

@@ -12,23 +12,48 @@ import { isWorkingThreadStatus } from "./thread-status.js";
 
 export const INHERIT = "";
 
+// Three states on the wire: absent inherits the source's project, an id files it
+// there, `""` unassigns. Absent cannot mean "none" — inherit already owns it.
+export const FORK_PROJECT_INHERIT = null;
+export const FORK_PROJECT_NONE = "__fork_project_none__";
+
 function firstCatalogModel(models) {
   if (!Array.isArray(models) || !models.length) return INHERIT;
   return models.find((option) => option?.is_default)?.model || models[0]?.model || INHERIT;
 }
 
-export function defaultForkFields({ thread = null, models = [], session = null } = {}) {
+// What an untouched field DISPLAYS, which is not what it submits: sending it
+// would freeze a permission the source may change while the dialog is open.
+const SOURCE_SETTING_KEYS = {
+  approvalPolicy: "approval_policy",
+  effort: "reasoning_effort",
+  model: "model",
+  sandbox: "sandbox",
+};
+
+export function forkInheritedDisplay(sourceSettings, field) {
+  if (!sourceSettings?.remembered) {
+    return "";
+  }
+  return sourceSettings[SOURCE_SETTING_KEYS[field] || field] || "";
+}
+
+export function defaultForkFields({
+  thread = null,
+  models = [],
+  session = null,
+} = {}) {
   const provider = thread?.provider || session?.provider || "";
   return {
     approvalPolicy: INHERIT,
     cwd: thread?.cwd || "",
     effort: INHERIT,
     initialPrompt: "",
-    // Only ever seeded from the TARGET provider's own catalog. The relay does
-    // not validate an explicitly-requested model against the target catalog, so
-    // a cross-provider seed (a codex model id on a Claude fork) would be sent
-    // verbatim to the wrong bridge.
-    model: firstCatalogModel(models),
+    // Inherited like every other untouched setting. Cross-provider is still safe:
+    // `normalizeForkFields` fills a concrete model once inherit is withdrawn.
+    model: INHERIT,
+    // Not the source's actual id: that would go stale if it moved project.
+    projectId: FORK_PROJECT_INHERIT,
     provider,
     sandbox: INHERIT,
     sourceThreadId: thread?.id || "",
@@ -245,6 +270,13 @@ function isUnresolvableCodexLiveForkPoint(upToItemId) {
   return /^msg_/.test(String(upToItemId ?? ""));
 }
 
+function forkProjectPayload(projectId) {
+  if (projectId === FORK_PROJECT_INHERIT || projectId === undefined) {
+    return {};
+  }
+  return { project_id: projectId === FORK_PROJECT_NONE ? "" : projectId };
+}
+
 export function forkFieldsToPayload(fields) {
   const upToItemId = orNull(fields?.upToItemId);
   return {
@@ -272,5 +304,7 @@ export function forkFieldsToPayload(fields) {
     sandbox: orNull(fields?.sandbox),
     effort: orNull(fields?.effort),
     provider: orNull(fields?.provider),
+    // Omitted, not nulled, when untouched: the relay reads absence as "inherit".
+    ...forkProjectPayload(fields?.projectId),
   };
 }

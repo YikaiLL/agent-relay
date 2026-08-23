@@ -1256,6 +1256,9 @@ export async function startRemoteSession(sessionDraftOverride = null) {
         sandbox: sessionDraft.sandbox,
         effort: sessionDraft.effort,
         provider: sessionDraft.provider,
+        // Explicit null when unfiled: remote has no second step, its start_session
+        // returns no thread id to follow up on.
+        project_id: sessionDraft.projectId || null,
       },
     });
     return true;

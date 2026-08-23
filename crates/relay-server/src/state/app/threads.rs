@@ -793,3 +793,44 @@ normal thread instead."
         })
     }
 }
+
+impl AppState {
+    /// Mirrors `fork_session`'s resolution exactly. A plain in-memory map read —
+    /// which is why it is not a piggyback on the provider-backed transcript response.
+    pub async fn thread_settings_view(
+        &self,
+        device_id: Option<String>,
+        thread_id: &str,
+    ) -> Result<ThreadSettingsView, String> {
+        let defaults = self.defaults().await;
+        let relay = self.relay.read().await;
+        // Optional `device_id`, like `workspace_git_context`: local is already
+        // authorized and names none, and `allowed_roots` still bind the read.
+        if let Some(cwd) = relay.thread_cwd(thread_id) {
+            let device_scope = device_id
+                .as_deref()
+                .map(|id| relay.device_path_scope(id))
+                .unwrap_or_default();
+            ensure_path_within_device_scope(&cwd, &device_scope, &relay.allowed_roots)?;
+        }
+
+        Ok(match relay.remembered_thread_settings(thread_id) {
+            Some(settings) => ThreadSettingsView {
+                thread_id: thread_id.to_string(),
+                model: settings.model,
+                reasoning_effort: settings.reasoning_effort,
+                approval_policy: settings.approval_policy,
+                sandbox: settings.sandbox,
+                remembered: true,
+            },
+            None => ThreadSettingsView {
+                thread_id: thread_id.to_string(),
+                model: defaults.model,
+                reasoning_effort: defaults.reasoning_effort,
+                approval_policy: defaults.approval_policy,
+                sandbox: defaults.sandbox,
+                remembered: false,
+            },
+        })
+    }
+}

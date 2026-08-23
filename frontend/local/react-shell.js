@@ -2,7 +2,6 @@ import React from "react";
 import { ClientLog } from "../shared/client-log.js";
 import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
-import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
 import { SidebarBrand, SidebarCollapseToggle, SidebarResizeHandle } from "../shared/sidebar-chrome.js";
 import { ConversationHeader, ConversationHeadingBody } from "../shared/conversation-header.js";
@@ -193,36 +192,6 @@ function LaunchPanel() {
   );
 }
 
-function LaunchStartSessionDialog({ launchModel, onLaunchFieldChange }) {
-  const m = launchModel || {};
-  return h(StartSessionDialog, {
-    id: "launch-start-session-dialog",
-    cwd: m.fields?.cwd || "",
-    fields: m.fields || {},
-    onFieldChange: onLaunchFieldChange || (() => {}),
-    // StartSessionDialog auto-closes itself on Start click; the actual API
-    // call fires from app.js via the #start-session-button document listener.
-    onStart: null,
-    startPending: false,
-    providerOptions: m.providerOptions || [],
-    models: m.models || [],
-    approvalOptions: m.approvalOptions || [],
-    effortOptions: m.effortOptions || [],
-    workspaceInputId: "cwd-input",
-    suggestionsListId: "workspace-suggestions",
-    startButtonId: "start-session-button",
-    initialPromptAttachmentsId: "start-prompt-attachments",
-    labels: {
-      initialPromptPlaceholder: "Optional first task. Paste an image to attach it.",
-    },
-    settingsPrefix: "",
-    directoryFormId: "directory-form",
-    loadButtonId: "load-directory-button",
-    // Claude supports deferred start — the relay accepts no initial prompt
-    // and promotes the session on the first composer message.
-    requireInitialPrompt: false,
-  });
-}
 
 /*
  * The sidebar's two destinations used to be written out here, as `SidebarNav`.
@@ -895,7 +864,9 @@ function PairingApprovalModal() {
   );
 }
 
-export function LocalShell({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
+// The shell renders once, at boot, and never again. Anything data-driven lives
+// in its own sub-root (see the mount points below) rather than taking props here.
+export function LocalShell() {
   return h(
     React.Fragment,
     null,
@@ -911,7 +882,9 @@ export function LocalShell({ launchModel = null, onLaunchFieldChange = null, onL
         h(WorkspaceChangesRail)
       )
     ),
-    h(LaunchStartSessionDialog, { launchModel, onLaunchFieldChange }),
+    // Filled by renderLaunchSessionDialog() through its own React sub-root: this
+    // shell renders exactly once, and a controlled dialog must re-render.
+    h("div", { className: "launch-dialog-mount", id: "launch-dialog-root" }),
     // Filled by renderStartTaskDialog() through its own React sub-root — the shell
     // renders once, so anything data-driven needs one.
     h("div", { className: "start-task-dialog-mount", id: "start-task-dialog-mount" }),

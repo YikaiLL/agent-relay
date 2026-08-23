@@ -653,7 +653,7 @@ fn trim_ascii(line: &[u8]) -> &[u8] {
 }
 
 /// Whether a `git rev-parse --is-*` predicate answered `true`.
-async fn git_flag(workspace: &LiveWorkspace, flag: &str) -> bool {
+pub(super) async fn git_flag(workspace: &LiveWorkspace, flag: &str) -> bool {
     git_line(workspace, &["rev-parse", flag])
         .await
         .is_some_and(|value| value == "true")
@@ -668,7 +668,7 @@ async fn git_ok(workspace: &LiveWorkspace, args: &[&str]) -> bool {
 }
 
 /// A git command's trimmed stdout, or `None` when it failed.
-async fn git_line(workspace: &LiveWorkspace, args: &[&str]) -> Option<String> {
+pub(super) async fn git_line(workspace: &LiveWorkspace, args: &[&str]) -> Option<String> {
     let output = run_git_capture(workspace, args).await.ok()?;
     output
         .status

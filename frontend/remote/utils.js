@@ -25,12 +25,17 @@ export function formatTimestamp(seconds) {
   });
 }
 
-export function formatRelativeTime(seconds) {
+// Optional clock injection, so pure callers can be tested against a fixed instant.
+export function formatRelativeTime(seconds, nowSeconds = null) {
   if (!seconds) {
     return "now";
   }
 
-  const diffSeconds = Math.max(0, Math.floor(Date.now() / 1000) - Number(seconds));
+  // Tested BEFORE coercing: Number(null) is 0 and finite, so a finiteness check
+  // alone pinned "now" to the epoch and made every timestamp read as "now".
+  const injected = nowSeconds == null ? NaN : Number(nowSeconds);
+  const now = Number.isFinite(injected) ? injected : Math.floor(Date.now() / 1000);
+  const diffSeconds = Math.max(0, now - Number(seconds));
   if (diffSeconds < 60) {
     return "now";
   }

@@ -1534,6 +1534,27 @@ pub struct WorkspaceRootView {
     pub is_main: bool,
 }
 
+/// The git standing of a workspace path, for the launch dialog's `main · clean` chip.
+/// Every field degrades to a neutral value, so "not a repo" is a normal answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkspaceGitContextView {
+    /// The normalized path this answers about, echoed so a client that has since
+    /// moved its selection can drop a stale reply.
+    pub cwd: String,
+    /// False covers not-a-repo, bare repo and missing directory alike — collapsing
+    /// them keeps the answer from doubling as an existence probe.
+    pub is_repo: bool,
+    /// Short name (`refs/heads/` stripped), matching `WorkspaceRootView::branch`.
+    /// `None` for a detached HEAD, an unborn branch, or a non-repo.
+    pub branch: Option<String>,
+    /// Distinct from `branch: None`: `rev-parse --abbrev-ref HEAD` reports a detached
+    /// checkout as the literal string `HEAD`, which must never render as a branch.
+    pub detached: bool,
+    /// Uncommitted changes, untracked files included. False when unknown too: the
+    /// chip warns, so an undetermined answer stays quiet rather than inventing changes.
+    pub dirty: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceDiffResponse {
     pub cwd: String,
@@ -2394,6 +2415,20 @@ pub struct ProjectActionReceipt {
     pub message: String,
 }
 
+/// What a fork of a thread would inherit, resolved exactly as `fork_session` resolves
+/// it. Not on `ThreadSummaryView`: that rides the byte-budgeted `ThreadsResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadSettingsView {
+    pub thread_id: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub approval_policy: String,
+    pub sandbox: String,
+    /// False when these are relay defaults, not the source's own choices. A fork gets
+    /// them either way, but a UI presenting them as chosen would invent history.
+    pub remembered: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionInput {
     pub cwd: Option<String>,
@@ -2404,6 +2439,10 @@ pub struct StartSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
+    /// Carried on the input rather than assigned afterwards: the broker's
+    /// `start_session` returns no thread id, so a phone has nothing to follow up on.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2421,6 +2460,10 @@ pub struct ForkSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
+    /// Three states: absent inherits the source's project, `"proj_…"` files it there,
+    /// `""` unassigns. Absent cannot mean "none" — inherit already owns it.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

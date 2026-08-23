@@ -122,6 +122,12 @@ pub(super) enum OutboundBrokerPayload {
         thread_entry_detail: Option<ThreadEntryDetailResponse>,
         thread_transcript: Option<ThreadTranscriptResponse>,
         workspace_diff: Option<crate::protocol::WorkspaceDiffResponse>,
+        /// Missing from THIS variant means dropped on the plaintext path only —
+        /// the same silent-drop trap `reviews` and `projects` each fell into.
+        workspace_git_context: Option<crate::protocol::WorkspaceGitContextView>,
+        /// Same plaintext-vs-sealed asymmetry as the fields above: absent here and
+        /// the fork dialog's settings arrive only on sealed transport.
+        thread_settings: Option<crate::protocol::ThreadSettingsView>,
         /// The `fetch_reviews` payload (review cards + reviewer threads). Without this the
         /// PLAINTEXT path silently dropped it — the sealed path serializes
         /// `RemoteActionResultPlaintext` wholesale and always carried it — so a phone's

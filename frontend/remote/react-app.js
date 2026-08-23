@@ -44,6 +44,7 @@ import {
 import { copyTextToClipboard } from "../shared/clipboard.js";
 import { installThreadListWheelProxy } from "../shared/thread-list-scroll.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
+import { createProjectAndSelect } from "../shared/project-create.js";
 import { createVerbCycler } from "../progress-verbs.js";
 import {
   buildProviderStatusModel,
@@ -222,11 +223,14 @@ import {
   useRemoteProjects,
   notifyRemoteProjects,
   refreshRemoteProjects,
+  getRemoteProjectsStore,
 } from "./projects-host.js";
 import {
   assignRemoteThreadToProject,
   createRemoteProject,
   fetchRemoteProjects,
+  fetchRemoteThreadSettings,
+  fetchRemoteWorkspaceGitContext,
   renameRemoteProject,
   renameRemoteThread,
   deleteRemoteProject,
@@ -456,7 +460,13 @@ function RemoteApp() {
         remoteUiStore.getState().setProviders(normalized);
         const draftProvider = remoteUiStore.getState().sessionDraft.provider;
         if (!draftProvider || !normalized.includes(draftProvider)) {
-          remoteUiStore.getState().setSessionDraftField("provider", defaultProvider(normalized));
+          // The MODEL must move with the provider: `provider` alone left a
+          // `codex/gpt-5.5` draft as `claude_code/gpt-5.5` on a Claude-only relay.
+          remoteUiStore
+            .getState()
+            .patchSessionDraft(
+              providerDraftPatch(remoteUiStore.getState(), defaultProvider(normalized))
+            );
         }
         // Pre-fetch models for all providers so the dropdown is populated
         // immediately. Worker-backed providers (Claude) can be cold right after
@@ -480,6 +490,36 @@ function RemoteApp() {
       cancelled = true;
     };
   }, [currentState.remoteAuth?.relayId, currentState.remoteAuth?.payloadSecret]);
+
+  // Debounced and generation-guarded: the field is free text, so a probe per
+  // keystroke would spawn a git subprocess per character on the HOST.
+  const launchCwd = remoteUi.sessionDraft?.cwd || "";
+  useEffect(() => {
+    if (!currentState.remoteAuth?.payloadSecret) return undefined;
+    const target = String(launchCwd || "").trim();
+    // Clear first: a stale chip is worse than no chip, and the effect re-runs on
+    // every cwd change so this is the only place that sees the transition.
+    remoteUiStore.getState().setLaunchGitContext(null);
+    if (!target) {
+      return undefined;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      fetchRemoteWorkspaceGitContext(target)
+        .then((context) => {
+          if (!cancelled) remoteUiStore.getState().setLaunchGitContext(context);
+        })
+        // A failed probe is not worth surfacing: the chip is an extra and the
+        // dialog is fully usable without it.
+        .catch(() => {
+          if (!cancelled) remoteUiStore.getState().setLaunchGitContext(null);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [launchCwd, currentState.remoteAuth?.payloadSecret]);
 
   useEffect(() => {
     if (!currentState.remoteAuth?.payloadSecret || !selectedProvider) return;
@@ -715,6 +755,28 @@ function RemoteApp() {
   }, [activeRelayId, threadListStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
+  // Must SELECT it, not just refresh the list.
+  const createRemoteProjectForDraft = async (apply, isCurrent) => {
+    const name = promptRemoteProjectName();
+    if (!name) return;
+    try {
+      const projectId = await createProjectAndSelect({
+        apply,
+        create: createRemoteProject,
+        isCurrent,
+        name,
+        store: getRemoteProjectsStore(),
+      });
+      renderLog(
+        projectId
+          ? `Created project "${name}".`
+          : `Created project "${name}", but could not tell which one is new — pick it manually.`
+      );
+    } catch (error) {
+      renderLog(`Failed to create project: ${error.message}`);
+    }
+  };
+
   const createRemoteProjectFromToolbar = async () => {
     const name = promptRemoteProjectName();
     if (!name) return;
@@ -805,15 +867,28 @@ function RemoteApp() {
     approvalOptions: selectedProviderSettings.approvalOptions,
     hasRemoteAuth: hasRelay,
     hasUsableRelay,
+    // The merged pill lists EVERY provider's catalogue, not one flattened array.
+    gitContext: remoteUi.launchGitContext,
+    providers: remoteUi.providers,
+    providerModels: remoteUi.providerModels,
+    // Still needed by the sidebar split button's agent menu, which starts a
+    // session AS a provider without opening the dialog.
     providerOptions: providerOptions(remoteUi.providers),
-    models: selectedProviderModels.length
-      ? selectedProviderModels
-      : [
-          {
-            display_name: remoteUi.sessionDraft.model || defaultModelForProvider(selectedProvider),
-            model: remoteUi.sessionDraft.model || defaultModelForProvider(selectedProvider),
-          },
-        ],
+    // Set on the draft, not derived here, so an in-dialog choice survives a render.
+    projects: remoteProjects.projects,
+    threads: currentState.threads,
+    threadProjectId: remoteProjects.threadProjectId,
+    onCreateProject: remoteProjectsReady
+      ? () => {
+          const opening = remoteUi.launchDialogGeneration;
+          return createRemoteProjectForDraft(
+            (projectId) => updateSessionDraft({ projectId }),
+            () =>
+              remoteUiStore.getState().launchDialogGeneration === opening
+              && document.getElementById("remote-start-session-dialog")?.open === true
+          );
+        }
+      : null,
     // When we have a real catalog the picker is authoritative; otherwise expose
     // the fetch status so the dialog can say "loading"/"failed" instead of
     // presenting the single fallback model as if it were the only choice.
@@ -1582,6 +1657,7 @@ function RemoteApp() {
       return;
     }
     const models = remoteUiStore.getState().providerModels[thread.provider] || [];
+    remoteUiStore.getState().beginForkDialogOpening();
     remoteUiStore.getState().setForkDialog({
       open: true,
       pending: false,
@@ -1598,6 +1674,25 @@ function RemoteApp() {
     // nothing else fetches that catalog — without this the model select sits
     // on "Loading models..." forever.
     void ensureRemoteProviderModels(thread.provider);
+    // Not awaited: the dialog opens on inherited fields and re-seeds when this lands.
+    void refreshRemoteForkSourceSettings(thread.id);
+  }
+
+  // Only untouched (INHERIT) fields are replaced, and only while the dialog still
+  // shows the same source — it can be reopened on another thread mid-flight.
+  async function refreshRemoteForkSourceSettings(threadId) {
+    try {
+      const settings = await fetchRemoteThreadSettings(threadId);
+      if (!settings) return;
+      const dialog = remoteUiStore.getState().forkDialog;
+      if (!dialog?.open || dialog.sourceThread?.id !== threadId) return;
+
+      // DISPLAY only: writing these into `fields` would submit them, freezing a
+      // permission the source may tighten while the dialog is open.
+      remoteUiStore.getState().setForkDialog({ ...dialog, sourceSettings: settings });
+    } catch {
+      // Leaves the fields inherited, which is still a correct request.
+    }
   }
 
   // --- per-session actions sheet ----------------------------------------------
@@ -2269,12 +2364,48 @@ function RemoteApp() {
       ? h(ForkSessionDialog, {
           id: "remote-fork-session-dialog",
           sourceThread: forkDialog.sourceThread,
+          onCreateProject: remoteProjectsReady
+            ? () => {
+                // The generation, not the source id: reopening on the SAME thread is
+                // still a different opening.
+                const opening = forkDialog.generation || 0;
+                return createRemoteProjectForDraft(
+                  (projectId) => handleForkFieldChange("projectId", projectId),
+                  () => {
+                    const current = remoteUiStore.getState().forkDialog;
+                    return current?.open && (current.generation || 0) === opening;
+                  }
+                );
+              }
+            : null,
+          projects: remoteProjects.projects,
+          threadProjectId: remoteProjects.threadProjectId,
+          threads: currentState.threads,
           fields: forkView.fields,
           pending: forkDialog.pending,
           error: forkDialog.error || "",
-          providerOptions: providerOptions(remoteUi.providers),
-          models: forkView.models,
+          // Every provider's catalogue: a cross-provider fork is chosen from the
+          // same merged menu the launch dialog uses.
+          providers: remoteUi.providers,
+          providerModels: remoteUi.providerModels,
           modelsStatus: forkView.modelsStatus,
+          workspaceSuggestions: selectWorkspaceSuggestionsModel({
+            selectedCwd: forkView.fields.cwd || "",
+            session,
+            threads: currentState.threads,
+          }),
+          onSelectModel: ({ provider, model }) => {
+            // Not re-resolving effort for the inherit row: that one stays null.
+            const catalog = remoteUi.providerModels[provider] || [];
+            handleForkFieldChange("provider", provider);
+            handleForkFieldChange("model", model);
+            if (model) {
+              handleForkFieldChange(
+                "effort",
+                resolveReasoningEffortValue(catalog, model, forkView.fields.effort)
+              );
+            }
+          },
           approvalOptions: forkView.settings.approvalOptions,
           effortOptions: buildReasoningEffortOptions(
             forkView.models,
@@ -2282,6 +2413,8 @@ function RemoteApp() {
             forkView.provider
           ),
           forkCapabilities: session?.provider_fork_capabilities || [],
+          sourceSettings: forkDialog.sourceSettings || null,
+          sourceProjectId: remoteProjects.threadProjectId?.[forkDialog.sourceThread?.id] || null,
           onFieldChange: handleForkFieldChange,
           onFork: (submitted) => void handleForkSession(submitted),
           onRequestClose() {
@@ -2362,7 +2495,11 @@ function findThreadNameInGroups(groups, threadId) {
 // with one agent selected and another agent's model still in the box. Hoisted because two
 // controls now perform this switch — the dialog's own select and the sidebar split
 // button's menu — and they must not drift.
-function openRemoteStartSessionDialog() {
+function openRemoteStartSessionDialog(activeProjectId = null) {
+  remoteUiStore.getState().beginLaunchDialogOpening();
+  // At open time, not per render: otherwise an unrelated re-render snaps the chip
+  // back over a choice made inside the dialog.
+  remoteUiStore.getState().setSessionDraftField("projectId", activeProjectId || null);
   document.getElementById("remote-start-session-dialog")?.showModal();
 }
 
@@ -2589,10 +2726,10 @@ function RemoteSidebar({
       buttonId: "remote-session-toggle",
       disabled: !hasUsableRelay,
       menuId: "remote-start-session-agent-menu",
-      onStart: openRemoteStartSessionDialog,
+      onStart: () => openRemoteStartSessionDialog(activeProjectId),
       onStartWithProvider(provider) {
         updateSessionDraft(providerDraftPatch(remoteUiState, provider));
-        openRemoteStartSessionDialog();
+        openRemoteStartSessionDialog(activeProjectId);
       },
       providerOptions: sessionPanelModel?.providerOptions || [],
     }),
@@ -2622,6 +2759,22 @@ function RemoteSidebar({
     ),
     h(SessionPanel, {
         model: sessionPanelModel,
+        onSelectModel({ provider, model }) {
+          // One patch: effort is per MODEL, and the second of two sequential
+          // callbacks would still be reading the previous render's catalogue.
+          const uiState = remoteUiState;
+          const catalog = uiState.providerModels[provider] || [];
+          const patch =
+            provider !== uiState.sessionDraft.provider
+              ? providerDraftPatch(uiState, provider)
+              : {};
+          updateSessionDraft({
+            ...patch,
+            effort: resolveReasoningEffortValue(catalog, model, uiState.sessionDraft.effort),
+            model,
+            provider,
+          });
+        },
         onFieldChange(field, value) {
           const uiState = remoteUiState;
           if (field === "provider") {

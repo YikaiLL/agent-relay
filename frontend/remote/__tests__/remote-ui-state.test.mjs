@@ -41,6 +41,7 @@ test("createDefaultSessionDraft returns the canonical remote session defaults", 
     effort: "medium",
     initialPrompt: "",
     model: "gpt-5.5",
+    projectId: null,
     provider: "codex",
     sandbox: "workspace-write",
   });
@@ -171,4 +172,70 @@ test("setProviderModels for claude_code provider seeds claude models", () => {
   assert.equal(store.getState().providerModels.codex, undefined);
   assert.equal(store.getState().providerModels.claude_code.length, 2);
   assert.equal(store.getState().providerModels.claude_code[0].model, "claude-sonnet-4-6");
+});
+
+test("patchSessionDraft applies provider, model and effort as one transition", () => {
+  // A single decision: applying them field by field leaves the draft in states
+  // that are not valid start requests, and each is visible to subscribers.
+  const store = createRemoteUiStore();
+  const seen = [];
+  const unsubscribe = store.subscribe((state) => seen.push({ ...state.sessionDraft }));
+
+  store.getState().patchSessionDraft({
+    effort: "high",
+    model: "claude-opus-4-6",
+    provider: "claude_code",
+  });
+  unsubscribe();
+
+  const draft = store.getState().sessionDraft;
+  assert.equal(draft.provider, "claude_code");
+  assert.equal(draft.model, "claude-opus-4-6");
+  assert.equal(draft.effort, "high");
+  assert.equal(seen.length, 1, "one transition, not three");
+  assert.equal(draft.sandbox, "workspace-write");
+});
+
+test("a draft holding an unavailable provider is repaired with its model, not just its provider", () => {
+  // Replacing `provider` alone leaves a Codex model id under Claude, which the
+  // merged menu then surfaces as selected and the dialog submits verbatim.
+  const store = createRemoteUiStore();
+  assert.equal(store.getState().sessionDraft.provider, "codex");
+  assert.equal(store.getState().sessionDraft.model, "gpt-5.5");
+
+  // What the repair path now does: one patch derived for the new provider.
+  store.getState().patchSessionDraft({
+    effort: "medium",
+    model: "claude-sonnet-4-6",
+    provider: "claude_code",
+  });
+
+  const draft = store.getState().sessionDraft;
+  assert.equal(draft.provider, "claude_code");
+  assert.notEqual(draft.model, "gpt-5.5", "the foreign model must not survive the switch");
+});
+
+test("a reopened dialog gets a new generation, so a late answer can be discarded", () => {
+  // A DOM `open` check cannot tell these apart: close during an in-flight create,
+  // reopen from another project, and the same element is open again.
+  const store = createRemoteUiStore();
+
+  const first = store.getState().beginLaunchDialogOpening();
+  const second = store.getState().beginLaunchDialogOpening();
+  assert.notEqual(first, second);
+
+  // Fork counts a reopening even on the SAME source thread.
+  store.getState().beginForkDialogOpening();
+  store.getState().setForkDialog({ open: true, sourceThread: { id: "t1" } });
+  const forkFirst = store.getState().forkDialog.generation;
+  store.getState().setForkDialog({ pending: true });
+  assert.equal(
+    store.getState().forkDialog.generation,
+    forkFirst,
+    "updating the showing dialog keeps its generation"
+  );
+
+  store.getState().beginForkDialogOpening();
+  store.getState().setForkDialog({ open: true, sourceThread: { id: "t1" } });
+  assert.notEqual(store.getState().forkDialog.generation, forkFirst);
 });

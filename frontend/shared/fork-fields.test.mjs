@@ -13,6 +13,8 @@ import {
   normalizeForkFields,
   resolveForkSourceThread,
   threadIsBusyForFork,
+  FORK_PROJECT_NONE,
+  forkInheritedDisplay,
 } from "./fork-fields.js";
 
 const CLAUDE_MODELS = [
@@ -73,15 +75,21 @@ test("model is never seeded from a different provider's session", () => {
   assert.equal(forkFieldsToPayload(fields).model, null, "unknown catalog inherits");
 });
 
-test("model is seeded from the target provider's own catalog when available", () => {
+test("the live session's model never leaks into a fork of a different provider", () => {
+  // Inherit-from-source enforces this more directly than the old target-catalogue
+  // seeding: the request carries no model at all.
   const fields = defaultForkFields({
     thread: { provider: "claude_code" },
     models: CLAUDE_MODELS,
     session: { provider: "codex", model: "gpt-5.3-codex" },
   });
 
-  assert.equal(fields.model, "claude-sonnet-4-6");
-  assert.equal(forkFieldsToPayload(fields).model, "claude-sonnet-4-6");
+  assert.equal(fields.model, INHERIT);
+  assert.equal(
+    forkFieldsToPayload(fields).model,
+    null,
+    "no model on the wire means the relay resolves the SOURCE thread's"
+  );
 });
 
 test("the fork point rides along with the payload", () => {
@@ -491,4 +499,134 @@ test("the drop rule stays anchored to the `msg_` prefix, not to a substring", ()
     forkPointIsTip: true,
   });
   assert.equal(payload.up_to_item_id, "acp-msg_1");
+});
+
+test("fork payload omits project_id entirely when the field is untouched", () => {
+  // Absence is INHERIT on the wire; sending the source's id would defeat
+  // server-side resolution.
+  const payload = forkFieldsToPayload({ sourceThreadId: "t1" });
+  assert.equal("project_id" in payload, false);
+});
+
+test("fork payload carries an explicitly chosen project", () => {
+  const payload = forkFieldsToPayload({ sourceThreadId: "t1", projectId: "proj_00ff" });
+  assert.equal(payload.project_id, "proj_00ff");
+});
+
+test("choosing the default workspace sends the explicit-unassigned sentinel", () => {
+  // Null is not usable for the third state — absent already means inherit.
+  const payload = forkFieldsToPayload({ sourceThreadId: "t1", projectId: FORK_PROJECT_NONE });
+  assert.equal(payload.project_id, "");
+});
+
+test("a fresh fork inherits the model, like every other untouched setting", () => {
+  // Seeding a concrete model moved a thread on a non-default model onto the
+  // catalogue default. Cross-provider stays safe via `normalizeForkFields`.
+  const fields = defaultForkFields({
+    thread: { id: "t1", provider: "claude_code", cwd: "/repo" },
+    models: [
+      { model: "claude-opus-4-6", is_default: true },
+      { model: "claude-sonnet-4-5" },
+    ],
+  });
+
+  assert.equal(fields.model, INHERIT);
+  assert.equal(fields.effort, INHERIT);
+  assert.equal(fields.approvalPolicy, INHERIT);
+  assert.equal("model" in forkFieldsToPayload(fields), true);
+  assert.equal(forkFieldsToPayload(fields).model, null, "omitted values reach the relay as null");
+});
+
+test("a fork whose provider changed still gets a concrete model, never a foreign one", () => {
+  const normalized = normalizeForkFields(
+    { ...defaultForkFields({ thread: { id: "t1", provider: "claude_code" } }), provider: "codex" },
+    { sourceProvider: "claude_code", models: [{ model: "gpt-5.5", is_default: true }] }
+  );
+
+  assert.equal(normalized.model, "gpt-5.5");
+});
+
+test("supplying source settings never changes what gets submitted", () => {
+  // Relay defaults, not the source's choices: presenting them as chosen would
+  // invent a decision, so the field falls back to inherit.
+  const fields = defaultForkFields({
+    thread: { id: "t1", provider: "claude_code" },
+    sourceSettings: {
+      approval_policy: "untrusted",
+      model: "gpt-5.5",
+      reasoning_effort: "medium",
+      remembered: false,
+      sandbox: "workspace-write",
+    },
+  });
+
+  assert.equal(fields.model, INHERIT);
+  assert.equal(fields.effort, INHERIT);
+  assert.equal(fields.approvalPolicy, INHERIT);
+});
+
+test("with no settings supplied at all the fields inherit, as before", () => {
+  // The dialog can open before its settings fetch resolves. Inherit is the only
+  // honest state in that window, and it is also what an older client sends.
+  const fields = defaultForkFields({ thread: { id: "t1", provider: "claude_code" } });
+  assert.equal(fields.model, INHERIT);
+  assert.equal(fields.approvalPolicy, INHERIT);
+});
+
+test("known source settings are DISPLAYED but not submitted", () => {
+  // The relay prefers an explicit parameter over resolving from the source, so
+  // sending what the dialog read at OPEN time freezes a stale permission.
+  const fields = defaultForkFields({
+    thread: { id: "t1", provider: "claude_code", cwd: "/repo" },
+    sourceSettings: {
+      approval_policy: "never",
+      model: "claude-opus-4-6",
+      reasoning_effort: "xhigh",
+      remembered: true,
+      sandbox: "danger-full-access",
+    },
+  });
+
+  assert.equal(fields.approvalPolicy, INHERIT, "untouched stays inherit");
+  assert.equal(fields.sandbox, INHERIT);
+  assert.equal(fields.effort, INHERIT);
+  assert.equal(fields.model, INHERIT);
+
+  const payload = forkFieldsToPayload(fields);
+  assert.equal(payload.approval_policy, null, "so the relay resolves at SUBMIT time");
+  assert.equal(payload.sandbox, null);
+  assert.equal(payload.effort, null);
+  assert.equal(payload.model, null);
+});
+
+test("an explicit choice is submitted, and only that field", () => {
+  const fields = {
+    ...defaultForkFields({ thread: { id: "t1", provider: "claude_code" } }),
+    approvalPolicy: "untrusted",
+  };
+  const payload = forkFieldsToPayload(fields);
+
+  assert.equal(payload.approval_policy, "untrusted");
+  assert.equal(payload.model, null, "the others keep resolving from the source");
+});
+
+test("the inherited value to DISPLAY comes from the source's settings", () => {
+  const shown = forkInheritedDisplay(
+    { approval_policy: "never", model: "claude-opus-4-6", reasoning_effort: "xhigh", remembered: true },
+    "approvalPolicy"
+  );
+  assert.equal(shown, "never");
+});
+
+test("nothing is displayed as inherited when the relay never recorded it", () => {
+  // `remembered: false` means these are relay defaults. A fork gets them either
+  // way, but naming them as the source's choice would invent history.
+  assert.equal(
+    forkInheritedDisplay(
+      { approval_policy: "untrusted", model: "gpt-5.5", reasoning_effort: "medium", remembered: false },
+      "approvalPolicy"
+    ),
+    ""
+  );
+  assert.equal(forkInheritedDisplay(null, "approvalPolicy"), "");
 });

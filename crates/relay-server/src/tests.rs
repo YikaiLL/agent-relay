@@ -1314,3 +1314,128 @@ fn another_loopback_page_cannot_post_without_the_csrf_header() {
         "a cross-port loopback origin without the custom header must be refused"
     );
 }
+
+/// Build a router whose relay is rooted at `cwd` and (optionally) fenced to
+/// `allowed_roots`, for the `/api/workspace/git-context` tests below.
+async fn git_context_router(cwd: &str, allowed_roots: Vec<String>) -> axum::Router {
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        cwd.to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    if !allowed_roots.is_empty() {
+        relay.write().await.set_allowed_roots(
+            crate::state::normalize_allowed_roots(allowed_roots).expect("roots"),
+        );
+    }
+    let context = AppContext {
+        app: crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx),
+        auth: test_auth(),
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
+    };
+    build_router(context, WebAssets::Embedded)
+}
+
+async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::HOST, "127.0.0.1:8787")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body should read");
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+async fn seed_git_repo(dir: &std::path::Path) -> String {
+    let path = dir.canonicalize().expect("canonicalize");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "t@e.com"],
+        vec!["config", "user.name", "T"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&path)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+    std::fs::write(path.join("seed.txt"), "line1\n").expect("write");
+    for args in [vec!["add", "seed.txt"], vec!["commit", "-q", "-m", "seed"]] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&path)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+    path.to_string_lossy().to_string()
+}
+
+/// The local surface must expose the probe the launch dialog's `main · clean` chip
+/// reads, beside `/api/workspace/diff`.
+#[tokio::test]
+async fn workspace_git_context_route_answers_for_a_local_path() {
+    let dir = tempfile::TempDir::new().expect("tmp");
+    let cwd = seed_git_repo(dir.path()).await;
+    std::fs::write(std::path::Path::new(&cwd).join("scratch.txt"), "new\n").expect("write");
+
+    let router = git_context_router(&cwd, Vec::new()).await;
+    let (status, body) = get_json(
+        router,
+        &format!("/api/workspace/git-context?cwd={}", cwd.replace(' ', "%20")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["data"]["is_repo"], serde_json::Value::Bool(true));
+    assert_eq!(body["data"]["branch"], serde_json::json!("main"));
+    assert_eq!(body["data"]["detached"], serde_json::Value::Bool(false));
+    assert_eq!(
+        body["data"]["dirty"],
+        serde_json::Value::Bool(true),
+        "an untracked file must show as dirty"
+    );
+}
+
+/// A caller-supplied-path probe, so `allowed_roots` must fence it and the refusal
+/// must be a 4xx that says nothing about the target.
+#[tokio::test]
+async fn workspace_git_context_route_refuses_a_path_outside_the_allowed_roots() {
+    let allowed = tempfile::TempDir::new().expect("tmp");
+    let outside = tempfile::TempDir::new().expect("tmp");
+    let allowed_cwd = seed_git_repo(allowed.path()).await;
+    let outside_cwd = seed_git_repo(outside.path()).await;
+
+    let router = git_context_router(&allowed_cwd, vec![allowed_cwd.clone()]).await;
+    let (status, body) = get_json(
+        router,
+        &format!("/api/workspace/git-context?cwd={outside_cwd}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains(&outside_cwd) && !message.contains("main"),
+        "the refusal must not describe the target: {message}"
+    );
+}

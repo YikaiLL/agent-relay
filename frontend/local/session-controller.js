@@ -148,6 +148,11 @@ export function createSessionController({
     handleUnauthorized,
     setStartControlsBusy,
     liveElement,
+    // The launch dialog's field values. The dialog is controlled, so the draft
+    // in the UI store — not the markup — is what the start request is built from.
+    readSessionDraft: () => readLocalUiState(state.localUiStore).sessionDraft || {},
+    focusWorkspaceField: () =>
+      document.getElementById("launch-start-session-dialog-cwd")?.focus(),
     isViewingConversation,
     isCurrentDeviceActiveController,
   };
