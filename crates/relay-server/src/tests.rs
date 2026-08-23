@@ -1416,10 +1416,8 @@ async fn workspace_git_context_route_answers_for_a_local_path() {
     );
 }
 
-/// The route is a caller-supplied-path probe, so the relay's `allowed_roots` must fence
-/// it — and the refusal must be a 4xx that says nothing about the target. A 5xx would be
-/// wrong twice over: it is the caller's mistake, and `bad_gateway` is the bucket that
-/// swallows unclassified messages.
+/// A caller-supplied-path probe, so `allowed_roots` must fence it and the refusal
+/// must be a 4xx that says nothing about the target.
 #[tokio::test]
 async fn workspace_git_context_route_refuses_a_path_outside_the_allowed_roots() {
     let allowed = tempfile::TempDir::new().expect("tmp");

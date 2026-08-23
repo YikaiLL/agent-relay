@@ -197,10 +197,8 @@ fn fork_session_action_round_trips_and_issues_session_claim() {
 
 #[test]
 fn fetch_workspace_git_context_round_trips_and_binds_the_requesting_device() {
-    // The cwd here is CALLER-SUPPLIED, which is what makes the device stamp
-    // load-bearing rather than bookkeeping: `workspace_git_context` resolves the
-    // path scope from the device id, so a request that arrived without one
-    // stamped would be scope-checked against an empty scope.
+    // The stamp is load-bearing, not bookkeeping: the path scope is resolved from
+    // the device id, and the cwd here is caller-supplied.
     let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
         "type": "fetch_workspace_git_context",
         "cwd": "/repo/checkout"
@@ -227,8 +225,7 @@ fn fetch_workspace_git_context_round_trips_and_binds_the_requesting_device() {
 
 #[test]
 fn fetch_workspace_git_context_is_read_only_and_needs_no_session_claim() {
-    // Same posture as fetch_workspace_diff and project_action: a paired device
-    // must be able to see what it is about to launch into without first taking
+    // A paired device must see what it is about to launch into without taking
     // control of whatever session happens to be running.
     assert!(
         !super::requires_session_claim(RemoteActionKind::FetchWorkspaceGitContext),
@@ -1142,11 +1139,8 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
 
 #[test]
 fn plain_fetch_workspace_git_context_result_reaches_the_device() {
-    // The same silent-drop trap `reviews` and `projects` each fell into: the SEALED
-    // path serializes `RemoteActionResultPlaintext` wholesale, so a field missing
-    // from the plaintext envelope builder fails only on unsealed transport — the
-    // chip works when sealed and is blank when not. Request binding is covered
-    // elsewhere; this locks the RESULT path.
+    // Missing from the plaintext envelope builder fails only on unsealed transport.
+    // Request binding is covered elsewhere; this locks the RESULT path.
     let result = RemoteActionResultPlaintext {
         kind: remote_action_result_kind(RemoteActionKind::FetchWorkspaceGitContext),
         action: RemoteActionKind::FetchWorkspaceGitContext,

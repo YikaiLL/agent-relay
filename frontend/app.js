@@ -1697,14 +1697,7 @@ async function createProjectFromToolbar() {
   }
 }
 
-// Create a project from INSIDE a launch dialog.
-//
-// Deliberately not `createProjectFromToolbar`: that one navigates to the new
-// project's overview, which from a modal means the dialog is left floating over
-// a page the user did not ask to visit — and, worse, the draft's `projectId` was
-// never updated, so pressing Start immediately afterwards filed the session
-// nowhere. Creating a project here is a step INSIDE choosing one, so the only
-// correct outcome is that it becomes the selection.
+// Selects the new project instead of navigating to it, unlike the toolbar version.
 async function createProjectForLaunchDraft(setProjectId) {
   const name = promptProjectName();
   if (!name) {
@@ -2169,10 +2162,6 @@ goConsoleHomeButton?.addEventListener("click", goConsoleHome);
 // Remember which project the next Start belongs to, then open the launcher. Shared
 // by the project overview's "New agent" and the chat header's.
 function startProjectAgent(projectId) {
-  // No more `pendingProjectAssignment`: the project rides ON the start request
-  // now, so there is nothing to remember and nothing to reconcile afterwards.
-  // The old two-step could also silently lose the filing when the follow-up
-  // assign failed, and remote could never copy it at all.
   openStartSessionDialog({ projectId: projectId || null });
 }
 
@@ -2383,17 +2372,6 @@ window.addEventListener("popstate", (event) => {
   );
 });
 
-// The `#directory-form` submit listener that used to sit here is gone with the
-// form. The old dialog wrapped its workspace field in a form whose Load button
-// re-grouped the session list by directory; the redesign has a combobox that
-// commits on pick, and the sidebar already lists every workspace's sessions.
-
-// Submit the launch dialog.
-//
-// Called by the dialog itself rather than by a delegated document click on
-// `#start-session-button`. That listener, and the "clear the pending project"
-// listener that had to run beside it, are both gone: the project now rides on
-// the start request, so there is no cross-click state to remember or to clear.
 async function submitStartSession() {
   if (state.newSessionSubmitInFlight) {
     return;
@@ -2421,11 +2399,6 @@ async function submitStartSession() {
 // membership change rides the snapshot's projects_revision bump (assign calls notify),
 // same as every other project mutation, so the sidebar/overview refresh on their own.
 
-// The two document-level `change`/`input` listeners that used to sit here are
-// gone. They existed to catch edits to the launch dialog's native controls by
-// element id — a delegated listener on the whole document, firing for every
-// input on the surface, to feed a form that could not tell the store what it had
-// changed. The dialog is controlled now and reports its own changes.
 
 // The banner is one slot with one button, but which button it is depends on why the
 // banner is up (see local/control-banner.js), so both are bound here by id.
@@ -2476,10 +2449,7 @@ function clearComposerImageAttachments() {
 }
 
 function renderNewSessionImageAttachments() {
-  // Resolved live. dom.js's module-level query ran at boot, before the dialog
-  // existed, so it captured null forever — this returned early every time and a
-  // pasted image became INVISIBLE while still riding along on submit. That is a
-  // send-something-you-did-not-mean-to bug, not a cosmetic one.
+  // Resolved live: the mount ships with the dialog, so a module-level query is null.
   const mount = document.getElementById("start-prompt-attachments");
   if (!mount) return;
   mount.replaceChildren();
@@ -2598,14 +2568,8 @@ document.addEventListener("click", (event) => {
   document.getElementById(FORK_PROMPT_INPUT_ID)?.focus();
 });
 
-// Attachment drafts are reset in openStartSessionDialog(). This used to be a
-// MutationObserver watching the dialog's `open` attribute, which depended on the
-// element existing at boot and on the attribute being toggled by hand — neither
-// is true now that the dialog is rendered on demand and opened with showModal().
 
-// Delegated, not bound to the element: the launch dialog is rendered on demand
-// now, so there is nothing to attach a listener to at boot. Same shape as the
-// fork dialog's paste handler, which already had to solve this.
+// Delegated: the dialog renders on demand, so there is nothing to bind at boot.
 document.addEventListener("paste", (event) => {
   const target = event.target instanceof Element ? event.target : null;
   if (!target?.closest("#launch-start-session-dialog-start-prompt")) {
@@ -2636,9 +2600,7 @@ document.addEventListener("paste", (event) => {
   }
 });
 
-// Delegated: the mount is created with the dialog, so there is nothing to bind to
-// at boot. Bound to the element, this listener never attached at all and the
-// remove buttons on the chips did nothing.
+// Delegated for the same reason as the paste handler above.
 document.addEventListener("click", (event) => {
   const button =
     event.target instanceof Element
@@ -2752,12 +2714,6 @@ messageForm.addEventListener("submit", (event) => {
   }
   void runComposerSubmit();
 });
-
-// The launch dialog's `#provider-input` / `#model-input` change listeners used to
-// sit here. Both elements are gone — Provider and Model are one pill now, and the
-// dialog reports its own changes through onSelectModel — so these could never
-// attach again. Left in place they read as live wiring and would send the next
-// reader looking for selects that do not exist.
 
 messageModel?.addEventListener("change", () => {
   // Keep the chip's logo on the model the user just picked. Unconditional and
@@ -3372,16 +3328,6 @@ function modelsForProvider(
   return scopedProviderModels(provider, state.providerModels, fallbackProvider, fallbackModels);
 }
 
-// Apply one launch-dialog field change.
-//
-// Takes a FIELD NAME now, not an element id. The dialog is controlled, so the
-// id→field lookup this used to start with described a DOM that no longer exists:
-// there are no `#provider-input` / `#model-input` selects to map from.
-//
-// Provider changes still cascade, because model and effort are per-provider — but
-// the cascade is now pure state. It used to also write `.value` onto three live
-// `<select>` elements and re-populate their `<option>`s imperatively, which is
-// what made the dialog impossible to render from data.
 function handleLaunchFieldInput(field, value) {
   if (!field) {
     return;
@@ -3398,9 +3344,7 @@ function handleLaunchFieldInput(field, value) {
   }
 
   if (field === "provider") {
-    // A provider switch invalidates the model and the two settings that are
-    // resolved per provider. Restore what this provider was last used with
-    // rather than leaving the previous provider's values in place.
+    // Model, effort and approval are all per-provider; restore this one's last used.
     void refreshProviderCatalogs(state.session || {});
     const storedApproval = loadLastApprovalPolicy(value);
     const storedEffort = loadLastEffort(value);
@@ -3411,12 +3355,8 @@ function handleLaunchFieldInput(field, value) {
   renderLaunchSessionDialog();
 }
 
-// Fetch the source thread's recorded settings and re-seed the dialog with them.
-//
-// Generation-guarded like the git probe: the dialog can be closed and reopened on
-// another thread while a request is in flight, and a late answer must not seed
-// the wrong source. Only fields the user has NOT touched are re-seeded — an edit
-// made while the fetch was in flight is a real choice and outranks it.
+// Generation-guarded: a late answer must not seed a dialog reopened on another
+// thread. Only untouched (INHERIT) fields are re-seeded.
 let forkSettingsGeneration = 0;
 async function refreshForkSourceSettings(threadId) {
   const generation = ++forkSettingsGeneration;
@@ -3448,10 +3388,8 @@ async function refreshForkSourceSettings(threadId) {
   }
 }
 
-// The fork dialog's own git probe. Deliberately a separate generation counter
-// and a separate state slot from the launch dialog's: the two can be open on
-// different directories, and sharing either would let one dialog label the
-// other's path.
+// Separate counter and slot from the launch dialog's: both can be open on
+// different directories.
 let forkGitContextGeneration = 0;
 let forkGitContextTimer = null;
 async function refreshForkGitContext(cwd) {
@@ -3477,16 +3415,7 @@ async function refreshForkGitContext(cwd) {
   }, 250);
 }
 
-// Apply a merged-pill model selection: provider, model and effort in one step.
-//
-// Effort is the reason this cannot be two field changes. Levels are per MODEL
-// (`supported_reasoning_efforts`), so switching from a Codex model on `xhigh` to
-// a Claude model that offers only high/max must re-resolve it — the relay does
-// not correct an explicitly-supplied effort, it honours it.
-// The catalogue's default model for a provider, falling back to the static
-// per-provider guess only while the catalogue is still cold. The static value is
-// a seed, not an answer — it can name a model the provider does not currently
-// offer.
+// The static per-provider constant is a seed, not an answer: prefer the catalogue.
 function defaultModelForProviderCatalog(provider) {
   const models = state.providerModels[provider] || [];
   return (
@@ -3496,6 +3425,8 @@ function defaultModelForProviderCatalog(provider) {
   );
 }
 
+// One step, because effort is per MODEL: a Codex `xhigh` carried onto a Claude
+// model that offers only high/max is honoured by the relay, not corrected.
 function handleLaunchModelSelection({ provider, model }) {
   const ui = state.localUiStore.getState();
   const previousProvider = readLocalUiState(state.localUiStore).sessionDraft?.provider || "";
@@ -3519,22 +3450,15 @@ function handleLaunchModelSelection({ provider, model }) {
   renderLaunchSessionDialog();
 }
 
-// The git chip's data for the chosen directory.
-//
-// Debounced and generation-guarded: the workspace field is free text, so probing
-// per keystroke would spawn a git subprocess per character, and out-of-order
-// replies would label the current directory with a previous one's branch. The
-// relay echoes the cwd it answered ABOUT, so a stale reply is dropped by
-// comparing it rather than by trusting arrival order.
+// Debounced and generation-guarded: the field is free text, so a probe per
+// keystroke would spawn a git subprocess per character.
 let launchGitContextGeneration = 0;
 let launchGitContextTimer = null;
 async function refreshLaunchGitContext(cwd) {
   const generation = ++launchGitContextGeneration;
   if (launchGitContextTimer) clearTimeout(launchGitContextTimer);
   const target = String(cwd || "").trim();
-  // Drop the previous directory's answer the moment a new one is chosen. Keeping
-  // it until the reply lands showed path B wearing path A's branch for a debounce
-  // plus a round trip.
+  // Drop the old answer now: otherwise path B wears path A's branch until the reply.
   state.launchGitContext = null;
   renderLaunchSessionDialogIfOpen();
   if (!target) {
@@ -3547,12 +3471,8 @@ async function refreshLaunchGitContext(cwd) {
       );
       const payload = await response.json();
       if (generation !== launchGitContextGeneration) return;
-      // The generation counter above is what makes a stale answer safe to drop,
-      // so this does NOT also require the echoed path to equal what was typed.
-      // It cannot: the relay answers about the NORMALIZED cwd, so `~/project`, a
-      // trailing slash, or a symlinked prefix — all of which this field accepts —
-      // came back under a different spelling and the valid git state was thrown
-      // away.
+      // No path-equality check: the relay answers about the NORMALIZED cwd, and the
+      // generation counter above already makes a stale answer safe to drop.
       state.launchGitContext = !response.ok || !payload.ok ? null : payload.data || null;
     } catch {
       // A failed probe is not worth surfacing: the chip is an extra, and the
@@ -3649,10 +3569,7 @@ function syncEffortSuggestions(select, models, selectedModel, selectedEffort, pr
 function setSelectedCwd(cwd) {
   state.threadListStore.getState().setSelectedCwd(cwd);
   state.selectedCwd = readThreadListUi(state.threadListStore).selectedCwd;
-  // The workspace field used to be a permanent `#cwd-input` in the static shell,
-  // so this could write straight to it. It is now a combobox inside a dialog
-  // that only exists while open, and the value lives in the draft — mirror it
-  // there instead, and let the dialog re-render from that.
+  // The field only exists while the dialog is open, so mirror into the draft.
   state.localUiStore?.getState?.().setSessionDraftField?.("cwd", state.selectedCwd);
 }
 
@@ -3704,8 +3621,6 @@ function renderForkSessionDialog() {
     approvalOptions: settings.approvalOptions,
     effortOptions: buildReasoningEffortOptions(models, selectedModel, provider),
     forkCapabilities: state.session?.provider_fork_capabilities || [],
-    // Project membership for the fork's own picker. Untouched, the field stays on
-    // the inherit sentinel and the relay resolves it from the source thread.
     onCreateProject() {
       void createProjectForLaunchDraft((projectId) =>
         handleForkDialogFieldChange("projectId", projectId)
@@ -3762,11 +3677,7 @@ function openForkDialogForThread(threadId, upToItemId = "") {
     return;
   }
   const models = modelsForProvider(thread.provider, state.session?.available_models || []);
-  // Ask the relay what a fork of THIS thread would inherit, so the dialog shows
-  // the real model/effort/permissions instead of an abstract "inherit". Fired
-  // here rather than awaited: the dialog opens immediately on inherited fields
-  // and re-seeds when the answer lands, because a fork dialog that blocks on a
-  // network round trip feels broken.
+  // Not awaited: the dialog opens on inherited fields and re-seeds when this lands.
   void refreshForkSourceSettings(thread.id);
   state.forkDialog = {
     open: true,
@@ -3845,14 +3756,8 @@ function handleForkDialogFieldChange(field, value) {
   renderForkSessionDialog();
 }
 
-// Provider + model + effort as one step, for the same reason the launch dialog
-// needs it: effort levels are per MODEL, so a cross-provider fork that keeps the
-// source's effort can submit a level the target model never offered — and the
-// relay honours an explicit effort rather than correcting it.
-//
-// Choosing the INHERIT row is the one case that must NOT re-resolve: an
-// untouched field is deliberately sent as null so the relay reads it off the
-// source thread.
+// One step, like the launch dialog. The INHERIT row must NOT re-resolve: that one
+// is deliberately sent as null for the relay to read off the source.
 function handleForkModelSelection({ provider, model }) {
   const current = state.forkDialog.fields;
   let next = { ...current };
@@ -4654,12 +4559,8 @@ function renderClientLogLines(lines) {
 // last labels are remembered because navigation and Projects-store changes also
 // re-render this control, and they have no opinion about the title.
 let lastSwitcherLabels = { label: "", labelTooltip: "" };
-// The launch dialog's own sub-root. Mirrors renderProjectSwitcher: the shell
-// renders once, so anything whose props change needs a root that can re-render.
-//
-// Called on open and again whenever the draft, the project list or the provider
-// catalogues change — the dialog is fully controlled now, so a value that is not
-// re-rendered is a value the user cannot change.
+// Its own sub-root, like renderProjectSwitcher: the shell renders once, so
+// anything whose props change needs a root that can re-render.
 function renderLaunchSessionDialog() {
   const mount = document.getElementById("launch-dialog-root");
   if (!mount) {
@@ -4705,11 +4606,8 @@ function renderLaunchSessionDialog() {
       projects: state.projects || [],
       providerModels: state.providerModels,
       providers: state.providers || [],
-      // Matches remote. Claude supports deferred start: the relay accepts a
-      // session with no initial prompt and promotes it on the first composer
-      // message. Leaving the shared default (true) here disabled Start for an
-      // empty Claude prompt on local only — an inconsistency between the two
-      // surfaces AND a regression against being able to open an idle session.
+      // Matches remote: Claude supports deferred start, so an empty prompt is
+      // allowed and the relay promotes the session on the first message.
       requireInitialPrompt: false,
       startPending: Boolean(state.newSessionSubmitInFlight),
       threadProjectId: state.threadProjectId || {},
@@ -4723,14 +4621,8 @@ function renderLaunchSessionDialog() {
   );
 }
 
-// Re-render the launch dialog only when it is actually open.
-//
-// The dialog is CONTROLLED, so anything that arrives asynchronously — the
-// provider catalogues, the Projects payload, the in-flight start flag — is
-// invisible until something re-renders it. Opening the dialog before the
-// catalogues land used to leave an empty model menu forever, and reopening
-// during an in-flight start left the button stuck on "Starting…" until the user
-// happened to touch a field.
+// The dialog is controlled, so anything arriving asynchronously (catalogues,
+// projects, the pending flag) is invisible until something re-renders it.
 function renderLaunchSessionDialogIfOpen() {
   if (document.getElementById("launch-start-session-dialog")?.open) {
     renderLaunchSessionDialog();
@@ -4794,10 +4686,8 @@ function resolveTabThread(threadId) {
 }
 
 function openStartSessionDialog({ projectId = undefined } = {}) {
-  // Seed the project chip from wherever the user IS, unless a caller named one
-  // (the project overview's "New agent" launches INTO its own project). Done at
-  // open time, not on every render: re-seeding per render would overwrite a
-  // choice made inside the dialog the moment anything else re-rendered.
+  // At open time, not per render: re-seeding per render would overwrite a choice
+  // made inside the dialog.
   const context = sessionViewStore.getState().location.context;
   const seeded =
     projectId !== undefined
@@ -4807,9 +4697,7 @@ function openStartSessionDialog({ projectId = undefined } = {}) {
         : null;
   const ui = state.localUiStore.getState();
   ui.setSessionDraftField("projectId", seeded || null);
-  // Seed the fields the dialog would otherwise only DISPLAY a fallback for.
-  // Submit reads the draft, so a value that exists solely as a render-time
-  // fallback would reach the relay as an empty string.
+  // Submit reads the draft, so a render-time-only fallback would post empty.
   const draft = readLocalUiState(state.localUiStore).sessionDraft || {};
   if (!draft.cwd) {
     ui.setSessionDraftField(
@@ -4817,13 +4705,8 @@ function openStartSessionDialog({ projectId = undefined } = {}) {
       state.selectedCwd || state.session?.current_cwd || ""
     );
   }
-  // Repair the provider against what the relay ACTUALLY offers, not just fill it
-  // when empty. The draft's default is "codex", which is wrong on a relay that
-  // does not run Codex — the dialog would offer a provider that is not there and
-  // the start fails with "agent provider 'codex' is not available". The old
-  // dialog got this for free: `syncProviderSuggestions` repopulated the <select>
-  // and snapped its value to an available option. Nothing does that now, so it
-  // has to be explicit.
+  // Repaired, not just filled when empty: the draft defaults to "codex", which a
+  // relay that does not run Codex would reject at start.
   const available = state.providers || [];
   const provider =
     draft.provider && available.includes(draft.provider)
@@ -4831,8 +4714,7 @@ function openStartSessionDialog({ projectId = undefined } = {}) {
       : defaultProvider(available);
   if (provider !== draft.provider) {
     ui.setSessionDraftField("provider", provider);
-    // The model belongs to the provider that was just replaced, so it cannot
-    // survive the swap.
+    // The model belonged to the provider just replaced.
     ui.setSessionDraftField("model", defaultModelForProvider(provider));
   } else if (!draft.model) {
     ui.setSessionDraftField("model", defaultModelForProvider(provider));
@@ -4840,22 +4722,16 @@ function openStartSessionDialog({ projectId = undefined } = {}) {
   void refreshLaunchGitContext(
     readLocalUiState(state.localUiStore).sessionDraft?.cwd || ""
   );
-  // Each opening is a fresh attachment draft: reopening after a dismiss or a
-  // failed start must not carry a screenshot into an unrelated workspace. This
-  // used to be a MutationObserver on the dialog's `open` attribute, which only
-  // worked while the element existed at boot and was toggled by hand.
+  // Fresh attachment draft per opening: a dismissed paste must not follow the
+  // user into an unrelated workspace.
   clearNewSessionImageAttachments();
-  // flushSync, because showModal() below needs the element to EXIST. createRoot's
-  // render is async, so on the first open the dialog was still uncommitted when
-  // showModal() ran — the click did nothing and nothing threw. Same reason the
-  // fork dialog flushes before it opens.
+  // flushSync because showModal() below needs the element to exist: createRoot's
+  // render is async, so the first open found nothing and failed silently.
   flushSync(() => renderLaunchSessionDialog());
-  // The attachments mount only exists once the dialog has rendered, so paint it
-  // after the flush rather than before.
+  // The mount only exists once the dialog has rendered.
   renderNewSessionImageAttachments();
-  // showModal(), not setAttribute("open"): the redesign has a real backdrop, and
-  // only a modal dialog gets `::backdrop` or the Escape close-request the pickers
-  // inside it cooperate with.
+  // showModal(), not setAttribute("open"): only a modal dialog gets `::backdrop`
+  // and the Escape close-request the pickers inside it cooperate with.
   document.getElementById("launch-start-session-dialog")?.showModal();
 }
 
@@ -4882,12 +4758,8 @@ function renderStartSessionSplit() {
       activeProvider: readLocalUiState(state.localUiStore).sessionDraft?.provider || "",
       onStart: () => openStartSessionDialog(),
       onStartWithProvider: (provider) => {
-        // Through the SAME atomic handler the Model pill uses. Two sequential
-        // field changes were wrong for the same reason they are wrong in the
-        // dialog: effort is model-specific, so switching to a provider with no
-        // remembered effort kept the previous model's level (a Codex `xhigh`
-        // landing on a model that only offers high/max). This also picks the
-        // catalogue's default model rather than the static per-provider guess.
+        // The same atomic handler the Model pill uses, so effort is re-resolved
+        // against the new model rather than carried over.
         handleLaunchModelSelection({
           model: defaultModelForProviderCatalog(provider),
           provider,

@@ -12,16 +12,8 @@ import { isWorkingThreadStatus } from "./thread-status.js";
 
 export const INHERIT = "";
 
-// The fork's project has THREE states, and the wire encodes them as:
-//   absent   -> inherit the source thread's project (the default)
-//   "proj_x" -> file into that project
-//   ""       -> explicitly unassigned (Default Workspace)
-//
-// Absence is already spoken for by inherit, so it cannot also mean "no project" —
-// without a distinct third value a fork could never be moved OUT of its source's
-// project. Project ids are always `proj_%016x`, so the empty string is safe to
-// overload. `FORK_PROJECT_INHERIT` is null rather than undefined so the dialog's
-// picker has a concrete value to hold and compare.
+// Three states on the wire: absent inherits the source's project, an id files it
+// there, `""` unassigns. Absent cannot mean "none" — inherit already owns it.
 export const FORK_PROJECT_INHERIT = null;
 export const FORK_PROJECT_NONE = "__fork_project_none__";
 
@@ -30,15 +22,8 @@ function firstCatalogModel(models) {
   return models.find((option) => option?.is_default)?.model || models[0]?.model || INHERIT;
 }
 
-// Seed a settings field from the SOURCE thread's own recorded settings.
-//
-// `remembered: false` means the relay has no record for that thread and handed
-// back its own defaults. A fork would get them either way — `fork_session` falls
-// back identically — but showing them as the source's choices would invent a
-// decision the user never made, so those stay inherited and the relay resolves
-// them. This is the same hazard as the header comment above, one step removed:
-// there, the wrong value was the live session's; here, it would be a default
-// dressed up as history.
+// `remembered: false` means these are relay defaults, not the source's choices.
+// Showing them as chosen would invent a decision, so those stay inherited.
 function seedFromSource(sourceSettings, key) {
   if (!sourceSettings?.remembered) {
     return INHERIT;
@@ -50,9 +35,7 @@ export function defaultForkFields({
   thread = null,
   models = [],
   session = null,
-  // The source thread's settings, as returned by `thread_settings_view`. Fetched
-  // FOR THAT THREAD — never read off the live session, which is what the header
-  // comment forbids.
+  // Fetched for THAT thread — never read off the live session (see above).
   sourceSettings = null,
 } = {}) {
   const provider = thread?.provider || session?.provider || "";
@@ -61,20 +44,10 @@ export function defaultForkFields({
     cwd: thread?.cwd || "",
     effort: seedFromSource(sourceSettings, "reasoning_effort"),
     initialPrompt: "",
-    // Inherited, like every other untouched setting. The dialog opens on the
-    // SOURCE's provider, so the relay resolves the model from the source thread —
-    // which is what a fork means. Seeding a concrete model here instead made
-    // "Inherit from source" something you could only opt back INTO, and silently
-    // moved a thread running a non-default model onto the catalogue default.
-    //
-    // The cross-provider hazard this used to guard against is still guarded, one
-    // layer up: `normalizeForkFields` fills a concrete model from the TARGET
-    // catalogue the moment a provider change withdraws the inherit option, so a
-    // foreign id can never reach the wrong bridge.
+    // Inherited like every other untouched setting. Cross-provider is still safe:
+    // `normalizeForkFields` fills a concrete model once inherit is withdrawn.
     model: seedFromSource(sourceSettings, "model"),
-    // Untouched = inherit the source thread's project. Not the source's actual
-    // id: sending that would defeat the relay's own resolution and would go
-    // stale if the source moved project in between.
+    // Not the source's actual id: that would go stale if it moved project.
     projectId: FORK_PROJECT_INHERIT,
     provider,
     sandbox: seedFromSource(sourceSettings, "sandbox"),
@@ -292,7 +265,6 @@ function isUnresolvableCodexLiveForkPoint(upToItemId) {
   return /^msg_/.test(String(upToItemId ?? ""));
 }
 
-// Map the picker's held value onto the wire's three states.
 function forkProjectPayload(projectId) {
   if (projectId === FORK_PROJECT_INHERIT || projectId === undefined) {
     return {};

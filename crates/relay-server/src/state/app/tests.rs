@@ -2776,14 +2776,8 @@ got {}",
             .is_ok());
     }
 
-    /// The fork dialog needs to SHOW what a fork would inherit, not just let the
-    /// relay resolve it silently.
-    ///
-    /// It has to be the same resolution `fork_session` performs, or the dialog
-    /// would advertise one thing and the fork would do another: remembered
-    /// settings when the relay has run the thread, relay defaults when it has
-    /// not. `remembered` distinguishes the two so a caller can tell "this is what
-    /// the source used" from "nobody recorded it, this is what you would get".
+    /// Must be the SAME resolution `fork_session` performs, or the dialog
+    /// advertises one thing and the fork does another.
     #[tokio::test]
     async fn thread_settings_report_what_a_fork_would_actually_inherit() {
         let dir = TempDir::new().expect("project tempdir");
@@ -2823,10 +2817,8 @@ got {}",
         assert_eq!(settings.approval_policy, "never");
     }
 
-    /// The local HTTP surface is already authorized and names no device, so the
-    /// read must work without one — otherwise the endpoint is unreachable from
-    /// the surface that needs it most. The relay's own allowed_roots still bind
-    /// it; remote never takes this branch because `bind_device` stamps an id.
+    /// Local is already authorized and names no device; `allowed_roots` still bind
+    /// the read. Remote never takes this branch — `bind_device` stamps an id.
     #[tokio::test]
     async fn thread_settings_are_readable_without_a_device_id() {
         let dir = TempDir::new().expect("project tempdir");
@@ -2862,10 +2854,8 @@ got {}",
         assert_eq!(settings.model, "fake-echo");
     }
 
-    /// A thread the relay has never run has nothing recorded. The answer must
-    /// still be usable — a fork of it WILL get the relay defaults — but it has to
-    /// say the values are not the source's own, so the dialog does not claim a
-    /// choice the user never made.
+    /// Still usable — a fork WILL get these — but flagged, so the dialog does not
+    /// claim a choice the user never made.
     #[tokio::test]
     async fn an_unrecorded_thread_reports_relay_defaults_and_says_so() {
         let dir = TempDir::new().expect("project tempdir");
@@ -2901,14 +2891,8 @@ got {}",
         (app, p, o, project_id)
     }
 
-    /// A session started INTO a project must land in it server-side.
-    ///
-    /// This is the difference between the two surfaces being the same feature and
-    /// only looking like it. Local fakes project-at-create today with a client-side
-    /// two-step — start, read the new thread id off the response, then `assign` —
-    /// and remote structurally cannot copy that, because its broker `start_session`
-    /// returns no thread id for the phone to assign. Carrying the project on the
-    /// start input is what lets one code path serve both.
+    /// Server-side, because remote cannot fake it client-side: its broker
+    /// `start_session` returns no thread id for a phone to follow up on.
     #[tokio::test]
     async fn start_session_assigns_the_new_thread_to_the_requested_project() {
         let dir = TempDir::new().expect("project tempdir");
@@ -2939,10 +2923,8 @@ got {}",
         );
     }
 
-    /// Omitting the project is not the same as naming a bad one, and neither may
-    /// cost the user the session they just asked for. An unknown id (deleted on
-    /// another device between opening the dialog and pressing Start) starts the
-    /// session UNASSIGNED rather than failing the start outright.
+    /// A project deleted on another device mid-dialog must not cost the user the
+    /// session they asked for.
     #[tokio::test]
     async fn an_unknown_project_id_still_starts_the_session_unassigned() {
         let dir = TempDir::new().expect("project tempdir");
@@ -2973,11 +2955,8 @@ got {}",
         );
     }
 
-    /// Forking out of a project keeps you in it.
-    ///
-    /// Today fork assigns no project at all, so branching a project session drops
-    /// the fork into Unassigned — it vanishes from the group it belongs to. The
-    /// source thread's membership is the honest default.
+    /// Fork assigned no project at all before this, so branching a project session
+    /// dropped it into Unassigned.
     #[tokio::test]
     async fn fork_inherits_the_source_threads_project_by_default() {
         let dir = TempDir::new().expect("project tempdir");
@@ -3042,13 +3021,8 @@ got {}",
         );
     }
 
-    /// A fork can also be filed OUT of its source's project, which absence alone
-    /// cannot express.
-    ///
-    /// `None` already means "inherit", so it is not available to mean "none". The
-    /// empty string is the explicit-unassigned sentinel: it is not a valid project
-    /// id (ids are always `proj_%016x`), so nothing else can produce it, and it
-    /// survives JSON without needing a second field.
+    /// `None` already means inherit, so it cannot also mean "none". Ids are always
+    /// `proj_%016x`, so the empty string is safe as the third value.
     #[tokio::test]
     async fn an_empty_fork_project_files_the_branch_out_of_the_source_project() {
         let dir = TempDir::new().expect("project tempdir");

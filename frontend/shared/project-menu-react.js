@@ -1,22 +1,5 @@
-// The project menu popup — one implementation, three placements.
-//
-// It was previously inlined in `ProjectSwitcher`, which was fine while the
-// switcher was the only thing that opened it. The launch and fork dialogs now
-// pick a project too, and re-typing this markup in a dialog is exactly how the
-// two sidebars drifted before the switcher itself was shared. So the popup moves
-// here and the switcher becomes one of its callers.
-//
-// Class names stay `.project-switcher-*` on purpose. They are load-bearing in
-// three places that have nothing to do with this refactor — the stylesheet, the
-// switcher's own DOM tests, and remote's drawer rule that anchors the menu to the
-// top bar rather than to its 32px trigger (`.project-switcher-top
-// .project-switcher-menu`). Renaming them buys a tidier prefix and risks all
-// three; the comment is cheaper.
-//
-// Dismissal (outside pointer, Escape) is NOT here. It belongs to whatever owns
-// the open/closed state, and the two owners need different things: the switcher
-// closes itself, while inside a `<dialog>` Escape has to be swallowed before the
-// browser treats it as a close request for the dialog behind the menu.
+// Shared by the top-bar switcher and both launch dialogs. Class names stay
+// `.project-switcher-*`: the stylesheet and remote's drawer anchoring key off them.
 
 import React from "react";
 
@@ -24,9 +7,7 @@ const h = React.createElement;
 
 export function ProjectMenu({
   createLabel = "New project",
-  // Rows come from `buildProjectPickerRows` — the menu deliberately does no
-  // deriving of its own, so what a row says is decided in one pure, tested place
-  // rather than drifting between the three placements.
+  // From `buildProjectPickerRows`, so what a row says is decided in one place.
   rows = [],
   id = null,
   heading = "Projects",
@@ -34,9 +15,7 @@ export function ProjectMenu({
   onCreateProject = null,
   onRenameProject = null,
   onDeleteProject = null,
-  // Rename/delete act on the ACTIVE project only. The menu names many projects
-  // and can act on exactly one; a rename that silently landed on another row
-  // would not be recoverable.
+  // Active project only: a rename landing on another row is unrecoverable.
   activeProject = null,
 }) {
   return h(
@@ -49,9 +28,7 @@ export function ProjectMenu({
       h(
         "button",
         {
-          // menuitemradio, not menuitem: this is a single-choice set and exactly
-          // one row is current, which is what the tick draws. A screen reader
-          // otherwise has to infer "selected" from a decorative glyph.
+          // menuitemradio: a screen reader should not infer "selected" from a glyph.
           "aria-checked": row.active ? "true" : "false",
           className: "project-switcher-option" + (row.active ? " is-active" : ""),
           "data-project-id": row.id || "",
@@ -68,8 +45,7 @@ export function ProjectMenu({
             ? h("span", { className: "project-switcher-option-subtitle" }, row.subtitle)
             : null
         ),
-        // Drawn always and hidden with opacity rather than conditionally
-        // rendered, so a row does not change width when it becomes current.
+        // Opacity, not conditional render: the row must not change width.
         h("span", { "aria-hidden": "true", className: "project-switcher-option-check" }, "✓")
       )
     ),
@@ -85,8 +61,7 @@ export function ProjectMenu({
           createLabel
         )
       : null,
-    // Destructive pair last, behind their own divider, never mixed into the list
-    // of places you can navigate to.
+    // Destructive pair last, never mixed into the navigation rows.
     activeProject && onRenameProject
       ? h(
           "button",

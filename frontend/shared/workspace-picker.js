@@ -1,18 +1,5 @@
-// The workspace chip in the launch dialogs' context bar.
-//
-// The mockup draws this as a chip with a caret, which would normally mean a
-// menu of fixed choices — but the workspace has never been a fixed set. It is a
-// free path, and the old dialog was a text input with a `<datalist>` for
-// convenience. Turning it into a pure menu would remove the ability to launch in
-// a directory the relay has not seen before.
-//
-// So it is a combobox: the chip reads like the mockup when closed, and opens a
-// panel with a real text field on top of the suggestions. Typing is still the
-// primary path; the list is the shortcut it always was.
-//
-// A native `<datalist>` cannot do this, which is the other reason for the
-// rewrite: an `<option>` renders only `value` + `label`, with nowhere to put the
-// git chip or the session count a suggestion carries.
+// A combobox, not a menu: the workspace is a free path, so a fixed list would drop
+// the ability to launch in a directory the relay has never seen.
 
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 
@@ -39,9 +26,7 @@ const FOLDER_ICON = h(
 );
 
 export function WorkspacePicker({
-  // The git chip's data, or null while it is unknown / still loading. Null
-  // renders no chip rather than a placeholder: a directory that is not a repo is
-  // the common case, and "not a repo" is not worth a line.
+  // Null renders no chip: "not a repo" is the common case and is not worth a line.
   gitContext = null,
   disabled = false,
   id = null,
@@ -77,14 +62,8 @@ export function WorkspacePicker({
     }
   };
 
-  // Only trust a context that names the path being shown. The relay echoes the
-  // cwd it answered about precisely so this check is possible — without it, the
-  // gap between choosing path B and its probe returning left B labelled with A's
-  // branch and dirty state, which is worse than showing nothing.
-  //
-  // Compared on the normalized spelling the relay returns, not on raw equality:
-  // the field accepts `~/project`, trailing slashes and symlinks, all of which
-  // come back expanded.
+  // Only trust a context naming the path shown, or path B wears path A's branch
+  // while its probe is in flight. Compared on the relay's normalized spelling.
   const contextMatchesValue =
     gitContext
     && (!gitContext.cwd
@@ -135,9 +114,8 @@ export function WorkspacePicker({
             className: "workspace-picker-input",
             id: inputId || undefined,
             onChange: (event) => setDraft(event.target.value),
-            // Enter commits, Escape is already handled by the dismiss hook.
-            // Without this the only way to accept a typed path would be to click
-            // away, which reads as "my typing was ignored".
+            // Without this, accepting a typed path means clicking away — which
+            // reads as "my typing was ignored".
             onKeyDown: (event) => {
               if (event.key === "Enter") {
                 event.preventDefault();

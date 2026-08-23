@@ -1,18 +1,11 @@
-// The chrome both launch dialogs share: shell, context bar, prompt card, footer.
-//
-// New session and Fork session ask the same question — "start an agent, here,
-// like this" — and differ only in what they inherit. Before this they were two
-// hand-built `<dialog>`s that happened to use the same two class names, and they
-// had already drifted (one closed on backdrop click and one did not; one said
-// "x" and the other "×"). Sharing the chassis makes the differences the only
-// thing either file expresses.
+// The chrome both launch dialogs share. They ask the same question and differ only
+// in what they inherit; hand-built separately, they had already drifted.
 
 import React from "react";
 
 const h = React.createElement;
 
-// Order matters: the context bar answers "where", the prompt answers "what", and
-// the pills answer "how". The old dialogs led with a Provider dropdown, which put
+// Order: "where", then "what", then "how". The old dialogs led with Provider —
 // the least-changed decision first.
 export function SessionDialogShell({
   actions = null,
@@ -34,9 +27,7 @@ export function SessionDialogShell({
       className: "panel-modal session-dialog",
       id,
       onClose: () => onRequestClose?.(),
-      // Backdrop click dismisses. `event.target === currentTarget` is only true
-      // for the backdrop itself, because every child renders inside the sections
-      // below — a click on the body cannot reach here.
+      // Only the backdrop matches: every child renders inside the sections below.
       onClick: (event) => {
         if (event.target === event.currentTarget) {
           close();
@@ -73,10 +64,8 @@ export function SessionDialogShell({
   );
 }
 
-// The "where" row: which project the session is filed under, and which directory
-// it runs in. One row because they are one thought — and because keeping them
-// adjacent is what makes it obvious that the project is NOT derived from the
-// path (projects are deliberately not bound to a cwd; see ProjectView's docs).
+// One row, because keeping them adjacent shows the project is NOT derived from
+// the path — projects are deliberately not bound to a cwd.
 export function SessionContextBar({ project = null, workspace = null }) {
   return h(
     "div",
@@ -108,9 +97,7 @@ export function PromptCard({
       className: "session-prompt-input",
       id,
       onChange: (event) => onChange?.(event.target.value),
-      // Cmd/Ctrl+Enter submits from inside the textarea, matching the footer's
-      // ⌘↵ hint. Plain Enter must stay a newline: this is a task description,
-      // not a chat message, and multi-line prompts are the norm.
+      // Plain Enter stays a newline: this is a task description, not a message.
       onKeyDown: (event) => {
         if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
           event.preventDefault();
@@ -133,16 +120,12 @@ export function PromptCard({
   );
 }
 
-// The row of settings pills. A plain wrapper, but named so both dialogs wrap
-// them identically and the CSS has one hook for the wrap behaviour that mobile
-// depends on.
+// Named so both dialogs wrap identically and mobile has one CSS hook.
 export function SettingPillRow({ children }) {
   return h("div", { className: "session-setting-pills" }, children);
 }
 
-// The keyboard hint on the primary action. Rendered as its own element rather
-// than baked into the label so it can be hidden on touch, where there is no
-// ⌘ and the shortcut is unreachable.
+// Its own element so touch can hide it: there is no ⌘ to press there.
 export function SubmitShortcutHint() {
   return h("span", { "aria-hidden": "true", className: "session-submit-shortcut" }, "⌘↵");
 }

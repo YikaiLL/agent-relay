@@ -1,27 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-// CHARACTERIZATION TESTS for the local "New session" submit path.
-//
-// These do not describe a bug. They pin the behavior that exists TODAY, before
-// the start dialog is redesigned and moved off its uncontrolled-DOM submit onto
-// a store-driven one like remote's. Every assertion here must still hold after
-// that migration — that is the whole point of writing them first.
-//
-// These were written BEFORE the migration, against the DOM-reading version, and
-// every assertion about the request body below is unchanged from that run. That
-// is the "identical behaviour" contract in mechanical form: the dialog was
-// rebuilt and local's submit moved from reading eight live elements by id onto
-// the session draft, and the bytes reaching `/api/session/start` still had to
-// match, key for key.
-//
-// ONE key was added on purpose — `project_id` — because filing a session into a
-// project at creation is the feature this work exists for. It is called out at
-// the assertion rather than quietly folded in.
-//
-// lifecycle.js transitively imports dom.js, which queries the document at
-// import time. Same stub shape as send-error.test.mjs — a stable node per
-// selector — so the module can be imported at all.
+// Written BEFORE the dialog was rebuilt, against the DOM-reading submit. Every
+// assertion about the request body is unchanged across that migration.
 const nodes = new Map();
 function fakeNode(selector) {
   if (!nodes.has(selector)) {
@@ -70,9 +51,7 @@ globalThis.window = {
 
 const { createLifecycleController } = await import("./lifecycle.js");
 
-// The launch draft a filled-in dialog would hold. This replaces the map of
-// element ids the earlier revision used — same values, read from the store the
-// dialog writes to instead of from the markup it renders.
+// The draft a filled-in dialog holds; replaces the earlier map of element ids.
 function defaultDraft() {
   return {
     approvalPolicy: "never",
@@ -82,9 +61,7 @@ function defaultDraft() {
     model: "claude-opus-4-6",
     projectId: null,
     provider: "claude_code",
-    // No longer offered in the UI — the file-access dropdown was collapsed into
-    // the permission level — but still carried so the start protocol is
-    // unchanged.
+    // Not offered in the UI any more, but still carried on the wire.
     sandbox: "workspace-write",
   };
 }
@@ -96,10 +73,8 @@ function buildController({ draft = defaultDraft(), respond } = {}) {
   const selectedCwds = [];
   const focused = [];
 
-  // `startSession` ends with a `loadThreads("post-start refresh")`, so the state
-  // needs enough of the thread-list plumbing for the success path to run to
-  // completion. Without it the refresh throws, the shared catch swallows it, and
-  // the function returns null — which looks exactly like a failed start.
+  // Enough thread-list plumbing for the post-start refresh: without it the shared
+  // catch swallows a throw and the success path returns null.
   const state = {
     deviceId: "device-1",
     session: null,
@@ -144,9 +119,7 @@ function buildController({ draft = defaultDraft(), respond } = {}) {
     renderThreadListMessage: () => {},
     renderThreads: () => {},
     renderAuthRequiredState: () => {},
-    // Seam: the real one runs the DOM-swap callback. Skipping it keeps these
-    // tests on the request contract instead of dragging in the whole snapshot
-    // apply path, which has its own tests.
+    // Seam: skipping the DOM swap keeps these on the request contract.
     runViewTransition: async () => {},
     setStartControlsBusy: () => {},
     isViewingConversation: () => true,
@@ -160,9 +133,7 @@ function buildController({ draft = defaultDraft(), respond } = {}) {
     resetTranscriptHydrationState: () => {},
   });
 
-  // The post-start thread refresh issues its own request; the assertions below
-  // are about the START call, so name it explicitly rather than relying on
-  // ordering or on the refresh happening to fail.
+  // The post-start refresh issues its own request; name the START call explicitly.
   const startRequests = () => requests.filter((entry) => entry.url === "/api/session/start");
 
   return {
@@ -213,20 +184,15 @@ test("the start request carries exactly the fields the dialog collects", async (
     effort: "xhigh",
     device_id: "device-1",
     provider: "claude_code",
-    // The one intentional addition since this test was first written against the
-    // DOM-reading implementation. Everything above is byte-for-byte what the old
-    // path sent.
+    // The one intentional addition; everything above is byte-for-byte the old path.
     project_id: null,
     images: [],
   });
 });
 
 test("submit reads the draft, never the DOM", async () => {
-  // The inverse of what this file originally asserted, and deliberately so. The
-  // old test pinned that submit read seven element ids, which was the right
-  // guard WHILE the values lived in the markup. Now that the dialog is
-  // controlled, reading the DOM at submit time is the bug: it would resurrect a
-  // second source of truth that can disagree with what the user sees.
+  // The inverse of what this file first asserted: now that the dialog is
+  // controlled, reading the DOM at submit would resurrect a second source of truth.
   const { controller, requestedIds, startRequests } = buildController({
     respond: () => acceptance(),
   });
@@ -238,10 +204,8 @@ test("submit reads the draft, never the DOM", async () => {
 });
 
 test("a project chosen in the dialog is filed as part of the start", async () => {
-  // Local used to do this as a second step — start, read the new thread id off
-  // the response, then POST a project `assign`. Remote structurally could not
-  // copy that (its start returns no thread id), and a failed follow-up silently
-  // left the session unfiled.
+  // Was a client-side second step, which remote could not copy: its start returns
+  // no thread id to follow up on.
   const { controller, startRequests } = buildController({
     draft: { ...defaultDraft(), projectId: "proj_00ff" },
     respond: () => acceptance(),
@@ -253,9 +217,7 @@ test("a project chosen in the dialog is filed as part of the start", async () =>
 });
 
 test("blank optional text fields are sent as null, not empty string", async () => {
-  // `initial_prompt` and `model` are the two the relay treats as "resolve a
-  // default for me". Sending "" instead of null makes the relay honour an empty
-  // prompt/model, which is not the same request.
+  // Null means "resolve a default"; "" would be honoured as an empty value.
   const { controller, startRequests } = buildController({
     draft: { ...defaultDraft(), initialPrompt: "   ", model: "" },
     respond: () => acceptance(),
@@ -312,10 +274,7 @@ test("an empty workspace refuses to submit and focuses the field instead", async
 });
 
 test("a successful start returns the new thread id", async () => {
-  // Still load-bearing, though for a smaller reason than when this was written:
-  // the pending-project two-step that consumed it is gone (the relay files the
-  // session now), but app.js still uses the id to clear the image attachments
-  // that were actually sent.
+  // app.js uses the id to clear the image attachments that were actually sent.
   const { controller } = buildController({ respond: () => acceptance() });
 
   assert.equal(await controller.startSession(), "thread-new");

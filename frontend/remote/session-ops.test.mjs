@@ -2094,10 +2094,8 @@ test("startRemoteSession re-enables the start button when the relay does not rep
 });
 
 test("startRemoteSession carries the chosen project so a phone can file a session too", async () => {
-  // Remote CANNOT do what local used to: the broker's start_session returns no
-  // thread id, so there is nothing for a phone to follow up with a project
-  // `assign` on. Sending the project as part of the start input is the only way
-  // the two surfaces file a session in the same place.
+  // Remote cannot do what local used to: its start_session returns no thread id,
+  // so the start input is the only place a phone can name a project.
   const browser = activeBrowser || installBrowserStubs();
 
   const { state, saveRemoteAuth } = await import("./state.js");
@@ -2150,9 +2148,8 @@ test("startRemoteSession carries the chosen project so a phone can file a sessio
 });
 
 test("an unfiled remote session sends a null project rather than omitting it", async () => {
-  // Explicit null keeps "Default Workspace" a real choice: an absent key and a
-  // null both mean unassigned to the relay today, but sending the key means the
-  // wire always shows what the dialog decided.
+  // Absent and null both mean unassigned today, but sending the key means the wire
+  // always shows what the dialog decided.
   const browser = activeBrowser || installBrowserStubs();
 
   const { state, saveRemoteAuth } = await import("./state.js");

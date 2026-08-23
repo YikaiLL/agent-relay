@@ -80,13 +80,9 @@ export function createLifecycleController(ctx) {
     liveElement,
     isViewingConversation,
   } = ctx;
-  // The launch dialog's field values. A ctx seam rather than a direct store
-  // import so the controller stays constructible in a test without standing up
-  // the whole local UI store.
+  // A ctx seam, not a store import, so the controller stays testable.
   const readSessionDraft = () => ctx.readSessionDraft?.() || {};
-  // Where to put the cursor when the start is refused for want of a directory.
-  // The dialog owns its own markup now, so the controller asks rather than
-  // reaching for an element id it would have to keep in step.
+  // The dialog owns its markup, so the controller asks rather than naming an id.
   const focusWorkspaceField = () =>
     ctx.focusWorkspaceField?.()
     ?? document.getElementById("launch-start-session-dialog-cwd")?.focus();
@@ -216,13 +212,8 @@ export function createLifecycleController(ctx) {
   }
 
   async function startSession(imageAttachments = []) {
-    // Read the DRAFT, not the DOM.
-    //
-    // This used to re-read `.value` off eight live elements looked up by id at
-    // submit time, which coupled the request body to the dialog's markup by
-    // nothing stronger than a string. The dialog is controlled now and its values
-    // live in the store; `start-session-payload.test.mjs` pins the resulting
-    // request across the change.
+    // Read the DRAFT, not the DOM. `start-session-payload.test.mjs` pins the
+    // resulting request across that change.
     const draft = readSessionDraft();
     const cwd = String(draft.cwd || "").trim();
 

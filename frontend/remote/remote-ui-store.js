@@ -179,11 +179,8 @@ export function createRemoteUiStore(initialState = {}) {
         sendPending: Boolean(value),
       });
     },
-    // Apply several draft fields as ONE transition. Provider, model and effort
-    // are a single decision — the effort levels are model-specific and the model
-    // belongs to a provider — so setting them one at a time leaves the draft in
-    // states that are not valid requests, and each intermediate state is
-    // observable by subscribers.
+    // One transition: provider, model and effort are a single decision, and each
+    // intermediate state is both invalid and observable by subscribers.
     patchSessionDraft(patch) {
       set((state) => ({
         sessionDraft: { ...state.sessionDraft, ...(patch || {}) },

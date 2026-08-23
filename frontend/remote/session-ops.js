@@ -1256,9 +1256,8 @@ export async function startRemoteSession(sessionDraftOverride = null) {
         sandbox: sessionDraft.sandbox,
         effort: sessionDraft.effort,
         provider: sessionDraft.provider,
-        // Sent as an explicit null when unfiled. Remote has no second step
-        // available to it — the broker's start_session returns no thread id, so
-        // there is nothing a phone could follow up with a project `assign` on.
+        // Explicit null when unfiled: remote has no second step, its start_session
+        // returns no thread id to follow up on.
         project_id: sessionDraft.projectId || null,
       },
     });

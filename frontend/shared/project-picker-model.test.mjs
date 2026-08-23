@@ -8,11 +8,8 @@ import {
 } from "./project-picker-model.js";
 import { formatRelativeTime } from "../remote/utils.js";
 
-// The picker's second line is the only thing that makes a list of project names
-// worth opening: it answers "which of these is alive right now" without a trip
-// into each one. Everything it shows is derived client-side from data the
-// surfaces already hold — thread membership plus the same live activity maps the
-// sidebar dots read — so nothing here needs the server to grow a field.
+// The second line answers "which of these is alive right now", derived entirely
+// from data the surfaces already hold.
 
 const NOW = 1_700_000_000;
 const minutesAgo = (n) => NOW - n * 60;
@@ -45,7 +42,6 @@ test("a project with sessions but none running reports only the count", () => {
 });
 
 test("one session is singular", () => {
-  // "1 sessions" is the kind of detail that makes a UI feel unfinished.
   assert.equal(projectSubtitle({ agents: [thread("a", NOW)], now: NOW }), "1 session");
 });
 
@@ -76,9 +72,7 @@ test("idle age comes from the most recent session, not the oldest", () => {
 });
 
 test("needs-input sessions count as running", () => {
-  // A session waiting on an approval is not idle — it is blocked ON YOU, which
-  // is the single most important reason to open a project. Folding it into
-  // "running" keeps the line short while never calling an awaiting session quiet.
+  // A session waiting on an approval is blocked ON YOU, never quiet.
   const subtitle = projectSubtitle({
     agents: [thread("a", NOW), thread("b", NOW)],
     threadAttention: new Map([["a", "needs_input"]]),
@@ -122,9 +116,8 @@ test("the default workspace row is active when no project is selected", () => {
 });
 
 test("an active id whose project is gone falls back to the default row", () => {
-  // Same fail-open rule the switcher already applies: a project deleted from
-  // another device must not leave every row unmarked and the trigger naming a
-  // project that no longer exists.
+  // Fail-open like the switcher: a project deleted elsewhere must not leave every
+  // row unmarked.
   const rows = buildProjectPickerRows({
     projects: [{ id: "p1", name: "Small improvement" }],
     activeProjectId: "p-deleted",
@@ -169,13 +162,10 @@ test("minutes-old activity still reads as a live session count", () => {
 });
 
 test("the relative-time formatter still uses the real clock when no clock is injected", () => {
-  // Regression guard. The injectable-clock parameter defaulted to null and was
-  // validated with a finiteness check — but Number(null) is 0, so "no clock"
-  // resolved to the epoch and EVERY timestamp on the remote surface (session
-  // times, the project menu's idle ages) rendered as "now".
+  // Number(null) is 0, so a finiteness check made "no clock" mean the epoch and
+  // every remote timestamp read as "now".
   const anHourAgo = Math.floor(Date.now() / 1000) - 3600;
   assert.equal(formatRelativeTime(anHourAgo), "1h");
   assert.equal(formatRelativeTime(anHourAgo, null), "1h");
-  // And an explicit clock still wins.
   assert.equal(formatRelativeTime(1_000_000, 1_000_000 + 7200), "2h");
 });

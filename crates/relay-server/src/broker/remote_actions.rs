@@ -135,21 +135,16 @@ pub(super) enum RemoteActionRequest {
         thread_id: String,
         input: RepairWorkspaceInput,
     },
-    /// The git standing of a caller-supplied path, for the launch dialogs'
-    /// `main · clean` chip. Read-only and cheap, but note the path comes from the
-    /// CLIENT rather than from a thread the relay already knows — the scope check in
-    /// `workspace_git_context` is what keeps it from being an existence oracle, and it
-    /// resolves the scope from `device_id`, so the stamp below is load-bearing.
+    /// The path comes from the CLIENT, so the scope check in `workspace_git_context`
+    /// is what keeps this from being an existence oracle. It reads `device_id`.
     FetchWorkspaceGitContext {
         #[serde(default)]
         device_id: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
     },
-    /// What a fork of this thread would inherit, so the fork dialog can show the
-    /// real values instead of an abstract "inherit" state. Read-only and cheap
-    /// (an in-memory map read), unlike the transcript response that also carries
-    /// settings but pays a provider page fetch to produce them.
+    /// What a fork of this thread would inherit. An in-memory map read, unlike the
+    /// transcript response that also carries settings but pays a provider fetch.
     FetchThreadSettings {
         #[serde(default)]
         device_id: Option<String>,

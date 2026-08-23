@@ -882,13 +882,8 @@ export function LocalShell() {
         h(WorkspaceChangesRail)
       )
     ),
-    // Filled by renderLaunchSessionDialog() through its own React sub-root. The
-    // dialog used to render here, inline — which was only ever viable while it was
-    // an uncontrolled form: this shell renders EXACTLY ONCE (local-app.js calls
-    // renderLocalShell with `props = {}` and nothing calls it again), so
-    // `launchModel` was permanently null and every value had to be read back off
-    // the DOM at submit time. A controlled dialog needs a root that can re-render,
-    // which is the same pattern the project switcher and the task dialog use.
+    // Filled by renderLaunchSessionDialog() through its own React sub-root: this
+    // shell renders exactly once, and a controlled dialog must re-render.
     h("div", { className: "launch-dialog-mount", id: "launch-dialog-root" }),
     // Filled by renderStartTaskDialog() through its own React sub-root — the shell
     // renders once, so anything data-driven needs one.

@@ -1,15 +1,5 @@
-// The project picker as it behaves INSIDE a modal dialog.
-//
-// The top-bar switcher's contract is covered by project-switcher.dom.test.mjs.
-// What is different here — and the reason this is a separate control rather than
-// the switcher with another class name — is that the menu opens inside a
-// `<dialog>` opened with showModal(). That changes exactly one thing, and it is
-// the thing worth pinning: Escape.
-//
-// A modal dialog treats Escape as a close request. So the FIRST Escape, while the
-// project menu is open, must close only the menu; the dialog behind it must
-// survive. Otherwise picking a project and changing your mind throws away the
-// prompt you already typed.
+// What differs from the top-bar switcher is Escape: inside showModal() the first
+// Escape must close only the menu, or a typed prompt is thrown away.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
@@ -100,9 +90,7 @@ test("choosing a project reports its id and closes the menu", () => {
 });
 
 test("Escape closes the menu and is prevented, so the dialog behind it stays open", () => {
-  // preventDefault is the actual mechanism: a modal dialog closes on Escape via
-  // the browser's close-request handling, and the only way to keep the dialog
-  // open while consuming the key for the menu is to cancel the event.
+  // preventDefault is the mechanism: only a cancelled event spares the dialog.
   const view = mount({ activeProjectId: null });
   open(view.host);
   assert.ok(menu(view.host), "precondition: the menu is open");
@@ -115,9 +103,7 @@ test("Escape closes the menu and is prevented, so the dialog behind it stays ope
 });
 
 test("Escape with the menu shut is left alone, so it still closes the dialog", () => {
-  // The mirror of the case above, and the one that is easy to lose: swallowing
-  // Escape unconditionally would trap the user in a dialog they cannot dismiss
-  // with the keyboard.
+  // Swallowing Escape unconditionally would trap the user in the dialog.
   const view = mount({ activeProjectId: null });
 
   const event = pressEscape();

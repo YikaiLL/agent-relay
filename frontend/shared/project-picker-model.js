@@ -1,34 +1,20 @@
-// Pure model for the project picker's menu rows.
-//
-// The picker is the same control in three places — the top-bar switcher, the New
-// session dialog, and the Fork dialog — so what a row SAYS is decided once, here,
-// with no DOM and no store. The React component below it only draws.
-//
-// Everything on a row is derived from data the surfaces already hold: project
-// membership (`thread_project_id`) joined against the thread list, plus the same
-// three live-signal maps the sidebar dots read. Nothing here needs a server field,
-// which is why the picker can ship without touching the byte-budgeted
-// `ThreadsResponse`.
+// Pure row model for the project picker, shared by the top-bar switcher and both
+// launch dialogs. Everything is derived client-side; no server field is needed.
 
 import { DEFAULT_WORKSPACE_LABEL } from "./project-labels.js";
 import { selectProjectAgents, summarizeProjectActivity } from "./project-overview-model.js";
 import { formatRelativeTime } from "../remote/utils.js";
 
-// The default row is not a project and has no membership to count — a session
-// with no `thread_project_id` entry is simply unfiled. Saying so is more honest
-// than counting every unassigned thread, which would make the row look like the
-// biggest project in the list when it is really the absence of one.
+// Not a count: unassigned sessions would make this look like the biggest project
+// in the list when it is really the absence of one.
 export const DEFAULT_WORKSPACE_SUBTITLE = "unfiled sessions";
 
 function pluralizeSessions(count) {
   return count === 1 ? "1 session" : `${count} sessions`;
 }
 
-// One project's second line.
-//
-// Priority is "is anything happening" over "how big is it": a count alone cannot
-// distinguish a project you should open right now from one you last touched in
-// March. Only when nothing is live does the line fall back to age.
+// Liveness outranks size: a count alone cannot separate a project worth opening
+// now from one last touched in March. Falls back to age only when nothing is live.
 export function projectSubtitle({
   agents = [],
   threadActivity = null,
@@ -45,11 +31,8 @@ export function projectSubtitle({
   });
 
   if (summary.total > 0) {
-    // needs-input folds into "running" deliberately. A session blocked on an
-    // approval is the most urgent thing a project can contain, and splitting it
-    // into its own clause makes the line long enough to truncate on a phone —
-    // where the distinction is least visible anyway. The dot in the session list
-    // still tells them apart.
+    // needs-input folds into "running": splitting it makes the line long enough to
+    // truncate on a phone, and the session list's dot already tells them apart.
     const live = summary.working + summary.needsInput + summary.reviewing;
     return live > 0
       ? `${pluralizeSessions(summary.total)} · ${live} running`
@@ -62,13 +45,8 @@ export function projectSubtitle({
   return `idle · ${formatRelativeTime(lastActiveAt, now)}`;
 }
 
-// The full row list, default workspace first.
-//
-// `activeProjectId` is resolved against the project list rather than trusted:
-// an id whose project was deleted on another device marks the DEFAULT row, the
-// same fail-open rule `ProjectSwitcher` applies to its trigger label. Letting the
-// raw id through gave one control two answers — no row ticked, while the list
-// below had already fallen back to plain cwd grouping.
+// `activeProjectId` is resolved against the list, not trusted: an id deleted on
+// another device marks the DEFAULT row instead of leaving nothing ticked.
 export function buildProjectPickerRows({
   projects = [],
   threads = [],

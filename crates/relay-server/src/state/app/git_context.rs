@@ -1,51 +1,28 @@
-//! Read-only git context for a CALLER-SUPPLIED workspace path.
-//!
-//! The session-launch dialog needs one line next to the directory the user just
-//! picked — `main · clean` — before any session exists. That makes this the first
-//! git probe in the relay whose `cwd` comes from the request rather than from
-//! relay-owned state (`current_cwd`, a thread's recorded cwd, an enumerated
-//! worktree root), which changes the threat model completely: without a scope
-//! check a paired phone could walk the whole filesystem asking "is this a repo,
-//! what branch is it on", and get an answer.
+//! Read-only git context for a CALLER-SUPPLIED workspace path — the first git probe
+//! in the relay whose cwd comes from the request rather than from relay-owned state.
 
 use super::worktree::{git_flag, git_line};
 use super::*;
 
-/// The ONLY refusal a caller-supplied path can get, whatever is (or is not) at it.
-///
-/// Fixed and content-free on purpose. `ensure_path_within_device_scope`'s own message
-/// echoes `normalize_cwd(path)` — which canonicalizes only when the path EXISTS, so a
-/// symlinked or missing target changes the string — and names the relay's allowed roots
-/// in its hint. Propagating either would rebuild, inside the error path, precisely the
-/// "does this exist / where does it really point / how is this box laid out" oracle the
-/// scope check is there to deny. There is nothing actionable to say anyway: a client can
-/// only reach this by asking about a directory it was never offered.
+/// Fixed and content-free: the underlying scope error echoes the normalized path and
+/// names the allowed roots, rebuilding the oracle the scope check exists to deny.
 pub(crate) const WORKSPACE_GIT_CONTEXT_OUT_OF_SCOPE: &str =
     "that directory is outside the paths this relay will inspect";
 
 impl AppState {
-    /// Read-only git standing of a workspace path, for the launch dialog's chip.
-    ///
-    /// `cwd` is CALLER-SUPPLIED — unlike every other git probe in the relay, which reads
-    /// a path the relay itself recorded. So the scope check below is not a formality: it
-    /// is the whole reason a paired phone cannot use this to enumerate the filesystem.
-    ///
-    /// Never errors for an in-scope path. "Not a repo", "bare repo" and "no such
-    /// directory" all answer `is_repo: false`, so the response cannot be read as a
-    /// probe either.
+    /// Never errors for an in-scope path: not-a-repo, bare repo and missing directory
+    /// all answer `is_repo: false`, so the response cannot be read as a probe either.
     pub async fn workspace_git_context(
         &self,
         device_id: Option<String>,
         cwd: String,
     ) -> Result<WorkspaceGitContextView, String> {
-        // Normalize FIRST, then check and spawn against the same string. Checking one
-        // spelling and spawning in another is how a scope check gets bypassed by a
-        // `..` segment or a symlinked prefix.
+        // Normalize FIRST: checking one spelling and spawning in another is how a
+        // scope check gets bypassed by a `..` segment or a symlinked prefix.
         let cwd = normalize_cwd(&cwd);
         if cwd.is_empty() {
-            // `Command::current_dir` would otherwise be skipped entirely and git would
-            // run in the RELAY PROCESS's own cwd — reporting its source checkout's
-            // branch for whatever the client thought it was asking about.
+            // Otherwise git runs in the relay process's own cwd and reports its
+            // source checkout's branch.
             return Err("a workspace path is required".to_string());
         }
 
@@ -59,10 +36,8 @@ impl AppState {
                 .map_err(|_| WORKSPACE_GIT_CONTEXT_OUT_OF_SCOPE.to_string())?;
         }
 
-        // Only past this line may a subprocess exist. `collect_git_context` takes a
-        // `LiveWorkspace`, and this is the one place that constructs one from a
-        // caller-supplied path — so "scope check before git" is enforced by what the
-        // git helpers accept, not by remembering to keep two statements in order.
+        // Only past this line may a subprocess exist: the git helpers take a
+        // `LiveWorkspace`, and this is the one place that builds one from caller input.
         let Some(workspace) = LiveWorkspace::from_path(&cwd) else {
             return Ok(WorkspaceGitContextView {
                 cwd,
@@ -89,23 +64,17 @@ async fn collect_git_context(cwd: String, workspace: &LiveWorkspace) -> Workspac
     view.is_repo = true;
 
     match git_line(workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
-        // git prints the literal string `HEAD` for a detached checkout, and refuses to
-        // let a branch BE named `HEAD` — so this is unambiguous, and it is the one
-        // reading that must never reach the UI as a branch name.
+        // git refuses to let a branch BE named `HEAD`, so this reading is unambiguous.
         Some(head) if head == "HEAD" => view.detached = true,
         Some(head) if !head.is_empty() => {
-            // `--abbrev-ref` already shortens, but strip anyway so this agrees with
-            // `parse_worktree_records`, which is the other place a branch name is
-            // normalized for display.
+            // Stripped anyway, so this agrees with `parse_worktree_records`.
             view.branch = Some(
                 head.strip_prefix("refs/heads/")
                     .unwrap_or(&head)
                     .to_string(),
             );
         }
-        // Fails outright on a repo with no commits yet (`fatal: ambiguous argument
-        // 'HEAD'`), where the branch exists only as an unborn symbolic ref. Not
-        // detached, just nothing to name — resolving it would cost a fourth command.
+        // Fails on a repo with no commits: not detached, just nothing to name.
         _ => {}
     }
 
@@ -113,18 +82,8 @@ async fn collect_git_context(cwd: String, workspace: &LiveWorkspace) -> Workspac
     view
 }
 
-/// Whether the working tree has ANY uncommitted change, untracked files included.
-///
-/// Reads at most ONE BYTE of `git status`. The question is a boolean; the output is
-/// O(changes), and on a repo whose build dropped a hundred thousand untracked artifacts
-/// `--porcelain` runs to megabytes. Collecting all of that to look at line one — on a
-/// probe that fires every time the directory picker moves — is the pathology this
-/// avoids: the pipe is read once and the child is killed, so git stops at its next
-/// blocked write.
-///
-/// `None` = could not determine (spawn failed, or git exited non-zero having written
-/// nothing). The caller reports that as "not dirty": this chip's job is to warn, so an
-/// unknown answer stays quiet rather than inventing changes.
+/// Reads at most ONE BYTE of `git status`: the question is a boolean but the output is
+/// O(changes), and `--porcelain` runs to megabytes on a tree full of build artifacts.
 async fn has_uncommitted_changes(workspace: &LiveWorkspace) -> Option<bool> {
     use tokio::io::AsyncReadExt;
 
@@ -145,7 +104,6 @@ async fn has_uncommitted_changes(workspace: &LiveWorkspace) -> Option<bool> {
 
     let mut first = [0_u8; 1];
     if stdout.read(&mut first).await.ok()? > 0 {
-        // One byte on stdout IS the answer.
         let _ = child.start_kill();
         let _ = child.wait().await;
         return Some(true);
@@ -225,9 +183,7 @@ mod tests {
         );
     }
 
-    // A directory that is not a repository must answer plainly, not error: the dialog
-    // renders "no git here" and the user carries on. Everything else stays neutral so a
-    // client cannot mistake it for a clean repo on an unnamed branch.
+    // Neutral everywhere else, so it cannot be mistaken for a clean unnamed branch.
     #[tokio::test]
     async fn a_non_repo_directory_reports_no_repo() {
         let dir = TempDir::new().expect("tmp");
@@ -245,7 +201,6 @@ mod tests {
         assert!(!context.dirty);
     }
 
-    // The chip's happy path: branch name, short form, clean.
     #[tokio::test]
     async fn a_clean_repo_reports_its_branch_and_no_changes() {
         let dir = TempDir::new().expect("tmp");
@@ -263,9 +218,8 @@ mod tests {
         assert!(!context.dirty, "nothing has been touched yet");
     }
 
-    // A slashed branch must survive verbatim, with `refs/heads/` stripped exactly the
-    // way `list_worktrees_in` strips it — the chip and the root picker must never
-    // disagree about what this tree is called.
+    // Stripped exactly the way `list_worktrees_in` strips it, or the chip and the
+    // diff panel's root picker disagree about what this tree is called.
     #[tokio::test]
     async fn a_branch_name_is_reported_short_not_as_a_ref() {
         let dir = TempDir::new().expect("tmp");
@@ -285,7 +239,6 @@ mod tests {
         assert_eq!(context.branch.as_deref(), Some("feat/alpha"));
     }
 
-    // A modified TRACKED file is dirty.
     #[tokio::test]
     async fn a_modified_tracked_file_makes_the_workspace_dirty() {
         let dir = TempDir::new().expect("tmp");
@@ -307,10 +260,8 @@ mod tests {
         assert!(context.dirty);
     }
 
-    // An UNTRACKED file is dirty too. This is what pins `--untracked-files=normal`:
-    // with git's `no` mode a repo full of brand-new files reads as clean, which is the
-    // most misleading thing this chip could say right before someone starts a session
-    // in it.
+    // Pins `--untracked-files=normal`: in git's `no` mode a tree of brand-new files
+    // reads as clean.
     #[tokio::test]
     async fn an_untracked_file_makes_the_workspace_dirty() {
         let dir = TempDir::new().expect("tmp");
@@ -329,9 +280,7 @@ mod tests {
         );
     }
 
-    // A detached HEAD must never render as a branch literally named "HEAD" — which is
-    // exactly what `rev-parse --abbrev-ref HEAD` prints, and what a naive read of it
-    // would put in the chip.
+    // `rev-parse --abbrev-ref HEAD` literally prints "HEAD" for a detached checkout.
     #[tokio::test]
     async fn a_detached_head_is_not_a_branch_named_head() {
         let dir = TempDir::new().expect("tmp");
@@ -352,10 +301,8 @@ mod tests {
         );
     }
 
-    // An in-scope path that simply is not there answers "no repo" rather than surfacing
-    // git's raw ENOENT. Same lesson as `workspace_diff`: a spawn failure reaching the UI
-    // verbatim ("No such file or directory (os error 2)") is not an answer anyone can act
-    // on, and here the directory legitimately may not exist yet.
+    // A raw ENOENT reaching the UI is not an answer anyone can act on, and the
+    // directory legitimately may not exist yet.
     #[tokio::test]
     async fn a_missing_directory_in_scope_reports_no_repo_rather_than_erroring() {
         let dir = TempDir::new().expect("tmp");
@@ -377,10 +324,8 @@ mod tests {
         assert!(!context.dirty);
     }
 
-    // THE security test. The cwd is caller-supplied, so a device scoped to one project
-    // must not be able to ask about anything else — and the refusal must be identical
-    // whatever is actually at the path, or the error message itself becomes the oracle
-    // ("does this exist / is it a repo") that the scope check exists to deny.
+    // THE security test: the refusal must be identical whatever is at the path, or the
+    // message itself becomes the oracle the scope check exists to deny.
     #[tokio::test]
     async fn an_out_of_scope_path_is_refused_without_revealing_what_is_there() {
         let allowed_dir = TempDir::new().expect("tmp");
@@ -441,9 +386,7 @@ mod tests {
         );
     }
 
-    // The relay's own `allowed_roots` bind the LOCAL surface too, which has no device id
-    // at all. Without this, `device_id: None` (every local HTTP call) would skip the
-    // check entirely and read any path on the box.
+    // Without this, `device_id: None` — every local HTTP call — would skip the check.
     #[tokio::test]
     async fn the_relay_allowed_roots_bind_a_caller_with_no_device_id() {
         let allowed_dir = TempDir::new().expect("tmp");
@@ -461,9 +404,7 @@ mod tests {
             .expect_err("a path outside the relay's roots must be refused");
     }
 
-    // An empty path is a client bug, not a workspace. Answering it would run the probe
-    // in whatever the relay process's own cwd happens to be — i.e. the relay's source
-    // checkout — which is both wrong and a disclosure.
+    // Answering would probe the relay process's own cwd: wrong, and a disclosure.
     #[tokio::test]
     async fn an_empty_path_is_refused() {
         let dir = TempDir::new().expect("tmp");

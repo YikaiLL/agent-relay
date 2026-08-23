@@ -175,11 +175,8 @@ test("setProviderModels for claude_code provider seeds claude models", () => {
 });
 
 test("patchSessionDraft applies provider, model and effort as one transition", () => {
-  // These three are a single decision — effort levels are model-specific and the
-  // model belongs to a provider — so applying them field by field leaves the
-  // draft in states that are not valid start requests, and each one is visible
-  // to subscribers. That is how a default `codex/gpt-5.5` draft became
-  // `claude_code/gpt-5.5` on a Claude-only relay: only `provider` was replaced.
+  // A single decision: applying them field by field leaves the draft in states
+  // that are not valid start requests, and each is visible to subscribers.
   const store = createRemoteUiStore();
   const seen = [];
   const unsubscribe = store.subscribe((state) => seen.push({ ...state.sessionDraft }));
@@ -196,15 +193,12 @@ test("patchSessionDraft applies provider, model and effort as one transition", (
   assert.equal(draft.model, "claude-opus-4-6");
   assert.equal(draft.effort, "high");
   assert.equal(seen.length, 1, "one transition, not three");
-  // And nothing else on the draft was disturbed.
   assert.equal(draft.sandbox, "workspace-write");
 });
 
 test("a draft holding an unavailable provider is repaired with its model, not just its provider", () => {
-  // The exact shape of the bug: connect a default Codex draft to a relay that
-  // only offers Claude. Replacing `provider` alone leaves a Codex model id under
-  // Claude, which the merged menu then surfaces as the selected option and the
-  // dialog submits verbatim.
+  // Replacing `provider` alone leaves a Codex model id under Claude, which the
+  // merged menu then surfaces as selected and the dialog submits verbatim.
   const store = createRemoteUiStore();
   assert.equal(store.getState().sessionDraft.provider, "codex");
   assert.equal(store.getState().sessionDraft.model, "gpt-5.5");

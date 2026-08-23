@@ -44,15 +44,11 @@ export const startSessionButton = document.querySelector("#start-session-button"
 export const openLaunchSettingsButton = document.querySelector("#open-launch-settings");
 export const launchSettingsModal = document.querySelector("#launch-settings-modal");
 export const closeLaunchSettingsModalButton = document.querySelector("#close-launch-settings-modal");
-// #launch-start-session-dialog is deliberately NOT queried here any more: the
-// dialog is rendered on demand into #launch-dialog-root, so a module-level query
-// at import time would capture null forever. Callers use getElementById at the
-// moment they need it.
+// Not queried here: the dialog renders on demand, so an import-time query would
+// capture null forever. Callers use getElementById when they need it.
 export const cwdInput = document.querySelector("#cwd-input");
 export const startPromptInput = document.querySelector("#start-prompt");
-// #start-prompt-attachments is deliberately NOT queried here: it is created with
-// the launch dialog, so a module-level query at import time captures null forever.
-// It did, and a pasted image became invisible while still being submitted.
+// Not queried here either, for the same reason as the dialog above.
 export const providerInput = document.querySelector("#provider-input");
 export const modelInput = document.querySelector("#model-input");
 export const modelInputLabel = document.querySelector("#model-input-label");

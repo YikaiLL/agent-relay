@@ -7,20 +7,8 @@ const MAX_PROJECTS: usize = 256;
 const MAX_PROJECT_NAME_CHARS: usize = 200;
 const MAX_PROJECT_MEMBERSHIPS: usize = 10_000;
 
-/// File a freshly-created thread into a project, as part of starting or forking it.
-///
-/// Deliberately best-effort, and that is the whole design of it: the user asked for
-/// a SESSION, and the project is filing. A project deleted on another device between
-/// opening the dialog and pressing Start must not cost them the session — they would
-/// have no way to tell an unknown-project refusal from a failed launch, and the
-/// session they wanted is the expensive half. So a refusal is logged and the thread
-/// stays Unassigned, which is exactly where it would have landed before this existed.
-///
-/// Shares `MAX_PROJECT_MEMBERSHIPS` with the manual assign path so creation cannot be
-/// used to walk around the cap.
-///
-/// Returns whether membership changed, so the caller only bumps `projects_revision`
-/// when clients actually have something to refetch.
+/// Best-effort by design: the user asked for a SESSION, and a project deleted
+/// mid-dialog must not cost them one. Returns whether membership changed.
 pub(super) fn attach_new_thread_to_project(
     relay: &mut RelayState,
     thread_id: &str,

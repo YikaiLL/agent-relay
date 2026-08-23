@@ -55,9 +55,8 @@ function trigger(host) {
   return host.querySelector(".project-switcher-trigger");
 }
 
-// A project row is now a label plus an activity subtitle plus a tick, so its raw
-// textContent concatenates all three. Read the label element when there is one;
-// the action rows (create / rename / delete) are still plain text buttons.
+// A row's textContent now concatenates label, subtitle and tick; the action rows
+// are still plain text buttons.
 function optionLabel(node) {
   return node.querySelector(".project-switcher-option-label")?.textContent ?? node.textContent;
 }

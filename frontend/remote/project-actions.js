@@ -47,27 +47,15 @@ export const renameRemoteThread = (threadId, name) =>
     input: { name: name ?? null },
   });
 
-/**
- * The git standing of a workspace path, for the launch dialog's `main · clean` chip.
- *
- * Read-only and not claim-gated, like `fetch_projects` and `fetch_workspace_diff`: a
- * paired device must be able to see what it is about to launch into without taking
- * control of whatever session happens to be running. Filed here rather than in
- * session-ops.js because it is a launch-dialog concern, not a session-lifecycle one.
- */
+// Not claim-gated: a paired device must see what it is about to launch into
+// without taking control of whatever session is running.
 export async function fetchRemoteWorkspaceGitContext(cwd) {
   const result = await dispatchOrRecover("fetch_workspace_git_context", { cwd });
   return result?.workspace_git_context || null;
 }
 
-/**
- * The settings a fork of `threadId` would inherit.
- *
- * Read-only and not claim-gated, like the other fetches here. Its own action
- * rather than reusing the transcript response — which also carries settings —
- * because that one pays a provider page fetch and a runtime hydration to answer
- * a question the relay can answer from an in-memory map.
- */
+// Its own action rather than the transcript response, which also carries settings
+// but pays a provider fetch to produce them.
 export async function fetchRemoteThreadSettings(threadId) {
   const result = await dispatchOrRecover("fetch_thread_settings", { thread_id: threadId });
   return result?.thread_settings || null;

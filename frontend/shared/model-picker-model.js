@@ -1,22 +1,10 @@
-// The merged Provider+Model picker's option model.
-//
-// The launch dialogs used to carry two dropdowns, Provider and Model, in that
-// order. That is one step more than the decision actually has: nobody chooses a
-// vendor as an act separate from choosing a model, and the pair could be left
-// inconsistent in between (a Codex model id showing under Claude) which the fork
-// dialog then had to defend against.
-//
-// So the control is one menu, grouped by provider, and picking a model reports
-// BOTH values at once. The consistency rule that used to live in field-change
-// handlers becomes structural: an option cannot name a model without also naming
-// the provider whose catalog it came from.
+// One menu grouped by provider, so an option cannot name a model without also
+// naming the catalogue it came from — the pair can never go inconsistent.
 
 import { buildModelSelectOptions } from "./composer.js";
 import { providerLabel } from "./provider-labels.js";
 
-// Shown when the dialog holds no explicit model — the relay will resolve the
-// provider's default. Saying "default" is honest about that; naming a concrete
-// model would claim a choice the request does not actually carry.
+// Naming a concrete model here would claim a choice the request does not carry.
 const DEFAULT_MODEL_LABEL = "default";
 
 function catalogFor(providerModels, provider) {
@@ -36,10 +24,8 @@ export function buildModelPickerGroups({
   return (providers || []).map((provider) => {
     const models = catalogFor(providerModels, provider);
     const isSelectedProvider = provider === selectedProvider;
-    // Only the SELECTED provider's group gets the current value forced into it.
-    // Passing it to every group would surface a Claude id under Codex — the exact
-    // cross-provider leak `buildModelSelectOptions`' `allowForeign: false` mode
-    // exists to prevent — and would tick two rows for one choice.
+    // Only the SELECTED provider's group: passing it to every group would surface
+    // a Claude id under Codex and tick two rows for one choice.
     const { options } = buildModelSelectOptions(
       models,
       isSelectedProvider ? selectedModel : "",
@@ -55,13 +41,8 @@ export function buildModelPickerGroups({
     }));
 
     return {
-      // `empty` marks a provider whose catalogue has not arrived (cold worker,
-      // failed fetch) — but the group still gets a CHOOSABLE row. Rendering the
-      // provider with zero options and a "No models available" note read as
-      // "offered but disabled", and stranded the user on their current provider
-      // even though the relay is perfectly able to start that one on its own
-      // default model. The row carries an empty model id, which is exactly what
-      // "let the relay resolve it" looks like on the wire.
+      // A cold catalogue still gets a CHOOSABLE row carrying an empty model id:
+      // zero options read as "offered but disabled" and stranded the user.
       empty: rendered.length === 0,
       label: providerLabel(provider),
       options: rendered.length
@@ -80,9 +61,7 @@ export function buildModelPickerGroups({
   });
 }
 
-// What the closed pill reads: "Claude · Opus 4.6", plus the "default" tag when
-// the chosen model is the provider's default. Provider and model together,
-// because after the merge the pill is the only thing naming the provider at all.
+// After the merge this pill is the only thing naming the provider, so it says both.
 export function selectedModelChip({
   providerModels = {},
   selectedModel = "",

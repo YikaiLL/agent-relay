@@ -3,12 +3,8 @@ import assert from "node:assert/strict";
 
 import { buildModelPickerGroups, selectedModelChip } from "./model-picker-model.js";
 
-// The launch dialogs merge the Provider and Model dropdowns into ONE control:
-// a menu grouped by provider, where picking a model implies its provider. That
-// removes a step (nobody wants to choose a vendor and then a model as separate
-// acts) but it moves a real invariant into this file — the pair the dialog
-// submits must always be consistent, and the currently-selected model must stay
-// visible in the menu even when its catalog is stale, empty, or still loading.
+// Merging the two dropdowns moves a real invariant here: the submitted pair must
+// stay consistent, and the current model must stay visible in a stale catalogue.
 
 const CLAUDE = [
   { model: "claude-opus-4-6", display_name: "Opus 4.6", is_default: true },
@@ -77,9 +73,7 @@ test("exactly one option is selected, and it is the one in the chosen provider's
 });
 
 test("an id that exists in two catalogs only selects under the chosen provider", () => {
-  // The merged menu makes this reachable in a way the old two-dropdown UI never
-  // was: the same model id under two providers would otherwise light up twice
-  // and the dialog would have two answers for "what did the user pick".
+  // Only reachable since the merge: two lit rows would be two answers.
   const groups = buildModelPickerGroups({
     providerModels: {
       claude_code: [{ model: "shared-id", display_name: "Shared" }],
@@ -113,10 +107,8 @@ test("the default model is tagged so the menu says which one you would get", () 
 });
 
 test("a selected model missing from its catalog is still listed, so the choice is visible", () => {
-  // Cold catalog, or a model the relay resolved that the client has not fetched
-  // yet. Dropping it would show a menu where nothing is ticked while the dialog
-  // is holding a real value — the user then re-picks and changes their session
-  // by accident.
+  // Dropping it would tick nothing while the dialog holds a real value, so the
+  // user re-picks and changes their session by accident.
   const groups = buildModelPickerGroups({
     providerModels: { claude_code: [], codex: CODEX },
     providers: PROVIDERS,
@@ -131,11 +123,8 @@ test("a selected model missing from its catalog is still listed, so the choice i
 });
 
 test("a provider with no catalog yet is still CHOOSABLE, not just visible", () => {
-  // The title used to claim this while the assertion only checked the option
-  // list was empty — so the menu rendered the provider with nothing to click and
-  // an inert "No models available" note. A cold or failed catalogue must not
-  // strand the user on their current provider: the relay can start that provider
-  // on its own default, and an empty model id is exactly how you ask for that.
+  // A cold catalogue must not strand the user on their current provider: the relay
+  // can start it on its own default, and an empty model id asks for exactly that.
   const groups = buildModelPickerGroups({
     providerModels: { claude_code: CLAUDE },
     providers: PROVIDERS,
@@ -206,12 +195,8 @@ test("with no model chosen the chip says so instead of naming a provider alone",
 });
 
 test("a provider the relay does not offer produces no group to pick from", () => {
-  // The shape of a bug found by driving the real app: the launch draft defaults
-  // to "codex", but a relay running only `fake` has no such provider. The dialog
-  // happily rendered a Codex chip and the start failed with "agent provider
-  // 'codex' is not available". The picker cannot fix that by itself — the host
-  // has to repair the draft against the available list — but it must at least
-  // not invent a group for a provider that was never offered.
+  // The host repairs the draft; the picker must at least not invent a group for a
+  // provider the relay never offered.
   const groups = buildModelPickerGroups({
     providerModels: { fake: [{ model: "fake-echo", display_name: "Fake Echo" }] },
     providers: ["fake"],

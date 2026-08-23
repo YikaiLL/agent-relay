@@ -1,14 +1,5 @@
-// The Fork dialog's behaviour contract.
-//
-// Replaces fork-session-dialog.test.mjs, which asserted on the previous markup
-// (a `control-hint` source line, native `<select>`s, a free-text workspace
-// input). The dialog now shares its chassis with New session; what stays
-// fork-specific is inheritance, and that is what most of this file is about.
-//
-// The rule underneath it all: a field the user has NOT touched is sent as null
-// so the relay resolves it from the SOURCE thread. Showing a concrete value for
-// such a field would be a lie about the request, which is why "inherited" is a
-// visually distinct state rather than a pre-selected option.
+// The dialog shares its chassis with New session; what stays fork-specific is
+// inheritance, and that is what most of this file pins.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
@@ -27,9 +18,7 @@ const { ForkSessionDialog } = await import("./shared/fork-session-dialog.js");
 const { INHERIT, FORK_PROJECT_NONE, forkFieldsToPayload } = await import(
   "./shared/fork-fields.js"
 );
-// Imported, not spelled out: `header-labels.test.mjs` guards that this string is
-// assigned in exactly one module, and a second copy here is precisely the drift
-// that guard exists to catch.
+// Imported, not spelled out: `header-labels.test.mjs` guards the single definition.
 const { DEFAULT_WORKSPACE_LABEL } = await import("./shared/project-labels.js");
 
 const PROVIDER_MODELS = {
@@ -130,9 +119,7 @@ test("the source card names the thread and when it was last active", () => {
 });
 
 test("the source card carries no message count, because the relay has no honest one", () => {
-  // The relay witnesses only the history it has loaded; for a provider-paged
-  // Claude thread that is a fraction of the conversation. Any number here would
-  // be a floor presented as a total.
+  // The relay sees only loaded history, so any number would be a floor as a total.
   const view = mount();
   assert.doesNotMatch(view.host.querySelector(".fork-source-card").textContent, /message/i);
   view.cleanup();
@@ -176,9 +163,7 @@ test("a cross-provider fork is badged as a replay, and says what is lost", () =>
 });
 
 test("untouched settings render as inherited, not as a concrete value", () => {
-  // The visual distinction IS the contract: an inherited field is sent as null
-  // and resolved from the source, which is a different request from choosing the
-  // same value explicitly.
+  // The visual distinction IS the contract: inherited is sent as null.
   const view = mount();
   const inherited = [...view.host.querySelectorAll(".setting-pill.is-inherited")].map(
     (n) => n.querySelector(".setting-pill-label").textContent
@@ -205,10 +190,8 @@ test("a same-provider fork offers the inherit option for model and effort", () =
 });
 
 test("a cross-provider fork withdraws inherit for model and effort", () => {
-  // The relay only resolves model/effort from the source when the provider is
-  // unchanged — a Codex model id means nothing to Claude, and effort levels are
-  // model-specific. Offering inherit there would promise something that never
-  // happens.
+  // The relay only resolves these from the source when the provider is unchanged,
+  // so offering inherit here would promise something that never happens.
   const view = mount({ fields: baseFields({ provider: "codex", model: "gpt-5.5" }) });
 
   click(view.host.querySelector("#test-fork-model"));
@@ -252,9 +235,7 @@ test("fork is blocked without a source or a workspace", () => {
 });
 
 test("Fork submits the NORMALIZED fields, not the raw draft", () => {
-  // After a provider change the raw state can still hold the withdrawn empty
-  // "inherit" value: the user sees a concrete model while the relay would
-  // resolve its own.
+  // After a provider change the raw state can still hold the withdrawn inherit.
   const view = mount({ fields: baseFields({ provider: "codex", model: INHERIT }) });
 
   click(view.host.querySelector("#test-fork-submit"));

@@ -110,9 +110,7 @@ impl AppState {
                     model = relay.model.clone();
                 }
             }
-            // File the new thread into the project the dialog chose, before the
-            // notify() below, so the first snapshot clients see already reflects
-            // it and the session does not visibly jump groups.
+            // Before the notify() below, so the session does not visibly jump groups.
             if let Some(project_id) = non_empty(input.project_id.clone()) {
                 if super::projects::attach_new_thread_to_project(
                     &mut relay,

@@ -25,18 +25,14 @@ export function formatTimestamp(seconds) {
   });
 }
 
-// `nowSeconds` is an optional clock injection, defaulting to the real one so
-// every existing caller is unaffected. It exists so callers that are themselves
-// pure — the project picker's row model — can be tested against a fixed instant
-// instead of against whenever the suite happens to run.
+// Optional clock injection, so pure callers can be tested against a fixed instant.
 export function formatRelativeTime(seconds, nowSeconds = null) {
   if (!seconds) {
     return "now";
   }
 
-  // `nowSeconds == null` must be tested BEFORE coercing: Number(null) is 0, which
-  // is finite, so a finiteness check alone pinned "now" to the epoch and made
-  // every timestamp read as "now" (the diff went negative and clamped to zero).
+  // Tested BEFORE coercing: Number(null) is 0 and finite, so a finiteness check
+  // alone pinned "now" to the epoch and made every timestamp read as "now".
   const injected = nowSeconds == null ? NaN : Number(nowSeconds);
   const now = Number.isFinite(injected) ? injected : Math.floor(Date.now() / 1000);
   const diffSeconds = Math.max(0, now - Number(seconds));

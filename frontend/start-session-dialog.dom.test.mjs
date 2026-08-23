@@ -1,15 +1,5 @@
-// The New session dialog's behaviour contract.
-//
-// Replaces start-session-dialog.test.mjs, which asserted on the previous
-// markup — a `<datalist>`, four native `<select>`s, and the unprefixed element
-// ids local's submit path used to read. All three are gone by design: the
-// workspace is a combobox (a `<datalist>` option cannot carry a git chip), the
-// settings are pills (an `<option>` cannot carry a "default" tag or a provider
-// heading), and local no longer reads the DOM at submit time.
-//
-// The invariants that survived the redesign are re-pinned here, plus the ones
-// the redesign introduced. jsdom rather than SSR because the menus are now
-// interactive: their contents do not exist until opened.
+// jsdom rather than SSR: the menus are interactive now, so their contents do not
+// exist until opened.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
@@ -98,11 +88,8 @@ const click = (node) =>
     node.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
   });
 
-// React stores the last value it wrote on the DOM node and compares against it
-// to decide whether an input event is a real change. Assigning `.value` directly
-// updates the node but not React's record, so the event is swallowed and the
-// component never sees the edit. Writing through the prototype's setter is the
-// supported way to simulate typing.
+// React compares against the last value it wrote, so a direct `.value` assignment
+// is swallowed. The prototype setter is the supported way to simulate typing.
 function type(node, value) {
   const setter = Object.getOwnPropertyDescriptor(
     dom.window.HTMLInputElement.prototype,
@@ -144,11 +131,8 @@ test("the model menu groups every provider's models under a heading", () => {
 });
 
 test("choosing a model reports the provider WITH it, in one selection", () => {
-  // The invariant that replaces the old provider→model cascade, and the reason
-  // this is its own callback rather than two onFieldChange calls: effort levels
-  // are per-model, so the host has to resolve provider, model and effort
-  // together. Two sequential field changes cannot be — the second reads
-  // catalogues from the render before the first.
+  // Its own callback because effort is per-model: two sequential field changes
+  // cannot be resolved together, the second reads a stale render.
   const view = mount();
   openPill(view.host, "model");
   click(
@@ -200,9 +184,7 @@ test("a workspace that is not a repo shows no git chip rather than an empty one"
 });
 
 test("a typed workspace path is reported on Enter", () => {
-  // The combobox exists precisely so a directory the relay has never seen can
-  // still be launched into. Losing free text would be a capability regression
-  // over the `<datalist>` it replaced.
+  // Losing free text would be a capability regression over the old `<datalist>`.
   const view = mount();
   click(view.host.querySelector(".workspace-picker-trigger"));
   const input = view.host.querySelector(".workspace-picker-input");
@@ -243,10 +225,8 @@ test("choosing a project reports it as a field, like every other setting", () =>
 });
 
 test("requireInitialPrompt gates Claude, and both hosts opt out of it", () => {
-  // The relay supports DEFERRED start: a Claude session with no initial prompt is
-  // promoted on the first composer message. Both surfaces therefore pass
-  // requireInitialPrompt: false, and local not doing so was a regression that
-  // disabled Start for an empty Claude prompt on one surface only.
+  // The relay promotes a promptless Claude session on its first message, so both
+  // surfaces pass requireInitialPrompt: false.
   const optedOut = mount({ requireInitialPrompt: false });
   assert.equal(
     optedOut.host.querySelector("#test-dialog-start").disabled,
@@ -277,9 +257,8 @@ test("an empty workspace blocks the start", () => {
 });
 
 test("Start closes the dialog BEFORE invoking onStart", () => {
-  // Survives from the old suite. The host's start is async and re-renders the
-  // surface underneath; closing afterwards left the dialog visibly hanging over
-  // a session that had already begun.
+  // The host's start is async and re-renders underneath; closing afterwards left
+  // the dialog hanging over a session that had already begun.
   const order = [];
   const view = mount({
     fields: baseFields({ initialPrompt: "go" }),

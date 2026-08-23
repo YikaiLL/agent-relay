@@ -55,9 +55,7 @@ export function ProjectSwitcher({
   onRenameProject = null,
   onSelectProject = null,
   projects = [],
-  // Live signals for the rows' second line ("4 sessions · 2 running"). All
-  // optional: a surface that has not wired them up yet still gets names, just
-  // without the activity summary.
+  // Live signals for the rows' second line; all optional.
   threads = [],
   threadProjectId = {},
   threadActivity = null,

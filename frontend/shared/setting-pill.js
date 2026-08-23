@@ -1,20 +1,5 @@
-// One settings control in the launch dialogs: a pill that names its setting and
-// its current value, and opens a menu of the alternatives.
-//
-// It replaces a labelled `<select>` per setting. The reason is not decoration —
-// a native `<option>` can only render a single string, and three things the
-// dialogs need to say do not fit in one:
-//
-//   * "default" / "inherited" tags beside a value, so the user can see which
-//     choices they have actually made and which are being resolved for them.
-//   * A provider heading above a group of models, now that Provider and Model
-//     are one control.
-//   * A per-row subtitle explaining what a permission level actually permits.
-//
-// The pill also renders in an INHERITED state (dashed) for the fork dialog,
-// where a field the user has not touched is deliberately sent as null so the
-// relay resolves it from the source thread. That state has to be visually
-// distinct from a chosen value, because the two produce different requests.
+// Replaces a labelled `<select>`: a native `<option>` renders one string, with
+// nowhere for a tag, a provider heading, or a per-row subtitle.
 
 import React, { useCallback, useId, useRef, useState } from "react";
 
@@ -80,9 +65,7 @@ export function SettingPill({
               section.label
                 ? h("div", { className: "setting-pill-section-heading" }, section.label)
                 : null,
-              // A catalogue-less provider still renders a choosable row (see
-              // buildModelPickerGroups), so this is a NOTE beside it, not a
-              // replacement for it.
+              // A note beside the choosable row, not a replacement for it.
               section.empty
                 ? h(
                     "div",

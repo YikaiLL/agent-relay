@@ -661,13 +661,8 @@ async fn workspace_diff(
         .map_err(|error| classify_session_error(error))
 }
 
-/// Query for `/api/workspace/git-context`.
-///
-/// `cwd` is REQUIRED and caller-supplied — that is the whole point of the endpoint (the
-/// launch dialog asks about a directory before any session owns it), and the reason
-/// `AppState::workspace_git_context` runs a scope check before it spawns anything. There
-/// is deliberately no fallback to the relay's active cwd: silently answering about a
-/// different directory than the one the user is looking at is worse than an error.
+/// `cwd` is required and caller-supplied: no fallback to the relay's active cwd,
+/// because answering about a different directory is worse than an error.
 #[derive(Debug, Deserialize)]
 struct WorkspaceGitContextQuery {
     cwd: String,
@@ -685,11 +680,8 @@ async fn workspace_git_context(
         .workspace_git_context(None, query.cwd)
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
-        // Both failures this can produce (out of scope, empty path) are the CALLER's,
-        // so they are 400s. Routing them through `classify_session_error` would file the
-        // scope refusal under `bad_gateway`, because its message is deliberately generic
-        // and matches none of that function's markers — reporting a client mistake as a
-        // relay fault, and inviting a client to retry it.
+        // Both failures are the caller's, so 400. `classify_session_error` would file
+        // the scope refusal as `bad_gateway` — a client mistake reported as ours.
         .map_err(bad_request)
 }
 

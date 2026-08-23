@@ -166,10 +166,8 @@ test("WorkspaceHeading can show a ready-toned important status", () => {
   assert.match(markup, /Approval/);
 });
 
-// Provider and Model are ONE control now, so the two `remote-launch-*` selects
-// this used to pin are gone. What remains worth pinning at this layer is that
-// remote hands the dialog the shape it expects: the whole per-provider catalog
-// map rather than one flattened list, and its own dialog id.
+// What is worth pinning at this layer: remote hands the dialog the whole
+// per-provider catalogue map rather than one flattened list.
 test("SessionPanel wires remote's per-provider catalogs into the merged model pill", () => {
   const markup = renderToStaticMarkup(
     h(SessionPanel, {

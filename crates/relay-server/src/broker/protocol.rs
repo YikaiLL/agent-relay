@@ -122,11 +122,8 @@ pub(super) enum OutboundBrokerPayload {
         thread_entry_detail: Option<ThreadEntryDetailResponse>,
         thread_transcript: Option<ThreadTranscriptResponse>,
         workspace_diff: Option<crate::protocol::WorkspaceDiffResponse>,
-        /// The `fetch_workspace_git_context` payload (branch + dirty for one path).
-        /// Carried here for the same reason `reviews` and `projects` are: the sealed
-        /// path serializes `RemoteActionResultPlaintext` wholesale, so a field missing
-        /// from THIS variant is silently dropped on the plaintext path only — the
-        /// failure mode is a chip that works when sealed and is blank when not.
+        /// Missing from THIS variant means dropped on the plaintext path only —
+        /// the same silent-drop trap `reviews` and `projects` each fell into.
         workspace_git_context: Option<crate::protocol::WorkspaceGitContextView>,
         /// Same plaintext-vs-sealed asymmetry as the fields above: absent here and
         /// the fork dialog's settings arrive only on sealed transport.

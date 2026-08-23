@@ -28,9 +28,7 @@ const h = React.createElement;
 
 const INHERIT_LABEL = "Inherit from source";
 
-// A thread's preview can be its entire first message — a replay-fork handoff blob
-// or a reviewer prompt runs to tens of thousands of characters. Rendering that in
-// the source card overflowed the dialog before the fork was even created.
+// A preview can be a whole handoff blob — tens of thousands of characters.
 const MAX_SOURCE_LABEL_CHARS = 80;
 function forkSourceLabel(sourceThread) {
   const raw = sourceThread?.name || sourceThread?.preview || sourceThread?.id || "session";
@@ -60,11 +58,8 @@ const BRANCH_ICON = h(
   h("path", { d: "M6 8.4v7.2M8.4 6h4.2a3 3 0 0 1 3 3v.4" })
 );
 
-// A field the user has not touched is sent as null on purpose, so the relay
-// resolves it from the SOURCE thread. That is a different request from choosing
-// the same value explicitly, which is why the pill renders it as a distinct
-// (dashed, tagged) state rather than showing a concrete value that would be a
-// lie about what will be sent.
+// An untouched field is sent as null so the relay resolves it — a different
+// request from choosing the same value, so it gets a distinct (dashed) state.
 function inheritedPill({ inheritable, value }) {
   const isInherited = inheritable && value === INHERIT;
   return {
@@ -110,9 +105,7 @@ export function ForkSessionDialog({
   const sourceProvider = sourceThread?.provider || "";
   const targetProvider = fields.provider || sourceProvider;
   const inheritable = forkInheritableFields({ sourceProvider, targetProvider });
-  // Normalize at render time so a catalog that arrives asynchronously seeds the
-  // field too — a provider switch made before the models load would otherwise
-  // leave the picker holding a value it never offers.
+  // At render time, so a catalogue arriving asynchronously seeds the field too.
   const shownFields = normalizeForkFields(fields, {
     sourceProvider,
     models: providerModels[targetProvider] || [],
@@ -185,10 +178,8 @@ export function ForkSessionDialog({
           h(SubmitShortcutHint)
         ),
       ],
-      // The badge says whether context survives; the footer says where the branch
-      // lands. Both are honest about what the relay actually does: a fork runs in
-      // the source's cwd unless told otherwise — it does NOT get its own worktree,
-      // so the source and the branch share a working tree and can collide.
+      // A fork gets no worktree: it runs in the source's cwd, so the two share a
+      // working tree and can collide.
       badge: h(
         "span",
         {
@@ -218,10 +209,8 @@ export function ForkSessionDialog({
           { className: "fork-source-meta" },
           [
             fields.upToItemId ? "from a message mid-session" : null,
-            // No message count: the relay has no honest one. It witnesses only
-            // what it has loaded, which for a provider-paged Claude thread is a
-            // fraction of the history — so any number here would be a floor
-            // presented as a total. `updated_at` is server-corrected and real.
+            // No message count: the relay sees only loaded history, so any number
+            // would be a floor presented as a total.
             sourceThread?.updated_at
               ? `last active ${formatRelativeTime(sourceThread.updated_at)}`
               : null,
@@ -277,10 +266,8 @@ export function ForkSessionDialog({
             id: initialPromptAttachmentsId,
           })
         : null,
-      // A native fork already carries the source context, so an empty prompt
-      // leaves the branch idle rather than burning a turn on a canned
-      // instruction. A replay fork always sends one (the transcript IS the
-      // prompt), which is why the hint differs.
+      // A native fork can idle; a replay fork always sends a turn (the transcript
+      // IS the prompt), hence the different hint.
       hint: lossy ? "Leave empty to replay and summarize" : "Leave empty to branch and wait",
       id: `${id}-start-prompt`,
       key: "prompt",

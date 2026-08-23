@@ -91,30 +91,16 @@ impl AppState {
             }
             (
                 relay.remembered_thread_settings(&source_thread_id),
-                // Only a project that still EXISTS is inherited: a dangling
-                // membership (project deleted elsewhere) resolves to None here,
-                // so the fork lands Unassigned rather than re-creating a ghost.
+                // A dangling membership resolves to None, so the fork lands
+                // Unassigned rather than re-creating a deleted project.
                 relay
                     .project_for_thread(&source_thread_id)
                     .map(|project| project.id.clone()),
             )
         };
 
-        // Three states, not two:
-        //   None       -> inherit the source's project
-        //   Some("id") -> file into that project
-        //   Some("")   -> explicitly unassigned
-        //
-        // The empty string is the sentinel because `None` is already spoken for by
-        // inherit, so absence cannot also mean "no project" — and a fork dialog
-        // that offers "Default Workspace" has to be able to say it. `""` is safe
-        // to overload: project ids are always `proj_%016x`, so nothing legitimate
-        // produces it. Note this deliberately does NOT use `non_empty`, which
+        // Three states (see ForkSessionInput). Deliberately NOT `non_empty`, which
         // collapses `Some("")` into `None` and would silently re-inherit.
-        //
-        // Resolved once, here, so the native and replay paths file the branch
-        // identically — they diverge on everything else and this is not a place
-        // they should differ.
         let target_project_id = match input.project_id {
             Some(explicit) if explicit.is_empty() => None,
             Some(explicit) => Some(explicit),

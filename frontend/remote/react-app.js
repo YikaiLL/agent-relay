@@ -459,13 +459,8 @@ function RemoteApp() {
         remoteUiStore.getState().setProviders(normalized);
         const draftProvider = remoteUiStore.getState().sessionDraft.provider;
         if (!draftProvider || !normalized.includes(draftProvider)) {
-          // The MODEL has to move with the provider. Setting `provider` alone
-          // left a default `codex/gpt-5.5` draft as `claude_code/gpt-5.5` on a
-          // Claude-only relay — and the merged menu then surfaced that foreign
-          // id as the selected option, so it was submitted verbatim.
-          // providerDraftPatch re-derives model, effort and approval together;
-          // with the catalogue still cold it lands on the provider's static
-          // default, which the catalogue effect below then refines.
+          // The MODEL must move with the provider: `provider` alone left a
+          // `codex/gpt-5.5` draft as `claude_code/gpt-5.5` on a Claude-only relay.
           remoteUiStore
             .getState()
             .patchSessionDraft(
@@ -495,12 +490,8 @@ function RemoteApp() {
     };
   }, [currentState.remoteAuth?.relayId, currentState.remoteAuth?.payloadSecret]);
 
-  // Probe the chosen directory's git standing for the launch dialog's chip.
-  //
-  // Debounced and generation-guarded for the same two reasons local is: the
-  // workspace field is free text, so a probe per keystroke would spawn a git
-  // subprocess per character on the HOST, and out-of-order replies would label
-  // the current directory with a previous one's branch.
+  // Debounced and generation-guarded: the field is free text, so a probe per
+  // keystroke would spawn a git subprocess per character on the HOST.
   const launchCwd = remoteUi.sessionDraft?.cwd || "";
   useEffect(() => {
     if (!currentState.remoteAuth?.payloadSecret) return undefined;
@@ -853,19 +844,14 @@ function RemoteApp() {
     approvalOptions: selectedProviderSettings.approvalOptions,
     hasRemoteAuth: hasRelay,
     hasUsableRelay,
-    // The merged Model pill lists EVERY provider's catalog, so it takes the
-    // provider list and the whole per-provider map rather than one flattened
-    // array for the selected provider. Remote pre-fetches all of them on
-    // connect, so this is already populated by the time the dialog opens.
+    // The merged pill lists EVERY provider's catalogue, not one flattened array.
     gitContext: remoteUi.launchGitContext,
     providers: remoteUi.providers,
     providerModels: remoteUi.providerModels,
     // Still needed by the sidebar split button's agent menu, which starts a
     // session AS a provider without opening the dialog.
     providerOptions: providerOptions(remoteUi.providers),
-    // Project membership for the launch dialog's project chip. The default is
-    // the project the UI is currently in — set on the draft, not derived here,
-    // so an explicit choice in the dialog survives a re-render.
+    // Set on the draft, not derived here, so an in-dialog choice survives a render.
     projects: remoteProjects.projects,
     threads: currentState.threads,
     threadProjectId: remoteProjects.threadProjectId,
@@ -1654,18 +1640,12 @@ function RemoteApp() {
     // nothing else fetches that catalog — without this the model select sits
     // on "Loading models..." forever.
     void ensureRemoteProviderModels(thread.provider);
-    // Ask what a fork of THIS thread would inherit, so the pills show real values
-    // rather than an abstract "inherit". Not awaited: the dialog opens on
-    // inherited fields and re-seeds when the answer lands.
+    // Not awaited: the dialog opens on inherited fields and re-seeds when this lands.
     void refreshRemoteForkSourceSettings(thread.id);
   }
 
-  // Re-seed the fork dialog with the source thread's own recorded settings.
-  //
-  // Only fields the user has NOT touched are replaced: INHERIT is the untouched
-  // marker, so anything else is a real choice and outranks a late answer. Guarded
-  // on the dialog still showing the same source, because it can be closed and
-  // reopened on another thread while the request is in flight.
+  // Only untouched (INHERIT) fields are replaced, and only while the dialog still
+  // shows the same source — it can be reopened on another thread mid-flight.
   async function refreshRemoteForkSourceSettings(threadId) {
     try {
       const settings = await fetchRemoteThreadSettings(threadId);
@@ -2374,9 +2354,7 @@ function RemoteApp() {
             threads: currentState.threads,
           }),
           onSelectModel: ({ provider, model }) => {
-            // Provider + model + effort together, and NOT re-resolving effort for
-            // the inherit row: an untouched field is deliberately sent as null so
-            // the relay reads it off the source thread.
+            // Not re-resolving effort for the inherit row: that one stays null.
             const catalog = remoteUi.providerModels[provider] || [];
             handleForkFieldChange("provider", provider);
             handleForkFieldChange("model", model);
@@ -2475,10 +2453,8 @@ function findThreadNameInGroups(groups, threadId) {
 // controls now perform this switch — the dialog's own select and the sidebar split
 // button's menu — and they must not drift.
 function openRemoteStartSessionDialog(activeProjectId = null) {
-  // Seed the project chip from wherever the user currently IS, at open time
-  // rather than at render time. Doing it on every render would fight an explicit
-  // choice made inside the dialog: the user picks another project, the surface
-  // re-renders for an unrelated reason, and the chip snaps back.
+  // At open time, not per render: otherwise an unrelated re-render snaps the chip
+  // back over a choice made inside the dialog.
   remoteUiStore.getState().setSessionDraftField("projectId", activeProjectId || null);
   document.getElementById("remote-start-session-dialog")?.showModal();
 }
@@ -2740,12 +2716,8 @@ function RemoteSidebar({
     h(SessionPanel, {
         model: sessionPanelModel,
         onSelectModel({ provider, model }) {
-          // One patch, not two field changes. Effort levels are per MODEL, and
-          // the second of two sequential callbacks would still be reading the
-          // catalogue from the render before the first — so a Codex `xhigh`
-          // could survive onto a Claude model that never offered it, and the
-          // relay honours an explicitly supplied effort rather than correcting
-          // it.
+          // One patch: effort is per MODEL, and the second of two sequential
+          // callbacks would still be reading the previous render's catalogue.
           const uiState = remoteUiState;
           const catalog = uiState.providerModels[provider] || [];
           const patch =

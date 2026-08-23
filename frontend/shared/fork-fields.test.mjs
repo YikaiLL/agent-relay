@@ -75,11 +75,8 @@ test("model is never seeded from a different provider's session", () => {
 });
 
 test("the live session's model never leaks into a fork of a different provider", () => {
-  // The invariant this has always been about: forking a Claude thread while a
-  // Codex session is open must not put `gt-5.3-codex` on the Claude fork. It used
-  // to be enforced by seeding a concrete model from the TARGET catalogue; the
-  // default is now inherit-from-source, which enforces it more directly — the
-  // request carries no model at all and the relay reads the source thread's.
+  // Inherit-from-source enforces this more directly than the old target-catalogue
+  // seeding: the request carries no model at all.
   const fields = defaultForkFields({
     thread: { provider: "claude_code" },
     models: CLAUDE_MODELS,
@@ -504,10 +501,8 @@ test("the drop rule stays anchored to the `msg_` prefix, not to a substring", ()
 });
 
 test("fork payload omits project_id entirely when the field is untouched", () => {
-  // Absence is INHERIT on the wire (see ForkSessionInput). It is therefore the
-  // only correct thing to send for a fork whose project the user never touched —
-  // sending null would read as "explicitly unassigned" if the sentinel were ever
-  // relaxed, and sending the source's id would defeat server-side resolution.
+  // Absence is INHERIT on the wire; sending the source's id would defeat
+  // server-side resolution.
   const payload = forkFieldsToPayload({ sourceThreadId: "t1" });
   assert.equal("project_id" in payload, false);
 });
@@ -518,23 +513,14 @@ test("fork payload carries an explicitly chosen project", () => {
 });
 
 test("choosing the default workspace sends the explicit-unassigned sentinel", () => {
-  // The three states are: absent = inherit, "id" = that project, "" = no project.
-  // Null is NOT usable for the third, because absent already means inherit — so
-  // a fork could otherwise never be moved OUT of its source's project.
+  // Null is not usable for the third state — absent already means inherit.
   const payload = forkFieldsToPayload({ sourceThreadId: "t1", projectId: FORK_PROJECT_NONE });
   assert.equal(payload.project_id, "");
 });
 
 test("a fresh fork inherits the model, like every other untouched setting", () => {
-  // The dialog opens on the SOURCE's provider, so model is inheritable and the
-  // relay resolves it from the source thread. Seeding a concrete model here made
-  // "Inherit from source" a setting you could only ever opt back INTO, and meant
-  // forking a thread on a non-default model silently moved it to the catalogue
-  // default — the exact drift `forkInheritableFields` exists to prevent.
-  //
-  // Safe precisely because it is same-provider: `normalizeForkFields` fills a
-  // concrete model the moment a provider change withdraws the inherit option, so
-  // a cross-provider fork still never carries a foreign id.
+  // Seeding a concrete model moved a thread on a non-default model onto the
+  // catalogue default. Cross-provider stays safe via `normalizeForkFields`.
   const fields = defaultForkFields({
     thread: { id: "t1", provider: "claude_code", cwd: "/repo" },
     models: [
@@ -560,10 +546,8 @@ test("a fork whose provider changed still gets a concrete model, never a foreign
 });
 
 test("known source settings are seeded as REAL values, not as inherit", () => {
-  // The point of the change: a user should see the model and effort the fork will
-  // actually run with, not an abstract "inherit" they have to reason about. The
-  // values are the SOURCE thread's own, fetched for that thread — never the live
-  // session's, which is the hazard this file's header comment was written about.
+  // The SOURCE thread's own values, fetched for that thread — never the live
+  // session's, which is the hazard the header comment describes.
   const fields = defaultForkFields({
     thread: { id: "t1", provider: "claude_code", cwd: "/repo" },
     sourceSettings: {
@@ -586,10 +570,8 @@ test("known source settings are seeded as REAL values, not as inherit", () => {
 });
 
 test("settings the relay never recorded stay inherited rather than inventing history", () => {
-  // `remembered: false` means the relay has no record and returned its own
-  // defaults. A fork WOULD get them, but presenting them as the source's choices
-  // would be inventing a decision the user never made — so the field falls back
-  // to inherit and the relay resolves it, exactly as before.
+  // Relay defaults, not the source's choices: presenting them as chosen would
+  // invent a decision, so the field falls back to inherit.
   const fields = defaultForkFields({
     thread: { id: "t1", provider: "claude_code" },
     sourceSettings: {

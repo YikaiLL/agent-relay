@@ -15,22 +15,8 @@ import {
 
 const h = React.createElement;
 
-// The New session dialog.
-//
-// Two structural changes from the version this replaces, both of which move work
-// out of the user's way rather than rearranging it:
-//
-//  * Provider and Model are ONE control. Picking a model implies its provider,
-//    so the pair can no longer be left inconsistent and the dialog is one
-//    decision shorter. See model-picker-model.js.
-//  * The prompt is the largest element instead of the last. It is the only field
-//    most launches fill in; it used to sit under four dropdowns.
-//
-// The dialog is fully CONTROLLED — every value arrives in `fields` and every
-// change leaves through `onFieldChange`. The local surface used to read its
-// values back off the DOM by element id at submit time; that is gone, and
-// `frontend/local/session/start-session-payload.test.mjs` pins the request body
-// across the change.
+// Fully controlled: every value arrives in `fields` and leaves through
+// `onFieldChange`. `start-session-payload.test.mjs` pins the resulting request.
 export function StartSessionDialog({
   approvalOptions = [],
   effortOptions = [],
@@ -42,12 +28,8 @@ export function StartSessionDialog({
   modelsStatus = "ready",
   onCreateProject = null,
   onFieldChange = null,
-  // Model selection is reported through its OWN callback, not as two
-  // onFieldChange calls. Provider, model and effort have to move together: the
-  // effort levels are model-specific, so a Codex `xhigh` carried onto a Claude
-  // model that only offers high/max is submitted verbatim and the relay honours
-  // it. Two sequential field changes cannot be resolved atomically by either
-  // host — the second one reads catalogues from the render before the first.
+  // Its own callback, not two onFieldChange calls: provider, model and effort must
+  // move together, and the second of two sequential calls reads a stale render.
   onSelectModel = null,
   onRequestClose = null,
   onStart = null,
@@ -123,11 +105,8 @@ export function StartSessionDialog({
           h(SubmitShortcutHint)
         ),
       ],
-      // Honest copy. Sessions do NOT run in a fresh worktree — only Task-team
-      // runs provision one (state/app/worktree.rs is called solely from
-      // start_team_run). Saying otherwise would promise isolation the session
-      // does not have, which is exactly the promise someone would rely on before
-      // letting an agent write.
+      // Sessions do NOT get a worktree — only Task-team runs provision one — so
+      // this must not promise isolation the session does not have.
       footerHint: cwd ? `Runs in ${abbreviateHomePath(cwd)}` : "Choose a directory to run in",
       id,
       onRequestClose,
@@ -155,10 +134,8 @@ export function StartSessionDialog({
       }),
     }),
     h(PromptCard, {
-      // `hidden` is deliberately NOT set here. The host fills this mount
-      // imperatively and toggles visibility as chips come and go; letting React
-      // own the attribute meant every re-render (a keystroke in the prompt) reset
-      // it to true and hid attachments the user had just pasted.
+      // `hidden` is the host's to set: React owning it re-hid pasted attachments
+      // on the next keystroke.
       accessory: initialPromptAttachmentsId
         ? h("div", {
             "aria-live": "polite",

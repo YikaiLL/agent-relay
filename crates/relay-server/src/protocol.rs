@@ -1534,36 +1534,24 @@ pub struct WorkspaceRootView {
     pub is_main: bool,
 }
 
-/// The git standing of a workspace path, for the one-line chip next to a chosen
-/// working directory (`main · clean`).
-///
-/// Deliberately tiny and derived on demand: it answers only what the launch dialog
-/// renders, and every field degrades to a neutral value rather than an error, so a
-/// directory that is not a repo (or not there yet) is a normal answer.
+/// The git standing of a workspace path, for the launch dialog's `main · clean` chip.
+/// Every field degrades to a neutral value, so "not a repo" is a normal answer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct WorkspaceGitContextView {
-    /// The path this answer is ABOUT, normalized the same way the relay normalizes
-    /// every cwd. Echoed so a client that changed its selection while the probe was
-    /// in flight can drop a stale answer instead of labelling the new directory with
-    /// the old one's branch.
+    /// The normalized path this answers about, echoed so a client that has since
+    /// moved its selection can drop a stale reply.
     pub cwd: String,
-    /// `git rev-parse --is-inside-work-tree`. False covers "not a repo", "bare repo"
-    /// and "directory does not exist" alike — the chip has nothing to say for any of
-    /// them, and collapsing them keeps the answer from doubling as a probe.
+    /// False covers not-a-repo, bare repo and missing directory alike — collapsing
+    /// them keeps the answer from doubling as an existence probe.
     pub is_repo: bool,
-    /// Short branch name (`refs/heads/` stripped), matching `WorkspaceRootView::branch`.
-    /// `None` for a detached HEAD, for a repo with no commits yet, and for anything
-    /// that is not a repo.
+    /// Short name (`refs/heads/` stripped), matching `WorkspaceRootView::branch`.
+    /// `None` for a detached HEAD, an unborn branch, or a non-repo.
     pub branch: Option<String>,
-    /// HEAD points at a commit, not a branch. Distinct from `branch: None` because a
-    /// detached checkout is a state worth naming, and because `rev-parse --abbrev-ref
-    /// HEAD` reports it as the literal string `HEAD` — which must never reach the UI
-    /// as a branch name.
+    /// Distinct from `branch: None`: `rev-parse --abbrev-ref HEAD` reports a detached
+    /// checkout as the literal string `HEAD`, which must never render as a branch.
     pub detached: bool,
-    /// The working tree has uncommitted changes, INCLUDING untracked files. False when
-    /// clean, when this is not a repo, and when the check could not be completed —
-    /// the chip's job is to warn, so an unknown answer stays silent rather than
-    /// claiming changes that may not exist.
+    /// Uncommitted changes, untracked files included. False when unknown too: the
+    /// chip warns, so an undetermined answer stays quiet rather than inventing changes.
     pub dirty: bool,
 }
 
@@ -2427,19 +2415,8 @@ pub struct ProjectActionReceipt {
     pub message: String,
 }
 
-/// What a fork of a given thread would inherit, resolved the same way
-/// `AppState::fork_session` resolves it.
-///
-/// Exists so the fork dialog can SHOW the values instead of offering an abstract
-/// "inherit" state. `ThreadSessionSettings` cannot be reused for this: it is
-/// `pub(crate)` and shaped for the on-disk state file, and it cannot express the
-/// not-recorded case at all.
-///
-/// Deliberately NOT folded into `ThreadSummaryView`. That rides `ThreadsResponse`,
-/// which is byte-budgeted and whose over-budget response is to DROP SESSIONS from
-/// the sidebar — four settings strings on every row, to serve the one row a user
-/// forks, is the bargain the `renamed: bool` comment already declined at a
-/// fraction of the cost.
+/// What a fork of a thread would inherit, resolved exactly as `fork_session` resolves
+/// it. Not on `ThreadSummaryView`: that rides the byte-budgeted `ThreadsResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadSettingsView {
     pub thread_id: String,
@@ -2447,10 +2424,8 @@ pub struct ThreadSettingsView {
     pub reasoning_effort: String,
     pub approval_policy: String,
     pub sandbox: String,
-    /// False when the relay has no record for this thread and the values above
-    /// are its own defaults. A fork WOULD get them — `fork_session` falls back
-    /// the same way — but they are not a choice the source ever made, and a UI
-    /// that presented them as such would be inventing history.
+    /// False when these are relay defaults, not the source's own choices. A fork gets
+    /// them either way, but a UI presenting them as chosen would invent history.
     pub remembered: bool,
 }
 
@@ -2464,17 +2439,8 @@ pub struct StartSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
-    /// Project the new thread joins, chosen in the launch dialog.
-    ///
-    /// Carried on the start input rather than assigned afterwards because the
-    /// two surfaces cannot share a client-side two-step: local can read the new
-    /// thread id off its HTTP response and follow up with a `ProjectAction`,
-    /// but the broker's `start_session` returns no id, so a paired device has
-    /// nothing to assign. Resolving it here is the only place both surfaces
-    /// reach.
-    ///
-    /// `#[serde(default)]` so older clients — and every caller that does not
-    /// care — keep working unchanged; absent means Unassigned, as before.
+    /// Carried on the input rather than assigned afterwards: the broker's
+    /// `start_session` returns no thread id, so a phone has nothing to follow up on.
     #[serde(default)]
     pub project_id: Option<String>,
 }
@@ -2494,26 +2460,8 @@ pub struct ForkSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
-    /// Project the fork joins. THREE states, because two are not enough:
-    ///
-    /// | value          | meaning                                          |
-    /// |----------------|--------------------------------------------------|
-    /// | absent / null  | inherit the source thread's project (the default)|
-    /// | `"proj_…"`     | file the fork into that project                  |
-    /// | `""`           | explicitly unassigned (no project)               |
-    ///
-    /// Absence is already spoken for by *inherit* — branching a conversation
-    /// should not silently drop it out of the group it belongs to, which is what
-    /// forking did before this field existed — so it cannot also mean "no
-    /// project". Without a distinct third value a fork could never be moved OUT
-    /// of its source's project.
-    ///
-    /// The empty string is safe to overload as that third value: project ids are
-    /// always `proj_%016x` (see `create_project`), so nothing legitimate produces
-    /// it. Clients must send `""`, not null, to unassign.
-    ///
-    /// Note this differs from `StartSessionInput`, where absent means *unassigned*
-    /// — there is no source to inherit from there.
+    /// Three states: absent inherits the source's project, `"proj_…"` files it there,
+    /// `""` unassigns. Absent cannot mean "none" — inherit already owns it.
     #[serde(default)]
     pub project_id: Option<String>,
 }

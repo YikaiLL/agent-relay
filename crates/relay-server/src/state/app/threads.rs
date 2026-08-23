@@ -795,17 +795,8 @@ normal thread instead."
 }
 
 impl AppState {
-    /// What a fork of `thread_id` would inherit.
-    ///
-    /// Mirrors the resolution in `fork_session`: remembered settings when the
-    /// relay has run the thread, relay defaults otherwise. Keeping the two in one
-    /// shape is the point — a dialog that advertised different values from the
-    /// ones the fork actually uses is worse than one that says nothing.
-    ///
-    /// A plain in-memory map read: no provider round-trip, no runtime hydration.
-    /// That is why this is its own endpoint rather than a piggyback on the
-    /// transcript response, which pays a provider page fetch and a write lock to
-    /// answer the same question.
+    /// Mirrors `fork_session`'s resolution exactly. A plain in-memory map read —
+    /// which is why it is not a piggyback on the provider-backed transcript response.
     pub async fn thread_settings_view(
         &self,
         device_id: Option<String>,
@@ -813,15 +804,8 @@ impl AppState {
     ) -> Result<ThreadSettingsView, String> {
         let defaults = self.defaults().await;
         let relay = self.relay.read().await;
-        // Scope the read to the thread's own workspace: a paired device must not
-        // learn the settings of a thread it cannot see.
-        //
-        // `device_id` is OPTIONAL, matching `workspace_git_context`. The local
-        // HTTP surface is already authorized and has no device to name, so
-        // requiring one would make this endpoint unreachable from the surface
-        // that needs it most; with none, the relay's own `allowed_roots` still
-        // bind the read. Remote never hits that branch — `bind_device` stamps the
-        // id server-side before dispatch.
+        // Optional `device_id`, like `workspace_git_context`: local is already
+        // authorized and names none, and `allowed_roots` still bind the read.
         if let Some(cwd) = relay.thread_cwd(thread_id) {
             let device_scope = device_id
                 .as_deref()

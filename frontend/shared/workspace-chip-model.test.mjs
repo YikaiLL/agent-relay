@@ -3,9 +3,7 @@ import assert from "node:assert/strict";
 
 import { abbreviateHomePath, gitContextLabel } from "./workspace-chip-model.js";
 
-// Display-only transforms for the workspace chip. Everything here is about what
-// the chip READS; the value the dialog submits is never touched, because a path
-// the relay has to resolve must stay exactly what the user chose.
+// What the chip READS; the submitted value is never touched.
 
 test("a home-relative path collapses to a tilde", () => {
   assert.equal(abbreviateHomePath("/Users/luchi/git/agent-relay"), "~/git/agent-relay");
@@ -23,9 +21,7 @@ test("paths outside a home directory are left alone", () => {
 });
 
 test("a path that merely starts with the word Users is not mistaken for a home", () => {
-  // `/Usersomething/...` shares a prefix with `/Users/` but is not one. A sloppy
-  // startsWith would turn it into "~omething/x" — wrong, and wrong in a way that
-  // looks like a real path.
+  // A sloppy startsWith turns this into "~omething/x" — wrong, and plausible.
   assert.equal(abbreviateHomePath("/Usersomething/x"), "/Usersomething/x");
 });
 
