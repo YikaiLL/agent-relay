@@ -214,3 +214,28 @@ test("a draft holding an unavailable provider is repaired with its model, not ju
   assert.equal(draft.provider, "claude_code");
   assert.notEqual(draft.model, "gpt-5.5", "the foreign model must not survive the switch");
 });
+
+test("a reopened dialog gets a new generation, so a late answer can be discarded", () => {
+  // A DOM `open` check cannot tell these apart: close during an in-flight create,
+  // reopen from another project, and the same element is open again.
+  const store = createRemoteUiStore();
+
+  const first = store.getState().beginLaunchDialogOpening();
+  const second = store.getState().beginLaunchDialogOpening();
+  assert.notEqual(first, second);
+
+  // Fork counts a reopening even on the SAME source thread.
+  store.getState().beginForkDialogOpening();
+  store.getState().setForkDialog({ open: true, sourceThread: { id: "t1" } });
+  const forkFirst = store.getState().forkDialog.generation;
+  store.getState().setForkDialog({ pending: true });
+  assert.equal(
+    store.getState().forkDialog.generation,
+    forkFirst,
+    "updating the showing dialog keeps its generation"
+  );
+
+  store.getState().beginForkDialogOpening();
+  store.getState().setForkDialog({ open: true, sourceThread: { id: "t1" } });
+  assert.notEqual(store.getState().forkDialog.generation, forkFirst);
+});

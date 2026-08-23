@@ -373,6 +373,9 @@ const state = {
   // Git standing of the launch dialog's chosen directory; null when unknown or
   // when the directory is not a repo.
   launchGitContext: null,
+  // Bumped on every opening. A DOM `open` check cannot tell a reopened dialog from
+  // the one an in-flight request was started against.
+  launchDialogGeneration: 0,
   // Same, for the fork dialog. Separate because the two dialogs can hold
   // different directories and neither should show the other's answer.
   forkGitContext: null,
@@ -3622,10 +3625,12 @@ function renderForkSessionDialog() {
     sourceSettings: dialogState.sourceSettings || null,
     sourceProjectId: state.threadProjectId?.[dialogState.sourceThread?.id] || null,
     onCreateProject() {
-      const sourceId = dialogState.sourceThread?.id || null;
+      // The generation, not the source id: reopening on the SAME thread is still a
+      // different opening, and the earlier answer does not belong to it.
+      const opening = state.forkDialogGeneration;
       void createProjectForLaunchDraft(
         (projectId) => handleForkDialogFieldChange("projectId", projectId),
-        () => state.forkDialog?.open && state.forkDialog.sourceThread?.id === sourceId
+        () => state.forkDialog?.open && state.forkDialogGeneration === opening
       );
     },
     projects: state.projects || [],
@@ -4593,9 +4598,12 @@ function renderLaunchSessionDialog() {
       id: "launch-start-session-dialog",
       initialPromptAttachmentsId: "start-prompt-attachments",
       onCreateProject() {
+        const opening = state.launchDialogGeneration;
         void createProjectForLaunchDraft(
           (projectId) => handleLaunchFieldInput("projectId", projectId),
-          () => document.getElementById("launch-start-session-dialog")?.open === true
+          () =>
+            state.launchDialogGeneration === opening
+            && document.getElementById("launch-start-session-dialog")?.open === true
         );
       },
       onFieldChange: handleLaunchFieldInput,
@@ -4689,6 +4697,7 @@ function resolveTabThread(threadId) {
 }
 
 function openStartSessionDialog({ projectId = undefined } = {}) {
+  state.launchDialogGeneration += 1;
   // At open time, not per render: re-seeding per render would overwrite a choice
   // made inside the dialog.
   const context = sessionViewStore.getState().location.context;

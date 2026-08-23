@@ -879,11 +879,15 @@ function RemoteApp() {
     threads: currentState.threads,
     threadProjectId: remoteProjects.threadProjectId,
     onCreateProject: remoteProjectsReady
-      ? () =>
-          createRemoteProjectForDraft(
+      ? () => {
+          const opening = remoteUi.launchDialogGeneration;
+          return createRemoteProjectForDraft(
             (projectId) => updateSessionDraft({ projectId }),
-            () => document.getElementById("remote-start-session-dialog")?.open === true
-          )
+            () =>
+              remoteUiStore.getState().launchDialogGeneration === opening
+              && document.getElementById("remote-start-session-dialog")?.open === true
+          );
+        }
       : null,
     // When we have a real catalog the picker is authoritative; otherwise expose
     // the fetch status so the dialog can say "loading"/"failed" instead of
@@ -1653,6 +1657,7 @@ function RemoteApp() {
       return;
     }
     const models = remoteUiStore.getState().providerModels[thread.provider] || [];
+    remoteUiStore.getState().beginForkDialogOpening();
     remoteUiStore.getState().setForkDialog({
       open: true,
       pending: false,
@@ -2361,12 +2366,14 @@ function RemoteApp() {
           sourceThread: forkDialog.sourceThread,
           onCreateProject: remoteProjectsReady
             ? () => {
-                const sourceId = forkDialog.sourceThread?.id || null;
+                // The generation, not the source id: reopening on the SAME thread is
+                // still a different opening.
+                const opening = forkDialog.generation || 0;
                 return createRemoteProjectForDraft(
                   (projectId) => handleForkFieldChange("projectId", projectId),
                   () => {
                     const current = remoteUiStore.getState().forkDialog;
-                    return current?.open && current.sourceThread?.id === sourceId;
+                    return current?.open && (current.generation || 0) === opening;
                   }
                 );
               }
@@ -2489,6 +2496,7 @@ function findThreadNameInGroups(groups, threadId) {
 // controls now perform this switch — the dialog's own select and the sidebar split
 // button's menu — and they must not drift.
 function openRemoteStartSessionDialog(activeProjectId = null) {
+  remoteUiStore.getState().beginLaunchDialogOpening();
   // At open time, not per render: otherwise an unrelated re-render snaps the chip
   // back over a choice made inside the dialog.
   remoteUiStore.getState().setSessionDraftField("projectId", activeProjectId || null);

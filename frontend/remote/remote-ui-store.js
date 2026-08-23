@@ -24,7 +24,7 @@ export function createDefaultSessionDraft(provider = "codex") {
 }
 
 export function createRemoteUiStore(initialState = {}) {
-  return createStore((set) => ({
+  return createStore((set, get) => ({
     composerDraft: "",
     // Empty = "this surface hasn't overridden the session's effort". Readers
     // fall back to session.reasoning_effort, so opening a session on a new
@@ -46,6 +46,9 @@ export function createRemoteUiStore(initialState = {}) {
     // Git standing of the launch dialog's chosen directory; null when unknown or
     // when the directory is not a repo.
     launchGitContext: null,
+    // Bumped on every opening of either dialog. A DOM `open` check, or the fork's
+    // source id, cannot tell a reopened dialog from the one a request started against.
+    launchDialogGeneration: 0,
     providerModels: {},
     // Per-provider catalog fetch status: "loading" | "ready" | "error".
     // Lets the new-session dialog show a truthful state instead of silently
@@ -134,6 +137,21 @@ export function createRemoteUiStore(initialState = {}) {
       set({
         settingsModalOpen: Boolean(open),
       });
+    },
+    // Called by the open paths, not inferred inside setForkDialog: reopening on a
+    // different thread while one is already showing is still a new opening.
+    beginForkDialogOpening() {
+      set((state) => ({
+        forkDialog: {
+          ...state.forkDialog,
+          generation: (state.forkDialog.generation || 0) + 1,
+        },
+      }));
+      return get().forkDialog.generation;
+    },
+    beginLaunchDialogOpening() {
+      set((state) => ({ launchDialogGeneration: state.launchDialogGeneration + 1 }));
+      return get().launchDialogGeneration;
     },
     setLaunchGitContext(context) {
       set({ launchGitContext: context || null });
