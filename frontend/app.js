@@ -193,6 +193,7 @@ import { applyProviderMark } from "./shared/provider-mark.js";
 import { ForkSessionDialog } from "./shared/fork-session-dialog.js";
 import { forkCompletionEffect } from "./local/fork-submit-ownership.js";
 import {
+  INHERIT,
   applyForkProviderChange,
   defaultForkFields,
   forkPointIsTranscriptTip,
@@ -371,6 +372,9 @@ const state = {
   // Git standing of the launch dialog's chosen directory; null when unknown or
   // when the directory is not a repo.
   launchGitContext: null,
+  // Same, for the fork dialog. Separate because the two dialogs can hold
+  // different directories and neither should show the other's answer.
+  forkGitContext: null,
   newSessionImageAttachments: [],
   nextNewSessionImageAttachmentId: 1,
   forkImageAttachments: [],
@@ -3407,6 +3411,35 @@ function handleLaunchFieldInput(field, value) {
   renderLaunchSessionDialog();
 }
 
+// The fork dialog's own git probe. Deliberately a separate generation counter
+// and a separate state slot from the launch dialog's: the two can be open on
+// different directories, and sharing either would let one dialog label the
+// other's path.
+let forkGitContextGeneration = 0;
+let forkGitContextTimer = null;
+async function refreshForkGitContext(cwd) {
+  const generation = ++forkGitContextGeneration;
+  if (forkGitContextTimer) clearTimeout(forkGitContextTimer);
+  const target = String(cwd || "").trim();
+  state.forkGitContext = null;
+  if (!target) {
+    return;
+  }
+  forkGitContextTimer = setTimeout(async () => {
+    try {
+      const response = await apiFetch(
+        `/api/workspace/git-context?cwd=${encodeURIComponent(target)}`
+      );
+      const payload = await response.json();
+      if (generation !== forkGitContextGeneration) return;
+      state.forkGitContext = !response.ok || !payload.ok ? null : payload.data || null;
+    } catch {
+      if (generation === forkGitContextGeneration) state.forkGitContext = null;
+    }
+    if (state.forkDialog?.open) renderForkSessionDialog();
+  }, 250);
+}
+
 // Apply a merged-pill model selection: provider, model and effort in one step.
 //
 // Effort is the reason this cannot be two field changes. Levels are per MODEL
@@ -3619,11 +3652,18 @@ function renderForkSessionDialog() {
     fields,
     pending: dialogState.pending,
     error: dialogState.error || "",
-    providerOptions: providerOptions(state.providers),
-    models: models.length
-      ? models
-      : [{ model: selectedModel, display_name: selectedModel }],
+    // The merged Model pill needs every provider's catalogue, not one flattened
+    // list — a cross-provider fork is chosen from the same menu.
+    providers: state.providers || [],
+    providerModels: state.providerModels,
     modelsStatus: models.length ? "ready" : "loading",
+    gitContext: state.forkGitContext,
+    workspaceSuggestions: selectWorkspaceSuggestionsModel({
+      selectedCwd: fields.cwd || "",
+      session: state.session,
+      threads: state.threads || [],
+    }),
+    onSelectModel: handleForkModelSelection,
     approvalOptions: settings.approvalOptions,
     effortOptions: buildReasoningEffortOptions(models, selectedModel, provider),
     forkCapabilities: state.session?.provider_fork_capabilities || [],
@@ -3750,10 +3790,41 @@ async function ensureForkProviderModels(provider) {
 function handleForkDialogFieldChange(field, value) {
   const current = state.forkDialog.fields;
   let next = { ...current, [field]: value };
+  if (field === "cwd") {
+    void refreshForkGitContext(value);
+  }
   if (field === "provider") {
     const models = modelsForProvider(value, state.session?.available_models || []);
     next = applyForkProviderChange(next, value, models);
     void ensureForkProviderModels(value);
+  }
+  state.forkDialog = { ...state.forkDialog, fields: next, error: "" };
+  renderForkSessionDialog();
+}
+
+// Provider + model + effort as one step, for the same reason the launch dialog
+// needs it: effort levels are per MODEL, so a cross-provider fork that keeps the
+// source's effort can submit a level the target model never offered — and the
+// relay honours an explicit effort rather than correcting it.
+//
+// Choosing the INHERIT row is the one case that must NOT re-resolve: an
+// untouched field is deliberately sent as null so the relay reads it off the
+// source thread.
+function handleForkModelSelection({ provider, model }) {
+  const current = state.forkDialog.fields;
+  let next = { ...current };
+  if (provider && provider !== current.provider) {
+    const models = modelsForProvider(provider, state.session?.available_models || []);
+    next = applyForkProviderChange(next, provider, models);
+    void ensureForkProviderModels(provider);
+  }
+  next.model = model;
+  if (model !== INHERIT) {
+    next.effort = resolveReasoningEffortValue(
+      state.providerModels[provider] || [],
+      model,
+      next.effort
+    );
   }
   state.forkDialog = { ...state.forkDialog, fields: next, error: "" };
   renderForkSessionDialog();

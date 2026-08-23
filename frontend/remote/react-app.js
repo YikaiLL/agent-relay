@@ -2330,9 +2330,30 @@ function RemoteApp() {
           fields: forkView.fields,
           pending: forkDialog.pending,
           error: forkDialog.error || "",
-          providerOptions: providerOptions(remoteUi.providers),
-          models: forkView.models,
+          // Every provider's catalogue: a cross-provider fork is chosen from the
+          // same merged menu the launch dialog uses.
+          providers: remoteUi.providers,
+          providerModels: remoteUi.providerModels,
           modelsStatus: forkView.modelsStatus,
+          workspaceSuggestions: selectWorkspaceSuggestionsModel({
+            selectedCwd: forkView.fields.cwd || "",
+            session,
+            threads: currentState.threads,
+          }),
+          onSelectModel: ({ provider, model }) => {
+            // Provider + model + effort together, and NOT re-resolving effort for
+            // the inherit row: an untouched field is deliberately sent as null so
+            // the relay reads it off the source thread.
+            const catalog = remoteUi.providerModels[provider] || [];
+            handleForkFieldChange("provider", provider);
+            handleForkFieldChange("model", model);
+            if (model) {
+              handleForkFieldChange(
+                "effort",
+                resolveReasoningEffortValue(catalog, model, forkView.fields.effort)
+              );
+            }
+          },
           approvalOptions: forkView.settings.approvalOptions,
           effortOptions: buildReasoningEffortOptions(
             forkView.models,

@@ -1,24 +1,36 @@
 import React from "react";
-import { SessionSettingsFields } from "./session-settings-fields.js";
+
 import {
+  FORK_PROJECT_INHERIT,
+  FORK_PROJECT_NONE,
   INHERIT,
   forkFieldsAreSubmittable,
   forkInheritableFields,
   forkIsLossy,
   normalizeForkFields,
 } from "./fork-fields.js";
-import { providerLabel } from "./provider-labels.js";
 import { ProjectPicker } from "./project-picker.js";
-import { FORK_PROJECT_INHERIT, FORK_PROJECT_NONE } from "./fork-fields.js";
+import { SettingPill } from "./setting-pill.js";
+import { WorkspacePicker } from "./workspace-picker.js";
+import { abbreviateHomePath } from "./workspace-chip-model.js";
+import { buildModelPickerGroups, selectedModelChip } from "./model-picker-model.js";
+import { providerLabel } from "./provider-labels.js";
+import { formatRelativeTime } from "../remote/utils.js";
+import {
+  PromptCard,
+  SessionContextBar,
+  SessionDialogShell,
+  SettingPillRow,
+  SubmitShortcutHint,
+} from "./session-dialog-chrome.js";
 
 const h = React.createElement;
 
-const INHERIT_LABEL = "Inherit from source session";
+const INHERIT_LABEL = "Inherit from source";
 
-// A thread's preview can be its entire first message — a replay-fork handoff
-// blob or a reviewer prompt runs to tens of thousands of characters. Rendering
-// that whole string in the "Source:" line overflowed the dialog before the
-// fork was even created. Collapse to the first line and cap the length.
+// A thread's preview can be its entire first message — a replay-fork handoff blob
+// or a reviewer prompt runs to tens of thousands of characters. Rendering that in
+// the source card overflowed the dialog before the fork was even created.
 const MAX_SOURCE_LABEL_CHARS = 80;
 function forkSourceLabel(sourceThread) {
   const raw = sourceThread?.name || sourceThread?.preview || sourceThread?.id || "session";
@@ -28,57 +40,83 @@ function forkSourceLabel(sourceThread) {
     : firstLine;
 }
 
-// Untouched settings must reach the relay as null so it can resolve them from
-// the SOURCE thread. Showing a concrete value here would be a lie — the relay
-// would not use it — and sending one silently re-permissions the fork.
-//
-// But the option is only offered for fields the relay actually inherits: after
-// a provider change it ignores the source model and effort (see
-// forkInheritableFields), so offering "inherit" there would promise something
-// that never happens.
+const BRANCH_ICON = h(
+  "svg",
+  {
+    "aria-hidden": "true",
+    className: "fork-source-icon",
+    fill: "none",
+    height: "16",
+    stroke: "currentColor",
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    strokeWidth: "1.6",
+    viewBox: "0 0 24 24",
+    width: "16",
+  },
+  h("circle", { cx: "6", cy: "6", r: "2.4" }),
+  h("circle", { cx: "6", cy: "18", r: "2.4" }),
+  h("circle", { cx: "18", cy: "10", r: "2.4" }),
+  h("path", { d: "M6 8.4v7.2M8.4 6h4.2a3 3 0 0 1 3 3v.4" })
+);
+
+// A field the user has not touched is sent as null on purpose, so the relay
+// resolves it from the SOURCE thread. That is a different request from choosing
+// the same value explicitly, which is why the pill renders it as a distinct
+// (dashed, tagged) state rather than showing a concrete value that would be a
+// lie about what will be sent.
+function inheritedPill({ inheritable, value }) {
+  const isInherited = inheritable && value === INHERIT;
+  return {
+    inherited: isInherited,
+    tag: isInherited ? "inherited" : null,
+  };
+}
+
 function withInheritOption(options, inheritable) {
-  const rest = options || [];
-  return inheritable ? [{ value: INHERIT, label: INHERIT_LABEL }, ...rest] : rest;
+  return inheritable ? [{ value: INHERIT, label: INHERIT_LABEL }, ...(options || [])] : options || [];
 }
 
 export function ForkSessionDialog({
-  id = "fork-session-dialog",
-  sourceThread = null,
-  fields = {},
-  onFieldChange = null,
-  onFork = null,
-  pending = false,
-  error = "",
-  forkCapabilities = [],
-  providerOptions = [],
-  models = [],
-  modelsStatus = "ready",
   approvalOptions = [],
   effortOptions = [],
-  onRequestClose = null,
-  // Project membership. A fork with an untouched picker INHERITS its source's
-  // project server-side, which is what most forks want; the picker exists so a
-  // branch can be filed somewhere else, or nowhere.
-  projects = [],
-  threads = [],
-  threadProjectId = {},
-  threadActivity = null,
-  threadAttention = null,
-  threadReviewing = null,
-  onCreateProject = null,
+  error = "",
+  fields = {},
+  forkCapabilities = [],
+  gitContext = null,
+  id = "fork-session-dialog",
   // Opt-in mount for pasted-image chips. Local passes an id; remote leaves it
   // null because a paired device cannot send image bytes at all.
   initialPromptAttachmentsId = null,
+  modelsStatus = "ready",
+  onCreateProject = null,
+  onFieldChange = null,
+  onFork = null,
+  onRequestClose = null,
+  onSelectModel = null,
+  pending = false,
+  projects = [],
+  providerModels = {},
+  providers = [],
+  sourceThread = null,
+  threadActivity = null,
+  threadAttention = null,
+  threadProjectId = {},
+  threadReviewing = null,
+  threads = [],
+  workspaceSuggestions = [],
 }) {
   const sourceTitle = forkSourceLabel(sourceThread);
-  const cwdId = `${id}-cwd`;
   const sourceProvider = sourceThread?.provider || "";
   const targetProvider = fields.provider || sourceProvider;
   const inheritable = forkInheritableFields({ sourceProvider, targetProvider });
   // Normalize at render time so a catalog that arrives asynchronously seeds the
   // field too — a provider switch made before the models load would otherwise
-  // leave the select holding a value it never offers.
-  const shownFields = normalizeForkFields(fields, { sourceProvider, models });
+  // leave the picker holding a value it never offers.
+  const shownFields = normalizeForkFields(fields, {
+    sourceProvider,
+    models: providerModels[targetProvider] || [],
+  });
   const submittable = forkFieldsAreSubmittable(shownFields, { sourceProvider });
   const lossy = forkIsLossy({
     sourceProvider,
@@ -87,65 +125,131 @@ export function ForkSessionDialog({
     forkPointIsTip: Boolean(fields.forkPointIsTip),
     capabilities: forkCapabilities,
   });
+
+  const cwd = shownFields.cwd || "";
+  const forkDisabled = pending || !sourceThread?.id || !cwd.trim() || !submittable;
+
   const closeDialog = () => {
     onRequestClose?.();
     document.getElementById(id)?.close?.();
   };
+  const submit = () => {
+    if (forkDisabled) {
+      return;
+    }
+    onFork?.(shownFields);
+  };
+
+  const modelInherits = inheritable.has("model") && shownFields.model === INHERIT;
+  const modelChip = modelInherits
+    ? { tag: "inherited", value: INHERIT_LABEL }
+    : selectedModelChip({
+        providerModels,
+        selectedModel: shownFields.model || "",
+        selectedProvider: targetProvider,
+      });
+
+  const selectedApproval = approvalOptions.find(
+    (option) => option.value === shownFields.approvalPolicy
+  );
+  const selectedEffort = effortOptions.find((option) => option.value === shownFields.effort);
+  const approvalState = inheritedPill({
+    inheritable: inheritable.has("approvalPolicy"),
+    value: shownFields.approvalPolicy,
+  });
+  const effortState = inheritedPill({
+    inheritable: inheritable.has("effort"),
+    value: shownFields.effort,
+  });
 
   return h(
-    "dialog",
+    SessionDialogShell,
     {
-      className: "panel-modal panel-modal-wide",
+      actions: [
+        h(
+          "button",
+          { className: "session-dialog-cancel", key: "cancel", onClick: closeDialog, type: "button" },
+          "Cancel"
+        ),
+        h(
+          "button",
+          {
+            className: "session-dialog-submit",
+            disabled: forkDisabled,
+            id: `${id}-submit`,
+            key: "fork",
+            onClick: submit,
+            type: "button",
+          },
+          pending ? "Forking…" : "Fork session",
+          h(SubmitShortcutHint)
+        ),
+      ],
+      // The badge says whether context survives; the footer says where the branch
+      // lands. Both are honest about what the relay actually does: a fork runs in
+      // the source's cwd unless told otherwise — it does NOT get its own worktree,
+      // so the source and the branch share a working tree and can collide.
+      badge: h(
+        "span",
+        {
+          className: "session-dialog-badge" + (lossy ? " is-lossy" : ""),
+          "data-fork-mode": lossy ? "replay" : "native",
+        },
+        lossy ? "transcript replay" : "full context preserved"
+      ),
+      footerHint: cwd
+        ? `Branches in ${abbreviateHomePath(cwd)} · the source keeps running`
+        : "Choose a directory for the branch",
       id,
-      onClose: () => onRequestClose?.(),
-      onClick: (event) => {
-        if (event.target === event.currentTarget) {
-          closeDialog();
-        }
-      },
+      onRequestClose,
+      title: "Fork session",
     },
     h(
       "div",
-      { className: "modal-header" },
-      h("h2", null, "Fork session"),
-      h("button", {
-        className: "header-button close-modal-btn",
-        onClick: closeDialog,
-        type: "button",
-      }, "x")
-    ),
-    h(
-      "section",
-      { className: "panel-modal-body" },
+      { className: "fork-source-card", key: "source" },
+      BRANCH_ICON,
       h(
-        "p",
-        { className: "control-hint" },
-        fields.upToItemId
-          ? `Branching from a message in: ${sourceTitle}`
-          : `Source: ${sourceTitle}`
-      ),
-      lossy
-        ? h(
-            "p",
-            { className: "control-hint", "data-fork-mode": "replay" },
-            sourceProvider && targetProvider && sourceProvider !== targetProvider
-              ? `Handing off ${providerLabel(sourceProvider)} → ${providerLabel(targetProvider)} via transcript replay — provider-native state (tool results, cached context) will not carry over.`
-              : "Branching mid-session uses transcript replay — provider-native state will not carry over."
-          )
-        : h(
-            "p",
-            { className: "control-hint", "data-fork-mode": "native" },
-            `Native ${providerLabel(targetProvider)} fork — full context is preserved.`
-          ),
-      // The project the branch is filed under. `FORK_PROJECT_INHERIT` (null) is
-      // the untouched state and is NOT the same as choosing Default Workspace —
-      // the first omits the field so the relay resolves it from the source, the
-      // second sends the explicit-unassigned sentinel.
-      h(ProjectPicker, {
+        "div",
+        { className: "fork-source-text" },
+        h("span", { className: "fork-source-eyebrow" }, "Forking from"),
+        h("span", { className: "fork-source-title", title: sourceTitle }, sourceTitle),
+        h(
+          "span",
+          { className: "fork-source-meta" },
+          [
+            fields.upToItemId ? "from a message mid-session" : null,
+            // No message count: the relay has no honest one. It witnesses only
+            // what it has loaded, which for a provider-paged Claude thread is a
+            // fraction of the history — so any number here would be a floor
+            // presented as a total. `updated_at` is server-corrected and real.
+            sourceThread?.updated_at
+              ? `last active ${formatRelativeTime(sourceThread.updated_at)}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")
+        )
+      )
+    ),
+    lossy
+      ? h(
+          "p",
+          { className: "session-dialog-note", "data-fork-mode": "replay", key: "lossy" },
+          sourceProvider && targetProvider && sourceProvider !== targetProvider
+            ? `Handing off ${providerLabel(sourceProvider)} → ${providerLabel(targetProvider)} by replaying the transcript. Provider-native state (tool results, cached context) will not carry over.`
+            : "Branching mid-session replays the transcript. Provider-native state will not carry over."
+        )
+      : null,
+    h(SessionContextBar, {
+      key: "context",
+      // Untouched, the picker shows the source's project is inherited rather than
+      // naming a project the request will not actually carry.
+      project: h(ProjectPicker, {
         activeProjectId:
-          fields.projectId === FORK_PROJECT_INHERIT || fields.projectId === FORK_PROJECT_NONE
+          shownFields.projectId === FORK_PROJECT_INHERIT
+          || shownFields.projectId === FORK_PROJECT_NONE
             ? null
-            : fields.projectId,
+            : shownFields.projectId,
         label: "Project",
         onCreateProject,
         onSelectProject: (projectId) =>
@@ -157,93 +261,129 @@ export function ForkSessionDialog({
         threadReviewing,
         threads,
       }),
-      h(
-        "label",
-        { className: "field field-full" },
-        h("span", null, "Workspace"),
-        h("input", {
-          autoComplete: "off",
-          id: cwdId,
-          onChange: (event) => onFieldChange?.("cwd", event.target.value),
-          placeholder: "/path/to/project or ~/project",
-          type: "text",
-          value: fields.cwd || "",
-        })
-      ),
-      h(SessionSettingsFields, {
-        fields: shownFields,
-        idPrefix: id,
-        labels: {
-          initialPrompt: "Fork Prompt",
-          // Only advertise pasting where it works. The mount id is the same
-          // signal the accessory uses, so the hint cannot drift from the
-          // surface that actually accepts a paste (remote has neither).
-          initialPromptPlaceholder: initialPromptAttachmentsId
-            ? "Optional task for the forked agent. Paste an image to attach it."
-            : "Optional task for the forked agent.",
-        },
-        model: {
-          approvalOptions: withInheritOption(approvalOptions, inheritable.has("approvalPolicy")),
-          effortOptions: withInheritOption(effortOptions, inheritable.has("effort")),
-          models: inheritable.has("model")
-            ? [{ model: INHERIT, display_name: INHERIT_LABEL }, ...(models || [])]
-            : models || [],
-          providerOptions,
-        },
-        onFieldChange,
-        initialPromptAccessory: initialPromptAttachmentsId
-          ? h("div", {
-              "aria-live": "polite",
-              className: "composer-attachments start-session-attachments",
-              hidden: true,
-              id: initialPromptAttachmentsId,
-            })
-          : null,
+      workspace: h(WorkspacePicker, {
+        gitContext,
+        inputId: `${id}-cwd`,
+        onChange: (next) => onFieldChange?.("cwd", next),
+        suggestions: workspaceSuggestions,
+        value: cwd,
       }),
-      error
-        ? h(
-            "p",
-            { className: "control-hint", "data-fork-error": "true", role: "alert" },
-            error
-          )
+    }),
+    h(PromptCard, {
+      accessory: initialPromptAttachmentsId
+        ? h("div", {
+            "aria-live": "polite",
+            className: "composer-attachments start-session-attachments",
+            id: initialPromptAttachmentsId,
+          })
         : null,
-      modelsStatus === "loading" || modelsStatus === "error"
-        ? h(
-            "p",
-            {
-              className: "control-hint",
-              id: `${id}-models-hint`,
-              "data-models-status": modelsStatus,
-            },
-            modelsStatus === "loading"
-              ? "Loading models..."
-              : "Could not load the model list."
-          )
-        : null
-    ),
+      // A native fork already carries the source context, so an empty prompt
+      // leaves the branch idle rather than burning a turn on a canned
+      // instruction. A replay fork always sends one (the transcript IS the
+      // prompt), which is why the hint differs.
+      hint: lossy ? "Leave empty to replay and summarize" : "Leave empty to branch and wait",
+      id: `${id}-start-prompt`,
+      key: "prompt",
+      onChange: (next) => onFieldChange?.("initialPrompt", next),
+      onSubmit: submit,
+      placeholder: initialPromptAttachmentsId
+        ? "What should the fork try instead? Paste an image to attach it."
+        : "What should the fork try instead?",
+      value: shownFields.initialPrompt ?? "",
+    }),
     h(
-      "div",
-      { className: "modal-actions" },
-      h(
-        "button",
-        {
-          className: "secondary-button",
-          onClick: closeDialog,
-          type: "button",
-        },
-        "Cancel"
-      ),
-      h(
-        "button",
-        {
-          className: "start-session-button",
-          disabled:
-            pending || !sourceThread?.id || !shownFields.cwd?.trim() || !submittable,
-          onClick: () => onFork?.(shownFields),
-          type: "button",
-        },
-        pending ? "Forking..." : "Fork Session"
-      )
-    )
+      SettingPillRow,
+      { key: "pills" },
+      h(SettingPill, {
+        groups: (inheritable.has("model")
+          ? [
+              {
+                empty: false,
+                label: null,
+                options: [
+                  {
+                    label: INHERIT_LABEL,
+                    provider: sourceProvider,
+                    selected: modelInherits,
+                    tag: null,
+                    value: INHERIT,
+                  },
+                ],
+                provider: "__inherit__",
+              },
+            ]
+          : []
+        ).concat(
+          buildModelPickerGroups({
+            providerModels,
+            providers,
+            selectedModel: modelInherits ? "" : shownFields.model || "",
+            selectedProvider: targetProvider,
+          })
+        ),
+        id: `${id}-model`,
+        inherited: modelInherits,
+        key: "model",
+        label: "Model",
+        onSelect: (value, option) =>
+          onSelectModel?.({ model: value, provider: option.provider || targetProvider }),
+        tag: modelChip.tag,
+        value: modelChip.value,
+      }),
+      h(SettingPill, {
+        id: `${id}-effort`,
+        inherited: effortState.inherited,
+        key: "effort",
+        label: "Effort",
+        onSelect: (value) => onFieldChange?.("effort", value),
+        options: withInheritOption(effortOptions, inheritable.has("effort")).map((option) => ({
+          ...option,
+          selected: option.value === shownFields.effort,
+        })),
+        tag: effortState.tag,
+        value: effortState.inherited
+          ? INHERIT_LABEL
+          : selectedEffort?.label || shownFields.effort || "default",
+      }),
+      h(SettingPill, {
+        id: `${id}-approval`,
+        inherited: approvalState.inherited,
+        key: "approval",
+        label: "Permissions",
+        onSelect: (value) => onFieldChange?.("approvalPolicy", value),
+        options: withInheritOption(
+          approvalOptions,
+          inheritable.has("approvalPolicy")
+        ).map((option) => ({ ...option, selected: option.value === shownFields.approvalPolicy })),
+        tag: approvalState.tag || selectedApproval?.tag || null,
+        value: approvalState.inherited
+          ? INHERIT_LABEL
+          : selectedApproval?.label || shownFields.approvalPolicy || "default",
+      })
+    ),
+    error
+      ? h(
+          "p",
+          {
+            className: "session-dialog-note is-error",
+            "data-fork-error": "true",
+            key: "error",
+            role: "alert",
+          },
+          error
+        )
+      : null,
+    modelsStatus === "loading" || modelsStatus === "error"
+      ? h(
+          "p",
+          {
+            className: "session-dialog-note",
+            "data-models-status": modelsStatus,
+            id: `${id}-models-hint`,
+            key: "models-hint",
+          },
+          modelsStatus === "loading" ? "Loading models…" : "Couldn’t load the model list."
+        )
+      : null
   );
 }

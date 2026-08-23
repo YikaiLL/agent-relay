@@ -37,11 +37,17 @@ export function defaultForkFields({ thread = null, models = [], session = null }
     cwd: thread?.cwd || "",
     effort: INHERIT,
     initialPrompt: "",
-    // Only ever seeded from the TARGET provider's own catalog. The relay does
-    // not validate an explicitly-requested model against the target catalog, so
-    // a cross-provider seed (a codex model id on a Claude fork) would be sent
-    // verbatim to the wrong bridge.
-    model: firstCatalogModel(models),
+    // Inherited, like every other untouched setting. The dialog opens on the
+    // SOURCE's provider, so the relay resolves the model from the source thread —
+    // which is what a fork means. Seeding a concrete model here instead made
+    // "Inherit from source" something you could only opt back INTO, and silently
+    // moved a thread running a non-default model onto the catalogue default.
+    //
+    // The cross-provider hazard this used to guard against is still guarded, one
+    // layer up: `normalizeForkFields` fills a concrete model from the TARGET
+    // catalogue the moment a provider change withdraws the inherit option, so a
+    // foreign id can never reach the wrong bridge.
+    model: INHERIT,
     // Untouched = inherit the source thread's project. Not the source's actual
     // id: sending that would defeat the relay's own resolution and would go
     // stale if the source moved project in between.

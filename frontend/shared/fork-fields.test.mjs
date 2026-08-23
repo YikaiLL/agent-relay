@@ -74,15 +74,24 @@ test("model is never seeded from a different provider's session", () => {
   assert.equal(forkFieldsToPayload(fields).model, null, "unknown catalog inherits");
 });
 
-test("model is seeded from the target provider's own catalog when available", () => {
+test("the live session's model never leaks into a fork of a different provider", () => {
+  // The invariant this has always been about: forking a Claude thread while a
+  // Codex session is open must not put `gt-5.3-codex` on the Claude fork. It used
+  // to be enforced by seeding a concrete model from the TARGET catalogue; the
+  // default is now inherit-from-source, which enforces it more directly — the
+  // request carries no model at all and the relay reads the source thread's.
   const fields = defaultForkFields({
     thread: { provider: "claude_code" },
     models: CLAUDE_MODELS,
     session: { provider: "codex", model: "gpt-5.3-codex" },
   });
 
-  assert.equal(fields.model, "claude-sonnet-4-6");
-  assert.equal(forkFieldsToPayload(fields).model, "claude-sonnet-4-6");
+  assert.equal(fields.model, INHERIT);
+  assert.equal(
+    forkFieldsToPayload(fields).model,
+    null,
+    "no model on the wire means the relay resolves the SOURCE thread's"
+  );
 });
 
 test("the fork point rides along with the payload", () => {
@@ -514,4 +523,38 @@ test("choosing the default workspace sends the explicit-unassigned sentinel", ()
   // a fork could otherwise never be moved OUT of its source's project.
   const payload = forkFieldsToPayload({ sourceThreadId: "t1", projectId: FORK_PROJECT_NONE });
   assert.equal(payload.project_id, "");
+});
+
+test("a fresh fork inherits the model, like every other untouched setting", () => {
+  // The dialog opens on the SOURCE's provider, so model is inheritable and the
+  // relay resolves it from the source thread. Seeding a concrete model here made
+  // "Inherit from source" a setting you could only ever opt back INTO, and meant
+  // forking a thread on a non-default model silently moved it to the catalogue
+  // default — the exact drift `forkInheritableFields` exists to prevent.
+  //
+  // Safe precisely because it is same-provider: `normalizeForkFields` fills a
+  // concrete model the moment a provider change withdraws the inherit option, so
+  // a cross-provider fork still never carries a foreign id.
+  const fields = defaultForkFields({
+    thread: { id: "t1", provider: "claude_code", cwd: "/repo" },
+    models: [
+      { model: "claude-opus-4-6", is_default: true },
+      { model: "claude-sonnet-4-5" },
+    ],
+  });
+
+  assert.equal(fields.model, INHERIT);
+  assert.equal(fields.effort, INHERIT);
+  assert.equal(fields.approvalPolicy, INHERIT);
+  assert.equal("model" in forkFieldsToPayload(fields), true);
+  assert.equal(forkFieldsToPayload(fields).model, null, "omitted values reach the relay as null");
+});
+
+test("a fork whose provider changed still gets a concrete model, never a foreign one", () => {
+  const normalized = normalizeForkFields(
+    { ...defaultForkFields({ thread: { id: "t1", provider: "claude_code" } }), provider: "codex" },
+    { sourceProvider: "claude_code", models: [{ model: "gpt-5.5", is_default: true }] }
+  );
+
+  assert.equal(normalized.model, "gpt-5.5");
 });
