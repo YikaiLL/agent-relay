@@ -300,3 +300,70 @@ test("the footer says the branch shares the source's directory", () => {
   );
   view.cleanup();
 });
+
+test("an inherited pill shows the source's REAL value while still submitting null", () => {
+  // Both halves matter: hiding the value made the user reason about it, and
+  // sending it would freeze a permission the source may tighten meanwhile.
+  const view = mount({
+    sourceSettings: {
+      approval_policy: "never",
+      model: "claude-opus-4-6",
+      reasoning_effort: "xhigh",
+      remembered: true,
+      sandbox: "workspace-write",
+    },
+  });
+
+  assert.match(view.host.querySelector("#test-fork-model").textContent, /Opus 4\.6/);
+  assert.match(view.host.querySelector("#test-fork-effort").textContent, /Extra high/);
+  assert.match(view.host.querySelector("#test-fork-approval").textContent, /Full access/);
+  // Still marked as inherited, because that is what the request says.
+  assert.equal(
+    view.host.querySelectorAll(".setting-pill.is-inherited").length,
+    3,
+    "shown, but not chosen"
+  );
+
+  view.host.querySelector("dialog").close = () => {};
+  click(view.host.querySelector("#test-fork-submit"));
+  assert.equal(view.forks[0].approvalPolicy, INHERIT, "and the relay still resolves it");
+  assert.equal(view.forks[0].effort, INHERIT);
+  view.cleanup();
+});
+
+test("the project chip names the source's project, not Default Workspace", () => {
+  // The two states looked identical: an untouched fork of a Project A thread read
+  // "Default Workspace" while the request omitted project_id and inherited A.
+  const view = mount({
+    projects: [{ id: "proj_a", name: "Payments" }],
+    sourceProjectId: "proj_a",
+  });
+
+  const chip = view.host.querySelector(".project-picker-trigger");
+  assert.match(chip.textContent, /Payments/);
+  assert.doesNotMatch(chip.textContent, new RegExp(DEFAULT_WORKSPACE_LABEL));
+  view.cleanup();
+});
+
+test("a fork can be put back to inheriting after choosing a project", () => {
+  // Without this row the choice is one-way: the menu offered only Default and
+  // concrete projects, so "inherit" was unreachable once you left it.
+  const view = mount({
+    fields: baseFields({ projectId: "proj_a" }),
+    projects: [{ id: "proj_a", name: "Payments" }],
+    sourceProjectId: "proj_a",
+  });
+  click(view.host.querySelector(".project-picker-trigger"));
+  const rows = [...view.host.querySelectorAll(".project-switcher-option")].map(
+    (n) => n.querySelector(".project-switcher-option-label")?.textContent
+  );
+  assert.ok(rows.includes("Inherit from source"), rows.join(" | "));
+
+  click(
+    [...view.host.querySelectorAll(".project-switcher-option")].find(
+      (n) => n.querySelector(".project-switcher-option-label")?.textContent === "Inherit from source"
+    )
+  );
+  assert.deepEqual(view.changes, [["projectId", null]]);
+  view.cleanup();
+});

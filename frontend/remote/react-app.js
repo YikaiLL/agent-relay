@@ -34,7 +34,6 @@ import {
 import { RefreshButton } from "../shared/refresh-button.js";
 import { ForkSessionDialog } from "../shared/fork-session-dialog.js";
 import {
-  INHERIT as FORK_INHERIT,
   applyForkProviderChange,
   canForkInSession,
   defaultForkFields,
@@ -754,6 +753,24 @@ function RemoteApp() {
   }, [activeRelayId, threadListStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
+  // Must SELECT it, not just refresh the list. The id is recovered by refetching,
+  // because the broker acks `project_action` without its receipt.
+  const createRemoteProjectForDraft = async (setProjectId) => {
+    const name = promptRemoteProjectName();
+    if (!name) return;
+    try {
+      const before = new Set((remoteProjects.projects || []).map((project) => project.id));
+      await createRemoteProject(name);
+      const payload = await fetchRemoteProjects();
+      const created = (payload?.projects || []).find((project) => !before.has(project.id));
+      refreshRemoteProjects();
+      if (created) setProjectId(created.id);
+      renderLog(`Created project "${name}".`);
+    } catch (error) {
+      renderLog(`Failed to create project: ${error.message}`);
+    }
+  };
+
   const createRemoteProjectFromToolbar = async () => {
     const name = promptRemoteProjectName();
     if (!name) return;
@@ -855,7 +872,9 @@ function RemoteApp() {
     projects: remoteProjects.projects,
     threads: currentState.threads,
     threadProjectId: remoteProjects.threadProjectId,
-    onCreateProject: remoteProjectsReady ? createRemoteProjectFromToolbar : null,
+    onCreateProject: remoteProjectsReady
+      ? () => createRemoteProjectForDraft((projectId) => updateSessionDraft({ projectId }))
+      : null,
     // When we have a real catalog the picker is authoritative; otherwise expose
     // the fetch status so the dialog can say "loading"/"failed" instead of
     // presenting the single fallback model as if it were the only choice.
@@ -1653,15 +1672,9 @@ function RemoteApp() {
       const dialog = remoteUiStore.getState().forkDialog;
       if (!dialog?.open || dialog.sourceThread?.id !== threadId) return;
 
-      const seeded = defaultForkFields({
-        thread: dialog.sourceThread,
-        sourceSettings: settings,
-      });
-      const fields = { ...dialog.fields };
-      for (const key of ["approvalPolicy", "effort", "model", "sandbox"]) {
-        if (fields[key] === FORK_INHERIT) fields[key] = seeded[key];
-      }
-      remoteUiStore.getState().setForkDialog({ ...dialog, fields });
+      // DISPLAY only: writing these into `fields` would submit them, freezing a
+      // permission the source may tighten while the dialog is open.
+      remoteUiStore.getState().setForkDialog({ ...dialog, sourceSettings: settings });
     } catch {
       // Leaves the fields inherited, which is still a correct request.
     }
@@ -2336,7 +2349,11 @@ function RemoteApp() {
       ? h(ForkSessionDialog, {
           id: "remote-fork-session-dialog",
           sourceThread: forkDialog.sourceThread,
-          onCreateProject: remoteProjectsReady ? createRemoteProjectFromToolbar : null,
+          onCreateProject: remoteProjectsReady
+            ? () => createRemoteProjectForDraft((projectId) =>
+                handleForkFieldChange("projectId", projectId)
+              )
+            : null,
           projects: remoteProjects.projects,
           threadProjectId: remoteProjects.threadProjectId,
           threads: currentState.threads,
@@ -2372,6 +2389,8 @@ function RemoteApp() {
             forkView.provider
           ),
           forkCapabilities: session?.provider_fork_capabilities || [],
+          sourceSettings: forkDialog.sourceSettings || null,
+          sourceProjectId: remoteProjects.threadProjectId?.[forkDialog.sourceThread?.id] || null,
           onFieldChange: handleForkFieldChange,
           onFork: (submitted) => void handleForkSession(submitted),
           onRequestClose() {

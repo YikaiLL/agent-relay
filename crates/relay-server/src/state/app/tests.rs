@@ -2875,6 +2875,89 @@ got {}",
         );
     }
 
+    /// At SUBMIT time, not when the dialog opened — otherwise tightening the
+    /// source's permissions elsewhere is undone by a fork already in progress.
+    #[tokio::test]
+    async fn an_omitted_fork_setting_uses_the_sources_value_at_submit_time() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: Some("never".to_string()),
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        // What the dialog would have shown when it opened.
+        let at_open = app
+            .thread_settings_view(None, &source_thread_id)
+            .await
+            .expect("settings");
+        assert_eq!(at_open.approval_policy, "never");
+
+        // Another device tightens the source while the dialog sits open.
+        {
+            let mut relay = app.relay.write().await;
+            relay.remember_thread_settings(
+                &source_thread_id,
+                "untrusted",
+                "read-only",
+                "medium",
+                "fake-echo",
+            );
+        }
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id: source_thread_id.clone(),
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: None,
+        })
+        .await
+        .expect("fork_session");
+
+        let forked = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        let settings = app
+            .thread_settings_view(None, &forked)
+            .await
+            .expect("fork settings");
+        assert_eq!(
+            settings.approval_policy, "untrusted",
+            "the fork must take the TIGHTENED policy, not the one the dialog read"
+        );
+        assert_eq!(settings.sandbox, "read-only");
+    }
+
     async fn project_with_session(cwd: &str) -> (AppState, TempDir, TempDir, String) {
         let (app, p, o) = build_app(cwd).await;
         pair_device(&app, "device-1", Vec::new()).await;

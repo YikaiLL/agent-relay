@@ -3356,7 +3356,7 @@ function handleLaunchFieldInput(field, value) {
 }
 
 // Generation-guarded: a late answer must not seed a dialog reopened on another
-// thread. Only untouched (INHERIT) fields are re-seeded.
+// thread. Display only — these are never written into the submitted fields.
 let forkSettingsGeneration = 0;
 async function refreshForkSourceSettings(threadId) {
   const generation = ++forkSettingsGeneration;
@@ -3370,17 +3370,9 @@ async function refreshForkSourceSettings(threadId) {
     const dialog = state.forkDialog;
     if (!dialog?.open || dialog.sourceThread?.id !== threadId) return;
 
-    const seeded = defaultForkFields({
-      thread: dialog.sourceThread,
-      session: state.session,
-      sourceSettings: payload.data,
-    });
-    const fields = { ...dialog.fields };
-    for (const key of ["approvalPolicy", "effort", "model", "sandbox"]) {
-      // INHERIT is the untouched marker, so anything else is a user choice.
-      if (fields[key] === INHERIT) fields[key] = seeded[key];
-    }
-    state.forkDialog = { ...dialog, fields };
+    // DISPLAY only. Writing these into `fields` would submit them, freezing a
+    // permission the source may tighten while the dialog is open.
+    state.forkDialog = { ...dialog, sourceSettings: payload.data };
     renderForkSessionDialog();
   } catch {
     // A failed fetch just leaves the fields inherited, which is what they were
@@ -3621,6 +3613,8 @@ function renderForkSessionDialog() {
     approvalOptions: settings.approvalOptions,
     effortOptions: buildReasoningEffortOptions(models, selectedModel, provider),
     forkCapabilities: state.session?.provider_fork_capabilities || [],
+    sourceSettings: dialogState.sourceSettings || null,
+    sourceProjectId: state.threadProjectId?.[dialogState.sourceThread?.id] || null,
     onCreateProject() {
       void createProjectForLaunchDraft((projectId) =>
         handleForkDialogFieldChange("projectId", projectId)

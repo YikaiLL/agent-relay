@@ -10,11 +10,21 @@ import { useDismissableMenu } from "./use-dismissable-menu.js";
 
 const h = React.createElement;
 
+// Sentinel row id for "resolve from the source". Not null — null is the Default
+// Workspace, and the whole point is that those are different requests.
+export const INHERIT_ROW_ID = "__fork_inherit__";
+// An id no project can have, so every real row reads as unselected while the
+// inherit row holds the mark.
+const NO_MATCH = "__none__";
+
 export function ProjectPicker({
   activeProjectId = null,
   className = "",
   createLabel = "New project…",
   disabled = false,
+  // Fork only: an explicit row for "resolve from the source at submit time",
+  // which is a different request from choosing the Default Workspace.
+  inheritRow = null,
   id = null,
   label = "Project",
   onCreateProject = null,
@@ -35,15 +45,20 @@ export function ProjectPicker({
   // Escape must be CONSUMED here: this opens inside a modal dialog.
   useDismissableMenu({ onClose: close, open, rootRef });
 
+  const inheriting = Boolean(inheritRow?.active);
   const activeProject = activeProjectId
     ? projects.find((project) => project.id === activeProjectId) || null
     : null;
   // Fail-open like the switcher: a deleted project reads as the default, and
   // nothing below sees the raw id.
   const resolvedProjectId = activeProject?.id || null;
-  const currentLabel = activeProject
-    ? activeProject.name || activeProject.id
-    : DEFAULT_WORKSPACE_LABEL;
+  // The chip names what the fork WOULD get; the menu row names what the choice is.
+  // Both as the row label would duplicate the concrete project row beneath it.
+  const currentLabel = inheriting
+    ? inheritRow.chipLabel || inheritRow.label
+    : activeProject
+      ? activeProject.name || activeProject.id
+      : DEFAULT_WORKSPACE_LABEL;
 
   const choose = (projectId) => {
     close();
@@ -63,8 +78,9 @@ export function ProjectPicker({
         "aria-expanded": open ? "true" : "false",
         "aria-haspopup": "menu",
         "aria-label": `${label}: ${currentLabel}`,
-        className: "project-picker-trigger",
+        className: "project-picker-trigger" + (inheriting ? " is-inherited" : ""),
         "data-active-project-id": resolvedProjectId || "",
+        "data-inheriting": inheriting ? "true" : undefined,
         disabled: disabled || undefined,
         id: id || undefined,
         onClick: () => setOpen((wasOpen) => !wasOpen),
@@ -75,7 +91,8 @@ export function ProjectPicker({
       h("span", {
         "aria-hidden": "true",
         className:
-          "project-picker-dot" + (resolvedProjectId ? " is-assigned" : ""),
+          "project-picker-dot"
+          + (resolvedProjectId || inheriting ? " is-assigned" : ""),
       }),
       h("span", { className: "project-picker-label" }, currentLabel),
       h("span", { "aria-hidden": "true", className: "project-switcher-caret" })
@@ -90,18 +107,30 @@ export function ProjectPicker({
                 onCreateProject();
               }
             : null,
-          onSelect: choose,
+          onSelect: (rowId) => choose(rowId === INHERIT_ROW_ID ? INHERIT_ROW_ID : rowId),
           // No rename/delete: a destructive act should not sit one keystroke from
           // a routine one, and the switcher already carries that pair.
-          rows: buildProjectPickerRows({
-            activeProjectId: resolvedProjectId,
-            projects,
-            threadActivity,
-            threadAttention,
-            threadProjectId,
-            threadReviewing,
-            threads,
-          }),
+          rows: (inheritRow
+            ? [
+                {
+                  active: inheriting,
+                  id: INHERIT_ROW_ID,
+                  label: inheritRow.label,
+                  subtitle: inheritRow.subtitle || null,
+                },
+              ]
+            : []
+          ).concat(
+            buildProjectPickerRows({
+              activeProjectId: inheriting ? NO_MATCH : resolvedProjectId,
+              projects,
+              threadActivity,
+              threadAttention,
+              threadProjectId,
+              threadReviewing,
+              threads,
+            })
+          ),
         })
       : null
   );

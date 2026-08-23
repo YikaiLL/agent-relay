@@ -6,10 +6,11 @@ import {
   INHERIT,
   forkFieldsAreSubmittable,
   forkInheritableFields,
+  forkInheritedDisplay,
   forkIsLossy,
   normalizeForkFields,
 } from "./fork-fields.js";
-import { ProjectPicker } from "./project-picker.js";
+import { INHERIT_ROW_ID, ProjectPicker } from "./project-picker.js";
 import { SettingPill } from "./setting-pill.js";
 import { WorkspacePicker } from "./workspace-picker.js";
 import { abbreviateHomePath } from "./workspace-chip-model.js";
@@ -27,6 +28,16 @@ import {
 const h = React.createElement;
 
 const INHERIT_LABEL = "Inherit from source";
+
+// What an inherited pill reads: the source's own value when the relay recorded
+// one, else the bare label. Either way the field still submits null.
+function inheritedLabel(sourceSettings, field, options) {
+  const raw = forkInheritedDisplay(sourceSettings, field);
+  if (!raw) {
+    return INHERIT_LABEL;
+  }
+  return (options || []).find((option) => option.value === raw)?.label || raw;
+}
 
 // A preview can be a whole handoff blob — tens of thousands of characters.
 const MAX_SOURCE_LABEL_CHARS = 80;
@@ -94,6 +105,10 @@ export function ForkSessionDialog({
   providerModels = {},
   providers = [],
   sourceThread = null,
+  // DISPLAY only. An untouched field still submits null so the relay resolves it
+  // at submit time — a value read when the dialog opened can be stale by then.
+  sourceSettings = null,
+  sourceProjectId = null,
   threadActivity = null,
   threadAttention = null,
   threadProjectId = {},
@@ -120,6 +135,8 @@ export function ForkSessionDialog({
   });
 
   const cwd = shownFields.cwd || "";
+  const sourceProjectName =
+    (projects || []).find((project) => project.id === sourceProjectId)?.name || "";
   const forkDisabled = pending || !sourceThread?.id || !cwd.trim() || !submittable;
 
   const closeDialog = () => {
@@ -134,8 +151,18 @@ export function ForkSessionDialog({
   };
 
   const modelInherits = inheritable.has("model") && shownFields.model === INHERIT;
+  const inheritedModel = forkInheritedDisplay(sourceSettings, "model");
   const modelChip = modelInherits
-    ? { tag: "inherited", value: INHERIT_LABEL }
+    ? {
+        tag: "inherited",
+        value: inheritedModel
+          ? selectedModelChip({
+              providerModels,
+              selectedModel: inheritedModel,
+              selectedProvider: sourceProvider,
+            }).value
+          : INHERIT_LABEL,
+      }
     : selectedModelChip({
         providerModels,
         selectedModel: shownFields.model || "",
@@ -239,10 +266,25 @@ export function ForkSessionDialog({
           || shownFields.projectId === FORK_PROJECT_NONE
             ? null
             : shownFields.projectId,
+        // Inheriting is NOT the Default Workspace: one omits `project_id` and the
+        // relay files the fork with its source, the other explicitly unassigns.
+        inheritRow: {
+          active: shownFields.projectId === FORK_PROJECT_INHERIT,
+          chipLabel: sourceProjectName || INHERIT_LABEL,
+          label: INHERIT_LABEL,
+          subtitle: sourceProjectName || "resolved when the fork is created",
+        },
         label: "Project",
         onCreateProject,
         onSelectProject: (projectId) =>
-          onFieldChange?.("projectId", projectId === null ? FORK_PROJECT_NONE : projectId),
+          onFieldChange?.(
+            "projectId",
+            projectId === INHERIT_ROW_ID
+              ? FORK_PROJECT_INHERIT
+              : projectId === null
+                ? FORK_PROJECT_NONE
+                : projectId
+          ),
         projects,
         threadActivity,
         threadAttention,
@@ -329,7 +371,7 @@ export function ForkSessionDialog({
         })),
         tag: effortState.tag,
         value: effortState.inherited
-          ? INHERIT_LABEL
+          ? inheritedLabel(sourceSettings, "effort", effortOptions)
           : selectedEffort?.label || shownFields.effort || "default",
       }),
       h(SettingPill, {
@@ -344,7 +386,7 @@ export function ForkSessionDialog({
         ).map((option) => ({ ...option, selected: option.value === shownFields.approvalPolicy })),
         tag: approvalState.tag || selectedApproval?.tag || null,
         value: approvalState.inherited
-          ? INHERIT_LABEL
+          ? inheritedLabel(sourceSettings, "approvalPolicy", approvalOptions)
           : selectedApproval?.label || shownFields.approvalPolicy || "default",
       })
     ),

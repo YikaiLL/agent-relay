@@ -22,35 +22,40 @@ function firstCatalogModel(models) {
   return models.find((option) => option?.is_default)?.model || models[0]?.model || INHERIT;
 }
 
-// `remembered: false` means these are relay defaults, not the source's choices.
-// Showing them as chosen would invent a decision, so those stay inherited.
-function seedFromSource(sourceSettings, key) {
+// What an untouched field DISPLAYS, which is not what it submits: sending it
+// would freeze a permission the source may change while the dialog is open.
+const SOURCE_SETTING_KEYS = {
+  approvalPolicy: "approval_policy",
+  effort: "reasoning_effort",
+  model: "model",
+  sandbox: "sandbox",
+};
+
+export function forkInheritedDisplay(sourceSettings, field) {
   if (!sourceSettings?.remembered) {
-    return INHERIT;
+    return "";
   }
-  return sourceSettings[key] || INHERIT;
+  return sourceSettings[SOURCE_SETTING_KEYS[field] || field] || "";
 }
 
 export function defaultForkFields({
   thread = null,
   models = [],
   session = null,
-  // Fetched for THAT thread — never read off the live session (see above).
-  sourceSettings = null,
 } = {}) {
   const provider = thread?.provider || session?.provider || "";
   return {
-    approvalPolicy: seedFromSource(sourceSettings, "approval_policy"),
+    approvalPolicy: INHERIT,
     cwd: thread?.cwd || "",
-    effort: seedFromSource(sourceSettings, "reasoning_effort"),
+    effort: INHERIT,
     initialPrompt: "",
     // Inherited like every other untouched setting. Cross-provider is still safe:
     // `normalizeForkFields` fills a concrete model once inherit is withdrawn.
-    model: seedFromSource(sourceSettings, "model"),
+    model: INHERIT,
     // Not the source's actual id: that would go stale if it moved project.
     projectId: FORK_PROJECT_INHERIT,
     provider,
-    sandbox: seedFromSource(sourceSettings, "sandbox"),
+    sandbox: INHERIT,
     sourceThreadId: thread?.id || "",
     upToItemId: "",
   };
