@@ -59,3 +59,16 @@ export async function fetchRemoteWorkspaceGitContext(cwd) {
   const result = await dispatchOrRecover("fetch_workspace_git_context", { cwd });
   return result?.workspace_git_context || null;
 }
+
+/**
+ * The settings a fork of `threadId` would inherit.
+ *
+ * Read-only and not claim-gated, like the other fetches here. Its own action
+ * rather than reusing the transcript response — which also carries settings —
+ * because that one pays a provider page fetch and a runtime hydration to answer
+ * a question the relay can answer from an in-memory map.
+ */
+export async function fetchRemoteThreadSettings(threadId) {
+  const result = await dispatchOrRecover("fetch_thread_settings", { thread_id: threadId });
+  return result?.thread_settings || null;
+}

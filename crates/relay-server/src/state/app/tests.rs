@@ -2776,6 +2776,115 @@ got {}",
             .is_ok());
     }
 
+    /// The fork dialog needs to SHOW what a fork would inherit, not just let the
+    /// relay resolve it silently.
+    ///
+    /// It has to be the same resolution `fork_session` performs, or the dialog
+    /// would advertise one thing and the fork would do another: remembered
+    /// settings when the relay has run the thread, relay defaults when it has
+    /// not. `remembered` distinguishes the two so a caller can tell "this is what
+    /// the source used" from "nobody recorded it, this is what you would get".
+    #[tokio::test]
+    async fn thread_settings_report_what_a_fork_would_actually_inherit() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: Some("fake-echo".to_string()),
+            effort: Some("high".to_string()),
+            approval_policy: Some("never".to_string()),
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        let settings = app
+            .thread_settings_view(Some("device-1".to_string()), &thread_id)
+            .await
+            .expect("settings");
+
+        assert!(settings.remembered, "the relay ran this thread");
+        assert_eq!(settings.model, "fake-echo");
+        assert_eq!(settings.reasoning_effort, "high");
+        assert_eq!(settings.approval_policy, "never");
+    }
+
+    /// The local HTTP surface is already authorized and names no device, so the
+    /// read must work without one — otherwise the endpoint is unreachable from
+    /// the surface that needs it most. The relay's own allowed_roots still bind
+    /// it; remote never takes this branch because `bind_device` stamps an id.
+    #[tokio::test]
+    async fn thread_settings_are_readable_without_a_device_id() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: Some("fake-echo".to_string()),
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        let settings = app
+            .thread_settings_view(None, &thread_id)
+            .await
+            .expect("readable without a device id");
+        assert_eq!(settings.model, "fake-echo");
+    }
+
+    /// A thread the relay has never run has nothing recorded. The answer must
+    /// still be usable — a fork of it WILL get the relay defaults — but it has to
+    /// say the values are not the source's own, so the dialog does not claim a
+    /// choice the user never made.
+    #[tokio::test]
+    async fn an_unrecorded_thread_reports_relay_defaults_and_says_so() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let settings = app
+            .thread_settings_view(Some("device-1".to_string()), "never-seen-thread")
+            .await
+            .expect("settings");
+
+        assert!(!settings.remembered);
+        assert!(
+            !settings.approval_policy.is_empty(),
+            "a usable value is still returned, because a fork would get one"
+        );
+    }
+
     async fn project_with_session(cwd: &str) -> (AppState, TempDir, TempDir, String) {
         let (app, p, o) = build_app(cwd).await;
         pair_device(&app, "device-1", Vec::new()).await;

@@ -3411,6 +3411,43 @@ function handleLaunchFieldInput(field, value) {
   renderLaunchSessionDialog();
 }
 
+// Fetch the source thread's recorded settings and re-seed the dialog with them.
+//
+// Generation-guarded like the git probe: the dialog can be closed and reopened on
+// another thread while a request is in flight, and a late answer must not seed
+// the wrong source. Only fields the user has NOT touched are re-seeded — an edit
+// made while the fetch was in flight is a real choice and outranks it.
+let forkSettingsGeneration = 0;
+async function refreshForkSourceSettings(threadId) {
+  const generation = ++forkSettingsGeneration;
+  try {
+    const response = await apiFetch(
+      `/api/threads/${encodeURIComponent(threadId)}/settings?device_id=${encodeURIComponent(state.deviceId || "")}`
+    );
+    const payload = await response.json();
+    if (generation !== forkSettingsGeneration) return;
+    if (!response.ok || !payload.ok) return;
+    const dialog = state.forkDialog;
+    if (!dialog?.open || dialog.sourceThread?.id !== threadId) return;
+
+    const seeded = defaultForkFields({
+      thread: dialog.sourceThread,
+      session: state.session,
+      sourceSettings: payload.data,
+    });
+    const fields = { ...dialog.fields };
+    for (const key of ["approvalPolicy", "effort", "model", "sandbox"]) {
+      // INHERIT is the untouched marker, so anything else is a user choice.
+      if (fields[key] === INHERIT) fields[key] = seeded[key];
+    }
+    state.forkDialog = { ...dialog, fields };
+    renderForkSessionDialog();
+  } catch {
+    // A failed fetch just leaves the fields inherited, which is what they were
+    // before this existed and is still a correct request.
+  }
+}
+
 // The fork dialog's own git probe. Deliberately a separate generation counter
 // and a separate state slot from the launch dialog's: the two can be open on
 // different directories, and sharing either would let one dialog label the
@@ -3725,6 +3762,12 @@ function openForkDialogForThread(threadId, upToItemId = "") {
     return;
   }
   const models = modelsForProvider(thread.provider, state.session?.available_models || []);
+  // Ask the relay what a fork of THIS thread would inherit, so the dialog shows
+  // the real model/effort/permissions instead of an abstract "inherit". Fired
+  // here rather than awaited: the dialog opens immediately on inherited fields
+  // and re-seeds when the answer lands, because a fork dialog that blocks on a
+  // network round trip feels broken.
+  void refreshForkSourceSettings(thread.id);
   state.forkDialog = {
     open: true,
     pending: false,

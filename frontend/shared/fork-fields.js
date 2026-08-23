@@ -30,12 +30,36 @@ function firstCatalogModel(models) {
   return models.find((option) => option?.is_default)?.model || models[0]?.model || INHERIT;
 }
 
-export function defaultForkFields({ thread = null, models = [], session = null } = {}) {
+// Seed a settings field from the SOURCE thread's own recorded settings.
+//
+// `remembered: false` means the relay has no record for that thread and handed
+// back its own defaults. A fork would get them either way — `fork_session` falls
+// back identically — but showing them as the source's choices would invent a
+// decision the user never made, so those stay inherited and the relay resolves
+// them. This is the same hazard as the header comment above, one step removed:
+// there, the wrong value was the live session's; here, it would be a default
+// dressed up as history.
+function seedFromSource(sourceSettings, key) {
+  if (!sourceSettings?.remembered) {
+    return INHERIT;
+  }
+  return sourceSettings[key] || INHERIT;
+}
+
+export function defaultForkFields({
+  thread = null,
+  models = [],
+  session = null,
+  // The source thread's settings, as returned by `thread_settings_view`. Fetched
+  // FOR THAT THREAD — never read off the live session, which is what the header
+  // comment forbids.
+  sourceSettings = null,
+} = {}) {
   const provider = thread?.provider || session?.provider || "";
   return {
-    approvalPolicy: INHERIT,
+    approvalPolicy: seedFromSource(sourceSettings, "approval_policy"),
     cwd: thread?.cwd || "",
-    effort: INHERIT,
+    effort: seedFromSource(sourceSettings, "reasoning_effort"),
     initialPrompt: "",
     // Inherited, like every other untouched setting. The dialog opens on the
     // SOURCE's provider, so the relay resolves the model from the source thread —
@@ -47,13 +71,13 @@ export function defaultForkFields({ thread = null, models = [], session = null }
     // layer up: `normalizeForkFields` fills a concrete model from the TARGET
     // catalogue the moment a provider change withdraws the inherit option, so a
     // foreign id can never reach the wrong bridge.
-    model: INHERIT,
+    model: seedFromSource(sourceSettings, "model"),
     // Untouched = inherit the source thread's project. Not the source's actual
     // id: sending that would defeat the relay's own resolution and would go
     // stale if the source moved project in between.
     projectId: FORK_PROJECT_INHERIT,
     provider,
-    sandbox: INHERIT,
+    sandbox: seedFromSource(sourceSettings, "sandbox"),
     sourceThreadId: thread?.id || "",
     upToItemId: "",
   };

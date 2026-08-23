@@ -395,6 +395,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -432,6 +433,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -535,6 +537,8 @@ fn remote_action_result_size_breakdown_reports_large_thread_transcript_payloads(
         None,
         // workspace_git_context
         None,
+        // thread_settings
+        None,
         // reviews
         None,
         // workflows
@@ -592,6 +596,7 @@ fn make_large_thread_transcript_plaintext() -> RemoteActionResultPlaintext {
         }),
         workspace_diff: None,
         workspace_git_context: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -622,6 +627,7 @@ fn make_large_ask_user_detail_plaintext() -> RemoteActionResultPlaintext {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -992,6 +998,7 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_settings: None,
         reviews: Some(reviews),
         workflows: None,
         devices: None,
@@ -1039,6 +1046,7 @@ fn plain_dedicated_workflows_and_devices_payloads_reach_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_settings: None,
         reviews: None,
         workflows: Some(crate::protocol::WorkflowsResponse {
             workflows_revision: 4,
@@ -1099,6 +1107,7 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -1152,6 +1161,7 @@ fn plain_fetch_workspace_git_context_result_reaches_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        thread_settings: None,
         workspace_git_context: Some(crate::protocol::WorkspaceGitContextView {
             cwd: "/repo/checkout".to_string(),
             is_repo: true,

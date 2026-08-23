@@ -558,3 +558,58 @@ test("a fork whose provider changed still gets a concrete model, never a foreign
 
   assert.equal(normalized.model, "gpt-5.5");
 });
+
+test("known source settings are seeded as REAL values, not as inherit", () => {
+  // The point of the change: a user should see the model and effort the fork will
+  // actually run with, not an abstract "inherit" they have to reason about. The
+  // values are the SOURCE thread's own, fetched for that thread — never the live
+  // session's, which is the hazard this file's header comment was written about.
+  const fields = defaultForkFields({
+    thread: { id: "t1", provider: "claude_code", cwd: "/repo" },
+    sourceSettings: {
+      approval_policy: "never",
+      model: "claude-opus-4-6",
+      reasoning_effort: "xhigh",
+      remembered: true,
+      sandbox: "workspace-write",
+    },
+  });
+
+  assert.equal(fields.model, "claude-opus-4-6");
+  assert.equal(fields.effort, "xhigh");
+  assert.equal(fields.approvalPolicy, "never");
+
+  const payload = forkFieldsToPayload(fields);
+  assert.equal(payload.model, "claude-opus-4-6", "and they are sent explicitly");
+  assert.equal(payload.effort, "xhigh");
+  assert.equal(payload.approval_policy, "never");
+});
+
+test("settings the relay never recorded stay inherited rather than inventing history", () => {
+  // `remembered: false` means the relay has no record and returned its own
+  // defaults. A fork WOULD get them, but presenting them as the source's choices
+  // would be inventing a decision the user never made — so the field falls back
+  // to inherit and the relay resolves it, exactly as before.
+  const fields = defaultForkFields({
+    thread: { id: "t1", provider: "claude_code" },
+    sourceSettings: {
+      approval_policy: "untrusted",
+      model: "gpt-5.5",
+      reasoning_effort: "medium",
+      remembered: false,
+      sandbox: "workspace-write",
+    },
+  });
+
+  assert.equal(fields.model, INHERIT);
+  assert.equal(fields.effort, INHERIT);
+  assert.equal(fields.approvalPolicy, INHERIT);
+});
+
+test("with no settings supplied at all the fields inherit, as before", () => {
+  // The dialog can open before its settings fetch resolves. Inherit is the only
+  // honest state in that window, and it is also what an older client sends.
+  const fields = defaultForkFields({ thread: { id: "t1", provider: "claude_code" } });
+  assert.equal(fields.model, INHERIT);
+  assert.equal(fields.approvalPolicy, INHERIT);
+});

@@ -52,10 +52,10 @@ use protocol::{
     SessionSnapshotCompactProfile, StartSessionInput, StartTeamInput, StartTeamReceipt,
     StartWorkflowInput, StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput,
     TakeOverInput, TeamActionInput, TeamActionReceipt, TeamsResponse, ThreadArchiveReceipt,
-    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadTranscriptResponse,
-    ThreadsQuery, ThreadsResponse, TranscriptDeltaEvent, UpdateSessionSettingsInput,
-    WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse,
-    WorkspaceDiffResponse, WorkspaceGitContextView,
+    ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadSettingsView,
+    ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, TranscriptDeltaEvent,
+    UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt,
+    WorkflowsResponse, WorkspaceDiffResponse, WorkspaceGitContextView,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -118,6 +118,13 @@ struct ThreadTranscriptQuery {
 struct ThreadEntryDetailQuery {
     field: Option<String>,
     cursor: Option<usize>,
+}
+
+/// `device_id` for a plain thread-addressed read. Optional so the local surface
+/// can call without one; `thread_settings_view` scopes on whatever it gets.
+#[derive(Debug, Deserialize)]
+struct DeviceQuery {
+    device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +345,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/session", get(session_snapshot))
         .route("/api/workspace/diff", get(workspace_diff))
         .route("/api/workspace/git-context", get(workspace_git_context))
+        .route("/api/threads/:thread_id/settings", get(thread_settings))
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
         .route("/api/threads/:thread_id/transcript", get(thread_transcript))
@@ -682,6 +690,24 @@ async fn workspace_git_context(
         // scope refusal under `bad_gateway`, because its message is deliberately generic
         // and matches none of that function's markers — reporting a client mistake as a
         // relay fault, and inviting a client to retry it.
+        .map_err(bad_request)
+}
+
+/// What a fork of this thread would inherit. Read-only, in-memory, and scoped to
+/// the thread's own workspace by `thread_settings_view`.
+async fn thread_settings(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+    Query(query): Query<DeviceQuery>,
+) -> Result<Json<ApiEnvelope<ThreadSettingsView>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .thread_settings_view(query.device_id, &thread_id)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(bad_request)
 }
 

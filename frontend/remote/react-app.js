@@ -34,6 +34,7 @@ import {
 import { RefreshButton } from "../shared/refresh-button.js";
 import { ForkSessionDialog } from "../shared/fork-session-dialog.js";
 import {
+  INHERIT as FORK_INHERIT,
   applyForkProviderChange,
   canForkInSession,
   defaultForkFields,
@@ -227,6 +228,7 @@ import {
   assignRemoteThreadToProject,
   createRemoteProject,
   fetchRemoteProjects,
+  fetchRemoteThreadSettings,
   fetchRemoteWorkspaceGitContext,
   renameRemoteProject,
   renameRemoteThread,
@@ -1652,6 +1654,37 @@ function RemoteApp() {
     // nothing else fetches that catalog — without this the model select sits
     // on "Loading models..." forever.
     void ensureRemoteProviderModels(thread.provider);
+    // Ask what a fork of THIS thread would inherit, so the pills show real values
+    // rather than an abstract "inherit". Not awaited: the dialog opens on
+    // inherited fields and re-seeds when the answer lands.
+    void refreshRemoteForkSourceSettings(thread.id);
+  }
+
+  // Re-seed the fork dialog with the source thread's own recorded settings.
+  //
+  // Only fields the user has NOT touched are replaced: INHERIT is the untouched
+  // marker, so anything else is a real choice and outranks a late answer. Guarded
+  // on the dialog still showing the same source, because it can be closed and
+  // reopened on another thread while the request is in flight.
+  async function refreshRemoteForkSourceSettings(threadId) {
+    try {
+      const settings = await fetchRemoteThreadSettings(threadId);
+      if (!settings) return;
+      const dialog = remoteUiStore.getState().forkDialog;
+      if (!dialog?.open || dialog.sourceThread?.id !== threadId) return;
+
+      const seeded = defaultForkFields({
+        thread: dialog.sourceThread,
+        sourceSettings: settings,
+      });
+      const fields = { ...dialog.fields };
+      for (const key of ["approvalPolicy", "effort", "model", "sandbox"]) {
+        if (fields[key] === FORK_INHERIT) fields[key] = seeded[key];
+      }
+      remoteUiStore.getState().setForkDialog({ ...dialog, fields });
+    } catch {
+      // Leaves the fields inherited, which is still a correct request.
+    }
   }
 
   // --- per-session actions sheet ----------------------------------------------

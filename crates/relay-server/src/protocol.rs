@@ -2427,6 +2427,33 @@ pub struct ProjectActionReceipt {
     pub message: String,
 }
 
+/// What a fork of a given thread would inherit, resolved the same way
+/// `AppState::fork_session` resolves it.
+///
+/// Exists so the fork dialog can SHOW the values instead of offering an abstract
+/// "inherit" state. `ThreadSessionSettings` cannot be reused for this: it is
+/// `pub(crate)` and shaped for the on-disk state file, and it cannot express the
+/// not-recorded case at all.
+///
+/// Deliberately NOT folded into `ThreadSummaryView`. That rides `ThreadsResponse`,
+/// which is byte-budgeted and whose over-budget response is to DROP SESSIONS from
+/// the sidebar — four settings strings on every row, to serve the one row a user
+/// forks, is the bargain the `renamed: bool` comment already declined at a
+/// fraction of the cost.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadSettingsView {
+    pub thread_id: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub approval_policy: String,
+    pub sandbox: String,
+    /// False when the relay has no record for this thread and the values above
+    /// are its own defaults. A fork WOULD get them — `fork_session` falls back
+    /// the same way — but they are not a choice the source ever made, and a UI
+    /// that presented them as such would be inventing history.
+    pub remembered: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionInput {
     pub cwd: Option<String>,

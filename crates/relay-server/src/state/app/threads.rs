@@ -793,3 +793,60 @@ normal thread instead."
         })
     }
 }
+
+impl AppState {
+    /// What a fork of `thread_id` would inherit.
+    ///
+    /// Mirrors the resolution in `fork_session`: remembered settings when the
+    /// relay has run the thread, relay defaults otherwise. Keeping the two in one
+    /// shape is the point — a dialog that advertised different values from the
+    /// ones the fork actually uses is worse than one that says nothing.
+    ///
+    /// A plain in-memory map read: no provider round-trip, no runtime hydration.
+    /// That is why this is its own endpoint rather than a piggyback on the
+    /// transcript response, which pays a provider page fetch and a write lock to
+    /// answer the same question.
+    pub async fn thread_settings_view(
+        &self,
+        device_id: Option<String>,
+        thread_id: &str,
+    ) -> Result<ThreadSettingsView, String> {
+        let defaults = self.defaults().await;
+        let relay = self.relay.read().await;
+        // Scope the read to the thread's own workspace: a paired device must not
+        // learn the settings of a thread it cannot see.
+        //
+        // `device_id` is OPTIONAL, matching `workspace_git_context`. The local
+        // HTTP surface is already authorized and has no device to name, so
+        // requiring one would make this endpoint unreachable from the surface
+        // that needs it most; with none, the relay's own `allowed_roots` still
+        // bind the read. Remote never hits that branch — `bind_device` stamps the
+        // id server-side before dispatch.
+        if let Some(cwd) = relay.thread_cwd(thread_id) {
+            let device_scope = device_id
+                .as_deref()
+                .map(|id| relay.device_path_scope(id))
+                .unwrap_or_default();
+            ensure_path_within_device_scope(&cwd, &device_scope, &relay.allowed_roots)?;
+        }
+
+        Ok(match relay.remembered_thread_settings(thread_id) {
+            Some(settings) => ThreadSettingsView {
+                thread_id: thread_id.to_string(),
+                model: settings.model,
+                reasoning_effort: settings.reasoning_effort,
+                approval_policy: settings.approval_policy,
+                sandbox: settings.sandbox,
+                remembered: true,
+            },
+            None => ThreadSettingsView {
+                thread_id: thread_id.to_string(),
+                model: defaults.model,
+                reasoning_effort: defaults.reasoning_effort,
+                approval_policy: defaults.approval_policy,
+                sandbox: defaults.sandbox,
+                remembered: false,
+            },
+        })
+    }
+}

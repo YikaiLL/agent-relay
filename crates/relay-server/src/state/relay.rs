@@ -177,6 +177,7 @@ pub(crate) struct CachedRemoteActionResult {
     pub(crate) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(crate) workspace_diff: Option<crate::protocol::WorkspaceDiffResponse>,
     pub(crate) workspace_git_context: Option<crate::protocol::WorkspaceGitContextView>,
+    pub(crate) thread_settings: Option<crate::protocol::ThreadSettingsView>,
     pub(crate) reviews: Option<crate::protocol::ReviewsResponse>,
     pub(crate) workflows: Option<crate::protocol::WorkflowsResponse>,
     pub(crate) devices: Option<crate::protocol::DevicesResponse>,
