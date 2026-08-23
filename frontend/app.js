@@ -229,6 +229,7 @@ import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-stri
 import { ProjectSwitcher } from "./shared/project-switcher.js";
 import { StartSessionDialog } from "./shared/start-session-dialog.js";
 import { selectWorkspaceSuggestionsModel } from "./shared/workspace-suggestions.js";
+import { createProjectAndSelect } from "./shared/project-create.js";
 import {
   layoutThreadIds,
 } from "./shared/tab-layout.js";
@@ -1698,19 +1699,24 @@ async function createProjectFromToolbar() {
 }
 
 // Selects the new project instead of navigating to it, unlike the toolbar version.
-async function createProjectForLaunchDraft(setProjectId) {
+async function createProjectForLaunchDraft(apply, isCurrent) {
   const name = promptProjectName();
   if (!name) {
     return;
   }
   try {
-    const before = state.projects || [];
-    const receipt = await createProject(apiFetch, name);
-    const projectId = pickNewProjectId(before, receipt?.projects);
-    if (projectId) {
-      setProjectId(projectId);
-    }
-    logLine(`Created project "${name}".`);
+    const projectId = await createProjectAndSelect({
+      apply,
+      create: (projectName) => createProject(apiFetch, projectName),
+      isCurrent,
+      name,
+      store: projectsStore,
+    });
+    logLine(
+      projectId
+        ? `Created project "${name}".`
+        : `Created project "${name}", but could not tell which one is new — pick it manually.`
+    );
   } catch (error) {
     logLine(`Failed to create project: ${error.message}`);
   }
@@ -3616,8 +3622,10 @@ function renderForkSessionDialog() {
     sourceSettings: dialogState.sourceSettings || null,
     sourceProjectId: state.threadProjectId?.[dialogState.sourceThread?.id] || null,
     onCreateProject() {
-      void createProjectForLaunchDraft((projectId) =>
-        handleForkDialogFieldChange("projectId", projectId)
+      const sourceId = dialogState.sourceThread?.id || null;
+      void createProjectForLaunchDraft(
+        (projectId) => handleForkDialogFieldChange("projectId", projectId),
+        () => state.forkDialog?.open && state.forkDialog.sourceThread?.id === sourceId
       );
     },
     projects: state.projects || [],
@@ -4585,8 +4593,9 @@ function renderLaunchSessionDialog() {
       id: "launch-start-session-dialog",
       initialPromptAttachmentsId: "start-prompt-attachments",
       onCreateProject() {
-        void createProjectForLaunchDraft((projectId) =>
-          handleLaunchFieldInput("projectId", projectId)
+        void createProjectForLaunchDraft(
+          (projectId) => handleLaunchFieldInput("projectId", projectId),
+          () => document.getElementById("launch-start-session-dialog")?.open === true
         );
       },
       onFieldChange: handleLaunchFieldInput,

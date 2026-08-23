@@ -31,7 +31,7 @@ export function notifyRemoteProjects(session) {
 
 // Force a refetch (e.g. right after a local mutation whose receipt the broker drops).
 export function refreshRemoteProjects() {
-  getRemoteProjectsStore().refresh();
+  return getRemoteProjectsStore().refresh();
 }
 
 // Forget fetched state when the relay/channel identity changes: an equal revision

@@ -44,6 +44,7 @@ import {
 import { copyTextToClipboard } from "../shared/clipboard.js";
 import { installThreadListWheelProxy } from "../shared/thread-list-scroll.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
+import { createProjectAndSelect } from "../shared/project-create.js";
 import { createVerbCycler } from "../progress-verbs.js";
 import {
   buildProviderStatusModel,
@@ -222,6 +223,7 @@ import {
   useRemoteProjects,
   notifyRemoteProjects,
   refreshRemoteProjects,
+  getRemoteProjectsStore,
 } from "./projects-host.js";
 import {
   assignRemoteThreadToProject,
@@ -753,19 +755,23 @@ function RemoteApp() {
   }, [activeRelayId, threadListStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
-  // Must SELECT it, not just refresh the list. The id is recovered by refetching,
-  // because the broker acks `project_action` without its receipt.
-  const createRemoteProjectForDraft = async (setProjectId) => {
+  // Must SELECT it, not just refresh the list.
+  const createRemoteProjectForDraft = async (apply, isCurrent) => {
     const name = promptRemoteProjectName();
     if (!name) return;
     try {
-      const before = new Set((remoteProjects.projects || []).map((project) => project.id));
-      await createRemoteProject(name);
-      const payload = await fetchRemoteProjects();
-      const created = (payload?.projects || []).find((project) => !before.has(project.id));
-      refreshRemoteProjects();
-      if (created) setProjectId(created.id);
-      renderLog(`Created project "${name}".`);
+      const projectId = await createProjectAndSelect({
+        apply,
+        create: createRemoteProject,
+        isCurrent,
+        name,
+        store: getRemoteProjectsStore(),
+      });
+      renderLog(
+        projectId
+          ? `Created project "${name}".`
+          : `Created project "${name}", but could not tell which one is new — pick it manually.`
+      );
     } catch (error) {
       renderLog(`Failed to create project: ${error.message}`);
     }
@@ -873,7 +879,11 @@ function RemoteApp() {
     threads: currentState.threads,
     threadProjectId: remoteProjects.threadProjectId,
     onCreateProject: remoteProjectsReady
-      ? () => createRemoteProjectForDraft((projectId) => updateSessionDraft({ projectId }))
+      ? () =>
+          createRemoteProjectForDraft(
+            (projectId) => updateSessionDraft({ projectId }),
+            () => document.getElementById("remote-start-session-dialog")?.open === true
+          )
       : null,
     // When we have a real catalog the picker is authoritative; otherwise expose
     // the fetch status so the dialog can say "loading"/"failed" instead of
@@ -2350,9 +2360,16 @@ function RemoteApp() {
           id: "remote-fork-session-dialog",
           sourceThread: forkDialog.sourceThread,
           onCreateProject: remoteProjectsReady
-            ? () => createRemoteProjectForDraft((projectId) =>
-                handleForkFieldChange("projectId", projectId)
-              )
+            ? () => {
+                const sourceId = forkDialog.sourceThread?.id || null;
+                return createRemoteProjectForDraft(
+                  (projectId) => handleForkFieldChange("projectId", projectId),
+                  () => {
+                    const current = remoteUiStore.getState().forkDialog;
+                    return current?.open && current.sourceThread?.id === sourceId;
+                  }
+                );
+              }
             : null,
           projects: remoteProjects.projects,
           threadProjectId: remoteProjects.threadProjectId,
