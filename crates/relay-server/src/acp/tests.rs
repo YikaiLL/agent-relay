@@ -1449,6 +1449,212 @@ async fn an_option_less_permission_request_cancels_and_is_never_read_as_a_plan()
     );
 }
 
+/// A `session/request_permission` as Cursor sends it, trimmed to what the
+/// bridge reads.
+fn permission_request(id: u64, session_id: &str) -> serde_json::Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": session_id,
+            "toolCall": {
+                "toolCallId": "call-1",
+                "title": "`rm -rf build`",
+                "kind": "execute",
+                "status": "pending"
+            },
+            "options": [
+                {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "reject", "name": "Reject", "kind": "reject_once"}
+            ]
+        }
+    })
+}
+
+/// Start a turn and drain its `session/prompt`, so the caller's next
+/// `next_wire_line` reads the agent's answer.
+async fn start_turn_and_drain_prompt(
+    bridge: &AcpBridge,
+    peer: &mut tokio::io::DuplexStream,
+    thread_id: &str,
+) {
+    crate::provider::ProviderBridge::start_turn(bridge, thread_id, "hello", "", "", &[])
+        .await
+        .expect("the prompt must reach the agent");
+    let prompt = next_wire_line(peer).await;
+    assert_eq!(
+        prompt["method"],
+        json!("session/prompt"),
+        "expected the turn's prompt first, got {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_refreshes_a_stale_approval_policy_before_prompting() {
+    // "YOLO still asks for permission on Cursor": pressing YOLO on a thread the
+    // relay already saved as `bypass` skips the resume, so the bridge copy that
+    // actually decides permissions never hears.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.remember_thread_settings("t1", "bypass", "workspace-write", "high", "");
+    }
+
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    // The copy the bridge is carrying predates the user's change.
+    bridge
+        .seed_session_with_policy_for_test("t1", "/tmp/project", "on-request")
+        .await;
+
+    start_turn_and_drain_prompt(&bridge, &mut outbound_peer, "t1").await;
+
+    let mut writer = inbound_writer;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut writer,
+        format!("{}\n", permission_request(21, "t1")).as_bytes(),
+    )
+    .await
+    .expect("write");
+
+    let answered = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(answered["id"], json!(21));
+    assert_eq!(
+        answered["result"]["outcome"],
+        json!({"outcome": "selected", "optionId": "allow"}),
+        "a thread the relay has on `bypass` must be answered by the bridge, not the user"
+    );
+    assert!(
+        state.read().await.pending_approvals.is_empty(),
+        "a YOLO thread must not park an approval card at all"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_on_a_session_the_bridge_has_no_copy_of_still_honours_bypass() {
+    // The same defect with the copy missing rather than stale — the state after
+    // every relay restart, since the session map is process memory.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.remember_thread_settings("t1", "bypass", "workspace-write", "high", "");
+    }
+
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    // Deliberately no `seed_session_*`: the bridge has never heard of `t1`.
+
+    start_turn_and_drain_prompt(&bridge, &mut outbound_peer, "t1").await;
+
+    let mut writer = inbound_writer;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut writer,
+        format!("{}\n", permission_request(22, "t1")).as_bytes(),
+    )
+    .await
+    .expect("write");
+
+    let answered = next_wire_line(&mut outbound_peer).await;
+    assert_eq!(answered["id"], json!(22));
+    assert_eq!(
+        answered["result"]["outcome"],
+        json!({"outcome": "selected", "optionId": "allow"}),
+        "a cold session must pick the relay's policy up on its first turn"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_refreshes_a_stale_approval_policy_in_the_restricting_direction_too() {
+    // A genuine re-read, not a one-way widening: a thread just taken OUT of YOLO
+    // must ask again on its next turn, whatever the stale copy says.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.remember_thread_settings("t1", "on-request", "workspace-write", "high", "");
+    }
+
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+    bridge
+        .seed_session_with_policy_for_test("t1", "/tmp/project", "bypass")
+        .await;
+
+    start_turn_and_drain_prompt(&bridge, &mut outbound_peer, "t1").await;
+
+    let mut writer = inbound_writer;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut writer,
+        format!("{}\n", permission_request(23, "t1")).as_bytes(),
+    )
+    .await
+    .expect("write");
+
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let relay = state.read().await;
+                if let Some(pending) = relay.pending_approvals.values().next() {
+                    return pending.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a thread the relay has on `on-request` must ask the user");
+    assert_eq!(parked.thread_id, "t1");
+}
+
+#[tokio::test]
+async fn a_cold_read_only_thread_is_put_back_in_plan_mode_before_its_turn() {
+    // The refresh writes `required_mode` too, so it has to restrict as well as
+    // relax: a reviewer whose copy was lost to a restart would otherwise run as
+    // a full `agent`, free to edit the artifact it was asked to judge.
+    let state = relay_state();
+    {
+        let mut relay = state.write().await;
+        relay.remember_thread_settings("t1", "review_read_only", "read-only", "high", "");
+    }
+
+    let (outbound, mut outbound_peer) = tokio::io::duplex(8192);
+    let (inbound_writer, inbound) = tokio::io::duplex(8192);
+    let bridge = AcpBridge::for_test(state.clone(), outbound, inbound, "cursor");
+
+    // `session/set_mode` is a request: answer it, and hold the peer open past
+    // the reply so the prompt that follows still has somewhere to go.
+    let responder = tokio::spawn(async move {
+        let request = next_wire_line(&mut outbound_peer).await;
+        let mut writer = inbound_writer;
+        let reply = json!({"jsonrpc": "2.0", "id": request["id"], "result": {}});
+        tokio::io::AsyncWriteExt::write_all(&mut writer, format!("{reply}\n").as_bytes())
+            .await
+            .expect("write");
+        let next = next_wire_line(&mut outbound_peer).await;
+        (request, next)
+    });
+
+    crate::provider::ProviderBridge::start_turn(&bridge, "t1", "hello", "", "", &[])
+        .await
+        .expect("the prompt must reach the agent");
+
+    let (request, next) = responder.await.expect("responder panicked");
+    assert_eq!(
+        request["method"],
+        json!("session/set_mode"),
+        "a read-only thread must be restricted before its prompt goes out"
+    );
+    assert_eq!(request["params"]["modeId"], json!("plan"));
+    assert_eq!(
+        next["method"],
+        json!("session/prompt"),
+        "and the prompt must follow it, not replace it"
+    );
+}
+
 #[tokio::test]
 async fn a_no_prompt_thread_accepts_the_plan_without_parking_it() {
     // Same contract as `session/request_permission` under a no-prompt policy:

@@ -873,6 +873,40 @@ impl AcpBridge {
         Ok(())
     }
 
+    /// Re-assert the relay's current policy on the session, as codex and claude
+    /// both do per turn: `SessionRuntime.approval_policy` decides
+    /// `session/request_permission`, and only `start_thread`/`resume_thread`
+    /// write it — so it is stale whenever a policy change skipped those (the
+    /// relay already read `bypass`) and absent after a restart. Both read as
+    /// "YOLO still asks for permission". No settings means nothing to assert;
+    /// inventing a default here could only widen the turn.
+    async fn sync_thread_policy(&self, thread_id: &str) -> Result<(), String> {
+        let settings = {
+            let relay = self.state.read().await;
+            relay.thread_settings(thread_id)
+        };
+        let Some(settings) = settings else {
+            return Ok(());
+        };
+
+        let mode = protocol::acp_mode_for_policy(&settings.approval_policy, &settings.sandbox);
+        let needs_mode_push = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions.entry(thread_id.to_string()).or_default();
+            session.approval_policy = settings.approval_policy.clone();
+            session.required_mode = (mode != protocol::MODE_AGENT).then_some(mode);
+            // Only a restriction is worth a round trip; pinning `agent` would
+            // fight an agent that entered plan mode on its own.
+            mode != protocol::MODE_AGENT && session.mode != mode
+        };
+
+        if needs_mode_push {
+            self.apply_mode(thread_id, &settings.approval_policy, &settings.sandbox)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Put the session into the mode the relay's policy demands.
     ///
     /// Failing to *restrict* is fatal: the caller (a reviewer thread, a workflow
@@ -1409,6 +1443,9 @@ impl ProviderBridge for AcpBridge {
         // effort has no separate axis here — ACP model ids encode it (see
         // `protocol::model_effort`), so it rides along inside `model`.
         self.apply_model(thread_id, model).await?;
+        // Same reason: this turn's permissions must be decided against the
+        // policy the relay holds now.
+        self.sync_thread_policy(thread_id).await?;
 
         let turn_id = self.mint_turn_id();
 
