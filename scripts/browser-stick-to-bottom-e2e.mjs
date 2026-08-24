@@ -30,6 +30,7 @@ import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
 import { attachPageDebugLogging, launchBrowser } from "./e2e/harness/browser.mjs";
 import { createFakeProviderScenarioHarness } from "./e2e/harness/fake-provider.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
+import { startLocalSession } from "./e2e/harness/local-session.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import {
   dumpProcessLogs,
@@ -713,16 +714,12 @@ async function exerciseTouchEscape(page, label) {
 // top. Regression shape: the empty render records no scroll snapshot, or the
 // follower's listener attaches too late to hear the jump-bottom broadcast.
 async function exerciseEmptyFirstSend(page, label, workspaceDir) {
-  await page.click("#open-start-session-dialog");
-  await page.waitForFunction(
-    () => document.querySelector("#launch-start-session-dialog")?.open,
-    null,
-    { timeout: TIMEOUT_MS }
-  );
-  await page.fill("#cwd-input", workspaceDir);
-  await page.selectOption("#provider-input", "fake");
-  await page.selectOption("#approval-policy-input", "never");
-  await page.click("#start-session-button");
+  await startLocalSession(page, {
+    cwd: workspaceDir,
+    provider: "fake",
+    approvalPolicy: "never",
+    timeoutMs: TIMEOUT_MS,
+  });
   await page.waitForFunction(
     () => (document.querySelector("#transcript")?.textContent || "").includes("Session ready"),
     null,

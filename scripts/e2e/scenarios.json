@@ -24,7 +24,8 @@
       "local-session-rename",
       "local-session-tab-scroll",
       "local-rail-toggle-align",
-      "local-permission-modes"
+      "local-permission-modes",
+      "local-workspace-repair"
     ],
     "local-full": [
       "local-session",
@@ -52,7 +53,8 @@
       "local-session-tab-scroll",
       "local-rail-toggle-align",
       "local-delete",
-      "local-permission-modes"
+      "local-permission-modes",
+      "local-workspace-repair"
     ],
     "public-core": [
       "public-transcript-delta",
@@ -555,6 +557,25 @@
         "virtualized-transcript",
         "desktop-layout",
         "mobile-layout"
+      ]
+    },
+    "local-workspace-repair": {
+      "script": "browser-local-workspace-repair-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "workspace-repair"
+      ]
+    },
+    "workflow-code-flow": {
+      "script": "workflow-code-flow-e2e.mjs",
+      "_comment": "In no suite: the run it starts stays queued forever and never reaches active_workflow_runs (reproduced at a 300s timeout, so not the tree-size latency its header warns about). Wire into local-core once diagnosed.",
+      "tier": "manual",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "workflow-code-flow"
       ]
     },
     "local-multi-live-follow": {

@@ -376,6 +376,16 @@ function RemoteApp() {
   const [askUserQuestionDetailErrors, setAskUserQuestionDetailErrors] = useState(() => new Map());
   const [remoteUiStore] = useState(() => createRemoteUiStore());
   const remoteUi = useRemoteUiStoreState(remoteUiStore);
+  // A binding, not just a sidebar prop: the create-project callback below calls it
+  // directly, and as a prop-only method that was a ReferenceError.
+  const updateSessionDraft = useCallback(
+    (nextPatch) => {
+      for (const [field, value] of Object.entries(nextPatch)) {
+        remoteUiStore.getState().setSessionDraftField(field, value);
+      }
+    },
+    [remoteUiStore]
+  );
   const [threadListStore] = useState(() => createThreadListStore());
   const threadListUi = useThreadListStoreState(threadListStore);
   // Dedicated Projects payload (list + membership), fetched off the snapshot's
@@ -2171,6 +2181,9 @@ function RemoteApp() {
         onStartSession() {
           void handleStartSession();
         },
+        onOpenStartSessionDialog(projectId = null) {
+          openRemoteStartSessionDialog(remoteUiStore, projectId);
+        },
         onToggleGroup(cwd) {
           threadListStore.getState().toggleCollapsedGroup(cwd);
         },
@@ -2186,11 +2199,7 @@ function RemoteApp() {
         sessionToggleLabel,
         threadListUi,
         threadsModel,
-        updateSessionDraft(nextPatch) {
-          for (const [field, value] of Object.entries(nextPatch)) {
-            remoteUiStore.getState().setSessionDraftField(field, value);
-          }
-        },
+        updateSessionDraft,
         setSessionPanelOpenLocal(open) {
           remoteUiStore.getState().setSessionPanelOpen(open);
         },
@@ -2513,11 +2522,14 @@ function findThreadNameInGroups(groups, threadId) {
 // with one agent selected and another agent's model still in the box. Hoisted because two
 // controls now perform this switch — the dialog's own select and the sidebar split
 // button's menu — and they must not drift.
-function openRemoteStartSessionDialog(activeProjectId = null) {
-  remoteUiStore.getState().beginLaunchDialogOpening();
+
+// Store passed in: this is module scope, but the store is created per-mount inside
+// RemoteApp, so naming it here was a ReferenceError.
+function openRemoteStartSessionDialog(store, activeProjectId = null) {
+  store.getState().beginLaunchDialogOpening();
   // At open time, not per render: otherwise an unrelated re-render snaps the chip
   // back over a choice made inside the dialog.
-  remoteUiStore.getState().setSessionDraftField("projectId", activeProjectId || null);
+  store.getState().setSessionDraftField("projectId", activeProjectId || null);
   document.getElementById("remote-start-session-dialog")?.showModal();
 }
 
@@ -2570,6 +2582,7 @@ function RemoteSidebar({
   onDeleteProject,
   onSelectRelay,
   onStartSession,
+  onOpenStartSessionDialog,
   onToggleExpandedGroup,
   onToggleGroup,
   relayDirectoryModel,
@@ -2744,10 +2757,10 @@ function RemoteSidebar({
       buttonId: "remote-session-toggle",
       disabled: !hasUsableRelay,
       menuId: "remote-start-session-agent-menu",
-      onStart: () => openRemoteStartSessionDialog(activeProjectId),
+      onStart: () => onOpenStartSessionDialog(activeProjectId),
       onStartWithProvider(provider) {
         updateSessionDraft(providerDraftPatch(remoteUiState, provider));
-        openRemoteStartSessionDialog(activeProjectId);
+        onOpenStartSessionDialog(activeProjectId);
       },
       providerOptions: sessionPanelModel?.providerOptions || [],
     }),

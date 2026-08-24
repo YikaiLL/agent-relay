@@ -189,6 +189,9 @@ async function main() {
   const relayBin = path.join(ROOT, "target", "debug", "relay-server");
   const relay = spawnManagedProcess("relay", relayBin, [], {
     AGENT_PROVIDERS: "fake",
+    // Stated, not inherited: `process.env` passes through, so a maintainer with
+    // SEALWIRE_BETA=1 exported saw this pass while CI got `bad_request`.
+    SEALWIRE_BETA: "1",
     PORT: String(relayPort),
     RELAY_STATE_PATH: statePath,
     FAKE_PROVIDER_SCENARIO_PATH: scenarioPath,

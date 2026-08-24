@@ -1,6 +1,12 @@
+import { fillStartSessionDialog } from "./start-session-dialog.mjs";
+
 // This matches compact header badge text ("Offline", "Re-pair"). Broader
 // alert badges such as approval/review/workflow states do not block composing.
 const REMOTE_MESSAGE_INPUT_BLOCKING_STATUS_PATTERN = /\b(?:offline|re-?pair)\b/i;
+
+// The remote surface renders the same `StartSessionDialog` as local, under its own
+// id. Everything inside it is driven by the shared module.
+const REMOTE_DIALOG_ID = "remote-start-session-dialog";
 
 export async function openRemoteSessionPanel(page, timeoutMs) {
   await selectFirstRelayIfNeeded(page, timeoutMs);
@@ -78,35 +84,21 @@ export async function startRemoteSession(
   { cwd, approvalPolicy = "never", effort, timeoutMs }
 ) {
   await openRemoteSessionPanel(page, timeoutMs);
-  await selectIfOptionExists(page, [
-    "#remote-provider-input",
-    "#remote-launch-provider-input",
-  ], "fake", timeoutMs);
-  await selectIfOptionExists(page, [
-    "#remote-model-input",
-    "#remote-launch-model-input",
-  ], "fake-echo", timeoutMs);
-  await selectFirstAvailable(page, [
-    "#remote-approval-policy-input",
-    "#remote-launch-approval-policy-input",
-  ], approvalPolicy, timeoutMs);
-  if (effort) {
-    await selectIfOptionExists(page, [
-      "#remote-start-effort",
-      "#remote-launch-start-effort",
-    ], effort, timeoutMs);
-  }
-  await fillFirstAvailable(page, [
-    "#remote-cwd-input",
-    "#remote-start-session-dialog-cwd",
-  ], cwd, timeoutMs);
-  await clickFirstAvailable(page, [
-    "#remote-start-session-button",
-    "#remote-start-session-dialog-start",
-  ], timeoutMs);
-  await page.evaluate(() => {
-    document.querySelector("#remote-start-session-dialog")?.close?.();
+  await fillStartSessionDialog(page, {
+    dialogId: REMOTE_DIALOG_ID,
+    cwd,
+    approvalPolicy,
+    effort,
+    provider: "fake",
+    model: "fake-echo",
+    // Asked for unconditionally, so a relay that does not publish fake must fall
+    // through rather than fail.
+    modelOptional: true,
+    timeout: timeoutMs,
   });
+  await page.evaluate((id) => {
+    document.getElementById(id)?.close?.();
+  }, REMOTE_DIALOG_ID);
 }
 
 export async function sendPromptAndWaitForReply(page, prompt, { timeoutMs, expectedReply } = {}) {
@@ -123,78 +115,4 @@ export async function sendPromptAndWaitForReply(page, prompt, { timeoutMs, expec
     reply,
     { timeout: timeoutMs }
   );
-}
-
-async function selectFirstAvailable(page, selectors, value, timeoutMs) {
-  const selector = await waitForUsableSelector(page, selectors, timeoutMs);
-  await page.selectOption(selector, value);
-}
-
-async function selectIfOptionExists(page, selectors, value, timeoutMs) {
-  const selector = await waitForOptionalSelectorWithOption(page, selectors, value, timeoutMs);
-  if (selector) {
-    await page.selectOption(selector, value);
-  }
-}
-
-async function fillFirstAvailable(page, selectors, value, timeoutMs) {
-  const selector = await waitForUsableSelector(page, selectors, timeoutMs);
-  await page.fill(selector, value);
-}
-
-async function clickFirstAvailable(page, selectors, timeoutMs) {
-  const selector = await waitForUsableSelector(page, selectors, timeoutMs);
-  await page.click(selector);
-}
-
-async function waitForUsableSelector(page, selectors, timeoutMs) {
-  return page.waitForFunction(
-    (candidateSelectors) => {
-      for (const selector of candidateSelectors) {
-        const element = document.querySelector(selector);
-        if (!element) {
-          continue;
-        }
-        const style = window.getComputedStyle(element);
-        const visible = style.visibility !== "hidden" && style.display !== "none";
-        if (visible && !element.disabled) {
-          return selector;
-        }
-      }
-      return null;
-    },
-    selectors,
-    { timeout: timeoutMs }
-  ).then((handle) => handle.jsonValue());
-}
-
-async function waitForOptionalSelectorWithOption(page, selectors, value, timeoutMs) {
-  const deadline = Date.now() + Math.min(timeoutMs ?? 0, 5000);
-  while (Date.now() < deadline) {
-    const selector = await page.evaluate(
-      ({ candidateSelectors, expectedValue }) => {
-        for (const selector of candidateSelectors) {
-          const element = document.querySelector(selector);
-          if (!element || element.disabled) {
-            continue;
-          }
-          const style = window.getComputedStyle(element);
-          const visible = style.visibility !== "hidden" && style.display !== "none";
-          const hasOption = [...element.options || []].some(
-            (option) => option.value === expectedValue
-          );
-          if (visible && hasOption) {
-            return selector;
-          }
-        }
-        return null;
-      },
-      { candidateSelectors: selectors, expectedValue: value }
-    );
-    if (selector) {
-      return selector;
-    }
-    await page.waitForTimeout(100);
-  }
-  return null;
 }

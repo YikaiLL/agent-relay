@@ -19782,6 +19782,7 @@ report headed \"Nothing was left unresolved\": {:?}",
                     sandbox: None,
                     provider: Some("codex".to_string()),
                     initial_prompt: Some("go rewrite everything".to_string()),
+                    project_id: None,
                 })
                 .await
                 .expect_err("no new session may be started inside a running task");

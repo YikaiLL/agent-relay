@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { DEFAULT_WORKSPACE_LABEL } from "../frontend/local/header-labels.js";
+import { DEFAULT_WORKSPACE_LABEL } from "../frontend/shared/header-labels.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { deleteThreadAndWait, fetchSession } from "./e2e-thread-cleanup.mjs";
 import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
 import { launchBrowser } from "./e2e/harness/browser.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
+import { startLocalSession } from "./e2e/harness/local-session.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import {
   dumpProcessLogs,
@@ -80,15 +81,12 @@ async function main() {
       ((await page.textContent("#overview-security-badges")) || "").trim().length > 0,
       "overview should describe relay posture"
     );
-    await page.click("#open-start-session-dialog");
-    await page.waitForFunction(() => {
-      const modal = document.querySelector("#launch-start-session-dialog");
-      return Boolean(modal?.open);
+    await startLocalSession(page, {
+      cwd: cwdInput,
+      provider: USE_FAKE_PROVIDER ? "fake" : "codex",
+      approvalPolicy: "never",
+      timeoutMs: LOCAL_TIMEOUT_MS,
     });
-    await page.fill("#cwd-input", cwdInput);
-    await page.selectOption("#provider-input", USE_FAKE_PROVIDER ? "fake" : "codex");
-    await page.selectOption("#approval-policy-input", "never");
-    await page.click("#start-session-button");
 
     await page.waitForFunction(() => {
       const transcript = document.querySelector("#transcript")?.textContent || "";

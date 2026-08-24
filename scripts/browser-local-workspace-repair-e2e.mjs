@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { launchBrowser } from "./e2e/harness/browser.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
+import { startLocalSession } from "./e2e/harness/local-session.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
 
@@ -50,12 +51,12 @@ const settle = () =>
     { timeout: 30000 }
   );
 
-await page.click("#open-start-session-dialog");
-await page.waitForFunction(() => document.querySelector("#launch-start-session-dialog")?.open);
-await page.fill("#cwd-input", doomed);
-await page.selectOption("#provider-input", "fake");
-await page.selectOption("#approval-policy-input", "never");
-await page.click("#start-session-button");
+await startLocalSession(page, {
+  cwd: doomed,
+  provider: "fake",
+  approvalPolicy: "never",
+  timeoutMs: 30000,
+});
 await page.waitForFunction(
   () => (document.querySelector("#transcript")?.textContent || "").includes("Session ready"),
   null,

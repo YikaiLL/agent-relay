@@ -117,7 +117,9 @@ async function main() {
     const grouping = await page.evaluate(() => {
       const groups = [...document.querySelectorAll("#threads-list .thread-group")];
       const threadButtons = [...document.querySelectorAll("#threads-list [data-thread-id]")];
-      const cwdInput = document.querySelector("#cwd-input");
+      // Off the group list, not the old dialog's `#cwd-input` — that id no longer
+      // renders, so this used to compare "" against a real path.
+      const selectedGroup = document.querySelector(".thread-group.is-selected-workspace");
 
       return {
         groupLabels: groups.map((group) =>
@@ -130,7 +132,7 @@ async function main() {
           rowType: button.closest("[data-row-type]")?.dataset.rowType || "",
         })),
         countText: document.querySelector("#threads-count")?.textContent?.trim() || "",
-        selectedWorkspaceValue: cwdInput instanceof HTMLInputElement ? cwdInput.value : "",
+        selectedWorkspaceValue: selectedGroup?.dataset.threadGroupCwd || "",
       };
     });
 
@@ -193,13 +195,8 @@ async function main() {
 
     await page.waitForFunction(
       (expectedWorkspace) => {
-        const input = document.querySelector("#cwd-input");
         const selectedGroup = document.querySelector(".thread-group.is-selected-workspace");
-        return (
-          input instanceof HTMLInputElement &&
-          input.value === expectedWorkspace &&
-          selectedGroup?.dataset.threadGroupCwd === expectedWorkspace
-        );
+        return selectedGroup?.dataset.threadGroupCwd === expectedWorkspace;
       },
       workspaces.root,
       { timeout: LOCAL_TIMEOUT_MS }
@@ -378,9 +375,8 @@ async function dumpBrowserState(page) {
           {
             appView: document.querySelector(".app-shell")?.dataset.view || null,
             selectedWorkspace:
-              document.querySelector("#cwd-input") instanceof HTMLInputElement
-                ? document.querySelector("#cwd-input").value
-                : null,
+              document.querySelector(".thread-group.is-selected-workspace")?.dataset
+                .threadGroupCwd || null,
             groups,
             threadRows,
           },

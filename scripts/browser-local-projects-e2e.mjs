@@ -13,7 +13,7 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { DEFAULT_WORKSPACE_LABEL } from "../frontend/local/header-labels.js";
+import { DEFAULT_WORKSPACE_LABEL } from "../frontend/shared/header-labels.js";
 import { prepareSeededCodexHome } from "./e2e-codex-home.mjs";
 import { launchBrowser } from "./e2e/harness/browser.mjs";
 import { openSessionsDrawer } from "./e2e/harness/drawer.mjs";

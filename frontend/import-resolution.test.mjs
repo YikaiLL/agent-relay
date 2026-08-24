@@ -24,6 +24,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const REPO = path.dirname(ROOT);
+
+// `scripts/` too: the e2e harness imports frontend modules by relative path, and a
+// stale one there costs a browser suite twenty minutes in instead of a millisecond.
+const SCAN_ROOTS = [ROOT, path.join(REPO, "scripts")];
 
 function sourceFiles(dir) {
   const out = [];
@@ -32,7 +37,7 @@ function sourceFiles(dir) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...sourceFiles(full));
-    } else if (entry.name.endsWith(".js")) {
+    } else if (entry.name.endsWith(".js") || entry.name.endsWith(".mjs")) {
       out.push(full);
     }
   }
@@ -98,10 +103,18 @@ function exportedNames(source) {
   return { names, opaque };
 }
 
-const FILES = sourceFiles(ROOT);
+const FILES = SCAN_ROOTS.flatMap((dir) => sourceFiles(dir));
 
-test("the frontend has sources to scan at all", () => {
+test("the frontend and scripts trees have sources to scan at all", () => {
   assert.ok(FILES.length > 50, `expected a real tree, found ${FILES.length} files`);
+  // Per root, not just in total: a mistyped root would still clear the bar above
+  // on the strength of the other one, and cover nothing.
+  for (const dir of SCAN_ROOTS) {
+    assert.ok(
+      sourceFiles(dir).length > 10,
+      `expected sources under ${path.relative(REPO, dir)}, found ${sourceFiles(dir).length}`
+    );
+  }
 });
 
 test("every named import resolves to a real export", () => {
@@ -115,19 +128,19 @@ test("every named import resolves to a real export", () => {
 
       const target = path.resolve(path.dirname(file), spec.from);
       if (!fs.existsSync(target)) {
-        broken.push(`${path.relative(ROOT, file)} imports from "${spec.from}", which does not exist`);
+        broken.push(`${path.relative(REPO, file)} imports from "${spec.from}", which does not exist`);
         continue;
       }
 
       const { names, opaque } = exportedNames(fs.readFileSync(target, "utf8"));
       if (opaque) {
-        unverifiable.push(`${path.relative(ROOT, target)} uses \`export *\``);
+        unverifiable.push(`${path.relative(REPO, target)} uses \`export *\``);
         continue;
       }
       for (const name of spec.names) {
         if (!names.has(name)) {
           broken.push(
-            `${path.relative(ROOT, file)} imports { ${name} } from "${spec.from}", `
+            `${path.relative(REPO, file)} imports { ${name} } from "${spec.from}", `
               + "which does not export it"
           );
         }
