@@ -1,8 +1,7 @@
 // Drives the local web UI to verify that Codex-style shell commands (transcript
 // kind "command", emitted running -> completed by the fake provider) fold into
-// the same collapsible tool-group as Claude tool calls. Regression guard for the
-// bug where a run of commands rendered as separate loose cards instead of one
-// collapsed "N tool calls" chip.
+// the same collapsible work-group as Claude tool calls, and that a run mixing
+// commands with reasoning stays ONE chip rather than splitting per kind.
 //
 // Run: AGENT_PROVIDERS=fake node scripts/browser-local-command-group-e2e.mjs
 import assert from "node:assert/strict";
@@ -29,6 +28,7 @@ import {
 
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 60000);
 const PROMPT = "run three deterministic shell commands";
+const INTERLEAVED_PROMPT = "run three commands, thinking between each";
 const REPLY = "commands done";
 const COMMAND_COUNT = 3;
 // Each command stays "running" this long before settling. Kept generous so a
@@ -53,6 +53,15 @@ async function main() {
         tool_calls: COMMAND_COUNT,
         tool_kind: "command",
         tool_call_delay_ms: COMMAND_DELAY_MS,
+      },
+      [INTERLEAVED_PROMPT]: {
+        reply: REPLY,
+        chunks: [REPLY],
+        chunk_delay_ms: 5,
+        tool_calls: COMMAND_COUNT,
+        tool_kind: "command",
+        tool_call_delay_ms: 5,
+        reasoning_between_tools: true,
       },
     },
   });
@@ -102,14 +111,14 @@ async function main() {
       { timeout: TIMEOUT_MS }
     );
 
-    // 2. Completed state: all commands settle and collapse into ONE tool-group
-    //    chip labelled "N tool calls", with the individual command previews
+    // 2. Completed state: all commands settle and collapse into ONE work-group
+    //    chip labelled by what ran ("N commands"), with the command previews
     //    hidden while the group is collapsed.
     await page.waitForFunction(
       (count) => {
-        const chip = document.querySelector(".tool-group-chip");
+        const chip = document.querySelector(".work-group-chip");
         if (!chip) return false;
-        if (!chip.textContent.includes(`${count} tool calls`)) return false;
+        if (!chip.textContent.includes(`${count} commands`)) return false;
         // Collapsed: members must not be mounted.
         if (document.querySelector('[data-transcript-entry-kind="command"]')) return false;
         if (document.querySelector(".command-preview")) return false;
@@ -119,7 +128,7 @@ async function main() {
       { timeout: TIMEOUT_MS }
     );
 
-    const chips = await page.locator(".tool-group-chip").count();
+    const chips = await page.locator(".work-group-chip").count();
     assert.equal(chips, 1, "the command run must collapse into exactly one group chip");
     assert.equal(
       await page.locator(".command-preview").count(),
@@ -128,7 +137,7 @@ async function main() {
     );
 
     // 3. Expand the group; every command card mounts and shows its preview text.
-    await page.click(".tool-group-chip");
+    await page.click(".work-group-chip");
     await page.waitForFunction(
       (count) => document.querySelectorAll(".command-preview").length === count,
       COMMAND_COUNT,
@@ -145,9 +154,62 @@ async function main() {
       );
     }
     assert.equal(
-      await page.locator(".tool-group-chip-open").count(),
+      await page.locator(".work-group-chip-open").count(),
       1,
       "the chip must show its open state after expanding"
+    );
+
+    // 4. Tools interleaved with reasoning still collapse into ONE chip.
+    await page.click(".work-group-chip");
+    await sendMessage(page, INTERLEAVED_PROMPT);
+    await page.waitForFunction(
+      (count) => {
+        const chips = [...document.querySelectorAll(".work-group-chip")];
+        return chips.some(
+          (chip) =>
+            chip.textContent.includes(`${count} commands`)
+            && chip.textContent.includes(`${count} thoughts`)
+        );
+      },
+      COMMAND_COUNT,
+      { timeout: TIMEOUT_MS }
+    );
+    // By label, not by counting chips: virtualization unmounts them off-screen.
+    const kindSplitChips = await page.evaluate(() =>
+      [...document.querySelectorAll(".work-group-chip")]
+        .map((chip) => chip.textContent.trim())
+        .filter((label) => /thoughts?/.test(label) && !/commands?/.test(label))
+    );
+    assert.deepEqual(
+      kindSplitChips,
+      [],
+      "reasoning must fold in with the commands, never into a chip of its own"
+    );
+    const interleavedChip = page
+      .locator(".work-group-chip", { hasText: `${COMMAND_COUNT} thoughts` })
+      .first();
+    assert.equal(
+      await page.locator(".work-group-chip-thinking").count(),
+      1,
+      "a chip holding reasoning must carry the thinking marker"
+    );
+
+    await interleavedChip.click();
+    await page.waitForFunction(
+      (count) =>
+        document.querySelectorAll('.is-group-member[data-transcript-entry-kind="reasoning"]')
+          .length === count,
+      COMMAND_COUNT,
+      { timeout: TIMEOUT_MS }
+    );
+    const memberKinds = await page.evaluate(() =>
+      [...document.querySelectorAll(".is-group-member")].map((row) =>
+        row.getAttribute("data-transcript-entry-kind")
+      )
+    );
+    assert.ok(
+      memberKinds.includes("command") && memberKinds.includes("reasoning"),
+      `an expanded work group must restore both kinds, got ${memberKinds.join(",")}`
     );
 
     assert.deepEqual(pageErrors, [], "the command-group flow must not raise browser errors");

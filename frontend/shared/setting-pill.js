@@ -80,6 +80,7 @@ export function SettingPill({
                     "aria-checked": option.selected ? "true" : "false",
                     className:
                       "setting-pill-option" + (option.selected ? " is-active" : ""),
+                    "data-provider": option.provider || section.provider || undefined,
                     "data-value": option.value,
                     key: `${section.provider || ""}:${option.value}`,
                     onClick: () => choose(option),

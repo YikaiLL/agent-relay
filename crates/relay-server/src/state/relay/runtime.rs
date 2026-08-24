@@ -492,19 +492,41 @@ fn tool_calls_equal(left: Option<&ToolCallView>, right: Option<&ToolCallView>) -
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => {
-            left.item_type == right.item_type
-                && left.name == right.name
-                && left.title == right.title
-                && left.detail == right.detail
-                && left.query == right.query
-                && left.path == right.path
-                && left.url == right.url
-                && left.command == right.command
-                && left.input_preview == right.input_preview
-                && left.result_preview == right.result_preview
-                && left.diff == right.diff
-                && left.file_changes == right.file_changes
-                && left.apply_state == right.apply_state
+            // Destructured on purpose: a new ToolCallView field stops compiling
+            // here until it is compared or explicitly skipped.
+            let ToolCallView {
+                item_type,
+                name,
+                title,
+                kind,
+                detail,
+                query,
+                path,
+                url,
+                command,
+                input_preview,
+                result_preview,
+                diff,
+                file_changes,
+                apply_state,
+                // Snapshot-only markers, recomputed per serialization.
+                file_changes_omitted: _,
+                can_apply: _,
+            } = left;
+            *item_type == right.item_type
+                && *name == right.name
+                && *title == right.title
+                && *kind == right.kind
+                && *detail == right.detail
+                && *query == right.query
+                && *path == right.path
+                && *url == right.url
+                && *command == right.command
+                && *input_preview == right.input_preview
+                && *result_preview == right.result_preview
+                && *diff == right.diff
+                && *file_changes == right.file_changes
+                && *apply_state == right.apply_state
         }
         _ => false,
     }
@@ -541,6 +563,55 @@ mod tests {
             0,
             0,
         )
+    }
+
+    fn tool_record(item_id: &str, kind: Option<&str>) -> TranscriptRecord {
+        TranscriptRecord {
+            item_id: item_id.to_string(),
+            // History-shaped: a re-read carries no live sequence number.
+            seq: None,
+            kind: crate::protocol::TranscriptEntryKind::ToolCall,
+            text: Some("Reading src/main.rs".to_string()),
+            status: "completed".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            tool: Some(ToolCallView {
+                item_type: "tool_call".to_string(),
+                name: "Reading src/main.rs".to_string(),
+                title: "Reading src/main.rs".to_string(),
+                kind: kind.map(str::to_string),
+                detail: None,
+                query: None,
+                path: Some("/repo/src/main.rs".to_string()),
+                url: None,
+                command: None,
+                input_preview: None,
+                result_preview: None,
+                diff: None,
+                file_changes: Vec::new(),
+                apply_state: None,
+                file_changes_omitted: false,
+                can_apply: None,
+            }),
+        }
+    }
+
+    // History re-read is the self-heal path: a field missing from equality makes
+    // the richer record read as unchanged, so it is dropped and revision stalls.
+    #[test]
+    fn a_history_record_that_only_adds_a_tool_kind_still_counts_as_changed() {
+        let mut existing = tool_record("acp-tool-1", None);
+        let incoming = tool_record("acp-tool-1", Some("read"));
+
+        let changed = merge_runtime_entry(&mut existing, incoming);
+
+        assert!(
+            changed,
+            "a fresh-history record that classifies the tool must be adopted"
+        );
+        assert_eq!(
+            existing.tool.as_ref().and_then(|tool| tool.kind.as_deref()),
+            Some("read")
+        );
     }
 
     // C5 — active_turn_id is the live-turn authority; a history re-read must NEVER

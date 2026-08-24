@@ -1675,6 +1675,10 @@ pub struct ToolCallView {
     pub item_type: String,
     pub name: String,
     pub title: String,
+    /// Set only by ACP (Cursor), whose tool `name` IS its human title. Claude
+    /// and Codex leave it None; the client derives a kind from name/item_type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub detail: Option<String>,
     pub query: Option<String>,
     pub path: Option<String>,

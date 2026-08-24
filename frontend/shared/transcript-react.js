@@ -1515,16 +1515,129 @@ function isEmptyReasoning(entry) {
   return isSettledReasoning(entry) && reasoningText(entry) === "";
 }
 
-// A settled reasoning entry that DOES carry a summary body. Consecutive ones
-// fold into a collapsible reasoning-group, mirroring the tool-call group.
 function isGroupableReasoning(entry) {
   return isSettledReasoning(entry) && reasoningText(entry) !== "";
+}
+
+// `tool.kind` (ACP) wins: a Cursor tool's `name` IS its human title, so no
+// name heuristic can classify it.
+const ACP_KIND_ALIASES = {
+  execute: "run",
+  delete: "edit",
+  move: "edit",
+  switch_mode: "other",
+};
+const TOOL_NAME_KINDS = {
+  read: "read",
+  notebookread: "read",
+  edit: "edit",
+  write: "edit",
+  multiedit: "edit",
+  notebookedit: "edit",
+  bash: "run",
+  bashoutput: "run",
+  killshell: "run",
+  grep: "search",
+  glob: "search",
+  websearch: "search",
+  webfetch: "fetch",
+};
+const KNOWN_TOOL_KINDS = new Set([
+  "read",
+  "edit",
+  "search",
+  "run",
+  "fetch",
+  "think",
+  "other",
+]);
+
+export function toolKindOf(tool) {
+  if (!tool) {
+    return null;
+  }
+  const acpKind = String(tool.kind || "").trim().toLowerCase();
+  if (acpKind) {
+    const mapped = ACP_KIND_ALIASES[acpKind] || acpKind;
+    if (KNOWN_TOOL_KINDS.has(mapped)) {
+      return mapped;
+    }
+  }
+  const itemType = String(tool.item_type || "").trim();
+  if (itemType === "command_execution") {
+    return "run";
+  }
+  if (itemType === "fileChange" || itemType === "turnDiff") {
+    return "edit";
+  }
+  const name = String(tool.name || "").trim().toLowerCase();
+  return TOOL_NAME_KINDS[name] || null;
+}
+
+const KIND_NOUNS = {
+  read: ["read", "reads"],
+  edit: ["edit", "edits"],
+  search: ["search", "searches"],
+  run: ["command", "commands"],
+  fetch: ["fetch", "fetches"],
+  think: ["thought", "thoughts"],
+  other: ["tool", "tools"],
+};
+// Fixed order so the label does not reshuffle between renders.
+const KIND_ORDER = ["read", "edit", "search", "run", "fetch", "other", "think"];
+// Beyond this the chip stops being scannable and starts being a list.
+const MAX_LABEL_PARTS = 4;
+
+export function workGroupLabel(group) {
+  const entries = group?.entries || [];
+  const counts = new Map();
+  const bump = (kind) => counts.set(kind, (counts.get(kind) || 0) + 1);
+
+  for (const entry of entries) {
+    if (entry?.kind === "reasoning") {
+      bump("think");
+      continue;
+    }
+    if (entry?.kind === "command") {
+      bump(toolKindOf(entry?.tool) || "run");
+      continue;
+    }
+    bump(toolKindOf(entry?.tool) || "other");
+  }
+
+  const parts = [];
+  let dropped = 0;
+  for (const kind of KIND_ORDER) {
+    const count = counts.get(kind);
+    if (!count) {
+      continue;
+    }
+    if (parts.length >= MAX_LABEL_PARTS) {
+      dropped += count;
+      continue;
+    }
+    const [one, many] = KIND_NOUNS[kind];
+    parts.push(`${count} ${count === 1 ? one : many}`);
+  }
+  if (dropped > 0) {
+    parts.push(`+${dropped} more`);
+  }
+  if (!parts.length) {
+    return `··· ${entries.length} steps`;
+  }
+  return `··· ${parts.join(" · ")}`;
+}
+
+// One shared run, not one per kind: Cursor and Codex interleave reasoning with
+// tool calls, so splitting by kind fragments a single stretch of work.
+function isGroupableWork(entry) {
+  return isGroupableCompletedTool(entry) || isGroupableReasoning(entry);
 }
 
 function isGroupableCompletedTool(entry) {
   // Claude routes every tool use through kind "tool_call"; Codex routes shell
   // commands through kind "command" (its file edits are tool_call/fileChange).
-  // Fold both into the same collapsible tool-group so Codex command runs
+  // Fold both into the same collapsible work-group so Codex command runs
   // collapse just like Claude tool calls instead of stacking as loose cards.
   if (!entry || (entry.kind !== "tool_call" && entry.kind !== "command")) {
     return false;
@@ -1606,15 +1719,11 @@ export function groupToolEntries(entries) {
       return;
     }
 
-    // Everything else groups by adjacency: tools into a tool-group, and any
-    // diff entry without a turn_id into an inline diff-group.
     let nextType = null;
-    if (isGroupableCompletedTool(entry)) {
-      nextType = "tool-group";
-    } else if (diffEntry) {
+    if (diffEntry) {
       nextType = "diff-group";
-    } else if (isGroupableReasoning(entry)) {
-      nextType = "reasoning-group";
+    } else if (isGroupableWork(entry)) {
+      nextType = "work-group";
     }
 
     if (nextType) {
@@ -1637,8 +1746,8 @@ export function groupToolEntries(entries) {
     result.push(group);
   }
 
-  // Finally, merge adjacent diff-groups into one — so several file diffs in a
-  // row collapse into a single group, exactly like consecutive tool calls do.
+  // Merge adjacent diff-groups into one — so several file diffs in a row
+  // collapse into a single group, exactly like consecutive tool calls do.
   const merged = [];
   for (const item of result) {
     const prev = merged[merged.length - 1];
@@ -1648,7 +1757,14 @@ export function groupToolEntries(entries) {
       merged.push(item);
     }
   }
-  return merged;
+
+  // A group of one costs a click and hides nothing the chip could have told
+  // you. diff-groups are exempt: the chip carries their +N/−N badge and Undo.
+  return merged.map((item) =>
+    item?.type === "work-group" && item.entries.length === 1
+      ? item.entries[0]
+      : item
+  );
 }
 
 function groupExpandKey(group) {
@@ -1719,72 +1835,47 @@ function aggregateDiffGroupStats(group, options = null) {
   return { added, removed, fileCount: files.size };
 }
 
-function ToolGroupEntry({ group, options = null }) {
+function WorkGroupEntry({ group, options = null }) {
   const expandKey = groupExpandKey(group);
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
-  const count = group?.entries?.length || 0;
   const { added, removed } = aggregateGroupDiffStats(group, options);
-  const label = `··· ${count} tool ${count === 1 ? "call" : "calls"}`;
+  const label = workGroupLabel(group);
+  const hasReasoning = (group?.entries || []).some(
+    (entry) => entry?.kind === "reasoning"
+  );
 
   return h(
     "article",
     {
-      className: "chat-message chat-message-system chat-message-tool-group",
-      ...(expandKey ? { "data-tool-group-key": expandKey } : {}),
+      className: "chat-message chat-message-system chat-message-work-group",
+      ...(expandKey ? { "data-work-group-key": expandKey } : {}),
     },
     h(
       "button",
       {
-        className: `tool-group-chip${expanded ? " tool-group-chip-open" : ""}`,
+        className: [
+          "work-group-chip",
+          expanded ? "work-group-chip-open" : "",
+          hasReasoning ? "work-group-chip-thinking" : "",
+        ]
+          .filter(Boolean)
+          .join(" "),
         ...(expandKey ? { "data-expand-key": expandKey } : {}),
         "data-transcript-toggle": "group",
         type: "button",
       },
       h(
         "span",
-        { "aria-hidden": "true", className: "tool-group-chevron" },
+        { "aria-hidden": "true", className: "work-group-chevron" },
         expanded ? "▾" : "▸"
       ),
-      h("span", { className: "tool-group-count" }, label),
+      h("span", { className: "work-group-count" }, label),
       added > 0
-        ? h("span", { className: "tool-group-chip-add" }, `+${added}`)
+        ? h("span", { className: "work-group-chip-add" }, `+${added}`)
         : null,
       removed > 0
-        ? h("span", { className: "tool-group-chip-del" }, `−${removed}`)
+        ? h("span", { className: "work-group-chip-del" }, `−${removed}`)
         : null
-    )
-  );
-}
-
-// Collapsed chip for a run of consecutive reasoning summaries, mirroring the
-// tool-call group. Empty reasoning is dropped before grouping, so every member
-// here carries a real summary body; the chip expands to reveal those cards.
-function ReasoningGroupEntry({ group, options = null }) {
-  const expandKey = groupExpandKey(group);
-  const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
-  const count = group?.entries?.length || 0;
-  const label = `··· ${count} reasoning ${count === 1 ? "step" : "steps"}`;
-
-  return h(
-    "article",
-    {
-      className: "chat-message chat-message-system chat-message-reasoning-group",
-      ...(expandKey ? { "data-reasoning-group-key": expandKey } : {}),
-    },
-    h(
-      "button",
-      {
-        className: `reasoning-group-chip${expanded ? " reasoning-group-chip-open" : ""}`,
-        ...(expandKey ? { "data-expand-key": expandKey } : {}),
-        "data-transcript-toggle": "group",
-        type: "button",
-      },
-      h(
-        "span",
-        { "aria-hidden": "true", className: "reasoning-group-chevron" },
-        expanded ? "▾" : "▸"
-      ),
-      h("span", { className: "reasoning-group-count" }, label)
     )
   );
 }
@@ -2246,42 +2337,12 @@ export function TranscriptContent({
   }
 
   groupedItems.forEach((item, index) => {
-    if (item?.type === "tool-group") {
+    if (item?.type === "work-group") {
       const expandKey = groupExpandKey(item);
       const expanded = Boolean(expandKey && effectiveOptions?.expandedKeys?.has(expandKey));
-      const groupKey = expandKey || `tool-group:${index}`;
+      const groupKey = expandKey || `work-group:${index}`;
       nodes.push(
-        h(ToolGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
-      );
-      if (expanded) {
-        item.entries.forEach((memberEntry, memberIndex) => {
-          const memberId = memberEntry.item_id || "";
-          nodes.push(
-            h(TranscriptEntry, {
-              entry: memberEntry,
-              // Painted as a rail row: this member is on screen only because
-              // the group chip above it is open.
-              inGroup: true,
-              isJustPrepended: Boolean(memberId && justPrependedItemIds.has(memberId)),
-              isLatestUser: false,
-              key:
-                memberId
-                || memberEntry.id
-                || `${groupKey}:member:${memberIndex}`,
-              options: effectiveOptions,
-            })
-          );
-        });
-      }
-      return;
-    }
-
-    if (item?.type === "reasoning-group") {
-      const expandKey = groupExpandKey(item);
-      const expanded = Boolean(expandKey && effectiveOptions?.expandedKeys?.has(expandKey));
-      const groupKey = expandKey || `reasoning-group:${index}`;
-      nodes.push(
-        h(ReasoningGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
+        h(WorkGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
       );
       if (expanded) {
         item.entries.forEach((memberEntry, memberIndex) => {

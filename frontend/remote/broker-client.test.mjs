@@ -1872,6 +1872,23 @@ test("a pairing request in flight during retirement is never sent to the wrong r
   }
 });
 
+// `installBrowserStubs()` resets localStorage, but these fields are in-memory
+// and outlive the test that wrote them.
+function resetRemoteIdentityState(state) {
+  state.remoteAuth = null;
+  state.clientAuth = null;
+  state.remoteProfiles = {};
+  state.activeRelayId = null;
+  state.relayDirectory = [];
+  state.claimPromise = null;
+  state.recoverPromise = null;
+  for (const pending of state.pendingActions.values()) {
+    window.clearTimeout(pending.timeoutId);
+  }
+  state.pendingActions.clear();
+  state.pendingActionChunks?.clear?.();
+}
+
 function pairedResultBundle(overrides = {}) {
   return {
     ok: true,
@@ -2145,8 +2162,7 @@ test("retirement during a session request cannot leave a half-paired, disconnect
     const { encryptJson } = await import("./crypto.js");
 
     const secret = "retire-mid-flight";
-    state.remoteAuth = null;
-    state.clientAuth = null;
+    resetRemoteIdentityState(state);
     state.deviceIdentityPromise = null;
     state.deviceKeypair = null;
     seedSocketState(state);
@@ -2201,6 +2217,44 @@ test("retirement during a session request cannot leave a half-paired, disconnect
   } finally {
     process.off("unhandledRejection", onUnhandled);
   }
+});
+
+test("a retired pairing cannot resurrect a profile an earlier pairing left in memory", async () => {
+  // Storage is per-test; `remoteProfiles` is not.
+  installBrowserStubs();
+  globalThis.fetch = async () => ({ ok: true, async json() { return {}; } });
+  globalThis.window.location.href = "https://remote.example.test/#pairing=abc";
+  globalThis.window.history.replaceState = () => {};
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+
+  saveRemoteAuth({
+    relayId: "relay-fresh",
+    relayLabel: "Fresh Relay",
+    brokerUrl: "ws://broker.example.test",
+    brokerChannelId: "pairing-room",
+    relayPeerId: "relay-peer",
+    securityMode: "private",
+    deviceId: "device-fresh",
+    deviceLabel: "New Phone",
+    payloadSecret: "fresh-payload-secret",
+    deviceRefreshMode: null,
+    deviceRefreshToken: null,
+    deviceJoinTicket: "fresh-device-join-ticket",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 600,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  assert.ok(state.remoteProfiles["relay-fresh"], "precondition: the profile is in memory");
+
+  resetRemoteIdentityState(state);
+
+  assert.equal(state.remoteAuth, null, "the clean slate must actually be clean");
+  assert.deepEqual(
+    state.remoteProfiles,
+    {},
+    "the leftover profile is what resurrects credentials in a later test"
+  );
 });
 
 test("a stale attempt cannot overwrite persisted client authorization", async () => {

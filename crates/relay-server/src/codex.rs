@@ -1258,6 +1258,7 @@ fn build_tool_call_view(item: &Value, item_type: &str) -> ToolCallView {
         item_type: item_type.to_string(),
         name,
         title,
+        kind: None,
         detail,
         query: preview_string_field(item, "query"),
         path: preview_string_field(item, "path").or_else(|| {
@@ -1324,6 +1325,7 @@ fn build_tool_call_detail_view(item: &Value, item_type: &str) -> ToolCallView {
         item_type: item_type.to_string(),
         name,
         title,
+        kind: None,
         detail,
         query: full_string_field(item, "query"),
         path: full_string_field(item, "path")
@@ -1415,6 +1417,7 @@ pub(crate) fn build_turn_diff_entry_with_fallback(
             item_type: "turnDiff".to_string(),
             name: "File summary".to_string(),
             title: summarize_turn_diff(&paths, agent_label),
+            kind: None,
             detail,
             query: None,
             path: (paths.len() == 1).then(|| paths[0].clone()),
