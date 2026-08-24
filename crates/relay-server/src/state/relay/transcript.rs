@@ -811,6 +811,7 @@ pub(super) fn merge_tool_call_view(
                 },
                 name: name.clone(),
                 title: select_tool_title(&existing.title, &incoming.title, &name),
+                kind: incoming.kind.or(existing.kind),
                 detail: incoming.detail.or(existing.detail),
                 query: incoming.query.or(existing.query),
                 path: incoming.path.or(existing.path),

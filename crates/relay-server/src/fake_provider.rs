@@ -116,6 +116,9 @@ struct FakeTurnScenario {
     /// command-group folding.
     #[serde(default)]
     tool_kind: FakeToolKind,
+    /// A reasoning entry after each tool call — the Cursor/Codex shape.
+    #[serde(default)]
+    reasoning_between_tools: bool,
     pause_after_chunks: Option<usize>,
     barrier: Option<String>,
     /// Files to write into the thread's OWN cwd before the reply is emitted,
@@ -681,6 +684,10 @@ impl ProviderBridge for FakeProviderBridge {
             .as_ref()
             .map(|scenario| scenario.tool_kind)
             .unwrap_or_default();
+        let reasoning_between_tools = scenario
+            .as_ref()
+            .map(|scenario| scenario.reasoning_between_tools)
+            .unwrap_or_default();
         let tool_call_delay = Duration::from_millis(
             scenario
                 .as_ref()
@@ -750,6 +757,9 @@ impl ProviderBridge for FakeProviderBridge {
         let assistant_item_id = self.next_token("fake-assistant");
         let tool_item_ids = (0..tool_call_count)
             .map(|_| self.next_token("fake-tool"))
+            .collect::<Vec<_>>();
+        let reasoning_item_ids = (0..tool_call_count)
+            .map(|_| self.next_token("fake-reasoning"))
             .collect::<Vec<_>>();
         let state = self.state.clone();
         let threads = self.threads.clone();
@@ -1330,6 +1340,34 @@ impl ProviderBridge for FakeProviderBridge {
                     },
                     content_state: crate::protocol::TranscriptContentState::Full,
                 });
+                // After the tool in both arrays, or a reload reorders the turn.
+                if reasoning_between_tools {
+                    let reasoning_item_id = reasoning_item_ids[index].clone();
+                    let reasoning_text =
+                        format!("Reasoning step {tool_number}: what to do after the last call.");
+                    {
+                        let mut relay = state.write().await;
+                        relay.upsert_transcript_item_for_thread(
+                            &thread_id,
+                            reasoning_item_id.clone(),
+                            TranscriptEntryKind::Reasoning,
+                            Some(reasoning_text.clone()),
+                            "completed".to_string(),
+                            Some(turn_id_for_task.clone()),
+                            None,
+                        );
+                        relay.notify();
+                    }
+                    tool_entries.push(TranscriptEntryView {
+                        item_id: Some(reasoning_item_id),
+                        kind: TranscriptEntryKind::Reasoning,
+                        text: Some(reasoning_text),
+                        status: "completed".to_string(),
+                        turn_id: Some(turn_id_for_task.clone()),
+                        tool: None,
+                        content_state: crate::protocol::TranscriptContentState::Full,
+                    });
+                }
             }
 
             // 4. Begin the agent reply.
@@ -1920,6 +1958,7 @@ fn fake_tool_call_view(index: usize, completed: bool) -> ToolCallView {
         item_type: "toolCall".to_string(),
         name: "Bash".to_string(),
         title: format!("Fake Bash call {index}"),
+        kind: None,
         detail: Some(format!("Synthetic streaming tool call {index}")),
         query: None,
         path: None,
@@ -2034,6 +2073,7 @@ fn fake_ask_user_tool_view(
         item_type: "toolCall".to_string(),
         name: "AskUserQuestion".to_string(),
         title: "AskUserQuestion".to_string(),
+        kind: None,
         detail: None,
         query: None,
         path: None,
@@ -2372,6 +2412,151 @@ mod tests {
             .expect("fake provider");
         bridge.scenario_harness = Some(harness);
         (bridge, state)
+    }
+
+    #[tokio::test]
+    async fn repeated_reasoning_turns_mint_fresh_ids_and_keep_tool_before_thought() {
+        // Two runs on one thread: reused ids would update turn 1 instead of
+        // appending, and the saved order could diverge from the live one.
+        let temp = tempfile::tempdir().expect("temporary control directory");
+        let harness = test_scenario_harness(
+            &temp,
+            HashMap::from([(
+                "interleave".to_string(),
+                FakeTurnScenario {
+                    chunks: Some(vec!["done".to_string()]),
+                    chunk_delay_ms: Some(0),
+                    tool_calls: 2,
+                    tool_call_delay_ms: Some(0),
+                    reasoning_between_tools: true,
+                    ..FakeTurnScenario::default()
+                },
+            )]),
+        );
+        let (bridge, state) = bridge_with_scenarios("bypass", harness.clone()).await;
+
+        for turn in 1..=2 {
+            bridge
+                .start_turn(ACTIVE_THREAD, "interleave", "fake-echo", "medium", &[])
+                .await
+                .expect("turn");
+            let want = turn * 2;
+            let mut seen = 0;
+            for _ in 0..200 {
+                seen = state
+                    .read()
+                    .await
+                    .runtime_for_thread(ACTIVE_THREAD)
+                    .map(|runtime| {
+                        runtime
+                            .transcript
+                            .iter()
+                            .filter(|entry| entry.kind == TranscriptEntryKind::Reasoning)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if seen >= want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert_eq!(
+                seen, want,
+                "turn {turn} should have added two reasoning entries"
+            );
+
+            // Reasoning lands mid-turn; starting the next one before this
+            // settles leaves the interleaving to the scheduler.
+            let mut settled = false;
+            for _ in 0..200 {
+                settled = state
+                    .read()
+                    .await
+                    .runtime_for_thread(ACTIVE_THREAD)
+                    .is_some_and(|runtime| runtime.active_turn_id.is_none());
+                if settled {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(settled, "turn {turn} never settled");
+        }
+
+        let relay = state.read().await;
+        let runtime = relay.runtime_for_thread(ACTIVE_THREAD).expect("runtime");
+        let reasoning: Vec<&str> = runtime
+            .transcript
+            .iter()
+            .filter(|entry| entry.kind == TranscriptEntryKind::Reasoning)
+            .map(|entry| entry.item_id.as_str())
+            .collect();
+        assert_eq!(
+            reasoning.len(),
+            4,
+            "two turns of two reasoning entries must all survive, got {reasoning:?}"
+        );
+        let unique: std::collections::HashSet<&&str> = reasoning.iter().collect();
+        assert_eq!(unique.len(), reasoning.len(), "ids collided: {reasoning:?}");
+
+        let live_kinds = work_kinds(runtime.transcript.iter().map(|entry| entry.kind));
+        assert_thought_follows_tool(&live_kinds, "live");
+        drop(relay);
+
+        // A separate array from the live upserts, so it needs its own assertion.
+        let saved = bridge
+            .read_thread(ACTIVE_THREAD)
+            .await
+            .expect("read_thread");
+        let saved_reasoning: Vec<&str> = saved
+            .transcript
+            .iter()
+            .filter(|entry| entry.kind == TranscriptEntryKind::Reasoning)
+            .filter_map(|entry| entry.item_id.as_deref())
+            .collect();
+        assert_eq!(
+            saved_reasoning.len(),
+            4,
+            "the saved transcript must hold both turns, got {saved_reasoning:?}"
+        );
+        let saved_unique: std::collections::HashSet<&&str> = saved_reasoning.iter().collect();
+        assert_eq!(
+            saved_unique.len(),
+            saved_reasoning.len(),
+            "saved ids collided: {saved_reasoning:?}"
+        );
+        assert_thought_follows_tool(
+            &work_kinds(saved.transcript.iter().map(|entry| entry.kind)),
+            "saved",
+        );
+    }
+
+    fn work_kinds(kinds: impl Iterator<Item = TranscriptEntryKind>) -> Vec<TranscriptEntryKind> {
+        kinds
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    TranscriptEntryKind::ToolCall | TranscriptEntryKind::Reasoning
+                )
+            })
+            .collect()
+    }
+
+    fn assert_thought_follows_tool(kinds: &[TranscriptEntryKind], label: &str) {
+        assert!(!kinds.is_empty(), "{label}: nothing to check");
+        for pair in kinds.windows(2) {
+            if pair[1] == TranscriptEntryKind::Reasoning {
+                assert_eq!(
+                    pair[0],
+                    TranscriptEntryKind::ToolCall,
+                    "{label}: a thought must follow its tool call, got {kinds:?}"
+                );
+            }
+        }
+        assert_eq!(
+            kinds[0],
+            TranscriptEntryKind::ToolCall,
+            "{label}: the run must open with a tool, got {kinds:?}"
+        );
     }
 
     #[tokio::test]

@@ -1494,12 +1494,13 @@
   background: var(--diff-meta-bg);
 }
 
-.chat-message-tool-group {
+.chat-message-work-group {
   align-self: stretch;
 }
 
-.tool-group-chip {
+.work-group-chip {
   display: inline-flex;
+  align-self: flex-start;
   align-items: center;
   gap: 8px;
   padding: 4px 10px;
@@ -1513,42 +1514,53 @@
   cursor: pointer;
   font-family: inherit;
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+  max-width: 100%;
 }
 
-.tool-group-chip:hover {
+.work-group-chip:hover,
+.work-group-chip-open {
   color: var(--text-secondary);
   background: var(--bg-elevated);
   border-color: var(--border-subtle);
 }
 
-.tool-group-chip-open {
-  color: var(--text-secondary);
-  background: var(--bg-elevated);
-  border-color: var(--border-subtle);
+.work-group-chip-thinking {
+  padding-left: 12px;
 }
 
-.tool-group-chevron {
+.work-group-chip-thinking::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: var(--warn-fg);
+}
+
+.work-group-chevron {
   display: inline-block;
   width: 10px;
   flex-shrink: 0;
   text-align: center;
 }
 
-.tool-group-count {
+.work-group-count {
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.tool-group-chip-add {
+.work-group-chip-add {
   color: var(--status-ready-text);
   font-size: var(--text-xs);
 }
 
-.tool-group-chip-del {
+.work-group-chip-del {
   color: var(--status-offline-text);
   font-size: var(--text-xs);
 }
 
-/* Diff group chip — mirrors the tool-group chip, used to collapse consecutive
+/* Diff group chip — mirrors the work-group chip, used to collapse consecutive
    per-turn diff cards. Stacks the optional Undo action beneath the chip. */
 .chat-message-diff-group {
   align-self: stretch;
@@ -1601,57 +1613,6 @@
 .diff-group-chip-del {
   color: var(--status-offline-text);
   font-size: var(--text-xs);
-}
-
-/* Reasoning group chip — mirrors the tool-group chip, collapsing a run of
-   reasoning summaries. Carries the same warn-fg accent the reasoning cards use
-   (a small leading dot) so it still reads as "the model's thinking". */
-.chat-message-reasoning-group {
-  align-self: stretch;
-}
-
-.reasoning-group-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px 4px 12px;
-  margin: 0;
-  border: 1px solid var(--border-faint);
-  border-radius: 999px;
-  background: var(--surface-1);
-  color: var(--text-tertiary);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  cursor: pointer;
-  font-family: inherit;
-  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
-}
-
-.reasoning-group-chip::before {
-  content: "";
-  width: 5px;
-  height: 5px;
-  flex-shrink: 0;
-  border-radius: 999px;
-  background: var(--warn-fg);
-}
-
-.reasoning-group-chip:hover,
-.reasoning-group-chip-open {
-  color: var(--text-secondary);
-  background: var(--bg-elevated);
-  border-color: var(--border-subtle);
-}
-
-.reasoning-group-chevron {
-  display: inline-block;
-  width: 10px;
-  flex-shrink: 0;
-  text-align: center;
-}
-
-.reasoning-group-count {
-  white-space: nowrap;
 }
 
 .file-change-summary {

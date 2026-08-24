@@ -2375,3 +2375,115 @@ async fn every_kind_of_run_that_answers_its_own_approvals_closes_the_gate() {
         "a team run answers its own approvals"
     );
 }
+
+#[test]
+fn a_tool_call_keeps_the_kind_and_file_acp_reported() {
+    let entries = replay(&[json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call-read-1",
+        "title": "Reading src/main.rs",
+        "kind": "read",
+        "status": "completed",
+        "locations": [{"path": "/repo/src/main.rs", "line": 42}]
+    })]);
+
+    let tool = entries
+        .iter()
+        .find_map(|entry| entry.tool.as_ref())
+        .expect("the replayed tool_call should carry a ToolCallView");
+
+    assert_eq!(
+        tool.kind.as_deref(),
+        Some("read"),
+        "the ACP ToolCallKind must survive into the view"
+    );
+    assert_eq!(
+        tool.path.as_deref(),
+        Some("/repo/src/main.rs"),
+        "the first ACP location is the file this call acted on"
+    );
+}
+
+#[test]
+fn a_shell_tool_call_keeps_its_execute_kind_alongside_the_command() {
+    let entries = replay(&[json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call-run-1",
+        "title": "`cargo test`",
+        "kind": "execute",
+        "status": "completed",
+        "rawInput": {"command": "cargo test"}
+    })]);
+
+    let tool = entries
+        .iter()
+        .find_map(|entry| entry.tool.as_ref())
+        .expect("the replayed tool_call should carry a ToolCallView");
+
+    assert_eq!(tool.kind.as_deref(), Some("execute"));
+    assert_eq!(tool.command.as_deref(), Some("cargo test"));
+    assert_eq!(
+        tool.item_type, "command_execution",
+        "a call carrying a command still routes to the command view"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_tool_update_keeps_the_kind_the_pending_call_reported() {
+    // The live path is two upserts, so the second always merges. Replay never
+    // does, which is why the replay tests cannot catch a field dropped there.
+    let state = relay_state();
+    let mut runtime = session();
+
+    let pending = plan_update(
+        &json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-read-live",
+            "title": "Reading src/main.rs",
+            "kind": "read",
+            "status": "pending",
+            "locations": [{"path": "/repo/src/main.rs"}]
+        }),
+        &mut runtime,
+    );
+    let completed = plan_update(
+        &json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-read-live",
+            "status": "completed"
+        }),
+        &mut runtime,
+    );
+
+    {
+        let mut relay = state.write().await;
+        crate::acp::rpc::apply_op(
+            &mut relay,
+            "t-live",
+            Some("acp-turn-1".to_string()),
+            pending,
+            "cursor",
+        );
+        crate::acp::rpc::apply_op(
+            &mut relay,
+            "t-live",
+            Some("acp-turn-1".to_string()),
+            completed,
+            "cursor",
+        );
+    }
+
+    let relay = state.read().await;
+    let runtime = relay.runtime_for_thread("t-live").expect("runtime");
+    let tool = runtime
+        .transcript
+        .iter()
+        .find_map(|entry| entry.tool.as_ref())
+        .expect("the tool entry must exist after the update");
+    assert_eq!(
+        tool.kind.as_deref(),
+        Some("read"),
+        "the completed update must not erase the kind the pending call reported"
+    );
+    assert_eq!(tool.path.as_deref(), Some("/repo/src/main.rs"));
+}

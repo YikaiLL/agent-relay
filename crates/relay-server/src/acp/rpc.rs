@@ -318,6 +318,8 @@ pub(crate) enum TranscriptOp {
     },
     Tool {
         item_id: String,
+        kind: Option<String>,
+        path: Option<String>,
         title: String,
         command: Option<String>,
         output: Option<String>,
@@ -470,9 +472,28 @@ pub(crate) fn plan_update(update: &Value, session: &mut SessionRuntime) -> Trans
             if let Some(status) = update.get("status").and_then(Value::as_str) {
                 meta.status = tool_status(Some(status));
             }
+            if let Some(kind) = update
+                .get("kind")
+                .and_then(Value::as_str)
+                .filter(|kind| !kind.is_empty())
+            {
+                meta.kind = Some(kind.to_string());
+            }
+            if let Some(path) = update
+                .get("locations")
+                .and_then(Value::as_array)
+                .and_then(|locations| locations.first())
+                .and_then(|location| location.get("path"))
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            {
+                meta.path = Some(path.to_string());
+            }
 
             TranscriptOp::Tool {
                 item_id,
+                kind: meta.kind.clone(),
+                path: meta.path.clone(),
                 title: meta.title.clone(),
                 command: meta.command.clone(),
                 output: meta.output.clone(),
@@ -504,7 +525,13 @@ pub(crate) fn plan_update(update: &Value, session: &mut SessionRuntime) -> Trans
     }
 }
 
-fn tool_view(title: &str, command: Option<&str>, output: Option<&str>) -> ToolCallView {
+fn tool_view(
+    title: &str,
+    command: Option<&str>,
+    output: Option<&str>,
+    kind: Option<&str>,
+    path: Option<&str>,
+) -> ToolCallView {
     ToolCallView {
         item_type: if command.is_some() {
             "command_execution".to_string()
@@ -513,9 +540,10 @@ fn tool_view(title: &str, command: Option<&str>, output: Option<&str>) -> ToolCa
         },
         name: title.to_string(),
         title: title.to_string(),
+        kind: kind.map(str::to_string),
         detail: None,
         query: None,
-        path: None,
+        path: path.map(str::to_string),
         url: None,
         command: command.map(str::to_string),
         input_preview: command.map(str::to_string),
@@ -560,6 +588,8 @@ pub(crate) fn capture_op(buffer: &mut Vec<TranscriptEntryView>, op: TranscriptOp
         },
         TranscriptOp::Tool {
             item_id,
+            kind,
+            path,
             title,
             command,
             output,
@@ -570,7 +600,13 @@ pub(crate) fn capture_op(buffer: &mut Vec<TranscriptEntryView>, op: TranscriptOp
             text: Some(title.clone()),
             status,
             turn_id: None,
-            tool: Some(tool_view(&title, command.as_deref(), output.as_deref())),
+            tool: Some(tool_view(
+                &title,
+                command.as_deref(),
+                output.as_deref(),
+                kind.as_deref(),
+                path.as_deref(),
+            )),
             content_state: TranscriptContentState::Full,
         },
         TranscriptOp::Title(_) | TranscriptOp::ModeChanged(_) | TranscriptOp::Ignore => return,
@@ -589,7 +625,7 @@ pub(crate) fn capture_op(buffer: &mut Vec<TranscriptEntryView>, op: TranscriptOp
 }
 
 /// Apply an op to live state. Returns whether anything changed.
-fn apply_op(
+pub(crate) fn apply_op(
     relay: &mut RelayState,
     thread_id: &str,
     turn_id: Option<String>,
@@ -656,12 +692,20 @@ fn apply_op(
         }
         TranscriptOp::Tool {
             item_id,
+            kind,
+            path,
             title,
             command,
             output,
             status,
         } => {
-            let tool = tool_view(&title, command.as_deref(), output.as_deref());
+            let tool = tool_view(
+                &title,
+                command.as_deref(),
+                output.as_deref(),
+                kind.as_deref(),
+                path.as_deref(),
+            );
             if background {
                 relay.bg_upsert_transcript_item(
                     thread_id,

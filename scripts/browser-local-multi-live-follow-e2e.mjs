@@ -17,14 +17,14 @@ import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
 const TIMEOUT_MS = 45000;
 const THREAD_ID = "thread-toolcalls-repro";
 const N_TURNS = 14; // user prompt + tool group + short agent text, x N
-const TOOLS_PER_TURN = 12; // adjacent tool_calls -> "12 tool calls" collapsed chip
+const TOOLS_PER_TURN = 12; // adjacent tool_calls -> one collapsed work chip
 const LIVE_PROMPT = "stream fake tool calls";
 const LIVE_TOOL_CALLS = 14;
 const LIVE_BARRIER = "hold-live-tail";
 const LIVE_SESSION_COUNT = 6;
 const LOST_FOLLOW_DISTANCE_PX = 160;
 // Force each 20KB transport tail to contain only a fraction of a tool-heavy
-// turn. In the UI those raw entries collapse into one short tool-group row,
+// turn. In the UI those raw entries collapse into one short work-group row,
 // matching the saved-session blank-space regression.
 const SEEDED_TOOL_PREVIEW = "seeded tool output ".repeat(70);
 
@@ -81,7 +81,7 @@ function measure() {
   const rectOf = (m) => m.getBoundingClientRect();
   const visible = msgs.filter((m) => { const r = rectOf(m); return r.bottom > trect.top + 1 && r.top < trect.bottom - 1; });
   const lowestVisibleBottom = visible.length ? Math.max(...visible.map((m) => rectOf(m).bottom)) : trect.top;
-  const toolGroups = t.querySelectorAll(".chat-message-tool-group").length;
+  const toolGroups = t.querySelectorAll(".chat-message-work-group").length;
   return {
     scrollTop: Math.round(t.scrollTop),
     scrollHeight: Math.round(t.scrollHeight),

@@ -78,7 +78,7 @@ function groupKeyFor(entries) {
 
 test("a collapsed group renders no member rows at all", () => {
   const markup = render(TOOL_GROUP_ENTRIES);
-  assert.match(markup, /tool-group-chip/, "the chip itself is still there");
+  assert.match(markup, /work-group-chip/, "the chip itself is still there");
   assert.doesNotMatch(
     markup,
     /is-group-member/,

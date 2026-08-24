@@ -198,6 +198,10 @@ pub(crate) struct ToolMeta {
     pub(crate) title: String,
     pub(crate) command: Option<String>,
     pub(crate) output: Option<String>,
+    /// Sticky like `status`: ACP lets a `tool_call_update` omit every field but
+    /// `toolCallId`, so a trailing content-only update must not blank these.
+    pub(crate) kind: Option<String>,
+    pub(crate) path: Option<String>,
     /// Last status the agent actually reported.
     ///
     /// Held here rather than recomputed per event because ACP allows every
@@ -213,6 +217,8 @@ impl Default for ToolMeta {
             title: String::new(),
             command: None,
             output: None,
+            kind: None,
+            path: None,
             status: "pending".to_string(),
         }
     }
