@@ -137,6 +137,10 @@ pub struct SessionSnapshot {
     /// viewed (the rest of this snapshot describes only the active thread).
     pub thread_activity: Vec<ThreadActivityView>,
     pub current_cwd: String,
+    /// Remembered tree for the active thread (pin, else proven). Birth `current_cwd`
+    /// does not move with observation, so surfaces key the Changes panel on this too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_workspace_cwd: Option<String>,
     /// Set only when `current_cwd` is gone, so every surface can swap the composer's
     /// banner for a repair action through the channel it already consumes. Rides the
     /// snapshot rather than being probed for, the same reason
@@ -233,6 +237,11 @@ pub struct SessionSnapshot {
     /// Skipped when 0 so the pre-rename wire shape stays byte-identical.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub threads_revision: u64,
+    /// Cache key bumped when any thread's remembered working tree changes. Surfaces
+    /// viewing a non-active thread cannot read that thread's proven path off
+    /// `thread_workspace_cwd` (that field is the ACTIVE session).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub thread_workspaces_revision: u64,
     /// Cache key for the dedicated Teams channel.
     ///
     /// Revision ONLY — no team run view rides the snapshot. That is deliberate: a
@@ -1041,14 +1050,18 @@ impl SessionSnapshot {
             }
             self.logs.clear();
             if budget.emergency_shell_transcript {
-                // Bound the one growable string identity field the earlier passes
-                // never touch. `current_cwd` is display-only on the wire (the relay
-                // uses its own path for scope checks), so clamping the snapshot copy
-                // keeps the hard byte cap honest when a pathological path dominates
+                // Bound the growable string identity fields the earlier passes
+                // never touch. `current_cwd` and `thread_workspace_cwd` are
+                // display/cache-key only on the wire (the relay uses its own
+                // path for scope checks), so clamping the snapshot copy keeps
+                // the hard byte cap honest when a pathological path dominates
                 // the frame. The remaining identity fields (available_models,
                 // paired_devices, allowed_roots) are domain-bounded — a handful of
                 // entries each — and are intentionally left intact.
                 truncate_with_ellipsis(&mut self.current_cwd, EMERGENCY_TRANSCRIPT_CWD_CHARS);
+                if let Some(cwd) = self.thread_workspace_cwd.as_mut() {
+                    truncate_with_ellipsis(cwd, EMERGENCY_TRANSCRIPT_CWD_CHARS);
+                }
             }
             if budget.emergency_shell_transcript && !self.transcript.is_empty() {
                 // Honesty rule: a non-empty thread must never serialize as an
@@ -1993,6 +2006,10 @@ pub struct ThreadStateView {
     pub thread_id: String,
     pub provider: String,
     pub current_cwd: String,
+    /// Remembered tree for this thread (pin, else proven). Same reason it rides the
+    /// snapshot: a viewed non-active thread's birth cwd does not move with observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_workspace_cwd: Option<String>,
     /// Set only when `current_cwd` is gone. Every surface reads this to swap the
     /// composer's banner for a repair action instead of letting a send die at spawn.
     pub workspace_missing: Option<WorkspaceRepairView>,

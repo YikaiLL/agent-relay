@@ -82,6 +82,35 @@ statuses aren't misread as busy:\n  {line}",
     }
 }
 
+#[cfg(test)]
+mod workspace_resolve_lock_lint {
+    #[test]
+    fn resolve_write_lock_does_not_touch_the_filesystem() {
+        let src = include_str!("thread_workspace.rs");
+        let marker = "String-only persist: path identity was decided outside this lock.";
+        let start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing write-lock marker in thread_workspace.rs"));
+        let block = &src[start..];
+        let end = block
+            .find("\n        };")
+            .or_else(|| block.find("\n        }"))
+            .expect("write-lock block should close");
+        let locked = &block[..end];
+        for needle in [
+            "paths_equivalent",
+            "root_containing_writes",
+            "normalize_cwd",
+            "canonicalize",
+        ] {
+            assert!(
+                !locked.contains(needle),
+                "resolve_thread_workspace holds the relay write lock while calling {needle}"
+            );
+        }
+    }
+}
+
 /// Shared provider-double contract: a thread keeps the cwd it was created with, and
 /// provider operations that drive it fail once that directory has been removed.
 fn require_live_test_cwd(
@@ -1685,6 +1714,7 @@ is also what keeps the refusal from confirming it exists: {error}"
                     status: status.to_string(),
                     turn_id: Some("turn-1".to_string()),
                     tool: Some(tool),
+                    seq: None,
                 });
         }
     }
@@ -1705,6 +1735,7 @@ is also what keeps the refusal from confirming it exists: {error}"
                     status: "completed".to_string(),
                     turn_id: Some("turn-1".to_string()),
                     tool: Some(tool),
+                    seq: None,
                 });
         }
     }
@@ -1755,6 +1786,904 @@ is also what keeps the refusal from confirming it exists: {error}"
             diff.cwd
         );
         assert!(diff.file_changes[0].diff.contains("EDITED-IN-WORKTREE"));
+    }
+
+    // Agent-reported cwd is enough: read-only work in a worktree never leaves write traces.
+    #[tokio::test]
+    async fn an_observed_cwd_proves_the_tree_without_any_writes() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a reported cwd must land the session in that tree with no writes; got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+        assert!(
+            same_path(&resolved.birth_cwd, &main_cwd) && resolved.birth_cwd_exists,
+            "birth cwd stays the directory the thread was created in"
+        );
+    }
+
+    // Hooks and command cwd report the process cwd, which is often a subdirectory.
+    #[tokio::test]
+    async fn an_observed_subdirectory_still_proves_the_containing_worktree() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let nested = format!("{linked_cwd}/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &nested);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a cwd inside a linked worktree must prove that tree, not birth: got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+    }
+
+    // Resolve maps `$wt/src` onto the git root for callers, but must not persist that
+    // spelling: the next PostToolUse reports `$wt/src` again and would otherwise look
+    // like a path change (revision bump → open Changes panel refetch).
+    #[tokio::test]
+    async fn a_repeated_subdirectory_observation_keeps_workspace_identity_stable() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let nested = format!("{linked_cwd}/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &nested);
+        }
+
+        let first = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&first.cwd, &linked_cwd),
+            "callers still see the containing worktree; got {}",
+            first.cwd
+        );
+        let revision_after_resolve = app.snapshot().await.thread_workspaces_revision;
+        let proven_after_resolve = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &nested);
+        }
+        let _ = resolve(&app, "thread-a").await;
+
+        let snap = app.snapshot().await;
+        assert_eq!(
+            snap.thread_workspaces_revision, revision_after_resolve,
+            "the same tree must not bump the workspace cache key on every tool"
+        );
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert_eq!(
+            proven, proven_after_resolve,
+            "resolve must not rewrite a subdirectory observation to the git root spelling"
+        );
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &nested)),
+            "stored proven stays the observed subdirectory; proven={proven:?}"
+        );
+    }
+
+    // Nested git worktrees are distinct trees even though one path contains the other.
+    #[tokio::test]
+    async fn observing_a_nested_worktree_is_not_the_enclosing_tree() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, nested_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        let on_main = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&on_main.cwd, &main_cwd),
+            "precondition: session starts on the enclosing tree; got {}",
+            on_main.cwd
+        );
+        let revision_on_main = app.snapshot().await.thread_workspaces_revision;
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &nested_cwd);
+        }
+        let on_nested = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&on_nested.cwd, &nested_cwd),
+            "moving into a nested worktree must follow the observation; got {}",
+            on_nested.cwd
+        );
+        let revision_on_nested = app.snapshot().await.thread_workspaces_revision;
+        assert_ne!(
+            revision_on_nested, revision_on_main,
+            "a real worktree move must bump the workspace cache key"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        let back_on_main = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&back_on_main.cwd, &main_cwd),
+            "moving back to the enclosing tree must follow the observation; got {}",
+            back_on_main.cwd
+        );
+        assert_ne!(
+            app.snapshot().await.thread_workspaces_revision,
+            revision_on_nested,
+            "returning to the enclosing tree is another workspace identity change"
+        );
+    }
+
+    // Writes in A, then a later observed cwd in B: B is where the session is now.
+    // Older write traces must not win, and must not be written back over B.
+    #[tokio::test]
+    async fn a_newer_observed_cwd_outranks_older_write_traces() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        assert!(
+            same_path(&resolve(&app, "thread-a").await.cwd, &main_cwd),
+            "precondition: writes in the birth tree prove that tree"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "read-only work after a move must follow the observed cwd, not older writes; got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &linked_cwd)),
+            "resolve must not write the older tree back over the observation; proven={proven:?}"
+        );
+
+        let diff = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(&diff.cwd, &linked_cwd),
+            "the already-open panel's next resolve must target B; got {}",
+            diff.cwd
+        );
+    }
+
+    // Loading older history prepends records and shifts every live index. An observation
+    // stamped with `transcript.len()` would then treat those old writes as newer.
+    #[tokio::test]
+    async fn prepending_older_history_does_not_outrank_an_observed_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+            let edited = format!("{main_cwd}/seed.txt");
+            relay
+                .ensure_runtime_for_thread("thread-a")
+                .prepend_provider_history(
+                    vec![crate::protocol::TranscriptEntryView {
+                        item_id: Some("old-write".to_string()),
+                        kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                        text: None,
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-old".to_string()),
+                        tool: Some(file_tool(&[&edited])),
+                        content_state: crate::protocol::TranscriptContentState::Full,
+                    }],
+                    Some(1),
+                    None,
+                );
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "older prepended writes must not look newer than the cwd observation; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Claude rebuilds only a bounded tail after restart, so array indices reset near
+    // zero while a persisted high watermark stays. A genuine new write must still win.
+    #[tokio::test]
+    async fn a_new_write_after_cold_bounded_tail_hydration_outranks_persisted_proven_at() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            seed_transcript(&mut relay, "thread-a", Vec::new());
+            let runtime = relay.ensure_runtime_for_thread("thread-a");
+            for index in 0..50 {
+                runtime
+                    .transcript
+                    .push(crate::state::relay::TranscriptRecord {
+                        item_id: format!("history-{index}"),
+                        kind: crate::protocol::TranscriptEntryKind::AgentText,
+                        text: Some("older tail that will not be rebuilt".to_string()),
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-old".to_string()),
+                        tool: None,
+                        seq: None,
+                    });
+            }
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+            let persisted = crate::state::persistence::PersistedRelayState::from_relay(&relay);
+            relay.runtimes.remove("thread-a");
+            relay.apply_persisted(&persisted);
+            relay.load_thread_data(
+                crate::provider::ThreadSyncData {
+                    thread: crate::protocol::ThreadSummaryView {
+                        id: "thread-a".to_string(),
+                        name: Some("thread-a".to_string()),
+                        preview: String::new(),
+                        cwd: main_cwd.clone(),
+                        updated_at: 1,
+                        source: "fake".to_string(),
+                        status: "idle".to_string(),
+                        model_provider: "fake".to_string(),
+                        provider: "fake".to_string(),
+                        forked_from: None,
+                        renamed: false,
+                    },
+                    status: "idle".to_string(),
+                    active_flags: Vec::new(),
+                    transcript: vec![crate::protocol::TranscriptEntryView {
+                        item_id: Some("tail".to_string()),
+                        kind: crate::protocol::TranscriptEntryKind::AgentText,
+                        text: Some("bounded rebuilt tail".to_string()),
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-tail".to_string()),
+                        tool: None,
+                        content_state: crate::protocol::TranscriptContentState::Full,
+                    }],
+                },
+                DEFAULT_APPROVAL_POLICY,
+                DEFAULT_SANDBOX,
+                DEFAULT_EFFORT,
+                DEFAULT_MODEL,
+                "device-a",
+            );
+            let edited = format!("{main_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "fresh-write".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-fresh".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "a write that landed after restart must outrank a stale high watermark; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Legacy persisted rows have `proven` and no `proven_at`. Undated writes still in
+    // the window must not clobber it; a later live write must be allowed to move.
+    #[tokio::test]
+    async fn legacy_undated_proven_survives_old_writes_but_yields_to_a_new_one() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+        let linked_root = resolve(&app, "thread-a")
+            .await
+            .roots
+            .into_iter()
+            .find(|root| same_path(&root.path, &linked_cwd))
+            .expect("linked worktree is enumerated")
+            .path;
+        {
+            let mut relay = app.relay.write().await;
+            relay.restore_thread_workspace_from_json(
+                "thread-a",
+                &format!(r#"{{"proven":{}}}"#, serde_json::json!(linked_root)),
+            );
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        assert!(
+            same_path(&resolve(&app, "thread-a").await.cwd, &linked_cwd),
+            "undated writes already in the window must not freeze-break a pre-upgrade proven tree"
+        );
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven_at,
+            None,
+            "matching spelling must leave a pre-upgrade row undated"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            let edited = format!("{main_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "live-after-upgrade".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-live".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+        }
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "a live write after upgrade must be allowed to move an undated proven tree; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Snapshot writes, drop the lock for git, then an observation lands before write-back.
+    #[tokio::test]
+    async fn an_observed_cwd_wins_a_race_with_resolver_writeback() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let hold = app.hold_workspace_resolve_barrier().await;
+        let arrivals_before = app.workspace_resolve_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "an observation that lands during resolve must survive write-back; got {}",
+            resolved.cwd
+        );
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &main_cwd)),
+            "persisted proven must stay on the observation; proven={proven:?}"
+        );
+    }
+
+    // Recency is a clock, not a set of distinct paths: a later observation that the
+    // agent is still in A must outrank a write that landed in B in between.
+    #[tokio::test]
+    async fn a_repeated_cwd_observation_outranks_a_contrary_live_write() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+            let edited = format!("{main_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "write-in-b".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-b".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a later same-tree observation must outrank an intervening write; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Claude's worker emits PostToolUse cwd *after* the completed write record, so
+    // the observation clock is newer than the write seq and must win.
+    #[tokio::test]
+    async fn a_post_tool_cwd_observation_outranks_the_write_it_followed() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+            let edited = format!("{linked_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "tool:write-in-b".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-1".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "PostToolUse cwd after a write in another tree must keep the session put; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Completion order is the live seq, not insertion order: an earlier row can finish last.
+    #[tokio::test]
+    async fn write_evidence_follows_the_record_with_the_highest_live_seq() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let runtime = relay.ensure_runtime_for_thread("thread-a");
+            let linked_edit = format!("{linked_cwd}/seed.txt");
+            let main_edit = format!("{main_cwd}/seed.txt");
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: "inserted-first-finished-last".to_string(),
+                    kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                    text: None,
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    tool: Some(file_tool(&[&linked_edit])),
+                    seq: Some(20),
+                });
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: "inserted-second-finished-first".to_string(),
+                    kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                    text: None,
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    tool: Some(file_tool(&[&main_edit])),
+                    seq: Some(10),
+                });
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "the write with the highest seq is the newest, even if it sits earlier in the array; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Unsequenced inference must not mint a clock after the snapshot: an observation
+    // in the post-snapshot / pre-writeback window would otherwise be overwritten.
+    #[tokio::test]
+    async fn an_observation_survives_unsequenced_inference_after_the_reread() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the unsequenced write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "unsequenced inference must not mint past a newer observation; got {}",
+            resolved.cwd
+        );
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &main_cwd)),
+            "persisted proven must stay on the observation; proven={proven:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_spelled_observation_wins_the_writeback_race() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let alias = tmp.path().join("alias-to-linked");
+        std::os::unix::fs::symlink(&linked_cwd, &alias).expect("symlink");
+        let alias = alias.to_string_lossy().to_string();
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &alias);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a symlink-spelled observation after the snapshot must still win; got {}",
+            resolved.cwd
+        );
+    }
+
+    // A pin is the operator's explicit SoT. An observation in the snapshot-to-writeback
+    // window must not hijack a review/Changes resolve onto another tree.
+    #[tokio::test]
+    async fn a_pin_survives_an_observation_in_the_writeback_window() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+        pin(&app, "thread-a", Some(&main_cwd))
+            .await
+            .expect("pin the enclosing tree");
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Pinned),
+            "a live pin must outrank a PostToolUse observation in the writeback window; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
+    }
+
+    // The CAS must re-read the live pin, not the snapshot pin: parking a different
+    // tree while resolve is in flight is still a pin.
+    #[tokio::test]
+    async fn a_pin_change_in_the_writeback_window_is_honored() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+        let linked_root = resolve(&app, "thread-a")
+            .await
+            .roots
+            .into_iter()
+            .find(|root| same_path(&root.path, &linked_cwd))
+            .expect("linked worktree is enumerated")
+            .path;
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_thread_workspace("thread-a", Some(&linked_root));
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Pinned),
+            "a pin set after the snapshot must still win; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
+    }
+
+    // Inverse: unpinning during the window must drop the snapshot pin and follow
+    // write evidence, not keep returning A as Pinned.
+    #[tokio::test]
+    async fn an_unpin_in_the_writeback_window_follows_write_evidence() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        pin(&app, "thread-a", Some(&main_cwd))
+            .await
+            .expect("pin the enclosing tree over contrary writes");
+        let parked = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&parked.cwd, &main_cwd) && matches!(parked.origin, WorkspaceOrigin::Pinned),
+            "precondition: the pin parks the session on the enclosing tree"
+        );
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_thread_workspace("thread-a", None);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Proven),
+            "unpinning must follow write evidence, not keep the snapshot pin; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
+    }
+
+    // Inverse of the observation case: a later landed write must be allowed to move
+    // the session even when Codex never emitted a cwd notification for that edit.
+    #[tokio::test]
+    async fn a_newer_landed_write_outranks_an_older_remembered_tree() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        assert!(
+            same_path(&resolve(&app, "thread-a").await.cwd, &main_cwd),
+            "precondition: the first resolve persists the birth tree as proven"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            let edited = format!("{linked_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "item-later-write".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-2".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a later successful write must move the session without a cwd hook; got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+    }
+
+    // Observation does not move birth `current_cwd`; the snapshot still has to carry the
+    // remembered tree so an already-open Changes panel can notice and refetch.
+    #[tokio::test]
+    async fn observing_cwd_rides_the_snapshot_without_moving_birth_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let snap = app.snapshot().await;
+        assert!(
+            same_path(&snap.current_cwd, &main_cwd),
+            "birth cwd stays on the snapshot; got {}",
+            snap.current_cwd
+        );
+        assert!(
+            snap.thread_workspace_cwd
+                .as_deref()
+                .is_some_and(|path| same_path(path, &linked_cwd)),
+            "the remembered tree must ride the snapshot so surfaces can refresh; got {:?}",
+            snap.thread_workspace_cwd
+        );
+        assert!(
+            snap.thread_workspaces_revision > 0,
+            "a proven-tree change must bump the cache key so a view-only panel can refetch"
+        );
+    }
+
+    // The older walk is capped by records, not by collecting 200 write paths — a
+    // write-sparse transcript must not be scanned to the start under the relay lock.
+    #[tokio::test]
+    async fn write_evidence_does_not_scan_the_whole_transcript_for_write_paths() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+            let runtime = relay.ensure_runtime_for_thread("thread-a");
+            for index in 0..2_000 {
+                runtime
+                    .transcript
+                    .push(crate::state::relay::TranscriptRecord {
+                        item_id: format!("chatter-{index}"),
+                        kind: crate::protocol::TranscriptEntryKind::AgentText,
+                        text: Some("still working, no files touched".to_string()),
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-chatter".to_string()),
+                        tool: None,
+                        seq: None,
+                    });
+            }
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "an ancient write past the record cap is not evidence; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
     }
 
     // Pin outranks fresh contrary evidence; one field would drag the panel off a parked tree.
@@ -10862,40 +11791,41 @@ mod review_tests {
                     // A real provider also reports the write, which is the evidence that
                     // says WHERE the author is now working.
                     let mut relay = self.state.write().await;
-                    let runtime = relay.ensure_runtime_for_thread(&thread_id);
-                    let item_id = format!("fix-edit-{}", runtime.transcript.len());
-                    runtime
-                        .transcript
-                        .push(crate::state::relay::TranscriptRecord {
-                            item_id,
-                            kind: crate::protocol::TranscriptEntryKind::ToolCall,
-                            text: None,
-                            status: "completed".to_string(),
-                            turn_id: Some("turn-fix".to_string()),
-                            tool: Some(crate::protocol::ToolCallView {
-                                item_type: "fileChange".to_string(),
-                                name: "Edit".to_string(),
-                                title: "Edit".to_string(),
-                                detail: None,
-                                query: None,
-                                path: None,
-                                url: None,
-                                command: None,
-                                input_preview: None,
-                                result_preview: None,
-                                diff: None,
-                                file_changes: vec![crate::protocol::FileChangeDiffView {
-                                    path: path.clone(),
-                                    change_type: "update".to_string(),
-                                    diff: format!(
-                                        "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
-                                    ),
-                                }],
-                                apply_state: None,
-                                file_changes_omitted: false,
-                                can_apply: None,
-                            }),
-                        });
+                    let item_id = format!(
+                        "fix-edit-{}",
+                        relay.ensure_runtime_for_thread(&thread_id).transcript.len()
+                    );
+                    relay.upsert_transcript_item_for_thread(
+                        &thread_id,
+                        item_id,
+                        crate::protocol::TranscriptEntryKind::ToolCall,
+                        None,
+                        "completed".to_string(),
+                        Some("turn-fix".to_string()),
+                        Some(crate::protocol::ToolCallView {
+                            item_type: "fileChange".to_string(),
+                            name: "Edit".to_string(),
+                            title: "Edit".to_string(),
+                            detail: None,
+                            query: None,
+                            path: None,
+                            url: None,
+                            command: None,
+                            input_preview: None,
+                            result_preview: None,
+                            diff: None,
+                            file_changes: vec![crate::protocol::FileChangeDiffView {
+                                path: path.clone(),
+                                change_type: "update".to_string(),
+                                diff: format!(
+                                    "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
+                                ),
+                            }],
+                            apply_state: None,
+                            file_changes_omitted: false,
+                            can_apply: None,
+                        }),
+                    );
                     relay.notify();
                 }
                 if let Some(marker) = self.mutate_cwd_on_fix_turn.lock().await.clone() {
@@ -14230,6 +15160,7 @@ settings update: {error}"
                 status: "completed".to_string(),
                 turn_id: Some("turn-evidence".to_string()),
                 tool: Some(tool),
+                seq: None,
             });
     }
 
@@ -14262,6 +15193,7 @@ settings update: {error}"
                     status: "completed".to_string(),
                     turn_id: Some("turn-chatter".to_string()),
                     tool: None,
+                    seq: None,
                 });
         }
     }
@@ -20346,6 +21278,7 @@ swallowed and the run strands"
                     status: "completed".to_string(),
                     turn_id: None,
                     tool: None,
+                    seq: None,
                 });
             relay.notify();
         }

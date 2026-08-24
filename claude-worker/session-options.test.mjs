@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildSessionOptionsBase } from "./session-options.mjs";
+import { buildSessionOptionsBase, createCwdReporter } from "./session-options.mjs";
 
 const noopCanUseTool = () => ({ behavior: "allow", updatedInput: {} });
 const defaults = { canUseTool: noopCanUseTool, defaultSettingSources: ["user"] };
@@ -55,6 +55,109 @@ test("reviewer-read-only maps to bypassPermissions + a write-tool denylist", () 
 test("non-reviewer modes carry no disallowedTools", () => {
   const opts = buildSessionOptionsBase({ cwd: "/tmp", permissionMode: "default" }, defaults);
   assert.ok(!("disallowedTools" in opts));
+});
+
+test("cwd observation hooks report PostToolUse and CwdChanged without rewriting tool output", async () => {
+  const seen = [];
+  const reporter = createCwdReporter((cwd) => seen.push(cwd));
+  const opts = buildSessionOptionsBase(
+    { cwd: "/tmp" },
+    { ...defaults, observeCwd: reporter.observeCwd }
+  );
+  assert.ok(opts.hooks?.CwdChanged, "CwdChanged is the move event");
+  assert.ok(opts.hooks?.PostToolUse, "PostToolUse.cwd covers a quiet stretch of reads");
+  const cwdChanged = await opts.hooks.CwdChanged[0].hooks[0]({ cwd: "/repo/wt" });
+  const postTool = await opts.hooks.PostToolUse[0].hooks[0]({
+    cwd: "/repo/wt",
+    tool_name: "Read",
+  });
+  assert.deepEqual(
+    seen,
+    ["/repo/wt"],
+    "CwdChanged reports immediately; PostToolUse waits until the tool result is published"
+  );
+  reporter.flushPostToolCwd();
+  assert.deepEqual(
+    seen,
+    ["/repo/wt", "/repo/wt"],
+    "the same cwd must still be reported: recency has to advance after intervening writes"
+  );
+  assert.deepEqual(cwdChanged, {}, "observe-only: do not replace tool output");
+  assert.deepEqual(postTool, {}, "observe-only: do not replace tool output");
+});
+
+test("PostToolUse cwd is held until flushPostToolCwd so it outranks the completed write", async () => {
+  const seen = [];
+  const reporter = createCwdReporter((cwd) => seen.push(cwd));
+  const opts = buildSessionOptionsBase(
+    { cwd: "/tmp" },
+    { ...defaults, observeCwd: reporter.observeCwd }
+  );
+  await opts.hooks.PostToolUse[0].hooks[0]({
+    cwd: "/repo/a",
+    tool_name: "Write",
+  });
+  assert.deepEqual(
+    seen,
+    [],
+    "PostToolUse runs before the SDK publishes the tool result; do not stamp cwd yet"
+  );
+  reporter.flushPostToolCwd();
+  assert.deepEqual(seen, ["/repo/a"]);
+});
+
+test("CwdChanged drops a queued PostToolUse cwd so a real move is not overwritten", async () => {
+  const seen = [];
+  const reporter = createCwdReporter((cwd) => seen.push(cwd));
+  const opts = buildSessionOptionsBase(
+    { cwd: "/tmp" },
+    { ...defaults, observeCwd: reporter.observeCwd }
+  );
+  await opts.hooks.PostToolUse[0].hooks[0]({ cwd: "/repo/b", tool_name: "Write" });
+  await opts.hooks.CwdChanged[0].hooks[0]({ cwd: "/repo/a" });
+  reporter.flushPostToolCwd();
+  assert.deepEqual(seen, ["/repo/a"]);
+});
+
+test("parallel PostToolUse cwds survive a batch of tool results", async () => {
+  const seen = [];
+  const reporter = createCwdReporter((cwd) => seen.push(cwd));
+  const opts = buildSessionOptionsBase(
+    { cwd: "/tmp" },
+    { ...defaults, observeCwd: reporter.observeCwd }
+  );
+  await Promise.all([
+    opts.hooks.PostToolUse[0].hooks[0]({
+      cwd: "/repo/a",
+      tool_name: "Write",
+      tool_use_id: "tool-1",
+    }),
+    opts.hooks.PostToolUse[0].hooks[0]({
+      cwd: "/repo/a",
+      tool_name: "Write",
+      tool_use_id: "tool-2",
+    }),
+  ]);
+  assert.deepEqual(seen, []);
+  reporter.flushPostToolCwd("tool-1");
+  reporter.flushPostToolCwd("tool-2");
+  assert.deepEqual(seen, ["/repo/a", "/repo/a"]);
+});
+
+test("cwd observation hooks ignore subagent PostToolUse so the parent stays put", async () => {
+  const seen = [];
+  const reporter = createCwdReporter((cwd) => seen.push(cwd));
+  const opts = buildSessionOptionsBase(
+    { cwd: "/tmp" },
+    { ...defaults, observeCwd: reporter.observeCwd }
+  );
+  await opts.hooks.PostToolUse[0].hooks[0]({
+    cwd: "/repo/subagent-wt",
+    tool_name: "Read",
+    agent_id: "agent-sub-1",
+  });
+  await opts.hooks.CwdChanged[0].hooks[0]({ cwd: "/repo/parent-wt" });
+  assert.deepEqual(seen, ["/repo/parent-wt"]);
 });
 
 test("model and explicit settingSources flow through", () => {

@@ -25,6 +25,7 @@
  *   {"type":"tool_call_result", "id":"...","content":"..."}
  *   {"type":"approval_requested","id":"...","action":"...","data":{}}
  *   {"type":"ask_user_question_requested","id":"...","tool_use_id":"...","questions":[...]}
+ *   {"type":"cwd_changed",     "provider_session_id":"...","cwd":"..."}
  *   {"type":"error",           "message":"..."}
  *   {"type":"response","id":"...","ok":true,"result":{}}   // reply to a command carrying an `id`
  *   {"type":"response","id":"...","ok":false,"error":"..."}
@@ -61,7 +62,7 @@ import {
   mcpStatusLogLines,
   userMessageTranscriptText,
 } from "./sdk-mapping.mjs";
-import { buildSessionOptionsBase } from "./session-options.mjs";
+import { buildSessionOptionsBase, createCwdReporter } from "./session-options.mjs";
 import { createProgressTracker } from "./progress-tracker.mjs";
 import { checkInstalledClaudeBinary } from "./native-binary-check.mjs";
 import {
@@ -175,6 +176,7 @@ async function flushEvents(
   onProviderSessionId = null,
   decorateEvent = null,
   progressTracker = null,
+  afterEmit = null,
 ) {
   let streamProviderSessionId = initialProviderSessionId;
   try {
@@ -202,20 +204,9 @@ async function flushEvents(
       const mapped = mapSdkMessage(msg);
       if (!mapped) continue;
 
-      if (Array.isArray(mapped)) {
-        for (const ev of mapped) {
-          const enriched = await enrichEvent(ev, fileDiffTracker);
-          decorateEvent?.(enriched);
-          streamProviderSessionId = stampProviderSession(
-            enriched,
-            streamProviderSessionId,
-            onProviderSessionId,
-          );
-          emit(enriched, progressTracker);
-          onEvent?.(enriched);
-        }
-      } else {
-        const enriched = await enrichEvent(mapped, fileDiffTracker);
+      const events = Array.isArray(mapped) ? mapped : [mapped];
+      for (const ev of events) {
+        const enriched = await enrichEvent(ev, fileDiffTracker);
         decorateEvent?.(enriched);
         streamProviderSessionId = stampProviderSession(
           enriched,
@@ -224,7 +215,12 @@ async function flushEvents(
         );
         emit(enriched, progressTracker);
         onEvent?.(enriched);
+        afterEmit?.(enriched);
       }
+      // PostToolUse may run for every tool in a parallel batch before any
+      // result is published. Flush remaining cwd reports after the whole mapped
+      // message so a later write result cannot outrank the observation.
+      afterEmit?.({ type: "mapped_batch_end" });
     }
   } catch (err) {
     if (!shouldCancel.current) {
@@ -258,6 +254,14 @@ async function enrichEvent(event, fileDiffTracker) {
   return event;
 }
 
+function cwdChangedEvent(cwd, providerSessionId) {
+  return {
+    type: "cwd_changed",
+    ...(providerSessionId ? { provider_session_id: providerSessionId } : {}),
+    cwd,
+  };
+}
+
 function buildSessionOptions(
   cmd,
   pendingApprovals,
@@ -266,6 +270,7 @@ function buildSessionOptions(
   nextAskUserRequestId,
   getProviderSessionId = () => null,
   emitEvent = rawEmit,
+  observeCwd = null,
 ) {
   return buildSessionOptionsBase(cmd, {
     canUseTool: createPermissionHandler(pendingApprovals, nextApprovalId, {
@@ -275,6 +280,7 @@ function buildSessionOptions(
       emitEvent,
     }),
     defaultSettingSources: DEFAULT_SETTING_SOURCES,
+    observeCwd,
   });
 }
 
@@ -894,6 +900,13 @@ function startSessionStream(sessions, entry, context) {
       }
     },
     entry.progressTracker,
+    (event) => {
+      if (event?.type === "tool_call_result") {
+        entry.flushPostToolCwd?.(event.id);
+      } else if (event?.type === "mapped_batch_end") {
+        entry.flushPostToolCwd?.();
+      }
+    },
   ).finally(() => {
     settleUnexpectedStreamEnd(sessions, entry, context);
     if (entry.streamTask === streamTask) {
@@ -955,14 +968,23 @@ function handleSessionEvent(sessions, entry, event, context) {
 }
 
 function buildEntryOptions(entry, cmd, pendingApprovals, nextApprovalId, pendingAskUserQuestions, nextAskUserRequestId) {
+  const reporter = createCwdReporter((cwd) => {
+    if (!cwd) return;
+    emit(
+      cwdChangedEvent(cwd, entry.providerSessionId || entry.pendingThreadId),
+      entry.progressTracker,
+    );
+  });
+  entry.flushPostToolCwd = reporter.flushPostToolCwd;
   return buildSessionOptions(
     cmd,
     pendingApprovals,
     nextApprovalId,
     pendingAskUserQuestions,
     nextAskUserRequestId,
-    () => entry.providerSessionId,
+    () => entry.providerSessionId || entry.pendingThreadId,
     (event) => emit(event, entry.progressTracker),
+    reporter.observeCwd,
   );
 }
 
@@ -1504,6 +1526,7 @@ export {
   createSessionEntry,
   createUserTurn,
   createWorkerSession,
+  cwdChangedEvent,
   ensureLiveSession,
   evictSessionsIfNeeded,
   findSessionEntry,

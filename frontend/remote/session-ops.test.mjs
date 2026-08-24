@@ -4307,6 +4307,33 @@ test("applySessionSnapshot re-hydrates a long final message added after the firs
   assert.equal(fetchCount(), 2, "the new final message triggered exactly one more fetch");
 });
 
+test("getRemoteViewedWorkspaceKey changes when only the remembered tree is observed", async () => {
+  activeBrowser = installBrowserStubs();
+  const { getRemoteViewedWorkspaceKey } = await import("./session-ops.js");
+  const { state } = await import("./state.js");
+  const previous = state.session;
+  try {
+    state.session = {
+      active_thread_id: "thread-1",
+      current_cwd: "/repo",
+      thread_workspace_cwd: "/repo",
+    };
+    const before = getRemoteViewedWorkspaceKey();
+    state.session = {
+      ...state.session,
+      thread_workspace_cwd: "/repo/.worktrees/feature",
+    };
+    const after = getRemoteViewedWorkspaceKey();
+    assert.notEqual(
+      after,
+      before,
+      "an observation-only move must look like a new workspace to an already-open panel"
+    );
+  } finally {
+    state.session = previous;
+  }
+});
+
 test("projectRemoteViewedSession surfaces the viewed thread's own reviewers, not the global set", async () => {
   activeBrowser = installBrowserStubs();
   const { projectRemoteViewedSession } = await import("./session-ops.js");

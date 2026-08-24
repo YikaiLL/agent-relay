@@ -236,6 +236,10 @@ impl AppState {
             thread_id: thread_id.to_string(),
             provider: provider.to_string(),
             current_cwd: runtime.current_cwd.clone(),
+            thread_workspace_cwd: {
+                let remembered = relay.thread_workspace(thread_id);
+                remembered.pinned.or(remembered.proven)
+            },
             // The cached verdict, not a fresh `stat`: this runs under the relay read lock,
             // and a blocking filesystem call here stalls every session update behind it.
             // `refresh_workspace_verdict` keeps it current from the async paths.

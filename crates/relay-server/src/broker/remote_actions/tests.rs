@@ -38,6 +38,7 @@ fn make_snapshot() -> SessionSnapshot {
         active_flags: vec![],
         thread_activity: vec![],
         current_cwd: "/tmp/project".to_string(),
+        thread_workspace_cwd: None,
         workspace_missing: None,
         model: "gpt-5.4".to_string(),
         available_models: vec![],
@@ -76,6 +77,7 @@ fn make_snapshot() -> SessionSnapshot {
         push_vapid_public_key: None,
         projects_revision: 0,
         threads_revision: 0,
+        thread_workspaces_revision: 0,
         teams_revision: 0,
     }
 }

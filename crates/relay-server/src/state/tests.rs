@@ -287,6 +287,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             active_flags: Vec::new(),
             thread_activity: Vec::new(),
             current_cwd: "/tmp/project".to_string(),
+            thread_workspace_cwd: None,
             workspace_missing: None,
             model: DEFAULT_MODEL.to_string(),
             available_models: Vec::new(),
@@ -315,6 +316,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             push_vapid_public_key: None,
             projects_revision: 0,
             threads_revision: 0,
+            thread_workspaces_revision: 0,
             teams_revision: 0,
         }),
         receipt: Some(ApprovalReceipt {
@@ -760,6 +762,27 @@ fn clearing_a_pin_with_nothing_else_remembered_drops_the_row() {
 // notifies — and the persistence task only saves in response to a notification. Without a
 // wake here, the very fact that would have prevented the NEXT review from re-targeting the
 // birth tree is lost on restart.
+#[test]
+fn a_stale_resolver_writeback_does_not_clobber_a_newer_cwd_observation() {
+    let mut relay = test_state();
+    relay.observe_thread_cwd("thread-1", "/tmp/project/.claude/worktrees/feature");
+    let observed = relay.thread_workspace("thread-1");
+    assert_eq!(
+        observed.proven.as_deref(),
+        Some("/tmp/project/.claude/worktrees/feature")
+    );
+    let observed_at = observed.proven_at.expect("observation stamps recency");
+
+    relay.record_proven_thread_workspace_at("thread-1", "/tmp/project", 0);
+    let after = relay.thread_workspace("thread-1");
+    assert_eq!(
+        after.proven.as_deref(),
+        Some("/tmp/project/.claude/worktrees/feature"),
+        "a stale write-back must not replace a newer cwd observation"
+    );
+    assert_eq!(after.proven_at, Some(observed_at));
+}
+
 #[test]
 fn recording_a_proven_workspace_notifies_so_it_reaches_disk() {
     let (change_tx, mut change_rx) = watch::channel(0_u64);
@@ -1672,6 +1695,32 @@ fn normalize_cwd_collapses_parent_segments_for_missing_paths() {
 }
 
 #[test]
+fn nearest_enumerated_root_picks_the_longest_containing_worktree() {
+    let roots = ["/repo", "/repo/.claude/worktrees/feature"];
+    assert_eq!(
+        nearest_enumerated_root("/repo", &roots).as_deref(),
+        Some("/repo")
+    );
+    assert_eq!(
+        nearest_enumerated_root("/repo/src", &roots).as_deref(),
+        Some("/repo")
+    );
+    assert_eq!(
+        nearest_enumerated_root("/repo/.claude/worktrees/feature", &roots).as_deref(),
+        Some("/repo/.claude/worktrees/feature")
+    );
+    assert_eq!(
+        nearest_enumerated_root("/repo/.claude/worktrees/feature/src", &roots).as_deref(),
+        Some("/repo/.claude/worktrees/feature")
+    );
+    assert_eq!(nearest_enumerated_root("/other", &roots), None);
+    assert!(!matches!(
+        nearest_enumerated_root("/repo", &roots).as_deref(),
+        Some("/repo/.claude/worktrees/feature")
+    ));
+}
+
+#[test]
 fn ensure_path_within_allowed_roots_rejects_parent_dir_escape_for_missing_paths() {
     let unique = format!(
         "agent-relay-allowed-roots-{}-{}",
@@ -1752,6 +1801,7 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
         status: "completed".to_string(),
         turn_id: Some("turn-1".to_string()),
         tool: None,
+        seq: None,
     });
     relay
         .pending_approvals
@@ -6092,6 +6142,7 @@ fn promoting_a_background_thread_does_not_rewind_the_real_threads_revision() {
             status: "completed".to_string(),
             turn_id: None,
             tool: None,
+            seq: None,
         },
         TranscriptRecord {
             item_id: "b".to_string(),
@@ -6100,6 +6151,7 @@ fn promoting_a_background_thread_does_not_rewind_the_real_threads_revision() {
             status: "completed".to_string(),
             turn_id: None,
             tool: None,
+            seq: None,
         },
     ];
 

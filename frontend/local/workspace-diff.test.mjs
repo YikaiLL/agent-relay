@@ -8,6 +8,7 @@ import {
   createWorkspaceDiffStore,
   WorkspaceChangesPanel,
 } from "./workspace-diff.js";
+import { localViewedWorkspaceKey } from "../shared/viewed-workspace-key.js";
 
 // Minimal external store for useSyncExternalStore: never notifies, just serves state.
 function fakeStore(state, methods = {}) {
@@ -314,6 +315,102 @@ test("changing a session's cwd clears the previous workspace's diff during loadi
   });
   await pB;
   assert.equal(store.getState().data.cwd, "/B");
+});
+
+// Observation records a new tree without moving birth current_cwd. The identity
+// must still change so an already-open panel drops the previous tree's diff.
+test("an observation-only workspace change clears the previous tree's diff during loading", async () => {
+  const gates = { A: deferred(), B: deferred() };
+  let workspaceCwd = "/repo";
+  const apiFetch = () => (workspaceCwd === "/repo/wt" ? gates.B.promise : gates.A.promise);
+  const store = createWorkspaceDiffStore({
+    apiFetch,
+    surface: "local",
+    getThreadId: () => "thread-1",
+    getWorkspaceKey: () => JSON.stringify(["thread-1", "/repo", workspaceCwd]),
+  });
+
+  const pA = store.refresh();
+  gates.A.resolve({
+    ok: true,
+    json: async () => ({
+      ok: true,
+      data: {
+        cwd: "/repo",
+        file_changes: [
+          { path: "a.txt", change_type: "update", diff: "@@ -1 +1 @@\n-x\n+y\n" },
+        ],
+      },
+    }),
+  });
+  await pA;
+  assert.equal(store.getState().data.cwd, "/repo");
+
+  workspaceCwd = "/repo/wt";
+  const pB = store.refresh();
+  const mid = store.getState();
+  assert.equal(mid.status, "loading");
+  assert.equal(
+    mid.data,
+    null,
+    "observation-only move must clear /repo's data during /repo/wt's load window"
+  );
+
+  gates.B.resolve({
+    ok: true,
+    json: async () => ({ ok: true, data: { cwd: "/repo/wt", file_changes: [] } }),
+  });
+  await pB;
+  assert.equal(store.getState().data.cwd, "/repo/wt");
+});
+
+test("viewing a non-active thread clears stale diff when workspaces_revision advances", async () => {
+  const gates = { first: deferred(), second: deferred() };
+  let revision = 1;
+  const pin = { threadId: "thread-a", cwd: "/a", threadWorkspaceCwd: "/a" };
+  const session = () => ({
+    active_thread_id: "thread-b",
+    current_cwd: "/b",
+    thread_workspace_cwd: "/b",
+    thread_workspaces_revision: revision,
+  });
+  const apiFetch = () => (revision === 2 ? gates.second.promise : gates.first.promise);
+  const store = createWorkspaceDiffStore({
+    apiFetch,
+    surface: "local",
+    getThreadId: () => "thread-a",
+    getWorkspaceKey: () => localViewedWorkspaceKey({
+      session: session(),
+      viewThreadId: "thread-a",
+      viewOnlyThread: pin,
+    }),
+  });
+
+  const p1 = store.refresh();
+  gates.first.resolve({
+    ok: true,
+    json: async () => ({
+      ok: true,
+      data: {
+        cwd: "/a",
+        file_changes: [
+          { path: "stale.txt", change_type: "update", diff: "@@ -1 +1 @@\n-x\n+y\n" },
+        ],
+      },
+    }),
+  });
+  await p1;
+  assert.equal(store.getState().data.cwd, "/a");
+
+  revision = 2;
+  const p2 = store.refresh();
+  assert.equal(store.getState().data, null, "A's observation must drop the previous diff");
+  gates.second.resolve({
+    ok: true,
+    json: async () => ({ ok: true, data: { cwd: "/a-wt", file_changes: [] } }),
+  });
+  await p2;
+  assert.equal(store.getState().data.cwd, "/a-wt");
 });
 
 // Guard against over-clearing: a refresh at the SAME workspace identity (same thread

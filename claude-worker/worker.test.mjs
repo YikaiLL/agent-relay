@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
+import { createCwdReporter } from "./session-options.mjs";
 import {
   buildSdkMsgProbe,
   closeSessionEntry,
   createSessionEntry,
   createWorkerSession,
+  cwdChangedEvent,
   ensureLiveSession,
   evictSessionsIfNeeded,
   findSessionEntry,
@@ -272,6 +275,99 @@ test("flushEvents emits no MCP log when init has no servers", async () => {
   );
 });
 
+test("flushEvents emits a queued PostToolUse cwd after the tool result", async () => {
+  const order = [];
+  const reporter = createCwdReporter((cwd) => order.push(`cwd:${cwd}`));
+  reporter.observeCwd("/repo/a", { source: "PostToolUse" });
+  assert.deepEqual(order, [], "PostToolUse must not race the tool result");
+
+  await captureStdout(async () => {
+    await flushEvents(
+      streamMessages([
+        {
+          type: "user",
+          uuid: "user-1",
+          message: {
+            content: [{ type: "tool_result", tool_use_id: "tool-1", content: "ok" }],
+          },
+        },
+      ]),
+      { current: false },
+      (event) => order.push(event.type),
+      null,
+      null,
+      null,
+      null,
+      makeTracker(),
+      (event) => {
+        if (event?.type === "tool_call_result") reporter.flushPostToolCwd(event.id);
+        else if (event?.type === "mapped_batch_end") reporter.flushPostToolCwd();
+      },
+    );
+  });
+
+  assert.deepEqual(order, ["tool_call_result", "cwd:/repo/a"]);
+});
+
+test("flushEvents emits PostToolUse cwd after a parallel batch of write results", async () => {
+  const order = [];
+  const reporter = createCwdReporter((cwd) => order.push(`cwd:${cwd}`));
+  reporter.observeCwd("/repo/a", { source: "PostToolUse", tool_use_id: "tool-1" });
+  reporter.observeCwd("/repo/a", { source: "PostToolUse", tool_use_id: "tool-2" });
+
+  await captureStdout(async () => {
+    await flushEvents(
+      streamMessages([
+        {
+          type: "user",
+          uuid: "user-1",
+          message: {
+            content: [
+              { type: "tool_result", tool_use_id: "tool-1", content: "ok" },
+              { type: "tool_result", tool_use_id: "tool-2", content: "ok" },
+            ],
+          },
+        },
+      ]),
+      { current: false },
+      (event) => order.push(event.type),
+      null,
+      null,
+      null,
+      null,
+      makeTracker(),
+      (event) => {
+        if (event?.type === "tool_call_result") reporter.flushPostToolCwd(event.id);
+        else if (event?.type === "mapped_batch_end") reporter.flushPostToolCwd();
+      },
+    );
+  });
+
+  assert.deepEqual(order, [
+    "tool_call_result",
+    "cwd:/repo/a",
+    "tool_call_result",
+    "cwd:/repo/a",
+  ]);
+  const lastCwd = order.lastIndexOf("cwd:/repo/a");
+  const lastResult = order.lastIndexOf("tool_call_result");
+  assert.ok(lastCwd > lastResult, "the last cwd must outrank the last write result");
+});
+
+test("the live stream flushes PostToolUse cwd after publishing tool_call_result", () => {
+  const src = readFileSync(new URL("./worker.mjs", import.meta.url), "utf8");
+  const flushAfterResult =
+    src.includes('event?.type === "tool_call_result"') &&
+    src.includes("entry.flushPostToolCwd?.(event.id)");
+  const flushAfterBatch =
+    src.includes('event?.type === "mapped_batch_end"') && src.includes("entry.flushPostToolCwd?.()");
+  assert.equal(
+    flushAfterResult && flushAfterBatch,
+    true,
+    "PostToolUse cwd has to leave the worker after each result and after the mapped batch",
+  );
+});
+
 // A fake SDK whose query() records the options it was booted with and blocks
 // (like a live session awaiting input) until interrupt(), so we can observe
 // whether ensureLiveSession reuses or rebuilds the underlying query.
@@ -429,4 +525,16 @@ test("ensureLiveSession rebuilds on a model switch and preserves model when omit
   assert.equal(sdk.queries[2].options.model, "claude-sonnet-4-6");
 
   closeSessionEntry(entry);
+});
+
+test("cwd_changed carries the pending thread id before Claude has a real session id", () => {
+  const pendingId = "claude-pending-1";
+  const event = cwdChangedEvent("/repo/wt", pendingId);
+  assert.equal(event.type, "cwd_changed");
+  assert.equal(event.cwd, "/repo/wt");
+  assert.equal(
+    event.provider_session_id,
+    pendingId,
+    "the first cwd hook must not wait for the SDK session id"
+  );
 });

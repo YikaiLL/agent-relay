@@ -1,15 +1,15 @@
-//! Pin → fresh writes → remembered proven → birth cwd. Candidates must be in enumerated, device-scoped `roots`.
+//! Pin → newer writes (after proven_at) → remembered proven → birth cwd. Candidates must be in enumerated, device-scoped `roots`.
 
 use super::*;
 
 impl AppState {
-    /// Pin → fresh write evidence → remembered proven → birth cwd (`None` device = relay-wide roots).
+    /// Pin → writes newer than remembered proven → remembered proven → birth cwd (`None` device = relay-wide roots).
     pub(crate) async fn resolve_thread_workspace(
         &self,
         thread_id: &str,
         device_id: Option<&str>,
     ) -> Result<ResolvedWorkspace, ThreadWorkspaceError> {
-        let (birth_cwd, relay_cwd, device_scope, allowed_roots, write_evidence, remembered) = {
+        let (birth_cwd, relay_cwd, device_scope, allowed_roots) = {
             let relay = self.relay.read().await;
             let birth_cwd = relay.thread_cwd(thread_id).ok_or_else(|| {
                 ThreadWorkspaceError::Unresolvable(format!(
@@ -21,18 +21,11 @@ impl AppState {
                 .unwrap_or_default();
             ensure_path_within_device_scope(&birth_cwd, &device_scope, &relay.allowed_roots)
                 .map_err(ThreadWorkspaceError::OutOfScope)?;
-            // Paths only: git matching happens after this lock is dropped.
-            let write_evidence = relay
-                .runtime_for_thread(thread_id)
-                .map(|runtime| thread_write_evidence(&runtime.transcript))
-                .unwrap_or_default();
             (
                 birth_cwd,
                 relay.current_cwd.clone(),
                 device_scope,
                 relay.allowed_roots.clone(),
-                write_evidence,
-                relay.thread_workspace(thread_id),
             )
         };
 
@@ -52,7 +45,33 @@ no workspace related to it is available instead"
             .into_iter()
             .filter(|root| path_within_device_scope(&root.path, &device_scope, &allowed_roots))
             .collect();
-        // Map stored paths onto git's spelling; re-check scope so this does not depend on the filter above.
+
+        #[cfg(test)]
+        {
+            self.workspace_resolve_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(self.workspace_resolve_barrier.lock().await);
+        }
+
+        let (mut write_evidence, mut remembered) = {
+            let relay = self.relay.read().await;
+            (
+                relay
+                    .runtime_for_thread(thread_id)
+                    .map(|runtime| thread_write_evidence(&runtime.transcript))
+                    .unwrap_or_default(),
+                relay.thread_workspace(thread_id),
+            )
+        };
+
+        #[cfg(test)]
+        {
+            self.workspace_resolve_writeback_arrivals
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(self.workspace_resolve_writeback_barrier.lock().await);
+        }
+
+        let root_paths: Vec<&str> = roots.iter().map(|root| root.path.as_str()).collect();
         let in_reach = |candidate: &str| -> Option<String> {
             roots
                 .iter()
@@ -60,27 +79,119 @@ no workspace related to it is available instead"
                 .filter(|root| path_within_device_scope(&root.path, &device_scope, &allowed_roots))
                 .map(|root| root.path.clone())
         };
+        let proven_root = |candidate: &str| -> Option<String> {
+            in_reach(candidate).or_else(|| root_containing_writes(&[candidate.to_string()], &roots))
+        };
 
-        let (cwd, origin) = if let Some(pinned) = remembered.pinned.as_deref().and_then(&in_reach) {
-            (pinned, WorkspaceOrigin::Pinned)
-        } else if let Some(proven) = root_containing_writes(&write_evidence, &roots) {
-            // Skip the write lock when the proven tree has not changed (this runs on every refresh).
-            if remembered.proven.as_deref() != Some(proven.as_str()) {
-                self.relay
-                    .write()
-                    .await
-                    .record_proven_thread_workspace(thread_id, &proven);
+        let mut retried_unpin = false;
+        let (cwd, origin) = loop {
+            let write_root = root_containing_writes(&write_evidence.paths, &roots);
+            let writes_are_newer = match (
+                write_root.as_ref(),
+                write_evidence.newest_seq,
+                remembered.proven.as_ref(),
+                remembered.proven_at,
+            ) {
+                (None, _, _, _) => false,
+                (Some(_), _, None, _) => true,
+                (Some(_), Some(seq), Some(_), at) => seq > at.unwrap_or(0),
+                (Some(_), None, Some(_), _) => false,
+            };
+
+            let mut persist: Option<(String, Option<u64>)> = None;
+            let (mut cwd, mut origin) =
+                if let Some(pinned) = remembered.pinned.as_deref().and_then(&in_reach) {
+                    (pinned, WorkspaceOrigin::Pinned)
+                } else if writes_are_newer {
+                    let proven = write_root.expect("writes_are_newer requires a write root");
+                    let same_enumerated_tree = remembered.proven.as_deref().is_some_and(|path| {
+                        crate::state::nearest_enumerated_root(path, &root_paths).as_deref()
+                            == Some(proven.as_str())
+                    });
+                    if !same_enumerated_tree {
+                        persist = Some((proven.clone(), write_evidence.newest_seq));
+                    }
+                    (proven, WorkspaceOrigin::Proven)
+                } else if let Some(remembered_root) =
+                    remembered.proven.as_deref().and_then(&proven_root)
+                {
+                    (remembered_root, WorkspaceOrigin::Proven)
+                } else if let Some(proven) = write_root {
+                    persist = Some((proven.clone(), write_evidence.newest_seq));
+                    (proven, WorkspaceOrigin::Proven)
+                } else {
+                    let cwd = usable.as_str().to_string();
+                    match gone.clone() {
+                        Some(gone) => (cwd, WorkspaceOrigin::Substituted { gone }),
+                        None => (cwd, WorkspaceOrigin::Birth),
+                    }
+                };
+
+            let mut remap_after_lock: Option<(String, WorkspaceOrigin)> = None;
+            let mut retry_unpinned = false;
+            {
+                // String-only persist: path identity was decided outside this lock.
+                let mut relay = self.relay.write().await;
+                let live = relay.thread_workspace(thread_id);
+                if let Some(pinned) = live.pinned.as_deref() {
+                    if let Some(root) = roots
+                        .iter()
+                        .find(|root| root.path == pinned)
+                        .map(|root| root.path.clone())
+                        .or_else(|| crate::state::nearest_enumerated_root(pinned, &root_paths))
+                    {
+                        cwd = root;
+                        origin = WorkspaceOrigin::Pinned;
+                    } else {
+                        remap_after_lock = Some((pinned.to_string(), WorkspaceOrigin::Pinned));
+                    }
+                } else if remembered.pinned.is_some() && !retried_unpin {
+                    write_evidence = relay
+                        .runtime_for_thread(thread_id)
+                        .map(|runtime| thread_write_evidence(&runtime.transcript))
+                        .unwrap_or_default();
+                    remembered = live;
+                    retry_unpinned = true;
+                } else {
+                    let live_is_newer = match (live.proven_at, remembered.proven_at) {
+                        (Some(live_at), Some(snap_at)) => live_at > snap_at,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if live_is_newer {
+                        if let Some(path) = live.proven.as_deref() {
+                            if let Some(root) =
+                                crate::state::nearest_enumerated_root(path, &root_paths)
+                            {
+                                cwd = root;
+                                origin = WorkspaceOrigin::Proven;
+                            } else {
+                                remap_after_lock =
+                                    Some((path.to_string(), WorkspaceOrigin::Proven));
+                            }
+                        }
+                    } else if let Some((tree, at)) = persist {
+                        if live.proven.as_deref() != Some(tree.as_str()) || live.proven_at != at {
+                            relay.record_inferred_thread_workspace(thread_id, &tree, at);
+                        }
+                    }
+                }
             }
-            (proven, WorkspaceOrigin::Proven)
-        } else if let Some(remembered) = remembered.proven.as_deref().and_then(&in_reach) {
-            // Empty evidence is not "moved back to birth".
-            (remembered, WorkspaceOrigin::Proven)
-        } else {
-            let cwd = usable.as_str().to_string();
-            match gone {
-                Some(gone) => (cwd, WorkspaceOrigin::Substituted { gone }),
-                None => (cwd, WorkspaceOrigin::Birth),
+            if retry_unpinned {
+                retried_unpin = true;
+                continue;
             }
+            if let Some((path, remap_origin)) = remap_after_lock {
+                let root = match &remap_origin {
+                    WorkspaceOrigin::Pinned => in_reach(&path),
+                    _ => proven_root(&path),
+                };
+                if let Some(root) = root {
+                    cwd = root;
+                    origin = remap_origin;
+                }
+            }
+            break (cwd, origin);
         };
 
         // Git standing is live; never stored.
@@ -102,6 +213,33 @@ no workspace related to it is available instead"
             birth_cwd,
             birth_cwd_exists,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_workspace_resolve_barrier(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.workspace_resolve_barrier.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_resolve_arrivals(&self) -> u64 {
+        self.workspace_resolve_arrivals
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_workspace_resolve_writeback_barrier(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.workspace_resolve_writeback_barrier
+            .clone()
+            .lock_owned()
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_resolve_writeback_arrivals(&self) -> u64 {
+        self.workspace_resolve_writeback_arrivals
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Pin (`Some`) or un-pin (`None`); only enumerated, in-scope trees, then re-resolve.
@@ -202,8 +340,8 @@ impl ThreadWorkspaceError {
     }
 }
 
-/// Landed write paths, newest first. An empty recent window is not "went home" — walk further, still capped.
-fn thread_write_evidence(transcript: &[crate::state::relay::TranscriptRecord]) -> Vec<String> {
+/// Landed write paths from the newest live record, plus that record's clock.
+fn thread_write_evidence(transcript: &[crate::state::relay::TranscriptRecord]) -> WriteEvidence {
     let landed = |record: &crate::state::relay::TranscriptRecord| {
         record
             .tool
@@ -211,21 +349,51 @@ fn thread_write_evidence(transcript: &[crate::state::relay::TranscriptRecord]) -
             .map(|tool| landed_write_paths(std::iter::once((tool, record.status.as_str()))))
             .unwrap_or_default()
     };
-    let recent: Vec<String> = transcript
+    let collect = |records: &[&crate::state::relay::TranscriptRecord]| {
+        let mut best: Option<&crate::state::relay::TranscriptRecord> = None;
+        for record in records {
+            let chunk = landed(record);
+            if chunk.is_empty() {
+                continue;
+            }
+            let take = match (best.and_then(|current| current.seq), record.seq) {
+                (None, _) if best.is_none() => true,
+                (None, Some(_)) => true,
+                (Some(current), Some(seq)) => seq > current,
+                (Some(_), None) | (None, None) => false,
+            };
+            if take {
+                best = Some(record);
+            }
+        }
+        match best {
+            Some(record) => WriteEvidence {
+                paths: landed(record),
+                newest_seq: record.seq,
+            },
+            None => WriteEvidence::default(),
+        }
+    };
+    let recent: Vec<_> = transcript
         .iter()
         .rev()
         .take(WRITE_EVIDENCE_SCAN_LIMIT)
-        .flat_map(&landed)
         .collect();
-    if !recent.is_empty() {
+    let recent = collect(&recent);
+    if !recent.paths.is_empty() {
         return recent;
     }
-    let mut older = Vec::new();
-    for record in transcript.iter().rev().skip(WRITE_EVIDENCE_SCAN_LIMIT) {
-        older.extend(landed(record));
-        if older.len() >= WRITE_EVIDENCE_SCAN_LIMIT {
-            break;
-        }
-    }
-    older
+    let older: Vec<_> = transcript
+        .iter()
+        .rev()
+        .skip(WRITE_EVIDENCE_SCAN_LIMIT)
+        .take(WRITE_EVIDENCE_SCAN_LIMIT)
+        .collect();
+    collect(&older)
+}
+
+#[derive(Clone, Default)]
+struct WriteEvidence {
+    paths: Vec<String>,
+    newest_seq: Option<u64>,
 }

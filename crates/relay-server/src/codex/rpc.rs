@@ -257,6 +257,11 @@ async fn handle_server_request_for_provider(
             );
         }
         relay.add_pending_approval(pending.clone());
+        if let Some(cwd) = pending.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            if !pending.thread_id.is_empty() {
+                relay.observe_thread_cwd(&pending.thread_id, cwd);
+            }
+        }
         if matches!(route, ThreadRoute::Active) {
             relay.touch_progress(Some("waiting_approval"), None);
         }
@@ -304,6 +309,9 @@ async fn handle_notification_for_provider(
                 relay.upsert_thread(thread);
                 changed = true;
             }
+        }
+        "thread/settings/updated" => {
+            observe_notification_cwd(&mut relay, notification_thread_id.as_deref(), &params);
         }
         "thread/status/changed" => {
             let thread_id = string_at(&params, &["threadId"]).unwrap_or_default();
@@ -554,6 +562,11 @@ async fn handle_notification_for_provider(
                 ) {
                     let status = string_at(&params, &["item", "status"])
                         .unwrap_or_else(|| "running".to_string());
+                    observe_notification_cwd(
+                        &mut relay,
+                        notification_thread_id.as_deref(),
+                        &params,
+                    );
                     if let ThreadRoute::Background(bg_thread_id) = route {
                         relay.bg_start_command_execution(
                             &bg_thread_id,
@@ -755,6 +768,11 @@ async fn handle_notification_for_provider(
                     let output = string_at(&params, &["item", "aggregatedOutput"]);
                     let status = string_at(&params, &["item", "status"])
                         .unwrap_or_else(|| "completed".to_string());
+                    observe_notification_cwd(
+                        &mut relay,
+                        notification_thread_id.as_deref(),
+                        &params,
+                    );
                     if let ThreadRoute::Background(bg_thread_id) = route {
                         relay.bg_add_command_result(
                             &bg_thread_id,
@@ -910,6 +928,27 @@ fn notification_thread_id(params: &Value) -> Option<String> {
     string_at(params, &["threadId"])
         .or_else(|| string_at(params, &["turn", "threadId"]))
         .or_else(|| string_at(params, &["item", "threadId"]))
+}
+
+fn observe_notification_cwd(relay: &mut RelayState, thread_id: Option<&str>, params: &Value) {
+    let Some(thread_id) = thread_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let settings_cwd = string_at(params, &["threadSettings", "cwd"]);
+    let cwd = string_at(params, &["item", "cwd"])
+        .or_else(|| string_at(params, &["cwd"]))
+        .or_else(|| settings_cwd.clone());
+    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return;
+    };
+    // Configured session cwd is restated on every settings update (model, sandbox).
+    // Restating birth is not "went home" and must not wipe a command-proven worktree.
+    if settings_cwd.as_deref() == Some(cwd.as_str()) {
+        if relay.thread_cwd(thread_id).as_deref() == Some(cwd.as_str()) {
+            return;
+        }
+    }
+    relay.observe_thread_cwd(thread_id, &cwd);
 }
 
 fn is_session_notification_method(method: &str) -> bool {

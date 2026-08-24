@@ -157,6 +157,7 @@ export function buildViewOnlyPin({
   workflowLocked = false,
   reviewSig = null,
   cwd = null,
+  threadWorkspaceCwd = null,
   provider = null,
   settings = null,
   settingsWritable = false,
@@ -189,6 +190,7 @@ export function buildViewOnlyPin({
     // rather than the live thread's. The summary carries no model/effort/policy,
     // so the projection blanks those (blank/unknown beats impersonating live).
     cwd,
+    threadWorkspaceCwd,
     provider,
     settings,
     settingsWritable,
@@ -438,6 +440,7 @@ export function projectViewOnlySession(realSession, { viewThreadId, viewOnlyThre
     // approval policy, sandbox). Blank/unknown over impersonation — and never
     // fall back to the live cwd.
     current_cwd: viewOnlyThread.cwd ?? "",
+    thread_workspace_cwd: viewOnlyThread.threadWorkspaceCwd ?? "",
     provider: viewOnlyThread.provider ?? "",
     model: settings.model || "",
     reasoning_effort: settings.reasoning_effort || "",

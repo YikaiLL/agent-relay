@@ -177,6 +177,17 @@ pub struct AppState {
     team_commit_barrier: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     team_commit_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// Test-only latch after git listing and before workspace write-back, so a cwd
+    /// observation can land in that window deterministically.
+    #[cfg(test)]
+    workspace_resolve_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    workspace_resolve_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// Test-only latch after evidence re-read and before inferred write-back.
+    #[cfg(test)]
+    workspace_resolve_writeback_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    workspace_resolve_writeback_arrivals: Arc<std::sync::atomic::AtomicU64>,
     /// How long (ms) to watch a thread for signs of a turn after a start request
     /// failed, before concluding the provider never began one. Overridable in
     /// tests.
@@ -350,6 +361,14 @@ impl AppState {
             team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_writeback_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -493,6 +512,14 @@ impl AppState {
             team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_writeback_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1558,7 +1585,8 @@ fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<Work
 }
 
 /// How far back through a thread's transcript to look for evidence of where it has
-/// been writing. Bounded so a long thread cannot make the diff endpoint expensive.
+/// been writing. Applied twice (recent window, then an older window of the same
+/// size) so a long write-sparse transcript cannot stall under the relay read lock.
 const WRITE_EVIDENCE_SCAN_LIMIT: usize = 200;
 
 /// One line telling a reviewer WHICH working tree it is being handed — path, branch, and

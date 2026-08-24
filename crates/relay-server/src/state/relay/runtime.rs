@@ -154,6 +154,7 @@ impl ThreadRuntime {
                 status: entry.status,
                 turn_id: entry.turn_id,
                 tool: entry.tool,
+                seq: None,
             })
             .collect();
 
@@ -311,6 +312,7 @@ impl ThreadRuntime {
                 status: entry.status,
                 turn_id: entry.turn_id,
                 tool: entry.tool,
+                seq: None,
             })
             .collect::<Vec<_>>();
         // Paging can split a tool's request from its result across pages. The newer page
@@ -467,7 +469,9 @@ fn merge_runtime_entry(existing: &mut TranscriptRecord, incoming: TranscriptReco
         || existing.turn_id != incoming.turn_id
         || !tool_calls_equal(existing.tool.as_ref(), incoming.tool.as_ref());
     if changed {
+        let seq = incoming.seq.or(existing.seq);
         *existing = incoming;
+        existing.seq = seq;
     }
     changed
 }
@@ -677,6 +681,7 @@ mod tests {
             status: "completed".to_string(),
             turn_id: None,
             tool: None,
+            seq: None,
         });
         let older = vec![TranscriptEntryView {
             item_id: Some("older".to_string()),

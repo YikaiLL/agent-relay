@@ -168,9 +168,12 @@ pub(crate) struct ThreadWorkspace {
     /// Explicit pin; only `set_thread_workspace` writes this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pinned: Option<String>,
-    /// Last proven write tree. Persisted because transcript evidence is bounded and gone after restart; empty evidence is not "went home".
+    /// Last proven tree. Observation and landed writes; recency is `proven_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) proven: Option<String>,
+    /// Transcript clock when this tree was proven. Live writes with `seq > proven_at` are newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proven_at: Option<u64>,
 }
 
 impl ThreadWorkspace {
@@ -365,6 +368,10 @@ pub struct RelayState {
     /// separately. In-memory only — a restart resets it to 0, so clients simply refetch
     /// once on the mismatch (harmless), same as `projects_revision`.
     pub(super) threads_revision: u64,
+    /// Bumped when any thread's pin or proven tree changes, so a surface viewing a
+    /// non-active thread can refetch that thread's workspace without reading the
+    /// active session's `thread_workspace_cwd`.
+    pub(super) thread_workspaces_revision: u64,
     /// Monotonic cache key for the dedicated Projects channel; bumped on every project
     /// mutation. Rides the snapshot (tiny); the full projects/membership payload is
     /// fetched on demand. In-memory only — a restart resets it to 0, so clients simply
@@ -528,6 +535,7 @@ impl RelayState {
             thread_project_id: HashMap::new(),
             thread_custom_name: HashMap::new(),
             threads_revision: 0,
+            thread_workspaces_revision: 0,
             projects_revision: 0,
             allowed_roots: Vec::new(),
             available_models: Vec::new(),
@@ -879,7 +887,7 @@ impl RelayState {
     }
 
     /// What is remembered about this thread's working tree. Empty → birth cwd.
-    pub(super) fn thread_workspace(&self, thread_id: &str) -> ThreadWorkspace {
+    pub(crate) fn thread_workspace(&self, thread_id: &str) -> ThreadWorkspace {
         self.thread_workspace
             .get(thread_id)
             .cloned()
@@ -904,19 +912,68 @@ impl RelayState {
         if entry.is_empty() {
             self.thread_workspace.remove(thread_id);
         }
+        self.thread_workspaces_revision = self.thread_workspaces_revision.wrapping_add(1);
         true
     }
 
+    /// Agent-reported cwd (hooks / command cwd). Does not pin and does not rewrite birth cwd.
+    /// Same path still advances recency: a later "still here" observation outranks intervening writes.
+    pub(crate) fn observe_thread_cwd(&mut self, thread_id: &str, cwd: &str) {
+        if thread_id.is_empty() || cwd.is_empty() {
+            return;
+        }
+        let at = self.next_transcript_revision();
+        self.record_proven_thread_workspace_at(thread_id, cwd, at);
+    }
+
     /// Internal side effect of `resolve_thread_workspace` (roots + scope already checked). Notifies on a real change so persistence can save even when the caller returns without touching job state.
-    pub(super) fn record_proven_thread_workspace(&mut self, thread_id: &str, tree: &str) {
+    pub(crate) fn record_proven_thread_workspace(&mut self, thread_id: &str, tree: &str) {
+        if self.thread_workspace(thread_id).proven.as_deref() == Some(tree) {
+            return;
+        }
+        let at = self.next_transcript_revision();
+        self.record_proven_thread_workspace_at(thread_id, tree, at);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_thread_workspace_from_json(&mut self, thread_id: &str, json: &str) {
+        let workspace: ThreadWorkspace = serde_json::from_str(json).expect("thread workspace json");
+        self.thread_workspace
+            .insert(thread_id.to_string(), workspace);
+    }
+
+    pub(crate) fn record_inferred_thread_workspace(
+        &mut self,
+        thread_id: &str,
+        tree: &str,
+        at: Option<u64>,
+    ) {
+        // Unsequenced evidence is older than any observation; never mint a clock at write-back.
+        self.record_proven_thread_workspace_at(thread_id, tree, at.unwrap_or(0));
+    }
+
+    pub(crate) fn record_proven_thread_workspace_at(
+        &mut self,
+        thread_id: &str,
+        tree: &str,
+        at: u64,
+    ) {
         let entry = self
             .thread_workspace
             .entry(thread_id.to_string())
             .or_default();
-        if entry.proven.as_deref() == Some(tree) {
+        if entry.proven_at.is_some_and(|current| current > at) {
             return;
         }
+        if entry.proven.as_deref() == Some(tree) && entry.proven_at == Some(at) {
+            return;
+        }
+        let path_changed = entry.proven.as_deref() != Some(tree);
         entry.proven = Some(tree.to_string());
+        entry.proven_at = Some(at);
+        if path_changed {
+            self.thread_workspaces_revision = self.thread_workspaces_revision.wrapping_add(1);
+        }
         self.notify();
     }
 
@@ -2855,6 +2912,10 @@ impl RelayState {
             active_flags,
             thread_activity: self.thread_activity_view(),
             current_cwd,
+            thread_workspace_cwd: self.active_thread_id.as_deref().and_then(|id| {
+                let remembered = self.thread_workspace(id);
+                remembered.pinned.or(remembered.proven)
+            }),
             workspace_missing,
             model,
             available_models: self.available_models.clone(),
@@ -2903,6 +2964,7 @@ impl RelayState {
             push_vapid_public_key: self.push_vapid_public_key.clone(),
             projects_revision: self.projects_revision,
             threads_revision: self.threads_revision,
+            thread_workspaces_revision: self.thread_workspaces_revision,
             teams_revision: self.teams_revision(),
         }
     }

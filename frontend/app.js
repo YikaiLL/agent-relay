@@ -229,6 +229,7 @@ import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-stri
 import { ProjectSwitcher } from "./shared/project-switcher.js";
 import { StartSessionDialog } from "./shared/start-session-dialog.js";
 import { selectWorkspaceSuggestionsModel } from "./shared/workspace-suggestions.js";
+import { localViewedWorkspaceKey } from "./shared/viewed-workspace-key.js";
 import { createProjectAndSelect } from "./shared/project-create.js";
 import {
   layoutThreadIds,
@@ -553,7 +554,11 @@ const workspaceDiffStore = createWorkspaceDiffStore({
   getThreadId: viewedThreadId,
   // Reset identity = viewed thread + its cwd, so a same-thread cwd change also
   // clears the stale diff during loading (not just a thread switch).
-  getWorkspaceKey: () => JSON.stringify([viewedThreadId() || "", state.session?.current_cwd || ""]),
+  getWorkspaceKey: () => localViewedWorkspaceKey({
+    session: state.session,
+    viewThreadId: viewedThreadId(),
+    viewOnlyThread: state.viewOnlyThread,
+  }),
 });
 // Projects ride a dedicated channel off the byte-budgeted snapshot; this store fetches
 // the payload when `projects_revision` changes (see createProjectsStore) and feeds it
@@ -765,8 +770,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 let lastTurnDiffItemId = null;
-let lastWorkspaceCwd = null;
-let lastViewThreadId = null;
+let lastWorkspaceKey = null;
 window.addEventListener("agent-relay:session-updated", () => {
   refreshWorkspaceDiffIfChanged();
   // Fetch the dedicated Projects payload when the snapshot's revision changes (a
@@ -816,21 +820,22 @@ function refreshThreadsIfRenamedElsewhere() {
 function refreshWorkspaceDiffIfChanged() {
   const session = state.session;
   if (!session) return;
-  const cwd = session.current_cwd || "";
-  // The viewed session id is also part of the key: switching between two threads
-  // that share a cwd must still refetch (each has its own workspace state).
+  // Viewed session + birth cwd + remembered tree: observation does not move
+  // current_cwd, so an open panel would otherwise keep showing the previous tree.
   const viewThreadId = state.viewThreadId || session.active_thread_id || null;
-  const cwdChanged = lastWorkspaceCwd !== null && cwd !== lastWorkspaceCwd;
-  const viewChanged = lastViewThreadId !== null && viewThreadId !== lastViewThreadId;
-  if (cwdChanged || viewChanged) {
-    lastWorkspaceCwd = cwd;
-    lastViewThreadId = viewThreadId;
+  const workspaceKey = localViewedWorkspaceKey({
+    session,
+    viewThreadId,
+    viewOnlyThread: state.viewOnlyThread,
+  });
+  const workspaceChanged = lastWorkspaceKey !== null && workspaceKey !== lastWorkspaceKey;
+  if (workspaceChanged) {
+    lastWorkspaceKey = workspaceKey;
     lastTurnDiffItemId = null;
     void workspaceDiffStore.refresh();
     return;
   }
-  lastWorkspaceCwd = cwd;
-  lastViewThreadId = viewThreadId;
+  lastWorkspaceKey = workspaceKey;
   const entries = session.transcript || [];
   let latest = null;
   for (let i = entries.length - 1; i >= 0; i -= 1) {
@@ -1098,6 +1103,7 @@ renderer.renderSession = function wrappedRenderSession(session) {
       threadId: state.viewThreadId,
       priorEntries: previousLiveSession.transcript || [],
       cwd: summary?.cwd ?? previousLiveSession.current_cwd ?? null,
+      threadWorkspaceCwd: previousLiveSession.thread_workspace_cwd ?? null,
       provider: summary?.provider ?? previousLiveSession.provider ?? null,
       status: previousLiveSession.current_status || "idle",
       lastRefreshAt: Date.now(),
@@ -1172,6 +1178,7 @@ async function loadViewOnlyTranscript(threadId) {
     workflowLocked,
     reviewSig,
     cwd,
+    threadWorkspaceCwd: prior?.threadWorkspaceCwd ?? null,
     provider,
     status,
     activeTurnId: prior?.activeTurnId || null,
@@ -1220,6 +1227,10 @@ async function loadViewOnlyTranscript(threadId) {
       workflowLocked: Boolean(normalized.thread_state?.workflow_locked ?? workflowLocked),
       reviewSig: exactReview ? viewOnlyReviewSignature(session, threadId) : reviewSig,
       cwd: normalized.thread_state?.current_cwd ?? cwd,
+      threadWorkspaceCwd:
+        normalized.thread_state?.thread_workspace_cwd
+        ?? prior?.threadWorkspaceCwd
+        ?? null,
       provider: normalized.thread_state?.provider ?? provider,
       status,
       activeTurnId: normalized.thread_state?.active_turn_id || null,
@@ -1251,6 +1262,7 @@ async function loadViewOnlyTranscript(threadId) {
       workflowLocked,
       reviewSig,
       cwd,
+      threadWorkspaceCwd: prior?.threadWorkspaceCwd ?? null,
       provider,
       status,
       activeTurnId: prior?.activeTurnId || null,

@@ -1088,6 +1088,27 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
             relay.notify();
         }
 
+        "cwd_changed" => {
+            let thread_id = event_thread_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .or_else(|| {
+                    payload
+                        .get("pending_thread_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                });
+            if let (Some(thread_id), Some(cwd)) = (
+                thread_id,
+                payload
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| !cwd.is_empty()),
+            ) {
+                relay.observe_thread_cwd(thread_id, cwd);
+            }
+        }
+
         "user_message" => {
             let route = claude_thread_route(&relay, event_thread_id.as_deref());
             if matches!(route, ClaudeThreadRoute::Drop) {
@@ -3239,6 +3260,112 @@ mod tests {
         );
         assert_eq!(relay.current_phase, None);
         assert_eq!(relay.current_tool, None);
+    }
+
+    #[tokio::test]
+    async fn cwd_changed_records_proven_without_clobbering_birth_cwd() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            json!({
+                "type": "cwd_changed",
+                "provider_session_id": "thread-b",
+                "cwd": "/tmp/worktree"
+            }),
+            &state,
+        )
+        .await;
+
+        let relay = state.read().await;
+        assert_eq!(
+            relay.thread_workspace("thread-b").proven.as_deref(),
+            Some("/tmp/worktree"),
+            "a reported cwd is where this session is, even with no file writes"
+        );
+        assert_eq!(
+            relay.thread_cwd("thread-b").as_deref(),
+            Some("/tmp/b"),
+            "birth cwd stays the directory the thread was created in"
+        );
+        assert_eq!(
+            relay.current_cwd, "/tmp/b",
+            "observation must not clobber the relay-wide cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_changed_accepts_pending_thread_id_before_the_sdk_session_id() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            json!({
+                "type": "cwd_changed",
+                "pending_thread_id": "thread-b",
+                "cwd": "/tmp/worktree"
+            }),
+            &state,
+        )
+        .await;
+
+        let relay = state.read().await;
+        assert_eq!(
+            relay.thread_workspace("thread-b").proven.as_deref(),
+            Some("/tmp/worktree"),
+            "the first cwd hook can fire before Claude has a real session id"
+        );
+    }
+
+    // Worker contract: tool_call_requested → tool_call_result → cwd_changed.
+    // PostToolUse is deferred until after the completed write is published, so the
+    // observation clock outranks that write's seq.
+    #[tokio::test]
+    async fn post_tool_cwd_after_a_completed_write_keeps_the_observed_tree() {
+        let state = test_relay_with_active_b().await;
+        handle_worker_event(pending_file_change("write-b", "/tmp/other/file.rs"), &state).await;
+        handle_worker_event(
+            file_change_result(
+                "write-b",
+                "/tmp/other/file.rs",
+                "--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                false,
+            ),
+            &state,
+        )
+        .await;
+        handle_worker_event(
+            json!({
+                "type": "cwd_changed",
+                "provider_session_id": "thread-b",
+                "cwd": "/tmp/b"
+            }),
+            &state,
+        )
+        .await;
+
+        let relay = state.read().await;
+        assert_eq!(
+            relay.thread_workspace("thread-b").proven.as_deref(),
+            Some("/tmp/b"),
+            "the PostToolUse cwd must win over the write it followed"
+        );
+        let write_seq = relay
+            .runtime_for_thread("thread-b")
+            .and_then(|runtime| {
+                runtime
+                    .transcript
+                    .iter()
+                    .find(|entry| entry.item_id == "tool:write-b")
+                    .and_then(|entry| entry.seq)
+            })
+            .expect("completed write should have a seq");
+        let proven_at = relay
+            .thread_workspace("thread-b")
+            .proven_at
+            .expect("observation should mint a clock");
+        assert!(
+            proven_at > write_seq,
+            "observation clock {proven_at} must be newer than write seq {write_seq}"
+        );
     }
 
     #[tokio::test]

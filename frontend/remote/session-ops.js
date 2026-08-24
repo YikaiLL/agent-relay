@@ -67,6 +67,7 @@ import { threadAttention } from "../shared/thread-attention.js";
 import { forkFieldsToPayload } from "../shared/fork-fields.js";
 import { isDocumentForeground, notifyThreadEvents } from "../shared/thread-notify.js";
 import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
+import { sessionViewedWorkspaceKey } from "../shared/viewed-workspace-key.js";
 import { isWorkingThreadStatus } from "../shared/thread-status.js";
 import { createFrameRenderQueue } from "./frame-render-queue.js";
 
@@ -895,6 +896,10 @@ export function projectRemoteViewedSession(realSession, threadId, currentView) {
     active_turn_id: explicitTurnId || (isWorking ? `view:${threadId}` : null),
     controller_lease_expires_at: null,
     current_cwd: threadState.current_cwd || thread?.cwd || "",
+    thread_workspace_cwd:
+      threadState.thread_workspace_cwd
+      ?? currentView?.thread_workspace_cwd
+      ?? "",
     current_phase: currentPhase,
     current_status: threadState.current_status
       || (isWorking ? "active" : settledThreadStatus(thread?.status)),
@@ -1956,10 +1961,9 @@ export function getRemoteViewedThreadId() {
   return viewOnlyThreadId || state.session?.active_thread_id || null;
 }
 
-// Identity of the viewed workspace (thread id + cwd): used to drop stale diff data
-// on a view switch OR a same-thread cwd change during the load window.
+// Identity of the viewed workspace (thread + birth cwd + remembered tree).
 export function getRemoteViewedWorkspaceKey() {
-  return JSON.stringify([getRemoteViewedThreadId() || "", state.session?.current_cwd || ""]);
+  return sessionViewedWorkspaceKey(state.session, getRemoteViewedThreadId());
 }
 
 export async function fetchRemoteWorkspaceDiff({ viewRoot = null } = {}) {
