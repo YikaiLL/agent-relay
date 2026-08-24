@@ -191,6 +191,11 @@ jobs:
       - name: Review recap-modes e2e
         run: npm run test:review-recap-modes
 
+      # Session workspace identity over HTTP: birth in a linked worktree must keep
+      # Changes + review on that tree, and pin/unpin must move Diff without a browser.
+      - name: Cwd-drift worktree e2e
+        run: CWD_DRIFT_E2E_SKIP_BUILD=1 npm run test:cwd-drift
+
       # Same shape for the Task team: the real relay binary, the fake provider, a
       # real git repository. It covers the layer the in-process Rust tests cannot
       # reach — HTTP routes, provisioning, and the branch left on disk — and it has
