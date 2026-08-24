@@ -5283,43 +5283,46 @@ body.is-resizing-panel {
   flex-direction: column;
   min-height: 100%;
 }
-/* Worktree root picker. Only rendered when the repo actually has more than one
- * working tree, so it must not reserve space in the common single-worktree case.
- * Borderless: a full-width boxed control read as the panel's primary subject
- * when it is only ever a qualifier on the list below it. */
-.workspace-root-picker {
+/* WHICH WORKING TREE this panel is about — the `ThreadWorkspaceField`, shared with the
+ * review request dialog so the two can never say different things. Borderless: it is a
+ * qualifier on the list below it, not the panel's primary subject. */
+.thread-workspace-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
   padding: 6px 8px 0;
 }
-.workspace-root-select {
-  /* Sized to its label, not to the panel: a full-width control reads as the
-   * panel's subject, and the native full-width drop arrow was the heaviest mark
-   * on the whole tab. `appearance: none` + a drawn caret keeps it a text button. */
-  width: auto;
-  max-width: 100%;
-  padding: 3px 18px 3px 6px;
-  margin-left: -6px;
-  border: none;
-  border-radius: 5px;
-  color: var(--text-secondary);
+.thread-workspace-label {
   font-size: var(--text-xs);
-  font-family: inherit;
-  cursor: pointer;
-  appearance: none;
-  background-color: transparent;
-  background-image:
-    linear-gradient(45deg, transparent 50%, currentColor 50%),
-    linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: right 9px top 50%, right 6px top 50%;
-  background-size: 3px 3px, 3px 3px;
-  background-repeat: no-repeat;
+  color: var(--text-secondary);
 }
-.workspace-root-select:hover {
-  background-color: var(--bg-elevated);
-  color: var(--text-primary);
+.thread-workspace-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
-.workspace-root-select:focus-visible {
-  outline: 2px solid var(--accent, currentColor);
-  outline-offset: 1px;
+.thread-workspace-unpin {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+}
+.thread-workspace-error {
+  margin: 2px 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-warning);
+}
+/* "we worked out which tree this is" — quieter than the fallback warning below, which
+   is the only one of the two that reports something the user may need to act on. */
+.workspace-origin-note {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+/* The dialog gives the control a whole row of its own, so it may look like a field
+   rather than an inline chip. */
+.panel-modal-body .thread-workspace-field {
+  padding: 0 0 4px;
 }
 .workspace-changes-list {
   display: flex;

@@ -47,15 +47,15 @@ use protocol::{
     PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
     ProjectActionInput, ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput,
     ReadThreadTranscriptInput, RenameThreadInput, RepairWorkspaceInput, RequestReviewInput,
-    RequestReviewReceipt, ResumeSessionInput, ReviewActionInput, ReviewDeleteReceipt,
-    ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+    RequestReviewReceipt, ResolvedWorkspace, ResumeSessionInput, ReviewActionInput,
+    ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
     SessionSnapshotCompactProfile, StartSessionInput, StartTeamInput, StartTeamReceipt,
     StartWorkflowInput, StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput,
     TakeOverInput, TeamActionInput, TeamActionReceipt, TeamsResponse, ThreadArchiveReceipt,
     ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadSettingsView,
-    ThreadTranscriptResponse, ThreadsQuery, ThreadsResponse, TranscriptDeltaEvent,
-    UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt,
-    WorkflowsResponse, WorkspaceDiffResponse, WorkspaceGitContextView,
+    ThreadTranscriptResponse, ThreadWorkspaceInput, ThreadsQuery, ThreadsResponse,
+    TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput,
+    WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse, WorkspaceGitContextView,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -129,17 +129,18 @@ struct DeviceQuery {
 
 #[derive(Debug, Deserialize)]
 struct WorkspaceDiffQuery {
-    /// The session the client is *viewing*. Absent → the global/active workspace
-    /// (legacy behavior). Present → diff that session's own workspace.
+    /// Viewed session; absent = global/active cwd.
     thread_id: Option<String>,
-    /// Which working tree to diff. Absent → the session's own cwd. Present → must be
-    /// one of the roots enumerated for that session's repo, else it fails closed.
-    root: Option<String>,
-    /// Opt in to landing on `suggested_root` (where this thread has actually been
-    /// writing) instead of its own cwd. The client sends this once per thread switch,
-    /// so the panel never re-targets itself underneath a reader.
-    #[serde(default)]
-    auto_root: bool,
+    /// Diff preview; must be an enumerated root. Does not pin the session.
+    view_root: Option<String>,
+}
+
+/// Session workspace (not a free path — that is `/api/workspace/git-context`).
+#[derive(Debug, Deserialize)]
+struct ThreadWorkspaceQuery {
+    thread_id: String,
+    /// Optional; local operator has no device identity.
+    device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +346,10 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/session", get(session_snapshot))
         .route("/api/workspace/diff", get(workspace_diff))
         .route("/api/workspace/git-context", get(workspace_git_context))
+        .route(
+            "/api/thread/workspace",
+            get(thread_workspace).post(pin_thread_workspace),
+        )
         .route("/api/threads/:thread_id/settings", get(thread_settings))
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
@@ -655,7 +660,7 @@ async fn workspace_diff(
     authorize_api(&context, &headers, &uri)?;
     context
         .app
-        .workspace_diff(None, query.thread_id, query.root, query.auto_root)
+        .workspace_diff(None, query.thread_id, query.view_root)
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(|error| classify_session_error(error))
@@ -682,6 +687,38 @@ async fn workspace_git_context(
         .map(|response| Json(ApiEnvelope::ok(response)))
         // Both failures are the caller's, so 400. `classify_session_error` would file
         // the scope refusal as `bad_gateway` — a client mistake reported as ours.
+        .map_err(bad_request)
+}
+
+/// Resolved working tree for this session.
+async fn thread_workspace(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<ThreadWorkspaceQuery>,
+) -> Result<Json<ApiEnvelope<ResolvedWorkspace>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .resolve_thread_workspace(&query.thread_id, query.device_id.as_deref())
+        .await
+        .map(|resolved| Json(ApiEnvelope::ok(resolved)))
+        .map_err(|error| bad_request(error.into_message()))
+}
+
+/// Pin (`cwd`) or un-pin (`cwd: null`); response is the re-resolved state.
+async fn pin_thread_workspace(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<ThreadWorkspaceInput>,
+) -> Result<Json<ApiEnvelope<ResolvedWorkspace>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .pin_thread_workspace(input)
+        .await
+        .map(|resolved| Json(ApiEnvelope::ok(resolved)))
         .map_err(bad_request)
 }
 

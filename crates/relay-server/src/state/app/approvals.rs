@@ -224,147 +224,99 @@ impl AppState {
         })
     }
 
+    /// Session tree from `resolve_thread_workspace`; `view_root` is a preview of another enumerated root, not a pin.
     pub async fn workspace_diff(
         &self,
         device_id: Option<String>,
         thread_id: Option<String>,
-        root: Option<String>,
-        auto_root: bool,
+        view_root: Option<String>,
     ) -> Result<WorkspaceDiffResponse, String> {
-        let (cwd, relay_cwd, device_scope, allowed_roots) = {
-            let relay = self.relay.read().await;
-            // Resolve which workspace to diff:
-            // - absent selector       → the global/active cwd (legacy back-compat)
-            // - present & resolvable   → the *viewed* session's own workspace
-            // - present & unresolvable → fail closed; NEVER fall back to the active
-            //   cwd, which would show (and, for a broad-scope remote device, leak)
-            //   another workspace's diff.
-            let resolved = match thread_id.as_deref() {
-                None => relay.current_cwd.clone(),
-                Some(thread_id) => match relay.thread_cwd(thread_id) {
-                    Some(cwd) => cwd,
-                    None => return Ok(WorkspaceDiffResponse::unavailable()),
-                },
+        // No thread: global cwd. view_root is unauthorized without a roots list.
+        let Some(thread_id) = non_empty(thread_id) else {
+            if non_empty(view_root).is_some() {
+                return Err(
+                    "view_root needs a thread_id so the relay can check it against that session's trees"
+                        .to_string(),
+                );
+            }
+            let (cwd, device_scope, allowed_roots) = {
+                let relay = self.relay.read().await;
+                let device_scope = device_id
+                    .as_deref()
+                    .map(|id| relay.device_path_scope(id))
+                    .unwrap_or_default();
+                ensure_path_within_device_scope(
+                    &relay.current_cwd,
+                    &device_scope,
+                    &relay.allowed_roots,
+                )?;
+                (
+                    relay.current_cwd.clone(),
+                    device_scope,
+                    relay.allowed_roots.clone(),
+                )
             };
-            let device_scope = device_id
-                .as_deref()
-                .map(|id| relay.device_path_scope(id))
-                .unwrap_or_default();
-            ensure_path_within_device_scope(&resolved, &device_scope, &relay.allowed_roots)?;
+            let (mut response, retry_fallback) =
+                super::collect_workspace_diff_resilient(&cwd, &cwd, &device_scope, &allowed_roots)
+                    .await?;
+            if response.unavailable {
+                return Ok(response);
+            }
+            response.roots = super::list_worktrees(&response.cwd)
+                .await
+                .into_iter()
+                .filter(|candidate| {
+                    path_within_device_scope(&candidate.path, &device_scope, &allowed_roots)
+                })
+                .collect();
+            response.fallback_from = retry_fallback;
+            return Ok(response);
+        };
+
+        // Unresolvable → empty panel. Do not fall back to active cwd (would leak another workspace).
+        let resolved = match self
+            .resolve_thread_workspace(&thread_id, device_id.as_deref())
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(ThreadWorkspaceError::Unresolvable(_)) => {
+                return Ok(WorkspaceDiffResponse::unavailable())
+            }
+            Err(ThreadWorkspaceError::OutOfScope(error)) => return Err(error),
+        };
+
+        let diff_cwd = match non_empty(view_root) {
+            Some(requested) => {
+                let matched = resolved
+                    .roots
+                    .iter()
+                    .find(|root| paths_equivalent(&root.path, &requested))
+                    .ok_or_else(|| {
+                        format!(
+                            "{requested} is not one of this session's working trees; pick one of \
+the trees the relay listed for it"
+                        )
+                    })?;
+                matched.path.clone()
+            }
+            None => resolved.cwd.clone(),
+        };
+
+        let (relay_cwd, device_scope, allowed_roots) = {
+            let relay = self.relay.read().await;
             (
-                resolved,
                 relay.current_cwd.clone(),
-                device_scope,
+                device_id
+                    .as_deref()
+                    .map(|id| relay.device_path_scope(id))
+                    .unwrap_or_default(),
                 relay.allowed_roots.clone(),
             )
         };
 
-        // That workspace may no longer EXIST — a thread born in an agent worktree keeps its
-        // path after the worktree is removed. Spawning git there fails with ENOENT, which
-        // used to reach the panel verbatim ("failed to run git rev-parse
-        // --is-inside-work-tree: No such file or directory (os error 2)") and took the root
-        // picker with it, leaving no way back. Degrade to a workspace that is provably
-        // related, in scope — or fail closed — and report WHICH one vanished.
-        let (workspace, fallback_from) =
-            match super::resolve_workspace_cwd(&cwd, &relay_cwd, &device_scope, &allowed_roots)
-                .await
-                .into_readable()
-            {
-                Some(usable) => usable,
-                None => return Ok(WorkspaceDiffResponse::unavailable()),
-            };
-        let cwd = workspace.as_str().to_string();
-
-        // Enumerate from the session's OWN cwd, which has just cleared the scope
-        // check. This is the only source of selectable roots, so the picker can
-        // never name a repo the viewed session has no access to.
-        //
-        // Then drop every root the caller may not see. A linked worktree routinely
-        // lives OUTSIDE the session cwd's subtree, so "is a worktree of this repo" is
-        // not on its own permission to know it exists: for a narrow-scoped device the
-        // path and branch name are themselves privileged topology. Filtering here (not
-        // just at selection time) also keeps the picker honest — every option it shows
-        // is one that will actually load.
-        let roots: Vec<WorkspaceRootView> = super::list_worktrees(&cwd)
-            .await
-            .into_iter()
-            .filter(|candidate| {
-                path_within_device_scope(&candidate.path, &device_scope, &allowed_roots)
-            })
-            .collect();
-
-        // Where this thread has actually been writing, derived (never stored) from its
-        // own transcript tail. Reported for the picker; only ACTED on when the client
-        // explicitly asks via `auto_root`, so a plain refresh can never move the panel
-        // out from under someone reading it.
-        // `known` distinguishes "looked, nothing to suggest" from "could not look yet"
-        // (a cold thread whose transcript has not loaded). Without that distinction a
-        // client burns its one-shot auto-resolve on a thread whose history has not
-        // arrived, and never re-resolves.
-        let (suggested, suggested_root_known) = match thread_id.as_deref() {
-            // No thread selected: nothing to attribute, and that IS the final answer.
-            None => (None, true),
-            Some(tid) => {
-                let relay = self.relay.read().await;
-                match relay.runtime_for_thread(tid) {
-                    None => (None, false),
-                    Some(runtime) => (
-                        super::suggested_root_from_tools(
-                            runtime
-                                .transcript
-                                .iter()
-                                .rev()
-                                .take(super::SUGGESTED_ROOT_SCAN_LIMIT)
-                                .filter_map(|record| {
-                                    // Status travels WITH the tool: whether a write landed
-                                    // is the deciding factor, and dropping it here is what
-                                    // let a failed edit count as evidence.
-                                    record
-                                        .tool
-                                        .as_ref()
-                                        .map(|tool| (tool, record.status.as_str()))
-                                }),
-                            &roots,
-                        ),
-                        true,
-                    ),
-                }
-            }
-        };
-        // Only a root DIFFERENT from the session's own cwd is worth suggesting; the
-        // panel already defaults there.
-        let suggested = suggested.filter(|candidate| !super::paths_equivalent(candidate, &cwd));
-
-        let target = match root {
-            // Adopt the suggestion only on an explicit opt-in from the client, which
-            // sends it once per thread switch (see the picker's auto-resolve).
-            None if auto_root => suggested.clone().unwrap_or(cwd),
-            None => cwd,
-            Some(requested) => {
-                // Gate 1 — membership: the request must name a worktree we just
-                // enumerated. Resolve to the ENUMERATED path and hand *that* to git;
-                // the caller's own string is never used as a filesystem path, so a
-                // crafted selector cannot reach a tree we did not enumerate.
-                let Some(matched) = roots
-                    .iter()
-                    .find(|candidate| super::paths_equivalent(&candidate.path, &requested))
-                else {
-                    return Ok(WorkspaceDiffResponse::unavailable());
-                };
-                // Gate 2 — device scope. Redundant by construction now that `roots` is
-                // pre-filtered, and deliberately kept: it is the check that actually
-                // enforces the boundary, so it must not depend on a caller elsewhere
-                // remembering to filter first.
-                ensure_path_within_device_scope(&matched.path, &device_scope, &allowed_roots)?;
-                matched.path.clone()
-            }
-        };
-
-        // Resilient because the resolve above and this collect are two steps: a cleanup task
-        // can remove the tree in between, and the panel must not go back to showing a raw
-        // git spawn error when it loses that race.
+        // Tree can vanish between resolve and collect.
         let (mut response, retry_fallback) = super::collect_workspace_diff_resilient(
-            &target,
+            &diff_cwd,
             &relay_cwd,
             &device_scope,
             &allowed_roots,
@@ -373,10 +325,12 @@ impl AppState {
         if response.unavailable {
             return Ok(response);
         }
-        response.roots = roots;
-        response.suggested_root = suggested;
-        response.suggested_root_known = suggested_root_known;
-        response.fallback_from = fallback_from.or(retry_fallback);
+        response.roots = resolved.roots;
+        response.fallback_from = match resolved.origin {
+            WorkspaceOrigin::Substituted { gone } => Some(gone),
+            _ => None,
+        }
+        .or(retry_fallback);
         Ok(response)
     }
 

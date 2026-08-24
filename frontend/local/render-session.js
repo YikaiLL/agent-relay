@@ -273,6 +273,9 @@ export function createSessionRenderer({
   requestReview,
   startWorkflow,
   setReviewSlice,
+  // Same ResolvedWorkspace the Changes/Reviewer panels read, so all three stay aligned.
+  getThreadWorkspace = () => null,
+  pinThreadWorkspace = null,
   reviewsCache = createReviewsCache(),
   workflowsCache = createWorkflowsCache(),
   fetchReviews,
@@ -1100,10 +1103,13 @@ export function createSessionRenderer({
       workflowRuns: threadWorkflowRuns,
       reviewModel: reviewLaunchModel(session),
       workflowModel: workflowLaunchModel(session),
-      // Existing reviewer threads of the VIEWED thread (same scope as the review job
-      // cards above), offered for reuse. Provider filtering happens in the panel (it
-      // reacts to the chosen provider).
-      reusableReviewers: reusableReviewersFromReviews(reviewsData, viewedThreadId, null),
+      // Filter reuse by working tree here: the relay refuses a reviewer bound to another tree.
+      reusableReviewers: reusableReviewersFromReviews(
+        reviewsData,
+        viewedThreadId,
+        null,
+        getThreadWorkspace()?.cwd || null
+      ),
       // Full reviewer-thread list so each card can show its reviewer thread's
       // (long, truncated-with-tooltip) name by joining on reviewer_thread_id.
       reviewerThreads: reviewsData.reviewer_threads || [],
@@ -1140,6 +1146,7 @@ export function createSessionRenderer({
       return;
     }
     const reviewModel = reviewLaunchModel(session);
+    const workspace = getThreadWorkspace();
     renderReactContent(
       reviewIdleNudge,
       h(
@@ -1157,9 +1164,12 @@ export function createSessionRenderer({
           reusableReviewers: reusableReviewersFromReviews(
             reviewsCache.current(),
             state.viewThreadId || session?.active_thread_id || null,
-            null
+            null,
+            workspace?.cwd || null
           ),
           parentThreadId: state.viewThreadId || session?.active_thread_id || null,
+          workspace,
+          onPinWorkspace: pinThreadWorkspace,
           disabled: false,
           onSubmit: (values) => requestReview(values),
         })

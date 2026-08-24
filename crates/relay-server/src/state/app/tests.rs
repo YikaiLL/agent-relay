@@ -619,6 +619,27 @@ mod path_scope_tests {
         )
     }
 
+    /// The resolved workspace for a thread, as the local operator surface asks for it.
+    async fn resolve(app: &AppState, thread_id: &str) -> crate::protocol::ResolvedWorkspace {
+        app.resolve_thread_workspace(thread_id, None)
+            .await
+            .unwrap_or_else(|error| panic!("{thread_id} should resolve: {}", error.into_message()))
+    }
+
+    /// Pin (`Some`) or un-pin (`None`) a thread's working tree as the local operator.
+    async fn pin(
+        app: &AppState,
+        thread_id: &str,
+        cwd: Option<&str>,
+    ) -> Result<crate::protocol::ResolvedWorkspace, String> {
+        app.pin_thread_workspace(ThreadWorkspaceInput {
+            thread_id: thread_id.to_string(),
+            cwd: cwd.map(str::to_string),
+            device_id: None,
+        })
+        .await
+    }
+
     // Part A: the interactive diff must follow the *viewed* session's workspace,
     // not the process-global/active one. Two runtimes at different cwds; thread-a is
     // active, but viewing thread-b must diff B's checkout.
@@ -640,7 +661,7 @@ mod path_scope_tests {
         // Absent selector → the global/active workspace (legacy back-compat).
         let expected_global = { app.relay.read().await.current_cwd.clone() };
         let global = app
-            .workspace_diff(None, None, None, false)
+            .workspace_diff(None, None, None)
             .await
             .expect("global diff");
         assert_eq!(global.cwd, expected_global);
@@ -649,7 +670,7 @@ mod path_scope_tests {
 
         // Viewing thread-b returns B's workspace even though A is active — the fix.
         let viewed_b = app
-            .workspace_diff(None, Some("thread-b".to_string()), None, false)
+            .workspace_diff(None, Some("thread-b".to_string()), None)
             .await
             .expect("viewed-b diff");
         assert_eq!(
@@ -660,7 +681,7 @@ mod path_scope_tests {
 
         // Viewing thread-a returns A's workspace.
         let viewed_a = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("viewed-a diff");
         assert_eq!(viewed_a.cwd, cwd_a);
@@ -681,7 +702,7 @@ mod path_scope_tests {
         }
 
         let ghost = app
-            .workspace_diff(None, Some("does-not-exist".to_string()), None, false)
+            .workspace_diff(None, Some("does-not-exist".to_string()), None)
             .await
             .expect("unresolvable selector returns unavailable, not an error");
         assert!(
@@ -753,8 +774,7 @@ mod path_scope_tests {
             }
     }
 
-    // L1: the panel must offer every working tree of the viewed session's repo,
-    // so the user can look at a worktree the agent went off and worked in.
+    // L1: the panel must offer every working tree of the viewed session's repo.
     #[tokio::test]
     async fn workspace_diff_enumerates_worktree_roots() {
         let tmp = TempDir::new().expect("tmp");
@@ -768,7 +788,7 @@ mod path_scope_tests {
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
 
@@ -879,7 +899,7 @@ mod path_scope_tests {
         std::fs::remove_dir_all(&nested_cwd).unwrap();
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("a removed worktree must not surface a raw git spawn error");
 
@@ -1015,7 +1035,7 @@ mod path_scope_tests {
         std::fs::remove_dir_all(&gone_cwd).unwrap();
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("a deleted workspace must not error");
         assert!(
@@ -1082,7 +1102,7 @@ got cwd {}",
         std::fs::remove_dir_all(&gone_cwd).unwrap();
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("a deleted worktree must not error");
         assert!(!response.unavailable);
@@ -1134,7 +1154,6 @@ got {}",
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 None,
-                false,
             )
             .await
             .expect("a removed worktree must not error, even for a scoped device");
@@ -1147,6 +1166,97 @@ got {}",
             "the fallback must not reach outside the device scope"
         );
         assert!(response.fallback_from.is_none());
+    }
+
+    // Substitute must name the vanished tree so UI does not present another tree as the session's.
+    #[tokio::test]
+    async fn a_vanished_birth_tree_resolves_to_a_substitute_that_names_what_is_gone() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, nested_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = nested_cwd.clone();
+        }
+
+        // While it still exists, this is an ordinary birth-tree answer.
+        let before = resolve(&app, "thread-a").await;
+        assert!(same_path(&before.cwd, &nested_cwd));
+        assert!(matches!(before.origin, WorkspaceOrigin::Birth));
+        assert!(before.birth_cwd_exists);
+
+        // Removed WITHOUT `git worktree remove` — what deleting a `.claude/worktrees/<x>`
+        // leaves behind (git keeps listing it, as prunable).
+        std::fs::remove_dir_all(&nested_cwd).unwrap();
+
+        let after = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&after.cwd, &main_cwd),
+            "the substitute must be the repo the worktree lived in; got {}",
+            after.cwd
+        );
+        match &after.origin {
+            WorkspaceOrigin::Substituted { gone } => assert!(
+                same_path(gone, &nested_cwd),
+                "the substitute must name WHICH workspace vanished; got {gone}"
+            ),
+            other => panic!("a vanished birth tree must report itself as such: {other:?}"),
+        }
+        assert!(
+            same_path(&after.birth_cwd, &nested_cwd) && !after.birth_cwd_exists,
+            "the birth cwd is still reported — it is the provider contract — and flagged \
+as gone"
+        );
+    }
+
+    // Git standing is live; storing a branch would go stale on checkout.
+    #[tokio::test]
+    async fn a_resolved_workspace_reports_live_git_standing_it_never_stored() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        let clean = resolve(&app, "thread-a").await;
+        assert!(same_path(&clean.git.cwd, &main_cwd));
+        assert!(clean.git.is_repo);
+        assert_eq!(clean.git.branch.as_deref(), Some("main"));
+        assert!(!clean.git.detached);
+        assert!(!clean.git.dirty, "nothing has been touched yet");
+
+        // Move the tree underneath the relay: same path, different branch, now dirty.
+        async fn git(dir: &str, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        git(&main_cwd, &["checkout", "-q", "-b", "feat/later"]).await;
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\n",
+        )
+        .unwrap();
+
+        let moved = resolve(&app, "thread-a").await;
+        assert_eq!(
+            moved.git.branch.as_deref(),
+            Some("feat/later"),
+            "the branch must be re-read, not remembered from the first answer"
+        );
+        assert!(moved.git.dirty);
+        assert!(
+            same_path(&moved.cwd, &main_cwd),
+            "and the TREE is unchanged by any of that — it is what the answer is about"
+        );
     }
 
     // A real repo with SEVERAL linked worktrees, including a detached one. Every other
@@ -1216,7 +1326,7 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
 
@@ -1248,13 +1358,12 @@ got {}",
         // Every enumerated root must actually be selectable — the picker must not offer
         // an option that fails to load.
         for root in &response.roots {
+            let pinned = pin(&app, "thread-a", Some(&root.path))
+                .await
+                .unwrap_or_else(|error| panic!("root {} should pin: {error}", root.path));
+            assert!(same_path(&pinned.cwd, &root.path));
             let selected = app
-                .workspace_diff(
-                    None,
-                    Some("thread-a".to_string()),
-                    Some(root.path.clone()),
-                    false,
-                )
+                .workspace_diff(None, Some("thread-a".to_string()), None)
                 .await
                 .unwrap_or_else(|error| panic!("root {} should load: {error}", root.path));
             assert!(!selected.unavailable, "root {} must resolve", root.path);
@@ -1262,11 +1371,66 @@ got {}",
         }
     }
 
-    // L1: selecting a root re-points the diff at THAT working tree. This is the whole
-    // feature — a change made only in the linked worktree is invisible from the
-    // session's own cwd, and must become visible once that root is selected.
+    // view_root re-points this response only; looking is not relocating.
     #[tokio::test]
-    async fn workspace_diff_selected_root_diffs_that_worktree() {
+    async fn workspace_diff_view_root_diffs_without_pinning() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nCHANGED-IN-WORKTREE\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        let preview = app
+            .workspace_diff(None, Some("thread-a".to_string()), Some(linked_cwd.clone()))
+            .await
+            .expect("diff");
+        assert!(
+            same_path(&preview.cwd, &linked_cwd),
+            "view_root must re-point this diff response: got {}",
+            preview.cwd
+        );
+        assert_eq!(preview.file_changes.len(), 1);
+        assert!(
+            preview.file_changes[0].diff.contains("CHANGED-IN-WORKTREE"),
+            "must show the linked worktree's own change"
+        );
+
+        // The session's settled tree is still the birth/main tree — preview did not pin.
+        let settled = app
+            .resolve_thread_workspace("thread-a", None)
+            .await
+            .expect("resolve");
+        assert!(
+            same_path(&settled.cwd, &main_cwd),
+            "a Diff preview must leave ThreadWorkspace alone; got {}",
+            settled.cwd
+        );
+        assert!(matches!(settled.origin, WorkspaceOrigin::Birth));
+
+        let again = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(&again.cwd, &main_cwd),
+            "without view_root the diff follows the session again"
+        );
+        assert!(again.file_changes.is_empty());
+    }
+
+    // Pin re-points the session (and therefore the default diff).
+    #[tokio::test]
+    async fn workspace_diff_pinned_root_diffs_that_worktree() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
@@ -1286,7 +1450,7 @@ got {}",
 
         // Session cwd (main worktree) is clean — this is the symptom being fixed.
         let unselected = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(same_path(&unselected.cwd, &main_cwd));
@@ -1295,14 +1459,13 @@ got {}",
             "the agent's worktree edit must NOT show up in the session's own cwd"
         );
 
-        // Selecting the linked worktree surfaces it.
+        // Pinning the linked worktree surfaces it.
+        let pinned = pin(&app, "thread-a", Some(&linked_cwd))
+            .await
+            .expect("a worktree of this session's own repo must be pinnable");
+        assert!(matches!(pinned.origin, WorkspaceOrigin::Pinned));
         let selected = app
-            .workspace_diff(
-                None,
-                Some("thread-a".to_string()),
-                Some(linked_cwd.clone()),
-                false,
-            )
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(!selected.unavailable, "a legitimate root must resolve");
@@ -1318,14 +1481,18 @@ got {}",
                 .contains("CHANGED-IN-WORKTREE"),
             "must show the linked worktree's own change"
         );
+
+        // Unpin must restore inference.
+        let cleared = pin(&app, "thread-a", None)
+            .await
+            .expect("un-pinning must be accepted");
+        assert!(matches!(cleared.origin, WorkspaceOrigin::Birth));
+        assert!(same_path(&cleared.cwd, &main_cwd));
     }
 
-    // L1 fail-closed (security): the `root` selector must only ever name a worktree of
-    // the viewed session's own repo. An arbitrary path — even a perfectly valid git repo
-    // the caller happens to know about — must be refused, never diffed. Without this the
-    // selector becomes an arbitrary-path read primitive over the broker.
+    // Pin of an unrelated repo must be refused — otherwise it is a durable arbitrary-path read.
     #[tokio::test]
-    async fn workspace_diff_rejects_root_outside_the_session_repo() {
+    async fn pinning_a_tree_outside_the_session_repo_is_refused() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, _linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
@@ -1345,27 +1512,26 @@ got {}",
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
         }
 
-        let refused = app
-            .workspace_diff(
-                None,
-                Some("thread-a".to_string()),
-                Some(other_cwd.clone()),
-                false,
-            )
+        let error = pin(&app, "thread-a", Some(&other_cwd))
             .await
-            .expect("a foreign root fails closed rather than erroring");
-
+            .expect_err("a tree outside the session's repo must be refused, not stored");
         assert!(
-            refused.unavailable,
-            "a root outside the session's repo must fail closed"
+            error.contains("working trees"),
+            "the refusal must say the tree is not one of this session's: {error}"
         );
+
+        // And nothing was recorded: the next read still resolves to the session's own
+        // tree, so a refused pin cannot half-apply.
+        let after = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
         assert!(
-            !same_path(&refused.cwd, &other_cwd),
+            !same_path(&after.cwd, &other_cwd),
             "must not diff the foreign repo"
         );
-        assert!(refused.file_changes.is_empty());
         assert!(
-            !refused.diff.contains("TOP-SECRET-FROM-OTHER-REPO"),
+            !after.diff.contains("TOP-SECRET-FROM-OTHER-REPO"),
             "must never leak a foreign repo's contents"
         );
     }
@@ -1393,7 +1559,6 @@ got {}",
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 None,
-                false,
             )
             .await
             .expect("diff");
@@ -1408,22 +1573,38 @@ got {}",
             "a worktree outside the device scope must not be listed; got {paths:?}"
         );
 
-        // ...and it must remain unselectable.
-        let refused = app
+        // A narrow device must not pin a tree it cannot see (that pin would be served to everyone).
+        let error = app
+            .pin_thread_workspace(ThreadWorkspaceInput {
+                thread_id: "thread-a".to_string(),
+                cwd: Some(linked_cwd.clone()),
+                device_id: Some("device-narrow".to_string()),
+            })
+            .await
+            .expect_err("an out-of-scope tree must be refused");
+        assert!(
+            error.contains("working trees"),
+            "an out-of-scope tree must be refused as 'not one of this session's', which \
+is also what keeps the refusal from confirming it exists: {error}"
+        );
+        let after = app
             .workspace_diff(
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
-                Some(linked_cwd.clone()),
-                false,
+                None,
             )
             .await
-            .expect("out-of-scope root fails closed rather than erroring");
-        assert!(refused.unavailable, "out-of-scope root must fail closed");
+            .expect("diff");
+        assert!(
+            same_path(&after.cwd, &main_cwd),
+            "a refused pin must leave the session where it was; got {}",
+            after.cwd
+        );
 
         // A device with no narrow scope still sees both (the filter is scope-driven,
         // not a blanket removal of linked worktrees).
         let unscoped = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert_eq!(
@@ -1528,10 +1709,9 @@ got {}",
         }
     }
 
-    // The feature: the agent went off and edited files in a linked worktree, so that is
-    // where the panel should land — but only when the client opts in via `auto_root`.
+    // Writes in a linked worktree are the session's tree until a pin says otherwise.
     #[tokio::test]
-    async fn auto_root_lands_on_the_worktree_the_thread_wrote_to() {
+    async fn the_panel_follows_the_worktree_the_thread_wrote_to() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
         std::fs::write(
@@ -1549,41 +1729,83 @@ got {}",
             seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
         }
 
-        // Reported as a fact even without opting in — but the target is untouched, so a
-        // plain refresh can never move the panel under a reader.
-        let plain = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
-            .await
-            .expect("diff");
+        let resolved = resolve(&app, "thread-a").await;
         assert!(
-            same_path(plain.suggested_root.as_deref().unwrap_or(""), &linked_cwd),
-            "the worktree the thread wrote to must be suggested; got {:?}",
-            plain.suggested_root
+            same_path(&resolved.cwd, &linked_cwd),
+            "the worktree the thread wrote to is where its work is; got {}",
+            resolved.cwd
         );
         assert!(
-            same_path(&plain.cwd, &main_cwd),
-            "without auto_root the target must stay the session cwd"
+            matches!(resolved.origin, WorkspaceOrigin::Proven),
+            "and the caller must be told it was INFERRED, not chosen: {:?}",
+            resolved.origin
+        );
+        assert!(
+            same_path(&resolved.birth_cwd, &main_cwd) && resolved.birth_cwd_exists,
+            "the birth cwd is reported alongside, never replaced"
         );
 
-        // Opting in lands there.
-        let auto = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+        let diff = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(&auto.cwd, &linked_cwd),
-            "auto_root must target the observed worktree; got {}",
-            auto.cwd
+            same_path(&diff.cwd, &linked_cwd),
+            "the diff must target the observed worktree; got {}",
+            diff.cwd
         );
-        assert!(auto.file_changes[0].diff.contains("EDITED-IN-WORKTREE"));
+        assert!(diff.file_changes[0].diff.contains("EDITED-IN-WORKTREE"));
     }
 
-    // The MIRROR of the case above, which nothing pinned: a thread that was born in a
-    // worktree and has moved back to the main tree (its worktree merged, the agent
-    // carried on in the repo). The panel has to follow in that direction too, or every
-    // post-merge session shows a stale worktree's diff.
+    // Pin outranks fresh contrary evidence; one field would drag the panel off a parked tree.
     #[tokio::test]
-    async fn auto_root_lands_back_on_the_main_tree_when_the_thread_moved_back() {
+    async fn a_pin_outranks_fresh_evidence_pointing_somewhere_else() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        // Inference says the worktree.
+        assert!(same_path(&resolve(&app, "thread-a").await.cwd, &linked_cwd));
+
+        // User pins the main tree.
+        let pinned = pin(&app, "thread-a", Some(&main_cwd))
+            .await
+            .expect("pinning the main tree");
+        assert!(same_path(&pinned.cwd, &main_cwd));
+        assert!(matches!(pinned.origin, WorkspaceOrigin::Pinned));
+
+        // More writes land in the worktree. The pin still wins.
+        {
+            let mut relay = app.relay.write().await;
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        let after = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&after.cwd, &main_cwd) && matches!(after.origin, WorkspaceOrigin::Pinned),
+            "a user's choice must not move under them on the next write; got {:?} at {}",
+            after.origin,
+            after.cwd
+        );
+
+        // Unpin must restore the write evidence, which has been the worktree all along.
+        let cleared = pin(&app, "thread-a", None).await.expect("un-pin");
+        assert!(
+            same_path(&cleared.cwd, &linked_cwd)
+                && matches!(cleared.origin, WorkspaceOrigin::Proven)
+        );
+    }
+
+    // Unpinned: follow writes back to main after merge, or post-merge diffs stay on the stale tree.
+    #[tokio::test]
+    async fn the_panel_lands_back_on_the_main_tree_when_the_thread_moved_back() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
         std::fs::write(
@@ -1604,17 +1826,12 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(response.suggested_root.as_deref().unwrap_or(""), &main_cwd),
-            "the main tree must be suggested once the thread writes there; got {:?}",
-            response.suggested_root
-        );
-        assert!(
             same_path(&response.cwd, &main_cwd),
-            "auto_root must follow the thread back to the main tree; got {}",
+            "the panel must follow the thread back to the main tree; got {}",
             response.cwd
         );
         assert!(
@@ -1626,10 +1843,11 @@ got {}",
         );
     }
 
-    // No evidence, or evidence pointing at the session's own cwd, is nothing to suggest:
-    // the panel already defaults there and a self-suggestion would pin every thread.
+    // Evidence pointing at the session's OWN cwd resolves there, exactly as it would for
+    // any other tree. There is no special case: the answer is the tree, not "the tree
+    // minus the boring one".
     #[tokio::test]
-    async fn no_suggestion_when_the_thread_writes_in_its_own_cwd() {
+    async fn a_thread_writing_in_its_own_cwd_resolves_there() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
 
@@ -1642,10 +1860,9 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
-        assert_eq!(response.suggested_root, None);
         assert!(same_path(&response.cwd, &main_cwd));
     }
 
@@ -1663,11 +1880,13 @@ got {}",
             seed_transcript(&mut relay, "thread-a", vec![file_tool(&["src/x.rs"])]);
         }
 
-        let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
-            .await
-            .expect("diff");
-        assert_eq!(response.suggested_root, None);
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "with no usable evidence the answer is the birth tree, and says so; got {:?}",
+            resolved.origin
+        );
     }
 
     // Reading a file is not working in it. A plain Read carries an absolute `path` just
@@ -1690,15 +1909,14 @@ got {}",
             );
         }
 
-        let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
-            .await
-            .expect("diff");
-        assert_eq!(
-            response.suggested_root, None,
-            "a Read must not be treated as writing there"
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "a Read must not be treated as writing there; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
         );
-        assert!(same_path(&response.cwd, &main_cwd));
     }
 
     // An edit that failed or is still running never landed on disk, so it is not
@@ -1734,73 +1952,87 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(
-                response.suggested_root.as_deref().unwrap_or(""),
-                &linked_cwd
-            ),
-            "the completed worktree edit must win over a failed/running/read on main; got {:?}",
-            response.suggested_root
+            same_path(&response.cwd, &linked_cwd),
+            "the completed worktree edit must win over a failed/running/read on main; got {}",
+            response.cwd
         );
     }
 
-    // A thread the client just navigated to may have a cwd (from its summary) but no
-    // loaded transcript yet. "No evidence" and "could not look yet" are different
-    // answers: conflating them makes the client burn its one-shot auto-resolve on a
-    // thread whose history has not arrived, and it never re-resolves.
+    // No loaded transcript (cold thread / restart) is not "went home"; remember proven.
     #[tokio::test]
-    async fn a_cold_thread_reports_the_suggestion_as_not_yet_known() {
+    async fn a_cold_thread_still_resolves_to_the_tree_it_was_proven_to_write_in() {
         let tmp = TempDir::new().expect("tmp");
-        let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nEDITED-IN-WORKTREE\n",
+        )
+        .unwrap();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        let cold_thread = ThreadSummaryView {
+            id: "cold-thread".to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: main_cwd.clone(),
+            updated_at: 1,
+            source: "local".to_string(),
+            status: "idle".to_string(),
+            model_provider: "anthropic".to_string(),
+            provider: "claude_code".to_string(),
+            forked_from: None,
+            renamed: false,
+        };
         {
             let mut relay = app.relay.write().await;
-            // Summary only — deliberately NO runtime for this thread.
-            relay.threads = vec![ThreadSummaryView {
-                id: "cold-thread".to_string(),
-                name: None,
-                preview: String::new(),
-                cwd: main_cwd.clone(),
-                updated_at: 1,
-                source: "local".to_string(),
-                status: "idle".to_string(),
-                model_provider: "anthropic".to_string(),
-                provider: "claude_code".to_string(),
-                forked_from: None,
-                renamed: false,
-            }];
+            relay.threads = vec![cold_thread.clone()];
+            relay.ensure_runtime_for_thread("cold-thread").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "cold-thread", vec![file_tool(&[&edited])]);
         }
 
-        let cold = app
-            .workspace_diff(None, Some("cold-thread".to_string()), None, true)
-            .await
-            .expect("a cold thread still diffs its own cwd");
-        assert!(same_path(&cold.cwd, &main_cwd));
-        assert_eq!(cold.suggested_root, None);
+        // While the transcript is loaded, the evidence proves the worktree.
+        let warm = resolve(&app, "cold-thread").await;
         assert!(
-            !cold.suggested_root_known,
-            "an unloaded transcript must report the suggestion as UNKNOWN, not as none"
+            same_path(&warm.cwd, &linked_cwd) && matches!(warm.origin, WorkspaceOrigin::Proven)
         );
 
-        // Once the transcript is loaded the answer becomes known.
+        // The runtime goes away — an eviction, or a restart, which is the case that
+        // matters. Summary only now, and the summary carries only the BIRTH tree.
         {
             let mut relay = app.relay.write().await;
-            relay.ensure_runtime_for_thread("cold-thread").current_cwd = main_cwd.clone();
-            seed_transcript_with_status(&mut relay, "cold-thread", vec![]);
+            relay.runtimes.remove("cold-thread");
+            relay.threads = vec![cold_thread];
+            assert!(
+                same_path(&relay.thread_cwd("cold-thread").expect("row"), &main_cwd),
+                "precondition: with no runtime the thread only knows where it was born"
+            );
         }
-        let warm = app
-            .workspace_diff(None, Some("cold-thread".to_string()), None, true)
+
+        let cold = resolve(&app, "cold-thread").await;
+        assert!(
+            same_path(&cold.cwd, &linked_cwd),
+            "an unloaded transcript is not evidence that the work moved back to the birth \
+tree; got {}",
+            cold.cwd
+        );
+        assert!(
+            matches!(cold.origin, WorkspaceOrigin::Proven),
+            "and it is still an inference, not a pin: {:?}",
+            cold.origin
+        );
+        let diff = app
+            .workspace_diff(None, Some("cold-thread".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            warm.suggested_root_known,
-            "a loaded thread with no worktree evidence is a KNOWN 'nothing to suggest'"
+            diff.diff.contains("EDITED-IN-WORKTREE"),
+            "the panel must show the remembered tree's real diff"
         );
-        assert_eq!(warm.suggested_root, None);
     }
 
     // A failed edit that still arrives with status "completed". `claude.rs` now maps the
@@ -1838,15 +2070,15 @@ got {}",
             );
         }
 
-        let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
-            .await
-            .expect("diff");
-        assert_eq!(
-            response.suggested_root, None,
-            "an edit that never landed must not suggest that worktree"
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "an edit that never landed must not move the session into that worktree; got \
+{:?} at {}",
+            resolved.origin,
+            resolved.cwd
         );
-        assert!(same_path(&response.cwd, &main_cwd));
     }
 
     #[tokio::test]
@@ -1878,16 +2110,13 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(
-                response.suggested_root.as_deref().unwrap_or(""),
-                &linked_cwd
-            ),
-            "the older LANDED write must win over a newer failed one; got {:?}",
-            response.suggested_root
+            same_path(&response.cwd, &linked_cwd),
+            "the older LANDED write must win over a newer failed one; got {}",
+            response.cwd
         );
     }
 
@@ -1949,23 +2178,20 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(
-                response.suggested_root.as_deref().unwrap_or(""),
-                &nested_cwd
-            ),
-            "the NESTED worktree must win over the enclosing main one; got {:?}",
-            response.suggested_root
+            same_path(&response.cwd, &nested_cwd),
+            "the NESTED worktree must win over the enclosing main one; got {}",
+            response.cwd
         );
     }
 
-    // Safety: auto-selection must obey the same boundary as manual selection. An
-    // out-of-scope worktree is not in `roots`, so it can never be suggested either.
+    // Safety: inference must obey the same boundary as an explicit pin. An out-of-scope
+    // worktree is not in `roots`, so evidence pointing at it resolves to nothing.
     #[tokio::test]
-    async fn auto_root_never_escapes_the_device_scope() {
+    async fn inference_never_escapes_the_device_scope() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
@@ -1983,17 +2209,20 @@ got {}",
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 None,
-                true,
             )
             .await
             .expect("diff");
-        assert_eq!(
-            response.suggested_root, None,
-            "an out-of-scope worktree must not be suggested"
-        );
         assert!(
             same_path(&response.cwd, &main_cwd),
-            "auto must fall back to the session cwd, not escape scope"
+            "inference must stay at the session cwd, not escape scope; got {}",
+            response.cwd
+        );
+        assert!(
+            !response
+                .roots
+                .iter()
+                .any(|root| same_path(&root.path, &linked_cwd)),
+            "and the out-of-scope tree must not even be listed"
         );
     }
 
@@ -14004,6 +14233,39 @@ settings update: {error}"
             });
     }
 
+    /// The working tree a review job actually ran in. `ReviewJobView` deliberately does
+    /// not carry it, so read it off the stored job.
+    async fn review_job_cwd(app: &AppState, job_id: &str) -> String {
+        app.relay
+            .read()
+            .await
+            .review_job(job_id)
+            .expect("review job")
+            .cwd
+            .clone()
+    }
+
+    /// Append `count` ordinary transcript records — the reads, greps and plain replies an
+    /// agent produces after its last edit. Enough of them push that edit out of the
+    /// recent window `thread_write_evidence` looks at first.
+    async fn seed_chatter(app: &AppState, thread: &str, count: usize) {
+        let mut relay = app.relay.write().await;
+        let runtime = relay.ensure_runtime_for_thread(thread);
+        for _ in 0..count {
+            let item_id = format!("chatter-{}", runtime.transcript.len());
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id,
+                    kind: crate::protocol::TranscriptEntryKind::AgentText,
+                    text: Some("still working, no files touched".to_string()),
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-chatter".to_string()),
+                    tool: None,
+                });
+        }
+    }
+
     /// A repo plus a SIBLING linked worktree, both with a committed `seed.txt`. Sibling
     /// (not nested) on purpose: the two trees' diffs then share no files at all, so
     /// "which tree did the reviewer actually get" is unambiguous in these tests.
@@ -14688,6 +14950,174 @@ settings update: {error}"
             providers.get("codex").unwrap().turns.lock().await.len(),
             turns_before,
             "the refused review must not run any turn"
+        );
+    }
+
+    // The reported failure: a reviewer works for a couple of reviews and then breaks
+    // PERMANENTLY with "that reviewer thread works in <repo>, but the work to review is in
+    // <repo>/.claude/worktrees/<name> — start a clean reviewer instead".
+    //
+    // The thread was born in the repo and has since moved into a worktree, so the only
+    // thing that says "review the worktree" is its landed writes — and those are read from
+    // a bounded window of the most recent transcript records. Keep working after the last
+    // edit (reads, greps, plain replies) and that window scrolls past it, at which point
+    // the review silently snaps back to the tree the thread was BORN in. A reviewer
+    // created against that snapped-back answer is in the wrong tree, and the moment the
+    // next edit re-enters the window the review targets the worktree again — so that
+    // reviewer is cross-tree, and refused, forever.
+    //
+    // Absence of evidence is not evidence that the work moved back.
+    #[tokio::test]
+    async fn the_review_target_survives_the_last_edit_scrolling_out_of_the_evidence_window() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &main_cwd, "codex").await;
+        // The thread moved into the worktree and did its work there.
+        seed_landed_edit(&app, &parent.id, &format!("{linked_cwd}/seed.txt")).await;
+
+        // Review 1, while that edit is still in the window: targets the worktree and
+        // leaves a reviewer thread bound there.
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("the first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        assert_eq!(first_job.status, "complete", "{:?}", first_job.error);
+        let first_cwd = review_job_cwd(&app, &first.review_job_id).await;
+        assert!(
+            same_dir(&first_cwd, &linked_cwd),
+            "review 1 must target the tree the thread is editing: {first_cwd}"
+        );
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // The author keeps working in the SAME worktree — reading, explaining, running
+        // tests — without touching another file. Nothing moved; only the window scrolled.
+        seed_chatter(&app, &parent.id, WRITE_EVIDENCE_SCAN_LIMIT * 2).await;
+
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer.clone());
+        let receipt = app.request_review(reuse).await.expect(
+            "a quiet stretch after the last edit must not strand the reviewer in another tree",
+        );
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "{:?}", job.error);
+        let second_cwd = review_job_cwd(&app, &receipt.review_job_id).await;
+        assert!(
+            same_dir(&second_cwd, &linked_cwd),
+            "review 2 must stay in the worktree the thread proved it works in, not snap \
+back to the tree it was born in: {second_cwd}"
+        );
+
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        let last_review_prompt = turns
+            .iter()
+            .rev()
+            .map(|(_, prompt)| prompt.as_str())
+            .find(|prompt| prompt.contains("Workspace diff collected by the relay"))
+            .expect("a reviewer turn carrying the workspace diff")
+            .to_string();
+        assert!(
+            last_review_prompt.contains("WORKTREE_EDIT")
+                && !last_review_prompt.contains("MAIN_TREE_EDIT"),
+            "the reviewer must still be handed the worktree's diff: {last_review_prompt}"
+        );
+    }
+
+    // The same defect one level deeper, and why it outlives a relay restart: the write
+    // evidence lives ONLY in the parent's in-memory transcript. Restart the relay and the
+    // parent has no runtime at all until someone opens it, so a review requested in that
+    // window sees no evidence whatsoever and resolves to the tree the thread was born in —
+    // stranding the reviewer that was created while the evidence was still there.
+    //
+    // Which tree a thread's work is in is a durable fact about the thread, not a property
+    // of whatever transcript happens to be loaded right now.
+    #[tokio::test]
+    async fn a_proven_review_tree_outlives_the_parents_runtime() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &main_cwd, "codex").await;
+        seed_landed_edit(&app, &parent.id, &format!("{linked_cwd}/seed.txt")).await;
+
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("the first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        assert_eq!(first_job.status, "complete", "{:?}", first_job.error);
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // The restart: runtimes are process-local, so the parent's transcript — and with
+        // it every trace of where it has been writing — is gone. Only its cached row (the
+        // cwd it was BORN in) survives, which is exactly the tree it left.
+        {
+            let mut relay = app.relay.write().await;
+            relay.runtimes.remove(&parent.id);
+            let recorded = relay.thread_cwd(&parent.id).expect("a cached thread row");
+            assert!(
+                same_dir(&recorded, &main_cwd),
+                "precondition: with no runtime the thread only knows its birth tree, got \
+{recorded}"
+            );
+        }
+
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer.clone());
+        let receipt = app
+            .request_review(reuse)
+            .await
+            .expect("a restart must not strand the reviewer in another tree");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "{:?}", job.error);
+        let cwd = review_job_cwd(&app, &receipt.review_job_id).await;
+        assert!(
+            same_dir(&cwd, &linked_cwd),
+            "the review must still target the tree the thread proved it works in: {cwd}"
+        );
+
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        let last_review_prompt = turns
+            .iter()
+            .rev()
+            .map(|(_, prompt)| prompt.as_str())
+            .find(|prompt| prompt.contains("Workspace diff collected by the relay"))
+            .expect("a reviewer turn carrying the workspace diff")
+            .to_string();
+        assert!(
+            last_review_prompt.contains("WORKTREE_EDIT")
+                && !last_review_prompt.contains("MAIN_TREE_EDIT"),
+            "the reviewer must still be handed the worktree's diff: {last_review_prompt}"
         );
     }
 
@@ -17768,6 +18198,22 @@ turn) must allow a review: {error:?}"
         let owned = run.owned_thread_ids();
         for id in [&run.tl_thread_id, &dev, &reviewer] {
             assert!(owned.contains(id), "{id} missing from {owned:?}");
+        }
+
+        // A task seat is born in the run's worktree and never leaves it, so the answer is
+        // known outright. It is recorded as a PIN in the one shared source of truth,
+        // rather than left for the write-evidence inference to rediscover — a task
+        // worktree is where three agents work, and "we could not find a recent edit" must
+        // never quietly re-point one of them at the repo the run forked from.
+        {
+            let relay = app.relay.read().await;
+            for id in [&run.tl_thread_id, &dev, &reviewer] {
+                assert_eq!(
+                    relay.thread_workspace(id).pinned.as_deref(),
+                    Some(run.cwd.as_str()),
+                    "{id} must be pinned to the run's worktree"
+                );
+            }
         }
 
         // The TL only ever learned the verdict + summary, never a transcript.

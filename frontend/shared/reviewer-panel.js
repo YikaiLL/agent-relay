@@ -124,6 +124,12 @@ export function ReviewerPanel({
   // The thread this panel is showing (the viewed thread). Sent as the review's parent
   // so "Request review" targets the thread in view, not the relay's active thread.
   parentThreadId = null,
+  // The working tree that thread's work is in, so the request dialog can show — and
+  // let the user correct — what a review is actually about to read.
+  workspace = null,
+  workspaceBusy = false,
+  workspaceError = null,
+  onPinWorkspace = null,
   canRequest = false,
   canStartWorkflow = false,
   requesting = false,
@@ -160,6 +166,10 @@ export function ReviewerPanel({
       onEnsureProviderModels: reviewModel.onEnsureProviderModels,
       reusableReviewers,
       parentThreadId,
+      workspace,
+      workspaceBusy,
+      workspaceError,
+      onPinWorkspace,
       disabled: requesting || !canRequest,
       onSubmit: onRequestReview,
     });
@@ -222,6 +232,10 @@ export function ReviewerPanel({
               panelId,
               reviewModel,
               reusableReviewers,
+              workspace,
+              workspaceBusy,
+              workspaceError,
+              onPinWorkspace,
               canRequest,
               onRequestReview,
               onResolveReview,
@@ -280,6 +294,10 @@ function ReviewerJobCard({
   panelId = "review-panel",
   reviewModel = {},
   reusableReviewers = [],
+  workspace = null,
+  workspaceBusy = false,
+  workspaceError = null,
+  onPinWorkspace = null,
   canRequest = false,
   onRequestReview,
   onResolveReview,
@@ -538,8 +556,15 @@ function ReviewerJobCard({
             activeProvider: reviewModel.activeProvider || "",
             onEnsureProviderModels: reviewModel.onEnsureProviderModels,
             reusableReviewers,
+            workspace,
+            workspaceBusy,
+            workspaceError,
+            onPinWorkspace,
             // Re-review targets THIS card's own parent thread.
             parentThreadId: job.parent_thread_id || null,
+            // May name a reviewer bound to a tree the work has since left. The dialog
+            // falls back to a clean reviewer when the prefill is not on offer, rather
+            // than submitting a reuse the relay will refuse.
             initialReviewerThreadId: job.reviewer_thread_id,
             initialProvider: job.reviewer_provider || "",
             disabled: !canRequest,

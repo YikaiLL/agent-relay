@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { FileChangeDiff } from "../shared/transcript-react.js";
 import { RightPanelTabs } from "../shared/right-panel-tabs.js";
+import { ThreadWorkspaceField } from "../shared/workspace-picker.js";
 
 const h = React.createElement;
 
@@ -26,6 +27,9 @@ export function WorkspaceDiffModalTitle({ store }) {
 export function createWorkspaceDiffStore({
   apiFetch,
   fetchDiff = null,
+  // Pin = Review dialog. Changes uses local `viewRoot` so looking does not relocate.
+  fetchWorkspace = null,
+  setWorkspace = null,
   surface = "local",
   getThreadId = null,
   // Identity of the viewed workspace (thread id + cwd) used to decide when to drop
@@ -33,40 +37,22 @@ export function createWorkspaceDiffStore({
   getWorkspaceKey = null,
 }) {
   const tabStorageKey = `agent-relay:right-panel-tab:${surface}`;
-  // Which worktree root each thread is pinned to. Keyed PER THREAD on purpose: a root
-  // picked while viewing A must not follow you to B, whose repo may not even contain
-  // that path — the panel would then show a completely unrelated tree. `null`/absent
-  // means "that thread's own workspace cwd", which is what the server defaults to.
-  const rootByThread = new Map();
-  // Roots the RELAY suggested, kept apart from the user's own picks above. The
-  // distinction matters on re-entry: a user's choice is theirs and must survive
-  // leaving and returning, while an auto pin is just a cached answer to "where is this
-  // thread working?" and has to be re-asked — otherwise an agent that moved from one
-  // worktree to another while you were away stays invisible behind the stale pin.
-  const autoRootByThread = new Map();
-  // Threads whose one-shot auto-resolve has already run. Deliberately once per thread
-  // SWITCH, not per refresh: the relay can tell us where a thread has been writing on
-  // every fetch, but acting on that every time would let the panel re-target itself
-  // while someone is reading it. So we ask once on entering a thread, and from then on
-  // it is an ordinary pin — while leaving and returning re-arms it, so a worktree the
-  // agent moved into while you were away is still picked up.
-  const autoResolved = new Set();
-  // Which thread the previous refresh was for, so entering a thread can re-arm it.
-  let lastAutoThread = null;
+  const fetchWorkspaceFn =
+    fetchWorkspace || (apiFetch ? (threadId) => fetchWorkspaceViaApi(apiFetch, threadId) : null);
+  const setWorkspaceFn =
+    setWorkspace
+    || (apiFetch ? (threadId, cwd) => pinWorkspaceViaApi(apiFetch, threadId, cwd) : null);
+  // Ephemeral Diff preview per thread. Never written to the relay.
+  const viewRootByThread = new Map();
 
   function threadKey() {
     const id = typeof getThreadId === "function" ? getThreadId() : null;
     return id ?? "";
   }
 
-  // The user's pick wins over anything derived.
-  function currentRoot() {
-    const key = threadKey();
-    return rootByThread.get(key) ?? autoRootByThread.get(key) ?? null;
-  }
-
-  function manualRoot() {
-    return rootByThread.get(threadKey()) ?? null;
+  function currentViewRoot() {
+    const id = threadKey();
+    return id ? viewRootByThread.get(id) || null : null;
   }
 
   let state = {
@@ -74,7 +60,14 @@ export function createWorkspaceDiffStore({
     data: null,
     error: null,
     expanded: false,
-    selectedRoot: null,
+    // ResolvedWorkspace for the viewed thread, or null before first fetch.
+    workspace: null,
+    workspaceStatus: "idle",
+    // Workspace read/pin failure; kept apart from the diff's `error`.
+    workspaceError: null,
+    workspacePinning: false,
+    // Diff preview override (local only). Null means "follow the session workspace".
+    viewRoot: null,
     activeTab: readStoredTab(tabStorageKey),
     review: {
       reviewJobs: [],
@@ -111,6 +104,53 @@ export function createWorkspaceDiffStore({
   // changes we drop the previous workspace's data immediately so the load window
   // can't flash it. Keying on thread id alone would miss a same-thread cwd change.
   let lastKey = null;
+  // Drop the previous session's tree on a thread switch.
+  let lastWorkspaceThread = null;
+
+  // Never throws: a workspace-label failure must not take the diff down.
+  async function refreshWorkspace(seq) {
+    const threadId = threadKey();
+    if (!threadId || !fetchWorkspaceFn) {
+      lastWorkspaceThread = threadId;
+      setState({
+        workspace: null,
+        workspaceStatus: "idle",
+        workspaceError: null,
+        viewRoot: null,
+      });
+      return;
+    }
+    const switched = threadId !== lastWorkspaceThread;
+    lastWorkspaceThread = threadId;
+    setState(
+      switched
+        ? {
+            workspace: null,
+            workspaceStatus: "loading",
+            workspaceError: null,
+            viewRoot: currentViewRoot(),
+          }
+        : { workspaceStatus: "loading", viewRoot: currentViewRoot() }
+    );
+    try {
+      const resolved = await fetchWorkspaceFn(threadId);
+      if (seq !== requestSeq) return; // superseded by a newer refresh
+      setState({
+        workspace: resolved || null,
+        workspaceStatus: "loaded",
+        workspaceError: null,
+        viewRoot: currentViewRoot(),
+      });
+    } catch (error) {
+      if (seq !== requestSeq) return;
+      setState({
+        workspaceStatus: "error",
+        workspaceError: error?.message || String(error),
+        viewRoot: currentViewRoot(),
+      });
+    }
+  }
+
   async function refresh() {
     const seq = (requestSeq += 1);
     const keyFn =
@@ -119,90 +159,34 @@ export function createWorkspaceDiffStore({
         : typeof getThreadId === "function"
           ? getThreadId
           : null;
-    // The selected root is part of the viewed-workspace identity: switching root is
-    // just as much a view change as switching thread, and must drop the previous
-    // root's diff rather than paint it into the new root's panel while it loads.
-    // Entering a thread re-arms its one-shot AND drops the previously derived root, so
-    // the question is genuinely re-asked rather than answered from a stale cache.
-    if (threadKey() !== lastAutoThread) {
-      autoResolved.delete(threadKey());
-      autoRootByThread.delete(threadKey());
-      lastAutoThread = threadKey();
-    }
-    // Only a thread with no pick OF THE USER'S asks the relay where it has been
-    // writing; a previous auto answer must not suppress the new question. Auto-resolve
-    // is a per-thread notion, so the no-thread (legacy/global) fetch never opts in.
-    const wantsAuto = !manualRoot() && !!threadKey() && !autoResolved.has(threadKey());
-    // Read the effective root only after the re-arm above, so a dropped auto pin is not
-    // resent.
-    const root = currentRoot();
-    const key = JSON.stringify([keyFn ? keyFn() : null, root]);
+    const key = JSON.stringify([keyFn ? keyFn() : null, currentViewRoot()]);
     const viewChanged = key !== lastKey;
     lastKey = key;
+    // Re-resolve on every refresh: origin can move (new writes, vanished worktree).
+    const workspaceDone = refreshWorkspace(seq);
     // Different workspace → clear stale data so we never render another session's
     // changes during the load window. Same workspace (turnDiff / manual refresh) →
     // keep prior data so the panel doesn't flicker on every refresh.
     setState(
       viewChanged
-        ? { status: "loading", error: null, data: null, selectedRoot: root }
-        : { status: "loading", error: null, selectedRoot: root }
+        ? { status: "loading", error: null, data: null, viewRoot: currentViewRoot() }
+        : { status: "loading", error: null, viewRoot: currentViewRoot() }
     );
     try {
+      const viewRoot = currentViewRoot();
       const data = fetchDiff
-        ? await fetchDiff(root, wantsAuto)
-        : await fetchViaApi(apiFetch, getThreadId, root, wantsAuto);
+        ? await fetchDiff({ viewRoot })
+        : await fetchViaApi(apiFetch, getThreadId, viewRoot);
       if (seq !== requestSeq) return; // superseded by a newer refresh
-      if (wantsAuto) {
-        // Spend the one shot only on a DETERMINED answer. `suggested_root_known: false`
-        // means the thread's transcript had not loaded yet, so "no suggestion" is not an
-        // answer — spending the shot there would strand the thread on its own cwd.
-        if (data?.suggested_root_known !== false) {
-          autoResolved.add(threadKey());
-        }
-        if (data?.suggested_root) {
-          // Derived, not chosen: stored separately so re-entry can re-ask.
-          autoRootByThread.set(threadKey(), data.suggested_root);
-          setState({ selectedRoot: currentRoot() });
-        }
-      }
-      // A pinned root the relay refuses (worktree removed/pruned, or this thread moved
-      // to another repo) comes back `unavailable` and — by the fail-closed contract —
-      // carries no roots. The picker hides itself without them, so the pin would be
-      // unreachable AND resent on every later refresh. Drop it and retry unpinned; the
-      // session's own workspace always resolves. Only ever retries when a pin WAS set,
-      // so the unpinned response below is terminal.
-      if (data?.unavailable && root) {
-        rootByThread.delete(threadKey());
-        autoRootByThread.delete(threadKey());
-        // Burn the auto-resolve too: recovery should land plainly on the session
-        // workspace, not bounce straight into re-pinning somewhere else.
-        autoResolved.add(threadKey());
-        setState({ selectedRoot: null });
-        return refresh();
-      }
       setState({ status: "loaded", data, error: null });
     } catch (error) {
       if (seq !== requestSeq) return; // superseded by a newer refresh
-      // Same self-heal for a hard failure on a pinned root: an error response also
-      // leaves no picker to recover through.
-      if (root) {
-        rootByThread.delete(threadKey());
-        autoRootByThread.delete(threadKey());
-        autoResolved.add(threadKey());
-        setState({ selectedRoot: null });
-        return refresh();
-      }
-      // Auto-resolve is best effort. If the opted-in request itself failed, retry once
-      // without it rather than surfacing an error the user cannot act on — and burn the
-      // shot so a persistently rejected auto cannot fail on every future refresh.
-      if (wantsAuto) {
-        autoResolved.add(threadKey());
-        return refresh();
-      }
       setState({
         status: "error",
         error: error?.message || String(error),
       });
+    } finally {
+      await workspaceDone;
     }
   }
 
@@ -218,17 +202,43 @@ export function createWorkspaceDiffStore({
     toggleExpanded() {
       setState({ expanded: !state.expanded });
     },
-    getSelectedRoot: () => currentRoot(),
-    /// Pin the viewed thread to a worktree root. Falsy clears the pin, returning the
-    /// panel to that thread's own workspace cwd.
-    setRoot(path) {
-      const key = threadKey();
-      // An explicit pick supersedes the derived one, and clearing it means "go back to
-      // the session workspace" — not "fall back to whatever was auto-detected".
-      autoRootByThread.delete(key);
-      if (path) rootByThread.set(key, path);
-      else rootByThread.delete(key);
-      setState({ selectedRoot: currentRoot() });
+    /// Local Diff preview; never a session pin.
+    async setViewRoot(path) {
+      const threadId = threadKey();
+      if (!threadId) return;
+      const next = path || null;
+      if (next) {
+        viewRootByThread.set(threadId, next);
+      } else {
+        viewRootByThread.delete(threadId);
+      }
+      setState({ viewRoot: next, workspaceError: null });
+      await refresh();
+    },
+    /// Durable session pin (Review dialog), not the Changes preview.
+    async pinWorkspace(path) {
+      const threadId = threadKey();
+      if (!threadId || !setWorkspaceFn) return;
+      setState({ workspacePinning: true, workspaceError: null });
+      try {
+        const resolved = await setWorkspaceFn(threadId, path || null);
+        if (threadKey() !== threadId) return;
+        // Pin is session truth; drop a peeking Diff preview.
+        viewRootByThread.delete(threadId);
+        setState({
+          workspace: resolved || null,
+          workspaceStatus: "loaded",
+          workspaceError: null,
+          viewRoot: null,
+        });
+        await refresh();
+      } catch (error) {
+        // Show the refusal next to the picker, not as a silent no-op.
+        if (threadKey() !== threadId) return;
+        setState({ workspaceError: error?.message || String(error) });
+      } finally {
+        setState({ workspacePinning: false });
+      }
     },
     setActiveTab(tab) {
       const next = tab === "reviewer" ? "reviewer" : "changes";
@@ -263,21 +273,43 @@ function writeStoredTab(key, value) {
   }
 }
 
-async function fetchViaApi(apiFetch, getThreadId = null, root = null, autoRoot = false) {
-  // Diff the session the user is *viewing*, not the process-global/active one.
+async function fetchViaApi(apiFetch, getThreadId = null, viewRoot = null) {
+  // Default = session workspace; `viewRoot` is preview only.
   const threadId = typeof getThreadId === "function" ? getThreadId() : null;
   const params = new URLSearchParams();
   if (threadId) params.set("thread_id", threadId);
-  // Absent → the session's own cwd. The server validates any root against the
-  // worktrees it enumerated for that session, so a stale pin fails closed.
-  if (root) params.set("root", root);
-  // One-shot opt-in: land on where this thread has actually been writing. Must be
-  // "true", not "1": the relay deserializes this as a Rust bool via serde_urlencoded,
-  // which accepts only true/false and 400s on anything else.
-  if (autoRoot) params.set("auto_root", "true");
-  const query = params.toString();
-  const path = query ? `/api/workspace/diff?${query}` : "/api/workspace/diff";
+  if (viewRoot) params.set("view_root", viewRoot);
+  const qs = params.toString();
+  const path = qs ? `/api/workspace/diff?${qs}` : "/api/workspace/diff";
   const response = await apiFetch(path, { method: "GET" });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || `HTTP ${response.status}`);
+  }
+  return payload.data;
+}
+
+// Local operator has no device_id; relay scopes to relay-wide allowed_roots.
+async function fetchWorkspaceViaApi(apiFetch, threadId) {
+  return unwrap(
+    await apiFetch(`/api/thread/workspace?thread_id=${encodeURIComponent(threadId)}`, {
+      method: "GET",
+    })
+  );
+}
+
+// Always send `cwd` (`null` unpins); omitting it would look like a no-op.
+async function pinWorkspaceViaApi(apiFetch, threadId, cwd) {
+  return unwrap(
+    await apiFetch("/api/thread/workspace", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, cwd: cwd || null }),
+    })
+  );
+}
+
+async function unwrap(response) {
   const payload = await response.json().catch(() => null);
   if (!response.ok || !payload?.ok) {
     throw new Error(payload?.error?.message || `HTTP ${response.status}`);
@@ -405,7 +437,7 @@ export function WorkspaceChangesPanel({ store }) {
   return h(
     "section",
     { className: "workspace-changes-panel" },
-    h(WorkspaceRootPicker, { store, state }),
+    h(WorkspaceTreeBar, { store, state }),
     h(
       "div",
       { className: "workspace-changes-list" },
@@ -414,62 +446,34 @@ export function WorkspaceChangesPanel({ store }) {
   );
 }
 
-// The server substitutes a workspace when the one a session ran in has stopped existing
-// (an agent worktree removed once its work landed). That beats the raw
-// `git rev-parse ... (os error 2)` it used to surface, but it must never be silent: an
-// unlabelled fallback reads as "this session's changes" while showing another tree's.
-function FallbackWorkspaceNote({ state }) {
-  const from = state.data?.fallback_from;
-  if (!from) return null;
-  const gone = basename(from);
-  const shown = basename(state.data?.cwd || "");
-  return h(
-    "p",
-    { className: "workspace-changes-fallback-note", title: `${from} → ${state.data?.cwd || ""}` },
-    shown
-      ? `Worktree ${gone} no longer exists — showing ${shown} instead.`
-      : `Worktree ${gone} no longer exists.`
-  );
-}
-
-function basename(path) {
-  return path.split("/").filter(Boolean).pop() || path;
-}
-
-function rootLabel(root) {
-  const name = basename(root.path);
-  const branch = root.branch || "detached";
-  return root.is_main ? `${branch} · ${name}` : `${branch} · ${name} (worktree)`;
-}
-
-// Lets the user point the diff at any working tree of the viewed session's repo —
-// the case this exists for is an agent that went off and worked in a `git worktree`,
-// whose changes are invisible from the session's own cwd. Hidden for the common
-// single-worktree repo, where a one-entry picker would be pure noise.
-function WorkspaceRootPicker({ store, state }) {
-  const roots = state.data?.roots || [];
-  if (roots.length < 2) return null;
-  return h(
-    "div",
-    { className: "workspace-root-picker" },
-    h(
-      "select",
-      {
-        className: "workspace-root-select",
-        // `selectedRoot` is the explicit pin; empty means "follow the session's cwd".
-        value: state.selectedRoot || "",
-        "aria-label": "Which working tree to show changes for",
-        onChange: (event) => {
-          store.setRoot(event.target.value || null);
-          void store.refresh();
-        },
-      },
-      h("option", { value: "" }, "Session workspace (auto)"),
-      roots.map((root) =>
-        h("option", { key: root.path, value: root.path }, rootLabel(root))
-      )
-    )
-  );
+// Changes picker is a Diff preview; it does not pin the session.
+export function WorkspaceTreeBar({ store, state }) {
+  const workspace = state.workspace || null;
+  const viewRoot = state.viewRoot || null;
+  const previewing =
+    Boolean(viewRoot) &&
+    workspace?.cwd &&
+    viewRoot !== workspace.cwd;
+  const displayWorkspace = workspace
+    ? {
+        ...workspace,
+        // Preview cwd for the picker; origin still describes the session.
+        cwd: viewRoot || workspace.cwd,
+        git: previewing ? null : workspace.git,
+      }
+    : null;
+  return h(ThreadWorkspaceField, {
+    busy: false,
+    error: state.workspaceError || null,
+    fallbackFrom: state.data?.fallback_from || null,
+    followLabel: "Follow session",
+    followTitle: "Show the session's working tree again (does not change a pin)",
+    label: previewing ? "Viewing" : null,
+    onPin: null,
+    onView: (path) => store.setViewRoot?.(path),
+    previewing,
+    workspace: displayWorkspace,
+  });
 }
 
 function RefreshIcon() {
@@ -561,9 +565,6 @@ function WorkspaceChangesEntry({ store, state, stats, expanded }) {
           renderDiffContent(state, "rail")
         )
       : null,
-    // Shown whether or not the row is expanded: which tree these stats belong to is
-    // exactly the thing a collapsed row hides.
-    h(FallbackWorkspaceNote, { state }),
     !expanded && isError
       ? h(
           "p",
@@ -788,25 +789,14 @@ export function WorkspaceDiffSheetBody({ store }) {
         )
       )
     ),
-    state.data?.cwd
+    h(WorkspaceTreeBar, { store, state }),
+    state.data?.truncated
       ? h(
           "div",
           { className: "workspace-diff-status" },
-          h(
-            "span",
-            { className: "workspace-diff-cwd", title: state.data.cwd },
-            state.data.cwd
-          ),
-          state.data?.truncated
-            ? h(
-                "span",
-                { className: "workspace-diff-warning" },
-                "Output truncated (large diff)."
-              )
-            : null
+          h("span", { className: "workspace-diff-warning" }, "Output truncated (large diff).")
         )
       : null,
-    h(FallbackWorkspaceNote, { state }),
     // Same compact row as the rail, so the panel reads identically on desktop
     // and phone. `.workspace-diff-sheet-body` is what scales it up to touch
     // targets — this surface is only ever reached from the mobile chip.

@@ -60,6 +60,10 @@ pub(super) struct PersistedRelayState {
     /// `#[serde(default)]` keeps pre-promotion state files loadable.
     #[serde(default)]
     pub(super) thread_promoted_from: std::collections::HashMap<String, String>,
+    /// Pin/proven paths. Persist so a worktree move and an explicit pin survive restart.
+    #[serde(default)]
+    pub(super) thread_workspace:
+        std::collections::HashMap<String, crate::state::relay::ThreadWorkspace>,
     /// Honest per-thread last-activity timestamps (unix secs) used as the
     /// thread-list sort key instead of the resume-polluted provider mtime.
     /// `#[serde(default)]` keeps old state files loadable (empty map).
@@ -175,6 +179,13 @@ impl PersistedRelayState {
             thread_settings: relay.thread_settings.clone(),
             thread_forked_from: relay.thread_forked_from.clone(),
             thread_promoted_from: relay.thread_promoted_from.clone(),
+            // Drop pending ids: a pin on a synthetic id would persist a dead key.
+            thread_workspace: relay
+                .thread_workspace
+                .iter()
+                .filter(|(thread_id, _)| !thread_id.starts_with("claude-pending-"))
+                .map(|(thread_id, workspace)| (thread_id.clone(), workspace.clone()))
+                .collect(),
             thread_last_activity_at: relay.thread_last_activity_at.clone(),
             allowed_roots: relay.allowed_roots.clone(),
             device_records: relay.device_records.clone(),

@@ -3,7 +3,12 @@
 
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 
-import { abbreviateHomePath, gitContextLabel } from "./workspace-chip-model.js";
+import {
+  abbreviateHomePath,
+  gitContextLabel,
+  workspaceOriginNote,
+  workspaceRootLabel,
+} from "./workspace-chip-model.js";
 import { useDismissableMenu } from "./use-dismissable-menu.js";
 
 const h = React.createElement;
@@ -162,6 +167,94 @@ export function WorkspacePicker({
               )
             : null
         )
+      : null
+  );
+}
+
+/** `onPin` is a durable session pin; `onView` is Diff preview only. */
+export function ThreadWorkspaceField({
+  workspace = null,
+  // `WorkspaceDiffResponse.fallback_from` when the resolved workspace has not landed yet.
+  fallbackFrom = null,
+  busy = false,
+  error = null,
+  onPin = null,
+  onView = null,
+  // Diff preview of another tree: clear means follow session, not unpin.
+  previewing = false,
+  followLabel = "Follow session",
+  followTitle = "Show the session's working tree again",
+  id = null,
+  label = null,
+}) {
+  const note = workspaceOriginNote(workspace, fallbackFrom, { previewing });
+  if (!workspace && !note) {
+    return null;
+  }
+  const roots = workspace?.roots || [];
+  const pinned = workspace?.origin?.kind === "pinned";
+  const canChange = typeof onPin === "function" || typeof onView === "function";
+  const onChange = (path) => {
+    if (typeof onView === "function") onView(path);
+    else onPin?.(path);
+  };
+  const showClear = typeof onView === "function" ? previewing : pinned && typeof onPin === "function";
+  const clear = () => {
+    if (typeof onView === "function") onView(null);
+    else onPin?.(null);
+  };
+  return h(
+    "div",
+    { className: "thread-workspace-field" },
+    label ? h("span", { className: "thread-workspace-label" }, label) : null,
+    workspace
+      ? h(
+          "div",
+          { className: "thread-workspace-row" },
+          h(WorkspacePicker, {
+            disabled: busy || !canChange,
+            gitContext: workspace.git || null,
+            id,
+            onChange,
+            suggestions: roots.map((root) => ({
+              cwd: root.path,
+              label: workspaceRootLabel(root),
+            })),
+            value: workspace.cwd || "",
+          }),
+          showClear
+            ? h(
+                "button",
+                {
+                  className: "link-button thread-workspace-unpin",
+                  disabled: busy || undefined,
+                  onClick: clear,
+                  title:
+                    typeof onView === "function"
+                      ? followTitle
+                      : "Stop pinning and follow the tree the relay detects",
+                  type: "button",
+                },
+                typeof onView === "function" ? followLabel : "Unpin"
+              )
+            : null
+        )
+      : null,
+    note
+      ? h(
+          "p",
+          {
+            className:
+              note.tone === "warn"
+                ? "workspace-changes-fallback-note"
+                : "workspace-origin-note",
+            title: note.title || undefined,
+          },
+          note.text
+        )
+      : null,
+    error
+      ? h("p", { className: "thread-workspace-error", role: "alert" }, error)
       : null
   );
 }

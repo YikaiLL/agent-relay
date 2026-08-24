@@ -9,9 +9,11 @@ import {
 } from "../local/workspace-diff.js";
 import { RightPanelTabs } from "../shared/right-panel-tabs.js";
 import {
+  fetchRemoteThreadWorkspace,
   fetchRemoteWorkspaceDiff,
   getRemoteViewedThreadId,
   getRemoteViewedWorkspaceKey,
+  setRemoteThreadWorkspace,
 } from "./session-ops.js";
 
 const h = React.createElement;
@@ -30,13 +32,27 @@ export function getRemoteWorkspaceDiffStore() {
       // same-thread cwd change clears the previous diff; the actual fetch goes
       // through fetchDiff below.
       getWorkspaceKey: getRemoteViewedWorkspaceKey,
-      // Also needed so a pinned worktree root is remembered PER THREAD; without it
-      // every remote thread would share one pin.
+      // Session the workspace read/pin is for.
       getThreadId: getRemoteViewedThreadId,
-      fetchDiff: async (root, autoRoot) => {
-        const data = await fetchRemoteWorkspaceDiff(root, autoRoot);
+      fetchDiff: async ({ viewRoot } = {}) => {
+        const data = await fetchRemoteWorkspaceDiff({ viewRoot });
         if (!data) {
           throw new Error("workspace_diff missing in remote response");
+        }
+        return data;
+      },
+      // Session workspace is relay state. Diff preview is local via setViewRoot.
+      fetchWorkspace: async (threadId) => {
+        const data = await fetchRemoteThreadWorkspace(threadId);
+        if (!data) {
+          throw new Error("thread_workspace missing in remote response");
+        }
+        return data;
+      },
+      setWorkspace: async (threadId, cwd) => {
+        const data = await setRemoteThreadWorkspace(threadId, cwd);
+        if (!data) {
+          throw new Error("thread_workspace missing in remote response");
         }
         return data;
       },

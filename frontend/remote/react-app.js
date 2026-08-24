@@ -1,4 +1,5 @@
 import React, {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -1163,6 +1164,13 @@ function RemoteApp() {
   // tab (rail + modal) and the mobile chip badge stay in sync with the session.
   const remoteDeviceId = currentState.remoteAuth?.deviceId;
   const remoteViewedThreadId = session?.active_thread_id || null;
+  // Subscribe so a pin in Changes re-filters the Reviewer picker in the same frame.
+  const remoteWorkspace = useSyncExternalStore(
+    useCallback((onChange) => getRemoteWorkspaceDiffStore().subscribe(onChange), []),
+    () => getRemoteWorkspaceDiffStore().getState().workspace,
+    () => getRemoteWorkspaceDiffStore().getState().workspace
+  );
+  const remoteWorkspaceCwd = remoteWorkspace?.cwd || null;
 
 
   // The two halves of keeping the strip honest. They are separate because the causes
@@ -1388,7 +1396,13 @@ function RemoteApp() {
         activeProvider: session?.provider || "",
         onEnsureProviderModels: ensureRemoteProviderModels,
       },
-      reusableReviewers: reusableReviewersFromReviews(reviewsData, remoteViewedThreadId, null),
+      // Filter reuse by working tree: a reviewer bound to a tree the work has left is refused.
+      reusableReviewers: reusableReviewersFromReviews(
+        reviewsData,
+        remoteViewedThreadId,
+        null,
+        remoteWorkspaceCwd
+      ),
       // Full reviewer-thread list so each card can show its reviewer thread's
       // (long, truncated-with-tooltip) name by joining on reviewer_thread_id.
       reviewerThreads: reviewsData.reviewer_threads || [],
@@ -1408,6 +1422,7 @@ function RemoteApp() {
     remoteUi.providerModels,
     remoteUi.providerModelsStatus,
     remoteDeviceId,
+    remoteWorkspaceCwd,
     hasControllerLease,
   ]);
 
@@ -2340,9 +2355,12 @@ function RemoteApp() {
             reusableReviewers: reusableReviewersFromReviews(
               remoteReviews || { reviewer_threads: [] },
               remoteViewedThreadId,
-              null
+              null,
+              remoteWorkspaceCwd
             ),
             parentThreadId: remoteViewedThreadId,
+            workspace: remoteWorkspace,
+            onPinWorkspace: (path) => getRemoteWorkspaceDiffStore().pinWorkspace(path),
             onRequestReview: reviewerActions.onRequestReview,
           },
           session,
@@ -3166,6 +3184,8 @@ function RemoteThreadPanel({
               onEnsureProviderModels: reviewNudgeModel.reviewModel?.onEnsureProviderModels,
               reusableReviewers: reviewNudgeModel.reusableReviewers || [],
               parentThreadId: reviewNudgeModel.parentThreadId || null,
+              workspace: reviewNudgeModel.workspace || null,
+              onPinWorkspace: reviewNudgeModel.onPinWorkspace,
               disabled: false,
               onSubmit: (values) => reviewNudgeModel.onRequestReview?.(values),
             })

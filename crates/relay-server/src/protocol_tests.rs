@@ -648,6 +648,7 @@ fn compact_for_broker_keeps_only_active_parent_reviewers() {
         reviewer_provider: Some("codex".to_string()),
         name: Some(id.to_string()),
         updated_at: Some(1),
+        cwd: None,
     };
     snapshot.reviewer_threads = vec![
         reviewer("active-rev-1", "thread-1"),
@@ -690,6 +691,7 @@ fn compact_for_broker_with_no_active_thread_keeps_reviewers() {
         reviewer_provider: Some("codex".to_string()),
         name: Some(id.to_string()),
         updated_at: Some(1),
+        cwd: None,
     };
     snapshot.reviewer_threads = vec![reviewer("rev-1", "thread-1"), reviewer("rev-2", "thread-2")];
 
@@ -719,6 +721,7 @@ fn compact_for_local_web_keeps_reviewer_threads() {
             reviewer_provider: Some("codex".to_string()),
             name: Some("Reviewer one".to_string()),
             updated_at: Some(42),
+            cwd: None,
         },
         // A reviewer of a NON-active parent — local must still keep it (the
         // delete/archive prompt works on any thread, not just the active one).
@@ -728,6 +731,7 @@ fn compact_for_local_web_keeps_reviewer_threads() {
             reviewer_provider: Some("codex".to_string()),
             name: Some("Reviewer two".to_string()),
             updated_at: Some(7),
+            cwd: None,
         },
     ];
 
@@ -792,6 +796,7 @@ fn local_web_control_plane_metadata_does_not_shell_normal_live_transcript() {
             reviewer_provider: Some("claude_code".to_string()),
             name: Some(format!("Independent Claude review {index:02}")),
             updated_at: Some(1_750_000_000 + index),
+            cwd: None,
         })
         .collect();
     snapshot.device_records = (0..11)
@@ -1001,6 +1006,7 @@ fn long_session_snapshot_stays_bounded_in_bytes_and_entry_count() {
                 reviewer_provider: Some("claude_code".to_string()),
                 name: Some(format!("review {index}")),
                 updated_at: Some(1_750_000_000 + index),
+                cwd: None,
             })
             .collect();
         snapshot
@@ -1195,6 +1201,7 @@ fn control_plane_flood_keeps_both_surfaces_bounded_without_shelling_live_text() 
                 reviewer_provider: Some("claude_code".to_string()),
                 name: Some(format!("Independent review {index:03}")),
                 updated_at: Some(1_750_000_000 + index),
+                cwd: None,
             })
             .collect();
         snapshot.device_records = (0..120)
@@ -1325,6 +1332,7 @@ fn control_plane_cap_keeps_active_parent_reviewer_threads() {
             reviewer_provider: Some("claude_code".to_string()),
             name: Some(format!("active review {index}")),
             updated_at: Some(1),
+            cwd: None,
         });
     }
     // 60 other-parent reviewers push the total over the LocalWeb cap of 48.
@@ -1335,6 +1343,7 @@ fn control_plane_cap_keeps_active_parent_reviewer_threads() {
             reviewer_provider: Some("claude_code".to_string()),
             name: Some(format!("other review {index}")),
             updated_at: Some(1),
+            cwd: None,
         });
     }
     snapshot.reviewer_threads = reviewer_threads;

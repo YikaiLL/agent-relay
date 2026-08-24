@@ -1962,17 +1962,31 @@ export function getRemoteViewedWorkspaceKey() {
   return JSON.stringify([getRemoteViewedThreadId() || "", state.session?.current_cwd || ""]);
 }
 
-export async function fetchRemoteWorkspaceDiff(root = null, autoRoot = false) {
+export async function fetchRemoteWorkspaceDiff({ viewRoot = null } = {}) {
   const threadId = getRemoteViewedThreadId();
   const payload = {};
   if (threadId) payload.thread_id = threadId;
-  // The relay validates this against the worktrees it enumerated for that session,
-  // so a stale pin fails closed rather than reading a foreign tree.
-  if (root) payload.root = root;
-  // One-shot opt-in: land on where this thread has actually been writing.
-  if (autoRoot) payload.auto_root = true;
+  // Diff preview only — never a session pin.
+  if (viewRoot) payload.view_root = viewRoot;
   const result = await dispatchOrRecover("fetch_workspace_diff", payload);
   return result.workspace_diff;
+}
+
+// Not claim-gated: a paired device must see where a session is without taking control.
+export async function fetchRemoteThreadWorkspace(threadId) {
+  if (!threadId) return null;
+  const result = await dispatchOrRecover("fetch_thread_workspace", { thread_id: threadId });
+  return result.thread_workspace || null;
+}
+
+// Pin (`cwd`) or unpin (`null`). No session claim: relay-owned, like rename_thread.
+export async function setRemoteThreadWorkspace(threadId, cwd) {
+  if (!threadId) return null;
+  const result = await dispatchOrRecover("set_thread_workspace", {
+    thread_id: threadId,
+    cwd: cwd || null,
+  });
+  return result.thread_workspace || null;
 }
 
 // Cross-agent review actions over the broker. Each ack carries no snapshot, so

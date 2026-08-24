@@ -23,13 +23,14 @@ use crate::{
         PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
         ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
         ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
-        RepairWorkspaceInput, ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput,
-        SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput,
-        SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
-        ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadSettingsView,
-        ThreadStateView, ThreadTranscriptResponse, ThreadsResponse, ToolCallView,
-        TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput, WorkspaceDiffResponse,
-        WorkspaceGitContextView, WorkspaceRootView,
+        RepairWorkspaceInput, ResolvedWorkspace, ResumeSessionInput, RevokeDeviceReceipt,
+        SendMessageInput, SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput,
+        StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt,
+        ThreadDeleteReceipt, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadRenameReceipt,
+        ThreadSettingsView, ThreadStateView, ThreadTranscriptResponse, ThreadWorkspaceInput,
+        ThreadsResponse, ToolCallView, TranscriptDeltaEvent, UpdateSessionSettingsInput,
+        WatchThreadsInput, WorkspaceDiffResponse, WorkspaceGitContextView, WorkspaceOrigin,
+        WorkspaceRootView,
     },
     provider::{
         spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
@@ -226,8 +227,10 @@ mod sessions;
 pub(crate) mod team;
 #[cfg(test)]
 mod tests;
+mod thread_workspace;
 mod threads;
 mod transcript;
+pub(crate) use thread_workspace::ThreadWorkspaceError;
 mod workflow;
 mod worktree;
 
@@ -1556,7 +1559,7 @@ fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<Work
 
 /// How far back through a thread's transcript to look for evidence of where it has
 /// been writing. Bounded so a long thread cannot make the diff endpoint expensive.
-const SUGGESTED_ROOT_SCAN_LIMIT: usize = 200;
+const WRITE_EVIDENCE_SCAN_LIMIT: usize = 200;
 
 /// One line telling a reviewer WHICH working tree it is being handed — path, branch, and
 /// whether that is the repo's main tree or a linked worktree — plus, when this is not the
@@ -1623,36 +1626,7 @@ exists, so this is the workspace that owned it."
     line
 }
 
-/// Which enumerated root a thread's recent writes actually landed in, given its tool
-/// calls most-recent-first. Returns `None` when there is no usable evidence.
-///
-/// Only ABSOLUTE paths count. Claude Code's edit tools always pass absolute
-/// `file_path`s (verified against real session transcripts), but a provider that
-/// reports paths relative to the session cwd carries no worktree information at all —
-/// guessing from those would silently mis-attribute, so they are ignored.
-///
-/// Matching is longest-root-wins, which is required rather than cosmetic: worktrees
-/// nest (this repo keeps them under `.claude/worktrees/`), so a nested worktree's
-/// files also sit under the main worktree and a first-match scan would always answer
-/// "main".
-/// Evidence is restricted to file changes that actually LANDED:
-/// - `item_type == "fileChange"`, because a read-only tool (Read/Glob/…) carries an
-///   absolute `path` too, and treating that as evidence makes the panel jump to
-///   whichever tree the agent merely glanced at;
-/// - a terminal-success status, because a failed or still-running edit never hit disk.
-pub(crate) fn suggested_root_from_tools<'a>(
-    tools: impl Iterator<Item = (&'a ToolCallView, &'a str)>,
-    roots: &[WorkspaceRootView],
-) -> Option<String> {
-    suggested_root_from_paths(&landed_write_paths(tools), roots)
-}
-
-/// The paths a thread's recent tool calls actually WROTE, most-recent-first.
-///
-/// Split out from `suggested_root_from_tools` so a caller that has to enumerate roots
-/// asynchronously (the review path: it needs git, and holding the relay lock across an
-/// await is not an option) can lift this evidence out under the lock without cloning
-/// whole tool views and their diff bodies.
+/// Landed write paths, newest first. Lifted as paths under the lock so git matching can await.
 pub(crate) fn landed_write_paths<'a>(
     tools: impl Iterator<Item = (&'a ToolCallView, &'a str)>,
 ) -> Vec<String> {
@@ -1680,8 +1654,8 @@ pub(crate) fn landed_write_paths<'a>(
     paths
 }
 
-/// Which enumerated root the given write paths (most-recent-first) landed in.
-pub(crate) fn suggested_root_from_paths(
+/// Longest-root-wins: nested worktrees also sit under main, so first-match would always pick main. Relative paths are ignored.
+pub(crate) fn root_containing_writes(
     paths: &[String],
     roots: &[WorkspaceRootView],
 ) -> Option<String> {
@@ -1705,18 +1679,7 @@ pub(crate) fn suggested_root_from_paths(
         .find_map(|candidate| match_longest_root(candidate, &normalized))
 }
 
-/// Whether this transcript entry represents a file write that actually reached disk.
-///
-/// Two independent signals, because neither is sufficient alone:
-/// - status, which the providers now set correctly (`claude.rs` propagates the worker's
-///   `is_error`; codex has always had a failed status);
-/// - a non-empty diff body, which is what actually proves the write reached disk. The
-///   worker re-reads the file and emits an EMPTY diff for an edit that never landed
-///   (the input-reconstructed fallback is deliberately suppressed for a failed result).
-///
-/// The diff check is kept as the provider-agnostic backstop: it holds even for a
-/// provider that reports no failure status at all, and it is what caught this case
-/// while the Claude path was still settling every result as "completed".
+/// Landed only if status is success and the diff body is non-empty (empty diff = edit never hit disk).
 fn is_landed_file_change(tool: &ToolCallView, status: &str) -> bool {
     if tool.item_type != "fileChange" {
         return false;
@@ -1817,8 +1780,6 @@ pub(crate) async fn collect_workspace_diff_against(
             not_a_git_repo: true,
             // Roots are attached by the caller, which owns the picker's scope rules.
             roots: Vec::new(),
-            suggested_root: None,
-            suggested_root_known: true,
             unavailable: false,
             // Attached by the caller, which owns the fallback decision.
             fallback_from: None,
@@ -1881,14 +1842,12 @@ pub(crate) async fn collect_workspace_diff_against(
 
     Ok(WorkspaceDiffResponse {
         cwd: cwd.to_string(),
-        suggested_root_known: true,
         diff: tracked_diff,
         file_changes,
         truncated: tracked_truncated || untracked_truncated,
         not_a_git_repo: false,
         // Roots are attached by the caller, which owns the picker's scope rules.
         roots: Vec::new(),
-        suggested_root: None,
         unavailable: false,
         // Attached by the caller, which owns the fallback decision.
         fallback_from: None,

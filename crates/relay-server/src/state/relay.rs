@@ -162,6 +162,23 @@ pub(crate) struct ReviewerThread {
     pub(crate) seq: u64,
 }
 
+/// Paths only. Pin and proven stay separate so a refresh cannot move an explicit choice.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ThreadWorkspace {
+    /// Explicit pin; only `set_thread_workspace` writes this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pinned: Option<String>,
+    /// Last proven write tree. Persisted because transcript evidence is bounded and gone after restart; empty evidence is not "went home".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proven: Option<String>,
+}
+
+impl ThreadWorkspace {
+    fn is_empty(&self) -> bool {
+        self.pinned.is_none() && self.proven.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CachedRemoteActionResult {
     pub(crate) action_kind: String,
@@ -177,6 +194,7 @@ pub(crate) struct CachedRemoteActionResult {
     pub(crate) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(crate) workspace_diff: Option<crate::protocol::WorkspaceDiffResponse>,
     pub(crate) workspace_git_context: Option<crate::protocol::WorkspaceGitContextView>,
+    pub(crate) thread_workspace: Option<crate::protocol::ResolvedWorkspace>,
     pub(crate) thread_settings: Option<crate::protocol::ThreadSettingsView>,
     pub(crate) reviews: Option<crate::protocol::ReviewsResponse>,
     pub(crate) workflows: Option<crate::protocol::WorkflowsResponse>,
@@ -292,6 +310,8 @@ pub struct RelayState {
     /// that never sent — can recognize the promotion authoritatively; the id
     /// sequence alone is indistinguishable from a normal thread switch.
     pub(super) thread_promoted_from: HashMap<String, String>,
+    /// Per-thread pin/proven paths. Absent = birth cwd.
+    pub(super) thread_workspace: HashMap<String, ThreadWorkspace>,
     /// Static per relay process, seeded from the spawned bridges. Rides the
     /// snapshot so both surfaces learn fork capability through the channel they
     /// already consume, instead of inferring it from provider names.
@@ -498,6 +518,7 @@ impl RelayState {
             thread_settings: HashMap::new(),
             thread_forked_from: HashMap::new(),
             thread_promoted_from: HashMap::new(),
+            thread_workspace: HashMap::new(),
             provider_fork_capabilities: Vec::new(),
             provider_archive_capabilities: Vec::new(),
             beta_features_enabled: false,
@@ -855,6 +876,48 @@ impl RelayState {
                     .map(|thread| thread.cwd.clone())
                     .filter(|cwd| !cwd.is_empty())
             })
+    }
+
+    /// What is remembered about this thread's working tree. Empty → birth cwd.
+    pub(super) fn thread_workspace(&self, thread_id: &str) -> ThreadWorkspace {
+        self.thread_workspace
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Pin (`Some`) or drop the pin (`None`). Caller validates roots + device scope.
+    pub(super) fn set_thread_workspace(&mut self, thread_id: &str, cwd: Option<&str>) -> bool {
+        let entry = self
+            .thread_workspace
+            .entry(thread_id.to_string())
+            .or_default();
+        let pinned = cwd.map(str::to_string);
+        if entry.pinned == pinned {
+            // Still prune: an empty pin is a persisted row no other cleanup would reach.
+            if entry.is_empty() {
+                self.thread_workspace.remove(thread_id);
+            }
+            return false;
+        }
+        entry.pinned = pinned;
+        if entry.is_empty() {
+            self.thread_workspace.remove(thread_id);
+        }
+        true
+    }
+
+    /// Internal side effect of `resolve_thread_workspace` (roots + scope already checked). Notifies on a real change so persistence can save even when the caller returns without touching job state.
+    pub(super) fn record_proven_thread_workspace(&mut self, thread_id: &str, tree: &str) {
+        let entry = self
+            .thread_workspace
+            .entry(thread_id.to_string())
+            .or_default();
+        if entry.proven.as_deref() == Some(tree) {
+            return;
+        }
+        entry.proven = Some(tree.to_string());
+        self.notify();
     }
 
     /// The project a thread belongs to, if any (`None` = "Unassigned").
@@ -1379,6 +1442,9 @@ impl RelayState {
                     reviewer_provider: self.reviewer_thread_provider(reviewer),
                     name: summary.and_then(|s| s.name.clone()),
                     updated_at: summary.map(|s| s.updated_at),
+                    // The reviewer's OWN tree, not its parent's: the parent may have
+                    // moved since, and the reuse gate compares against the reviewer.
+                    cwd: self.thread_cwd(reviewer),
                 }
             })
             .collect();
@@ -1478,6 +1544,12 @@ impl RelayState {
             self.thread_forked_from
                 .entry(real_id.to_string())
                 .or_insert(pending_source);
+        }
+        // Promote pending workspace too: it is keyed by thread id in a persisted map.
+        if let Some(pending_workspace) = self.thread_workspace.remove(pending_id) {
+            self.thread_workspace
+                .entry(real_id.to_string())
+                .or_insert(pending_workspace);
         }
         // Drop the stale pending row; the real row is upserted by the caller.
         self.threads.retain(|thread| thread.id != pending_id);
@@ -3178,6 +3250,7 @@ impl RelayState {
             .or_insert(materialized);
         self.thread_forked_from = persisted.thread_forked_from.clone();
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
+        self.thread_workspace = persisted.thread_workspace.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
         self.thread_custom_name = persisted.thread_custom_name.clone();
@@ -3554,6 +3627,11 @@ impl RelayState {
         // forever and wait to be inherited by a reused id. It joins the two persisted
         // per-thread maps this function already clears, rather than being a special case.
         self.thread_custom_name.remove(thread_id);
+        // Same reasoning again for the thread's working tree: another persisted
+        // per-thread map, whose entry could otherwise never be reached again and would
+        // wait to be inherited by a reused id — pointing a future review at a tree that
+        // thread was never in.
+        self.thread_workspace.remove(thread_id);
         // Same reasoning: a hint left behind would keep an archived/deleted session
         // routable from a stale search result the client still has on screen.
         self.forget_search_routing_hint(thread_id);
@@ -4270,6 +4348,7 @@ impl RelayState {
         }
         self.thread_forked_from = persisted.thread_forked_from.clone();
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
+        self.thread_workspace = persisted.thread_workspace.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
         self.thread_custom_name = persisted.thread_custom_name.clone();

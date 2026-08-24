@@ -699,6 +699,23 @@ mountReviewerChip({
 });
 void workspaceDiffStore.refresh();
 
+// The resolved working tree arrives asynchronously and decides which reviewer threads
+// are reusable at all, so a snapshot render that happened before it landed would leave
+// the reuse picker offering cross-tree reviewers the relay refuses. Repaint once the
+// answer (or a later, different one) is in. Guarded on the cwd so the setReview →
+// notify → render loop closes: a repaint that changes nothing re-enters here and stops.
+let renderedWorkspaceCwd = null;
+workspaceDiffStore.subscribe((workspaceState) => {
+  const cwd = workspaceState.workspace?.cwd || null;
+  if (cwd === renderedWorkspaceCwd) {
+    return;
+  }
+  renderedWorkspaceCwd = cwd;
+  if (state.session) {
+    renderSession(state.session);
+  }
+});
+
 const leftPanelControl = createPanelControl({
   cssVarName: "--sidebar-width",
   widthStorageKey: "agent-relay:local-sidebar-width",
@@ -980,6 +997,11 @@ const renderer = createSessionRenderer({
   setReviewSlice(slice) {
     workspaceDiffStore.setReview(slice);
   },
+  // One answer to "which working tree is this session's work in", shared by the Changes
+  // panel, the Reviewer panel and the review dialog — and stored on the relay, so it
+  // survives a reload and is the same tree the phone sees.
+  getThreadWorkspace: () => workspaceDiffStore.getState().workspace,
+  pinThreadWorkspace: (path) => workspaceDiffStore.pinWorkspace(path),
   reviewsCache,
   workflowsCache,
   // Dedicated, uncompacted reviewer data. The snapshot carries only its revision

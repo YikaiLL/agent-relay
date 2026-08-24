@@ -299,6 +299,9 @@ pub struct ReviewerThreadView {
     /// Last-updated time, for newest-first ordering in the reuse picker.
     #[serde(default)]
     pub updated_at: Option<u64>,
+    /// Tree this reviewer is bound to; `None` after restart. Needed so reuse can drop cross-tree candidates `request_review` would refuse.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// One working thread, as surfaced to clients for per-thread activity badges.
@@ -1555,6 +1558,47 @@ pub struct WorkspaceGitContextView {
     pub dirty: bool,
 }
 
+/// Why this tree: pin vs inference vs birth vs stand-in for a vanished worktree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceOrigin {
+    /// Explicit choice; outranks inference and survives quiet stretches / restart.
+    Pinned,
+    /// Landed writes are (or last were) in this tree.
+    Proven,
+    /// Nothing said otherwise, so the tree the thread was born in.
+    Birth,
+    /// Birth tree is gone; `gone` is the vanished path so UI does not silently show another tree.
+    Substituted { gone: String },
+}
+
+/// Settled tree plus live git/roots. Only paths are stored; branch/dirty would go stale on checkout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedWorkspace {
+    /// Diff, review, and picker default all run git here.
+    pub cwd: String,
+    pub origin: WorkspaceOrigin,
+    /// Live git standing of `cwd`, never stored.
+    pub git: WorkspaceGitContextView,
+    /// In-scope trees of this repo; `cwd` is one of them unless enumeration was empty.
+    pub roots: Vec<WorkspaceRootView>,
+    /// Birth cwd (provider identity); distinct from `cwd`.
+    pub birth_cwd: String,
+    /// False when the birth directory was removed mid-session.
+    pub birth_cwd_exists: bool,
+}
+
+/// Pin (or un-pin) which working tree a thread's work is considered to be in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThreadWorkspaceInput {
+    pub thread_id: String,
+    /// Pin this path; `null`/absent drops the pin. Must be one of the thread's enumerated roots.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceDiffResponse {
     pub cwd: String,
@@ -1562,24 +1606,9 @@ pub struct WorkspaceDiffResponse {
     pub diff: String,
     pub truncated: bool,
     pub not_a_git_repo: bool,
-    /// Every working tree the viewed session's repo exposes, for the panel's root
-    /// picker. `#[serde(default)]` keeps older clients/persisted payloads readable.
+    /// Trees the picker may offer. Diff `cwd` follows the session unless the request sent `view_root`.
     #[serde(default)]
     pub roots: Vec<WorkspaceRootView>,
-    /// Where this thread's recent file writes actually landed, when that is a
-    /// DIFFERENT root than its own cwd — i.e. the agent went off and worked in a
-    /// worktree. `None` means "no evidence, or it is already working in its own cwd",
-    /// so there is nothing to suggest. Purely derived: reporting it never changes
-    /// which tree got diffed (see the `auto_root` request flag for that).
-    #[serde(default)]
-    pub suggested_root: Option<String>,
-    /// Whether `suggested_root` was actually DETERMINED, as opposed to unknown because
-    /// the thread's transcript is not loaded yet (a cold thread the client just
-    /// navigated to). `false` means "ask again later" — without this a client cannot
-    /// tell "this thread works in its own cwd" from "we could not look", and would burn
-    /// its one-shot auto-resolve on a thread whose history had not arrived.
-    #[serde(default = "default_true")]
-    pub suggested_root_known: bool,
     /// The requested session's workspace could not be resolved (deleted / not-yet-loaded /
     /// pending thread). Fail-closed marker: the panel renders "workspace unavailable" rather
     /// than falling back to another workspace's diff. Distinct from a clean tree.
@@ -1619,8 +1648,6 @@ impl WorkspaceDiffResponse {
             // No roots either: the picker must not reveal a repo layout for a
             // workspace the caller was just refused.
             roots: Vec::new(),
-            suggested_root: None,
-            suggested_root_known: false,
             unavailable: true,
             fallback_from: None,
             base_ref: None,

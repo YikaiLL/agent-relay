@@ -10,8 +10,8 @@ import {
 } from "./workspace-diff.js";
 
 // Minimal external store for useSyncExternalStore: never notifies, just serves state.
-function fakeStore(state) {
-  return { subscribe: () => () => {}, getState: () => state };
+function fakeStore(state, methods = {}) {
+  return { subscribe: () => () => {}, getState: () => state, ...methods };
 }
 
 // A promise whose resolution we control, to force out-of-order refresh completion.
@@ -90,6 +90,12 @@ test("computeChangeStats handles file changes with empty diff strings", () => {
   assert.equal(stats.removed, 0);
 });
 
+// The workspace read rides alongside the diff on the local surface, so tests about the
+// DIFF request say so rather than counting every call.
+const diffCalls = (calls) => calls.filter((path) => path.startsWith("/api/workspace/diff"));
+// Silences the workspace read for tests that are only about the diff transport.
+const NO_WORKSPACE = async () => null;
+
 // Part A: the diff request must carry the *viewed* session id so the panel shows
 // that session's workspace (not the process-global/active one).
 test("workspace diff request carries ?thread_id= for the viewed session", async () => {
@@ -104,9 +110,29 @@ test("workspace diff request carries ?thread_id= for the viewed session", async 
     getThreadId: () => "thread-xyz",
   });
   await store.refresh();
-  assert.equal(calls.length, 1);
-  // First view of a thread also opts in to the one-shot auto-resolve (L2).
-  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-xyz&auto_root=true");
+  assert.deepEqual(diffCalls(calls), ["/api/workspace/diff?thread_id=thread-xyz"]);
+  // …and the tree is asked for by the SAME session id, over the route that owns it.
+  assert.ok(calls.includes("/api/thread/workspace?thread_id=thread-xyz"));
+});
+
+// The relay DELETED `root` / `auto_root` and now parses-and-ignores them, so a client
+// still sending them is not a 400 — it is a pin that silently does nothing. Nothing but
+// this assertion would catch that, which is exactly why it is here.
+test("the diff request carries no root selector — the relay decides the tree", async () => {
+  const calls = [];
+  const store = createWorkspaceDiffStore({
+    apiFetch: async (path) => {
+      calls.push(path);
+      return { ok: true, json: async () => ({ ok: true, data: { file_changes: [] } }) };
+    },
+    getThreadId: () => "thread-xyz",
+  });
+  await store.refresh();
+  await store.refresh();
+  for (const path of diffCalls(calls)) {
+    assert.doesNotMatch(path, /\broot=/, `${path} must not carry a root override`);
+    assert.doesNotMatch(path, /auto_root/, `${path} must not negotiate auto-resolve`);
+  }
 });
 
 test("workspace diff request omits thread_id when no session is viewed (back-compat)", async () => {
@@ -301,6 +327,8 @@ test("refreshing the same viewed session keeps its diff visible during loading",
     surface: "local",
     getThreadId: () => "A",
     getWorkspaceKey: () => JSON.stringify(["A", "/same-cwd"]),
+    // This test gates apiFetch call-by-call; the workspace read is a separate concern.
+    fetchWorkspace: NO_WORKSPACE,
   });
 
   const p1 = store.refresh();
@@ -341,486 +369,326 @@ test("unavailable workspace renders as unavailable, not clean or non-git", () =>
   assert.doesNotMatch(html, /not a git repository/);
 });
 
-// ---- L1: worktree root picker ------------------------------------------------
+// ---- which working tree, decided by the relay ---------------------------------
+//
+// This browser used to hold the answer itself: a `rootByThread` pin plus an
+// `autoRootByThread` one-shot negotiation, both sent on every diff request. That state
+// died on reload, local and remote each kept their own copy, and a review could see
+// neither — which is how three reviews ran against a tree the work had left. It is gone.
+// The relay resolves the tree, this store reads it, and a user's choice is a WRITE to the
+// relay, so it is durable and shared.
 
-test("selecting a root sends it as ?root= alongside the viewed thread", async () => {
-  const calls = [];
-  const apiFetch = async (path) => {
-    calls.push(path);
-    return { ok: true, json: async () => ({ ok: true, data: { cwd: "/wt", roots: [] } }) };
-  };
-  const store = createWorkspaceDiffStore({
-    apiFetch,
-    getThreadId: () => "thread-a",
+// A stand-in relay: resolves to `cwd`, accepts a pin only for a listed root.
+function fakeRelayWorkspace({ cwd = "/repo/main", roots = ["/repo/main", "/repo/wt"] } = {}) {
+  let pinned = null;
+  const calls = { reads: [], writes: [] };
+  const resolve = () => ({
+    cwd: pinned || cwd,
+    origin: pinned ? { kind: "pinned" } : { kind: "proven" },
+    git: { cwd: pinned || cwd, is_repo: true, branch: "main", detached: false, dirty: false },
+    roots: roots.map((path) => ({ path, branch: "main", is_main: path === "/repo/main" })),
+    birth_cwd: "/repo/main",
+    birth_cwd_exists: true,
   });
-
-  await store.refresh();
-  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-a&auto_root=true");
-
-  store.setRoot("/repo/linked");
-  await store.refresh();
-  assert.equal(
-    calls[1],
-    "/api/workspace/diff?thread_id=thread-a&root=%2Frepo%2Flinked",
-    "the selected root must be sent, url-encoded"
-  );
-});
-
-// The whole point of the picker: switching root must not paint the previous root's
-// diff into the new root's panel while it loads.
-test("switching root clears the previous root's diff during loading", async () => {
-  const first = deferred();
-  const second = deferred();
-  let call = 0;
-  const store = createWorkspaceDiffStore({
-    apiFetch: async () => {
-      call += 1;
-      const data = await (call === 1 ? first.promise : second.promise);
-      return { ok: true, json: async () => ({ ok: true, data }) };
+  return {
+    calls,
+    fetchWorkspace: async (threadId) => {
+      calls.reads.push(threadId);
+      return resolve();
     },
-    getThreadId: () => "thread-a",
+    setWorkspace: async (threadId, requested) => {
+      calls.writes.push([threadId, requested]);
+      if (requested && !roots.includes(requested)) {
+        throw new Error(
+          `${requested} is not one of this session's working trees; pick one of the trees the relay listed for it`
+        );
+      }
+      pinned = requested || null;
+      return resolve();
+    },
+  };
+}
+
+function storeWithRelay(relay, getThreadId = () => "thread-a") {
+  return createWorkspaceDiffStore({
+    apiFetch: async () => ({
+      ok: true,
+      json: async () => ({ ok: true, data: { cwd: "/repo/main", file_changes: [] } }),
+    }),
+    getThreadId,
+    fetchWorkspace: relay.fetchWorkspace,
+    setWorkspace: relay.setWorkspace,
   });
+}
 
-  const p1 = store.refresh();
-  first.resolve({ cwd: "/repo/main", file_changes: [{ path: "a.txt", diff: "+main" }], roots: [] });
-  await p1;
-  assert.equal(store.getState().data.cwd, "/repo/main");
+test("a refresh reads the relay's resolved working tree for the viewed thread", async () => {
+  const relay = fakeRelayWorkspace();
+  const store = storeWithRelay(relay);
 
-  store.setRoot("/repo/linked");
-  const p2 = store.refresh();
-  assert.equal(
-    store.getState().data,
-    null,
-    "the previous root's diff must be dropped while the new root loads"
-  );
-  second.resolve({ cwd: "/repo/linked", file_changes: [], roots: [] });
-  await p2;
-  assert.equal(store.getState().data.cwd, "/repo/linked");
+  await store.refresh();
+
+  assert.deepEqual(relay.calls.reads, ["thread-a"]);
+  const { workspace } = store.getState();
+  assert.equal(workspace.cwd, "/repo/main");
+  assert.equal(workspace.origin.kind, "proven");
+  assert.equal(store.getState().workspaceStatus, "loaded");
 });
 
-// A root picked while viewing thread A must not follow you to thread B, whose repo
-// may not even contain that path — the panel would show an unrelated tree.
-test("selected root is remembered per thread, not carried across threads", async () => {
-  const calls = [];
-  let viewed = "thread-a";
+// Looking at another tree in Changes is a view, not a session pin.
+test("choosing a tree in Changes must not pin the session workspace", async () => {
+  const relay = fakeRelayWorkspace();
+  const store = storeWithRelay(relay);
+  await store.refresh();
+  assert.equal(store.getState().workspace.origin.kind, "proven");
+
+  await store.setViewRoot("/repo/wt");
+
+  assert.deepEqual(
+    relay.calls.writes,
+    [],
+    "a Diff preview must never POST a session pin — viewing is not relocating"
+  );
+  assert.equal(
+    store.getState().workspace.origin.kind,
+    "proven",
+    "the relay's session answer is unchanged"
+  );
+  assert.equal(store.getState().viewRoot, "/repo/wt");
+});
+
+test("choosing a tree in Changes asks the diff for that view_root only", async () => {
+  const relay = fakeRelayWorkspace();
+  const diffCalls = [];
   const store = createWorkspaceDiffStore({
     apiFetch: async (path) => {
-      calls.push(path);
-      return { ok: true, json: async () => ({ ok: true, data: { cwd: "/x", roots: [] } }) };
+      diffCalls.push(path);
+      return {
+        ok: true,
+        json: async () => ({ ok: true, data: { cwd: "/repo/wt", file_changes: [] } }),
+      };
     },
-    getThreadId: () => viewed,
+    getThreadId: () => "thread-a",
+    fetchWorkspace: relay.fetchWorkspace,
+    setWorkspace: relay.setWorkspace,
   });
-
-  store.setRoot("/repo/linked");
   await store.refresh();
-  assert.ok(calls.at(-1).includes("root=%2Frepo%2Flinked"));
+  diffCalls.length = 0;
 
-  // Switch to another thread: it has no remembered root, so none is sent.
+  await store.setViewRoot("/repo/wt");
+
+  assert.equal(diffCalls.length, 1, "previewing another tree must refetch the diff");
+  assert.match(
+    String(diffCalls[0]),
+    /view_root=.*%2Frepo%2Fwt/,
+    "the override is request-scoped on the diff URL, not durable session state"
+  );
+  assert.deepEqual(relay.calls.writes, []);
+});
+
+test("pinning a tree writes it to the relay, never to browser memory", async () => {
+  const relay = fakeRelayWorkspace();
+  const store = storeWithRelay(relay);
+  await store.refresh();
+
+  await store.pinWorkspace("/repo/wt");
+
+  assert.deepEqual(
+    relay.calls.writes,
+    [["thread-a", "/repo/wt"]],
+    "the pin must go over the wire — that is what makes it survive a reload"
+  );
+  assert.equal(store.getState().workspace.cwd, "/repo/wt");
+  assert.equal(store.getState().workspace.origin.kind, "pinned");
+});
+
+test("un-pinning sends an explicit null rather than omitting the field", async () => {
+  const relay = fakeRelayWorkspace();
+  const store = storeWithRelay(relay);
+  await store.refresh();
+  await store.pinWorkspace("/repo/wt");
+
+  await store.pinWorkspace(null);
+
+  assert.deepEqual(relay.calls.writes.at(-1), ["thread-a", null]);
+  assert.equal(store.getState().workspace.origin.kind, "proven");
+});
+
+// The point of moving the pin server-side: it is not a per-tab, per-session-of-the-browser
+// preference any more. Leaving the thread and coming back must show the same tree because
+// the RELAY still says so, not because this store remembered.
+test("a pin survives leaving the thread and returning, because the relay holds it", async () => {
+  const relay = fakeRelayWorkspace();
+  let viewed = "thread-a";
+  const store = storeWithRelay(relay, () => viewed);
+
+  await store.refresh();
+  await store.pinWorkspace("/repo/wt");
+  assert.equal(store.getState().workspace.cwd, "/repo/wt");
+
   viewed = "thread-b";
   await store.refresh();
-  assert.equal(
-    calls.at(-1),
-    "/api/workspace/diff?thread_id=thread-b&auto_root=true",
-    "thread B must start at its own workspace, not A's picked root"
-  );
-
-  // Switching back restores A's pick.
   viewed = "thread-a";
   await store.refresh();
-  assert.ok(
-    calls.at(-1).includes("root=%2Frepo%2Flinked"),
-    "returning to thread A must restore the root it was left on"
+
+  assert.equal(store.getState().workspace.cwd, "/repo/wt");
+  assert.equal(
+    relay.calls.writes.length,
+    1,
+    "returning must re-READ the tree, not re-write a remembered pin"
   );
 });
 
-test("root picker lists every worktree, labelled by branch", () => {
+// Fail loud, not silent: the relay refuses a tree that is not one of the session's, and
+// the picker is where that has to be said.
+test("a refused pin surfaces the relay's reason and leaves the tree alone", async () => {
+  const relay = fakeRelayWorkspace();
+  const store = storeWithRelay(relay);
+  await store.refresh();
+
+  await store.pinWorkspace("/somewhere/else");
+
+  assert.match(store.getState().workspaceError, /not one of this session's working trees/);
+  assert.equal(store.getState().workspace.cwd, "/repo/main", "the settled tree is unchanged");
+  assert.equal(store.getState().workspacePinning, false, "the control must not stay busy");
+});
+
+// A tree label belongs to ONE session. Carrying the previous session's over into the load
+// window would put a wrong — and plausible — answer under the new session's diff.
+test("switching threads drops the previous session's tree while the new one loads", async () => {
+  const gate = deferred();
+  let viewed = "thread-a";
+  let first = true;
+  const store = createWorkspaceDiffStore({
+    apiFetch: async () => ({ ok: true, json: async () => ({ ok: true, data: {} }) }),
+    getThreadId: () => viewed,
+    fetchWorkspace: async () => {
+      if (first) {
+        first = false;
+        return { cwd: "/repo/main", origin: { kind: "birth" }, roots: [], birth_cwd: "/repo/main", birth_cwd_exists: true };
+      }
+      return gate.promise;
+    },
+  });
+
+  await store.refresh();
+  assert.equal(store.getState().workspace.cwd, "/repo/main");
+
+  viewed = "thread-b";
+  const pending = store.refresh();
+  assert.equal(store.getState().workspace, null, "thread A's tree must not label thread B");
+  assert.equal(store.getState().workspaceStatus, "loading");
+
+  gate.resolve({ cwd: "/repo/wt", origin: { kind: "proven" }, roots: [], birth_cwd: "/repo/wt", birth_cwd_exists: true });
+  await pending;
+  assert.equal(store.getState().workspace.cwd, "/repo/wt");
+});
+
+// The tree is a LABEL on the diff. Failing to fetch it must not take the diff down.
+test("a failed workspace read leaves the diff loaded and reports itself separately", async () => {
+  const store = createWorkspaceDiffStore({
+    apiFetch: async () => ({
+      ok: true,
+      json: async () => ({ ok: true, data: { cwd: "/repo/main", file_changes: [] } }),
+    }),
+    getThreadId: () => "thread-a",
+    fetchWorkspace: async () => {
+      throw new Error("relay said no");
+    },
+  });
+
+  await store.refresh();
+
+  assert.equal(store.getState().status, "loaded");
+  assert.equal(store.getState().data.cwd, "/repo/main");
+  assert.equal(store.getState().workspaceStatus, "error");
+  assert.match(store.getState().workspaceError, /relay said no/);
+});
+
+// ---- the tree, on screen ------------------------------------------------------
+
+const RESOLVED = {
+  cwd: "/repo/wt",
+  origin: { kind: "pinned" },
+  git: { cwd: "/repo/wt", is_repo: true, branch: "feature", detached: false, dirty: true },
+  roots: [
+    { path: "/repo/main", branch: "main", is_main: true },
+    { path: "/repo/wt", branch: "feature", is_main: false },
+  ],
+  birth_cwd: "/repo/main",
+  birth_cwd_exists: true,
+};
+
+test("every workspace-diff surface names the tree it is showing, and can re-point the preview", async () => {
+  const { WorkspaceDiffSheetBody } = await import("./workspace-diff.js");
+  const state = {
+    status: "loaded",
+    expanded: true,
+    data: { cwd: "/repo/wt", file_changes: [] },
+    workspace: { ...RESOLVED, origin: { kind: "proven" } },
+    viewRoot: "/repo/wt",
+  };
+
+  for (const [name, Component] of [
+    ["desktop rail (local + remote)", WorkspaceChangesPanel],
+    ["phone sheet / remote modal", WorkspaceDiffSheetBody],
+  ]) {
+    const html = renderToStaticMarkup(
+      React.createElement(Component, {
+        store: fakeStore(state, { setViewRoot() {} }),
+      })
+    );
+    assert.match(html, /workspace-picker-trigger/, `${name} offers the picker`);
+    assert.match(html, /\/repo\/wt/, `${name} names the tree in view`);
+    assert.doesNotMatch(
+      html,
+      />Unpin</,
+      `${name} must not offer session Unpin from a Diff preview`
+    );
+  }
+});
+
+test("a Diff preview of another tree says viewing is not relocating, and can follow the session", () => {
   const html = renderToStaticMarkup(
     React.createElement(WorkspaceChangesPanel, {
-      store: fakeStore({
-        status: "loaded",
-        selectedRoot: "/repo/feature",
-        data: {
-          cwd: "/repo/feature",
-          file_changes: [],
-          roots: [
-            { path: "/repo/main", branch: "main", is_main: true },
-            { path: "/repo/feature", branch: "feature", is_main: false },
-          ],
+      store: fakeStore(
+        {
+          status: "loaded",
+          data: { cwd: "/repo/wt", file_changes: [] },
+          workspace: {
+            ...RESOLVED,
+            cwd: "/repo/main",
+            origin: { kind: "proven" },
+          },
+          viewRoot: "/repo/wt",
         },
-      }),
+        { setViewRoot() {} }
+      ),
     })
   );
-  assert.match(html, /main/);
-  assert.match(html, /feature/);
-  assert.match(html, /value="\/repo\/feature"/, "roots are selectable by path");
+  assert.match(html, /does not move the session/);
+  assert.match(html, /Follow session/);
 });
 
-// A single-worktree repo is the common case; a picker with one entry is pure noise.
-test("root picker is hidden when the repo has only one worktree", () => {
+// The single-worktree repo used to hide the picker entirely. That made the panel's own
+// subject invisible in exactly the moment a session is about to acquire a second tree.
+test("the working tree is named even when the repo has only one", () => {
   const html = renderToStaticMarkup(
     React.createElement(WorkspaceChangesPanel, {
       store: fakeStore({
         status: "loaded",
-        data: {
+        data: { cwd: "/repo/main", file_changes: [] },
+        workspace: {
+          ...RESOLVED,
           cwd: "/repo/main",
-          file_changes: [],
+          origin: { kind: "birth" },
           roots: [{ path: "/repo/main", branch: "main", is_main: true }],
         },
       }),
     })
   );
-  assert.doesNotMatch(html, /workspace-root-select/);
+  assert.match(html, /\/repo\/main/);
 });
 
-// Review finding 2: a pinned root the relay can no longer resolve (worktree removed or
-// pruned, thread moved repos) returns `unavailable` with NO roots — so the picker hides
-// and there is no UI left to un-pin with. The pin must self-heal instead of wedging the
-// panel and re-sending the dead root on every refresh.
-test("a root pin the server rejects is cleared and retried against the session workspace", async () => {
-  const calls = [];
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      // The dead root fails closed; the unpinned request succeeds.
-      const data = path.includes("root=")
-        ? { unavailable: true, file_changes: [], roots: [] }
-        : { cwd: "/repo/main", file_changes: [], roots: [] };
-      return { ok: true, json: async () => ({ ok: true, data }) };
-    },
-    getThreadId: () => "thread-a",
-  });
-
-  store.setRoot("/repo/deleted");
-  await store.refresh();
-
-  assert.ok(calls[0].includes("root=%2Frepo%2Fdeleted"), "first attempt uses the pin");
-  assert.equal(
-    calls[1],
-    "/api/workspace/diff?thread_id=thread-a",
-    "a rejected pin must be retried without it"
-  );
-  assert.equal(store.getSelectedRoot(), null, "the dead pin must be dropped");
-  assert.equal(
-    store.getState().data.cwd,
-    "/repo/main",
-    "the panel recovers to the session workspace instead of staying unavailable"
-  );
-
-  // And the dead root must not come back on the next refresh.
-  await store.refresh();
-  assert.equal(calls.at(-1), "/api/workspace/diff?thread_id=thread-a");
-});
-
-// Guard the recovery against looping: an unavailable response with no pin set must be
-// reported as-is, not retried forever.
-test("unavailable with no pin set is reported, not retried", async () => {
-  let calls = 0;
-  const store = createWorkspaceDiffStore({
-    apiFetch: async () => {
-      calls += 1;
-      return {
-        ok: true,
-        json: async () => ({ ok: true, data: { unavailable: true, file_changes: [] } }),
-      };
-    },
-    getThreadId: () => "thread-a",
-  });
-
-  await store.refresh();
-  assert.equal(calls, 1, "no pin → no retry");
-  assert.equal(store.getState().data.unavailable, true);
-});
-
-// ---- L2: land on the worktree the thread has been working in ------------------
-
-test("first view of a thread asks for auto-resolve and adopts the suggested root", async () => {
-  const calls = [];
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      return {
-        ok: true,
-        json: async () => ({
-          ok: true,
-          data: { cwd: "/repo/linked", file_changes: [], roots: [], suggested_root: "/repo/linked" },
-        }),
-      };
-    },
-    getThreadId: () => "thread-a",
-  });
-
-  await store.refresh();
-  assert.equal(
-    calls[0],
-    "/api/workspace/diff?thread_id=thread-a&auto_root=true",
-    "the first view opts in to auto-resolve"
-  );
-  assert.equal(store.getSelectedRoot(), "/repo/linked", "the suggestion becomes the pin");
-
-  // Thereafter it is an ordinary pin — and crucially NOT re-resolved.
-  await store.refresh();
-  assert.equal(
-    calls[1],
-    "/api/workspace/diff?thread_id=thread-a&root=%2Frepo%2Flinked",
-    "later refreshes send the pin, not another auto-resolve"
-  );
-});
-
-// This is the whole point of picking "once per thread switch" over "follow always":
-// a later refresh must never re-target the panel under someone reading it.
-test("auto-resolve happens once per thread, even when it suggests nothing", async () => {
-  const calls = [];
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      return {
-        ok: true,
-        json: async () => ({
-          ok: true,
-          data: { cwd: "/repo/main", file_changes: [], roots: [], suggested_root: null },
-        }),
-      };
-    },
-    getThreadId: () => "thread-a",
-  });
-
-  await store.refresh();
-  assert.ok(calls[0].includes("auto_root=true"));
-  assert.equal(store.getSelectedRoot(), null, "nothing to suggest → no pin");
-
-  await store.refresh();
-  assert.equal(
-    calls[1],
-    "/api/workspace/diff?thread_id=thread-a",
-    "a second refresh must NOT re-ask for auto-resolve"
-  );
-});
-
-test("a thread the user already pinned is never auto-resolved", async () => {
-  const calls = [];
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      return { ok: true, json: async () => ({ ok: true, data: { cwd: "/x", roots: [] } }) };
-    },
-    getThreadId: () => "thread-a",
-  });
-
-  store.setRoot("/repo/chosen");
-  await store.refresh();
-  assert.equal(calls[0], "/api/workspace/diff?thread_id=thread-a&root=%2Frepo%2Fchosen");
-  assert.ok(!calls[0].includes("auto_root"), "a manual pin outranks auto-resolve");
-});
-
-// Each thread gets its own one-shot resolve; switching threads must not inherit A's.
-test("switching to a new thread triggers its own auto-resolve", async () => {
-  const calls = [];
-  let viewed = "thread-a";
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      const suggested = path.includes("thread-b") ? "/repo/b-wt" : null;
-      return {
-        ok: true,
-        json: async () => ({
-          ok: true,
-          data: { cwd: "/x", file_changes: [], roots: [], suggested_root: suggested },
-        }),
-      };
-    },
-    getThreadId: () => viewed,
-  });
-
-  await store.refresh();
-  viewed = "thread-b";
-  await store.refresh();
-  assert.equal(
-    calls[1],
-    "/api/workspace/diff?thread_id=thread-b&auto_root=true",
-    "thread B gets its own auto-resolve"
-  );
-  assert.equal(store.getSelectedRoot(), "/repo/b-wt");
-});
-
-// A thread navigated to before its transcript loads answers "don't know yet". Burning
-// the one-shot on that answer strands the thread on its own cwd forever.
-test("an unknown suggestion does not burn the one-shot auto-resolve", async () => {
-  const calls = [];
-  let loaded = false;
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      const data = loaded
-        ? { cwd: "/repo/wt", file_changes: [], roots: [], suggested_root: "/repo/wt", suggested_root_known: true }
-        : { cwd: "/repo/main", file_changes: [], roots: [], suggested_root: null, suggested_root_known: false };
-      return { ok: true, json: async () => ({ ok: true, data }) };
-    },
-    getThreadId: () => "thread-a",
-  });
-
-  await store.refresh();
-  assert.ok(calls[0].includes("auto_root=true"));
-  assert.equal(store.getSelectedRoot(), null, "nothing known yet → no pin");
-
-  // Transcript arrives; the next refresh must still be allowed to auto-resolve.
-  loaded = true;
-  await store.refresh();
-  assert.ok(
-    calls[1].includes("auto_root=true"),
-    "an unknown answer must leave the one-shot armed"
-  );
-  assert.equal(store.getSelectedRoot(), "/repo/wt");
-
-  // Now it is known, so the shot is spent.
-  await store.refresh();
-  assert.ok(!calls[2].includes("auto_root"));
-});
-
-// "Once per thread SWITCH", which is what the picker documents: leaving A and coming
-// back re-resolves, so a worktree the agent moved into while you were away is picked up.
-test("returning to a thread re-arms its auto-resolve", async () => {
-  const calls = [];
-  let viewed = "thread-a";
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      return {
-        ok: true,
-        json: async () => ({
-          ok: true,
-          data: { cwd: "/x", file_changes: [], roots: [], suggested_root: null, suggested_root_known: true },
-        }),
-      };
-    },
-    getThreadId: () => viewed,
-  });
-
-  await store.refresh();
-  assert.ok(calls[0].includes("auto_root=true"));
-  await store.refresh();
-  assert.ok(!calls[1].includes("auto_root"), "same thread → spent");
-
-  viewed = "thread-b";
-  await store.refresh();
-  viewed = "thread-a";
-  await store.refresh();
-  assert.ok(
-    calls[3].includes("auto_root=true"),
-    "coming back to A must re-resolve; the agent may have moved worktrees meanwhile"
-  );
-});
-
-// Auto-resolve is best effort: a failing auto request must degrade to a plain fetch
-// rather than erroring on every refresh forever.
-test("a failing auto-resolve falls back to a plain fetch instead of wedging", async () => {
-  const calls = [];
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      if (path.includes("auto_root")) throw new Error("HTTP 400");
-      return {
-        ok: true,
-        json: async () => ({ ok: true, data: { cwd: "/repo/main", file_changes: [], roots: [] } }),
-      };
-    },
-    getThreadId: () => "thread-a",
-  });
-
-  await store.refresh();
-  assert.equal(store.getState().status, "loaded", "must recover, not sit in error");
-  assert.equal(store.getState().data.cwd, "/repo/main");
-  assert.ok(!calls.at(-1).includes("auto_root"), "the retry drops the auto opt-in");
-});
-
-// The core scenario the previous re-arm test missed: A DID get an auto suggestion, so it
-// has a pin — and `wantsAuto` requires no pin, so returning to A re-sent the stale pin
-// instead of re-resolving. The agent moving wt1 → wt2 while you were away was invisible.
-test("returning to a thread re-resolves even when it was auto-pinned", async () => {
-  const calls = [];
-  let viewed = "thread-a";
-  let evidence = "/repo/wt-1";
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      return {
-        ok: true,
-        json: async () => ({
-          ok: true,
-          data: {
-            cwd: evidence,
-            file_changes: [],
-            roots: [],
-            suggested_root: path.includes("auto_root") ? evidence : null,
-            suggested_root_known: true,
-          },
-        }),
-      };
-    },
-    getThreadId: () => viewed,
-  });
-
-  await store.refresh();
-  assert.ok(calls[0].includes("auto_root=true"));
-  assert.equal(store.getSelectedRoot(), "/repo/wt-1", "auto-pinned to wt-1");
-
-  // Away to B, meanwhile the agent moves to wt-2.
-  viewed = "thread-b";
-  await store.refresh();
-  evidence = "/repo/wt-2";
-
-  viewed = "thread-a";
-  await store.refresh();
-  assert.ok(
-    calls[2].includes("auto_root=true"),
-    `returning to A must re-resolve, not resend the stale auto pin; got ${calls[2]}`
-  );
-  assert.equal(
-    store.getSelectedRoot(),
-    "/repo/wt-2",
-    "the panel must follow the agent to its new worktree"
-  );
-});
-
-// ...but a root the USER chose is theirs, and must survive leaving and returning.
-test("a manually chosen root survives a thread switch and is never re-resolved", async () => {
-  const calls = [];
-  let viewed = "thread-a";
-  const store = createWorkspaceDiffStore({
-    apiFetch: async (path) => {
-      calls.push(path);
-      return {
-        ok: true,
-        json: async () => ({
-          ok: true,
-          data: {
-            cwd: "/x",
-            file_changes: [],
-            roots: [],
-            suggested_root: "/repo/somewhere-else",
-            suggested_root_known: true,
-          },
-        }),
-      };
-    },
-    getThreadId: () => viewed,
-  });
-
-  store.setRoot("/repo/my-choice");
-  await store.refresh();
-  assert.ok(calls[0].includes("root=%2Frepo%2Fmy-choice"));
-
-  viewed = "thread-b";
-  await store.refresh();
-  viewed = "thread-a";
-  await store.refresh();
-
-  assert.ok(
-    !calls[2].includes("auto_root"),
-    "a user's own pick must not be re-resolved away"
-  );
-  assert.ok(calls[2].includes("root=%2Frepo%2Fmy-choice"));
-  assert.equal(store.getSelectedRoot(), "/repo/my-choice");
-});
 
 // The per-file +/- counts are the densest signal this panel carries, and every
 // byte needed to compute them already ships in `file_changes[].diff`. They were

@@ -235,9 +235,7 @@ fn fetch_workspace_git_context_is_read_only_and_needs_no_session_claim() {
 
 #[test]
 fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
-    // The client sends the viewed session's thread_id; bind_device must stamp the
-    // requesting device WITHOUT dropping the selector (regression guard for the
-    // "rebuild loses the field" bug the reviewer flagged).
+    // bind_device must keep thread_id. Extra `root`/`auto_root` fields parse and are ignored.
     let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
         "type": "fetch_workspace_diff",
         "thread_id": "thread-viewed",
@@ -255,24 +253,15 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
-            root,
-            auto_root,
+            view_root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-9"));
-            assert!(
-                auto_root,
-                "bind_device must preserve the auto-resolve opt-in too"
-            );
             assert_eq!(
                 thread_id.as_deref(),
                 Some("thread-viewed"),
                 "bind_device must preserve the viewed thread_id, not drop it"
             );
-            assert_eq!(
-                root.as_deref(),
-                Some("/repo/linked"),
-                "bind_device must preserve the worktree root selector too"
-            );
+            assert_eq!(view_root, None);
         }
         other => panic!("unexpected bound request: {other:?}"),
     }
@@ -286,15 +275,85 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
-            root,
-            auto_root,
+            view_root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-1"));
             assert_eq!(thread_id, None);
-            assert_eq!(root, None, "an omitted root must default to None");
-            assert!(!auto_root, "an omitted auto_root must default to false");
+            assert_eq!(view_root, None);
         }
         other => panic!("unexpected variant: {other:?}"),
+    }
+}
+
+// Not claim-gated: seeing/pinning a tree must not steal the session lease.
+#[test]
+fn thread_workspace_actions_round_trip_and_need_no_session_claim() {
+    let fetch: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "fetch_thread_workspace",
+        "thread_id": "thread-viewed"
+    }))
+    .expect("fetch_thread_workspace should parse");
+    assert_eq!(fetch.kind(), RemoteActionKind::FetchThreadWorkspace);
+    assert_eq!(
+        RemoteActionKind::FetchThreadWorkspace.as_str(),
+        "fetch_thread_workspace"
+    );
+    match fetch.bind_device("device-9".to_string()) {
+        RemoteActionRequest::FetchThreadWorkspace {
+            device_id,
+            thread_id,
+        } => {
+            assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert_eq!(thread_id, "thread-viewed");
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // The pin's payload is flattened, so `thread_id`/`cwd` sit next to `type`.
+    let pin: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "set_thread_workspace",
+        "thread_id": "thread-viewed",
+        "cwd": "/repo/linked",
+        // Client-supplied device_id must not win over bind_device.
+        "device_id": "device-someone-else"
+    }))
+    .expect("set_thread_workspace should parse");
+    assert_eq!(pin.kind(), RemoteActionKind::SetThreadWorkspace);
+    match pin.bind_device("device-9".to_string()) {
+        RemoteActionRequest::SetThreadWorkspace { device_id, input } => {
+            assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert_eq!(input.thread_id, "thread-viewed");
+            assert_eq!(input.cwd.as_deref(), Some("/repo/linked"));
+            assert_eq!(
+                input.device_id.as_deref(),
+                Some("device-9"),
+                "the INNER device_id is what pin_thread_workspace scopes on, so \
+bind_device must overwrite the client's"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // An absent `cwd` is the un-pin, not a malformed request.
+    let unpin: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "set_thread_workspace",
+        "thread_id": "thread-viewed"
+    }))
+    .expect("an un-pin carries no cwd");
+    match unpin {
+        RemoteActionRequest::SetThreadWorkspace { input, .. } => assert_eq!(input.cwd, None),
+        other => panic!("unexpected request: {other:?}"),
+    }
+
+    for action in [
+        RemoteActionKind::FetchThreadWorkspace,
+        RemoteActionKind::SetThreadWorkspace,
+    ] {
+        assert!(
+            !requires_session_claim(action),
+            "{} must not require a session claim",
+            action.as_str()
+        );
     }
 }
 
@@ -392,6 +451,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: None,
         workflows: None,
@@ -430,6 +490,7 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: None,
         workflows: None,
@@ -534,6 +595,8 @@ fn remote_action_result_size_breakdown_reports_large_thread_transcript_payloads(
         None,
         // workspace_git_context
         None,
+        // thread_workspace
+        None,
         // thread_settings
         None,
         // reviews
@@ -593,6 +656,7 @@ fn make_large_thread_transcript_plaintext() -> RemoteActionResultPlaintext {
         }),
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: None,
         workflows: None,
@@ -624,6 +688,7 @@ fn make_large_ask_user_detail_plaintext() -> RemoteActionResultPlaintext {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: None,
         workflows: None,
@@ -978,6 +1043,7 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
             reviewer_provider: Some("codex".to_string()),
             name: Some("reviewer one".to_string()),
             updated_at: Some(5),
+            cwd: None,
         }],
     };
     let result = RemoteActionResultPlaintext {
@@ -995,6 +1061,7 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: Some(reviews),
         workflows: None,
@@ -1043,6 +1110,7 @@ fn plain_dedicated_workflows_and_devices_payloads_reach_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: None,
         workflows: Some(crate::protocol::WorkflowsResponse {
@@ -1104,6 +1172,7 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: None,
         workflows: None,
@@ -1155,6 +1224,7 @@ fn plain_fetch_workspace_git_context_result_reaches_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        thread_workspace: None,
         thread_settings: None,
         workspace_git_context: Some(crate::protocol::WorkspaceGitContextView {
             cwd: "/repo/checkout".to_string(),

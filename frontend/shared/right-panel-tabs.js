@@ -81,6 +81,13 @@ export function RightPanelTabs({ store, changes, reviewer = {}, panelId = "revie
           reusableReviewers: review.reusableReviewers || [],
           reviewerThreads: review.reviewerThreads || [],
           parentThreadId: review.parentThreadId || null,
+          // The working tree comes off the store, not the review slice: it is the SAME
+          // resolved workspace the Changes tab is diffing, so the two tabs can never
+          // disagree about which tree the panel is about.
+          workspace: state.workspace || null,
+          workspaceBusy: Boolean(state.workspacePinning),
+          workspaceError: state.workspaceError || null,
+          onPinWorkspace: (path) => store.pinWorkspace?.(path),
           canRequest: Boolean(review.canRequest),
           canStartWorkflow: Boolean(review.canStartWorkflow),
           requesting: Boolean(review.requesting),

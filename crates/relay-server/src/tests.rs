@@ -664,47 +664,67 @@ fn session_errors_are_classified_by_cause_not_lumped_into_502() {
 
 // Regression guard for the layer neither side's unit tests covered: the frontend
 // builds a query string and the backend deserializes it, and NOTHING exercised the
-// contract between them. `serde_urlencoded` parses a Rust `bool` with `str::parse`,
-// which accepts only "true"/"false" — so a query built with `auto_root=1` 400s before
-// the handler ever runs, and the panel just errors.
+// contract between them. That gap is how a query built with `auto_root=1` came to 400
+// before the handler ever ran, leaving the panel showing only an error.
 #[test]
 fn workspace_diff_query_parses_the_url_the_client_actually_builds() {
     use axum::extract::Query;
 
-    // Exactly what frontend/local/workspace-diff.js emits for a first thread view.
-    let uri: Uri = "/api/workspace/diff?thread_id=thread-a&auto_root=true"
+    let uri: Uri = "/api/workspace/diff?thread_id=thread-a"
         .parse()
         .expect("uri");
     let query: Query<crate::WorkspaceDiffQuery> =
         Query::try_from_uri(&uri).expect("the client's own URL must deserialize");
     assert_eq!(query.0.thread_id.as_deref(), Some("thread-a"));
-    assert!(query.0.auto_root);
 
-    // Absent flag stays false (legacy clients).
-    let uri: Uri = "/api/workspace/diff?thread_id=thread-a"
-        .parse()
-        .expect("uri");
+    // No thread selected is the legacy global view, not a rejection.
+    let uri: Uri = "/api/workspace/diff".parse().expect("uri");
     let query: Query<crate::WorkspaceDiffQuery> = Query::try_from_uri(&uri).expect("legacy url");
-    assert!(!query.0.auto_root);
-    assert_eq!(query.0.root, None);
+    assert_eq!(query.0.thread_id, None);
 
-    // The bug this guards: "1" is NOT a urlencoded bool. Proven here so the guard
-    // above can never be "fixed" by loosening the client back to `1`.
-    let uri: Uri = "/api/workspace/diff?thread_id=t&auto_root=1"
+    // Unknown query fields must parse (stale clients) and be ignored.
+    let uri: Uri = "/api/workspace/diff?thread_id=t&root=%2Frepo%2Flinked&auto_root=true"
         .parse()
         .expect("uri");
+    let query: Query<crate::WorkspaceDiffQuery> =
+        Query::try_from_uri(&uri).expect("a stale client's URL must still deserialize");
+    assert_eq!(query.0.thread_id.as_deref(), Some("t"));
+    assert_eq!(query.0.view_root, None);
+
+    let uri: Uri = "/api/workspace/diff?thread_id=t&view_root=%2Frepo%2Fwt"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::WorkspaceDiffQuery> =
+        Query::try_from_uri(&uri).expect("view_root must deserialize");
+    assert_eq!(query.0.view_root.as_deref(), Some("/repo/wt"));
+}
+
+// thread_id is required: there is no session-less workspace.
+#[test]
+fn thread_workspace_query_requires_a_thread_and_takes_an_optional_device() {
+    use axum::extract::Query;
+
+    let uri: Uri = "/api/thread/workspace?thread_id=thread-a&device_id=phone-1"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::ThreadWorkspaceQuery> = Query::try_from_uri(&uri).expect("url");
+    assert_eq!(query.0.thread_id, "thread-a");
+    assert_eq!(query.0.device_id.as_deref(), Some("phone-1"));
+
+    // The local operator surface sends no device id.
+    let uri: Uri = "/api/thread/workspace?thread_id=thread-a"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::ThreadWorkspaceQuery> = Query::try_from_uri(&uri).expect("local url");
+    assert_eq!(query.0.device_id, None);
+
     assert!(
-        Query::<crate::WorkspaceDiffQuery>::try_from_uri(&uri).is_err(),
-        "serde_urlencoded accepts only true/false for bool — if this ever starts \
-         passing, the client may use 1 again"
+        Query::<crate::ThreadWorkspaceQuery>::try_from_uri(
+            &"/api/thread/workspace".parse::<Uri>().expect("uri")
+        )
+        .is_err(),
+        "answering with no session named would mean guessing which one"
     );
-
-    // And an explicit root round-trips url-decoded.
-    let uri: Uri = "/api/workspace/diff?thread_id=t&root=%2Frepo%2Flinked"
-        .parse()
-        .expect("uri");
-    let query: Query<crate::WorkspaceDiffQuery> = Query::try_from_uri(&uri).expect("root url");
-    assert_eq!(query.0.root.as_deref(), Some("/repo/linked"));
 }
 
 /// A rename body that cannot be parsed must be REFUSED, never read as a reset.

@@ -48,9 +48,11 @@ impl AppState {
     }
 }
 
-/// Three cheap git commands, no more. This runs every time someone moves the directory
-/// picker, so nothing here may scale with the size of the repo or its history.
-async fn collect_git_context(cwd: String, workspace: &LiveWorkspace) -> WorkspaceGitContextView {
+/// Three cheap git commands: runs on every picker move and every workspace resolve.
+pub(super) async fn collect_git_context(
+    cwd: String,
+    workspace: &LiveWorkspace,
+) -> WorkspaceGitContextView {
     let mut view = WorkspaceGitContextView {
         cwd,
         ..WorkspaceGitContextView::default()

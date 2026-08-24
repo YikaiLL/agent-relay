@@ -125,6 +125,8 @@ pub(super) enum OutboundBrokerPayload {
         /// Missing from THIS variant means dropped on the plaintext path only —
         /// the same silent-drop trap `reviews` and `projects` each fell into.
         workspace_git_context: Option<crate::protocol::WorkspaceGitContextView>,
+        /// Must be copied on the plaintext path or the picker is empty on that transport.
+        thread_workspace: Option<crate::protocol::ResolvedWorkspace>,
         /// Same plaintext-vs-sealed asymmetry as the fields above: absent here and
         /// the fork dialog's settings arrive only on sealed transport.
         thread_settings: Option<crate::protocol::ThreadSettingsView>,

@@ -90,9 +90,19 @@ export function reviewCardsForViewedThread(reviews, viewedThreadId) {
 }
 
 /**
- * The reusable reviewer threads of the viewed thread, from a `ReviewsResponse` (mirrors
- * `selectReusableReviewersForView` but over the dedicated channel's reviewer_threads).
+ * Reusable reviewer threads of the viewed thread from a `ReviewsResponse`.
+ * `workspaceCwd` drops reviewers minted in another tree.
  */
-export function reusableReviewersFromReviews(reviews, viewedThreadId, provider = null) {
-  return selectReusableReviewers(reviews?.reviewer_threads, viewedThreadId, provider);
+export function reusableReviewersFromReviews(
+  reviews,
+  viewedThreadId,
+  provider = null,
+  workspaceCwd = null
+) {
+  return selectReusableReviewers(
+    reviews?.reviewer_threads,
+    viewedThreadId,
+    provider,
+    workspaceCwd
+  );
 }

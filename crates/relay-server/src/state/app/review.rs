@@ -345,20 +345,14 @@ reviewer thread"
             )
         };
 
-        // Which working tree this review reads (see `resolve_review_workspace`). Resolved
-        // once here so an unresolvable workspace is refused with a clear message at request
-        // time, and re-resolved per round by the orchestrator.
+        // Which working tree this review reads. Resolve once so an unresolvable workspace is refused at request time.
         let review_workspace = self
             .resolve_review_workspace(&parent_thread_id, &device_id)
             .await?;
         let cwd = review_workspace.cwd.clone();
         let initial_fallback_from = review_workspace.fallback_from.clone();
 
-        // An explicitly requested reviewer thread must live IN the tree we are about to
-        // review. A provider thread cannot be relocated, so "reuse" across trees would hand it
-        // one tree's diff while its file tools read another — refuse instead of accepting with
-        // a caveat the reviewer may ignore, or (worse) silently substituting a different
-        // reviewer than the receipt promises.
+        // Reviewer must live in the tree we are about to review; a provider thread cannot relocate.
         if let Some(reviewer_id) = &reuse_thread_id {
             let reviewer_cwd = self
                 .thread_recorded_cwd(reviewer_id)
@@ -690,10 +684,7 @@ last message (no recap turn)."
                 return;
             }
 
-            // --- re-resolve the workspace, then collect a fresh diff for this round ---
-            // Re-resolved (not pinned at job creation) so a worktree removed mid-review, or
-            // an author whose fix landed in another tree, degrades or follows instead of
-            // failing the job / re-reviewing a stale tree.
+            // Re-resolve each round so a vanished/moved tree degrades or follows instead of failing.
             let workspace = match self
                 .resolve_review_workspace(&parent_thread_id, &device_id)
                 .await
@@ -1410,86 +1401,25 @@ started ({error}); finishing with round {round}'s findings."
         relay.notify();
     }
 
-    /// Which working tree a review of `parent_thread_id` should read RIGHT NOW.
-    ///
-    /// Two routine reasons that is not the thread's recorded cwd:
-    ///  - the directory no longer exists (an agent worktree removed once its work landed):
-    ///    every git command spawned there dies with ENOENT, which used to fail the whole
-    ///    job with "failed to collect the workspace diff: … (os error 2)". It degrades to a
-    ///    provably-related workspace, or refuses — never to an unrelated repo;
-    ///  - the thread has moved between the repo and a worktree, so its landed writes are in
-    ///    a different tree. Reviewing the tree it was born in means reviewing none of the
-    ///    work.
-    ///
-    /// Called per round, not pinned at job creation: a worktree that disappears — or an
-    /// author whose fix lands in another tree — mid-review must not strand the loop on a
-    /// dead or stale workspace.
+    /// Per-round so a vanished/moved worktree does not strand the loop. Delegates to `resolve_thread_workspace`.
     pub(super) async fn resolve_review_workspace(
         &self,
         parent_thread_id: &str,
         device_id: &str,
     ) -> Result<ReviewWorkspace, String> {
-        let (recorded_cwd, relay_cwd, device_scope, allowed_roots, write_evidence) = {
-            let relay = self.relay.read().await;
-            let recorded_cwd = relay
-                .thread_cwd(parent_thread_id)
-                .ok_or_else(|| "cannot resolve the thread to review".to_string())?;
-            let device_scope = relay.device_path_scope(device_id);
-            ensure_path_within_device_scope(&recorded_cwd, &device_scope, &relay.allowed_roots)?;
-            // Where this thread has actually been WRITING, lifted out under the lock as
-            // paths only (never whole tool views with their diff bodies): turning them into
-            // a working tree needs git, and the lock must not be held across an await.
-            let write_evidence = relay
-                .runtime_for_thread(parent_thread_id)
-                .map(|runtime| {
-                    landed_write_paths(
-                        runtime
-                            .transcript
-                            .iter()
-                            .rev()
-                            .take(SUGGESTED_ROOT_SCAN_LIMIT)
-                            .filter_map(|record| {
-                                record
-                                    .tool
-                                    .as_ref()
-                                    .map(|tool| (tool, record.status.as_str()))
-                            }),
-                    )
-                })
-                .unwrap_or_default();
-            (
-                recorded_cwd,
-                relay.current_cwd.clone(),
-                device_scope,
-                relay.allowed_roots.clone(),
-                write_evidence,
-            )
-        };
-
-        let (usable, fallback_from) =
-            resolve_workspace_cwd(&recorded_cwd, &relay_cwd, &device_scope, &allowed_roots)
-                .await
-                .into_readable()
-                .ok_or_else(|| {
-                    format!(
-                    "the workspace this thread ran in ({recorded_cwd}) no longer exists, and no \
-workspace related to it is available to review instead"
-                )
-                })?;
-        // Roots come from git, so all of them still exist; filtered to the requesting
-        // device's scope so a review can never be steered outside it.
-        let roots: Vec<_> = list_worktrees_in(&usable)
+        let resolved = self
+            .resolve_thread_workspace(parent_thread_id, Some(device_id))
             .await
-            .into_iter()
-            .filter(|root| path_within_device_scope(&root.path, &device_scope, &allowed_roots))
-            .collect();
-        let cwd = suggested_root_from_paths(&write_evidence, &roots)
-            .unwrap_or_else(|| usable.as_str().to_string());
+            .map_err(ThreadWorkspaceError::into_message)?;
         Ok(ReviewWorkspace {
-            cwd,
-            recorded_cwd,
-            fallback_from,
-            roots,
+            cwd: resolved.cwd,
+            recorded_cwd: resolved.birth_cwd,
+            // Only a vanished birth tree is a fallback; a live move is not "deleted".
+            fallback_from: match resolved.origin {
+                WorkspaceOrigin::Substituted { gone } => Some(gone),
+                _ => None,
+            },
+            roots: resolved.roots,
         })
     }
 

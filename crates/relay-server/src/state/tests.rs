@@ -85,6 +85,7 @@ fn test_persisted_state() -> PersistedRelayState {
         team_runs: std::collections::HashMap::new(),
         thread_forked_from: Default::default(),
         thread_promoted_from: Default::default(),
+        thread_workspace: Default::default(),
         push_subscriptions: std::collections::HashMap::new(),
         projects: Default::default(),
         thread_project_id: Default::default(),
@@ -334,6 +335,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         thread_transcript: None,
         workspace_diff: None,
         workspace_git_context: None,
+        thread_workspace: None,
         thread_settings: None,
         reviews: None,
         workflows: None,
@@ -670,6 +672,120 @@ fn thread_last_activity_survives_persistence_round_trip() {
     let mut restored = test_state();
     restored.apply_persisted(&persisted);
     assert_eq!(restored.thread_last_activity_or("thread-1", 0), 1_234);
+}
+
+// Both halves of a thread's working tree outlive the process, for different reasons.
+//
+// The PROVEN half exists precisely to outlive the process-local evidence it came from: a
+// restart is the case that matters most, because the thread has no runtime, so nothing
+// else can say it ever left the tree it was born in — and a review that assumes it didn't
+// strands the reviewer in the wrong tree.
+//
+// The PINNED half is a person's explicit choice, and nobody expects one of those to last
+// only until the next relay restart.
+#[test]
+fn a_threads_working_tree_survives_a_persistence_round_trip() {
+    const WORKTREE: &str = "/tmp/project/.claude/worktrees/feature";
+    let mut relay = test_state();
+    relay.record_proven_thread_workspace("thread-1", WORKTREE);
+    relay.set_thread_workspace("thread-2", Some("/tmp/project"));
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    assert_eq!(
+        persisted
+            .thread_workspace
+            .get("thread-1")
+            .and_then(|workspace| workspace.proven.as_deref()),
+        Some(WORKTREE),
+        "the proven tree must be written to disk"
+    );
+    assert_eq!(
+        persisted
+            .thread_workspace
+            .get("thread-2")
+            .and_then(|workspace| workspace.pinned.as_deref()),
+        Some("/tmp/project"),
+        "so must the pin"
+    );
+
+    let mut restored = test_state();
+    restored.apply_persisted(&persisted);
+    assert_eq!(
+        restored.thread_workspace("thread-1").proven.as_deref(),
+        Some(WORKTREE),
+        "and read back, or every review after a restart re-targets the birth tree"
+    );
+    assert_eq!(
+        restored.thread_workspace("thread-2").pinned.as_deref(),
+        Some("/tmp/project")
+    );
+    // The two must not be conflated in either direction: which of them holds the value is
+    // exactly how a caller tells "a user chose this" from "we worked it out".
+    assert_eq!(restored.thread_workspace("thread-1").pinned, None);
+    assert_eq!(restored.thread_workspace("thread-2").proven, None);
+}
+
+// Un-pinning a thread that was never proven anywhere must not leave an empty row behind:
+// this map is PERSISTED and (unlike its predecessor) writable by a paired device, so a
+// row nothing can reach again holds a slot forever.
+#[test]
+fn clearing_a_pin_with_nothing_else_remembered_drops_the_row() {
+    let mut relay = test_state();
+    relay.set_thread_workspace("thread-1", Some("/tmp/project"));
+    assert!(
+        relay.set_thread_workspace("thread-1", None),
+        "a real change"
+    );
+    assert!(
+        PersistedRelayState::from_relay(&relay)
+            .thread_workspace
+            .is_empty(),
+        "an emptied entry must not be persisted"
+    );
+
+    // But a thread that is still PROVEN somewhere keeps its row — un-pinning hands it
+    // back to the inference, it does not erase what the inference learned.
+    relay.record_proven_thread_workspace("thread-2", "/tmp/project/wt");
+    relay.set_thread_workspace("thread-2", Some("/tmp/project"));
+    relay.set_thread_workspace("thread-2", None);
+    assert_eq!(
+        relay.thread_workspace("thread-2").proven.as_deref(),
+        Some("/tmp/project/wt")
+    );
+}
+
+// Same reasoning as `clearing_fork_lineage_notifies_so_the_removal_reaches_disk`:
+// recording the proven tree in memory is only half the job. A review that refuses (the
+// cross-tree reuse gate) returns without touching job state, so nothing else on that path
+// notifies — and the persistence task only saves in response to a notification. Without a
+// wake here, the very fact that would have prevented the NEXT review from re-targeting the
+// birth tree is lost on restart.
+#[test]
+fn recording_a_proven_workspace_notifies_so_it_reaches_disk() {
+    let (change_tx, mut change_rx) = watch::channel(0_u64);
+    let mut relay = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    relay.notify();
+    let _ = change_rx.borrow_and_update();
+
+    relay.record_proven_thread_workspace("thread-1", "/tmp/project/.claude/worktrees/feature");
+    assert!(
+        change_rx.has_changed().expect("channel stays open"),
+        "a newly proven tree must wake the persistence task"
+    );
+
+    // The flip side: re-proving the SAME tree happens on every review round AND every
+    // diff-panel refresh now that they share one resolver, so waking every connected
+    // client for a value that did not change would be constant noise.
+    let _ = change_rx.borrow_and_update();
+    relay.record_proven_thread_workspace("thread-1", "/tmp/project/.claude/worktrees/feature");
+    assert!(
+        !change_rx.has_changed().expect("channel stays open"),
+        "re-proving the same tree must not notify"
+    );
 }
 
 #[test]
@@ -2052,6 +2168,57 @@ fn reviewer_thread_views_enrich_provider_and_label_from_summary() {
     assert_eq!(ghost.reviewer_provider, None);
     assert_eq!(ghost.name, None);
     assert_eq!(ghost.updated_at, None);
+}
+
+// The reuse picker exists to offer reviewer threads `request_review` will actually
+// accept — and it refuses any reviewer that is not in the tree under review ("that
+// reviewer thread works in X, but the work to review is in Y — start a clean reviewer
+// instead"). A reviewer's tree is NOT a property of its parent: an author that moves
+// into a worktree mid-session leaves reviewers behind in both trees, and only one of
+// them is reusable at any moment.
+//
+// So the candidate list has to say which tree each reviewer is bound to. Without it no
+// client can filter, and the picker keeps offering options that are guaranteed to be
+// refused — which is exactly what the reported "start a clean reviewer instead" dead end
+// looks like from the outside.
+//
+// Asserted on the SERIALIZED payload on purpose: the picker is a client, and all it can
+// filter on is what crosses the wire.
+#[test]
+fn reviewer_reuse_candidates_carry_the_working_tree_they_are_bound_to() {
+    let mut relay = test_state();
+    relay.upsert_thread(test_thread("reviewer-main", "/tmp/project"));
+    relay.register_reviewer_thread("reviewer-main".to_string(), "parent-1".to_string());
+    relay.upsert_thread(test_thread(
+        "reviewer-worktree",
+        "/tmp/project/.claude/worktrees/feature",
+    ));
+    relay.register_reviewer_thread("reviewer-worktree".to_string(), "parent-1".to_string());
+
+    let wire = serde_json::to_value(relay.reviewer_thread_views()).expect("views serialize");
+    let tree_of = |reviewer: &str| -> Option<String> {
+        wire.as_array()
+            .expect("a list of candidates")
+            .iter()
+            .find(|view| view["reviewer_thread_id"] == reviewer)
+            .unwrap_or_else(|| panic!("{reviewer} should be offered as a candidate"))
+            .get("cwd")
+            .and_then(|cwd| cwd.as_str())
+            .map(str::to_string)
+    };
+
+    assert_eq!(
+        tree_of("reviewer-main").as_deref(),
+        Some("/tmp/project"),
+        "a reuse candidate must name its own working tree, or a client cannot tell which \
+reviewers a review would refuse as cross-tree: {wire}"
+    );
+    assert_eq!(
+        tree_of("reviewer-worktree").as_deref(),
+        Some("/tmp/project/.claude/worktrees/feature"),
+        "two reviewers of the SAME parent can sit in different trees; the payload has to \
+tell them apart: {wire}"
+    );
 }
 
 #[test]

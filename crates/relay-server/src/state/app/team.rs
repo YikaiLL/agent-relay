@@ -1349,6 +1349,8 @@ over on resume"
                 &sandbox,
                 &effort,
             );
+            // Seats never leave the run worktree; pin so they share the same resolver.
+            relay.set_thread_workspace(&thread_id, Some(workspace.as_str()));
             // Hide only the reviewer from navigation. Hiding the dev too would put
             // it in `reviewer_thread_ids()`, which `has_working_thread_in_cwd`
             // subtracts — and the dev is the seat that WRITES, so it must stay
