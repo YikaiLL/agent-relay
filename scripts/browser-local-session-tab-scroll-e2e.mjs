@@ -48,6 +48,10 @@ function stripState(page) {
       // the only pixel allowed to.
       chromeHeight: strip.offsetHeight - strip.clientHeight,
       scrollbarWidth: style.scrollbarWidth,
+      // Scoped to `.session-tab-strip`, not :root.
+      declaredTabWidth: Math.round(
+        parseFloat(style.getPropertyValue("--session-tab-width")) || 0
+      ),
       widths: tabs.map((tab) => Math.round(tab.getBoundingClientRect().width)),
       threadIds: tabs.map((tab) => tab.dataset.threadId || ""),
       focusedThreadId:
@@ -158,7 +162,12 @@ async function run() {
     const initial = await stripState(page);
     assert.equal(initial.widths.length, SESSION_COUNT);
     const [width] = initial.widths;
-    assert.ok(width >= 190, `tabs keep their fixed width, got ${width}`);
+    assert.ok(initial.declaredTabWidth > 0, "the tab-width token must resolve");
+    assert.equal(
+      width,
+      initial.declaredTabWidth,
+      `tabs keep their declared fixed width (--session-tab-width), got ${width}`
+    );
     assert.deepEqual(
       initial.widths,
       initial.widths.map(() => width),
