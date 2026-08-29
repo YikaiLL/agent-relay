@@ -62,6 +62,16 @@ fn test_persisted_state() -> PersistedRelayState {
         ),
     );
     PersistedRelayState {
+        trusted_workspaces: Vec::new(),
+        // No budget: these fixtures are about session restoration, and a cap
+        // would gate turns in tests that have nothing to say about spending.
+        usage_daily_cap: None,
+        usage_budget_policy: String::new(),
+        // A state file written by the CURRENT version: the legacy `allowed_roots`
+        // carry-over already happened, so `allowed_roots` below stays a pure fence and
+        // these fixtures keep meaning what they meant. The migration itself is covered
+        // in `state::relay::tests`, on a file that predates the marker.
+        allowed_roots_trust_migrated: true,
         schema_version: PERSISTED_STATE_VERSION,
         active_thread_id: Some("thread-1".to_string()),
         active_controller_device_id: Some("device-a".to_string()),
@@ -82,13 +92,21 @@ fn test_persisted_state() -> PersistedRelayState {
         reviewer_threads: std::collections::HashMap::new(),
         review_jobs: std::collections::HashMap::new(),
         workflow_jobs: std::collections::HashMap::new(),
+        team_runs: std::collections::HashMap::new(),
+        orchestrator_thread_id: None,
+        orchestrator_device_id: None,
+        orchestrator_system_prompt: None,
+        orchestrator_system_prompt_version: None,
+        orchestrator_proposals: Vec::new(),
         thread_forked_from: Default::default(),
         thread_promoted_from: Default::default(),
+        thread_workspace: Default::default(),
         push_subscriptions: std::collections::HashMap::new(),
         projects: Default::default(),
         thread_project_id: Default::default(),
         thread_custom_name: Default::default(),
         projects_revision: 0,
+        transcript_clock: 0,
     }
 }
 
@@ -169,6 +187,7 @@ fn issue_test_pairing_ticket_with_scope(
 
 fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
     ThreadSummaryView {
+        workspace_trusted: false,
         id: id.to_string(),
         name: Some("Test Thread".to_string()),
         preview: "Test preview".to_string(),
@@ -254,6 +273,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         ok,
         snapshot: Some(SessionSnapshot {
             provider_fork_capabilities: Vec::new(),
+            provider_archive_capabilities: Vec::new(),
             provider_status: Vec::new(),
             revision: 7,
             transcript_revision: 3,
@@ -268,6 +288,7 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             e2ee_enabled: true,
             broker_can_read_content: false,
             audit_enabled: false,
+            beta_features_enabled: false,
             active_thread_id: Some("thread-1".to_string()),
             active_thread_promoted_from: None,
             active_controller_device_id: Some("device-a".to_string()),
@@ -282,6 +303,8 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             active_flags: Vec::new(),
             thread_activity: Vec::new(),
             current_cwd: "/tmp/project".to_string(),
+            thread_workspace_cwd: None,
+            workspace_missing: None,
             model: DEFAULT_MODEL.to_string(),
             available_models: Vec::new(),
             approval_policy: DEFAULT_APPROVAL_POLICY.to_string(),
@@ -309,6 +332,10 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
             push_vapid_public_key: None,
             projects_revision: 0,
             threads_revision: 0,
+            thread_workspaces_revision: 0,
+            teams_revision: 0,
+            orchestrator_thread_id: None,
+            orchestrator_proposals: Vec::new(),
         }),
         receipt: Some(ApprovalReceipt {
             request_id: "req-1".to_string(),
@@ -327,6 +354,9 @@ fn test_cached_remote_action_result(action_kind: &str, ok: bool) -> CachedRemote
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -386,8 +416,8 @@ fn available_models_update_default_model_and_effort() {
 #[test]
 fn switching_active_provider_drops_the_previous_providers_catalog() {
     // Repro for: "Codex shows Claude's models." Boot leaves the relay on Claude
-    // with Claude's catalog (the last-spawned provider wins `provider_name`, and
-    // the startup refresh stamps `available_models`).
+    // with Claude's catalog (Claude heads `DEFAULT_PROVIDER_PREFERENCE`, and the
+    // startup refresh stamps `available_models`).
     let mut relay = test_state();
     relay.set_provider_name("claude_code".to_string());
     relay.set_available_models(vec![ModelOptionView {
@@ -538,6 +568,7 @@ fn snapshot_strips_file_change_diffs_but_keeps_stored_diffs() {
         item_type: "turnDiff".to_string(),
         name: "turn_diff".to_string(),
         title: "Changed files".to_string(),
+        kind: None,
         detail: None,
         query: None,
         path: None,
@@ -662,6 +693,295 @@ fn thread_last_activity_survives_persistence_round_trip() {
     let mut restored = test_state();
     restored.apply_persisted(&persisted);
     assert_eq!(restored.thread_last_activity_or("thread-1", 0), 1_234);
+}
+
+// Both halves of a thread's working tree outlive the process, for different reasons.
+//
+// The PROVEN half exists precisely to outlive the process-local evidence it came from: a
+// restart is the case that matters most, because the thread has no runtime, so nothing
+// else can say it ever left the tree it was born in — and a review that assumes it didn't
+// strands the reviewer in the wrong tree.
+//
+// The PINNED half is a person's explicit choice, and nobody expects one of those to last
+// only until the next relay restart.
+#[test]
+fn a_threads_working_tree_survives_a_persistence_round_trip() {
+    const WORKTREE: &str = "/tmp/project/.claude/worktrees/feature";
+    let mut relay = test_state();
+    relay.record_proven_thread_workspace("thread-1", WORKTREE);
+    relay.set_thread_workspace("thread-2", Some("/tmp/project"));
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    assert_eq!(
+        persisted
+            .thread_workspace
+            .get("thread-1")
+            .and_then(|workspace| workspace.proven.as_deref()),
+        Some(WORKTREE),
+        "the proven tree must be written to disk"
+    );
+    assert_eq!(
+        persisted
+            .thread_workspace
+            .get("thread-2")
+            .and_then(|workspace| workspace.pinned.as_deref()),
+        Some("/tmp/project"),
+        "so must the pin"
+    );
+
+    let mut restored = test_state();
+    restored.apply_persisted(&persisted);
+    assert_eq!(
+        restored.thread_workspace("thread-1").proven.as_deref(),
+        Some(WORKTREE),
+        "and read back, or every review after a restart re-targets the birth tree"
+    );
+    assert_eq!(
+        restored.thread_workspace("thread-2").pinned.as_deref(),
+        Some("/tmp/project")
+    );
+    // The two must not be conflated in either direction: which of them holds the value is
+    // exactly how a caller tells "a user chose this" from "we worked it out".
+    assert_eq!(restored.thread_workspace("thread-1").pinned, None);
+    assert_eq!(restored.thread_workspace("thread-2").proven, None);
+}
+
+// Un-pinning a thread that was never proven anywhere must not leave an empty row behind:
+// this map is PERSISTED and (unlike its predecessor) writable by a paired device, so a
+// row nothing can reach again holds a slot forever.
+#[test]
+fn clearing_a_pin_with_nothing_else_remembered_drops_the_row() {
+    let mut relay = test_state();
+    relay.set_thread_workspace("thread-1", Some("/tmp/project"));
+    assert!(
+        relay.set_thread_workspace("thread-1", None),
+        "a real change"
+    );
+    assert!(
+        PersistedRelayState::from_relay(&relay)
+            .thread_workspace
+            .is_empty(),
+        "an emptied entry must not be persisted"
+    );
+
+    // But a thread that is still PROVEN somewhere keeps its row — un-pinning hands it
+    // back to the inference, it does not erase what the inference learned.
+    relay.record_proven_thread_workspace("thread-2", "/tmp/project/wt");
+    relay.set_thread_workspace("thread-2", Some("/tmp/project"));
+    relay.set_thread_workspace("thread-2", None);
+    assert_eq!(
+        relay.thread_workspace("thread-2").proven.as_deref(),
+        Some("/tmp/project/wt")
+    );
+}
+
+// Same reasoning as `clearing_fork_lineage_notifies_so_the_removal_reaches_disk`:
+// recording the proven tree in memory is only half the job. A review that refuses (the
+// cross-tree reuse gate) returns without touching job state, so nothing else on that path
+// notifies — and the persistence task only saves in response to a notification. Without a
+// wake here, the very fact that would have prevented the NEXT review from re-targeting the
+// birth tree is lost on restart.
+#[test]
+fn a_stale_resolver_writeback_does_not_clobber_a_newer_cwd_observation() {
+    let mut relay = test_state();
+    relay.observe_thread_cwd("thread-1", "/tmp/project/.claude/worktrees/feature");
+    let observed = relay.thread_workspace("thread-1");
+    assert_eq!(
+        observed.proven.as_deref(),
+        Some("/tmp/project/.claude/worktrees/feature")
+    );
+    let observed_at = observed.proven_at.expect("observation stamps recency");
+
+    relay.record_proven_thread_workspace_at("thread-1", "/tmp/project", 0);
+    let after = relay.thread_workspace("thread-1");
+    assert_eq!(
+        after.proven.as_deref(),
+        Some("/tmp/project/.claude/worktrees/feature"),
+        "a stale write-back must not replace a newer cwd observation"
+    );
+    assert_eq!(after.proven_at, Some(observed_at));
+}
+
+#[test]
+fn recording_a_proven_workspace_notifies_so_it_reaches_disk() {
+    let (change_tx, mut change_rx) = watch::channel(0_u64);
+    let mut relay = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    relay.notify();
+    let _ = change_rx.borrow_and_update();
+
+    relay.record_proven_thread_workspace("thread-1", "/tmp/project/.claude/worktrees/feature");
+    assert!(
+        change_rx.has_changed().expect("channel stays open"),
+        "a newly proven tree must wake the persistence task"
+    );
+
+    // The flip side: re-proving the SAME tree happens on every review round AND every
+    // diff-panel refresh now that they share one resolver, so waking every connected
+    // client for a value that did not change would be constant noise.
+    let _ = change_rx.borrow_and_update();
+    relay.record_proven_thread_workspace("thread-1", "/tmp/project/.claude/worktrees/feature");
+    assert!(
+        !change_rx.has_changed().expect("channel stays open"),
+        "re-proving the same tree must not notify"
+    );
+}
+
+#[test]
+fn promote_background_thread_carries_the_orchestrator_pin() {
+    // Observed against a real Claude session, not reasoned about. The Orchestrator
+    // opens with no prompt, so Claude defers the session and hands back a synthetic
+    // `claude-pending-…` id, which is what gets pinned. The FIRST message promotes
+    // it to a real id — and if the pin does not follow, this happens:
+    //
+    //   live_orchestrator_thread_id -> find_thread_provider(pending) -> not found
+    //     -> clears the pin (its self-heal for a deleted thread)
+    //     -> the next ensure builds a BRAND NEW Orchestrator
+    //
+    // i.e. the conversation resets after the first message, on the provider the
+    // ranking deliberately prefers. The self-heal is right; it just cannot tell a
+    // promoted thread from a deleted one unless promotion says so.
+    let (change_tx, _rx) = watch::channel(0_u64);
+    let mut relay = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    relay.orchestrator_thread_id = Some("claude-pending-7".to_string());
+
+    relay.promote_background_thread("claude-pending-7", "real-session-id");
+
+    assert_eq!(
+        relay.orchestrator_thread_id.as_deref(),
+        Some("real-session-id"),
+        "the pin must follow its thread, or the Orchestrator resets every first turn"
+    );
+}
+
+#[test]
+fn promotion_keeps_a_reviewed_parent_review_locked() {
+    // Promotion re-keys the reviewer id, workflow step threads and team seats — but
+    // the PARENT id of a review/workflow is the same class of pointer and was left
+    // behind. A review of a Claude session that has never been messaged promotes that
+    // session on its first (recap) turn, and the lock is what stops the user typing
+    // into a thread the orchestrator is driving. Keyed to a dead id, it evaporates.
+    let mut relay = test_state();
+    let job = crate::state::ReviewJob::new(
+        "review-1".to_string(),
+        "claude-pending-1".to_string(),
+        "claude_code".to_string(),
+        "codex".to_string(),
+        None,
+        crate::state::ReviewMode::CleanThread,
+        "/tmp/project".to_string(),
+        "device-1".to_string(),
+        None,
+        1,
+    );
+    relay.insert_review_job(job);
+    assert!(relay.is_thread_review_locked("claude-pending-1"));
+
+    relay.promote_background_thread("claude-pending-1", "real-1");
+
+    assert!(
+        relay.is_thread_review_locked("real-1"),
+        "the reviewed thread must stay locked across its own promotion"
+    );
+    assert!(
+        !relay.is_thread_review_locked("claude-pending-1"),
+        "and the dead placeholder must not stay locked"
+    );
+}
+
+#[test]
+fn registering_a_thread_from_a_working_summary_does_not_make_it_working() {
+    // `ThreadRuntime::new` copies the summary's status VERBATIM, so the settling is
+    // done by the `upsert_thread` that `register_background_thread` ends with. A
+    // Claude deferred-start placeholder is reported `"active"` before it has ever
+    // had a turn, so if that upsert stops settling, registration alone leaves a
+    // permanently-working ghost: `update_session_settings` refuses a working thread,
+    // and the review's uncertain-start cleanup tries to interrupt an SDK session
+    // that was never created and can leave the job stuck in `Blocked`.
+    //
+    // Upserting the same summary again (a list refresh) must not revive it either.
+    let mut relay = test_state();
+    let mut pending = test_thread("claude-pending-1", "/tmp/project");
+    pending.provider = "claude_code".to_string();
+    pending.source = "claude_code".to_string();
+    pending.status = "active".to_string();
+    relay.register_background_thread(
+        pending.clone(),
+        "/tmp/project",
+        "claude-sonnet-4-6",
+        "on-request",
+        "workspace-write",
+        "medium",
+    );
+
+    assert!(
+        !relay
+            .runtime_for_thread("claude-pending-1")
+            .expect("the runtime is registered")
+            .is_working(),
+        "a placeholder that has never had a turn must not register as working"
+    );
+
+    relay.upsert_thread(pending);
+    assert!(
+        !relay
+            .runtime_for_thread("claude-pending-1")
+            .expect("the runtime is still there")
+            .is_working(),
+        "re-reading the same working summary must not revive it either"
+    );
+}
+
+#[test]
+fn a_summary_still_cannot_mark_an_idle_turnless_thread_working() {
+    // The other half of the same rule, and the reason it exists: a provider
+    // list/read row is NOT a liveness signal. A settled runtime with no live turn
+    // must stay settled however working the summary claims to be, or a stale
+    // `status.type` from a Codex read/list resurrects a finished turn.
+    let mut relay = test_state();
+    relay.register_background_thread(
+        test_thread("thread-1", "/tmp/project"),
+        "/tmp/project",
+        "gpt-5-codex",
+        "on-request",
+        "workspace-write",
+        "medium",
+    );
+    relay.set_thread_status("thread-1", "idle".to_string(), Vec::new());
+
+    let mut working = test_thread("thread-1", "/tmp/project");
+    working.status = "active".to_string();
+    relay.upsert_thread(working);
+
+    assert!(
+        !relay
+            .runtime_for_thread("thread-1")
+            .expect("runtime present")
+            .is_working(),
+        "a summary must never resurrect a settled, turn-less thread"
+    );
+}
+
+#[test]
+fn promote_background_thread_leaves_an_unrelated_orchestrator_pin_alone() {
+    let (change_tx, _rx) = watch::channel(0_u64);
+    let mut relay = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    relay.orchestrator_thread_id = Some("orch-thread".to_string());
+
+    relay.promote_background_thread("claude-pending-7", "real-session-id");
+
+    assert_eq!(relay.orchestrator_thread_id.as_deref(), Some("orch-thread"));
 }
 
 #[test]
@@ -1312,13 +1632,22 @@ fn clear_active_session_clears_selected_runtime_mirror() {
         "turn-1".to_string(),
     );
     assert_eq!(relay.snapshot().transcript.len(), 1);
+    let reported_before = relay.snapshot().transcript_revision;
 
     relay.clear_active_session();
 
     let snapshot = relay.snapshot();
     assert!(snapshot.active_thread_id.is_none());
     assert!(snapshot.transcript.is_empty());
-    assert_eq!(snapshot.transcript_revision, 0);
+    // The empty transcript above is the cleared mirror. Its revision, though, may
+    // not be reported below one already issued — the snapshot falls back to the
+    // clock, not the cleared mirror. A snapshot is how a client repairs, and one
+    // that moves backwards gets rejected.
+    assert!(
+        snapshot.transcript_revision >= reported_before,
+        "clearing reported revision {} after {reported_before}",
+        snapshot.transcript_revision
+    );
 }
 
 #[test]
@@ -1539,6 +1868,32 @@ fn normalize_cwd_collapses_parent_segments_for_missing_paths() {
 }
 
 #[test]
+fn nearest_enumerated_root_picks_the_longest_containing_worktree() {
+    let roots = ["/repo", "/repo/.claude/worktrees/feature"];
+    assert_eq!(
+        nearest_enumerated_root("/repo", &roots).as_deref(),
+        Some("/repo")
+    );
+    assert_eq!(
+        nearest_enumerated_root("/repo/src", &roots).as_deref(),
+        Some("/repo")
+    );
+    assert_eq!(
+        nearest_enumerated_root("/repo/.claude/worktrees/feature", &roots).as_deref(),
+        Some("/repo/.claude/worktrees/feature")
+    );
+    assert_eq!(
+        nearest_enumerated_root("/repo/.claude/worktrees/feature/src", &roots).as_deref(),
+        Some("/repo/.claude/worktrees/feature")
+    );
+    assert_eq!(nearest_enumerated_root("/other", &roots), None);
+    assert!(!matches!(
+        nearest_enumerated_root("/repo", &roots).as_deref(),
+        Some("/repo/.claude/worktrees/feature")
+    ));
+}
+
+#[test]
 fn ensure_path_within_allowed_roots_rejects_parent_dir_escape_for_missing_paths() {
     let unique = format!(
         "agent-relay-allowed-roots-{}-{}",
@@ -1619,6 +1974,7 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
         status: "completed".to_string(),
         turn_id: Some("turn-1".to_string()),
         tool: None,
+        seq: None,
     });
     relay
         .pending_approvals
@@ -1645,9 +2001,12 @@ fn persisted_state_round_trip_drops_ephemeral_fields() {
     assert_eq!(restored.paired_devices.len(), 0);
     assert_eq!(restored.transcript.len(), 0);
     assert_eq!(restored.logs.len(), 1);
+    // The point is that a restore resets the log to exactly the fresh boot line,
+    // not what that line says — the copy is provider-neutral now that a relay
+    // can be running only Cursor.
     assert_eq!(
         restored.logs[0].message,
-        "Relay booted. Waiting for Codex app-server."
+        "Relay booted. Waiting for an agent provider."
     );
     assert_eq!(restored.allowed_roots, vec!["/tmp/project".to_string()]);
     assert_eq!(
@@ -2032,6 +2391,57 @@ fn reviewer_thread_views_enrich_provider_and_label_from_summary() {
     assert_eq!(ghost.reviewer_provider, None);
     assert_eq!(ghost.name, None);
     assert_eq!(ghost.updated_at, None);
+}
+
+// The reuse picker exists to offer reviewer threads `request_review` will actually
+// accept — and it refuses any reviewer that is not in the tree under review ("that
+// reviewer thread works in X, but the work to review is in Y — start a clean reviewer
+// instead"). A reviewer's tree is NOT a property of its parent: an author that moves
+// into a worktree mid-session leaves reviewers behind in both trees, and only one of
+// them is reusable at any moment.
+//
+// So the candidate list has to say which tree each reviewer is bound to. Without it no
+// client can filter, and the picker keeps offering options that are guaranteed to be
+// refused — which is exactly what the reported "start a clean reviewer instead" dead end
+// looks like from the outside.
+//
+// Asserted on the SERIALIZED payload on purpose: the picker is a client, and all it can
+// filter on is what crosses the wire.
+#[test]
+fn reviewer_reuse_candidates_carry_the_working_tree_they_are_bound_to() {
+    let mut relay = test_state();
+    relay.upsert_thread(test_thread("reviewer-main", "/tmp/project"));
+    relay.register_reviewer_thread("reviewer-main".to_string(), "parent-1".to_string());
+    relay.upsert_thread(test_thread(
+        "reviewer-worktree",
+        "/tmp/project/.claude/worktrees/feature",
+    ));
+    relay.register_reviewer_thread("reviewer-worktree".to_string(), "parent-1".to_string());
+
+    let wire = serde_json::to_value(relay.reviewer_thread_views()).expect("views serialize");
+    let tree_of = |reviewer: &str| -> Option<String> {
+        wire.as_array()
+            .expect("a list of candidates")
+            .iter()
+            .find(|view| view["reviewer_thread_id"] == reviewer)
+            .unwrap_or_else(|| panic!("{reviewer} should be offered as a candidate"))
+            .get("cwd")
+            .and_then(|cwd| cwd.as_str())
+            .map(str::to_string)
+    };
+
+    assert_eq!(
+        tree_of("reviewer-main").as_deref(),
+        Some("/tmp/project"),
+        "a reuse candidate must name its own working tree, or a client cannot tell which \
+reviewers a review would refuse as cross-tree: {wire}"
+    );
+    assert_eq!(
+        tree_of("reviewer-worktree").as_deref(),
+        Some("/tmp/project/.claude/worktrees/feature"),
+        "two reviewers of the SAME parent can sit in different trees; the payload has to \
+tell them apart: {wire}"
+    );
 }
 
 #[test]
@@ -2595,9 +3005,25 @@ fn pairing_ticket_includes_scannable_broker_link() {
         Some(60),
     );
 
-    assert!(ticket
-        .pairing_url
-        .starts_with("https://relay.example.com/?pairing="));
+    // SECURITY: the payload carries the pairing_secret, which is the ONLY key
+    // sealing the pairing handshake — the envelope that ships payload_secret and
+    // the refresh tokens. It must ride in the URL fragment, never the query: the
+    // broker serves this very page, so a query string puts the secret in its
+    // request line (and in any proxy/CDN access log in front of it), letting the
+    // broker decrypt a handshake that `private` mode promises it cannot read.
+    // Fragments are never sent to the server.
+    assert!(
+        ticket
+            .pairing_url
+            .starts_with("https://relay.example.com/#pairing="),
+        "pairing payload must ride in the fragment, got {}",
+        ticket.pairing_url
+    );
+    assert!(
+        !ticket.pairing_url.contains("?pairing="),
+        "pairing payload must never appear in the query string, got {}",
+        ticket.pairing_url
+    );
     assert!(ticket.pairing_qr_svg.contains("<svg"));
 
     let encoded = ticket
@@ -3237,7 +3663,19 @@ fn active_running_thread_cannot_be_archived() {
         .can_archive_thread("thread-1")
         .expect_err("running active thread should not be archivable");
 
-    assert!(error.contains("Codex is still running"));
+    // The `cannot archive` prefix is what the HTTP handler keys its 400-vs-502
+    // split on, so it is part of the contract rather than prose.
+    assert!(
+        error.starts_with("cannot archive"),
+        "the refusal must stay classifiable as a bad request, got: {error}"
+    );
+    assert!(error.contains("still running"));
+    // Every provider reaches this guard, so naming one would tell most users
+    // their session is held by an agent they are not running.
+    assert!(
+        !error.contains("Codex"),
+        "the refusal must not name one vendor, got: {error}"
+    );
     assert_eq!(relay.threads.len(), 1);
     assert_eq!(relay.threads[0].id, "thread-1");
 }
@@ -3270,7 +3708,17 @@ fn active_running_thread_cannot_be_deleted() {
         .can_delete_thread("thread-1")
         .expect_err("running active thread should not be deletable");
 
-    assert!(error.contains("Codex is still running"));
+    // Same contract as the archive guard above: the prefix drives the status
+    // code, and the message must not name a vendor every provider is not.
+    assert!(
+        error.starts_with("cannot permanently delete"),
+        "the refusal must stay classifiable as a bad request, got: {error}"
+    );
+    assert!(error.contains("still running"));
+    assert!(
+        !error.contains("Codex"),
+        "the refusal must not name one vendor, got: {error}"
+    );
     assert_eq!(relay.threads.len(), 1);
     assert_eq!(relay.threads[0].id, "thread-1");
 }
@@ -3795,6 +4243,85 @@ fn repeated_pairing_request_rebinds_to_latest_broker_peer() {
 }
 
 #[test]
+fn a_second_device_cannot_steal_a_pending_pairing_request() {
+    // SECURITY: the rebind in `repeated_pairing_request_rebinds_to_latest_broker
+    // _peer` exists so ONE device can retry over a new broker peer. It must not
+    // also let a DIFFERENT device (different Ed25519 verify key) overwrite the
+    // request the operator is about to approve: whoever holds the QR payload can
+    // then wait for the victim to register, register last, and receive the
+    // approval — plus the payload_secret and refresh tokens that come with it.
+    let mut relay = test_state();
+    let ticket = issue_test_pairing_ticket(
+        &mut relay,
+        "ws://127.0.0.1:8789",
+        "room-a",
+        "relay-a",
+        Some(60),
+    );
+
+    relay
+        .register_pairing_request(
+            &ticket.pairing_id,
+            Some("victim-phone".to_string()),
+            Some("Victim Phone".to_string()),
+            "surface-victim",
+            "victim-verify-key".to_string(),
+            100,
+        )
+        .expect("the victim's pairing request should register");
+
+    let stolen = relay.register_pairing_request(
+        &ticket.pairing_id,
+        Some("victim-phone".to_string()),
+        Some("Victim Phone".to_string()),
+        "surface-attacker",
+        "attacker-verify-key".to_string(),
+        101,
+    );
+
+    assert!(
+        stolen.is_err(),
+        "a request carrying a different verify key must not rebind an existing \
+         pending pairing request, got {stolen:?}"
+    );
+
+    let result = relay
+        .decide_pairing_request(&ticket.pairing_id, true, None, 102)
+        .expect("approval should still resolve the victim's request");
+    assert_eq!(
+        result.target_peer_id, "surface-victim",
+        "the approval must land on the device the operator actually saw"
+    );
+    assert_eq!(
+        result
+            .device
+            .as_ref()
+            .expect("approved device")
+            .fingerprint
+            .as_deref(),
+        device_fingerprint_for("victim-verify-key").as_deref(),
+        "the paired device must be keyed to the victim's verify key"
+    );
+}
+
+fn device_fingerprint_for(verify_key: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(verify_key)
+        .unwrap_or_else(|_| verify_key.as_bytes().to_vec());
+    let digest = Sha256::digest(&bytes);
+    let mut fingerprint = String::new();
+    for (index, byte) in digest.iter().take(8).enumerate() {
+        if index > 0 {
+            fingerprint.push(':');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    Some(fingerprint)
+}
+
+#[test]
 fn completed_pairing_can_replay_result_to_reconnected_peer() {
     let mut relay = test_state();
     let ticket = issue_test_pairing_ticket(
@@ -3864,8 +4391,9 @@ fn completed_pairing_can_carry_client_directory_grant() {
             &ticket.pairing_id,
             Some("relay-directory".to_string()),
             Some("Demo Relay".to_string()),
-            Some("client-directory".to_string()),
-            Some("client-refresh-directory".to_string()),
+            Some("claim-directory".to_string()),
+            Some("nonce-directory".to_string()),
+            Some(900),
         )
         .expect("client directory grant should attach");
 
@@ -3876,11 +4404,12 @@ fn completed_pairing_can_carry_client_directory_grant() {
 
     assert_eq!(replay.relay_id.as_deref(), Some("relay-directory"));
     assert_eq!(replay.relay_label.as_deref(), Some("Demo Relay"));
-    assert_eq!(replay.client_id.as_deref(), Some("client-directory"));
+    assert_eq!(replay.client_claim_id.as_deref(), Some("claim-directory"));
     assert_eq!(
-        replay.client_refresh_token.as_deref(),
-        Some("client-refresh-directory")
+        replay.client_claim_nonce.as_deref(),
+        Some("nonce-directory")
     );
+    assert_eq!(replay.client_claim_expires_at, Some(900));
 }
 
 #[test]
@@ -4039,6 +4568,24 @@ fn ensure_path_within_device_scope_passes_when_device_scope_empty() {
     );
 
     std::fs::remove_dir_all(&root).expect("temp scope dir should be removable");
+}
+
+#[test]
+fn prepare_pairing_ticket_defaults_to_a_three_minute_approval_window() {
+    // The default TTL is the whole approval budget: it has to cover the human
+    // walking from phone to laptop and hitting Approve. 30s was not enough.
+    let mut relay = test_state();
+    let before = unix_now();
+    let prepared = relay
+        .prepare_pairing_ticket(None, Vec::new())
+        .expect("pairing ticket should prepare");
+    let after = unix_now();
+
+    assert!(
+        prepared.expires_at >= before + 180 && prepared.expires_at <= after + 180,
+        "default pairing TTL should be 180s (3 minutes); got expires_at={} with now in {before}..={after}",
+        prepared.expires_at
+    );
 }
 
 #[test]
@@ -4332,6 +4879,7 @@ mod paged_history_merge_tests {
     fn make_runtime() -> ThreadRuntime {
         ThreadRuntime::new(
             crate::protocol::ThreadSummaryView {
+                workspace_trusted: false,
                 id: "thread-1".to_string(),
                 name: None,
                 preview: String::new(),
@@ -4350,6 +4898,7 @@ mod paged_history_merge_tests {
             "workspace-write",
             "medium",
             1,
+            0,
         )
     }
 
@@ -4358,6 +4907,7 @@ mod paged_history_merge_tests {
             item_type: item_type.to_string(),
             name: name.to_string(),
             title: name.to_string(),
+            kind: None,
             detail: None,
             query: None,
             path: None,
@@ -4411,6 +4961,7 @@ mod paged_history_merge_tests {
         let mut runtime = make_runtime();
         let _unused = ThreadRuntime::new(
             crate::protocol::ThreadSummaryView {
+                workspace_trusted: false,
                 id: "thread-1".to_string(),
                 name: None,
                 preview: String::new(),
@@ -4429,6 +4980,7 @@ mod paged_history_merge_tests {
             "workspace-write",
             "medium",
             1,
+            0,
         );
 
         // Newest page first: only the tool_result was on it.
@@ -5462,4 +6014,602 @@ mod watched_threads {
             "a revoked device must not remain a delta target"
         );
     }
+
+    /// A revoked device must not keep acting as the Orchestrator across restarts.
+    #[test]
+    fn revoking_the_orchestrator_device_clears_the_pin() {
+        let mut relay = test_state();
+        online_paired_device(&mut relay, "phone", "peer-phone");
+        relay.orchestrator_thread_id = Some("orch-thread".to_string());
+        relay.orchestrator_device_id = Some("phone".to_string());
+        relay.orchestrator_system_prompt = Some("You are the Orchestrator.".to_string());
+        relay.orchestrator_system_prompt_version = Some(2);
+
+        assert!(relay.revoke_paired_device("phone", 100));
+
+        assert!(relay.orchestrator_thread_id.is_none());
+        assert!(relay.orchestrator_device_id.is_none());
+        assert!(relay.orchestrator_system_prompt.is_none());
+        assert!(relay.orchestrator_system_prompt_version.is_none());
+        assert!(
+            relay.orchestrator_session_options("orch-thread").is_none(),
+            "a revoked acting device must not keep Orchestrator MCP authority"
+        );
+    }
+
+    #[test]
+    fn orchestrator_session_options_allow_unpaired_local_device_id() {
+        let mut relay = test_state();
+        relay.orchestrator_thread_id = Some("orch-thread".to_string());
+        relay.orchestrator_device_id = Some("local-browser-uuid".to_string());
+        relay.orchestrator_system_prompt = Some("You are the Orchestrator.".to_string());
+
+        assert_eq!(
+            relay.orchestrator_session_options("orch-thread"),
+            Some((
+                "local-browser-uuid".to_string(),
+                Some("You are the Orchestrator.".to_string())
+            )),
+            "local browser operators are not in paired_devices and must still get tools"
+        );
+    }
+
+    #[test]
+    fn orchestrator_session_options_reject_explicitly_revoked_device() {
+        use crate::protocol::DeviceLifecycleState;
+        use crate::state::DeviceRecord;
+
+        let mut relay = test_state();
+        relay.orchestrator_thread_id = Some("orch-thread".to_string());
+        relay.orchestrator_device_id = Some("phone".to_string());
+        relay.orchestrator_system_prompt = Some("You are the Orchestrator.".to_string());
+        relay.device_records.insert(
+            "phone".to_string(),
+            DeviceRecord {
+                device_id: "phone".to_string(),
+                label: "Phone".to_string(),
+                lifecycle_state: DeviceLifecycleState::Revoked,
+                created_at: 1,
+                state_changed_at: 100,
+                last_seen_at: None,
+                last_peer_id: None,
+                device_verify_key: String::new(),
+                broker_join_ticket_expires_at: None,
+                path_scope: Vec::new(),
+            },
+        );
+
+        assert!(
+            relay.orchestrator_session_options("orch-thread").is_none(),
+            "explicitly revoked acting devices must not receive Orchestrator tools"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript revision: one shared monotonic clock.
+//
+// The transcript revision is the client's only proof that it has not missed a
+// delta: it accepts a delta when `base_revision` matches the revision it holds,
+// and drops one whose `revision` is below it (frontend/remote/session-ops.js
+// `shouldAcceptTranscriptRevision`). That contract only holds if the revision a
+// thread reports NEVER goes backwards. These tests pin that invariant at each
+// place the relay hands out a revision.
+// ---------------------------------------------------------------------------
+
+/// Every revision the relay issues must be unique across threads, because they
+/// all have to come from one clock. Two threads minting their own 1, 2, 3...
+/// means a client that switches threads can hold a revision the other thread is
+/// about to re-issue.
+#[test]
+fn transcript_revisions_are_unique_across_threads() {
+    let mut relay = test_state();
+    let mut seen = std::collections::HashSet::new();
+
+    for _ in 0..3 {
+        for thread_id in ["thread-a", "thread-b"] {
+            let (_base, revision) = relay.bump_thread_transcript_revision(thread_id);
+            assert!(
+                seen.insert(revision),
+                "revision {revision} was handed out twice (second time to {thread_id}); \
+                 per-thread counters are not one shared clock"
+            );
+        }
+    }
+}
+
+/// A thread's revision must survive a relay restart. A browser tab that held
+/// revision N before the restart drops every delta below N, so a restored
+/// runtime that restarts at 0 goes silently deaf until the counter climbs back.
+#[test]
+fn transcript_revision_survives_a_relay_restart() {
+    let mut relay = test_state();
+    for _ in 0..5 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let before_restart = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+    assert!(before_restart > 0, "precondition: revision advanced");
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+
+    let (_base, after_restart) = restored.bump_thread_transcript_revision("thread-1");
+    assert!(
+        after_restart > before_restart,
+        "after a restart thread-1 issued revision {after_restart}, which is not above \
+         the {before_restart} a live client still holds — every delta up to \
+         {before_restart} will be dropped as stale"
+    );
+}
+
+/// Re-reading history rebuilds the runtime. That must not rewind the revision:
+/// the client needs to see the number move FORWARD so it repairs the gap, rather
+/// than see it move backward and silently discard the deltas that follow.
+#[test]
+fn rehydrating_a_thread_does_not_rewind_its_transcript_revision() {
+    let mut relay = test_state();
+    for _ in 0..4 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let before = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+    assert!(before > 0, "precondition: revision advanced");
+
+    // Drop the runtime the way an eviction / cold re-read does, then let the
+    // relay rebuild it from a fresh provider history read.
+    relay.runtimes.remove("thread-1");
+    relay.load_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-1", "/tmp/project"),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+            transcript: vec![TranscriptEntryView {
+                item_id: Some("item-1".to_string()),
+                kind: TranscriptEntryKind::AgentText,
+                text: Some("hello".to_string()),
+                status: "completed".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                tool: None,
+                content_state: crate::protocol::TranscriptContentState::Full,
+            }],
+        },
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        DEFAULT_MODEL,
+        "device-a",
+    );
+
+    let after = relay
+        .runtime_for_thread("thread-1")
+        .expect("rehydrated runtime")
+        .transcript_revision;
+    assert!(
+        after >= before,
+        "rehydration rewound thread-1 from revision {before} to {after}; a client \
+         holding {before} would drop every delta that follows"
+    );
+}
+
+/// `merge_fresh_history` mutates the transcript, so it has to draw its new
+/// revision from the same clock as every other mutation. If it bumps a private
+/// per-thread counter it can mint a revision another thread already used.
+#[test]
+fn merging_fresh_history_draws_from_the_shared_revision_clock() {
+    let mut relay = test_state();
+    // Advance the shared clock well past thread-1's own counter using a
+    // different thread.
+    let mut highest = 0;
+    for _ in 0..6 {
+        let (_base, revision) = relay.bump_thread_transcript_revision("thread-other");
+        highest = highest.max(revision);
+    }
+    let (_base, thread_one) = relay.bump_thread_transcript_revision("thread-1");
+    highest = highest.max(thread_one);
+
+    // A history re-read that genuinely adds an entry must move the revision
+    // forward relative to everything issued so far.
+    relay.load_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-1", "/tmp/project"),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+            transcript: vec![TranscriptEntryView {
+                item_id: Some("fresh-item".to_string()),
+                kind: TranscriptEntryKind::AgentText,
+                text: Some("fresh".to_string()),
+                status: "completed".to_string(),
+                turn_id: Some("turn-2".to_string()),
+                tool: None,
+                content_state: crate::protocol::TranscriptContentState::Full,
+            }],
+        },
+        DEFAULT_APPROVAL_POLICY,
+        DEFAULT_SANDBOX,
+        DEFAULT_EFFORT,
+        DEFAULT_MODEL,
+        "device-a",
+    );
+
+    let merged = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+    assert!(
+        merged > highest,
+        "merge_fresh_history issued revision {merged}, but the shared clock had \
+         already handed out {highest} — it is bumping a private counter"
+    );
+}
+
+/// Every delta must carry `base_revision < revision`. The pair is a *chain*: the
+/// client matches `base_revision` against what it holds and then adopts
+/// `revision`. A bump that hands back a revision at or below its own base tells
+/// the client to move backwards, and it responds by discarding the delta.
+#[test]
+fn a_bump_always_reports_a_base_below_the_revision_it_issues() {
+    let mut relay = test_state();
+
+    // Includes the very first bump on a thread with no runtime yet — that path
+    // has to create the runtime AND issue a revision, so it is the easiest one to
+    // get out of order.
+    for round in 0..3 {
+        for thread_id in ["thread-a", "thread-b"] {
+            let (base_revision, revision) = relay.bump_thread_transcript_revision(thread_id);
+            assert!(
+                base_revision < revision,
+                "round {round}: {thread_id} issued base_revision {base_revision} with \
+                 revision {revision}; a delta that does not move forward is dropped \
+                 by the client"
+            );
+        }
+    }
+}
+
+/// Restoring a relay whose ACTIVE thread has no runtime yet must not seed that
+/// thread at 0. The active thread is rebuilt lazily by
+/// `materialize_selected_runtime_from_fields`, which runs in the window between
+/// `apply_persisted` and `restore_persisted_session` — a window any provider
+/// event or client poll can land in.
+#[test]
+fn restoring_an_active_thread_does_not_seed_it_below_the_clock() {
+    let mut relay = test_state();
+    relay.active_thread_id = Some("thread-1".to_string());
+    for _ in 0..5 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let before_restart = relay
+        .runtime_for_thread("thread-1")
+        .expect("runtime")
+        .transcript_revision;
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+    assert_eq!(
+        restored.active_thread_id.as_deref(),
+        Some("thread-1"),
+        "precondition: the active thread was restored"
+    );
+
+    // Lazily materialize it, the way a provider event arriving before
+    // `restore_persisted_session` would.
+    let seeded = restored
+        .ensure_runtime_for_thread("thread-1")
+        .transcript_revision;
+    assert!(
+        seeded >= before_restart,
+        "the restored active thread was seeded at revision {seeded}, below the \
+         {before_restart} a surviving client still holds — that client rejects both \
+         the deltas AND the snapshot that would have repaired it"
+    );
+}
+
+/// Persistence is debounced, and several paths advance the clock without
+/// scheduling a save at all. So the persisted value must sit AHEAD of the
+/// revisions already issued: a hard crash must make the clock skip forward, never
+/// replay numbers it has already handed out.
+#[test]
+fn a_crash_after_the_last_save_does_not_replay_issued_revisions() {
+    let mut relay = test_state();
+    for _ in 0..3 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+
+    // The last successful save.
+    let persisted = PersistedRelayState::from_relay(&relay);
+
+    // The relay keeps running and keeps issuing revisions, then dies before the
+    // next save lands.
+    let mut highest_issued = 0;
+    for _ in 0..100 {
+        let (_base, revision) = relay.bump_thread_transcript_revision("thread-1");
+        highest_issued = highest_issued.max(revision);
+    }
+
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+    let (_base, first_after_restart) = restored.bump_thread_transcript_revision("thread-1");
+    assert!(
+        first_after_restart > highest_issued,
+        "after a crash the relay re-issued revision {first_after_restart}, but \
+         {highest_issued} had already gone out to clients — the persisted clock \
+         needs headroom for revisions minted since the last save"
+    );
+}
+
+/// Promoting a deferred thread onto its real id must not rewind the real id's
+/// revision. `turn_revision` is already max-folded here; the transcript revision
+/// has to be too.
+#[test]
+fn promoting_a_background_thread_does_not_rewind_the_real_threads_revision() {
+    let mut relay = test_state();
+    // The pending runtime was created first, so it sits BEHIND on the shared clock.
+    relay.bump_thread_transcript_revision("claude-pending-1");
+    // The event stream then built a real-id runtime and advanced it past pending.
+    for _ in 0..4 {
+        relay.bump_thread_transcript_revision("real-id");
+    }
+    let real_before = relay
+        .runtime_for_thread("real-id")
+        .expect("real runtime")
+        .transcript_revision;
+    // Pending carries the longer transcript, so promotion keeps pending's runtime.
+    relay
+        .runtimes
+        .get_mut("claude-pending-1")
+        .expect("pending runtime")
+        .transcript = vec![
+        TranscriptRecord {
+            item_id: "a".to_string(),
+            kind: TranscriptEntryKind::AgentText,
+            text: Some("a".to_string()),
+            status: "completed".to_string(),
+            turn_id: None,
+            tool: None,
+            seq: None,
+        },
+        TranscriptRecord {
+            item_id: "b".to_string(),
+            kind: TranscriptEntryKind::AgentText,
+            text: Some("b".to_string()),
+            status: "completed".to_string(),
+            turn_id: None,
+            tool: None,
+            seq: None,
+        },
+    ];
+
+    relay.promote_background_thread("claude-pending-1", "real-id");
+
+    let real_after = relay
+        .runtime_for_thread("real-id")
+        .expect("promoted runtime")
+        .transcript_revision;
+    assert!(
+        real_after >= real_before,
+        "promotion rewound real-id from revision {real_before} to {real_after}; a \
+         client tracking real-id would discard everything until the clock caught up"
+    );
+}
+
+/// `restore_thread_data` restores the clock itself, so it must do that BEFORE it
+/// draws a revision — otherwise the restored thread is seeded from a clock that
+/// has not yet resumed.
+#[test]
+fn restore_thread_data_resumes_the_clock_before_it_draws_from_it() {
+    let mut relay = test_state();
+    let mut persisted = test_persisted_state();
+    persisted.transcript_clock = 900;
+
+    relay.restore_thread_data(
+        ThreadSyncData {
+            thread: test_thread("thread-1", "/tmp/project"),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+            transcript: Vec::new(),
+        },
+        &persisted,
+    );
+
+    let seeded = relay
+        .runtime_for_thread("thread-1")
+        .expect("restored runtime")
+        .transcript_revision;
+    assert!(
+        seeded > 900,
+        "the restored thread was seeded at revision {seeded}, at or below the \
+         persisted clock high-water mark of 900"
+    );
+}
+
+/// `snapshot()` falls back to the mirror when the active thread has no runtime,
+/// and the mirror is 0 on a freshly restored relay. A snapshot is the client's
+/// repair path, so one reporting a revision below what the client holds gets
+/// rejected — taking the repair with it.
+#[test]
+fn a_snapshot_never_reports_a_revision_below_one_already_issued() {
+    let mut relay = test_state();
+    relay.active_thread_id = Some("thread-1".to_string());
+    for _ in 0..5 {
+        relay.bump_thread_transcript_revision("thread-1");
+    }
+    let reported_before = relay.snapshot().transcript_revision;
+    assert!(reported_before > 0, "precondition: a revision was reported");
+
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut restored = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    restored.apply_persisted(&persisted);
+
+    let reported_after = restored.snapshot().transcript_revision;
+    assert!(
+        reported_after >= reported_before,
+        "the same thread reported revision {reported_before}, then {reported_after} \
+         after a restart; a client holding {reported_before} rejects that snapshot — \
+         and the snapshot was its way out"
+    );
+}
+
+/// End-to-end over the REAL mutation API, with two threads interleaved — the
+/// shape a client actually sees on the wire.
+///
+/// The unit tests above drive `bump_thread_transcript_revision` directly, so they
+/// would not catch a mutation path that emits a stale or out-of-order meta. This
+/// replays the contract a surface applies: per thread, each delta's
+/// `base_revision` must equal the previous delta's `revision` for THAT thread
+/// (the chain), and no revision may ever be reused across threads.
+#[test]
+fn interleaved_threads_emit_an_unbroken_per_thread_chain() {
+    let mut relay = test_state();
+    let mut last_revision: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    let mut all_revisions = std::collections::HashSet::new();
+
+    for round in 0..6 {
+        for thread_id in ["thread-a", "thread-b"] {
+            // Alternate the two mutation kinds a real turn produces.
+            let meta = if round % 2 == 0 {
+                relay.upsert_transcript_item_for_thread(
+                    thread_id,
+                    format!("{thread_id}-item-{round}"),
+                    TranscriptEntryKind::AgentText,
+                    Some("hello".to_string()),
+                    "in_progress".to_string(),
+                    Some(format!("turn-{round}")),
+                    None,
+                )
+            } else {
+                relay.append_agent_delta_for_thread(
+                    thread_id,
+                    &format!("{thread_id}-item-{}", round - 1),
+                    " more",
+                    &format!("turn-{}", round - 1),
+                )
+            };
+
+            assert!(
+                meta.base_revision < meta.revision,
+                "round {round} {thread_id}: base {} is not below revision {}",
+                meta.base_revision,
+                meta.revision
+            );
+            if let Some(previous) = last_revision.get(thread_id) {
+                assert_eq!(
+                    meta.base_revision, *previous,
+                    "round {round} {thread_id}: chain broken — base_revision {} does \
+                     not match this thread's previous revision {previous}; the client \
+                     would treat every following delta as a gap",
+                    meta.base_revision
+                );
+            }
+            assert!(
+                all_revisions.insert(meta.revision),
+                "round {round} {thread_id}: revision {} was already issued to some \
+                 thread",
+                meta.revision
+            );
+            last_revision.insert(thread_id, meta.revision);
+        }
+    }
+}
+
+/// The snapshot's `transcript_revision` is a cache key: the surface re-fetches the
+/// transcript whenever it advances past what it last fetched at
+/// (`transcript-hydration-store.js`, "cap the omitted/preview re-fetch to once per
+/// revision"). So it must only move when the transcript it describes moves.
+/// Reading the live global clock would make it churn on every poll as unrelated
+/// background threads stream, re-arming that fetch each time.
+#[test]
+fn the_snapshot_revision_does_not_churn_on_unrelated_thread_activity() {
+    let mut relay = test_state();
+    // No active thread — the branch that falls back off the selected runtime.
+    assert!(relay.active_thread_id.is_none());
+    let first = relay.snapshot().transcript_revision;
+
+    // A background thread streams. Nothing about the snapshot's own transcript
+    // changed.
+    for _ in 0..3 {
+        relay.bump_thread_transcript_revision("background-thread");
+    }
+
+    let second = relay.snapshot().transcript_revision;
+    assert_eq!(
+        first, second,
+        "the snapshot revision moved from {first} to {second} because another \
+         thread streamed; the surface reads that as 'my transcript changed' and \
+         re-fetches on every poll"
+    );
+}
+
+/// A SECOND crash must not replay revisions either.
+///
+/// The headroom is added when state is written, so it only protects the run that
+/// did the writing. If a restored relay issues revisions and dies before its own
+/// first debounced save, the next start reads the SAME stale value and hands the
+/// same numbers out again. The startup reservation (a save taken right after
+/// restore, before anything can issue) is what closes that.
+#[test]
+fn a_crash_before_the_first_save_after_a_restore_does_not_replay() {
+    let mut first = test_state();
+    for _ in 0..3 {
+        first.bump_thread_transcript_revision("thread-1");
+    }
+    let after_first_run = PersistedRelayState::from_relay(&first);
+
+    // Second run restores, then reserves on disk before serving.
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut second = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    second.apply_persisted(&after_first_run);
+    let startup_reservation = PersistedRelayState::from_relay(&second);
+    // It then issues revisions and dies before any later save.
+    let mut issued_by_second = Vec::new();
+    for _ in 0..5 {
+        let (_base, revision) = second.bump_thread_transcript_revision("thread-1");
+        issued_by_second.push(revision);
+    }
+
+    // Third run reads what the second run reserved at startup.
+    let (change_tx, _) = watch::channel(0_u64);
+    let mut third = RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    );
+    third.apply_persisted(&startup_reservation);
+    let (_base, first_after_second_crash) = third.bump_thread_transcript_revision("thread-1");
+
+    assert!(
+        !issued_by_second.contains(&first_after_second_crash),
+        "the third run re-issued revision {first_after_second_crash}, which the \
+         second run had already handed out ({issued_by_second:?})"
+    );
 }

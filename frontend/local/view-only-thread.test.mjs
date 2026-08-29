@@ -84,6 +84,7 @@ test("projection uses the VIEWED thread's metadata and never impersonates the li
     viewThreadId: "A",
     viewOnlyThread: pinFor("A", {
       cwd: "/saved/workspace",
+      threadWorkspaceCwd: "/saved/worktree",
       provider: "saved-provider",
       settings: {
         approval_policy: "never",
@@ -96,6 +97,7 @@ test("projection uses the VIEWED thread's metadata and never impersonates the li
   });
   // Summary-backed fields use the saved thread's own values.
   assert.equal(projected.current_cwd, "/saved/workspace");
+  assert.equal(projected.thread_workspace_cwd, "/saved/worktree");
   assert.equal(projected.provider, "saved-provider");
   // Settings come from the targeted thread-state read, never the live thread.
   assert.equal(projected.model, "saved-model");

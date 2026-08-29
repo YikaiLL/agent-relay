@@ -16,12 +16,15 @@ export function createDefaultSessionDraft(provider = "codex") {
     initialPrompt: "",
     provider,
     model: defaultModelForProvider(provider),
+    // Which project the new session is filed under. Seeded from the project the
+    // UI is currently in when the dialog opens; null is the Default Workspace.
+    projectId: null,
     sandbox: "workspace-write",
   };
 }
 
 export function createRemoteUiStore(initialState = {}) {
-  return createStore((set) => ({
+  return createStore((set, get) => ({
     composerDraft: "",
     // Empty = "this surface hasn't overridden the session's effort". Readers
     // fall back to session.reasoning_effort, so opening a session on a new
@@ -39,6 +42,13 @@ export function createRemoteUiStore(initialState = {}) {
       error: "",
     },
     remoteInfoModalOpen: false,
+    settingsModalOpen: false,
+    // Git standing of the launch dialog's chosen directory; null when unknown or
+    // when the directory is not a repo.
+    launchGitContext: null,
+    // Bumped on every opening of either dialog. A DOM `open` check, or the fork's
+    // source id, cannot tell a reopened dialog from the one a request started against.
+    launchDialogGeneration: 0,
     providerModels: {},
     // Per-provider catalog fetch status: "loading" | "ready" | "error".
     // Lets the new-session dialog show a truthful state instead of silently
@@ -52,27 +62,13 @@ export function createRemoteUiStore(initialState = {}) {
     pushPermission: notificationPermission(),
     pushSubscribed: false,
     sendPending: false,
-    // The bell. Same shape and rules as local's `state.threadFilter` — see
-    // shared/thread-filter.js — but held here because remote has no imperative `state`
-    // object. `retained` is a Map on purpose: thread ids are arbitrary strings.
-    threadFilter: { on: false, retained: new Map() },
+    // The bell used to live here as a byte-identical port of local's
+    // `state.threadFilter`. It now lives once, in shared/thread-list-store.js — both
+    // shells already own one of those stores, so neither shell has to declare the field.
     sessionDraft: createDefaultSessionDraft(),
     sessionPanelOpen: false,
     sessionStartPending: false,
     ...initialState,
-    // Turning the bell on, or changing which states it covers, RESETS retention:
-    // carrying it across a deliberate change of selection would show rows the user just
-    // excluded.
-    setThreadFilter(next) {
-      set((state) => ({
-        threadFilter: { ...state.threadFilter, ...next, retained: new Map() },
-      }));
-    },
-    // The retention map is a monotonic accumulator recomputed each render, not a user
-    // action — kept off `setThreadFilter` so it cannot reset what it is accumulating.
-    setThreadFilterRetained(retained) {
-      set((state) => ({ threadFilter: { ...state.threadFilter, retained } }));
-    },
     clearComposerDraft() {
       set({
         composerDraft: "",
@@ -137,6 +133,29 @@ export function createRemoteUiStore(initialState = {}) {
         remoteInfoModalOpen: Boolean(open),
       });
     },
+    setSettingsModalOpen(open) {
+      set({
+        settingsModalOpen: Boolean(open),
+      });
+    },
+    // Called by the open paths, not inferred inside setForkDialog: reopening on a
+    // different thread while one is already showing is still a new opening.
+    beginForkDialogOpening() {
+      set((state) => ({
+        forkDialog: {
+          ...state.forkDialog,
+          generation: (state.forkDialog.generation || 0) + 1,
+        },
+      }));
+      return get().forkDialog.generation;
+    },
+    beginLaunchDialogOpening() {
+      set((state) => ({ launchDialogGeneration: state.launchDialogGeneration + 1 }));
+      return get().launchDialogGeneration;
+    },
+    setLaunchGitContext(context) {
+      set({ launchGitContext: context || null });
+    },
     setProviderModels(provider, models) {
       set((state) => ({
         providerModels: {
@@ -177,6 +196,13 @@ export function createRemoteUiStore(initialState = {}) {
       set({
         sendPending: Boolean(value),
       });
+    },
+    // One transition: provider, model and effort are a single decision, and each
+    // intermediate state is both invalid and observable by subscribers.
+    patchSessionDraft(patch) {
+      set((state) => ({
+        sessionDraft: { ...state.sessionDraft, ...(patch || {}) },
+      }));
     },
     setSessionDraftField(field, value) {
       set((state) => ({

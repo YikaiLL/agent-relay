@@ -23,6 +23,34 @@ import { buildProjectMenuItems, projectsMenuReady } from "./project-menu.js";
 import { resolveForkSourceThread, threadIsBusyForFork } from "./fork-fields.js";
 
 /**
+ * Whether `provider`'s bridge can archive at all.
+ *
+ * This is the first rule above applied to archive: most bridges have no archive
+ * method, and the relay has no stand-in for one. "Archive" means removing the
+ * thread from local history, so without the provider forgetting it, dropping the
+ * row just means the next list fetches it straight back — which is exactly what
+ * Cursor did. It reported "Session archived" and the session never moved.
+ *
+ * Driven by the relay's own `provider_archive_capabilities`, not by provider
+ * names, for the same reason `forkIsLossy` is.
+ *
+ * The unknown case resolves the OPPOSITE way to `forkIsLossy`'s, deliberately.
+ * There, assuming the worst over-warns about context loss, which a user can
+ * recover from. Here, assuming the worst would silently remove a working control
+ * (Codex's archive) whenever the snapshot is old or the provider is new, and a
+ * control that is simply absent gives the user nothing to reason about. An
+ * action that is offered and fails at least says why.
+ */
+export function providerSupportsArchive({ provider = "", capabilities = [] } = {}) {
+  if (!provider) return false;
+  const capability = (Array.isArray(capabilities) ? capabilities : []).find(
+    (entry) => entry?.provider === provider
+  );
+  // Absent row → no evidence against; present row → believe it.
+  return capability ? Boolean(capability.native_archive) : true;
+}
+
+/**
  * Ordered sections for the sheet.
  *
  * @returns {Array<{kind: string, label: string, items: Array}>}

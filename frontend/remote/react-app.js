@@ -1,4 +1,5 @@
 import React, {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -10,6 +11,9 @@ import React, {
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { fetchBuildInfo } from "../shared/build-badge.js";
+import { createTranscriptInteractionHandler } from "../shared/transcript-interactions.js";
+import { StartSessionSplitButton } from "../shared/start-session-split-button.js";
+import { ConversationHeader } from "../shared/conversation-header.js";
 import { ClientLog } from "../shared/client-log.js";
 import { createAskUserQuestionDetailLoader } from "../shared/ask-user-question-detail-loader.js";
 import {
@@ -40,9 +44,9 @@ import {
   threadIsBusyForFork,
 } from "../shared/fork-fields.js";
 import { copyTextToClipboard } from "../shared/clipboard.js";
-import { ThemePickerRow } from "../shared/theme-picker.js";
 import { installThreadListWheelProxy } from "../shared/thread-list-scroll.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
+import { createProjectAndSelect } from "../shared/project-create.js";
 import { createVerbCycler } from "../progress-verbs.js";
 import {
   buildProviderStatusModel,
@@ -50,7 +54,9 @@ import {
   selectResetChromeRenderModel,
   selectSessionChromeRenderModel,
   selectStatusBadgeRenderModel,
+  selectedRelayNeedsRepair,
 } from "./chrome-view-model.js";
+import { selectRemoteHeaderProjectSwitcherModel } from "./header-project-switcher-model.js";
 import { deriveSessionRuntime } from "./session-runtime.js";
 import {
   closeRemoteNavigation,
@@ -128,7 +134,9 @@ import {
   isReviewInProgressForThread,
   selectReviewLaunchModel,
 } from "../shared/review-state.js";
-import { BELL_SVG, SEARCH_SVG, X_SVG } from "../svg.js";
+// BELL_SVG / SEARCH_SVG / X_SVG left with the controls that used them — they are drawn by
+// `shared/sidebar-chrome.js` now, on both surfaces.
+import { SETTINGS_SVG } from "../svg.js";
 import { selectThreadState } from "../shared/thread-dot.js";
 import {
   composeListChrome,
@@ -191,19 +199,40 @@ const getThreadAttentionVersion = () => threadAttention.getVersion();
 import {
   createThreadListStore,
   readActiveProjectId,
+  readSearchUi,
+  readThreadFilter,
 } from "../shared/thread-list-store.js";
 import { ProjectSwitcher } from "../shared/project-switcher.js";
+import {
+  SidebarBellToggle,
+  SidebarBrand,
+  SidebarCollapseToggle,
+  SidebarResizeHandle,
+  SidebarSearchField,
+  SidebarSearchToggle,
+} from "../shared/sidebar-chrome.js";
+// The `Remote`-prefixed copies of these were byte-for-byte identical to local's.
+import {
+  BackArrowIcon,
+  ComposeIcon,
+  ProjectTagIcon,
+  ToggleLeftPanelIcon,
+  ToggleRightPanelIcon,
+} from "../shared/panel-icons.js";
 import { resetRelayScopedState } from "./relay-scoped-state.js";
 import { selectPinnedProjectId } from "../shared/thread-groups.js";
 import {
   useRemoteProjects,
   notifyRemoteProjects,
   refreshRemoteProjects,
+  getRemoteProjectsStore,
 } from "./projects-host.js";
 import {
   assignRemoteThreadToProject,
   createRemoteProject,
   fetchRemoteProjects,
+  fetchRemoteThreadSettings,
+  fetchRemoteWorkspaceGitContext,
   renameRemoteProject,
   renameRemoteThread,
   deleteRemoteProject,
@@ -217,10 +246,15 @@ import {
 import { normalizeProjectName, projectsMenuReady } from "../shared/project-menu.js";
 import { selectThreadSheet } from "../shared/thread-actions-model.js";
 import { runThreadSheetAction } from "./thread-sheet-action.js";
-import { ProviderStatusSection } from "./provider-status-section.js";
+import { ManagedDialog } from "../shared/managed-dialog.js";
+import { RemoteSettingsModal } from "./settings-modal.js";
 import { TranscriptPane } from "../shared/transcript-pane.js";
 import { renderLog } from "./session-surface.js";
 import { formatRelativeTime, formatTimestamp, shortId } from "./utils.js";
+import { SessionTabStrip, buildSessionTabItems } from "../shared/session-tab-strip.js";
+import { layoutThreadIds } from "../shared/tab-layout.js";
+import { sessionViewContextKey } from "../shared/session-view-state.js";
+import { BOOT_RESTORE_REASON, useRemoteSessionTabs } from "./session-tabs-host.js";
 
 const h = React.createElement;
 const LIVE_TRANSCRIPT_DETAIL_REFRESH_MS = 1000;
@@ -245,6 +279,27 @@ function useActiveProjectId(store) {
     store.subscribe,
     () => readActiveProjectId(store),
     () => readActiveProjectId(store)
+  );
+}
+
+// The bell, also a SIBLING of `threadList`, so it needs its own snapshot for the same
+// reason `activeProjectId` does. `readThreadFilter` returns the stored object rather than
+// a normalized copy precisely so this stays identity-stable between changes.
+function useThreadFilter(store) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => readThreadFilter(store),
+    () => readThreadFilter(store)
+  );
+}
+
+// The search field's open/draft state, snapshotted for the same reason: it is a sibling of
+// `threadList`, so `useThreadListStoreState` never sees it change.
+function useSearchUi(store) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => readSearchUi(store),
+    () => readSearchUi(store)
   );
 }
 
@@ -322,6 +377,16 @@ function RemoteApp() {
   const [askUserQuestionDetailErrors, setAskUserQuestionDetailErrors] = useState(() => new Map());
   const [remoteUiStore] = useState(() => createRemoteUiStore());
   const remoteUi = useRemoteUiStoreState(remoteUiStore);
+  // A binding, not just a sidebar prop: the create-project callback below calls it
+  // directly, and as a prop-only method that was a ReferenceError.
+  const updateSessionDraft = useCallback(
+    (nextPatch) => {
+      for (const [field, value] of Object.entries(nextPatch)) {
+        remoteUiStore.getState().setSessionDraftField(field, value);
+      }
+    },
+    [remoteUiStore]
+  );
   const [threadListStore] = useState(() => createThreadListStore());
   const threadListUi = useThreadListStoreState(threadListStore);
   // Dedicated Projects payload (list + membership), fetched off the snapshot's
@@ -329,6 +394,7 @@ function RemoteApp() {
   // as it loads/errors.
   const remoteProjects = useRemoteProjects();
   const activeProjectId = useActiveProjectId(threadListStore);
+  const threadFilter = useThreadFilter(threadListStore);
   // Which session the actions sheet is open for (null = closed). Held by id, not by
   // object, so the sheet keeps tracking the thread across list refreshes.
   const [actionsSheetThreadId, setActionsSheetThreadId] = useState(null);
@@ -406,7 +472,13 @@ function RemoteApp() {
         remoteUiStore.getState().setProviders(normalized);
         const draftProvider = remoteUiStore.getState().sessionDraft.provider;
         if (!draftProvider || !normalized.includes(draftProvider)) {
-          remoteUiStore.getState().setSessionDraftField("provider", defaultProvider(normalized));
+          // The MODEL must move with the provider: `provider` alone left a
+          // `codex/gpt-5.5` draft as `claude_code/gpt-5.5` on a Claude-only relay.
+          remoteUiStore
+            .getState()
+            .patchSessionDraft(
+              providerDraftPatch(remoteUiStore.getState(), defaultProvider(normalized))
+            );
         }
         // Pre-fetch models for all providers so the dropdown is populated
         // immediately. Worker-backed providers (Claude) can be cold right after
@@ -430,6 +502,36 @@ function RemoteApp() {
       cancelled = true;
     };
   }, [currentState.remoteAuth?.relayId, currentState.remoteAuth?.payloadSecret]);
+
+  // Debounced and generation-guarded: the field is free text, so a probe per
+  // keystroke would spawn a git subprocess per character on the HOST.
+  const launchCwd = remoteUi.sessionDraft?.cwd || "";
+  useEffect(() => {
+    if (!currentState.remoteAuth?.payloadSecret) return undefined;
+    const target = String(launchCwd || "").trim();
+    // Clear first: a stale chip is worse than no chip, and the effect re-runs on
+    // every cwd change so this is the only place that sees the transition.
+    remoteUiStore.getState().setLaunchGitContext(null);
+    if (!target) {
+      return undefined;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      fetchRemoteWorkspaceGitContext(target)
+        .then((context) => {
+          if (!cancelled) remoteUiStore.getState().setLaunchGitContext(context);
+        })
+        // A failed probe is not worth surfacing: the chip is an extra and the
+        // dialog is fully usable without it.
+        .catch(() => {
+          if (!cancelled) remoteUiStore.getState().setLaunchGitContext(null);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [launchCwd, currentState.remoteAuth?.payloadSecret]);
 
   useEffect(() => {
     if (!currentState.remoteAuth?.payloadSecret || !selectedProvider) return;
@@ -560,7 +662,7 @@ function RemoteApp() {
     // to lift out of.
     pinnedProjectId: selectPinnedProjectId({
       activeProjectId,
-      filtering: Boolean(remoteUi.threadFilter?.on),
+      filtering: Boolean(threadFilter.on),
       searching: isThreadSearchActive(currentState.threadSearch),
     }),
     projects: remoteProjects.projects,
@@ -575,11 +677,17 @@ function RemoteApp() {
   });
   const promptRemoteProjectName = (current = "") =>
     normalizeProjectName(window.prompt("Project name", current));
-  const setActiveProject = (projectId) =>
-    threadListStore.getState().setActiveProject(projectId);
-  const setThreadFilter = (next) => remoteUiStore.getState().setThreadFilter(next);
+  // Straight through the session-view controller, exactly as local's switcher does: each
+  // context owns its own workspace and its own remembered focus, so selecting a project
+  // has to MOVE the location or the strip would describe a workspace nobody is in. The
+  // sidebar's pinned id is then written back from the committed context by the projection
+  // effect below, which keeps one source of truth instead of two.
+  const setActiveProject = (projectId) => {
+    void sessionTabsHost.selectProject(projectId);
+  };
+  const setThreadFilter = (next) => threadListStore.getState().setThreadFilter(next);
   const setThreadFilterRetained = (retained) =>
-    remoteUiStore.getState().setThreadFilterRetained(retained);
+    threadListStore.getState().setThreadFilterRetained(retained);
 
   // Every thread the user can currently SEE: the authoritative list plus anything a
   // search surfaced from beyond it. LOOKUPS only — iteration stays on
@@ -590,39 +698,63 @@ function RemoteApp() {
       threadId
     );
 
-  const [searchOpen, setSearchOpen] = useState(false);
-  // The field is controlled by a LOCAL draft, never by the executed query. Binding it to
+  // The session tab set, keyed by the selected project exactly as local keys its own.
+  // The host owns the store/controller lifecycle per relay; see session-tabs-host.js.
+  const { host: sessionTabsHost, viewState: sessionTabsView } = useRemoteSessionTabs(
+    currentState.remoteAuth?.relayId || null
+  );
+  // Membership, held in a ref: it is an INPUT to filing a tab, not a trigger for it.
+  const threadProjectIdRef = useRef(null);
+  threadProjectIdRef.current = remoteProjects.threadProjectId || null;
+  // The RELAY's live thread, read from realSession rather than the rendered projection —
+  // the projection rewrites active_thread_id to whatever is pinned, so reading it here
+  // would make "fall back to the live thread" mean "fall back to the one just closed".
+  const liveThreadIdRef = useRef(null);
+  liveThreadIdRef.current = currentState.realSession?.active_thread_id || null;
+  // The canonical answer to "which tab set is on screen", exactly as on local: the
+  // LOCATION owns it, and the sidebar's pinned project is a projection of it (see the
+  // onCommit hook in the host wiring below). Deriving it the other way — from the pin —
+  // files sessions into whichever project happens to be selected, which is the bug
+  // `selectOwningContext` was written to fix.
+  const sessionTabsContext = sessionTabsView.location.context;
+
+  // Whether the field is open, and what has been typed into it, both live in
+  // `threadListStore` — the same place local reads them from. They were a pair of
+  // `useState` hooks here and DOM properties over there, which is two definitions of one
+  // control's state.
+  //
+  // The field is controlled by that DRAFT, never by the executed query. Binding it to
   // `threadSearch.query` — which only advances after the debounce fires — makes React
   // restore the previous value after every keystroke, so typing a word char by char
   // ends up searching for its last letter. `page.fill()` sets the value in one shot and
   // hides this completely; only real key-by-key input shows it.
-  const [searchDraft, setSearchDraft] = useState("");
+  const searchUi = useSearchUi(threadListStore);
+  const searchOpen = searchUi.open;
+  const searchDraft = searchUi.draft;
   // The DEBOUNCE is not held here. A timer owned by the component is invisible to the
   // surface reset, so a keystroke typed just before a re-pair would fire against
   // whatever connection replaced the one it was typed into. `session-ops` owns it, next
   // to the request it triggers, and cancels both together.
   const onSearchInput = (value) => {
-    setSearchDraft(value);
+    threadListStore.getState().setSearchDraft(value);
     queueRemoteThreadSearch(value);
   };
   const onSetSearchOpen = (open) => {
-    setSearchOpen(open);
-    // Closing must also clear: a hidden field still narrowing the list is a sidebar that
-    // looks like it lost sessions, with the reason off screen.
+    // "Closing also clears the draft" is enforced by the store, so what is left here is
+    // the half that is remote's: telling the relay the query is gone.
+    threadListStore.getState().setSearchOpen(open);
     if (!open) {
-      setSearchDraft("");
       queueRemoteThreadSearch("");
     }
   };
 
   // Every teardown path — relay switch, re-pair, forget device — cancels the search
-  // through the reset transaction and bumps this token. The draft is the one piece of
-  // the search that lives in React, so this is how a reset reaches it.
+  // through the reset transaction and bumps this token. `setSearchOpen(false)` clears the
+  // draft with it, which is the whole reset.
   const searchCancelToken = currentState.threadSearchCancelToken || 0;
   useEffect(() => {
-    setSearchDraft("");
-    setSearchOpen(false);
-  }, [searchCancelToken]);
+    threadListStore.getState().setSearchOpen(false);
+  }, [searchCancelToken, threadListStore]);
 
   // Retention is keyed by thread id alone, and thread ids are only unique WITHIN a
   // relay. Switching relays would otherwise let one relay's remembered states decide
@@ -631,10 +763,32 @@ function RemoteApp() {
   // advertise an equal projects_revision"); this is that hazard for the filter.
   const activeRelayId = currentState.remoteAuth?.relayId || null;
   useEffect(() => {
-    resetRelayScopedState({ remoteUiStore, threadListStore });
-  }, [activeRelayId, remoteUiStore, threadListStore]);
+    resetRelayScopedState({ threadListStore });
+  }, [activeRelayId, threadListStore]);
   // Refresh rides the projects_revision snapshot bump, but the broker drops the write
   // receipt, so also refetch eagerly for snappier remote feedback.
+  // Must SELECT it, not just refresh the list.
+  const createRemoteProjectForDraft = async (apply, isCurrent) => {
+    const name = promptRemoteProjectName();
+    if (!name) return;
+    try {
+      const projectId = await createProjectAndSelect({
+        apply,
+        create: createRemoteProject,
+        isCurrent,
+        name,
+        store: getRemoteProjectsStore(),
+      });
+      renderLog(
+        projectId
+          ? `Created project "${name}".`
+          : `Created project "${name}", but could not tell which one is new — pick it manually.`
+      );
+    } catch (error) {
+      renderLog(`Failed to create project: ${error.message}`);
+    }
+  };
+
   const createRemoteProjectFromToolbar = async () => {
     const name = promptRemoteProjectName();
     if (!name) return;
@@ -664,13 +818,12 @@ function RemoteApp() {
     if (!confirmed) return;
     try {
       await deleteRemoteProject(projectId);
-      // Stand the pin down BEFORE the refetch. The switcher already fails open on an id
-      // it cannot resolve, so the screen would recover either way — but leaving a dead
-      // id in the store means the next payload that happens to contain a project with
-      // that id silently re-pins it.
-      if (readActiveProjectId(threadListStore) === projectId) {
-        threadListStore.getState().setActiveProject(null);
-      }
+      // Move the LOCATION out of the dead project, before the refetch. Writing the
+      // sidebar pin here instead would desync the two: the pin is a projection of the
+      // context and its effect is edge-triggered ON the context, so clearing the pin
+      // directly leaves the strip rendering — and every close/pin/move aiming at — a
+      // workspace whose project no longer exists.
+      await sessionTabsHost.forgetProject(projectId);
       refreshRemoteProjects();
       renderLog(`Deleted project "${name}".`);
     } catch (error) {
@@ -678,7 +831,9 @@ function RemoteApp() {
     }
   };
   const hasRelay = Boolean(currentState.remoteAuth);
-  const hasUsableRelay = Boolean(currentState.remoteAuth?.payloadSecret);
+  const hasUsableRelay = Boolean(
+    currentState.remoteAuth?.payloadSecret && !selectedRelayNeedsRepair(currentState)
+  );
   const sessionChromeModel = session
     ? selectSessionChromeRenderModel({ ...currentState, progressVerb }, session)
     : null;
@@ -724,15 +879,28 @@ function RemoteApp() {
     approvalOptions: selectedProviderSettings.approvalOptions,
     hasRemoteAuth: hasRelay,
     hasUsableRelay,
+    // The merged pill lists EVERY provider's catalogue, not one flattened array.
+    gitContext: remoteUi.launchGitContext,
+    providers: remoteUi.providers,
+    providerModels: remoteUi.providerModels,
+    // Still needed by the sidebar split button's agent menu, which starts a
+    // session AS a provider without opening the dialog.
     providerOptions: providerOptions(remoteUi.providers),
-    models: selectedProviderModels.length
-      ? selectedProviderModels
-      : [
-          {
-            display_name: remoteUi.sessionDraft.model || defaultModelForProvider(selectedProvider),
-            model: remoteUi.sessionDraft.model || defaultModelForProvider(selectedProvider),
-          },
-        ],
+    // Set on the draft, not derived here, so an in-dialog choice survives a render.
+    projects: remoteProjects.projects,
+    threads: currentState.threads,
+    threadProjectId: remoteProjects.threadProjectId,
+    onCreateProject: remoteProjectsReady
+      ? () => {
+          const opening = remoteUi.launchDialogGeneration;
+          return createRemoteProjectForDraft(
+            (projectId) => updateSessionDraft({ projectId }),
+            () =>
+              remoteUiStore.getState().launchDialogGeneration === opening
+              && document.getElementById("remote-start-session-dialog")?.open === true
+          );
+        }
+      : null,
     // When we have a real catalog the picker is authoritative; otherwise expose
     // the fetch status so the dialog can say "loading"/"failed" instead of
     // presenting the single fallback model as if it were the only choice.
@@ -1007,6 +1175,183 @@ function RemoteApp() {
   // tab (rail + modal) and the mobile chip badge stay in sync with the session.
   const remoteDeviceId = currentState.remoteAuth?.deviceId;
   const remoteViewedThreadId = session?.active_thread_id || null;
+  // Subscribe so a pin in Changes re-filters the Reviewer picker in the same frame.
+  const remoteWorkspace = useSyncExternalStore(
+    useCallback((onChange) => getRemoteWorkspaceDiffStore().subscribe(onChange), []),
+    () => getRemoteWorkspaceDiffStore().getState().workspace,
+    () => getRemoteWorkspaceDiffStore().getState().workspace
+  );
+  const remoteWorkspaceCwd = remoteWorkspace?.cwd || null;
+
+
+  // The two halves of keeping the strip honest. They are separate because the causes
+  // are: one is the user steering, the other is the world moving underneath.
+  //
+  // 1. Controller -> screen. A committed location change performs the view.
+  //
+  // A CLOSE that lands on no thread (it emptied the workspace) still has to put something
+  // on screen: remote always shows a conversation, so it falls back to the relay's live
+  // thread, which re-opens a tab for it. Skipping instead would leave the just-closed
+  // session rendered under a strip claiming nothing is open.
+  //
+  // Scoped to CLOSE_TAB, and that scope is load-bearing. A context SWITCH also lands on
+  // no thread whenever the project you picked has no tabs yet — and falling back there
+  // would immediately re-file the live thread into ITS owning context, yanking you back
+  // out of the project you just selected. That reads as "the project switcher does
+  // nothing", which is how it was found.
+  //
+  // Two consequences worth knowing, both accepted rather than overlooked:
+  //
+  //   - Closing the LIVE thread's only tab re-creates it, so the × looks inert there.
+  //     It is the strip refusing to lie: that conversation is still on screen, and remote
+  //     has no home screen to close it in favour of.
+  //   - Selecting an empty project leaves the previous conversation under an empty strip.
+  //     Local expresses this state as the sessions-home overview; remote has no such
+  //     screen, so this is the least-bad of the available shapes rather than a good one.
+  useEffect(
+    () =>
+      sessionTabsHost.controller.subscribe((change) => {
+        if (!change.locationChanged) return;
+        const threadId = change.next.location.threadId;
+        if (threadId) {
+          const viewed = handlersRef.current.onViewThread?.(threadId);
+          // Repair for the ONE navigation nobody asked for: the boot restore.
+          //
+          // It routes to a session the surface has not fetched yet, so it can fail — the
+          // broker may still be settling. Left alone, that leaves the location naming a
+          // thread the screen is not showing, and the strip highlighting it. Clicking that
+          // tab then does nothing at all: the location already IS that thread, so the
+          // command commits no change and never re-fires this subscriber. Falling back to
+          // the live thread costs the restore and returns a surface that works.
+          //
+          // Scoped to the restore, and that scope is the point. A project selection that
+          // failed the same way must NOT fall back — it would drag the user out of the
+          // project they just chose, which is the trap the CLOSE_TAB branch below spells
+          // out at length.
+          if (change.action?.reason === BOOT_RESTORE_REASON) {
+            void Promise.resolve(viewed).then((shown) => {
+              // The decision itself lives on the host (`shouldRepairBootRestore`), where it
+              // is checkable without rendering — notably the part that makes `false` safe
+              // to act on, since `viewRemoteThread` returns it both for a failed fetch and
+              // for one a newer navigation superseded.
+              const liveThreadId = liveThreadIdRef.current;
+              if (!sessionTabsHost.shouldRepairBootRestore({ shown, liveThreadId })) return;
+              void sessionTabsHost.adoptViewedThread({
+                threadId: liveThreadId,
+                threadProjectId: threadProjectIdRef.current,
+              });
+            });
+          }
+          return;
+        }
+        const liveThreadId = liveThreadIdRef.current;
+        if (change.action?.type === "CLOSE_TAB" && liveThreadId) {
+          void sessionTabsHost.adoptViewedThread({
+            threadId: liveThreadId,
+            threadProjectId: threadProjectIdRef.current,
+          });
+        }
+      }),
+    [sessionTabsHost]
+  );
+
+  // The sidebar's pinned project is a PROJECTION of the committed context, never a second
+  // source of truth — the same one-way sync local does in `syncThreadListViewFromContext`.
+  // Guarded on inequality so this cannot ping-pong with `selectProject`.
+  const contextProjectId =
+    sessionTabsContext?.kind === "project" ? sessionTabsContext.projectId : null;
+  useEffect(() => {
+    if (readActiveProjectId(threadListStore) !== contextProjectId) {
+      threadListStore.getState().setActiveProject(contextProjectId);
+    }
+  }, [contextProjectId, threadListStore]);
+
+  // Boot hydration. Every other command reads persistence as a side effect of doing
+  // something; with no active thread nothing would ever dispatch, so a populated database
+  // would render as an empty strip until the user happened to click a session.
+  useEffect(() => {
+    void sessionTabsHost.hydrate();
+  }, [sessionTabsHost]);
+
+  // 2. Screen -> controller. Remote's viewed thread is NOT owned by the controller —
+  // boot shows the relay's active thread, another client can move it, and a Claude
+  // pending id gets promoted mid-turn. Mirroring it back guarantees the strip always
+  // describes what is actually rendered, which is the invariant five review rounds on
+  // the local surface were spent establishing.
+  //
+  // `preview` is deliberately omitted rather than passed: omitting it routes without
+  // re-flagging an already-open tab, so a session the user chose to KEEP is not demoted
+  // back to a peek by the snapshot that follows.
+  // The relay's own lineage field. It is the ONLY signal that separates a Claude
+  // pending->real promotion from another device switching threads; without it the pending
+  // tab would survive beside its promoted self, persisted, one per session.
+  //
+  // Held in a ref for the same reason as the others: it is an INPUT to how the change is
+  // classified, never a reason to re-classify. Reading it inline would be correct — it
+  // comes from the same render's `session` as `remoteViewedThreadId` — but it would read
+  // as a missing dependency to everyone after this.
+  const promotedFromRef = useRef(null);
+  promotedFromRef.current = session?.active_thread_promoted_from || null;
+  useEffect(() => {
+    if (!remoteViewedThreadId) return;
+    void sessionTabsHost.adoptViewedThread({
+      threadId: remoteViewedThreadId,
+      promotedFrom: promotedFromRef.current,
+      threadProjectId: threadProjectIdRef.current,
+    });
+  }, [remoteViewedThreadId, sessionTabsHost]);
+
+  // 5. Dead-workspace GC. A deleted project's tab set is COLD data — nothing renders it,
+  // so nothing would ever notice it, and `validHistoryWorkspaces` (the only thing in the
+  // codebase that deletes a whole workspace bucket) runs on RESTORE_HISTORY alone. Remote
+  // had no boot restore to dispatch one, so those buckets accumulated in IndexedDB
+  // forever. This reconciles on the same signal local does (`app.js`'s projects
+  // subscriber) with the same remedy: re-run the current location as a restore.
+  //
+  // Two gates, and they are not redundant. This effect only fires on a SETTLED payload;
+  // the controller's `getProjectIds()` independently reports "not authoritative" until
+  // then, which disables the sweep inside the reduction. Either one alone would be a
+  // single point of failure for an operation whose failure mode is deleting live tab
+  // sets — the sweep is an allowlist diffed against disk, so every key it omits is a
+  // delete, and a payload that is merely still loading looks exactly like "every project
+  // was deleted".
+  //
+  // Fires on every SETTLED payload; the host decides whether that payload is a new
+  // project set. Deliberately not deduped here: a refresh passes through `loading: true`,
+  // so any signature computed in this component goes X -> null -> X and re-fires anyway,
+  // and a ref holding the last one would outlive a relay switch (RemoteApp never
+  // remounts) while the rule it implements is per relay. `reconcileProjects` owns it.
+  const projectsSettled =
+    remoteProjects.loaded && !remoteProjects.loading && !remoteProjects.error;
+  useEffect(() => {
+    if (!projectsSettled) return;
+    void sessionTabsHost.reconcileProjects();
+  }, [projectsSettled, remoteProjects.projects, sessionTabsHost]);
+
+  // 6. Close tabs whose session is gone — ONCE per boot, and only after the thread list
+  // has arrived so its ids can spare the probe the sessions it already proves are alive.
+  //
+  // Once, deliberately. This is the one operation here that closes something the user
+  // opened, its input is a network answer, and repeating it on every list poll would keep
+  // re-asking a question whose answer only changes when someone deletes a session on
+  // another device. A reload is soon enough for that, and it is when the tabs are being
+  // rebuilt from storage anyway.
+  // `currentState.threads` and not `threadsModel`: the render model returns GROUPS, with
+  // no flat list on it, so keying this off the model would compile, read fine, and never
+  // fire. The raw list is also the honest input — the ids that came back from the relay,
+  // before any grouping or pin policy touched them.
+  const remoteThreadList = currentState.threads;
+  const sweptMissingRef = useRef(null);
+  useEffect(() => {
+    if (sweptMissingRef.current === sessionTabsHost) return;
+    if (!remoteThreadList?.length) return;
+    sweptMissingRef.current = sessionTabsHost;
+    void sessionTabsHost.sweepMissingThreads({
+      knownThreadIds: remoteThreadList.map((thread) => thread?.id).filter(Boolean),
+      probeThreads: (ids) => handlersRef.current.onProbeThreadsExist?.(ids),
+    });
+  }, [remoteThreadList, sessionTabsHost]);
+
   // Reviewer-panel data over the dedicated (uncompacted) `fetch_reviews` channel, cached and
   // re-fetched only when the snapshot's `reviews_revision` changes.
   const remoteReviewsCacheRef = useRef(null);
@@ -1062,7 +1407,13 @@ function RemoteApp() {
         activeProvider: session?.provider || "",
         onEnsureProviderModels: ensureRemoteProviderModels,
       },
-      reusableReviewers: reusableReviewersFromReviews(reviewsData, remoteViewedThreadId, null),
+      // Filter reuse by working tree: a reviewer bound to a tree the work has left is refused.
+      reusableReviewers: reusableReviewersFromReviews(
+        reviewsData,
+        remoteViewedThreadId,
+        null,
+        remoteWorkspaceCwd
+      ),
       // Full reviewer-thread list so each card can show its reviewer thread's
       // (long, truncated-with-tooltip) name by joining on reviewer_thread_id.
       reviewerThreads: reviewsData.reviewer_threads || [],
@@ -1082,8 +1433,45 @@ function RemoteApp() {
     remoteUi.providerModels,
     remoteUi.providerModelsStatus,
     remoteDeviceId,
+    remoteWorkspaceCwd,
     hasControllerLease,
   ]);
+
+  // Built once per render and shared by the sidebar's group roll-up, its per-row dots,
+  // and the tab strip — the same hoist local does (render-session.js), one level up now
+  // that a second region needs them. Beyond the wasted rebuild, `snapshotMap()` copies
+  // mutable state on every call, so two copies could let a tab's dot disagree with the
+  // sidebar row for the same session.
+  const threadActivityMap = buildThreadActivityMap(session);
+  const threadAttentionMap = threadAttention.snapshotMap();
+  const threadReviewingSet = buildReviewingThreadSet(session, remoteReviews);
+
+  // The strip's view model. `workspace` is the tab set for the CURRENT context, so
+  // selecting a project swaps the whole strip, exactly as on local.
+  const sessionTabItems = buildSessionTabItems({
+    workspace: sessionTabsView.workspaces[sessionViewContextKey(sessionTabsContext)] || {
+      tabs: [],
+      focusedTabId: null,
+    },
+    layoutThreadIds,
+    // A tab can outlive the thread it names — the list is paginated and a session can
+    // be deleted from another surface — so an unresolvable id still gets a readable
+    // label rather than vanishing from a strip that is meant to describe the screen.
+    resolveThread(threadId) {
+      const thread = findVisible(threadId);
+      if (!thread) {
+        return { title: shortId(threadId), tooltip: threadId };
+      }
+      return {
+        title: thread.name || thread.preview || shortId(thread.id),
+        tooltip: thread.cwd || thread.name || thread.id,
+        provider: thread.provider || "",
+      };
+    },
+    threadActivity: threadActivityMap,
+    threadAttention: threadAttentionMap,
+    threadReviewing: threadReviewingSet,
+  });
 
   // Inputs for the composer idle nudge ("Want a second opinion on these
   // changes?"), mirroring the local surface. Plain render-time derivations — not
@@ -1295,6 +1683,7 @@ function RemoteApp() {
       return;
     }
     const models = remoteUiStore.getState().providerModels[thread.provider] || [];
+    remoteUiStore.getState().beginForkDialogOpening();
     remoteUiStore.getState().setForkDialog({
       open: true,
       pending: false,
@@ -1311,6 +1700,25 @@ function RemoteApp() {
     // nothing else fetches that catalog — without this the model select sits
     // on "Loading models..." forever.
     void ensureRemoteProviderModels(thread.provider);
+    // Not awaited: the dialog opens on inherited fields and re-seeds when this lands.
+    void refreshRemoteForkSourceSettings(thread.id);
+  }
+
+  // Only untouched (INHERIT) fields are replaced, and only while the dialog still
+  // shows the same source — it can be reopened on another thread mid-flight.
+  async function refreshRemoteForkSourceSettings(threadId) {
+    try {
+      const settings = await fetchRemoteThreadSettings(threadId);
+      if (!settings) return;
+      const dialog = remoteUiStore.getState().forkDialog;
+      if (!dialog?.open || dialog.sourceThread?.id !== threadId) return;
+
+      // DISPLAY only: writing these into `fields` would submit them, freezing a
+      // permission the source may tighten while the dialog is open.
+      remoteUiStore.getState().setForkDialog({ ...dialog, sourceSettings: settings });
+    } catch {
+      // Leaves the fields inherited, which is still a correct request.
+    }
   }
 
   // --- per-session actions sheet ----------------------------------------------
@@ -1429,7 +1837,22 @@ function RemoteApp() {
     }
   }
 
-  async function handleResumeThread(threadId) {
+  // The strip renames in place (right-click or F2) rather than through the actions
+  // sheet, so it commits a raw string here. An empty commit is a RESET to the agent's
+  // own name, which is why the normalized value falls back to `null` rather than being
+  // rejected — the same two intents `promptRename` distinguishes for the sheet.
+  async function handleRenameThreadInline(threadId, rawName) {
+    try {
+      await renameRemoteThread(threadId, normalizeThreadName(rawName) || null);
+      await runThreadRefresh("session renamed", { silent: true, fresh: true });
+    } catch (error) {
+      renderLog(`Rename failed: ${error?.message || error}`);
+    }
+  }
+
+  // `preview` comes from the shared row: a single click peeks (reusing the one preview
+  // tab), a double click keeps. It used to be dropped here because remote had no strip.
+  async function handleResumeThread(threadId, { preview } = {}) {
     closeRemoteNavigation();
     // Opening a thread clears its attention dot; treat the click as the user
     // gesture that unlocks notification permission for later events. Store the
@@ -1437,7 +1860,14 @@ function RemoteApp() {
     // the user dismissed the prompt during pairing).
     threadAttention.clear(threadId);
     void requestAndStorePermission();
-    await handlers.onViewThread?.(threadId);
+    // Navigation goes through the controller so the tab set and what is on screen can
+    // never disagree; the subscriber below performs the actual view change. The host
+    // files it under the thread's OWNING project, not the pinned one.
+    await sessionTabsHost.openThread({
+      threadId,
+      threadProjectId: threadProjectIdRef.current,
+      preview,
+    });
   }
 
   // VAPID public key arrives on the session snapshot (null until the server
@@ -1701,12 +2131,22 @@ function RemoteApp() {
         currentState,
         hasRelay,
         hasUsableRelay,
+        threadActivityMap,
+        threadAttentionMap,
+        threadReviewingSet,
         onOpenInfo() {
           closeRemoteNavigation();
           remoteUiStore.getState().setRemoteInfoModalOpen(true);
         },
         onOpenPairing() {
           remoteUiStore.getState().setPairingModalOpen(true);
+        },
+        onOpenSettings() {
+          // Closes the drawer first on phones: the modal renders over the shell,
+          // and leaving the nav open behind it means dismissing Settings drops
+          // you back onto a drawer you did not ask to reopen.
+          closeRemoteNavigation();
+          remoteUiStore.getState().setSettingsModalOpen(true);
         },
         onRefreshRelayDirectory() {
           void handlers.onRefreshRelayDirectory();
@@ -1720,7 +2160,7 @@ function RemoteApp() {
         // on touch, where `contextmenu` never fires.
         onContextThread: handleOpenForkDialog,
         onThreadActions: openActionsSheet,
-        threadFilter: remoteUi.threadFilter,
+        threadFilter,
         onSetThreadFilter: setThreadFilter,
         onSetThreadFilterRetained: setThreadFilterRetained,
         threadSearch: currentState.threadSearch,
@@ -1742,6 +2182,9 @@ function RemoteApp() {
         onStartSession() {
           void handleStartSession();
         },
+        onOpenStartSessionDialog(projectId = null) {
+          openRemoteStartSessionDialog(remoteUiStore, projectId);
+        },
         onToggleGroup(cwd) {
           threadListStore.getState().toggleCollapsedGroup(cwd);
         },
@@ -1757,11 +2200,7 @@ function RemoteApp() {
         sessionToggleLabel,
         threadListUi,
         threadsModel,
-        updateSessionDraft(nextPatch) {
-          for (const [field, value] of Object.entries(nextPatch)) {
-            remoteUiStore.getState().setSessionDraftField(field, value);
-          }
-        },
+        updateSessionDraft,
         setSessionPanelOpenLocal(open) {
           remoteUiStore.getState().setSessionPanelOpen(open);
         },
@@ -1785,6 +2224,16 @@ function RemoteApp() {
           currentState,
           deviceChromeModel,
           headerModel,
+          activeProjectId,
+          hasUsableRelay,
+          projects: remoteProjects.projects,
+          projectsError: remoteProjects.error,
+          projectsLoaded: remoteProjects.loaded,
+          projectsReady: remoteProjectsReady,
+          onCreateProject: createRemoteProjectFromToolbar,
+          onDeleteProject: handleDeleteRemoteProject,
+          onRenameProject: handleRenameRemoteProject,
+          onSelectProject: setActiveProject,
           onOpenInfo() {
             remoteUiStore.getState().setRemoteInfoModalOpen(true);
           },
@@ -1799,6 +2248,48 @@ function RemoteApp() {
           },
           statusBadgeModel,
         }),
+        // Desktop-pointer only. On touch the strip is ABSENT rather than inert: its pin
+        // and close controls are hover-revealed and reordering needs a hold-and-drag,
+        // so a finger would get a row of controls it cannot reach. The tab set is still
+        // maintained underneath, so attaching a mouse reveals a correct strip rather
+        // than an empty one.
+        currentState.remotePointerClass === "desktop"
+          ? h(SessionTabStrip, {
+              items: sessionTabItems,
+              // Derived from the VIEWED thread, with no fallback to the workspace's
+              // remembered focus or to active_thread_id. A fallback is how the strip
+              // starts disagreeing with the screen.
+              focusedTabId:
+                sessionTabItems.find((item) => item.threadId === remoteViewedThreadId)
+                  ?.tabId || null,
+              onFocus(tabId) {
+                const item = sessionTabItems.find((entry) => entry.tabId === tabId);
+                if (item) void handleResumeThread(item.threadId, { preview: undefined });
+              },
+              onClose(tabId) {
+                void sessionTabsHost.controller.closeTab(tabId, {
+                  context: sessionTabsContext,
+                });
+              },
+              onPromote(tabId) {
+                void sessionTabsHost.controller.promoteTab(tabId, {
+                  context: sessionTabsContext,
+                });
+              },
+              onTogglePin(tabId, pinned) {
+                void sessionTabsHost.controller.pinTab(tabId, pinned, {
+                  context: sessionTabsContext,
+                });
+              },
+              onMove(tabId, toIndex) {
+                void sessionTabsHost.controller.moveTab(tabId, toIndex, {
+                  context: sessionTabsContext,
+                });
+              },
+              onRename: handleRenameThreadInline,
+              emptyMessage: "No open sessions. Pick one from the sidebar.",
+            })
+          : null,
         h(RemoteThreadPanel, {
           agentWorkingIndicatorModel,
           onForkFromMessage: handleOpenForkDialog,
@@ -1851,6 +2342,11 @@ function RemoteApp() {
           onTakeOver() {
             void handlers.onTakeOver();
           },
+          // The banner passes the thread it is describing, not "the current one": a
+          // repair must target the session whose path the user just read.
+          onRepairWorkspace(threadId) {
+            void handlers.onRepairWorkspace?.(threadId);
+          },
           onUpdateSessionSettings(payload) {
             const provider = session?.provider;
             if (provider && payload) {
@@ -1869,9 +2365,12 @@ function RemoteApp() {
             reusableReviewers: reusableReviewersFromReviews(
               remoteReviews || { reviewer_threads: [] },
               remoteViewedThreadId,
-              null
+              null,
+              remoteWorkspaceCwd
             ),
             parentThreadId: remoteViewedThreadId,
+            workspace: remoteWorkspace,
+            onPinWorkspace: (path) => getRemoteWorkspaceDiffStore().pinWorkspace(path),
             onRequestReview: reviewerActions.onRequestReview,
           },
           session,
@@ -1893,12 +2392,48 @@ function RemoteApp() {
       ? h(ForkSessionDialog, {
           id: "remote-fork-session-dialog",
           sourceThread: forkDialog.sourceThread,
+          onCreateProject: remoteProjectsReady
+            ? () => {
+                // The generation, not the source id: reopening on the SAME thread is
+                // still a different opening.
+                const opening = forkDialog.generation || 0;
+                return createRemoteProjectForDraft(
+                  (projectId) => handleForkFieldChange("projectId", projectId),
+                  () => {
+                    const current = remoteUiStore.getState().forkDialog;
+                    return current?.open && (current.generation || 0) === opening;
+                  }
+                );
+              }
+            : null,
+          projects: remoteProjects.projects,
+          threadProjectId: remoteProjects.threadProjectId,
+          threads: currentState.threads,
           fields: forkView.fields,
           pending: forkDialog.pending,
           error: forkDialog.error || "",
-          providerOptions: providerOptions(remoteUi.providers),
-          models: forkView.models,
+          // Every provider's catalogue: a cross-provider fork is chosen from the
+          // same merged menu the launch dialog uses.
+          providers: remoteUi.providers,
+          providerModels: remoteUi.providerModels,
           modelsStatus: forkView.modelsStatus,
+          workspaceSuggestions: selectWorkspaceSuggestionsModel({
+            selectedCwd: forkView.fields.cwd || "",
+            session,
+            threads: currentState.threads,
+          }),
+          onSelectModel: ({ provider, model }) => {
+            // Not re-resolving effort for the inherit row: that one stays null.
+            const catalog = remoteUi.providerModels[provider] || [];
+            handleForkFieldChange("provider", provider);
+            handleForkFieldChange("model", model);
+            if (model) {
+              handleForkFieldChange(
+                "effort",
+                resolveReasoningEffortValue(catalog, model, forkView.fields.effort)
+              );
+            }
+          },
           approvalOptions: forkView.settings.approvalOptions,
           effortOptions: buildReasoningEffortOptions(
             forkView.models,
@@ -1906,6 +2441,8 @@ function RemoteApp() {
             forkView.provider
           ),
           forkCapabilities: session?.provider_fork_capabilities || [],
+          sourceSettings: forkDialog.sourceSettings || null,
+          sourceProjectId: remoteProjects.threadProjectId?.[forkDialog.sourceThread?.id] || null,
           onFieldChange: handleForkFieldChange,
           onFork: (submitted) => void handleForkSession(submitted),
           onRequestClose() {
@@ -1941,6 +2478,13 @@ function RemoteApp() {
         remoteUiStore.getState().setPairingInputValue(value);
       },
     }),
+    h(RemoteSettingsModal, {
+      open: remoteUi.settingsModalOpen,
+      providerModel: buildProviderStatusModel(session),
+      onClose() {
+        remoteUiStore.getState().setSettingsModalOpen(false);
+      },
+    }),
     h(RemoteInfoModal, {
       open: remoteUi.remoteInfoModalOpen,
       onClose() {
@@ -1974,12 +2518,48 @@ function findThreadNameInGroups(groups, threadId) {
 // The bell has no pills on either surface — turning it on re-groups the list by state,
 // and the bucket headers underneath already carry those four labels.
 
+// Switching agent is not just "set provider": the model, the reasoning effort and the
+// approval policy are all per-agent, so the draft has to move together or the dialog opens
+// with one agent selected and another agent's model still in the box. Hoisted because two
+// controls now perform this switch — the dialog's own select and the sidebar split
+// button's menu — and they must not drift.
+
+// Store passed in: this is module scope, but the store is created per-mount inside
+// RemoteApp, so naming it here was a ReferenceError.
+function openRemoteStartSessionDialog(store, activeProjectId = null) {
+  store.getState().beginLaunchDialogOpening();
+  // At open time, not per render: otherwise an unrelated re-render snaps the chip
+  // back over a choice made inside the dialog.
+  store.getState().setSessionDraftField("projectId", activeProjectId || null);
+  document.getElementById("remote-start-session-dialog")?.showModal();
+}
+
+function providerDraftPatch(uiState, value) {
+  const models = uiState.providerModels[value] || [];
+  const model = models.find((option) => option.is_default)?.model
+    || models[0]?.model
+    || defaultModelForProvider(value);
+  const storedEffort = loadLastEffort(value);
+  const storedApproval = loadLastApprovalPolicy(value);
+  const patch = {
+    effort: resolveReasoningEffortValue(models, model, storedEffort || uiState.sessionDraft.effort),
+    model,
+    provider: value,
+  };
+  if (storedApproval) patch.approvalPolicy = storedApproval;
+  return patch;
+}
+
 function RemoteSidebar({
   currentState,
   hasRelay,
   hasUsableRelay,
+  threadActivityMap,
+  threadAttentionMap,
+  threadReviewingSet,
   onOpenInfo,
   onOpenPairing,
+  onOpenSettings,
   onRefreshRelayDirectory,
   onRefreshThreads,
   remoteUiState,
@@ -2003,6 +2583,7 @@ function RemoteSidebar({
   onDeleteProject,
   onSelectRelay,
   onStartSession,
+  onOpenStartSessionDialog,
   onToggleExpandedGroup,
   onToggleGroup,
   relayDirectoryModel,
@@ -2042,14 +2623,6 @@ function RemoteSidebar({
       void onResumeThread?.(threadId);
     },
   });
-
-  // Built once per render and shared by the group headers' roll-up and the per-row dots
-  // below — the same hoist local does (render-session.js). Beyond the wasted rebuild per
-  // project, `threadAttention.snapshotMap()` copies mutable state on every call, so
-  // recomputing per group could let a header's badge disagree with the row under it.
-  const threadActivityMap = buildThreadActivityMap(session);
-  const threadAttentionMap = threadAttention.snapshotMap();
-  const threadReviewingSet = buildReviewingThreadSet(session, remoteReviews);
 
   // The bell re-buckets the SAME rows by state. It belongs here for the same reason the
   // roll-up does: this is where all three per-thread maps are in scope. Doing it in the
@@ -2117,29 +2690,8 @@ function RemoteSidebar({
     h(
       "div",
       { className: "sidebar-top-bar" },
-      h(
-        "button",
-        {
-          "aria-label": "Hide navigation panel",
-          className: "header-button header-panel-toggle sidebar-top-toggle",
-          id: "remote-sidebar-top-toggle",
-          title: "Hide navigation panel (⌘B)",
-          type: "button",
-        },
-        h(RemoteToggleLeftPanelIcon)
-      ),
-      h(
-        "div",
-        { className: "sidebar-brand" },
-        h("img", {
-          className: "sidebar-brand-logo",
-          src: "/static/sealwire_logo.png",
-          alt: "",
-          width: 24,
-          height: 24,
-        }),
-        h("span", { className: "sidebar-brand-name" }, "Sealwire")
-      ),
+      h(SidebarCollapseToggle, { id: "remote-sidebar-top-toggle" }),
+      h(SidebarBrand),
       h(
         "div",
         { className: "sidebar-top-actions" },
@@ -2148,101 +2700,44 @@ function RemoteSidebar({
         // them rather than a heading above the list. The name it would have displayed
         // lives on the chip below, which only exists while a project is actually
         // pinned.
-        h(ProjectSwitcher, {
-          activeProjectId,
-          className: "project-switcher-top",
-          onCreateProject: projectsReady ? () => onCreateProject() : null,
-          onDeleteProject: projectsReady ? onDeleteProject : null,
-          onRenameProject: projectsReady ? onRenameProject : null,
-          onSelectProject,
-          projects,
-          renderHeading: false,
-          triggerIcon: h(RemoteProjectIcon),
-        }),
-        h(
-          "button",
-          {
-            className:
-              "header-button sidebar-search-toggle" + (searchOpen ? " is-active" : ""),
-            id: "remote-sidebar-search-toggle",
-            type: "button",
-            title: "Search sessions",
-            "aria-label": "Search sessions",
-            "aria-expanded": String(searchOpen),
-            onClick: () => onSetSearchOpen(!searchOpen),
-          },
-          h("span", {
-            className: "inline-icon",
-            "aria-hidden": "true",
-            dangerouslySetInnerHTML: { __html: SEARCH_SVG },
-          })
-        ),
-        h(
-          "button",
-          {
-            className:
-              "header-button sidebar-bell-toggle" + (threadFilter.on ? " is-active" : ""),
-            id: "remote-sidebar-bell-toggle",
-            type: "button",
-            title: "Filter by activity",
-            "aria-label": "Filter by activity",
-            // A toggle, not a disclosure: it re-groups the list in place and there is
-            // no popover under it to expand.
-            "aria-pressed": String(threadFilter.on),
-            onClick: () => onSetThreadFilter({ on: !threadFilter.on }),
-          },
-          h("span", {
-            className: "inline-icon",
-            "aria-hidden": "true",
-            dangerouslySetInnerHTML: { __html: BELL_SVG },
-          })
-        )
+        //
+        // Drawer widths only: the chat header carries the full switcher at every width
+        // (RemoteHeader's `titleNode`), so this icon is that same control a second time
+        // unless the drawer is covering it.
+        usesDrawer
+          ? h(ProjectSwitcher, {
+              activeProjectId,
+              className: "project-switcher-top",
+              onCreateProject: projectsReady ? () => onCreateProject() : null,
+              onDeleteProject: projectsReady ? onDeleteProject : null,
+              onRenameProject: projectsReady ? onRenameProject : null,
+              onSelectProject,
+              projects,
+              renderHeading: false,
+              // The same tag the tree marks project groups with. This used to be a
+              // bespoke folder outline, on the reasoning that a second mark at 16px
+              // would be noise — which held only while projects and cwds shared a
+              // glyph. They no longer do, so a folder here would name the wrong kind.
+              triggerIcon: h(ProjectTagIcon),
+            })
+          : null,
+        // No `shortcutHint`: remote is a phone surface with no ⌘F to promise.
+        h(SidebarSearchToggle, { open: searchOpen, onToggle: onSetSearchOpen }),
+        h(SidebarBellToggle, {
+          on: threadFilter.on,
+          onToggle: (on) => onSetThreadFilter({ on }),
+        })
       )
     ),
-    searchOpen
-      ? h(
-          "div",
-          { className: "sidebar-search", id: "remote-sidebar-search" },
-          h("span", {
-            className: "inline-icon sidebar-search-glyph",
-            "aria-hidden": "true",
-            dangerouslySetInnerHTML: { __html: SEARCH_SVG },
-          }),
-          h("input", {
-            autoComplete: "off",
-            className: "sidebar-search-input",
-            id: "remote-sidebar-search-input",
-            placeholder: "Search session titles",
-            spellCheck: false,
-            type: "search",
-            value: searchQuery,
-            "aria-label": "Search session titles",
-            onChange: (event) => onSearchInput(event.target.value),
-            onKeyDown: (event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                onSetSearchOpen(false);
-              }
-            },
-          }),
-          h(
-            "button",
-            {
-              className: "sidebar-search-clear",
-              id: "remote-sidebar-search-clear",
-              type: "button",
-              title: "Clear search",
-              "aria-label": "Clear search",
-              onClick: () => onSearchInput(""),
-            },
-            h("span", {
-              className: "inline-icon",
-              "aria-hidden": "true",
-              dangerouslySetInnerHTML: { __html: X_SVG },
-            })
-          )
-        )
-      : null,
+    h(SidebarSearchField, {
+      open: searchOpen,
+      query: searchQuery,
+      onInput: onSearchInput,
+      onClose: () => onSetSearchOpen(false),
+      // No `focusOnOpen`, deliberately: on a phone, focusing pops the on-screen keyboard
+      // over the very list the user just asked to search. `focusSignal` is therefore
+      // irrelevant here — the component ignores it without the policy flag.
+    }),
     h(
       "div",
       { className: "sidebar-row" },
@@ -2258,18 +2753,23 @@ function RemoteSidebar({
         "Manage"
       )
     ),
-    h(
-      "button",
-      {
-        className: "start-session-button",
-        disabled: !hasUsableRelay,
-        id: "remote-session-toggle",
-        onClick: () => document.getElementById("remote-start-session-dialog")?.showModal(),
-        type: "button",
+    h(StartSessionSplitButton, {
+      activeProvider: sessionPanelModel?.fields?.provider || "",
+      buttonId: "remote-session-toggle",
+      disabled: !hasUsableRelay,
+      menuId: "remote-start-session-agent-menu",
+      onStart: () => onOpenStartSessionDialog(activeProjectId),
+      onStartWithProvider(provider) {
+        updateSessionDraft(providerDraftPatch(remoteUiState, provider));
+        onOpenStartSessionDialog(activeProjectId);
       },
-      "New session"
-    ),
-    h(ProviderStatusSection, { model: buildProviderStatusModel(session) }),
+      providerOptions: sessionPanelModel?.providerOptions || [],
+    }),
+    // The Providers health panel used to sit here, between the primary action and
+    // the relay list. It is now a Settings tab — the same place local files it.
+    // Provider is per-session and immutable once a session starts, so nothing on
+    // this panel is ever acted on from the sidebar; it was spending permanent
+    // column space to answer a question you ask about twice a week.
     h(
       "section",
       { className: "remote-access-shell remote-relay-shell" },
@@ -2291,26 +2791,26 @@ function RemoteSidebar({
     ),
     h(SessionPanel, {
         model: sessionPanelModel,
+        onSelectModel({ provider, model }) {
+          // One patch: effort is per MODEL, and the second of two sequential
+          // callbacks would still be reading the previous render's catalogue.
+          const uiState = remoteUiState;
+          const catalog = uiState.providerModels[provider] || [];
+          const patch =
+            provider !== uiState.sessionDraft.provider
+              ? providerDraftPatch(uiState, provider)
+              : {};
+          updateSessionDraft({
+            ...patch,
+            effort: resolveReasoningEffortValue(catalog, model, uiState.sessionDraft.effort),
+            model,
+            provider,
+          });
+        },
         onFieldChange(field, value) {
           const uiState = remoteUiState;
           if (field === "provider") {
-            const models = uiState.providerModels[value] || [];
-            const model = models.find((option) => option.is_default)?.model
-              || models[0]?.model
-              || defaultModelForProvider(value);
-            const storedEffort = loadLastEffort(value);
-            const storedApproval = loadLastApprovalPolicy(value);
-            const patch = {
-              effort: resolveReasoningEffortValue(
-                models,
-                model,
-                storedEffort || uiState.sessionDraft.effort
-              ),
-              model,
-              provider: value,
-            };
-            if (storedApproval) patch.approvalPolicy = storedApproval;
-            updateSessionDraft(patch);
+            updateSessionDraft(providerDraftPatch(uiState, value));
             return;
           }
           if (field === "model") {
@@ -2396,42 +2896,31 @@ function RemoteSidebar({
         })
       )
     ),
+    // Footer, matching local's: what you are connected to on the left, the way
+    // into Settings on the right. The theme picker used to be the footer's only
+    // occupant — one preference, permanently on screen, with no home to belong
+    // to. It is now the Appearance tab.
     h(
       "div",
       { className: "sidebar-bottom-bar" },
-      h(ThemePickerRow)
+      h(
+        "button",
+        {
+          className: "sidebar-settings-button",
+          id: "remote-sidebar-settings",
+          onClick: onOpenSettings,
+          type: "button",
+          title: "Settings",
+          "aria-label": "Settings",
+        },
+        h("span", {
+          className: "inline-icon",
+          "aria-hidden": "true",
+          dangerouslySetInnerHTML: { __html: SETTINGS_SVG },
+        })
+      )
     ),
-    h("div", {
-      className: "sidebar-resize",
-      id: "remote-sidebar-resize",
-      role: "separator",
-      "aria-orientation": "vertical",
-      "aria-label": "Resize navigation panel",
-      tabIndex: 0,
-    })
-  );
-}
-
-// Geometry is a plain folder outline rather than anything project-specific: the
-// drawer already spends its folder glyph on cwd groups, and at 16px a second bespoke
-// mark would just be noise. What identifies this control is its position beside search
-// and the bell, plus `is-active` when a project is pinned.
-function RemoteProjectIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "16",
-      viewBox: "0 0 24 24",
-      width: "16",
-      stroke: "currentColor",
-      strokeWidth: "1.8",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M3 7.5h6l2 2h10v9.5H3z" }),
-    h("path", { d: "M3 7.5V5h5.5l2 2.5" })
+    h(SidebarResizeHandle, { id: "remote-sidebar-resize" })
   );
 }
 
@@ -2472,169 +2961,110 @@ function PinnedProjectChip({ name, onClear, summary }) {
   );
 }
 
-function RemoteToggleLeftPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "6", y1: "2.5", x2: "6", y2: "13.5" })
-  );
-}
 
-function RemoteToggleRightPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "10", y1: "2.5", x2: "10", y2: "13.5" })
-  );
-}
 
-function RemoteComposeIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "16",
-      viewBox: "0 0 16 16",
-      width: "16",
-      stroke: "currentColor",
-      strokeWidth: "1.4",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M2.5 13.5h4l6.5-6.5a1.8 1.8 0 0 0-2.5-2.5L4 11v2.5z" }),
-    h("path", { d: "M10 5.5l2 2" })
-  );
-}
 
-function RemoteBackArrowIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "14",
-      viewBox: "0 0 16 16",
-      width: "14",
-      stroke: "currentColor",
-      strokeWidth: "1.6",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M10 3.5L5.5 8L10 12.5" })
-  );
-}
 
 function RemoteHeader({
   currentState,
   deviceChromeModel,
   headerModel,
+  activeProjectId,
+  hasUsableRelay = false,
+  projects = [],
+  projectsError = null,
+  projectsLoaded = false,
+  projectsReady = false,
+  onCreateProject,
+  onDeleteProject,
   onOpenInfo,
   onOpenStartSession,
+  onRenameProject,
   onReturnHome,
+  onSelectProject,
   onToggleNavigation,
   statusBadgeModel,
 }) {
   const usesDrawer = currentState.remoteNavMode === "drawer";
   const navOpen = currentState.remoteNavOpen;
   const navLabel = navOpen ? "Close sidebar" : "Open sidebar";
+  const {
+    label: switcherLabel,
+    labelTooltip: switcherTooltip,
+  } = selectRemoteHeaderProjectSwitcherModel({
+    activeProjectId,
+    headerModel,
+    projects,
+    projectsError,
+    projectsLoaded,
+  });
+  const titleNode = hasUsableRelay
+    ? h(ProjectSwitcher, {
+        activeProjectId,
+        label: switcherLabel,
+        labelTooltip: switcherTooltip,
+        onCreateProject: projectsReady ? onCreateProject : null,
+        onDeleteProject: projectsReady ? onDeleteProject : null,
+        onRenameProject: projectsReady ? onRenameProject : null,
+        onSelectProject,
+        projects,
+        titleId: "remote-workspace-title",
+      })
+    : null;
 
-  return h(
-    "header",
-    { className: "chat-header" },
-    h(
-      "div",
-      { className: "chat-header-main" },
+  return h(ConversationHeader, {
+    // Remote-only: the drawer hamburger. Local has no drawer, so this slot is the one
+    // structural thing the two headers genuinely do not share.
+    navToggle: h(
+      "button",
+      {
+        "aria-expanded": String(navOpen),
+        "aria-label": navLabel,
+        className: "header-button remote-nav-toggle-button",
+        "data-nav-state": navOpen ? "open" : "closed",
+        hidden: !usesDrawer,
+        id: "remote-nav-toggle-button",
+        onClick: onToggleNavigation,
+        title: navLabel,
+        type: "button",
+      },
       h(
-        "button",
-        {
-          "aria-expanded": String(navOpen),
-          "aria-label": navLabel,
-          className: "header-button remote-nav-toggle-button",
-          "data-nav-state": navOpen ? "open" : "closed",
-          hidden: !usesDrawer,
-          id: "remote-nav-toggle-button",
-          onClick: onToggleNavigation,
-          title: navLabel,
-          type: "button",
-        },
-        h(
-          "span",
-          { className: "remote-nav-toggle-icon", "aria-hidden": "true" },
-          h("span", null),
-          h("span", null),
-          h("span", null)
-        ),
-        h("span", { className: "sr-only" }, "Toggle sidebar")
+        "span",
+        { className: "remote-nav-toggle-icon", "aria-hidden": "true" },
+        h("span", null),
+        h("span", null),
+        h("span", null)
       ),
-      h(
-        "div",
-        { className: "chat-header-collapsed-actions" },
-        h(
-          "button",
-          {
-            "aria-label": "Show navigation panel",
-            className: "header-button header-panel-toggle header-panel-toggle-left",
-            id: "remote-toggle-left-panel",
-            title: "Show navigation panel (⌘B)",
-            type: "button",
-          },
-          h(RemoteToggleLeftPanelIcon)
-        ),
-        h(
-          "button",
-          {
-            "aria-label": "Start new session",
-            className: "header-button header-compose-button",
-            id: "remote-new-session-compose-button",
-            type: "button",
-            title: "Start new session",
-            onClick: onOpenStartSession,
-          },
-          h(RemoteComposeIcon)
-        )
-      ),
-      h(
-        "button",
-        {
-          className: "header-icon-button chat-heading-back-button",
-          hidden: deviceChromeModel.homeButton.hidden,
-          id: "remote-home-button",
-          onClick: onReturnHome,
-          title: "All relays",
-          "aria-label": "All relays",
-          type: "button",
-        },
-        h(RemoteBackArrowIcon)
-      ),
-      h(
-        "div",
-        { className: "chat-heading", id: "remote-chat-heading" },
-        h(WorkspaceHeading, {
-          header: headerModel,
-          statusBadge: statusBadgeModel,
-          onOpenInfo,
-        })
-      )
+      h("span", { className: "sr-only" }, "Toggle sidebar")
     ),
-    h(
-      "div",
-      { className: "chat-header-actions" },
-      h(
-        "button",
-        {
-          "aria-label": "Toggle side panel",
-          className: "header-button header-panel-toggle header-panel-toggle-right",
-          id: "remote-toggle-right-panel",
-          title: "Toggle side panel (⌥⌘B)",
-          type: "button",
-        },
-        h(RemoteToggleRightPanelIcon)
-      )
-    )
-  );
+    // The back button goes somewhere different here than on local — the relay list, not
+    // the console — which is why the label travels with the handler.
+    backButtonId: "remote-home-button",
+    backHidden: deviceChromeModel.homeButton.hidden,
+    backLabel: "All relays",
+    onBack: onReturnHome,
+    composeButtonId: "remote-new-session-compose-button",
+    onCompose: onOpenStartSession,
+    leftPanelToggleId: "remote-toggle-left-panel",
+    headingId: "remote-chat-heading",
+    heading: h(WorkspaceHeading, {
+      header: headerModel,
+      onOpenInfo,
+      statusBadge: statusBadgeModel,
+      titleNode,
+    }),
+    actions: h(
+      "button",
+      {
+        "aria-label": "Toggle side panel",
+        className: "header-button header-panel-toggle header-panel-toggle-right",
+        id: "remote-toggle-right-panel",
+        title: "Toggle side panel (\u2325\u2318B)",
+        type: "button",
+      },
+      h(ToggleRightPanelIcon)
+    ),
+  });
 }
 
 function RemoteThreadPanel({
@@ -2658,6 +3088,7 @@ function RemoteThreadPanel({
   onEnsureFileChangeDetail,
   onSubmitDecision,
   onSubmitAskUserAnswers,
+  onRepairWorkspace,
   onTakeOver,
   onUpdateSessionSettings,
   pendingAskUserQuestions,
@@ -2739,6 +3170,7 @@ function RemoteThreadPanel({
       },
       h(ControlBanner, {
         model: controlBannerModel,
+        onRepairWorkspace,
         onTakeOver,
       })
     ),
@@ -2766,6 +3198,8 @@ function RemoteThreadPanel({
               onEnsureProviderModels: reviewNudgeModel.reviewModel?.onEnsureProviderModels,
               reusableReviewers: reviewNudgeModel.reusableReviewers || [],
               parentThreadId: reviewNudgeModel.parentThreadId || null,
+              workspace: reviewNudgeModel.workspace || null,
+              onPinWorkspace: reviewNudgeModel.onPinWorkspace,
               disabled: false,
               onSubmit: (values) => reviewNudgeModel.onRequestReview?.(values),
             })
@@ -2851,6 +3285,7 @@ function RemoteTranscriptPanel({
   useRemoteTranscriptScrollBookkeeping({
     currentState,
     entries,
+    session,
     threadId: session?.active_thread_id || null,
     transcriptRef,
   });
@@ -2919,56 +3354,38 @@ function RemoteTranscriptPanel({
             ? askUserDetailLoadingRequestIds
             : new Set(),
       },
-      onTranscriptInteract: (event) => {
-        const copyButton = event.target.closest?.("[data-copy-message]");
-        if (copyButton) {
+      // The same dispatcher the local surface uses. This chain had drifted from
+      // that one in ways nobody chose: it alone handled a bare `data-expand-key`
+      // summary, and it alone called preventDefault. Both are preserved here —
+      // the drift is now visible as which keys this surface supplies.
+      onTranscriptInteract: createTranscriptInteractionHandler({
+        copyMessage: ({ text, element }, event) => {
           event.preventDefault();
-          void copyTextToClipboard(copyButton.dataset.copyMessage || "", copyButton);
-          return;
-        }
-
-        const forkButton = event.target.closest?.("[data-fork-from-item]");
-        if (forkButton) {
+          void copyTextToClipboard(text, element);
+        },
+        forkFromItem: ({ itemId }, event) => {
           event.preventDefault();
-          onForkFromMessage?.(
-            session?.active_thread_id || "",
-            forkButton.dataset.forkFromItem || ""
-          );
-          return;
-        }
-
-        const fileChangeButton = event.target.closest?.("[data-file-change-action]");
-        if (fileChangeButton) {
+          onForkFromMessage?.(session?.active_thread_id || "", itemId);
+        },
+        fileChangeAction: ({ itemId, action }, event) => {
           event.preventDefault();
-          const action = fileChangeButton.dataset.fileChangeAction;
-          const itemId = fileChangeButton.dataset.itemId || "";
           if (itemId && (action === "rollback" || action === "reapply")) {
             void onApplyFileChange?.(itemId, action);
           }
-          return;
-        }
-
-        const approvalButton = event.target.closest?.("[data-approval-decision]");
-        if (!approvalButton) {
-          const expandSummary = event.target.closest?.("[data-expand-key]");
-          if (expandSummary) {
-            event.preventDefault();
-            onToggleExpandableBlock?.(expandSummary.dataset.expandKey || "");
-            return;
-          }
-          const toggleButton = event.target.closest?.("[data-transcript-toggle]");
-          if (!toggleButton) {
-            return;
-          }
-          void onToggleTranscriptItem?.(toggleButton.dataset.itemId || "");
-          return;
-        }
-
-        onSubmitDecision(
-          approvalButton.dataset.approvalDecision,
-          approvalButton.dataset.approvalScope || "once"
-        );
-      },
+        },
+        approvalDecision: ({ decision, scope }) => onSubmitDecision(decision, scope),
+        // A group header carries an expand key AND a toggle attribute; this
+        // surface has always treated both as the same gesture.
+        toggleGroup: ({ expandKey }, event) => {
+          event.preventDefault();
+          onToggleExpandableBlock?.(expandKey);
+        },
+        expandBlock: ({ expandKey }, event) => {
+          event.preventDefault();
+          onToggleExpandableBlock?.(expandKey);
+        },
+        toggleEntry: ({ itemId }) => void onToggleTranscriptItem?.(itemId),
+      }),
     });
   }
 
@@ -3284,74 +3701,6 @@ function ThreadActionsSheet({ onClose, onSelect, open, sections, threadTitle }) 
         )
       )
     )
-  );
-}
-
-function ManagedDialog({
-  children,
-  className,
-  id,
-  onRequestClose,
-  open,
-}) {
-  const dialogRef = useRef(null);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) {
-      return;
-    }
-
-    if (open) {
-      if (!dialog.open) {
-        if (typeof dialog.showModal === "function") {
-          dialog.showModal();
-        } else {
-          dialog.setAttribute("open", "");
-        }
-      }
-      return;
-    }
-
-    if (dialog.open) {
-      if (typeof dialog.close === "function") {
-        dialog.close();
-      } else {
-        dialog.removeAttribute("open");
-      }
-    }
-  }, [open]);
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) {
-      return undefined;
-    }
-
-    const handleCancel = (event) => {
-      event.preventDefault();
-      onRequestClose?.();
-    };
-
-    dialog.addEventListener("cancel", handleCancel);
-    return () => {
-      dialog.removeEventListener("cancel", handleCancel);
-    };
-  }, [onRequestClose]);
-
-  return h(
-    "dialog",
-    {
-      className,
-      id,
-      onClick: (event) => {
-        if (event.target === event.currentTarget) {
-          onRequestClose?.();
-        }
-      },
-      ref: dialogRef,
-    },
-    children
   );
 }
 

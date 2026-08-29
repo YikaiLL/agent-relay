@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::protocol::ThreadSummaryView;
+use crate::protocol::{ThreadSummaryView, WorkspaceTrustInput, WorkspaceTrustReceipt};
 
 /// Hard bounds on user-chosen session titles, for the same reason `project_action` has
 /// them: a paired device drives this path, and the map is persisted.
@@ -69,24 +69,77 @@ fn thread_display_title(thread: &ThreadSummaryView) -> &str {
     }
 }
 
+/// How many ids one probe may ask about.
+///
+/// A probe's caller is a client listing the sessions it still holds a reference to — open
+/// tabs — so the realistic count is single digits. The cap is a bound on what an untrusted
+/// client can make the relay do, not a product limit.
+///
+/// Exceeding it is an ERROR, not a truncation. A dropped id is absent from the answer, and
+/// absence is exactly how a probe's caller concludes "deleted" — so truncating here would
+/// turn this one number disagreeing with the client's copy of it into mass closure of live
+/// sessions, silently, in the direction (lowering it) that looks harmless from this side.
+/// Failing loudly makes the bound enforced rather than documented: the caller discards a
+/// sweep it could not complete, so the worst case is that nothing happens.
+const MAX_THREAD_ID_PROBE: usize = 128;
+
+/// Normalize a raw id list into a probe set, or `None` for "not a probe".
+///
+/// An EMPTY list normalizes to `None` — i.e. "the normal page" — rather than to "a probe
+/// about nothing". The alternative is worse than it looks: a probe about nothing answers
+/// with nothing, and a caller that diffs its ids against an empty answer concludes every
+/// session it asked about is gone. Making the degenerate input mean "no probe" keeps a
+/// client bug from reading as mass deletion.
+///
+/// Deduplicated BEFORE the cap, so a caller that repeats an id does not spend its budget
+/// on the same question twice.
+fn normalize_thread_id_probe(ids: Option<&[String]>) -> Result<Option<HashSet<String>>, String> {
+    let Some(ids) = ids else {
+        return Ok(None);
+    };
+    let mut wanted = ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    wanted.sort();
+    wanted.dedup();
+    if wanted.len() > MAX_THREAD_ID_PROBE {
+        return Err(format!(
+            "a thread-id probe may ask about at most {MAX_THREAD_ID_PROBE} sessions; \
+             got {}. Split it — a truncated answer is indistinguishable from those \
+             sessions being deleted.",
+            wanted.len()
+        ));
+    }
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(wanted.into_iter().collect::<HashSet<_>>()))
+}
+
 impl AppState {
     pub async fn list_threads(
         &self,
         limit: usize,
         device_id: Option<String>,
     ) -> Result<ThreadsResponse, String> {
-        self.list_threads_matching(limit, device_id, None).await
+        self.list_threads_matching(limit, device_id, None, None)
+            .await
     }
 
     /// `list_threads`, optionally narrowed to rows whose displayed title contains
-    /// `query` (case-insensitive).
+    /// `query` (case-insensitive), or to an explicit set of thread `ids`.
     pub async fn list_threads_matching(
         &self,
         limit: usize,
         device_id: Option<String>,
         query: Option<&str>,
+        ids: Option<&[String]>,
     ) -> Result<ThreadsResponse, String> {
         let query = normalize_thread_query(query);
+        let wanted_ids = normalize_thread_id_probe(ids)?;
         // Read reviewer ids before the provider fetch so we can request a larger
         // page from each provider. If the newest N slots are all reviewer threads
         // we would return fewer than `limit` normal threads otherwise.
@@ -96,7 +149,11 @@ impl AppState {
         };
         // A search asks each provider for a deep scan, because the row it is looking
         // for is almost always one that fell off the end of a normal page.
-        let scan_limit = if query.is_some() {
+        //
+        // An id probe scans the same way, and for a stronger reason: its caller is asking
+        // whether specific sessions still exist, so a shallow scan would answer "gone" for
+        // every session older than the page and be indistinguishable from the truth.
+        let scan_limit = if query.is_some() || wanted_ids.is_some() {
             SEARCH_SCAN_LIMIT.max(limit)
         } else {
             limit
@@ -204,20 +261,39 @@ impl AppState {
         if let Some(needle) = &query {
             threads.retain(|thread| thread_display_title(thread).to_lowercase().contains(needle));
         }
+        // Applied AFTER the active-thread re-add above, so a probe cannot be handed a row
+        // it did not ask about.
+        if let Some(wanted) = &wanted_ids {
+            threads.retain(|thread| wanted.contains(&thread.id));
+        }
         sort_threads_by_recency(&mut threads);
-        threads.truncate(limit);
-        let response_threads = threads.clone();
+        // A probe is bounded by how many ids it asked about, never by the page size — the
+        // caller's `limit` describes a sidebar, and truncating to it would drop answers it
+        // explicitly requested, which reads as "deleted".
+        threads.truncate(match &wanted_ids {
+            Some(wanted) => wanted.len(),
+            None => limit,
+        });
+        let mut response_threads = threads.clone();
 
-        if query.is_some() {
+        if query.is_some() || wanted_ids.is_some() {
             // A search is a NARROWED VIEW, not a new authoritative list: assigning it to
             // the routing cache would stop every non-matching thread routing while the
             // sidebar kept rendering it. Hints go in their own map instead — see
             // `RelayState::search_routing_hints` for why appending here is not enough.
+            //
+            // An id probe is narrower still, and unlike a search it is issued
+            // automatically on every remote boot rather than by someone typing. Its worst
+            // case is also worse: when every probed session really is gone the answer is
+            // EMPTY, so the cache would be wiped to reviewer rows and nothing would be
+            // routable at all. The hints are what keep the probed threads — old ones, by
+            // construction — routable afterwards, which is exactly what they exist for.
             for thread in &response_threads {
                 relay.remember_search_routing_hint(thread);
             }
             // Deliberately no `notify()`. A search is one client narrowing its own view;
-            // waking every connected client per keystroke would be pure noise.
+            // waking every connected client per keystroke would be pure noise. A probe is
+            // the same claim: it tells the asker something, not the room.
         } else {
             // The routing cache (relay.threads) must retain reviewer-thread rows even
             // though they are filtered from the nav-visible response. `find_thread_provider`
@@ -237,9 +313,112 @@ impl AppState {
 
             relay.notify();
         }
+        // Stamped on the way out, not stored: the grant list changes without the thread
+        // list changing, and a cached row must never claim stale trust.
+        //
+        // Asked of the GATE, never re-derived. This row's own doc promises "the relay
+        // declines to run git there", which is a claim about what `admit` will do — and a
+        // second, hand-written copy of that rule does not stay equal to it. The copy this
+        // replaced had already drifted in both directions: a cwd only in `allowed_roots`
+        // read as trusted while git was refused, and a linked worktree of a granted repo
+        // read as restricted while git ran. One rule, one answer.
+        //
+        // Costs an ancestor walk per row. Worth it: a pill that lies is worse than a slow
+        // one, and the walk stops at the first `.git`.
+        //
+        // Copied from the guard ALREADY held, then that guard is dropped. Not a style
+        // choice: `AppState::admit` takes `relay.read()`, so calling it here — with the
+        // write guard above still alive — is an unconditional self-deadlock, and reopening
+        // the lock to fetch the grants is the same deadlock a line earlier. Dropping first
+        // is also what keeps the per-row `.git` walk below off the lock entirely.
+        let grants = relay.trust_grants();
+        drop(relay);
+        for thread in &mut response_threads {
+            thread.workspace_trusted =
+                !thread.cwd.is_empty() && grants.admit(&thread.cwd).await.trusted().is_some();
+        }
         Ok(ThreadsResponse {
             threads: response_threads,
             unavailable_providers,
+        })
+    }
+
+    /// Grant or withdraw trust for one directory.
+    ///
+    /// Reachable only from the local surface: no `RemoteActionRequest` variant maps
+    /// here, so a paired phone can report a restricted workspace but never clear it.
+    pub async fn set_workspace_trust(
+        &self,
+        input: WorkspaceTrustInput,
+    ) -> Result<WorkspaceTrustReceipt, String> {
+        // Same normalization as the probe, or a grant would be recorded under one
+        // spelling and checked under another.
+        let cwd = normalize_cwd(&input.cwd);
+        if cwd.is_empty() {
+            return Err("a workspace path is required".to_string());
+        }
+
+        // Recorded against the REPOSITORY, not the tree that happened to be open. Trust is
+        // a property of the repository — every linked worktree runs the main repo's config
+        // — so storing the literal path made the grant directional: vouching from
+        // `/repo/linked` covered neither `/repo`, nor its siblings, nor a task worktree
+        // created afterwards, which was then refused as though it did not exist.
+        //
+        // Withdrawal resolves the same way, which is the half that makes the receipt
+        // honest: revoking through any tree removes the grant the gate actually consults,
+        // instead of deleting a path nothing was keyed on and reporting `trusted: false`
+        // about a workspace git still runs in.
+        //
+        // Resolved BEFORE the lock: this reads `.git` from disk, and awaiting on that
+        // while holding the write guard is the deadlock this file has already shipped once.
+        let cwd = super::workspace_trust::grant_key(&cwd).await;
+
+        // Every stored spelling of this repository, not just the key.
+        //
+        // A grant persisted by an older build — or copied in verbatim by the allowed-roots
+        // migration — reads as whatever tree the user had open, and admission still
+        // honours that literal. Removing only the repository key would leave it standing,
+        // so withdrawal would answer `trusted: false` about a workspace git keeps running
+        // in, and re-granting could not repair it: it would add the key and leave the
+        // literal behind to survive the next withdrawal too. An unrevokable grant is the
+        // whole defect, preserved for precisely the installs that already trusted
+        // something.
+        //
+        // Resolved before the lock, because each of these reads `.git` from disk.
+        let aliases = {
+            let stored = { self.relay.read().await.trusted_workspaces.clone() };
+            let mut aliases = Vec::new();
+            for granted in stored {
+                if super::workspace_trust::grant_key(&normalize_cwd(&granted)).await == cwd {
+                    aliases.push(granted);
+                }
+            }
+            aliases
+        };
+
+        let mut relay = self.relay.write().await;
+        let before = relay.trusted_workspaces.len();
+        relay.trusted_workspaces.retain(|granted| {
+            normalize_cwd(granted) != cwd && !aliases.iter().any(|alias| alias == granted)
+        });
+        if input.trusted {
+            relay.trusted_workspaces.push(cwd.clone());
+        }
+        if relay.trusted_workspaces.len() != before {
+            relay.push_log(
+                "info",
+                if input.trusted {
+                    format!("Trusted workspace {cwd}.")
+                } else {
+                    format!("Withdrew trust for workspace {cwd}.")
+                },
+            );
+            relay.notify();
+        }
+
+        Ok(WorkspaceTrustReceipt {
+            cwd,
+            trusted: input.trusted,
         })
     }
 
@@ -286,6 +465,117 @@ impl AppState {
         })
     }
 
+    /// May a turn start, given today's spend against the relay's budget?
+    ///
+    /// Reads the ledger, not a counter kept in memory: the ledger is the same
+    /// source the Usage screen reports from, so a refusal can never disagree
+    /// with the number the user is looking at while being refused.
+    ///
+    /// The store handle is cloned out from under the relay lock before it is
+    /// queried. `UsageStore` guards its connection with a blocking
+    /// `std::sync::Mutex`, and this runs on the turn path, which already holds
+    /// async locks — taking a blocking lock underneath one is how an executor
+    /// thread gets parked with a `RwLock` still held.
+    ///
+    /// A degraded ledger allows everything. It cannot tell us what was spent,
+    /// and refusing work because we cannot measure it would turn a best-effort
+    /// reporting feature into an outage.
+    pub(super) async fn usage_budget_verdict(
+        &self,
+        origin: crate::usage::budget::TurnOrigin,
+    ) -> crate::usage::budget::BudgetVerdict {
+        use crate::usage::budget::{decide, BudgetVerdict};
+
+        let (store, budget) = {
+            let relay = self.relay.read().await;
+            (relay.usage_store.clone(), relay.usage_budget)
+        };
+        if budget.cap().is_none() || !store.is_enabled() {
+            return BudgetVerdict::Allow;
+        }
+        let now = crate::state::unix_now();
+        let day_start = store.local_midnight_containing(now);
+        let spent =
+            crate::usage::report::effective_total(&store.window_totals(day_start, now + 1).usage);
+        let verdict = decide(&budget, spent, origin);
+        if let (BudgetVerdict::Refuse(_), Some(cap)) = (&verdict, budget.cap()) {
+            // Chart annotations need a fact the token rows cannot provide: a
+            // refuse leaves no spend. Write it here, once the gate has already
+            // decided, so a degraded ledger still never blocks a turn.
+            store.record_budget_hit(now, spent, cap, budget.policy.as_str());
+        }
+        verdict
+    }
+
+    /// Set the relay-wide daily token budget.
+    ///
+    /// PATCH-shaped: an absent field is left alone. That is what lets the two
+    /// controls on the Usage screen — the cap and the exhaustion policy — move
+    /// without each having to restate the other's current value, which is the
+    /// shape that races when two tabs are open.
+    ///
+    /// A cap of 0 clears the cap. "No limit" and "a limit of nothing" are
+    /// different statements and only one of them is reachable from a UI that
+    /// empties a number field, so the parse collapses 0 into `None` here rather
+    /// than storing a 0 that `budget::decide` would have to special-case forever.
+    pub async fn update_usage_budget(
+        &self,
+        input: crate::protocol::UsageBudgetInput,
+    ) -> Result<crate::protocol::UsageBudgetReceipt, String> {
+        use crate::usage::budget::BudgetPolicy;
+
+        if let Some(raw) = input.policy.as_deref() {
+            // Unlike the persisted-state path, an unknown policy from a CLIENT
+            // is an error rather than a fallback: the state file may legitimately
+            // come from a newer build, but a request cannot, and silently storing
+            // something softer than asked for would be the wrong surprise for a
+            // caller trying to tighten a budget.
+            if !matches!(raw, "hold_new_work" | "stop_everything") {
+                return Err(format!(
+                    "unknown budget policy {raw:?}; expected hold_new_work or stop_everything"
+                ));
+            }
+        }
+
+        let mut relay = self.relay.write().await;
+        let before = relay.usage_budget;
+        if let Some(cap) = input.daily_cap {
+            relay.usage_budget.daily_cap = cap.filter(|value| *value > 0);
+        }
+        if let Some(raw) = input.policy.as_deref() {
+            relay.usage_budget.policy = BudgetPolicy::parse(raw);
+        }
+        let after = relay.usage_budget;
+        let changed = before != after;
+
+        if changed {
+            relay.push_log(
+                "info",
+                match after.cap() {
+                    Some(cap) => format!(
+                        "Daily token budget set to {cap} ({}).",
+                        match after.policy {
+                            BudgetPolicy::HoldNewWork => "hold new autonomous work when reached",
+                            BudgetPolicy::StopEverything => "stop everything when reached",
+                        }
+                    ),
+                    None => "Daily token budget cleared. Nothing is capped.".to_string(),
+                },
+            );
+            relay.notify();
+        }
+
+        Ok(crate::protocol::UsageBudgetReceipt {
+            daily_cap: after.cap(),
+            policy: after.policy.as_str().to_string(),
+            message: if changed {
+                "Budget saved.".to_string()
+            } else {
+                "Budget was already up to date.".to_string()
+            },
+        })
+    }
+
     /// Set or clear a session's user-chosen title.
     ///
     /// Pure relay-owned metadata — deliberately NOT routed to a provider. Neither
@@ -299,6 +589,65 @@ impl AppState {
     ///     agent for the relay-wide lease, and must work while a turn is running;
     ///   * an id that is not currently loaded into the thread list is still renamable;
     ///   * a reviewer thread is not, because it is hidden from navigation entirely.
+    /// Make a thread's vanished workspace exist again, at the exact path it recorded.
+    ///
+    /// Nothing here tries to be clever about WHERE: a Claude session is archived under the
+    /// project directory derived from its cwd and `resume` resolves through that same
+    /// derivation, so a session resumed from any other directory fails with a bare "an
+    /// error occurred during execution". Re-creating the recorded path is not one repair
+    /// among several — it is the only one that works.
+    pub async fn repair_thread_workspace(
+        &self,
+        thread_id: &str,
+        input: RepairWorkspaceInput,
+    ) -> Result<SessionSnapshot, String> {
+        let device_id = require_device_id(input.device_id)?;
+        let (recorded, device_scope, allowed_roots, grants) = {
+            let relay = self.relay.read().await;
+            (
+                relay
+                    .thread_cwd(thread_id)
+                    .ok_or_else(|| format!("thread `{thread_id}` has no workspace on record"))?,
+                relay.device_path_scope(&device_id),
+                relay.allowed_roots.clone(),
+                relay.trust_grants(),
+            )
+        };
+        let Some(plan) = super::worktree::plan_workspace_repair(&recorded) else {
+            // Idempotent on purpose. There is a real gap between the verdict a surface was
+            // shown and the press that follows it — another device may have repaired it,
+            // the user may have re-created the directory by hand, two taps may race — and
+            // in every one of those the postcondition the caller asked for already holds.
+            // Reporting failure there puts an error on a button that worked.
+            self.refresh_workspace_verdict(thread_id, &recorded).await;
+            return Ok(self.snapshot().await);
+        };
+
+        // Every tree the repair touches is scope-checked before the first mutation, so a
+        // refusal leaves the repository exactly as it was. The scope is read once, above,
+        // rather than re-locking the relay inside the guard: the guard is held across
+        // awaits, and taking the lock there would deadlock the snapshot at the end.
+        let guard =
+            move |path: &str| ensure_path_within_device_scope(path, &device_scope, &allowed_roots);
+        super::worktree::repair_workspace(&plan, &guard, &grants).await?;
+        // The directory is back: re-decide now rather than leaving the banner up until
+        // something else happens to look.
+        self.refresh_workspace_verdict(thread_id, &recorded).await;
+
+        {
+            let mut relay = self.relay.write().await;
+            relay.push_log(
+                "info",
+                format!(
+                    "Re-created the {} workspace {} for thread {thread_id}.",
+                    plan.kind, plan.recorded_cwd
+                ),
+            );
+            relay.notify();
+        }
+        Ok(self.snapshot().await)
+    }
+
     pub async fn rename_thread(
         &self,
         thread_id: &str,
@@ -655,6 +1004,47 @@ normal thread instead."
                 "Active session permanently deleted from local provider storage.".to_string()
             } else {
                 "Session permanently deleted from local provider storage.".to_string()
+            },
+        })
+    }
+}
+
+impl AppState {
+    /// Mirrors `fork_session`'s resolution exactly. A plain in-memory map read —
+    /// which is why it is not a piggyback on the provider-backed transcript response.
+    pub async fn thread_settings_view(
+        &self,
+        device_id: Option<String>,
+        thread_id: &str,
+    ) -> Result<ThreadSettingsView, String> {
+        let defaults = self.defaults().await;
+        let relay = self.relay.read().await;
+        // Optional `device_id`, like `workspace_git_context`: local is already
+        // authorized and names none, and `allowed_roots` still bind the read.
+        if let Some(cwd) = relay.thread_cwd(thread_id) {
+            let device_scope = device_id
+                .as_deref()
+                .map(|id| relay.device_path_scope(id))
+                .unwrap_or_default();
+            ensure_path_within_device_scope(&cwd, &device_scope, &relay.allowed_roots)?;
+        }
+
+        Ok(match relay.remembered_thread_settings(thread_id) {
+            Some(settings) => ThreadSettingsView {
+                thread_id: thread_id.to_string(),
+                model: settings.model,
+                reasoning_effort: settings.reasoning_effort,
+                approval_policy: settings.approval_policy,
+                sandbox: settings.sandbox,
+                remembered: true,
+            },
+            None => ThreadSettingsView {
+                thread_id: thread_id.to_string(),
+                model: defaults.model,
+                reasoning_effort: defaults.reasoning_effort,
+                approval_policy: defaults.approval_policy,
+                sandbox: defaults.sandbox,
+                remembered: false,
             },
         })
     }

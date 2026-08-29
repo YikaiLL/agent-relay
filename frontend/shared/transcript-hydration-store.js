@@ -3,6 +3,7 @@ export function createClearedTranscriptHydrationPatch() {
     transcriptHydrationBaseSnapshot: null,
     transcriptHydrationEntries: new Map(),
     transcriptHydrationFetchedRevision: null,
+    transcriptHydrationBodyRevision: null,
     transcriptHydrationLastFetchAt: 0,
     transcriptHydrationOrder: [],
     transcriptHydrationOlderCursor: null,
@@ -234,6 +235,23 @@ export function transcriptEntryContentOmitted(entry) {
 //                                     -> fetch; once terminal+full it is trusted;
 //   * otherwise (cached full+terminal, or a preview no longer than our body)
 //                                     -> trusted, no fetch.
+/**
+ * Has the transcript advanced past the revision we last fetched at, with no
+ * turn still running? Then a cached body predates the final text.
+ */
+function turnSettledSinceHydration(state, snapshot) {
+  if (snapshot.active_turn_id) {
+    return false;
+  }
+  const revision = snapshot.transcript_revision;
+  if (revision == null || state.transcriptHydrationBodyRevision == null) {
+    // Never hydrated at a known revision, so there is nothing to compare and
+    // the cold-boot path already fetches unconditionally.
+    return false;
+  }
+  return revision !== state.transcriptHydrationBodyRevision;
+}
+
 function snapshotTailNeedsFullText(state, snapshot) {
   const entries = state.transcriptHydrationEntries;
   for (const entry of snapshot.transcript || []) {
@@ -249,6 +267,23 @@ function snapshotTailNeedsFullText(state, snapshot) {
       const cachedLen = typeof cached.text === "string" ? cached.text.length : 0;
       const previewLen = typeof entry.text === "string" ? entry.text.length : 0;
       if (cachedLen < previewLen) {
+        return true;
+      }
+      // Length cannot establish freshness. The relay clips a preview to a FIXED
+      // `max_transcript_chars` (1600 local, 1200 remote), so `previewLen` is
+      // that constant for every long message and the test above is really
+      // "cachedLen >= 1600" — which any mid-turn body passes. There is no
+      // per-entry completion event in the relay, so a turn's final text arrives
+      // ONLY as this preview; trusting the cache on length alone is what left
+      // the last message of a long task rendering as its mid-turn tail until a
+      // reload. Cursor makes it certain rather than likely, its bridge emitting
+      // no deltas at all for a foreground thread.
+      //
+      // So re-check once when the turn has SETTLED. Deliberately not while it
+      // runs: the revision bumps on every delta, and the stream owns the tail
+      // then anyway, so re-checking would be a fetch per chunk. Paired with the
+      // once-per-revision arm above, this is at most one repair per turn.
+      if (turnSettledSinceHydration(state, snapshot)) {
         return true;
       }
       continue;
@@ -397,10 +432,38 @@ export function createClearedTranscriptHydrationPromisePatch(state, promise) {
   };
 }
 
-export function createTranscriptHydrationCompletePatch() {
+/**
+ * The `transcript_revision` a tail's cached bodies were fetched at.
+ *
+ * Deliberately NOT `transcriptHydrationFetchedRevision`, which answers a
+ * different question -- "did we already ARM a fetch at this revision" -- and is
+ * what stops a settle from re-arming an identical one an RTT later. Overloading
+ * it suppressed re-arms the pipeline depends on within a revision.
+ *
+ * Recorded so a later snapshot can tell "my cache IS the current text" from "my
+ * cache is merely longer than a fixed-size preview" — the distinction the
+ * settled-turn freshness check turns on. Deliberately separate from
+ * "the window is complete": a long thread's tail page always has history above
+ * it, and folding the two together meant the revision was never recorded for
+ * exactly the transcripts the repair targets.
+ */
+export function createTranscriptHydrationRevisionPatch(bodyRevision) {
+  return { transcriptHydrationBodyRevision: bodyRevision ?? null };
+}
+
+/**
+ * @param {number|null} [fetchedRevision] gates the once-per-revision re-arm, so
+ *   a settle at the same revision does not start an identical fetch an RTT
+ *   later. Answers "did we already fetch at this revision", NOT "which revision
+ *   are the bodies from" — see createTranscriptHydrationRevisionPatch.
+ */
+export function createTranscriptHydrationCompletePatch(fetchedRevision = undefined) {
   return {
     transcriptHydrationStatus: "complete",
     transcriptHydrationTailReady: true,
+    ...(fetchedRevision === undefined
+      ? {}
+      : { transcriptHydrationFetchedRevision: fetchedRevision }),
   };
 }
 
@@ -453,7 +516,7 @@ export function createMergedTranscriptHydrationPagePatch(
 
   const nextOrderValue = prepend
     ? uniqueItemIds([...pageItemIds, ...nextOrder])
-    : uniqueItemIds(pageItemIds);
+    : mergeTailPageOrder(state.transcriptHydrationOrder, pageItemIds);
   const nextStatus =
     page.prev_cursor == null
       ? "complete"
@@ -470,6 +533,126 @@ export function createMergedTranscriptHydrationPagePatch(
     transcriptHydrationStatus: nextStatus,
     transcriptHydrationTailReady: nextOrderValue.length > 0,
   };
+}
+
+// Splice a TAIL page's ids into the window's order instead of replacing it.
+//
+// A tail page is authoritative for the ids it carries and for their relative
+// order — but it is NOT the whole window. Older pages the reader scrolled in sit
+// above it, and an id a live SSE delta appended after the page was built sits
+// below it. Replacing `order` with the page's ids therefore ORPHANED those:
+// still present in `entries`, never rendered again, and unrecoverable, because
+// both re-add sites only fire for ids that are new to `entries`.
+//
+// Everything in the window before the page's first known id stays above the
+// page; everything after it stays below. O(window), which is fine here — a page
+// merge is user-paced (cold hydration / scroll-up) and already copies the map;
+// it is the per-SNAPSHOT path that must stay proportional to the tail.
+function mergeTailPageOrder(existingOrder, pageItemIds) {
+  if (!existingOrder?.length) {
+    return uniqueItemIds(pageItemIds);
+  }
+  const pageIds = new Set(pageItemIds);
+  const above = [];
+  const below = [];
+  let reachedPage = false;
+  for (const itemId of existingOrder) {
+    if (pageIds.has(itemId)) {
+      reachedPage = true;
+      continue;
+    }
+    (reachedPage ? below : above).push(itemId);
+  }
+  if (!reachedPage) {
+    // Nothing in the window is in the page, so there is no split point. The
+    // window cannot be OLDER than a tail page it does not intersect — older
+    // pages are only ever prepended onto a window that already holds the tail —
+    // so whatever is here is NEWER: a live delta that landed before this page
+    // did (a just-cleared window on a thread switch can hold nothing else).
+    // Keep it below the page rather than stranding it above.
+    return uniqueItemIds([...pageItemIds, ...above]);
+  }
+  return uniqueItemIds([...above, ...pageItemIds, ...below]);
+}
+
+// Merge an ORDERED run of ids — a snapshot tail, which arrives in the server's
+// true conversation order — into the window's order array, placing ids that are
+// not ordered yet where the run says they go rather than at the end.
+//
+// This is what keeps a late-settling user message above the reply it triggered.
+// The delta stream and the snapshot stream are independent, so an agent_text
+// delta can append the reply BEFORE any snapshot carries the user_text that
+// caused it; appending the user message at the tail renders the turn upside-down.
+//
+// `unorderedIds` is "ids we did not already hold an entry for" — an id we have
+// never seen cannot be in the order, so the common case (a genuinely-new tail
+// entry) skips the lookup entirely. Located ids are found with `lastIndexOf`, a
+// BACKWARD scan, so a tail id costs its distance from the end of the window
+// rather than a full traversal: the per-snapshot path must not become O(window)
+// (see markdown/transcript-perf-freeze-analysis.md).
+//
+// With `copyOnWrite`, `order` is never mutated — a copy is taken lazily, and only
+// if something actually has to be inserted. Returns the array to use.
+function placeOrderedTailIds(order, tailIds, unorderedIds, { copyOnWrite = false } = {}) {
+  let working = order;
+  // Index in `working` of the last tail id we located or placed.
+  let anchorIndex = -1;
+
+  for (let index = 0; index < tailIds.length; index += 1) {
+    const itemId = tailIds[index];
+    const at = unorderedIds.has(itemId) ? -1 : working.lastIndexOf(itemId);
+    if (at >= 0) {
+      anchorIndex = at;
+      continue;
+    }
+
+    if (copyOnWrite && working === order) {
+      working = [...order];
+    }
+    let insertAt = anchorIndex >= 0
+      ? anchorIndex + 1
+      // No id before this one in the tail is in the window — the compacted tail
+      // (8 local / 6 remote entries, protocol.rs) can open on a brand-new entry.
+      // Anchor on the RIGHT instead: land just before the first later tail id we
+      // can locate.
+      //
+      // With NO anchor on either side, append. That is deliberately the opposite
+      // default from `mergeTailPageOrder`, and the asymmetry is load-bearing:
+      //   * A tail PAGE is fetched for the tail the window already holds, so an
+      //     empty intersection means the leftover cannot be older history — it is
+      //     a live delta, and belongs BELOW the page.
+      //   * A snapshot TAIL is just the last N entries. An empty intersection is
+      //     the ordinary "a burst of new entries pushed the whole window out of
+      //     the tail" case, where the window really is older and the tail really
+      //     does belong at the end.
+      : locateLaterTailId(working, tailIds, index + 1, unorderedIds);
+    if (insertAt < 0 || insertAt >= working.length) {
+      working.push(itemId);
+      insertAt = working.length - 1;
+    } else {
+      working.splice(insertAt, 0, itemId);
+    }
+    anchorIndex = insertAt;
+  }
+
+  return working;
+}
+
+// Order position of the first tail id at or after `from` that the window already
+// holds, or -1. Runs at most once per merge: the insert it feeds sets an anchor,
+// so every later unordered id chains off that instead.
+function locateLaterTailId(order, tailIds, from, unorderedIds) {
+  for (let index = from; index < tailIds.length; index += 1) {
+    const itemId = tailIds[index];
+    if (unorderedIds.has(itemId)) {
+      continue;
+    }
+    const at = order.lastIndexOf(itemId);
+    if (at >= 0) {
+      return at;
+    }
+  }
+  return -1;
 }
 
 export function buildHydratedTranscriptProgress(state) {
@@ -507,7 +690,8 @@ function buildHydratedTranscriptSnapshot(
   const baseEntries = state.transcriptHydrationEntries;
   const baseOrder = state.transcriptHydrationOrder;
   let overlay = null;
-  let appended = null;
+  const tailIds = [];
+  const unorderedIds = new Set();
 
   for (const entry of overlayEntries || []) {
     const itemId = entry?.item_id;
@@ -519,13 +703,15 @@ function buildHydratedTranscriptSnapshot(
       itemId,
       mergeTranscriptEntry(existing, prepareSnapshotOverlayEntry(existing, entry))
     );
-    // includes() runs only for a genuinely-new tail id (rare), not every entry.
-    if (existing === undefined && !baseOrder.includes(itemId)) {
-      (appended ||= []).push(itemId);
+    if (existing === undefined) {
+      unorderedIds.add(itemId);
     }
+    tailIds.push(itemId);
   }
 
-  const order = appended ? [...baseOrder, ...appended] : baseOrder;
+  // Copy-on-write: the steady-state snapshot (every tail id already ordered)
+  // returns `baseOrder` untouched, so no per-snapshot full-window copy.
+  const order = placeOrderedTailIds(baseOrder, tailIds, unorderedIds, { copyOnWrite: true });
   const transcript = order
     .map((itemId) => (overlay && overlay.has(itemId) ? overlay.get(itemId) : baseEntries.get(itemId)))
     .filter(Boolean);
@@ -716,22 +902,29 @@ function createMergedSnapshotTailPatch(state, snapshot, signature) {
   const entries = state.transcriptHydrationEntries;
   const order = state.transcriptHydrationOrder;
 
+  // Collect the tail (and which ids are new to us) BEFORE placing anything: the
+  // merge below writes into `entries`, so "did we already hold this?" has to be
+  // answered while that is still true.
+  const tailIds = [];
+  const unorderedIds = new Set();
   for (const entry of snapshot.transcript || []) {
     const itemId = entry?.item_id;
     if (!itemId) {
       continue;
     }
     const existing = entries.get(itemId);
-    const wasPresent = existing !== undefined;
+    if (existing === undefined) {
+      unorderedIds.add(itemId);
+    }
     entries.set(
       itemId,
       mergeTranscriptEntry(existing, prepareSnapshotOverlayEntry(existing, entry))
     );
-    // includes() runs only for a genuinely-new tail id (rare), not every entry.
-    if (!wasPresent && !order.includes(itemId)) {
-      order.push(itemId);
-    }
+    tailIds.push(itemId);
   }
+  // In place: an id that is not ordered yet — genuinely new, or orphaned out of
+  // the order by an older build — goes where THIS snapshot says it belongs.
+  placeOrderedTailIds(order, tailIds, unorderedIds);
 
   return {
     transcriptHydrationBaseSnapshot: snapshot,

@@ -26,6 +26,16 @@ pub(crate) struct ThreadRuntime {
     pub(crate) liveness_stop_requested: bool,
     pub(crate) active_flags: Vec<String>,
     pub(crate) current_cwd: String,
+    /// The last answer to "is `current_cwd` still a directory?", or `None` for "it is
+    /// there" / "nobody has looked yet".
+    ///
+    /// CACHED, not computed on read. Deciding it means a `stat`, and the two readers —
+    /// `RelayState::snapshot` and `read_loaded_thread_state` — both run holding the relay
+    /// lock on the hot notify path: a stat that blocks there (a disconnected network
+    /// mount, autofs) would freeze every session, not one banner. So the filesystem is
+    /// touched only on the async paths that were going to touch the workspace anyway
+    /// (open, resume, send, repair) and the verdict is parked here for readers.
+    pub(crate) workspace_missing: Option<crate::protocol::WorkspaceRepairView>,
     pub(crate) model: String,
     pub(crate) approval_policy: String,
     pub(crate) sandbox: String,
@@ -41,9 +51,14 @@ pub(crate) struct ThreadRuntime {
 }
 
 impl ThreadRuntime {
-    pub(crate) fn placeholder(thread_id: &str, now: u64) -> Self {
+    /// `transcript_revision` is a value the caller drew from
+    /// `RelayState::next_transcript_revision`, never a literal. Seeding a rebuilt
+    /// runtime at 0 is what used to rewind a thread under a live client and make
+    /// it drop every delta that followed.
+    pub(crate) fn placeholder(thread_id: &str, now: u64, transcript_revision: u64) -> Self {
         Self {
             summary: Some(ThreadSummaryView {
+                workspace_trusted: false,
                 id: thread_id.to_string(),
                 name: None,
                 preview: String::new(),
@@ -70,7 +85,7 @@ impl ThreadRuntime {
             approval_policy: String::new(),
             sandbox: String::new(),
             reasoning_effort: String::new(),
-            transcript_revision: 0,
+            transcript_revision,
             transcript: Vec::new(),
             provider_history_cursor: None,
             provider_history_paged: false,
@@ -78,6 +93,7 @@ impl ThreadRuntime {
             pending_approvals: HashMap::new(),
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
+            workspace_missing: None,
         }
     }
 
@@ -89,6 +105,7 @@ impl ThreadRuntime {
         sandbox: &str,
         effort: &str,
         now: u64,
+        transcript_revision: u64,
     ) -> Self {
         Self {
             current_status: thread.status.clone(),
@@ -106,7 +123,7 @@ impl ThreadRuntime {
             liveness_timed_out: false,
             liveness_stop_requested: false,
             active_flags: Vec::new(),
-            transcript_revision: 0,
+            transcript_revision,
             transcript: Vec::new(),
             provider_history_cursor: None,
             provider_history_paged: false,
@@ -114,6 +131,7 @@ impl ThreadRuntime {
             pending_approvals: HashMap::new(),
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
+            workspace_missing: None,
         }
     }
 
@@ -124,6 +142,7 @@ impl ThreadRuntime {
         effort: &str,
         model: &str,
         now: u64,
+        transcript_revision: u64,
     ) -> Self {
         let transcript = data
             .transcript
@@ -136,6 +155,7 @@ impl ThreadRuntime {
                 status: entry.status,
                 turn_id: entry.turn_id,
                 tool: entry.tool,
+                seq: None,
             })
             .collect();
 
@@ -173,7 +193,7 @@ impl ThreadRuntime {
             liveness_timed_out: false,
             liveness_stop_requested: false,
             active_flags: data.active_flags,
-            transcript_revision: 0,
+            transcript_revision,
             transcript,
             provider_history_cursor: None,
             provider_history_paged: false,
@@ -181,6 +201,7 @@ impl ThreadRuntime {
             pending_approvals: HashMap::new(),
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
+            workspace_missing: None,
         }
     }
 
@@ -292,6 +313,7 @@ impl ThreadRuntime {
                 status: entry.status,
                 turn_id: entry.turn_id,
                 tool: entry.tool,
+                seq: None,
             })
             .collect::<Vec<_>>();
         // Paging can split a tool's request from its result across pages. The newer page
@@ -329,7 +351,10 @@ impl ThreadRuntime {
         self.last_update_at = now;
     }
 
-    pub(crate) fn merge_fresh_history(&mut self, fresh: ThreadRuntime) {
+    /// Returns whether the transcript changed; see `merge_transcript_records` —
+    /// the caller assigns the new revision.
+    #[must_use]
+    pub(crate) fn merge_fresh_history(&mut self, fresh: ThreadRuntime) -> bool {
         self.summary = fresh.summary;
         self.current_cwd = fresh.current_cwd;
         self.approval_policy = fresh.approval_policy;
@@ -363,10 +388,16 @@ impl ThreadRuntime {
             self.provider_history_cursor = None;
             self.provider_history_paged = false;
         }
-        self.merge_transcript_records(fresh.transcript);
+        self.merge_transcript_records(fresh.transcript)
     }
 
-    pub(crate) fn merge_transcript_records(&mut self, records: Vec<TranscriptRecord>) {
+    /// Returns whether the transcript actually changed. The caller owns the
+    /// revision: it must draw a fresh one from `RelayState::next_transcript_revision`
+    /// and assign it. This deliberately does NOT bump `transcript_revision` itself —
+    /// doing so used to mint a number off a private per-thread counter that another
+    /// thread had already been given.
+    #[must_use]
+    pub(crate) fn merge_transcript_records(&mut self, records: Vec<TranscriptRecord>) -> bool {
         let mut changed = false;
         for record in records {
             match self
@@ -386,9 +417,7 @@ impl ThreadRuntime {
                 }
             }
         }
-        if changed {
-            self.transcript_revision = self.transcript_revision.wrapping_add(1);
-        }
+        changed
     }
 
     fn has_equivalent_user_message(&self, entry: &TranscriptRecord) -> bool {
@@ -441,7 +470,9 @@ fn merge_runtime_entry(existing: &mut TranscriptRecord, incoming: TranscriptReco
         || existing.turn_id != incoming.turn_id
         || !tool_calls_equal(existing.tool.as_ref(), incoming.tool.as_ref());
     if changed {
+        let seq = incoming.seq.or(existing.seq);
         *existing = incoming;
+        existing.seq = seq;
     }
     changed
 }
@@ -462,19 +493,41 @@ fn tool_calls_equal(left: Option<&ToolCallView>, right: Option<&ToolCallView>) -
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => {
-            left.item_type == right.item_type
-                && left.name == right.name
-                && left.title == right.title
-                && left.detail == right.detail
-                && left.query == right.query
-                && left.path == right.path
-                && left.url == right.url
-                && left.command == right.command
-                && left.input_preview == right.input_preview
-                && left.result_preview == right.result_preview
-                && left.diff == right.diff
-                && left.file_changes == right.file_changes
-                && left.apply_state == right.apply_state
+            // Destructured on purpose: a new ToolCallView field stops compiling
+            // here until it is compared or explicitly skipped.
+            let ToolCallView {
+                item_type,
+                name,
+                title,
+                kind,
+                detail,
+                query,
+                path,
+                url,
+                command,
+                input_preview,
+                result_preview,
+                diff,
+                file_changes,
+                apply_state,
+                // Snapshot-only markers, recomputed per serialization.
+                file_changes_omitted: _,
+                can_apply: _,
+            } = left;
+            *item_type == right.item_type
+                && *name == right.name
+                && *title == right.title
+                && *kind == right.kind
+                && *detail == right.detail
+                && *query == right.query
+                && *path == right.path
+                && *url == right.url
+                && *command == right.command
+                && *input_preview == right.input_preview
+                && *result_preview == right.result_preview
+                && *diff == right.diff
+                && *file_changes == right.file_changes
+                && *apply_state == right.apply_state
         }
         _ => false,
     }
@@ -486,6 +539,7 @@ mod tests {
 
     fn summary(id: &str, status: &str) -> ThreadSummaryView {
         ThreadSummaryView {
+            workspace_trusted: false,
             id: id.to_string(),
             name: None,
             preview: String::new(),
@@ -509,7 +563,57 @@ mod tests {
             "ro",
             "high",
             0,
+            0,
         )
+    }
+
+    fn tool_record(item_id: &str, kind: Option<&str>) -> TranscriptRecord {
+        TranscriptRecord {
+            item_id: item_id.to_string(),
+            // History-shaped: a re-read carries no live sequence number.
+            seq: None,
+            kind: crate::protocol::TranscriptEntryKind::ToolCall,
+            text: Some("Reading src/main.rs".to_string()),
+            status: "completed".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            tool: Some(ToolCallView {
+                item_type: "tool_call".to_string(),
+                name: "Reading src/main.rs".to_string(),
+                title: "Reading src/main.rs".to_string(),
+                kind: kind.map(str::to_string),
+                detail: None,
+                query: None,
+                path: Some("/repo/src/main.rs".to_string()),
+                url: None,
+                command: None,
+                input_preview: None,
+                result_preview: None,
+                diff: None,
+                file_changes: Vec::new(),
+                apply_state: None,
+                file_changes_omitted: false,
+                can_apply: None,
+            }),
+        }
+    }
+
+    // History re-read is the self-heal path: a field missing from equality makes
+    // the richer record read as unchanged, so it is dropped and revision stalls.
+    #[test]
+    fn a_history_record_that_only_adds_a_tool_kind_still_counts_as_changed() {
+        let mut existing = tool_record("acp-tool-1", None);
+        let incoming = tool_record("acp-tool-1", Some("read"));
+
+        let changed = merge_runtime_entry(&mut existing, incoming);
+
+        assert!(
+            changed,
+            "a fresh-history record that classifies the tool must be adopted"
+        );
+        assert_eq!(
+            existing.tool.as_ref().and_then(|tool| tool.kind.as_deref()),
+            Some("read")
+        );
     }
 
     // C5 — active_turn_id is the live-turn authority; a history re-read must NEVER
@@ -525,13 +629,13 @@ mod tests {
         rt.active_turn_id = Some("turn-1".to_string());
         assert!(rt.is_working(), "a turn id keeps is_working() true");
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
             "first idle re-read keeps the turn (could be the pre-status-event window)"
         );
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
@@ -550,7 +654,7 @@ mod tests {
         assert!(rt.active_turn_id.is_none());
         assert!(rt.is_working(), "a working status alone makes it working");
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
 
         assert_eq!(rt.current_status, "idle");
         assert!(rt.active_turn_id.is_none());
@@ -575,7 +679,7 @@ mod tests {
 
         // Fresh read can't confirm liveness (Claude reports idle); it must not end
         // the turn the relay knows is live.
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
 
         assert_eq!(rt.active_turn_id.as_deref(), Some("turn-1"));
         assert!(
@@ -595,7 +699,7 @@ mod tests {
         assert!(rt.is_working());
 
         // Claude reports idle on every read_thread; resume happens twice.
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
@@ -603,7 +707,7 @@ mod tests {
         );
         assert!(rt.is_working());
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
         assert_eq!(
             rt.active_turn_id.as_deref(),
             Some("turn-1"),
@@ -622,7 +726,7 @@ mod tests {
 
         // A still-working fresh read carries no turn id (provider reads don't), but
         // we must not drop the running turn — it's restored via the bg buffer path.
-        rt.merge_fresh_history(runtime("t1", "active"));
+        let _ = rt.merge_fresh_history(runtime("t1", "active"));
 
         assert_eq!(rt.active_turn_id.as_deref(), Some("turn-1"));
         assert!(rt.is_working());
@@ -634,7 +738,7 @@ mod tests {
         rt.provider_history_paged = true;
         rt.provider_history_cursor = Some(4096);
 
-        rt.merge_fresh_history(runtime("t1", "idle"));
+        let _ = rt.merge_fresh_history(runtime("t1", "idle"));
 
         assert!(!rt.provider_history_paged);
         assert_eq!(rt.provider_history_cursor, None);
@@ -650,6 +754,7 @@ mod tests {
             status: "completed".to_string(),
             turn_id: None,
             tool: None,
+            seq: None,
         });
         let older = vec![TranscriptEntryView {
             item_id: Some("older".to_string()),
@@ -698,7 +803,7 @@ mod tests {
             transcript: Vec::new(),
         };
 
-        let rt = ThreadRuntime::from_sync_data(data, "untrusted", "ro", "high", "model", 0);
+        let rt = ThreadRuntime::from_sync_data(data, "untrusted", "ro", "high", "model", 0, 0);
 
         assert!(
             rt.active_turn_id.is_none(),

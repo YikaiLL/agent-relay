@@ -16,7 +16,7 @@ const REVIEWER_DISALLOWED_TOOLS = [
   "AskUserQuestion",
 ];
 
-export function buildSessionOptionsBase(cmd, { canUseTool, defaultSettingSources }) {
+export function buildSessionOptionsBase(cmd, { canUseTool, defaultSettingSources, observeCwd }) {
   const requestedMode = cmd.permissionMode ?? "default";
   const readOnlyReviewer = requestedMode === REVIEWER_READ_ONLY_MODE;
   const permissionMode = readOnlyReviewer ? "bypassPermissions" : requestedMode;
@@ -45,5 +45,85 @@ export function buildSessionOptionsBase(cmd, { canUseTool, defaultSettingSources
     options.model = cmd.model;
   }
 
+  // Persona as systemPrompt (replaces coding preset; not a user turn).
+  const systemPrompt =
+    typeof cmd.systemPrompt === "string" ? cmd.systemPrompt.trim() : "";
+  if (systemPrompt) {
+    options.systemPrompt = systemPrompt;
+  }
+
+  // Custom tools: only `mcpServers` can define non-built-ins.
+  if (cmd.mcpServers && typeof cmd.mcpServers === "object") {
+    options.mcpServers = cmd.mcpServers;
+  }
+  // MCP tools need an allowlist; acceptEdits alone still prompts on every call.
+  if (Array.isArray(cmd.allowedTools) && cmd.allowedTools.length > 0) {
+    options.allowedTools = cmd.allowedTools;
+  }
+  // Built-in toolset (separate from allowlist). `[]` strips Bash etc. — load-
+  // bearing for the Orchestrator; empty array is meaningful, don't length-check.
+  if (Array.isArray(cmd.tools)) {
+    options.tools = cmd.tools;
+  }
+
+  if (typeof observeCwd === "function") {
+    options.hooks = cwdObservationHooks(observeCwd);
+  }
+
   return options;
+}
+
+// CwdChanged is a move: emit immediately. PostToolUse runs before the SDK
+// publishes the tool result, so queue that cwd until after the matching
+// `tool_call_result` (and flush any remainder after the mapped batch).
+export function createCwdReporter(observeCwd) {
+  const pendingByTool = new Map();
+  let pendingUnkeyed = null;
+  return {
+    observeCwd(cwd, meta) {
+      if (!cwd) return;
+      if (meta?.source === "PostToolUse") {
+        if (meta.tool_use_id) {
+          pendingByTool.set(meta.tool_use_id, cwd);
+        } else {
+          pendingUnkeyed = cwd;
+        }
+        return;
+      }
+      pendingByTool.clear();
+      pendingUnkeyed = null;
+      observeCwd(cwd);
+    },
+    flushPostToolCwd(toolUseId) {
+      if (toolUseId) {
+        const cwd = pendingByTool.get(toolUseId);
+        if (cwd == null) return;
+        pendingByTool.delete(toolUseId);
+        observeCwd(cwd);
+        return;
+      }
+      const rest = [...pendingByTool.values()];
+      pendingByTool.clear();
+      if (pendingUnkeyed != null) {
+        rest.push(pendingUnkeyed);
+        pendingUnkeyed = null;
+      }
+      for (const cwd of rest) observeCwd(cwd);
+    },
+  };
+}
+
+export function cwdObservationHooks(observeCwd) {
+  const hook = (source) => async (input) => {
+    // Subagent tools report their own cwd; that must not relocate the parent session.
+    if (input?.agent_id) return {};
+    if (input?.cwd) {
+      observeCwd(input.cwd, { source, tool_use_id: input.tool_use_id });
+    }
+    return {};
+  };
+  return {
+    CwdChanged: [{ hooks: [hook("CwdChanged")] }],
+    PostToolUse: [{ hooks: [hook("PostToolUse")] }],
+  };
 }

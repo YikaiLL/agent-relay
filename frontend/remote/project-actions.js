@@ -46,3 +46,17 @@ export const renameRemoteThread = (threadId, name) =>
     thread_id: threadId,
     input: { name: name ?? null },
   });
+
+// Not claim-gated: a paired device must see what it is about to launch into
+// without taking control of whatever session is running.
+export async function fetchRemoteWorkspaceGitContext(cwd) {
+  const result = await dispatchOrRecover("fetch_workspace_git_context", { cwd });
+  return result?.workspace_git_context || null;
+}
+
+// Its own action rather than the transcript response, which also carries settings
+// but pays a provider fetch to produce them.
+export async function fetchRemoteThreadSettings(threadId) {
+  const result = await dispatchOrRecover("fetch_thread_settings", { thread_id: threadId });
+  return result?.thread_settings || null;
+}

@@ -173,6 +173,14 @@ function buildCwdGroups(threads, options) {
         key: cwd,
         cwd,
         label: knownCwd ? workspaceBasename(cwd) : UNKNOWN_WORKSPACE_LABEL,
+        // No `restricted` flag, deliberately. `thread.workspace_trusted` is on every
+        // granted row (omitted, not `false`, on the rest — read it as falsy, never
+        // `=== false`) and hoisting it here would be easy. But the sidebar renders
+        // because sessions exist, not because anyone asked about a workspace: most
+        // workspaces are legitimately ungranted, nothing about the session is blocked by
+        // it, so a tag would sit on most groups forever and be tuned out — spending the
+        // attention the in-context offer (diff panel / review dialog) needs. Carrying
+        // the flag no further is what keeps a renderer from being tempted by it.
         latestUpdatedAt: 0,
         threads: [],
       });

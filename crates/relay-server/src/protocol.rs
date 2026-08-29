@@ -87,6 +87,11 @@ pub struct SessionSnapshot {
     /// through the channel they already consume (no extra remote action).
     #[serde(default)]
     pub provider_fork_capabilities: Vec<ProviderForkCapabilityView>,
+    /// Which providers can archive. Static per relay process and carried for the
+    /// same reason as `provider_fork_capabilities`: the surfaces have to gate the
+    /// affordance on what the bridge does, not on the provider's name.
+    #[serde(default)]
+    pub provider_archive_capabilities: Vec<ProviderArchiveCapabilityView>,
     /// Per-provider health (incl. providers that failed to spawn). Rides the
     /// snapshot for the same reason as `provider_fork_capabilities`, but its
     /// `status`/`connected` are recomputed live so drops/reconnects stream.
@@ -101,6 +106,13 @@ pub struct SessionSnapshot {
     pub e2ee_enabled: bool,
     pub broker_can_read_content: bool,
     pub audit_enabled: bool,
+    /// Whether in-development features are unlocked (`sealwire --beta`). Static
+    /// per relay process.
+    ///
+    /// `#[serde(default)]` so absence reads as LOCKED — an older peer or a
+    /// replayed snapshot fails closed instead of unlocking an unfinished feature.
+    #[serde(default)]
+    pub beta_features_enabled: bool,
     pub active_thread_id: Option<String>,
     /// When the ACTIVE thread was promoted from a deferred `claude-pending-…`
     /// id at first send: that pending id. Authoritative promotion signal for
@@ -125,6 +137,16 @@ pub struct SessionSnapshot {
     /// viewed (the rest of this snapshot describes only the active thread).
     pub thread_activity: Vec<ThreadActivityView>,
     pub current_cwd: String,
+    /// Remembered tree for the active thread (pin, else proven). Birth `current_cwd`
+    /// does not move with observation, so surfaces key the Changes panel on this too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_workspace_cwd: Option<String>,
+    /// Set only when `current_cwd` is gone, so every surface can swap the composer's
+    /// banner for a repair action through the channel it already consumes. Rides the
+    /// snapshot rather than being probed for, the same reason
+    /// `provider_fork_capabilities` does.
+    #[serde(default)]
+    pub workspace_missing: Option<WorkspaceRepairView>,
     pub model: String,
     pub available_models: Vec<ModelOptionView>,
     pub approval_policy: String,
@@ -215,6 +237,31 @@ pub struct SessionSnapshot {
     /// Skipped when 0 so the pre-rename wire shape stays byte-identical.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub threads_revision: u64,
+    /// Cache key bumped when any thread's remembered working tree changes. Surfaces
+    /// viewing a non-active thread cannot read that thread's proven path off
+    /// `thread_workspace_cwd` (that field is the ACTIVE session).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub thread_workspaces_revision: u64,
+    /// Cache key for the dedicated Teams channel.
+    ///
+    /// Revision ONLY — no team run view rides the snapshot. That is deliberate: a
+    /// run view carries a sub-task list and an unresolved list, both unbounded, so
+    /// embedding one would need the whole `active_workflow_runs` compaction budget
+    /// to earn its place. A scalar the drain loop can never reclaim is enough to
+    /// tell a client to refetch `GET /api/session/teams`.
+    ///
+    /// Skipped when 0 so every relay that never runs a task keeps a byte-identical
+    /// wire shape.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub teams_revision: u64,
+    /// Persisted pin for the Tasks-screen Orchestrator thread. `None` until
+    /// `POST /api/orchestrator/ensure` has created one. Clients stay on the Tasks
+    /// view and embed this thread's transcript; they do not `viewThread` into it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_thread_id: Option<String>,
+    /// Pending Orchestrator proposal cards (propose → user confirms → start_team).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orchestrator_proposals: Vec<OrchestratorProposalView>,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -269,6 +316,9 @@ pub struct ReviewerThreadView {
     /// Last-updated time, for newest-first ordering in the reuse picker.
     #[serde(default)]
     pub updated_at: Option<u64>,
+    /// Tree this reviewer is bound to; `None` after restart. Needed so reuse can drop cross-tree candidates `request_review` would refuse.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// One working thread, as surfaced to clients for per-thread activity badges.
@@ -1008,14 +1058,18 @@ impl SessionSnapshot {
             }
             self.logs.clear();
             if budget.emergency_shell_transcript {
-                // Bound the one growable string identity field the earlier passes
-                // never touch. `current_cwd` is display-only on the wire (the relay
-                // uses its own path for scope checks), so clamping the snapshot copy
-                // keeps the hard byte cap honest when a pathological path dominates
+                // Bound the growable string identity fields the earlier passes
+                // never touch. `current_cwd` and `thread_workspace_cwd` are
+                // display/cache-key only on the wire (the relay uses its own
+                // path for scope checks), so clamping the snapshot copy keeps
+                // the hard byte cap honest when a pathological path dominates
                 // the frame. The remaining identity fields (available_models,
                 // paired_devices, allowed_roots) are domain-bounded — a handful of
                 // entries each — and are intentionally left intact.
                 truncate_with_ellipsis(&mut self.current_cwd, EMERGENCY_TRANSCRIPT_CWD_CHARS);
+                if let Some(cwd) = self.thread_workspace_cwd.as_mut() {
+                    truncate_with_ellipsis(cwd, EMERGENCY_TRANSCRIPT_CWD_CHARS);
+                }
             }
             if budget.emergency_shell_transcript && !self.transcript.is_empty() {
                 // Honesty rule: a non-empty thread must never serialize as an
@@ -1502,6 +1556,90 @@ pub struct WorkspaceRootView {
     pub branch: Option<String>,
     /// True for the repository's main (non-linked) worktree.
     pub is_main: bool,
+    /// `None` means NOT MEASURED — render nothing, never `clean`. Default on every
+    /// response: only the request that displays the counts pays for measuring them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files: Option<u32>,
+    /// The count above stopped early, so it is a floor rather than a total — a tree
+    /// full of unignored build output can produce megabytes of `git status`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changed_files_capped: bool,
+}
+
+/// The git standing of a workspace path, for the launch dialog's `main · clean` chip.
+/// Every field degrades to a neutral value, so "not a repo" is a normal answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkspaceGitContextView {
+    /// The normalized path this answers about, echoed so a client that has since
+    /// moved its selection can drop a stale reply.
+    pub cwd: String,
+    /// False covers not-a-repo, bare repo and missing directory alike — collapsing
+    /// them keeps the answer from doubling as an existence probe.
+    pub is_repo: bool,
+    /// The relay declined to run git here: this repository has not been granted.
+    ///
+    /// Stated, not inferred. Clients used to read it off `dirty_known == false`, which is
+    /// also what a GRANTED repository reports when `git status` simply fails — so the
+    /// offer to grant appeared where granting would change nothing, and pressing it left
+    /// the same message on screen. One bool about a path the client already named
+    /// discloses nothing the grant list would; it is the list itself that stays private.
+    #[serde(default)]
+    pub restricted: bool,
+    /// Short name (`refs/heads/` stripped), matching `WorkspaceRootView::branch`.
+    /// `None` for a detached HEAD, an unborn branch, or a non-repo.
+    pub branch: Option<String>,
+    /// Distinct from `branch: None`: `rev-parse --abbrev-ref HEAD` reports a detached
+    /// checkout as the literal string `HEAD`, which must never render as a branch.
+    pub detached: bool,
+    /// Uncommitted changes, untracked files included. False when unknown too: the
+    /// chip warns, so an undetermined answer stays quiet rather than inventing changes.
+    pub dirty: bool,
+    /// Whether `dirty` was actually determined. False means NOT LOOKED AT — the probe
+    /// declined to run git in a directory nobody chose — and a client must not render
+    /// that as "clean", which is a claim it cannot make.
+    #[serde(default)]
+    pub dirty_known: bool,
+}
+
+/// Why this tree: pin vs inference vs birth vs stand-in for a vanished worktree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceOrigin {
+    /// Explicit choice; outranks inference and survives quiet stretches / restart.
+    Pinned,
+    /// Landed writes are (or last were) in this tree.
+    Proven,
+    /// Nothing said otherwise, so the tree the thread was born in.
+    Birth,
+    /// Birth tree is gone; `gone` is the vanished path so UI does not silently show another tree.
+    Substituted { gone: String },
+}
+
+/// Settled tree plus live git/roots. Only paths are stored; branch/dirty would go stale on checkout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedWorkspace {
+    /// Diff, review, and picker default all run git here.
+    pub cwd: String,
+    pub origin: WorkspaceOrigin,
+    /// Live git standing of `cwd`, never stored.
+    pub git: WorkspaceGitContextView,
+    /// In-scope trees of this repo; `cwd` is one of them unless enumeration was empty.
+    pub roots: Vec<WorkspaceRootView>,
+    /// Birth cwd (provider identity); distinct from `cwd`.
+    pub birth_cwd: String,
+    /// False when the birth directory was removed mid-session.
+    pub birth_cwd_exists: bool,
+}
+
+/// Pin (or un-pin) which working tree a thread's work is considered to be in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThreadWorkspaceInput {
+    pub thread_id: String,
+    /// Pin this path; `null`/absent drops the pin. Must be one of the thread's enumerated roots.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1511,24 +1649,9 @@ pub struct WorkspaceDiffResponse {
     pub diff: String,
     pub truncated: bool,
     pub not_a_git_repo: bool,
-    /// Every working tree the viewed session's repo exposes, for the panel's root
-    /// picker. `#[serde(default)]` keeps older clients/persisted payloads readable.
+    /// Trees the picker may offer. Diff `cwd` follows the session unless the request sent `view_root`.
     #[serde(default)]
     pub roots: Vec<WorkspaceRootView>,
-    /// Where this thread's recent file writes actually landed, when that is a
-    /// DIFFERENT root than its own cwd — i.e. the agent went off and worked in a
-    /// worktree. `None` means "no evidence, or it is already working in its own cwd",
-    /// so there is nothing to suggest. Purely derived: reporting it never changes
-    /// which tree got diffed (see the `auto_root` request flag for that).
-    #[serde(default)]
-    pub suggested_root: Option<String>,
-    /// Whether `suggested_root` was actually DETERMINED, as opposed to unknown because
-    /// the thread's transcript is not loaded yet (a cold thread the client just
-    /// navigated to). `false` means "ask again later" — without this a client cannot
-    /// tell "this thread works in its own cwd" from "we could not look", and would burn
-    /// its one-shot auto-resolve on a thread whose history had not arrived.
-    #[serde(default = "default_true")]
-    pub suggested_root_known: bool,
     /// The requested session's workspace could not be resolved (deleted / not-yet-loaded /
     /// pending thread). Fail-closed marker: the panel renders "workspace unavailable" rather
     /// than falling back to another workspace's diff. Distinct from a clean tree.
@@ -1541,6 +1664,17 @@ pub struct WorkspaceDiffResponse {
     /// tree's changes. `None` = `cwd` is the thread's own workspace.
     #[serde(default)]
     pub fallback_from: Option<String>,
+    /// The human-facing name of what this diff is measured against — a branch like
+    /// `main` for a task's MR view. `None` means the default "working tree vs
+    /// HEAD" view, which needs no label.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// The commit the diff was actually taken against. For an MR view this is the
+    /// MERGE BASE of `base_ref` and the branch, not `base_ref`'s tip — so commits
+    /// that landed on the target after the fork are excluded rather than showing
+    /// up reversed. Pairs with `base_ref` to render "vs main (merge-base abc1234)".
+    #[serde(default)]
+    pub base_commit: Option<String>,
     pub generated_at: u64,
 }
 
@@ -1557,10 +1691,10 @@ impl WorkspaceDiffResponse {
             // No roots either: the picker must not reveal a repo layout for a
             // workspace the caller was just refused.
             roots: Vec::new(),
-            suggested_root: None,
-            suggested_root_known: false,
             unavailable: true,
             fallback_from: None,
+            base_ref: None,
+            base_commit: None,
             generated_at: 0,
         }
     }
@@ -1571,6 +1705,10 @@ pub struct ToolCallView {
     pub item_type: String,
     pub name: String,
     pub title: String,
+    /// Set only by ACP (Cursor), whose tool `name` IS its human title. Claude
+    /// and Codex leave it None; the client derives a kind from name/item_type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub detail: Option<String>,
     pub query: Option<String>,
     pub path: Option<String>,
@@ -1873,11 +2011,42 @@ pub struct ThreadEntryDetailResponse {
     pub chunk: Option<ThreadEntryDetailChunk>,
 }
 
+/// A thread whose recorded workspace no longer exists on disk, and what it would take
+/// to make it exist again.
+///
+/// This is a TOMBSTONE, not a substitute: `resolve_workspace_cwd` may hand a read-only
+/// caller (the diff panel, a reviewer) a provably-related workspace to look at, but a
+/// provider session cannot be moved. The Claude SDK archives a session under the project
+/// directory derived from its cwd and resolves `resume` through that same derivation, so
+/// resuming one from anywhere else fails with a bare "an error occurred during execution".
+/// The only repair is to make the recorded path exist again — which is what `kind`
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRepairView {
+    /// The path the thread records, which is not a directory right now.
+    pub recorded_cwd: String,
+    /// `folder` — nothing but an empty directory is missing — or `worktree`, when the
+    /// path sits in a linked-worktree slot of a repository that still exists.
+    pub kind: String,
+    /// The repository whose tree contained `recorded_cwd`. `None` when nothing provably
+    /// related is in reach, in which case `kind` is always `folder`.
+    pub repo_root: Option<String>,
+    /// The branch a re-created worktree would check out. Only set for `worktree`.
+    pub branch: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadStateView {
     pub thread_id: String,
     pub provider: String,
     pub current_cwd: String,
+    /// Remembered tree for this thread (pin, else proven). Same reason it rides the
+    /// snapshot: a viewed non-active thread's birth cwd does not move with observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_workspace_cwd: Option<String>,
+    /// Set only when `current_cwd` is gone. Every surface reads this to swap the
+    /// composer's banner for a repair action instead of letting a send die at spawn.
+    pub workspace_missing: Option<WorkspaceRepairView>,
     pub current_status: String,
     pub active_turn_id: Option<String>,
     pub current_phase: Option<String>,
@@ -1927,6 +2096,19 @@ pub struct ThreadSummaryView {
     pub preview: String,
     pub cwd: String,
     pub updated_at: u64,
+    /// Whether the local operator granted this row's `cwd`. False means RESTRICTED —
+    /// the relay declines to run git there, so branch state is unknown, not clean.
+    /// Carried per row rather than as a relay-wide list because a device already sees
+    /// `cwd`; the full grant list would name directories it has no business knowing.
+    ///
+    /// Omitted when false, for the same budget reason spelled out on `renamed` below: an
+    /// unconditional 24 bytes on every row crossed `THREADS_RESPONSE_TARGET_BYTES`, and
+    /// the compactor answers an over-budget frame by DROPPING SESSIONS (80 → 40), so
+    /// adding this field silently halved a remote sidebar. Absent reads as `false`, which
+    /// is also the fail-closed answer: a client that cannot see the flag must assume
+    /// restricted, never trusted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub workspace_trusted: bool,
     pub source: String,
     pub status: String,
     pub model_provider: String,
@@ -1999,6 +2181,20 @@ pub struct ProviderForkCapabilityView {
     pub native_fork_at_message: bool,
 }
 
+/// Whether a provider's bridge can archive a thread at all. Same reasoning as
+/// `ProviderForkCapabilityView`: inferring it from provider NAMES is how a
+/// surface ends up offering an action that cannot happen. Cursor is the case
+/// that forced this — ACP has no archive method, so the control reported
+/// success and the session came straight back on the next list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderArchiveCapabilityView {
+    pub provider: String,
+    /// The bridge implements a real `archive_thread` (vs. refusing). There is no
+    /// relay-side fallback: without the provider forgetting the thread, dropping
+    /// the row just means the next list fetches it back.
+    pub native_archive: bool,
+}
+
 /// Health of a single *configured* provider, derived live at snapshot time.
 /// Unlike `available_providers()` (which lists only bridges that spawned OK),
 /// this surfaces providers that failed to launch too, so the UI can explain
@@ -2060,6 +2256,17 @@ pub struct ThreadArchiveReceipt {
 pub struct ThreadDeleteReceipt {
     pub thread_id: String,
     pub message: String,
+}
+
+/// Re-create a thread's recorded workspace. Carries no target path on purpose: the only
+/// path that can work is the one the thread already records (see `repair_thread_workspace`),
+/// so letting a client name one would only invite a repair that resumes into nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepairWorkspaceInput {
+    /// Actor for the log line. Stamped SERVER-side on the broker path; client-supplied
+    /// only on the local surface.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 /// Body of the session rename endpoint.
@@ -2221,6 +2428,23 @@ pub struct ThreadsQuery {
     /// the whole reason to search.
     #[serde(default)]
     pub q: Option<String>,
+    /// Ask about specific sessions by id, rather than for a page of the list.
+    ///
+    /// Same argument as `q`, for the same reason: a page is bounded by `limit`, and the
+    /// bound is applied to the PROVIDER SCAN as well as the result, so a client that
+    /// diffs its own ids against a page cannot tell "this session is gone" from "this
+    /// session is older than the newest 80". That distinction is the whole question a
+    /// client holding long-lived references — open tabs — needs answered, and it is not
+    /// answerable client-side at all.
+    ///
+    /// Absence from the answer therefore means the relay cannot resolve the id: deleted,
+    /// archived, or outside this device's `allowed_roots`. All three mean the same thing
+    /// to a caller, because all three make the session unopenable here.
+    ///
+    /// Scanned as deeply as a search (`SEARCH_SCAN_LIMIT`) and not truncated to `limit`,
+    /// or it would reproduce the very ambiguity it exists to remove.
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2228,9 +2452,48 @@ pub struct AllowedRootsInput {
     pub allowed_roots: Vec<String>,
 }
 
+/// Grant or withdraw trust for ONE directory. Local surface only — there is no
+/// broker action for this, which is what makes the grant a local act.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceTrustInput {
+    pub cwd: String,
+    /// Absent means grant; `false` withdraws.
+    #[serde(default = "default_true")]
+    pub trusted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceTrustReceipt {
+    pub cwd: String,
+    pub trusted: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AllowedRootsReceipt {
     pub allowed_roots: Vec<String>,
+    pub message: String,
+}
+
+/// Set the relay-wide daily token budget.
+///
+/// Both fields are optional so the two controls on the Usage screen can move
+/// independently: changing the policy must not require restating the cap, and
+/// clearing the cap must not reset the policy back to its default.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageBudgetInput {
+    /// Tokens per local day. `Some(0)` clears the cap, which is how a UI that
+    /// empties the field says "no limit" without a second flag.
+    #[serde(default, deserialize_with = "crate::protocol::double_option")]
+    pub daily_cap: Option<Option<u64>>,
+    /// `hold_new_work` or `stop_everything`. Absent leaves it unchanged.
+    #[serde(default)]
+    pub policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageBudgetReceipt {
+    pub daily_cap: Option<u64>,
+    pub policy: String,
     pub message: String,
 }
 
@@ -2282,6 +2545,20 @@ pub struct ProjectActionReceipt {
     pub message: String,
 }
 
+/// What a fork of a thread would inherit, resolved exactly as `fork_session` resolves
+/// it. Not on `ThreadSummaryView`: that rides the byte-budgeted `ThreadsResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadSettingsView {
+    pub thread_id: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub approval_policy: String,
+    pub sandbox: String,
+    /// False when these are relay defaults, not the source's own choices. A fork gets
+    /// them either way, but a UI presenting them as chosen would invent history.
+    pub remembered: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionInput {
     pub cwd: Option<String>,
@@ -2292,6 +2569,10 @@ pub struct StartSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
+    /// Carried on the input rather than assigned afterwards: the broker's
+    /// `start_session` returns no thread id, so a phone has nothing to follow up on.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2309,6 +2590,10 @@ pub struct ForkSessionInput {
     pub effort: Option<String>,
     pub device_id: Option<String>,
     pub provider: Option<String>,
+    /// Three states: absent inherits the source's project, `"proj_…"` files it there,
+    /// `""` unassigns. Absent cannot mean "none" — inherit already owns it.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2368,6 +2653,95 @@ pub struct TakeOverInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatInput {
+    pub device_id: Option<String>,
+}
+
+/// Create-or-return the Tasks Orchestrator thread.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EnsureOrchestratorInput {
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EnsureOrchestratorReceipt {
+    pub thread_id: String,
+}
+
+/// A held Orchestrator proposal waiting for the user to confirm or dismiss.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestratorProposalView {
+    pub id: String,
+    /// Wire discriminator — today only `start_task`.
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub acceptance_criteria: String,
+    #[serde(default)]
+    pub agreed_scope: String,
+    #[serde(default)]
+    pub quality_rules: String,
+    pub team_id: String,
+    pub team_version_id: String,
+    pub team_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProposeOrchestratorTaskInput {
+    pub title: String,
+    #[serde(default)]
+    pub context: Option<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Option<String>,
+    #[serde(default)]
+    pub agreed_scope: Option<String>,
+    #[serde(default)]
+    pub quality_rules: Option<String>,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub why: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProposeOrchestratorTaskReceipt {
+    pub proposal: OrchestratorProposalView,
+    pub message: String,
+}
+
+/// Edit a card that is still waiting. Every field is optional: an absent one
+/// leaves the staged value alone, so a caller changing only the team does not
+/// have to echo back a title it never read.
+///
+/// This is 13b's 改派 in its cheapest form — the card exists precisely so the
+/// assignment can be argued with before anything runs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ReviseOrchestratorProposalInput {
+    pub title: Option<String>,
+    pub context: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub team_id: Option<String>,
+    pub why: Option<String>,
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConfirmOrchestratorProposalInput {
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DismissOrchestratorProposalInput {
+    #[serde(default)]
     pub device_id: Option<String>,
 }
 
@@ -2508,6 +2882,247 @@ pub struct StartWorkflowReceipt {
     pub parent_thread_id: String,
     pub status: WorkflowRunStatusView,
     pub message: String,
+}
+
+/// Start a Task team run. Flat rather than nesting the spec, because a client
+/// filling this in is filling in a form, not assembling a domain object.
+/// One base a task team's diff may be taken against.
+///
+/// Sent as data rather than fixed by the client so a sub-task added to a run
+/// appears in the picker with no frontend change — and so the labels the user
+/// reads are written once, next to the code that resolves them.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamDiffBaseView {
+    pub key: String,
+    pub label: String,
+}
+
+/// A task team's changes, against one base.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamDiffResponse {
+    pub team_run_id: String,
+    /// The base key actually used — echoed because the request may omit it.
+    pub base: String,
+    pub base_label: String,
+    /// What the key resolved to. `None` means HEAD: uncommitted work only.
+    pub base_commit: Option<String>,
+    pub bases: Vec<TeamDiffBaseView>,
+    pub branch: String,
+    pub target_ref: String,
+    pub diff: WorkspaceDiffResponse,
+}
+
+/// One file from a task worktree or its diff base.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamFileResponse {
+    pub team_run_id: String,
+    pub base: String,
+    pub base_label: String,
+    pub base_commit: Option<String>,
+    pub path: String,
+    /// `old` reads the base blob; `new` reads the working tree.
+    pub side: String,
+    pub content: String,
+    pub truncated: bool,
+    pub missing: bool,
+}
+
+/// Query for `/api/comments`.
+#[derive(Debug, Deserialize)]
+pub struct ListCommentsQuery {
+    pub scope: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListCommentsResponse {
+    pub scope: String,
+    pub comments: Vec<relay_api::ReviewCommentView>,
+    /// Whether `POST /api/comments/:id/hand-back` is supported for this scope.
+    pub can_hand_back: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_back_unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCommentAnchorInput {
+    pub path: String,
+    pub side: String,
+    pub line: u32,
+    #[serde(default)]
+    pub base_commit: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCommentInput {
+    pub scope: String,
+    pub body: String,
+    pub anchor: CreateCommentAnchorInput,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommentMutationReceipt {
+    pub comment: relay_api::ReviewComment,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommentResolveInput {
+    /// `resolve` or `dismiss`.
+    pub action: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommentHandBackInput {
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+/// Query for `/api/review-ticks`.
+#[derive(Debug, Deserialize)]
+pub struct ListReviewTicksQuery {
+    pub scope: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListReviewTicksResponse {
+    pub scope: String,
+    pub ticks: Vec<relay_api::FileReviewTickView>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TickReviewFileInput {
+    pub scope: String,
+    pub path: String,
+    pub side: String,
+    #[serde(default)]
+    pub base_commit: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StartTeamInput {
+    pub title: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub acceptance_criteria: String,
+    /// The MR gate's yardstick, along with `quality_rules`. Immutable once the run
+    /// starts: the team must not be able to edit what it is measured against.
+    #[serde(default)]
+    pub agreed_scope: String,
+    #[serde(default)]
+    pub quality_rules: String,
+    /// Any directory inside the repository to fork from. Defaults to the relay's
+    /// current workspace.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Branch to fork from; defaults to the main worktree's current branch.
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    #[serde(default)]
+    pub tl_provider: Option<String>,
+    #[serde(default)]
+    pub dev_provider: Option<String>,
+    #[serde(default)]
+    pub reviewer_provider: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+/// Every whole-run action takes the same shape: which run, and who is asking.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TeamActionInput {
+    /// Optional while one task runs at a time; required once that relaxes.
+    #[serde(default)]
+    pub team_run_id: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamActionReceipt {
+    pub team_run_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartTeamReceipt {
+    pub team_run_id: String,
+    pub cwd: String,
+    pub branch: String,
+    pub status: String,
+    pub message: String,
+}
+
+/// One sub-task, as a client sees it. The brief is deliberately absent: it is
+/// TL-authored instruction for a developer, not status.
+#[derive(Debug, Clone, Serialize, Hash)]
+pub struct TeamSubTaskView {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub rounds_used: u32,
+    pub digested: bool,
+    pub result_summary: Option<String>,
+    /// Who is seated in the Dev and Reviewer chairs for this sub-task, so a team
+    /// diagram can open their transcripts. Identity, not instruction — which is
+    /// why these are here and `brief` is not. `None` until the seat is filled;
+    /// the UI must render an unopenable node rather than invent an id.
+    pub dev_thread_id: Option<String>,
+    pub reviewer_thread_id: Option<String>,
+}
+
+/// A parked question, so a client knows who is waiting and on what.
+#[derive(Debug, Clone, Serialize, Hash)]
+pub struct TeamAwaitingView {
+    pub thread_id: String,
+    pub request_id: String,
+    pub role: String,
+    pub asked_at: u64,
+}
+
+/// `Hash` is load-bearing, not incidental: `RelayState::teams_revision` hashes the
+/// WHOLE view, so any field added here automatically joins the Teams cache key. A
+/// hand-written field list would have to be remembered instead.
+#[derive(Debug, Clone, Serialize, Hash)]
+pub struct TeamRunView {
+    pub team_run_id: String,
+    pub title: String,
+    pub status: String,
+    pub phase: String,
+    pub cwd: String,
+    pub branch: String,
+    pub target_ref: String,
+    pub tl_thread_id: String,
+    /// How many team leads this run has had. Anything above 1 means a re-seed.
+    pub tl_generations: usize,
+    pub sub_tasks: Vec<TeamSubTaskView>,
+    pub awaiting: Option<TeamAwaitingView>,
+    pub unresolved: Vec<String>,
+    pub head_commit: Option<String>,
+    pub pause_reason: Option<String>,
+    pub error: Option<String>,
+    pub requested_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamsResponse {
+    /// Echoed so a client can confirm which revision it just fetched. The cache
+    /// must still gate on the SNAPSHOT's revision, not this one — see
+    /// `frontend/shared/reviews-cache.js` for why gating on the response's own
+    /// revision loops when the relay moves mid-fetch.
+    pub teams_revision: u64,
+    pub teams: Vec<TeamRunView>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3085,4 +3700,15 @@ fn set_detail_field_value(
 
 fn slice_chars(value: &str, start: usize, len: usize) -> String {
     value.chars().skip(start).take(len).collect()
+}
+
+/// Distinguish "field absent" from "field explicitly null" in a PATCH-shaped
+/// body. Without it, omitting `daily_cap` and sending `"daily_cap": null` both
+/// arrive as `None`, so a policy-only update would silently clear the cap.
+pub(crate) fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }

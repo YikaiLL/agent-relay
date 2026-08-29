@@ -23,16 +23,18 @@ use crate::{
         PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
         ProjectAction, ProjectActionInput, ProjectActionReceipt, ReadThreadEntriesInput,
         ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
-        ResumeSessionInput, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
-        SessionSnapshotCompactProfile, StartSessionInput, StopTurnInput, SubmitAskUserAnswerInput,
-        TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntriesResponse,
-        ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadStateView, ThreadTranscriptResponse,
+        RepairWorkspaceInput, ResolvedWorkspace, ResumeSessionInput, RevokeDeviceReceipt,
+        SendMessageInput, SessionSnapshot, SessionSnapshotCompactProfile, StartSessionInput,
+        StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt,
+        ThreadDeleteReceipt, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadRenameReceipt,
+        ThreadSettingsView, ThreadStateView, ThreadTranscriptResponse, ThreadWorkspaceInput,
         ThreadsResponse, ToolCallView, TranscriptDeltaEvent, UpdateSessionSettingsInput,
-        WatchThreadsInput, WorkspaceDiffResponse, WorkspaceRootView,
+        WatchThreadsInput, WorkspaceDiffResponse, WorkspaceGitContextView, WorkspaceOrigin,
+        WorkspaceRootView,
     },
     provider::{
-        spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadResult,
-        ThreadSyncData,
+        spawn_providers, ProviderBridge, ProviderForkRequest, ProviderImage, StartThreadRequest,
+        StartThreadResult, ThreadSyncData,
     },
 };
 
@@ -82,10 +84,27 @@ pub(crate) const REVIEW_LOCKED_THREAD_MSG: &str =
     "this thread is being reviewed; switch to another thread or wait for the review to finish";
 pub(crate) const WORKFLOW_LOCKED_THREAD_MSG: &str =
     "a workflow is running in this workspace; wait for it to finish before changing threads or files";
+/// A team thread is driven by the run, not talked to. A message typed into one
+/// would interleave with the driver's own turn on the same thread. The question
+/// card stays answerable — that channel is deliberately NOT closed by this lock.
+pub(crate) const TEAM_LOCKED_THREAD_MSG: &str =
+    "this thread belongs to a running task; pause the task to talk to its team lead";
 
 #[derive(Clone)]
 pub struct AppState {
     relay: Arc<RwLock<RelayState>>,
+    /// The private orchestration engines this build registered, if any.
+    ///
+    /// Empty in a build without them, and every lock question answers "free" —
+    /// which is why the guards below need no `cfg` and the public repo compiles
+    /// and runs untouched.
+    orchestrators: relay_api::Orchestrators,
+    /// The private task workflow runner and sole product registration point.
+    /// `None` in a public build: task starts refuse before any work begins.
+    team_driver: Option<Arc<dyn relay_api::TeamDriver>>,
+    /// Line-comment anchor re-location. Public builds use
+    /// [`crate::usage::review_anchors::UnavailableReviewAnchors`].
+    review_anchors: Arc<dyn relay_api::ReviewAnchors>,
     providers: HashMap<String, Arc<dyn ProviderBridge>>,
     provider_model_catalogs: Arc<RwLock<HashMap<String, Vec<ModelOptionView>>>>,
     change_tx: watch::Sender<u64>,
@@ -96,6 +115,18 @@ pub struct AppState {
     /// job state via `RelayState::is_thread_review_locked`. `request_review` takes
     /// it only briefly to atomically validate + record the job.
     session_guard: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes Orchestrator CREATION, and nothing else.
+    ///
+    /// `ensure_orchestrator` reads the pin, releases the lock, awaits the
+    /// provider, then publishes — a check-then-act window with a provider round
+    /// trip inside it. Two tabs opening Tasks together both saw no pin, both
+    /// started a thread, and the last writer won; the loser kept an id that is
+    /// not the pin and quietly lost its persona and MCP tools on its second
+    /// turn. Deliberately NOT `session_guard`: this is held across a
+    /// `start_thread`, and blocking every unrelated session op for the length of
+    /// a provider handshake is exactly what that guard's own comment refuses to
+    /// do.
+    orchestrator_create_guard: Arc<tokio::sync::Mutex<()>>,
     /// Per-turn timeout (ms) for review steps. Overridable in tests so the
     /// timeout-interrupt path can be exercised without a 10-minute wait.
     review_step_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -116,6 +147,70 @@ pub struct AppState {
     /// Review job ids whose orchestrators must stop before starting another turn.
     /// A set is required because unrelated parent threads may be reviewed concurrently.
     cancel_requested_jobs: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Stall window (ms) for one team turn. A backstop, not a cap: it resets on
+    /// every scrap of progress and FREEZES entirely while a turn is parked on a
+    /// user's question. Overridable in tests.
+    team_step_stall_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes the two things that must never interleave for a task team:
+    /// STARTING a turn on one of its threads, and CHANGING whether the run may be
+    /// driven at all.
+    ///
+    /// Without it the driver's boundary check and its `start_turn` are separated
+    /// by provider and git work, so a stop landing in between drains an idle
+    /// runtime, records the run stopped, and then watches the driver start a turn
+    /// into a worktree it just told the user was quiet. For a cancel that is worse
+    /// than a lie: terminal releases the workspace lock while an agent writes.
+    ///
+    /// One gate rather than one per run because M1 allows a single run at a time;
+    /// key it by run id when that relaxes.
+    team_drive_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only latch held across the exact window a stop must not be able to
+    /// exploit: after the driver's boundary check, before it takes the drive gate.
+    /// A test holds it, settles the run, and releases — which is the only way to
+    /// drive that interleaving deterministically rather than hoping for it.
+    #[cfg(test)]
+    team_turn_barrier: Arc<tokio::sync::Mutex<()>>,
+    /// Counts drivers that have REACHED that latch, so a test can wait for the
+    /// driver to be genuinely past its boundary check instead of sleeping.
+    #[cfg(test)]
+    team_turn_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// The second window, INSIDE the drive gate: preflight has passed and
+    /// `start_turn` has not been called. A stop reaching the worktree here is the
+    /// failure the gate exists to make impossible, so a test proves it by holding
+    /// this and showing the stop cannot complete.
+    #[cfg(test)]
+    team_gated_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    team_gated_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// The third window: the driver's OWN git mutation of the worktree. Not a
+    /// turn, so the turn latches miss it entirely — and a stop that returned here
+    /// would release the tree while the relay was still staging into it.
+    #[cfg(test)]
+    team_commit_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    team_commit_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// Test-only latch after git listing and before workspace write-back, so a cwd
+    /// observation can land in that window deterministically.
+    #[cfg(test)]
+    workspace_resolve_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    workspace_resolve_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// Test-only latch after evidence re-read and before inferred write-back.
+    #[cfg(test)]
+    workspace_resolve_writeback_barrier: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    workspace_resolve_writeback_arrivals: Arc<std::sync::atomic::AtomicU64>,
+    /// How long (ms) to watch a thread for signs of a turn after a start request
+    /// failed, before concluding the provider never began one. Overridable in
+    /// tests.
+    team_liveness_window_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Task team run ids that currently have a driver. The ONE piece of team run
+    /// state that cannot live on the record: two concurrent Resumes both read
+    /// `Paused`, both pass their guard, and both spawn a driver onto the same
+    /// worktree. A `std` mutex rather than a `tokio` one on purpose — the ticket
+    /// releases from `Drop`, which cannot await, and every critical section here
+    /// is one set operation with no await inside it.
+    driving_team_runs: Arc<std::sync::Mutex<HashSet<String>>>,
     /// The compacted, pre-serialized local snapshot for one change version, shared by
     /// every SSE surface that wakes on it.
     ///
@@ -145,17 +240,29 @@ const MAX_THREAD_ID_BYTES: usize = 256;
 mod approvals;
 mod broker;
 mod fork;
+mod git_context;
+mod orchestrator;
+pub(crate) mod orchestrator_dispatch;
+pub(crate) mod orchestrator_proposals;
 mod pairing;
+mod port;
 mod projects;
 mod providers;
 mod review;
+mod review_comments;
+mod review_ticks;
 mod sessions;
-mod task_list;
+pub(crate) mod team;
+mod team_diff;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
+mod thread_workspace;
 mod threads;
 mod transcript;
+pub(crate) use thread_workspace::ThreadWorkspaceError;
 mod workflow;
+mod workspace_trust;
+mod worktree;
 
 /// Fork capability is a property of WHICH BRIDGES EXIST, not of any session,
 /// so it is derived once at construction. Every constructor must seed it: a
@@ -174,6 +281,28 @@ pub(crate) fn fork_capability_views(
                 native_fork_at_message: capability.native_fork_at_message,
             }
         })
+        .collect::<Vec<_>>();
+    views.sort_by(|a, b| a.provider.cmp(&b.provider));
+    views
+}
+
+/// Archive capability, derived at construction for the same reason fork's is:
+/// it is a property of which bridges exist, not of any session. A path that
+/// forgets to seed it publishes an empty list — and since a provider missing
+/// from the list is read as "no evidence it cannot archive", that degrades to
+/// today's behaviour (the action offered) rather than to a silently missing
+/// control.
+pub(crate) fn archive_capability_views(
+    providers: &HashMap<String, Arc<dyn ProviderBridge>>,
+) -> Vec<crate::protocol::ProviderArchiveCapabilityView> {
+    let mut views = providers
+        .iter()
+        .map(
+            |(name, bridge)| crate::protocol::ProviderArchiveCapabilityView {
+                provider: name.clone(),
+                native_archive: bridge.supports_archive(),
+            },
+        )
         .collect::<Vec<_>>();
     views.sort_by(|a, b| a.provider.cmp(&b.provider));
     views
@@ -219,21 +348,50 @@ impl AppState {
     ) -> Self {
         if let Ok(mut state) = relay.try_write() {
             state.set_provider_fork_capabilities(fork_capability_views(&providers));
+            state.set_provider_archive_capabilities(archive_capability_views(&providers));
             state.set_provider_status_base(provider_status_base_from_map(&providers));
         }
 
         Self {
             relay,
+            orchestrators: relay_api::Orchestrators::default(),
+            team_driver: None,
+            review_anchors: Arc::new(crate::usage::review_anchors::UnavailableReviewAnchors),
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
             change_tx,
             session_guard: Arc::new(tokio::sync::Mutex::new(())),
+            orchestrator_create_guard: Arc::new(tokio::sync::Mutex::new(())),
             review_step_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             review_drain_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(300_000)),
             workflow_drain_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(30_000)),
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            team_liveness_window_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_000)),
+            #[cfg(test)]
+            team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_writeback_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -265,6 +423,15 @@ impl AppState {
             security,
         )));
 
+        // Install the token ledger beside session.json. Best-effort by
+        // construction: a failure degrades to `enabled: false` on /api/usage and
+        // never blocks boot (see `crate::usage::store`).
+        {
+            let mut relay = relay.write().await;
+            let ledger_path = persistence.path().with_file_name("token-usage.db");
+            relay.usage_store = crate::usage::store::UsageStore::open(&ledger_path);
+        }
+
         if let Some(ref persisted) = restored_state {
             let mut relay = relay.write().await;
             relay.apply_persisted(persisted);
@@ -276,6 +443,30 @@ impl AppState {
                 ),
             );
             relay.notify();
+        }
+
+        // Reserve the transcript clock on disk BEFORE anything can issue a revision.
+        //
+        // The headroom in `PersistedRelayState::from_relay` only protects the run
+        // that wrote it. Without this, a relay that restores, hands out revisions,
+        // and then dies before its own first debounced save leaves the file still
+        // holding the PREVIOUS run's value — so the next start reads the same number
+        // and hands the same revisions out a second time. Awaited, and ahead of
+        // `spawn_providers`, so the file leads before any event can arrive.
+        //
+        // Best-effort: a relay that cannot write its state file still has to run.
+        if restored_state.is_some() {
+            let reserved = {
+                let relay = relay.read().await;
+                PersistedRelayState::from_relay(&relay)
+            };
+            if let Err(error) = persistence.save(&reserved).await {
+                let mut relay = relay.write().await;
+                relay.push_log(
+                    "warn",
+                    format!("failed to reserve transcript clock on startup: {error}"),
+                );
+            }
         }
 
         {
@@ -305,7 +496,8 @@ impl AppState {
 
         if providers.is_empty() {
             return Err(
-                "no agent providers are available; install codex or claude CLI".to_string(),
+                "no agent providers are available; install the codex, claude or cursor-agent CLI"
+                    .to_string(),
             );
         }
 
@@ -317,22 +509,51 @@ impl AppState {
                 format!("Agent providers initialized: {:?}", provider_names),
             );
             relay.set_provider_fork_capabilities(fork_capability_views(&providers));
+            relay.set_provider_archive_capabilities(archive_capability_views(&providers));
             relay.set_provider_status_base(provider_status_base);
             relay.notify();
         }
 
         let state = Self {
             relay,
+            orchestrators: relay_api::Orchestrators::default(),
+            team_driver: None,
+            review_anchors: Arc::new(crate::usage::review_anchors::UnavailableReviewAnchors),
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
             change_tx,
             session_guard: Arc::new(tokio::sync::Mutex::new(())),
+            orchestrator_create_guard: Arc::new(tokio::sync::Mutex::new(())),
             review_step_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             review_drain_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(300_000)),
             workflow_drain_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(30_000)),
             stop_fallback_ms: Arc::new(std::sync::atomic::AtomicU64::new(10_000)),
             blocked_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel_requested_jobs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            team_drive_gate: Arc::new(tokio::sync::Mutex::new(())),
+            team_liveness_window_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_000)),
+            #[cfg(test)]
+            team_turn_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_turn_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_gated_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_gated_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            team_commit_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            team_commit_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            workspace_resolve_writeback_barrier: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            workspace_resolve_writeback_arrivals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            team_step_stall_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            driving_team_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             local_snapshot_cache: Arc::new(tokio::sync::Mutex::new(None)),
             local_snapshot_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_snapshot_waiters: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -351,6 +572,10 @@ impl AppState {
         if let Some(persisted) = restored_state {
             state.restore_persisted_session(persisted).await;
         }
+
+        // After restore AND after `spawn_providers`: a restored task's threads can
+        // only be routed once the providers that own them exist.
+        state.validate_paused_team_runs().await;
 
         crate::broker::spawn_broker_task(state.clone()).await?;
 
@@ -553,6 +778,128 @@ in thread {thread_id}: {error}"
         providers
     }
 
+    /// Token usage report for the Usage screen.
+    ///
+    /// Reads the ledger under a brief lock (clone of the store handle), then
+    /// runs the aggregates without holding the relay write path.
+    pub async fn usage_report(
+        &self,
+        since: u64,
+        until: u64,
+        bucket: &str,
+        compare: Option<&str>,
+    ) -> Result<crate::usage::report::UsageReport, String> {
+        let bucket = crate::usage::report::Bucket::parse(bucket)?;
+        let compare_previous = match compare {
+            None | Some("") => false,
+            Some("previous") => true,
+            Some(other) => {
+                return Err(format!(
+                    "unknown compare `{other}`; expected previous or omit"
+                ));
+            }
+        };
+        let providers = self.available_providers();
+        let (store, team_runs, budget) = {
+            let relay = self.relay.read().await;
+            let mut team_runs = std::collections::HashMap::new();
+            for run in relay.team_runs.values() {
+                team_runs.insert(
+                    run.id.clone(),
+                    crate::usage::report::TeamRunMeta {
+                        title: run.spec.title.clone(),
+                        status: run.status.as_str().to_string(),
+                    },
+                );
+            }
+            (relay.usage_store.clone(), team_runs, relay.usage_budget)
+        };
+        // The persisted setting wins; the env var stays as a fallback so a
+        // relay started with USAGE_DAILY_CAP keeps behaving as it did before the
+        // budget became settable. Setting a cap in the UI overrides it, which is
+        // the right precedence: the env var was a launch-time default, and the
+        // UI is someone deciding now.
+        let daily_cap = budget.cap().or_else(|| {
+            std::env::var("USAGE_DAILY_CAP")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+        });
+        let options = crate::usage::report::ReportOptions {
+            team_runs,
+            budget_policy: budget.policy,
+            daily_cap,
+        };
+        crate::usage::report::build_report(
+            &store,
+            since,
+            until,
+            bucket,
+            compare_previous,
+            &providers,
+            &options,
+        )
+    }
+
+    /// The Teams library (mockup 13a): catalog rows + 7-day ledger stats.
+    ///
+    /// Distinct from [`Self::teams`], which lists live `TeamRun`s. This is the
+    /// durable definition a run pins; that is the ephemeral execution.
+    pub async fn team_catalog(&self) -> crate::teams::TeamCatalogReport {
+        let store = {
+            let relay = self.relay.read().await;
+            relay.usage_store.clone()
+        };
+        let now = crate::state::unix_now();
+        crate::teams::build_catalog(&store, now)
+    }
+
+    /// Register the private orchestration engines.
+    ///
+    /// Call once, before the state is shared: `Orchestrators` is held by value, so
+    /// clones taken earlier (an engine's own port handle, for instance) keep the
+    /// empty registry. That is deliberate — an engine has no business asking the
+    /// relay about its peers.
+    pub fn with_orchestrators(mut self, engines: Vec<Arc<dyn relay_api::Orchestrator>>) -> Self {
+        self.orchestrators = relay_api::Orchestrators::new(engines);
+        self
+    }
+
+    /// The registered engines, for the guards and the snapshot.
+    pub fn orchestrators(&self) -> &relay_api::Orchestrators {
+        &self.orchestrators
+    }
+
+    /// Install the private workflow runner. Call once before sharing the state.
+    pub fn with_team_driver(mut self, driver: Arc<dyn relay_api::TeamDriver>) -> Self {
+        self.team_driver = Some(driver);
+        self
+    }
+
+    /// Install the private line-comment re-locator. Call once before sharing the state.
+    pub fn with_private_review_anchors(
+        mut self,
+        relocator: Arc<dyn relay_api::ReviewAnchors>,
+    ) -> Self {
+        self.review_anchors = relocator;
+        self
+    }
+
+    /// Whether this build has the private workflow runner.
+    pub(crate) fn has_team_driver(&self) -> bool {
+        self.team_driver.is_some()
+    }
+
+    /// Unlock in-development features. Call once at startup, before the state is shared.
+    pub async fn set_beta_features_enabled(&self, enabled: bool) {
+        self.relay.write().await.set_beta_features_enabled(enabled);
+    }
+
+    /// Whether in-development features are unlocked (`sealwire --beta`).
+    pub(crate) async fn beta_features_enabled(&self) -> bool {
+        self.relay.read().await.beta_features_enabled()
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.change_tx.subscribe()
     }
@@ -658,6 +1005,31 @@ in thread {thread_id}: {error}"
         expire_controller_if_needed(&mut relay);
     }
 
+    /// Re-decide whether a thread's workspace is still on disk, and park the answer on
+    /// its runtime for the lock-held readers (`snapshot`, `read_loaded_thread_state`).
+    ///
+    /// The `stat` happens HERE, on an async path with no relay lock held, and only where
+    /// the workspace was about to be used anyway: opening a thread, resuming one, sending
+    /// into one, repairing one. That is what keeps a blocking filesystem call off the
+    /// notify path — see `ThreadRuntime::workspace_missing`.
+    pub(super) async fn refresh_workspace_verdict(
+        &self,
+        thread_id: &str,
+        cwd: &str,
+    ) -> Option<crate::protocol::WorkspaceRepairView> {
+        let verdict = worktree::plan_workspace_repair(cwd);
+        let mut relay = self.relay.write().await;
+        let runtime = relay.ensure_runtime_for_thread(thread_id);
+        if runtime.workspace_missing == verdict {
+            return verdict;
+        }
+        runtime.workspace_missing = verdict.clone();
+        // A change either raises the banner or takes it down; both are things every
+        // attached surface has to repaint for.
+        relay.notify();
+        verdict
+    }
+
     async fn ensure_thread_runtime_loaded(
         &self,
         thread_id: &str,
@@ -737,7 +1109,7 @@ in thread {thread_id}: {error}"
 
         // Resolve + resume the restored active thread. Try the PERSISTED provider
         // FIRST — it's robust against a cold `list_threads` at restart, which would
-        // otherwise mis-route the thread to the boot-default (last-spawned)
+        // otherwise mis-route the thread to the boot-default (preferred)
         // provider. Fall back to probing every provider by thread id when the
         // persisted provider is gone (removed/renamed → not in the map) OR resuming
         // on it fails (a stale/wrong persisted value) — so a bad persisted provider
@@ -769,7 +1141,7 @@ in thread {thread_id}: {error}"
         // Genuine provider-list probe — NOT `find_thread_provider`, which would
         // short-circuit to the relay's ACTIVE provider. At boot the persisted
         // thread is already marked active (apply_persisted) with the untrusted
-        // last-spawned provider, so that shortcut returns the wrong provider and
+        // boot-default provider, so that shortcut returns the wrong provider and
         // never actually probes the thread lists.
         if restored.is_none() {
             if let Some((name, bridge)) = self.probe_thread_provider(&thread_id).await {
@@ -836,7 +1208,7 @@ in thread {thread_id}: {error}"
     /// provider whose listing contains it. Unlike `find_thread_provider`, this
     /// does NOT short-circuit to the relay's active provider — restore needs a
     /// genuine probe because at boot the persisted thread is already marked active
-    /// with the untrusted last-spawned provider, which that shortcut would return.
+    /// with the untrusted boot-default provider, which that shortcut would return.
     async fn probe_thread_provider(
         &self,
         thread_id: &str,
@@ -875,7 +1247,7 @@ an automatic provider stop will be requested."
 }
 
 async fn apply_unified_diff_in(
-    workspace: &LiveWorkspace,
+    workspace: &TrustedWorkspace,
     diff: &str,
     direction: FileChangeApplyDirection,
 ) -> Result<(), String> {
@@ -926,41 +1298,26 @@ async fn apply_unified_diff(
     cwd: &str,
     diff: &str,
     direction: FileChangeApplyDirection,
+    grants: &TrustGrants,
 ) -> Result<(), String> {
-    let workspace = LiveWorkspace::from_path(cwd)
-        .ok_or_else(|| format!("failed to start git apply: workspace {cwd} no longer exists"))?;
+    // USER-INVOKED and a WRITE: someone pressed apply. `git apply` still runs the target
+    // repo's config, so a tree nobody vouched for is refused with a message that says so,
+    // rather than being silently treated as missing.
+    let workspace =
+        grants.admit(cwd).await.trusted().cloned().ok_or_else(|| {
+            format!("failed to start git apply: {cwd} is not a granted workspace")
+        })?;
     apply_unified_diff_in(&workspace, diff, direction).await
 }
 
 const WORKSPACE_DIFF_MAX_BYTES: usize = 4 * 1024 * 1024;
 const WORKSPACE_DIFF_UNTRACKED_MAX_BYTES: usize = 64 * 1024;
 
-/// A directory that existed when it crossed into a filesystem/provider boundary.
-///
-/// The handle does not pretend a directory can never disappear: cleanup may still race
-/// the operation after construction. It does make every spawn site start from an explicit
-/// liveness check, and gives the error classifier the exact path whose disappearance it
-/// must distinguish from a real git/provider error.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LiveWorkspace {
-    path: String,
-}
-
-impl LiveWorkspace {
-    pub(crate) fn from_path(path: &str) -> Option<Self> {
-        dir_exists(path).then(|| Self {
-            path: path.to_string(),
-        })
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.path
-    }
-
-    pub(crate) fn is_live(&self) -> bool {
-        dir_exists(&self.path)
-    }
-}
+// `TrustedWorkspace` used to live here as `LiveWorkspace`, with a public `from_path` that
+// proved only that a directory existed. Every git helper already took it, so the shape of
+// a capability was there — but anyone could mint one, so it granted nothing. It now comes
+// from `workspace_trust`, where the only constructor decides trust on the way through.
+pub(crate) use workspace_trust::{Admission, LiveDir, TrustGrants, TrustedWorkspace};
 
 /// The result of resolving a recorded workspace.
 ///
@@ -970,17 +1327,17 @@ impl LiveWorkspace {
 /// cwd must refuse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceResolution {
-    Live(LiveWorkspace),
+    Live(LiveDir),
     Gone {
         recorded: String,
-        substitute: Option<LiveWorkspace>,
+        substitute: Option<LiveDir>,
     },
 }
 
 impl WorkspaceResolution {
     /// Select a live workspace for a read-only operation, retaining the tombstone that
     /// must be surfaced to the user when this is a fallback.
-    pub(crate) fn into_readable(self) -> Option<(LiveWorkspace, Option<String>)> {
+    pub(crate) fn into_readable(self) -> Option<(LiveDir, Option<String>)> {
         match self {
             Self::Live(workspace) => Some((workspace, None)),
             Self::Gone {
@@ -1016,22 +1373,36 @@ pub(crate) async fn collect_workspace_diff_resilient(
     relay_cwd: &str,
     device_scope: &[String],
     allowed_roots: &[String],
+    grants: &TrustGrants,
 ) -> Result<(WorkspaceDiffResponse, Option<String>), String> {
-    let first = LiveWorkspace::from_path(target);
+    // An ungranted tree lands in the same arm as a vanished one, and that is the point:
+    // both mean "no diff can be read here", and neither is worth an error banner on a
+    // panel the user merely opened.
+    let first = grants.admit(target).await.trusted().cloned();
     let first_result = match first.as_ref() {
         Some(workspace) => collect_workspace_diff_in(workspace).await,
-        None => Err(format!("workspace {target} no longer exists")),
+        None => Err(format!("workspace {target} is not available for a diff")),
     };
     match first_result {
         Ok(diff) => Ok((diff, None)),
         // Only a vanished workspace is retried; a genuine git error still surfaces.
-        Err(error) if !first.as_ref().is_some_and(LiveWorkspace::is_live) => {
+        Err(error) if !first.as_ref().is_some_and(TrustedWorkspace::is_live) => {
             let resolution =
-                resolve_workspace_cwd(target, relay_cwd, device_scope, allowed_roots).await;
+                resolve_workspace_cwd(target, relay_cwd, device_scope, allowed_roots, grants).await;
             match resolution.into_readable() {
+                // The substitute is a DIFFERENT directory than the one admitted above —
+                // `resolve_workspace_cwd` deliberately reaches outside the vanished tree —
+                // so it is admitted on its own standing. Degrading is right here: the
+                // fallback is the relay's idea, not the user's, so an ungranted one reports
+                // nothing rather than making a refusal the user cannot act on.
                 Some((retry, fallback_from)) => {
-                    let diff = collect_workspace_diff_in(&retry).await?;
-                    Ok((diff, fallback_from))
+                    match grants.admit(retry.as_str()).await.trusted() {
+                        Some(workspace) => {
+                            let diff = collect_workspace_diff_in(workspace).await?;
+                            Ok((diff, fallback_from))
+                        }
+                        None => Ok((WorkspaceDiffResponse::unavailable(), None)),
+                    }
                 }
                 None => {
                     tracing::debug!(
@@ -1094,13 +1465,18 @@ pub(crate) async fn resolve_workspace_cwd(
     relay_cwd: &str,
     device_scope: &[String],
     allowed_roots: &[String],
+    grants: &TrustGrants,
 ) -> WorkspaceResolution {
-    if let Some(workspace) = LiveWorkspace::from_path(recorded) {
+    if let Some(workspace) = LiveDir::from_path(recorded) {
         return WorkspaceResolution::Live(workspace);
     }
+    // `enclosing_repo_root` reads the filesystem; only the second candidate has to ASK a
+    // repository about itself, which is git running somewhere, so the grants come this far
+    // in purely for it. What this hands back is still a `LiveDir` either way — resolving
+    // where a thread lives never decides what may run there.
     let candidates = [
         enclosing_repo_root(recorded),
-        registering_repo_main_worktree(recorded, relay_cwd).await,
+        registering_repo_main_worktree(recorded, relay_cwd, grants).await,
     ];
     for candidate in candidates.into_iter().flatten() {
         // The recorded cwd is gone by definition, so a candidate equal to it is no
@@ -1111,7 +1487,7 @@ pub(crate) async fn resolve_workspace_cwd(
         if !path_within_device_scope(&candidate, device_scope, allowed_roots) {
             continue;
         }
-        let Some(substitute) = LiveWorkspace::from_path(&candidate) else {
+        let Some(substitute) = LiveDir::from_path(&candidate) else {
             continue;
         };
         return WorkspaceResolution::Gone {
@@ -1133,8 +1509,15 @@ pub(crate) async fn resolve_workspace_cwd(
 /// worktree whose directory was removed as `prunable`, so its presence there is the repo
 /// saying "that was mine". The answer is the repo's main tree — where the work merges to —
 /// not `probe_cwd`, which may itself be some other worktree.
-async fn registering_repo_main_worktree(recorded: &str, probe_cwd: &str) -> Option<String> {
-    let probe = LiveWorkspace::from_path(probe_cwd)?;
+async fn registering_repo_main_worktree(
+    recorded: &str,
+    probe_cwd: &str,
+    grants: &TrustGrants,
+) -> Option<String> {
+    // `probe_cwd` is the relay's own current cwd — wherever the most recent session
+    // happened to start, which nobody granted by starting it. Asking git about it is still
+    // running git in it, so this answers "no related worktree" rather than probing.
+    let probe = grants.admit(probe_cwd).await.trusted().cloned()?;
     let records = list_worktree_records(&probe).await;
     if !records
         .iter()
@@ -1184,15 +1567,15 @@ fn normalize_missing_path(path: &str) -> std::path::PathBuf {
 /// Enumerate every working tree of the repo containing `workspace` (main + linked
 /// `git worktree`s) that can actually be diffed. Best-effort: a non-repo / git failure
 /// yields an empty list, which degrades the panel to "no picker", never to an error.
-pub(crate) async fn list_worktrees_in(workspace: &LiveWorkspace) -> Vec<WorkspaceRootView> {
+pub(crate) async fn list_worktrees_in(workspace: &TrustedWorkspace) -> Vec<WorkspaceRootView> {
     diffable_roots(list_worktree_records(workspace).await)
 }
 
 /// Compatibility boundary for callers that only have a persisted/display cwd. The git
-/// spawn itself still accepts only `LiveWorkspace`; later orchestration code should carry
+/// spawn itself still accepts only `TrustedWorkspace`; later orchestration code should carry
 /// the handle returned by `resolve_workspace_cwd` instead of re-entering through this.
-pub(crate) async fn list_worktrees(cwd: &str) -> Vec<WorkspaceRootView> {
-    let Some(workspace) = LiveWorkspace::from_path(cwd) else {
+pub(crate) async fn list_worktrees(cwd: &str, grants: &TrustGrants) -> Vec<WorkspaceRootView> {
+    let Some(workspace) = grants.admit(cwd).await.trusted().cloned() else {
         return Vec::new();
     };
     list_worktrees_in(&workspace).await
@@ -1209,15 +1592,80 @@ fn diffable_roots(records: Vec<WorktreeRecord>) -> Vec<WorkspaceRootView> {
             path: record.path,
             branch: record.branch,
             is_main: record.is_main,
+            // Left unmeasured here on purpose — see `measure_root_changes`.
+            changed_files: None,
+            changed_files_capped: false,
         })
         .collect()
+}
+
+/// RELAY-WIDE. Per-request pipelining is no ceiling: each concurrent request starts its
+/// own batch, and obsolete replies are dropped without cancelling the requests behind.
+const ROOT_STATUS_CONCURRENCY: usize = 8;
+
+/// Process-wide rather than a field on `AppState`: there is one relay per process, and
+/// threading it through would add a lock to paths that all want the same ceiling.
+fn root_status_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(ROOT_STATUS_CONCURRENCY))
+}
+
+/// Kept OUT of `list_worktrees_in`, which runs twice per panel refresh: only the request
+/// that RENDERS counts should pay a subprocess per worktree. Best-effort per root.
+pub(crate) async fn measure_root_changes(app: &AppState, roots: &mut [WorkspaceRootView]) {
+    // Own block: admission awaits on disk below, and holding the relay lock across that is
+    // how one picker refresh stalls every other session.
+    let grants = { app.relay.read().await.trust_grants() };
+    measure_root_changes_with(roots, root_status_permits(), &grants).await
+}
+
+/// Pool-parameterised so the queueing behaviour is testable without a private pool
+/// having to stall the relay-wide one every other test shares.
+async fn measure_root_changes_with(
+    roots: &mut [WorkspaceRootView],
+    permits: &tokio::sync::Semaphore,
+    grants: &TrustGrants,
+) {
+    use futures_util::stream::{self, StreamExt};
+
+    // Paths are copied out FIRST so each probe owns its input: futures borrowing from
+    // `roots` cannot be held across the `iter_mut` write-back below.
+    let paths: Vec<String> = roots.iter().map(|root| root.path.clone()).collect();
+
+    let measured: Vec<Option<(u32, bool)>> =
+        stream::iter(paths.into_iter().map(|path| async move {
+            // PASSIVE — nobody asked for a count, the picker just rendered — so an
+            // ungranted root goes unmeasured rather than refusing: counting means
+            // `git status`, which executes the inspected repo's own clean filter.
+            //
+            // Per root, not once per repo. `admit` already inherits a linked worktree
+            // from the main tree whose `.git/config` it shares, so the repo-wide verdict
+            // this used to precompute was the same answer reached less safely — via
+            // `allowed_roots`, which is reach, not permission to execute. Before the
+            // permit, so a refusal costs nothing and none is held across a disk probe.
+            let workspace = grants.admit(&path).await.trusted().cloned()?;
+            // Held across the spawn, so the ceiling counts PROCESSES, not futures —
+            // `buffered` below only caps how many queue per request.
+            let _permit = permits.acquire().await.ok()?;
+            git_context::count_changed_files(&workspace).await
+        }))
+        .buffered(ROOT_STATUS_CONCURRENCY)
+        .collect()
+        .await;
+
+    for (root, outcome) in roots.iter_mut().zip(measured) {
+        if let Some((count, capped)) = outcome {
+            root.changed_files = Some(count);
+            root.changed_files_capped = capped;
+        }
+    }
 }
 
 /// Every worktree record git reports for the repo containing `workspace`, INCLUDING bare
 /// and prunable ones. Kept separate from `list_worktrees_in` because the prunable entries
 /// are exactly what proves a repo once owned a directory that has since been deleted (see
 /// `registering_repo_main_worktree`), while they must never be offered as diff targets.
-async fn list_worktree_records(workspace: &LiveWorkspace) -> Vec<WorktreeRecord> {
+async fn list_worktree_records(workspace: &TrustedWorkspace) -> Vec<WorktreeRecord> {
     // `-z` is what makes a path containing a newline (or trailing whitespace)
     // parseable at all — it is git's own documented answer for exactly that case.
     // `worktree list -z` landed in git 2.36, so fall back to the newline form for
@@ -1319,8 +1767,9 @@ fn parse_worktree_records<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<Work
 }
 
 /// How far back through a thread's transcript to look for evidence of where it has
-/// been writing. Bounded so a long thread cannot make the diff endpoint expensive.
-const SUGGESTED_ROOT_SCAN_LIMIT: usize = 200;
+/// been writing. Applied twice (recent window, then an older window of the same
+/// size) so a long write-sparse transcript cannot stall under the relay read lock.
+const WRITE_EVIDENCE_SCAN_LIMIT: usize = 200;
 
 /// One line telling a reviewer WHICH working tree it is being handed — path, branch, and
 /// whether that is the repo's main tree or a linked worktree — plus, when this is not the
@@ -1387,36 +1836,7 @@ exists, so this is the workspace that owned it."
     line
 }
 
-/// Which enumerated root a thread's recent writes actually landed in, given its tool
-/// calls most-recent-first. Returns `None` when there is no usable evidence.
-///
-/// Only ABSOLUTE paths count. Claude Code's edit tools always pass absolute
-/// `file_path`s (verified against real session transcripts), but a provider that
-/// reports paths relative to the session cwd carries no worktree information at all —
-/// guessing from those would silently mis-attribute, so they are ignored.
-///
-/// Matching is longest-root-wins, which is required rather than cosmetic: worktrees
-/// nest (this repo keeps them under `.claude/worktrees/`), so a nested worktree's
-/// files also sit under the main worktree and a first-match scan would always answer
-/// "main".
-/// Evidence is restricted to file changes that actually LANDED:
-/// - `item_type == "fileChange"`, because a read-only tool (Read/Glob/…) carries an
-///   absolute `path` too, and treating that as evidence makes the panel jump to
-///   whichever tree the agent merely glanced at;
-/// - a terminal-success status, because a failed or still-running edit never hit disk.
-pub(crate) fn suggested_root_from_tools<'a>(
-    tools: impl Iterator<Item = (&'a ToolCallView, &'a str)>,
-    roots: &[WorkspaceRootView],
-) -> Option<String> {
-    suggested_root_from_paths(&landed_write_paths(tools), roots)
-}
-
-/// The paths a thread's recent tool calls actually WROTE, most-recent-first.
-///
-/// Split out from `suggested_root_from_tools` so a caller that has to enumerate roots
-/// asynchronously (the review path: it needs git, and holding the relay lock across an
-/// await is not an option) can lift this evidence out under the lock without cloning
-/// whole tool views and their diff bodies.
+/// Landed write paths, newest first. Lifted as paths under the lock so git matching can await.
 pub(crate) fn landed_write_paths<'a>(
     tools: impl Iterator<Item = (&'a ToolCallView, &'a str)>,
 ) -> Vec<String> {
@@ -1444,8 +1864,8 @@ pub(crate) fn landed_write_paths<'a>(
     paths
 }
 
-/// Which enumerated root the given write paths (most-recent-first) landed in.
-pub(crate) fn suggested_root_from_paths(
+/// Longest-root-wins: nested worktrees also sit under main, so first-match would always pick main. Relative paths are ignored.
+pub(crate) fn root_containing_writes(
     paths: &[String],
     roots: &[WorkspaceRootView],
 ) -> Option<String> {
@@ -1469,18 +1889,7 @@ pub(crate) fn suggested_root_from_paths(
         .find_map(|candidate| match_longest_root(candidate, &normalized))
 }
 
-/// Whether this transcript entry represents a file write that actually reached disk.
-///
-/// Two independent signals, because neither is sufficient alone:
-/// - status, which the providers now set correctly (`claude.rs` propagates the worker's
-///   `is_error`; codex has always had a failed status);
-/// - a non-empty diff body, which is what actually proves the write reached disk. The
-///   worker re-reads the file and emits an EMPTY diff for an edit that never landed
-///   (the input-reconstructed fallback is deliberately suppressed for a failed result).
-///
-/// The diff check is kept as the provider-agnostic backstop: it holds even for a
-/// provider that reports no failure status at all, and it is what caught this case
-/// while the Claude path was still settling every result as "completed".
+/// Landed only if status is success and the diff body is non-empty (empty diff = edit never hit disk).
 fn is_landed_file_change(tool: &ToolCallView, status: &str) -> bool {
     if tool.item_type != "fileChange" {
         return false;
@@ -1526,10 +1935,59 @@ pub(crate) fn paths_equivalent(a: &str, b: &str) -> bool {
 }
 
 async fn collect_workspace_diff_in(
-    workspace: &LiveWorkspace,
+    workspace: &TrustedWorkspace,
+) -> Result<WorkspaceDiffResponse, String> {
+    collect_workspace_diff_against(workspace, None).await
+}
+
+/// The merge base of `target` and the workspace's HEAD.
+///
+/// `None` when git cannot answer — an unknown ref, or histories with no common
+/// ancestor. Callers fall back to `HEAD` rather than failing: a task whose MR base
+/// cannot be computed should still show its own uncommitted work.
+pub(crate) async fn merge_base_with(workspace: &TrustedWorkspace, target: &str) -> Option<String> {
+    let output = run_git_capture(workspace, &["merge-base", target, "HEAD"])
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!base.is_empty()).then_some(base)
+}
+
+/// Collect a diff for `workspace` against `base`, defaulting to `HEAD`.
+///
+/// The `base` parameter is what makes an MR view possible without a second diff
+/// pipeline: pass a merge base and you get "everything this branch changed
+/// relative to the target"; pass `None` and you get today's "everything
+/// uncommitted". Either way the result is the same `WorkspaceDiffResponse` the
+/// Changes panel already renders.
+///
+/// Two things NOT to do here, both of which look right:
+/// - `git diff <target>` (two-dot) also reports commits that landed on the target
+///   AFTER the fork, reversed, as though this branch had deleted them.
+/// - `git diff <target>...HEAD` omits uncommitted work, so a mid-run MR view
+///   would quietly under-report what the team has actually touched.
+///
+/// Omitting the second operand — `git diff <merge-base>` — is the form that means
+/// "base .. WORKING TREE", which is what both callers actually want.
+pub(crate) async fn collect_workspace_diff_against(
+    workspace: &TrustedWorkspace,
+    base: Option<&str>,
+) -> Result<WorkspaceDiffResponse, String> {
+    collect_workspace_diff_against_capped(workspace, base, WORKSPACE_DIFF_MAX_BYTES).await
+}
+
+pub(crate) async fn collect_workspace_diff_against_capped(
+    workspace: &TrustedWorkspace,
+    base: Option<&str>,
+    max_bytes: usize,
 ) -> Result<WorkspaceDiffResponse, String> {
     let cwd = workspace.as_str();
     let generated_at = unix_now();
+    let base_commit = base.map(str::to_string);
+    let diff_base = base.unwrap_or("HEAD");
     let inside = run_git_capture(workspace, &["rev-parse", "--is-inside-work-tree"]).await?;
     if !inside.status.success() {
         return Ok(WorkspaceDiffResponse {
@@ -1540,26 +1998,26 @@ async fn collect_workspace_diff_in(
             not_a_git_repo: true,
             // Roots are attached by the caller, which owns the picker's scope rules.
             roots: Vec::new(),
-            suggested_root: None,
-            suggested_root_known: true,
             unavailable: false,
             // Attached by the caller, which owns the fallback decision.
             fallback_from: None,
+            // Attached by the caller, which knows the branch's display name.
+            base_ref: None,
+            base_commit,
             generated_at,
         });
     }
 
-    let tracked = run_git_capture(workspace, &["diff", "--no-color", "HEAD"]).await?;
+    let tracked = run_git_capture(workspace, &["diff", "--no-color", diff_base]).await?;
     if !tracked.status.success() {
         let stderr = String::from_utf8_lossy(&tracked.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            "git diff HEAD failed".to_string()
+            format!("git diff {diff_base} failed")
         } else {
-            format!("git diff HEAD failed: {stderr}")
+            format!("git diff {diff_base} failed: {stderr}")
         });
     }
-    let (tracked_diff, tracked_truncated) =
-        truncate_to_char_boundary(tracked.stdout, WORKSPACE_DIFF_MAX_BYTES);
+    let (tracked_diff, tracked_truncated) = truncate_to_char_boundary(tracked.stdout, max_bytes);
     let mut file_changes = split_unified_diff_by_file(&tracked_diff);
 
     let untracked_listing = run_git_capture(
@@ -1601,34 +2059,53 @@ async fn collect_workspace_diff_in(
 
     Ok(WorkspaceDiffResponse {
         cwd: cwd.to_string(),
-        suggested_root_known: true,
         diff: tracked_diff,
         file_changes,
         truncated: tracked_truncated || untracked_truncated,
         not_a_git_repo: false,
         // Roots are attached by the caller, which owns the picker's scope rules.
         roots: Vec::new(),
-        suggested_root: None,
         unavailable: false,
         // Attached by the caller, which owns the fallback decision.
         fallback_from: None,
+        // Attached by the caller, which knows the branch's display name.
+        base_ref: None,
+        base_commit,
         generated_at,
     })
 }
 
-async fn collect_workspace_diff(cwd: &str) -> Result<WorkspaceDiffResponse, String> {
-    let workspace =
-        LiveWorkspace::from_path(cwd).ok_or_else(|| format!("workspace {cwd} no longer exists"))?;
+/// AUTONOMOUS callers (review rounds, workflow steps) reach this with nobody watching, so
+/// an ungranted tree refuses here instead of running unattended.
+async fn collect_workspace_diff(
+    cwd: &str,
+    grants: &TrustGrants,
+) -> Result<WorkspaceDiffResponse, String> {
+    let workspace = grants
+        .admit(cwd)
+        .await
+        .trusted()
+        .cloned()
+        .ok_or_else(|| format!("{cwd} is not a granted workspace, so it cannot be diffed"))?;
     collect_workspace_diff_in(&workspace).await
 }
 
+/// `status` and `diff` write a stale index back, taking `.git/index.lock` while the agent
+/// in that tree runs `git add`: measured 4 failures in 72 without this, 0 with it.
+pub(super) fn background_git(workspace: &TrustedWorkspace) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(workspace.as_str())
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
 async fn run_git_capture(
-    workspace: &LiveWorkspace,
+    workspace: &TrustedWorkspace,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    Command::new("git")
+    background_git(workspace)
         .args(args)
-        .current_dir(workspace.as_str())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -1649,7 +2126,7 @@ fn truncate_to_char_boundary(mut bytes: Vec<u8>, limit: usize) -> (String, bool)
 }
 
 async fn synthesize_untracked_diff_in(
-    workspace: &LiveWorkspace,
+    workspace: &TrustedWorkspace,
     rel_path: &str,
 ) -> Result<(String, bool), String> {
     use tokio::io::AsyncReadExt;
@@ -1711,8 +2188,8 @@ async fn synthesize_untracked_diff_in(
 
 #[cfg(test)]
 async fn synthesize_untracked_diff(cwd: &str, rel_path: &str) -> Result<(String, bool), String> {
-    let workspace =
-        LiveWorkspace::from_path(cwd).ok_or_else(|| format!("workspace {cwd} no longer exists"))?;
+    let workspace = TrustedWorkspace::granted_for_test(cwd)
+        .ok_or_else(|| format!("workspace {cwd} no longer exists"))?;
     synthesize_untracked_diff_in(&workspace, rel_path).await
 }
 

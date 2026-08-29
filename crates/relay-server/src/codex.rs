@@ -23,7 +23,7 @@ use crate::{
     },
     provider::{
         user_message_transcript_text, ProviderBridge, ProviderForkCapability, ProviderForkRequest,
-        ProviderImage, StartThreadResult, ThreadSyncData,
+        ProviderImage, StartThreadRequest, StartThreadResult, ThreadSyncData,
     },
     state::{ApprovalKind, PendingApproval, RelayState},
 };
@@ -69,16 +69,20 @@ impl ProviderBridge for CodexBridge {
         self.list_models().await
     }
 
-    async fn start_thread(
-        &self,
-        cwd: &str,
-        model: &str,
-        approval_policy: &str,
-        sandbox: &str,
-        _initial_prompt: Option<&str>,
-    ) -> Result<StartThreadResult, String> {
+    /// `system_prompt` is IGNORED. The app-server's `thread/start` takes only
+    /// cwd / model / approvalPolicy / sandbox / personality — there is no
+    /// instruction surface, and `~/.codex/config.toml` is process-global while
+    /// one app-server serves every thread, so it could not be scoped to this one
+    /// anyway. Smuggling the persona in as a user turn is deliberately not done:
+    /// see `StartThreadRequest::system_prompt`.
+    async fn start_thread(&self, request: StartThreadRequest) -> Result<StartThreadResult, String> {
         let thread = self
-            .start_thread(cwd, model, approval_policy, sandbox)
+            .start_thread(
+                &request.cwd,
+                &request.model,
+                &request.approval_policy,
+                &request.sandbox,
+            )
             .await?;
         Ok(StartThreadResult {
             thread,
@@ -111,6 +115,12 @@ impl ProviderBridge for CodexBridge {
     // to replay in `fork_thread` above.
     fn fork_capability(&self) -> ProviderForkCapability {
         ProviderForkCapability::NATIVE_TIP_ONLY
+    }
+
+    // `thread/archive` is a real app-server method: Codex moves the rollout into
+    // `archived_sessions`, so the thread stops coming back from `list_threads`.
+    fn supports_archive(&self) -> bool {
+        true
     }
 
     async fn resume_thread(
@@ -247,7 +257,7 @@ fn summarize_codex_mcp_servers(json: &str) -> Result<Vec<String>, String> {
 // only stops awaiting — without it a genuinely hung CLI keeps running as an
 // orphan. With it, the child is killed and reaped when the future is dropped.
 async fn collect_codex_mcp_lines(binary_name: &str, timeout: Duration) -> Vec<String> {
-    let mut command = Command::new(binary_name);
+    let mut command = Command::new(crate::provider::resolve_binary(binary_name));
     command
         .arg("mcp")
         .arg("list")
@@ -293,7 +303,9 @@ impl CodexBridge {
         display_name: &'static str,
         provider_key: &'static str,
     ) -> Result<Self, String> {
-        let mut command = Command::new(binary_name);
+        // Resolved, not bare — see `provider::resolve_binary`. The error text
+        // below stays bare: it names a command for a human to run.
+        let mut command = Command::new(crate::provider::resolve_binary(binary_name));
         command
             .arg("app-server")
             .stdin(Stdio::piped())
@@ -342,7 +354,6 @@ impl CodexBridge {
         {
             let mut relay = bridge.state.write().await;
             relay.set_provider_connection(provider_key, true);
-            relay.set_provider_name(provider_key.to_string());
             relay.push_log("info", format!("Connected to {display_name} app-server."));
             relay.notify();
         }
@@ -856,6 +867,7 @@ fn codex_turn_start_params_with_images(
 
 fn parse_thread_summary(thread: &Value) -> Result<ThreadSummaryView, String> {
     Ok(ThreadSummaryView {
+        workspace_trusted: false,
         id: string_at(thread, &["id"]).ok_or_else(|| "thread id is missing".to_string())?,
         name: string_at(thread, &["name"]),
         preview: string_at(thread, &["preview"]).unwrap_or_default(),
@@ -1251,6 +1263,7 @@ fn build_tool_call_view(item: &Value, item_type: &str) -> ToolCallView {
         item_type: item_type.to_string(),
         name,
         title,
+        kind: None,
         detail,
         query: preview_string_field(item, "query"),
         path: preview_string_field(item, "path").or_else(|| {
@@ -1317,6 +1330,7 @@ fn build_tool_call_detail_view(item: &Value, item_type: &str) -> ToolCallView {
         item_type: item_type.to_string(),
         name,
         title,
+        kind: None,
         detail,
         query: full_string_field(item, "query"),
         path: full_string_field(item, "path")
@@ -1408,6 +1422,7 @@ pub(crate) fn build_turn_diff_entry_with_fallback(
             item_type: "turnDiff".to_string(),
             name: "File summary".to_string(),
             title: summarize_turn_diff(&paths, agent_label),
+            kind: None,
             detail,
             query: None,
             path: (paths.len() == 1).then(|| paths[0].clone()),

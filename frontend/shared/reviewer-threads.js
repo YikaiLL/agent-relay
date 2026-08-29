@@ -46,19 +46,25 @@ export function reviewerChoiceRequestInit(deleteReviewers) {
   };
 }
 
+// Trailing-slash only: both sides are already relay-normalized; this only gates the offer.
+function sameWorkingTree(a, b) {
+  const trim = (path) => String(path).replace(/\/+$/, "");
+  return trim(a) === trim(b);
+}
+
 /**
- * Reviewer threads (from the session snapshot's `reviewer_threads` map) that can be
- * REUSED for a new review of `parentThreadId` (Phase 3 reuse picker). Filters to the
- * parent; if `provider` is given, keeps entries whose provider matches OR is unknown
- * (`null` after a restart — still offered, the backend re-derives the provider on
- * submit). Sorted newest-first by `updated_at`. Defensive about null/malformed input.
- *
- * @param {Array<{reviewer_thread_id?: string, parent_thread_id?: string, reviewer_provider?: string|null, name?: string|null, updated_at?: number|null}>|null|undefined} reviewerThreads
- * @param {string|null|undefined} parentThreadId
- * @param {string|null|undefined} provider
- * @returns {Array<{reviewerThreadId: string, provider: string|null, label: string}>}
+ * Reviewer threads reusable for a new review of `parentThreadId`.
+ * Filters to the parent; given `provider`, keeps matching or unknown (`null` after restart).
+ * Newest-first. `workspaceCwd` drops reviewers minted in another tree (they cannot relocate).
+ * Omit it while the workspace is still resolving so a missing fact does not empty the list.
+ * Unknown reviewer `cwd` stays on offer; the backend re-checks on submit.
  */
-export function selectReusableReviewers(reviewerThreads, parentThreadId, provider) {
+export function selectReusableReviewers(
+  reviewerThreads,
+  parentThreadId,
+  provider,
+  workspaceCwd = null
+) {
   if (!parentThreadId) {
     return [];
   }
@@ -69,7 +75,8 @@ export function selectReusableReviewers(reviewerThreads, parentThreadId, provide
         entry.parent_thread_id === parentThreadId &&
         (!provider ||
           entry.reviewer_provider == null ||
-          entry.reviewer_provider === provider)
+          entry.reviewer_provider === provider) &&
+        (!workspaceCwd || entry.cwd == null || sameWorkingTree(entry.cwd, workspaceCwd))
     )
     .slice()
     .sort((a, b) => (b?.updated_at || 0) - (a?.updated_at || 0))
@@ -92,9 +99,20 @@ export function selectReusableReviewers(reviewerThreads, parentThreadId, provide
  * @param {{active_thread_id?: string|null, reviewer_threads?: Array}|null|undefined} session
  * @param {string|null|undefined} viewThreadId
  * @param {string|null|undefined} provider
+ * @param {string|null|undefined} workspaceCwd the tree the review will target
  * @returns {Array<{reviewerThreadId: string, provider: string|null, label: string}>}
  */
-export function selectReusableReviewersForView(session, viewThreadId, provider = null) {
+export function selectReusableReviewersForView(
+  session,
+  viewThreadId,
+  provider = null,
+  workspaceCwd = null
+) {
   const viewedThreadId = viewThreadId || session?.active_thread_id || null;
-  return selectReusableReviewers(session?.reviewer_threads, viewedThreadId, provider);
+  return selectReusableReviewers(
+    session?.reviewer_threads,
+    viewedThreadId,
+    provider,
+    workspaceCwd
+  );
 }

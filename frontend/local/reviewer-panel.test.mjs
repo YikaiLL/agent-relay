@@ -336,7 +336,15 @@ test("ReviewerPanel shows round progress + verdict for an iterative review", () 
     })
   );
   assert.match(html, /Round 1\/3/);
-  assert.match(html, /Verdict: needs_changes/);
+  // The verdict is the card's title now, so the visible word drops the "Verdict:" prefix
+  // that its own position already implies — but the prefix stays for screen readers, and
+  // the underscore is humanised for display only.
+  assert.match(html, /reviewer-job-verdict-label[^>]*>needs changes</);
+  assert.match(html, /sr-only[^>]*>Verdict: </);
+  // Tone rides a class, and the colour lands on the MARK rather than the word: dark
+  // --ok-fg is a passing mark (3.86:1) but a failing 4.5:1 word on this surface.
+  assert.match(html, /reviewer-job-verdict reviewer-job-verdict-warn/);
+  assert.match(html, /reviewer-job-verdict-mark/);
 });
 
 test("ReviewerPanel hides round/verdict for a single-shot review", () => {
@@ -588,4 +596,87 @@ test("an in-progress card has no Re-review launcher (only terminal cards can re-
   );
   assert.doesNotMatch(html, /Re-review/);
   assert.doesNotMatch(html, /-recard-r2"/);
+});
+
+// The request dialog leads with the working tree it will review; it is a control, not a caption.
+
+const RESOLVED_WORKSPACE = {
+  cwd: "/repo/.worktrees/feature",
+  origin: { kind: "proven" },
+  git: {
+    cwd: "/repo/.worktrees/feature",
+    is_repo: true,
+    branch: "feature",
+    detached: false,
+    dirty: true,
+  },
+  roots: [
+    { path: "/repo", branch: "main", is_main: true },
+    { path: "/repo/.worktrees/feature", branch: "feature", is_main: false },
+  ],
+  birth_cwd: "/repo",
+  birth_cwd_exists: true,
+};
+
+test("the review dialog names the working tree it will review, and lets you re-point it", () => {
+  const html = renderToStaticMarkup(
+    h(ReviewerPanel, {
+      reviewModel: {
+        providerOptions: [{ label: "Codex", value: "codex" }],
+        models: [],
+        defaultProvider: "codex",
+      },
+      canRequest: true,
+      panelId: "review-panel-test",
+      workspace: RESOLVED_WORKSPACE,
+      onPinWorkspace() {},
+      onRequestReview() {},
+    })
+  );
+  assert.match(html, /Working tree to review/, "the dialog says what it is about to read");
+  assert.match(html, /\/repo\/\.worktrees\/feature/, "and names it");
+  assert.match(html, /feature · changes/, "with that tree's live git standing");
+  assert.match(html, /workspace-picker-trigger/, "as a control, not a caption");
+});
+
+// A prefill bound to another tree would be refused; the dialog must not sit on it silently.
+test("a Re-review prefill that is not on offer falls back to a clean reviewer, and says why", () => {
+  const html = renderToStaticMarkup(
+    h(ReviewerPanel, {
+      reviewJobs: [
+        {
+          id: "r9",
+          reviewer_provider: "codex",
+          status: "complete",
+          reviewer_thread_id: "rev-in-main",
+        },
+      ],
+      reviewModel: {
+        providerOptions: [{ label: "Codex", value: "codex" }],
+        models: [],
+        defaultProvider: "codex",
+      },
+      // Filtered upstream to the tree under review.
+      reusableReviewers: [
+        { reviewerThreadId: "rev-in-worktree", provider: "codex", label: "Worktree reviewer" },
+      ],
+      canRequest: true,
+      panelId: "review-panel-test",
+      workspace: RESOLVED_WORKSPACE,
+      onRequestReview() {},
+    })
+  );
+  const dialogStart = html.indexOf('id="review-panel-test-recard-r9"');
+  assert.ok(dialogStart > -1, "the per-card dialog should render");
+  const dialog = html.slice(dialogStart, html.indexOf("</dialog>", dialogStart));
+  // The reuse select must land on a real option, not a blank that still submits the refused id.
+  assert.match(
+    dialog,
+    /<option value="clean" selected="">/,
+    "an unofferable prefill must resolve to the clean reviewer, not to no selection"
+  );
+  assert.doesNotMatch(dialog, /value="rev-in-main"/, "and never to the cross-tree reviewer");
+  // (the apostrophe arrives HTML-escaped, so match the half that carries the meaning)
+  assert.match(html, /review this working tree/, "and the dialog says why it changed");
+  assert.match(html, /starts a clean one/);
 });

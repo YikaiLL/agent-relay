@@ -19,6 +19,7 @@ import { providerLabel } from "./provider-labels.js";
 // rather than borrowing another vendor's logo, which would mislabel the session
 // — same rule the transcript avatar and the session tab follow.
 import { providerMark } from "./provider-mark.js";
+import { ProjectTagIcon, WorkspaceFolderIcon } from "./panel-icons.js";
 import { selectThreadDot } from "./thread-dot.js";
 
 const h = React.createElement;
@@ -138,10 +139,12 @@ export function ThreadGroupList({
   threadAttention = null,
   threadReviewing = null,
 }) {
-  if (!groups.length) {
-    return h("p", { className: "sidebar-empty" }, emptyMessage);
-  }
-
+  // Every hook runs before the empty-list early return below. The sidebar goes from no
+  // groups to groups on every cold load, and an early return ABOVE these made React see
+  // zero hooks on one render and two on the next — corrupting its hook bookkeeping
+  // ("Expected static flag was missing") rather than failing loudly. Both hooks are
+  // safe to run with an empty list: `createThreadListRows` returns [], and the
+  // virtualizer is built for `count: 0` with a ref that never attaches.
   const normalizedSelectedCwd = canonicalizeWorkspace(selectedCwd);
   const rows = useMemo(
     () =>
@@ -157,6 +160,10 @@ export function ThreadGroupList({
   );
   const virtualizer = useThreadListVirtualizer(rows);
   const virtualRows = virtualizer.getVirtualItems();
+
+  if (!groups.length) {
+    return h("p", { className: "sidebar-empty" }, emptyMessage);
+  }
 
   return h(
     "div",
@@ -396,6 +403,34 @@ function measureScrollMargin(node, scrollElement) {
   return rootRect.top - scrollRect.top + scrollElement.scrollTop;
 }
 
+// The header's leading mark: a tag for a project, a folder for a working
+// directory. Both kinds used to render the same CSS-drawn folder, which made
+// them indistinguishable in a column that shows them side by side — and the
+// folder was wrong for a project, which is deliberately not bound to a cwd.
+//
+// The kind is read from the GROUP, not from whichever branch below happens to
+// render it. A pinned project carries a projectId but no rename/delete handlers,
+// so it falls through to the generic collapsible branch — and that is the case
+// actually on screen, since both surfaces group by cwd today and lift one
+// project to the top. Anything keyed on the branch (a CSS rule on
+// `.thread-group-header-project`, say) gets exactly that row wrong.
+//
+// `projectId: null` is the Unassigned bucket — the absence of a project — so it
+// takes the folder rather than claiming to be one.
+//
+// No workspace-trust marker here, and that is a decision rather than an omission. This
+// header is passive — it renders because sessions exist, not because anyone asked about
+// the folder — and an ungranted folder is the ordinary case that blocks nothing. A tag on
+// most rows forever is a tag people stop reading, and it would spend the attention the
+// in-context offer needs. `thread-groups.js` withholds the flag for the same reason.
+function groupIcon(group) {
+  return h(
+    "span",
+    { "aria-hidden": "true", className: "thread-group-icon" },
+    h(group.projectId ? ProjectTagIcon : WorkspaceFolderIcon)
+  );
+}
+
 // Exported for unit tests: the list itself virtualizes and renders nothing
 // under SSR, so the sentinel guard below cannot be observed through it.
 export function ThreadGroupHeader({
@@ -454,7 +489,7 @@ export function ThreadGroupHeader({
             }
           : undefined,
       },
-      h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
+      groupIcon(group),
       // Still a real <button> so the row's action is keyboard-reachable — the
       // header itself is a <div> (it hosts the action <button>s) and cannot be
       // one. stopPropagation keeps it from ALSO firing the row handler, which
@@ -562,7 +597,7 @@ export function ThreadGroupHeader({
         // "Needs input" is not a directory, and absent renders exactly as before.
         "data-group-kind": group.state ? "state" : undefined,
       },
-      h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
+      groupIcon(group),
       selectable
         ? h(
             "button",
@@ -601,7 +636,7 @@ export function ThreadGroupHeader({
         title: headerTitle,
         type: "button",
       },
-      h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
+      groupIcon(group),
       h("span", { className: "thread-group-name" }, group.label)
     );
   }
@@ -612,7 +647,7 @@ export function ThreadGroupHeader({
       className: "thread-group-header thread-group-header-static",
       title: headerTitle,
     },
-    h("span", { "aria-hidden": "true", className: "thread-group-icon" }),
+    groupIcon(group),
     h("span", { className: "thread-group-name" }, group.label)
   );
 }

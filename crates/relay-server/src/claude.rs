@@ -26,7 +26,8 @@ use crate::{
     },
     provider::{
         user_message_transcript_text, ProviderBridge, ProviderForkCapability, ProviderForkRequest,
-        ProviderImage, StartThreadResult, ThreadSyncData, ThreadTranscriptPageData,
+        ProviderImage, StartThreadRequest, StartThreadResult, ThreadSyncData,
+        ThreadTranscriptPageData,
     },
     state::{
         BrokerPendingMessage, PendingApproval, PendingTranscriptDelta, RelayState,
@@ -43,6 +44,11 @@ type PendingResponses = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, 
 
 const CLAUDE_REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// The relay provider key for this bridge — the same string
+/// `ClaudeCodeBridge::provider_name` returns and `DEFAULT_PROVIDERS` registers.
+/// Ledger rows are grouped by it, so it must not drift from either.
+const CLAUDE_PROVIDER_KEY: &str = "claude_code";
+
 /// Configuration captured when a Claude session is created without an initial
 /// prompt. The SDK only assigns a `session_id` after it sees the first user
 /// message, so we cannot call the worker yet — we hand back a synthetic
@@ -53,6 +59,10 @@ struct PendingClaudeConfig {
     cwd: String,
     model: String,
     permission_mode: String,
+    /// Carried across deferred start (no initial prompt until first turn).
+    system_prompt: Option<String>,
+    /// Same: Orchestrator opens with no prompt but needs tools on first send.
+    orchestrator_tools: Option<String>,
 }
 
 /// Bridges the relay to Claude Code via a Node.js worker process that wraps the
@@ -79,6 +89,77 @@ pub struct ClaudeCodeBridge {
     /// only — never persisted, so it is re-warmed on every restart (no stale
     /// catalog surviving across versions).
     cached_models: Arc<RwLock<Option<Vec<ModelOptionView>>>>,
+    /// Kept so the Orchestrator's MCP bridge resolves beside the worker that is
+    /// actually running, not beside the one the default path would guess.
+    worker_path: String,
+}
+
+/// Attach Orchestrator MCP tools and persona when this thread is the pin.
+/// On every options-bearing command — omitting either on `send` rebuilds the
+/// session without tools (second message falls back to Bash) or without the
+/// secretary persona (second message falls back to a coding assistant).
+async fn attach_orchestrator_session(
+    state: &Arc<RwLock<RelayState>>,
+    worker_path: &str,
+    thread_id: &str,
+    cmd: &mut Value,
+) {
+    let options = {
+        let relay = state.read().await;
+        relay.orchestrator_session_options(thread_id)
+    };
+    let Some((device_id, system_prompt)) = options else {
+        return;
+    };
+    cmd["mcpServers"] = orchestrator_mcp_config(worker_path, &device_id);
+    cmd["allowedTools"] = orchestrator_allowed_tools();
+    cmd["tools"] = Value::Array(Vec::new());
+    if let Some(prompt) = system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        cmd["systemPrompt"] = Value::String(prompt.to_string());
+    }
+}
+
+/// Auto-allow MCP tools (`acceptEdits` does not).
+fn orchestrator_allowed_tools() -> Value {
+    Value::Array(
+        crate::orchestrator_tools::TOOLS
+            .iter()
+            .map(|tool| Value::String(format!("mcp__sealwire__{}", tool.name)))
+            .collect(),
+    )
+}
+
+/// Stdio MCP config beside `worker.mjs` (follows `CLAUDE_WORKER_PATH`).
+fn orchestrator_mcp_config(worker_path: &str, device_id: &str) -> Value {
+    let bridge = std::path::Path::new(worker_path)
+        .parent()
+        .map(|dir| dir.join("orchestrator-mcp.mjs").display().to_string())
+        .unwrap_or_else(|| "claude-worker/orchestrator-mcp.mjs".to_string());
+    let mut env = json!({
+        "SEALWIRE_DEVICE_ID": device_id,
+        "SEALWIRE_RELAY_URL": std::env::var("SEALWIRE_RELAY_URL").unwrap_or_else(|_| {
+            let port = std::env::var("PORT").unwrap_or_else(|_| "8787".to_string());
+            format!("http://127.0.0.1:{port}")
+        }),
+    });
+    // Only when the API is actually token-gated.
+    if let Ok(token) = std::env::var("RELAY_API_TOKEN") {
+        if !token.is_empty() {
+            env["RELAY_API_TOKEN"] = Value::String(token);
+        }
+    }
+    json!({
+        "sealwire": {
+            "type": "stdio",
+            "command": std::env::var("CLAUDE_NODE_BINARY").unwrap_or_else(|_| "node".to_string()),
+            "args": [bridge],
+            "env": env,
+        }
+    })
 }
 
 impl ClaudeCodeBridge {
@@ -147,12 +228,12 @@ impl ClaudeCodeBridge {
             pending_threads: Arc::new(Mutex::new(HashMap::new())),
             promoted_thread_ids: Arc::new(Mutex::new(HashMap::new())),
             cached_models: Arc::new(RwLock::new(None)),
+            worker_path: worker_path.to_string(),
         };
 
         {
             let mut relay = bridge.state.write().await;
             relay.set_provider_connection("claude_code", true);
-            relay.set_provider_name("claude_code".to_string());
             relay.push_log("info", "Claude Code worker connected.");
             relay.notify();
         }
@@ -310,18 +391,23 @@ impl ProviderBridge for ClaudeCodeBridge {
         Ok(models)
     }
 
-    async fn start_thread(
-        &self,
-        cwd: &str,
-        model: &str,
-        _approval_policy: &str,
-        _sandbox: &str,
-        initial_prompt: Option<&str>,
-    ) -> Result<StartThreadResult, String> {
-        let initial_prompt = initial_prompt
+    /// The one bridge that can honour `system_prompt`: the SDK takes a real
+    /// `systemPrompt`, so the persona reaches the model without becoming a turn.
+    async fn start_thread(&self, request: StartThreadRequest) -> Result<StartThreadResult, String> {
+        let cwd = request.cwd.as_str();
+        let model = request.model.as_str();
+        let initial_prompt = request
+            .initial_prompt
+            .as_deref()
             .map(str::trim)
             .filter(|prompt| !prompt.is_empty());
-        let permission_mode = claude_permission_mode(_approval_policy, _sandbox);
+        let system_prompt = request
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .map(str::to_string);
+        let permission_mode = claude_permission_mode(&request.approval_policy, &request.sandbox);
 
         // Deferred start: with no prompt the SDK cannot give us a session_id yet
         // (it is only emitted after the first user message). Hand back a
@@ -335,9 +421,12 @@ impl ProviderBridge for ClaudeCodeBridge {
                     cwd: cwd.to_string(),
                     model: model.to_string(),
                     permission_mode: permission_mode.to_string(),
+                    system_prompt: system_prompt.clone(),
+                    orchestrator_tools: request.orchestrator_tools.clone(),
                 },
             );
             let thread = ThreadSummaryView {
+                workspace_trusted: false,
                 id: pending_id,
                 name: None,
                 preview: String::new(),
@@ -366,6 +455,16 @@ impl ProviderBridge for ClaudeCodeBridge {
         });
         if let Some(prompt) = initial_prompt {
             cmd["prompt"] = Value::String(prompt.to_string());
+        }
+        if let Some(prompt) = system_prompt.as_deref() {
+            cmd["systemPrompt"] = Value::String(prompt.to_string());
+        }
+        if let Some(device_id) = request.orchestrator_tools.as_deref() {
+            cmd["mcpServers"] = orchestrator_mcp_config(&self.worker_path, device_id);
+            cmd["allowedTools"] = orchestrator_allowed_tools();
+            // No built-ins. A secretary with Bash is a coding agent that has been
+            // asked nicely not to be one.
+            cmd["tools"] = Value::Array(Vec::new());
         }
         let result = self.send_request("start", cmd).await?;
         let thread = parse_thread_summary(value_at(&result, &["thread"]).unwrap_or(&Value::Null))?;
@@ -435,6 +534,7 @@ impl ProviderBridge for ClaudeCodeBridge {
         // immediately `read_thread`s the fork for its real preview/name, and
         // stamps `forked_from` itself.
         let thread = ThreadSummaryView {
+            workspace_trusted: false,
             id: forked_session_id,
             name: None,
             preview: String::new(),
@@ -483,6 +583,7 @@ impl ProviderBridge for ClaudeCodeBridge {
                 object.insert("cwd".to_string(), Value::String(cwd));
             }
         }
+        attach_orchestrator_session(&self.state, &self.worker_path, thread_id, &mut cmd).await;
         self.send_request("resume", cmd).await?;
         Ok(())
     }
@@ -493,6 +594,7 @@ impl ProviderBridge for ClaudeCodeBridge {
             let cwd = self.cwd_for_thread(thread_id).await.unwrap_or_default();
             return Ok(ThreadSyncData {
                 thread: ThreadSummaryView {
+                    workspace_trusted: false,
                     id: thread_id.to_string(),
                     name: None,
                     preview: String::new(),
@@ -681,7 +783,7 @@ impl ProviderBridge for ClaudeCodeBridge {
             );
             let user_message_uuid = new_user_message_uuid();
             let user_item_id = format!("user:{user_message_uuid}");
-            let cmd = json!({
+            let mut cmd = json!({
                 "type": "start",
                 "cwd": config.cwd,
                 "model": config.model,
@@ -693,6 +795,20 @@ impl ProviderBridge for ClaudeCodeBridge {
                 "user_item_id": user_item_id,
                 "user_message_uuid": user_message_uuid,
             });
+            // The persona was set when the thread was created; this deferred
+            // `start` is the first time a worker session actually exists to
+            // receive it.
+            if let Some(prompt) = config.system_prompt.as_deref() {
+                cmd["systemPrompt"] = Value::String(prompt.to_string());
+            }
+            if let Some(device_id) = config.orchestrator_tools.as_deref() {
+                cmd["mcpServers"] = orchestrator_mcp_config(&self.worker_path, device_id);
+                cmd["allowedTools"] = orchestrator_allowed_tools();
+                cmd["tools"] = Value::Array(Vec::new());
+            } else {
+                attach_orchestrator_session(&self.state, &self.worker_path, thread_id, &mut cmd)
+                    .await;
+            }
             let result = match self.send_request("start", cmd).await {
                 Ok(result) => result,
                 Err(error) => {
@@ -768,6 +884,7 @@ impl ProviderBridge for ClaudeCodeBridge {
             "model": _model,
             "permissionMode": permission_mode,
         });
+        attach_orchestrator_session(&self.state, &self.worker_path, thread_id, &mut cmd).await;
         if let Some(cwd) = cwd {
             if let Some(object) = cmd.as_object_mut() {
                 object.insert("cwd".to_string(), Value::String(cwd));
@@ -1074,6 +1191,7 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                 payload_cwd.unwrap_or_default().to_string()
             };
             relay.upsert_thread(ThreadSummaryView {
+                workspace_trusted: false,
                 id: thread_id,
                 name: None,
                 preview: String::new(),
@@ -1087,6 +1205,27 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                 renamed: false,
             });
             relay.notify();
+        }
+
+        "cwd_changed" => {
+            let thread_id = event_thread_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .or_else(|| {
+                    payload
+                        .get("pending_thread_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                });
+            if let (Some(thread_id), Some(cwd)) = (
+                thread_id,
+                payload
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| !cwd.is_empty()),
+            ) {
+                relay.observe_thread_cwd(thread_id, cwd);
+            }
         }
 
         "user_message" => {
@@ -1197,6 +1336,7 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                         item_type: "toolCall".to_string(),
                         name: name.to_string(),
                         title: name.to_string(),
+                        kind: None,
                         detail: None,
                         query: None,
                         path: None,
@@ -1255,6 +1395,7 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                         item_type: String::new(),
                         name: String::new(),
                         title: String::new(),
+                        kind: None,
                         detail: None,
                         query: None,
                         path: None,
@@ -1462,6 +1603,14 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
         "done" | "session_stopped" => {
             let stopped_explicitly = event_type == "session_stopped";
             let event_turn_id = string_at(&payload, &["turn_id"]);
+
+            // The worker has always forwarded `usage` here; this arm read
+            // `turn_id` and dropped the rest on the floor. Bill it before the
+            // routing match below, which returns early on several paths — a
+            // turn that failed still spent its tokens, and a stale completion
+            // still describes real work the provider performed.
+            record_claude_turn_usage(&mut relay, &payload, event_thread_id.as_deref());
+
             match claude_thread_route(&relay, event_thread_id.as_deref()) {
                 ClaudeThreadRoute::Active => {
                     let tid = relay.active_thread_id.clone().unwrap_or_default();
@@ -1645,6 +1794,96 @@ fn claude_failed_turn_reason(payload: &Value) -> Option<String> {
 /// upserts (never duplicates) the same entry.
 fn claude_turn_error_item_id(turn_id: Option<&str>) -> String {
     format!("turn-error:{}", turn_id.unwrap_or("unknown"))
+}
+
+/// Bill the tokens a finished Claude turn reported.
+///
+/// The worker forwards three things from the SDK's `result` message:
+///
+/// - `usage` — the turn's totals, already per-turn (the SDK accumulates it), so
+///   unlike Codex there is nothing to difference.
+/// - `model_usage` — the same spend split BY MODEL. A single turn can span
+///   several: a subagent on a cheaper model, a fallback after a refusal. When
+///   present it is strictly better than `usage`, because a report keyed on the
+///   thread's configured model would attribute a Haiku subagent's tokens to
+///   Opus.
+/// - `total_cost_usd` — the provider's own figure. Only meaningful on API-key
+///   billing; on a subscription it is a notional price, but it is *their*
+///   notional price, which is still better than a local price table.
+///
+/// Cost is attached to the whole turn, so when splitting by model it is
+/// attributed to the row with the most tokens rather than divided — a split
+/// would invent per-model prices the provider never quoted.
+fn record_claude_turn_usage(
+    relay: &mut RelayState,
+    payload: &serde_json::Value,
+    event_thread_id: Option<&str>,
+) {
+    let thread_id = event_thread_id
+        .map(str::to_string)
+        .or_else(|| relay.active_thread_id.clone())
+        .unwrap_or_default();
+    if thread_id.is_empty() {
+        return;
+    }
+    let turn_id = string_at(payload, &["turn_id"]);
+    let cost_usd = payload
+        .get("total_cost_usd")
+        .and_then(serde_json::Value::as_f64);
+    // The worker sets this on a turn that errored. A failed turn still spent
+    // its tokens, so it is billed — and flagged, so the report can separate
+    // work from waste.
+    let failed = payload
+        .get("failed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let per_model: Vec<(String, crate::usage::TokenUsage)> = payload
+        .get("model_usage")
+        .and_then(serde_json::Value::as_object)
+        .map(|models| {
+            models
+                .iter()
+                .map(|(model, value)| (model.clone(), crate::usage::claude_model_usage(value)))
+                .filter(|(_, usage)| !usage.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !per_model.is_empty() {
+        let costliest = per_model
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (_, usage))| usage.total)
+            .map(|(index, _)| index);
+        for (index, (model, usage)) in per_model.into_iter().enumerate() {
+            relay.record_token_usage(
+                &thread_id,
+                turn_id.clone(),
+                CLAUDE_PROVIDER_KEY,
+                usage,
+                (Some(index) == costliest).then_some(cost_usd).flatten(),
+                None,
+                Some(model),
+                failed,
+            );
+        }
+        return;
+    }
+
+    let Some(usage) = payload.get("usage").map(crate::usage::claude_turn_usage) else {
+        return;
+    };
+    relay.record_token_usage(
+        &thread_id,
+        turn_id,
+        CLAUDE_PROVIDER_KEY,
+        usage,
+        cost_usd,
+        None,
+        None,
+        failed,
+    );
 }
 
 fn completion_matches_turn(active_turn_id: Option<&str>, event_turn_id: Option<&str>) -> bool {
@@ -1980,6 +2219,7 @@ mod tests {
 
     fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
         ThreadSummaryView {
+            workspace_trusted: false,
             id: id.to_string(),
             name: None,
             preview: String::new(),
@@ -2218,6 +2458,114 @@ mod tests {
         );
     }
 
+    async fn pin_orchestrator_thread(state: &Arc<RwLock<RelayState>>, thread_id: &str, cwd: &str) {
+        let mut relay = state.write().await;
+        relay.test_set_orchestrator_pin(thread_id, "device-orch", "You are the Orchestrator.");
+        relay.upsert_thread(test_thread(thread_id, cwd));
+    }
+
+    async fn wait_for_worker_log_count(
+        state: &Arc<RwLock<RelayState>>,
+        needles: &[&str],
+        min_count: usize,
+        timeout_secs: u64,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if count_worker_logs_containing_all(state, needles).await >= min_count {
+                return true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_send_carries_system_prompt_on_every_turn() {
+        let Some((bridge, state)) = spawn_fake_bridge().await else {
+            return;
+        };
+        pin_orchestrator_thread(&state, "orch-sess", "/tmp/orch").await;
+
+        bridge
+            .start_turn("orch-sess", "hello", "claude-sonnet-4-6", "high", &[])
+            .await
+            .expect("first orchestrator turn");
+        assert!(
+            wait_for_log(
+                &state,
+                "type=send permissionMode=default model=claude-sonnet-4-6 session=orch-sess",
+                5,
+            )
+            .await
+                && wait_for_log(&state, "systemPrompt=yes", 5).await,
+            "the first orchestrator send must carry the secretary persona",
+        );
+        let after_first = count_worker_logs_containing_all(
+            &state,
+            &["type=send", "session=orch-sess", "systemPrompt=yes"],
+        )
+        .await;
+        assert_eq!(
+            after_first, 1,
+            "expected exactly one persona-bearing send after the first turn",
+        );
+
+        bridge
+            .start_turn("orch-sess", "again", "claude-sonnet-4-6", "high", &[])
+            .await
+            .expect("second orchestrator turn");
+        assert!(
+            wait_for_worker_log_count(
+                &state,
+                &["type=send", "session=orch-sess", "systemPrompt=yes"],
+                2,
+                5,
+            )
+            .await,
+            "later orchestrator sends must re-send the persona, not drop it",
+        );
+    }
+
+    async fn count_worker_logs_containing_all(
+        state: &Arc<RwLock<RelayState>>,
+        needles: &[&str],
+    ) -> usize {
+        state
+            .read()
+            .await
+            .snapshot()
+            .logs
+            .iter()
+            .filter(|log| needles.iter().all(|needle| log.message.contains(needle)))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn orchestrator_resume_carries_system_prompt_after_worker_cold_start() {
+        let Some((bridge, state)) = spawn_fake_bridge().await else {
+            return;
+        };
+        pin_orchestrator_thread(&state, "orch-resume", "/tmp/orch").await;
+
+        bridge
+            .resume_thread("orch-resume", "never", "workspace-write")
+            .await
+            .expect("orchestrator resume");
+        assert!(
+            wait_for_log(
+                &state,
+                "type=resume permissionMode=acceptEdits model=- session=orch-resume",
+                5,
+            )
+            .await
+                && wait_for_log(&state, "systemPrompt=yes", 5).await,
+            "orchestrator resume must reattach persona for a cold worker session",
+        );
+    }
+
     #[tokio::test]
     async fn deferred_start_promotes_with_its_permission_mode() {
         // A thread started without a prompt promotes on the first turn via a
@@ -2227,13 +2575,12 @@ mod tests {
         };
 
         let result = bridge
-            .start_thread(
+            .start_thread(StartThreadRequest::new(
                 "/tmp/d",
                 "claude-sonnet-4-6",
                 "bypass",
                 "workspace-write",
-                None,
-            )
+            ))
             .await
             .expect("deferred start");
         let pending_id = result.thread.id.clone();
@@ -2305,6 +2652,7 @@ mod tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("claude_code".to_string()),
+                project_id: None,
             })
             .await
             .expect("deferred start should succeed");
@@ -2349,6 +2697,7 @@ mod tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("claude_code".to_string()),
+                project_id: None,
             })
             .await
             .expect("second deferred start should succeed");
@@ -2433,6 +2782,7 @@ mod tests {
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("claude_code".to_string()),
+                project_id: None,
             })
             .await
             .expect("deferred start should succeed");
@@ -2615,6 +2965,37 @@ mod tests {
         );
     }
 
+    /// The seam bug this caught: both halves were tested and neither was wired.
+    /// The bridge forwards `SEALWIRE_DEVICE_ID` (its own test proves it) and every
+    /// relay op calls `require_device_id`, which REJECTS `None` — so a config that
+    /// omits it yields a toolset where every single call fails "device_id is
+    /// required", with nothing in either unit suite to say so.
+    #[test]
+    fn the_orchestrator_mcp_config_carries_an_identity_to_act_as() {
+        let config = orchestrator_mcp_config("/tmp/claude-worker/worker.mjs", "device-1");
+        let env = &config["sealwire"]["env"];
+        assert_eq!(
+            env["SEALWIRE_DEVICE_ID"], "device-1",
+            "without this every tool call is refused: {config}"
+        );
+        assert!(env["SEALWIRE_RELAY_URL"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://"));
+    }
+
+    /// The bridge must resolve beside the worker that is actually running, not
+    /// beside the one a default path would guess — a custom `CLAUDE_WORKER_PATH`
+    /// (which the integration tests use) would otherwise point at another tree.
+    #[test]
+    fn the_mcp_bridge_resolves_beside_its_worker() {
+        let config = orchestrator_mcp_config("/custom/tree/claude-worker/worker.mjs", "d");
+        assert_eq!(
+            config["sealwire"]["args"][0],
+            "/custom/tree/claude-worker/orchestrator-mcp.mjs"
+        );
+    }
+
     #[tokio::test]
     async fn start_thread_with_prompt_sends_start_and_returns_a_thread() {
         let Some((bridge, state)) = spawn_fake_bridge().await else {
@@ -2623,11 +3004,8 @@ mod tests {
 
         let result = bridge
             .start_thread(
-                "/tmp/z",
-                "claude-sonnet-4-6",
-                "bypass",
-                "workspace-write",
-                Some("hi there"),
+                StartThreadRequest::new("/tmp/z", "claude-sonnet-4-6", "bypass", "workspace-write")
+                    .with_initial_prompt(Some("hi there")),
             )
             .await
             .expect("start_thread with prompt");
@@ -2921,6 +3299,7 @@ mod tests {
                     item_type: "fileChange".to_string(),
                     name: "Edit".to_string(),
                     title: "Edit".to_string(),
+                    kind: None,
                     detail: None,
                     query: None,
                     path: Some(path.to_string()),
@@ -3240,6 +3619,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cwd_changed_records_proven_without_clobbering_birth_cwd() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            json!({
+                "type": "cwd_changed",
+                "provider_session_id": "thread-b",
+                "cwd": "/tmp/worktree"
+            }),
+            &state,
+        )
+        .await;
+
+        let relay = state.read().await;
+        assert_eq!(
+            relay.thread_workspace("thread-b").proven.as_deref(),
+            Some("/tmp/worktree"),
+            "a reported cwd is where this session is, even with no file writes"
+        );
+        assert_eq!(
+            relay.thread_cwd("thread-b").as_deref(),
+            Some("/tmp/b"),
+            "birth cwd stays the directory the thread was created in"
+        );
+        assert_eq!(
+            relay.current_cwd, "/tmp/b",
+            "observation must not clobber the relay-wide cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_changed_accepts_pending_thread_id_before_the_sdk_session_id() {
+        let state = test_relay_with_active_b().await;
+
+        handle_worker_event(
+            json!({
+                "type": "cwd_changed",
+                "pending_thread_id": "thread-b",
+                "cwd": "/tmp/worktree"
+            }),
+            &state,
+        )
+        .await;
+
+        let relay = state.read().await;
+        assert_eq!(
+            relay.thread_workspace("thread-b").proven.as_deref(),
+            Some("/tmp/worktree"),
+            "the first cwd hook can fire before Claude has a real session id"
+        );
+    }
+
+    // Worker contract: tool_call_requested → tool_call_result → cwd_changed.
+    // PostToolUse is deferred until after the completed write is published, so the
+    // observation clock outranks that write's seq.
+    #[tokio::test]
+    async fn post_tool_cwd_after_a_completed_write_keeps_the_observed_tree() {
+        let state = test_relay_with_active_b().await;
+        handle_worker_event(pending_file_change("write-b", "/tmp/other/file.rs"), &state).await;
+        handle_worker_event(
+            file_change_result(
+                "write-b",
+                "/tmp/other/file.rs",
+                "--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                false,
+            ),
+            &state,
+        )
+        .await;
+        handle_worker_event(
+            json!({
+                "type": "cwd_changed",
+                "provider_session_id": "thread-b",
+                "cwd": "/tmp/b"
+            }),
+            &state,
+        )
+        .await;
+
+        let relay = state.read().await;
+        assert_eq!(
+            relay.thread_workspace("thread-b").proven.as_deref(),
+            Some("/tmp/b"),
+            "the PostToolUse cwd must win over the write it followed"
+        );
+        let write_seq = relay
+            .runtime_for_thread("thread-b")
+            .and_then(|runtime| {
+                runtime
+                    .transcript
+                    .iter()
+                    .find(|entry| entry.item_id == "tool:write-b")
+                    .and_then(|entry| entry.seq)
+            })
+            .expect("completed write should have a seq");
+        let proven_at = relay
+            .thread_workspace("thread-b")
+            .proven_at
+            .expect("observation should mint a clock");
+        assert!(
+            proven_at > write_seq,
+            "observation clock {proven_at} must be newer than write seq {write_seq}"
+        );
+    }
+
+    #[tokio::test]
     async fn background_claude_session_started_does_not_steal_active_provider() {
         let (tx, _) = tokio::sync::watch::channel(0);
         let state = Arc::new(RwLock::new(RelayState::new(
@@ -3252,6 +3737,7 @@ mod tests {
             relay.set_provider_name("codex".to_string());
             relay.activate_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "codex-thread".to_string(),
                     name: None,
                     preview: String::new(),
@@ -4319,11 +4805,8 @@ mod tests {
         let prompt_a = "Do not use tools or commands. Write exactly 160 numbered lines. Every line must contain AGENT_RELAY_CONCURRENCY_A and its line number. No markdown, no summary.";
         let start_a = match bridge
             .start_thread(
-                "/tmp",
-                "claude-sonnet-4-6",
-                "never",
-                "workspace-write",
-                Some(prompt_a),
+                StartThreadRequest::new("/tmp", "claude-sonnet-4-6", "never", "workspace-write")
+                    .with_initial_prompt(Some(prompt_a)),
             )
             .await
         {
@@ -4340,11 +4823,8 @@ mod tests {
         let prompt_b = "Do not use tools or commands. Write exactly 160 numbered lines. Every line must contain AGENT_RELAY_CONCURRENCY_B and its line number. No markdown, no summary.";
         let start_b = match bridge
             .start_thread(
-                "/tmp",
-                "claude-sonnet-4-6",
-                "never",
-                "workspace-write",
-                Some(prompt_b),
+                StartThreadRequest::new("/tmp", "claude-sonnet-4-6", "never", "workspace-write")
+                    .with_initial_prompt(Some(prompt_b)),
             )
             .await
         {

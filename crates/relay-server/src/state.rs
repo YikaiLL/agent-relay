@@ -1,9 +1,9 @@
-mod app;
+pub(crate) mod app;
 mod persistence;
 mod relay;
 mod review;
 mod security;
-mod task_list;
+mod team;
 #[cfg(test)]
 mod tests;
 mod workflow;
@@ -15,6 +15,7 @@ use std::{
 };
 
 pub(crate) use self::app::BrokerTarget;
+pub(crate) use self::app::ThreadWorkspaceError;
 pub(crate) use self::app::REVIEW_LOCKED_THREAD_MSG;
 pub use self::app::{AppState, ApprovalError, AskUserAnswerError};
 #[cfg(test)]
@@ -40,11 +41,15 @@ pub(crate) use self::review::{
 // a live path isn't wired up yet, so keep the re-export without an unused-import
 // warning in non-test builds.
 #[allow(unused_imports)]
+pub(crate) use self::app::team::TeamAction2;
+#[allow(unused_imports)]
 pub(crate) use self::review::Verdict;
 pub(crate) use self::security::SecurityProfile;
 #[allow(unused_imports)]
-pub(crate) use self::task_list::{
-    CheckpointMode, EscalatePolicy, TaskItem, TaskListRun, TaskStatus,
+pub(crate) use self::team::{
+    AwaitingUser, SubTask, SubTaskStatus, TaskSpec, TeamPhase, TeamRun, TeamRunStatus,
+    TeamThreadGate, TeamThreadSlot, TlGeneration, MAX_MR_ROUNDS, MAX_SUBTASK_REVIEW_ROUNDS,
+    MAX_TL_GENERATIONS,
 };
 #[allow(unused_imports)]
 pub(crate) use self::workflow::{
@@ -310,6 +315,26 @@ fn normalize_path_lossy(path: PathBuf) -> PathBuf {
     }
 
     collapse_lexical_components(normalized)
+}
+
+/// Longest enumerated root that lexically contains `path`. Nested worktrees
+/// sit under the main tree, so longest-prefix wins. No filesystem — safe under
+/// the relay write lock. Symlink-equivalent spellings that are not prefixes miss
+/// here and must be remapped with `paths_equivalent` outside the lock.
+pub(crate) fn nearest_enumerated_root(path: &str, roots: &[&str]) -> Option<String> {
+    if path.is_empty() || roots.is_empty() {
+        return None;
+    }
+    let path = collapse_lexical_components(PathBuf::from(path));
+    roots
+        .iter()
+        .copied()
+        .filter(|root| {
+            let root = collapse_lexical_components(PathBuf::from(root));
+            path == root || path.starts_with(&root)
+        })
+        .max_by_key(|root| root.len())
+        .map(str::to_string)
 }
 
 fn collapse_lexical_components(path: PathBuf) -> PathBuf {

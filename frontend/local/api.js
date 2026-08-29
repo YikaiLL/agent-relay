@@ -188,6 +188,52 @@ export async function getWorkflows(apiFetch, deviceId) {
   return payload.data;
 }
 
+export async function getTeams(apiFetch) {
+  // No `device_id` suffix: `list_teams` takes none. Local is the operator surface
+  // with full access, and a task is scoped by its worktree, not by a device.
+  const response = await apiFetch("/api/session/teams", { method: "GET" });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to load tasks");
+  }
+  return payload.data;
+}
+
+export async function startTeam(apiFetch, input) {
+  // Flat by design: a client filling this in is filling in a form, not assembling
+  // a domain object.
+  const response = await apiFetch("/api/session/team", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to start the task");
+  }
+  return payload.data;
+}
+
+// The five whole-run actions share one body and one receipt, so they share one
+// client. `team_run_id` is optional only while one task runs at a time — send it.
+export const TEAM_ACTIONS = Object.freeze(["pause", "stop", "cancel", "resume", "resolve"]);
+
+export async function teamAction(apiFetch, action, { teamRunId, deviceId } = {}) {
+  if (!TEAM_ACTIONS.includes(action)) {
+    throw new Error(`Unknown task action: ${action}`);
+  }
+  const response = await apiFetch(`/api/session/team/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ team_run_id: teamRunId || null, device_id: deviceId || null }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || `Failed to ${action} the task`);
+  }
+  return payload.data;
+}
+
 export async function getDevices(apiFetch) {
   const response = await apiFetch("/api/devices", { method: "GET" });
   const payload = await response.json();
@@ -223,3 +269,182 @@ export function createApiFetch({ getApiToken, onUnauthorized, fetchImpl = fetch 
     return response;
   };
 }
+
+/**
+ * The usage report.
+ *
+ * `since`/`until` are unix seconds, half-open — `until` is exclusive, so adjacent
+ * windows neither double-count a row nor drop one. `bucket` is
+ * `none|hour|day|week|month`; `compare: "previous"` asks the server to add the
+ * preceding equal-length window, which is what makes 环比 / "vs the same time
+ * yesterday" one round trip.
+ *
+ * Window arithmetic deliberately lives on ONE side of the wire. Computing the
+ * previous window's boundaries in the client as well would put the same
+ * off-by-one in two places, and boundaries are exactly where that bug lives.
+ *
+ * A DEGRADED LEDGER IS NOT AN ERROR. The store is built so that a corrupt or
+ * unopenable database costs a number and never the relay, so the route answers
+ * 200 with `enabled: false`. Callers must render that as "unavailable" — which is
+ * a different state from "no usage yet", and collapsing the two makes a broken
+ * ledger look like a quiet day forever.
+ */
+/**
+ * Change the daily token budget.
+ *
+ * PATCH-shaped: send only what changed. The cap and the policy are two separate
+ * controls on one screen, and making each restate the other's value is what
+ * makes two open tabs overwrite each other.
+ */
+export async function setUsageBudget(apiFetch, patch) {
+  const response = await apiFetch("/api/usage/budget", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to save the budget");
+  }
+  return payload.data;
+}
+
+export async function getUsage(apiFetch, { since, until, bucket = "day", compare } = {}) {
+  const query = new URLSearchParams({ since: String(since), until: String(until), bucket });
+  if (compare) query.set("compare", compare);
+  const response = await apiFetch(`/api/usage?${query}`, { method: "GET" });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to load usage");
+  }
+  return payload.data;
+}
+
+/**
+ * The Teams library catalog — definitions a run pins, not live TeamRuns.
+ *
+ * Distinct from `/api/session/teams`. A degraded ledger answers 200 with
+ * `enabled: false` and still includes the builtin Default.
+ */
+export async function getTeamCatalog(apiFetch) {
+  const response = await apiFetch("/api/teams", { method: "GET" });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to load teams");
+  }
+  return payload.data;
+}
+
+/**
+ * Create-or-return the Tasks Orchestrator thread id.
+ *
+ * Idempotent on the relay: a live pin is reused. Opening Tasks does not steal
+ * the user's active conversation (background start).
+ */
+export async function ensureOrchestrator(apiFetch, deviceId) {
+  const response = await apiFetch("/api/orchestrator/ensure", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_id: deviceId || null }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to open the Orchestrator");
+  }
+  return payload.data;
+}
+
+/**
+ * Retire the pinned Orchestrator and open a fresh one.
+ *
+ * Not the same as `ensureOrchestrator`, which is idempotent and reuses a live
+ * pin. This is the way out of a pin the relay cannot tell is dead: the thread
+ * still resolves, so nothing self-heals, but its provider-side session is gone
+ * and every turn fails. The old thread is kept; only the pin moves.
+ */
+export async function resetOrchestrator(apiFetch, deviceId) {
+  const response = await apiFetch("/api/orchestrator/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_id: deviceId || null }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to restart the Orchestrator");
+  }
+  return payload.data;
+}
+
+/**
+ * What a task team changed, against one of the bases the relay offers.
+ *
+ * `base` is a key from a previous response's `bases`, never a ref or a commit:
+ * the relay refuses anything it did not itself name, so a caller cannot hand
+ * git an argument.
+ */
+export async function getTeamDiff(apiFetch, teamRunId, base, deviceId) {
+  const params = new URLSearchParams({ team_run_id: teamRunId });
+  if (base) params.set("base", base);
+  if (deviceId) params.set("device_id", deviceId);
+  const response = await apiFetch(`/api/session/team/diff?${params}`);
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to load the task's changes");
+  }
+  return payload.data;
+}
+
+export async function proposeOrchestratorTask(apiFetch, body) {
+  const response = await apiFetch("/api/orchestrator/proposals", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to create proposal");
+  }
+  return payload.data;
+}
+
+export async function confirmOrchestratorProposal(apiFetch, proposalId, deviceId) {
+  const response = await apiFetch(
+    `/api/orchestrator/proposals/${encodeURIComponent(proposalId)}/confirm`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId || null }),
+    }
+  );
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to confirm proposal");
+  }
+  return payload.data;
+}
+
+export async function dismissOrchestratorProposal(apiFetch, proposalId, deviceId) {
+  const response = await apiFetch(
+    `/api/orchestrator/proposals/${encodeURIComponent(proposalId)}/dismiss`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId || null }),
+    }
+  );
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to dismiss proposal");
+  }
+  return payload.data;
+}
+
+export {
+  listLineComments,
+  createLineComment,
+  resolveLineComment,
+  handBackLineComment,
+  listReviewTicks,
+  tickReviewFile,
+  teamRunCommentScope,
+} from "../shared/line-comments-api.js";

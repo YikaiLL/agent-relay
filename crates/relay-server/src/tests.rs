@@ -66,6 +66,7 @@ async fn image_accepting_routes_accept_a_body_over_the_default_limit() {
             auth: test_auth(),
             launch_id: None,
             security_headers: SecurityHeadersConfig::default(),
+            host_policy: HostPolicy::loopback_only(),
         };
         let router = build_router(context, WebAssets::Embedded);
 
@@ -663,47 +664,67 @@ fn session_errors_are_classified_by_cause_not_lumped_into_502() {
 
 // Regression guard for the layer neither side's unit tests covered: the frontend
 // builds a query string and the backend deserializes it, and NOTHING exercised the
-// contract between them. `serde_urlencoded` parses a Rust `bool` with `str::parse`,
-// which accepts only "true"/"false" — so a query built with `auto_root=1` 400s before
-// the handler ever runs, and the panel just errors.
+// contract between them. That gap is how a query built with `auto_root=1` came to 400
+// before the handler ever ran, leaving the panel showing only an error.
 #[test]
 fn workspace_diff_query_parses_the_url_the_client_actually_builds() {
     use axum::extract::Query;
 
-    // Exactly what frontend/local/workspace-diff.js emits for a first thread view.
-    let uri: Uri = "/api/workspace/diff?thread_id=thread-a&auto_root=true"
+    let uri: Uri = "/api/workspace/diff?thread_id=thread-a"
         .parse()
         .expect("uri");
     let query: Query<crate::WorkspaceDiffQuery> =
         Query::try_from_uri(&uri).expect("the client's own URL must deserialize");
     assert_eq!(query.0.thread_id.as_deref(), Some("thread-a"));
-    assert!(query.0.auto_root);
 
-    // Absent flag stays false (legacy clients).
-    let uri: Uri = "/api/workspace/diff?thread_id=thread-a"
-        .parse()
-        .expect("uri");
+    // No thread selected is the legacy global view, not a rejection.
+    let uri: Uri = "/api/workspace/diff".parse().expect("uri");
     let query: Query<crate::WorkspaceDiffQuery> = Query::try_from_uri(&uri).expect("legacy url");
-    assert!(!query.0.auto_root);
-    assert_eq!(query.0.root, None);
+    assert_eq!(query.0.thread_id, None);
 
-    // The bug this guards: "1" is NOT a urlencoded bool. Proven here so the guard
-    // above can never be "fixed" by loosening the client back to `1`.
-    let uri: Uri = "/api/workspace/diff?thread_id=t&auto_root=1"
+    // Unknown query fields must parse (stale clients) and be ignored.
+    let uri: Uri = "/api/workspace/diff?thread_id=t&root=%2Frepo%2Flinked&auto_root=true"
         .parse()
         .expect("uri");
+    let query: Query<crate::WorkspaceDiffQuery> =
+        Query::try_from_uri(&uri).expect("a stale client's URL must still deserialize");
+    assert_eq!(query.0.thread_id.as_deref(), Some("t"));
+    assert_eq!(query.0.view_root, None);
+
+    let uri: Uri = "/api/workspace/diff?thread_id=t&view_root=%2Frepo%2Fwt"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::WorkspaceDiffQuery> =
+        Query::try_from_uri(&uri).expect("view_root must deserialize");
+    assert_eq!(query.0.view_root.as_deref(), Some("/repo/wt"));
+}
+
+// thread_id is required: there is no session-less workspace.
+#[test]
+fn thread_workspace_query_requires_a_thread_and_takes_an_optional_device() {
+    use axum::extract::Query;
+
+    let uri: Uri = "/api/thread/workspace?thread_id=thread-a&device_id=phone-1"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::ThreadWorkspaceQuery> = Query::try_from_uri(&uri).expect("url");
+    assert_eq!(query.0.thread_id, "thread-a");
+    assert_eq!(query.0.device_id.as_deref(), Some("phone-1"));
+
+    // The local operator surface sends no device id.
+    let uri: Uri = "/api/thread/workspace?thread_id=thread-a"
+        .parse()
+        .expect("uri");
+    let query: Query<crate::ThreadWorkspaceQuery> = Query::try_from_uri(&uri).expect("local url");
+    assert_eq!(query.0.device_id, None);
+
     assert!(
-        Query::<crate::WorkspaceDiffQuery>::try_from_uri(&uri).is_err(),
-        "serde_urlencoded accepts only true/false for bool — if this ever starts \
-         passing, the client may use 1 again"
+        Query::<crate::ThreadWorkspaceQuery>::try_from_uri(
+            &"/api/thread/workspace".parse::<Uri>().expect("uri")
+        )
+        .is_err(),
+        "answering with no session named would mean guessing which one"
     );
-
-    // And an explicit root round-trips url-decoded.
-    let uri: Uri = "/api/workspace/diff?thread_id=t&root=%2Frepo%2Flinked"
-        .parse()
-        .expect("uri");
-    let query: Query<crate::WorkspaceDiffQuery> = Query::try_from_uri(&uri).expect("root url");
-    assert_eq!(query.0.root.as_deref(), Some("/repo/linked"));
 }
 
 /// A rename body that cannot be parsed must be REFUSED, never read as a reset.
@@ -761,6 +782,7 @@ async fn rename_thread_refuses_an_unparseable_body_instead_of_clearing_the_name(
             auth: test_auth(),
             launch_id: None,
             security_headers: SecurityHeadersConfig::default(),
+            host_policy: HostPolicy::loopback_only(),
         };
         let router = build_router(context, WebAssets::Embedded);
 
@@ -814,6 +836,7 @@ async fn rename_thread_refuses_a_body_that_omits_the_name_field() {
         auth: test_auth(),
         launch_id: None,
         security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
     };
     let router = build_router(context, WebAssets::Embedded);
 
@@ -864,6 +887,7 @@ async fn rename_thread_accepts_an_explicit_null_name_as_a_reset() {
         auth: test_auth(),
         launch_id: None,
         security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
     };
     let router = build_router(context, WebAssets::Embedded);
 
@@ -922,6 +946,7 @@ async fn the_first_stream_frame_is_built_fresh_not_served_from_the_fanout_cache(
         auth: test_auth(),
         launch_id: None,
         security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
     };
     let router = build_router(context, WebAssets::Embedded);
 
@@ -958,5 +983,548 @@ async fn the_first_stream_frame_is_built_fresh_not_served_from_the_fanout_cache(
         "a connecting surface must build its own snapshot; serving the warm fan-out \
          entry would hand it `server_time`/`devices_revision` from an arbitrarily old \
          build and skip the expiry sweeps that building runs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Local surface hardening: Host allowlist + CSRF on the unauthenticated path.
+// ---------------------------------------------------------------------------
+
+fn no_auth() -> AuthConfig {
+    AuthConfig::from_parts(
+        None,
+        None,
+        "127.0.0.1".parse().expect("loopback should parse"),
+    )
+    .expect("a loopback bind with no token is a valid config")
+}
+
+/// Returns the `TempDir` alongside the context: the caller has to hold it for
+/// the lifetime of the router, and dropping it cleans the directory up.
+fn test_context(auth: AuthConfig, host_policy: HostPolicy) -> (AppContext, tempfile::TempDir) {
+    let project = tempfile::TempDir::new().expect("project tempdir");
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        project.path().display().to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    let context = AppContext {
+        app: crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx),
+        auth,
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+        host_policy,
+    };
+    (context, project)
+}
+
+/// DNS rebinding: after the rebind the browser still sends the ATTACKER's
+/// hostname, only the resolved IP changed. Asserting on Host (not Origin) is
+/// the whole point — `request_origin` derives the expected origin FROM Host,
+/// so the same-origin check happily compares `http://evil.example` against
+/// itself and passes. Only an allowlist on the Host header stops this.
+#[tokio::test]
+async fn a_rebound_attacker_host_is_rejected_before_routing() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (context, _project) = test_context(no_auth(), HostPolicy::loopback_only());
+    let router = build_router(context, WebAssets::Embedded);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/start")
+                .header(header::HOST, "evil.example")
+                // The rebound page's own origin — self-consistent with Host,
+                // which is exactly why the Origin check cannot catch it.
+                .header(header::ORIGIN, "http://evil.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::MISDIRECTED_REQUEST,
+        "a foreign Host must be refused before any handler runs"
+    );
+}
+
+#[test]
+fn the_host_allowlist_accepts_loopback_names_and_the_configured_bind_host() {
+    let policy = HostPolicy::loopback_only();
+    for host in [
+        "127.0.0.1:8787",
+        "127.0.0.1",
+        "localhost:8787",
+        "localhost",
+        "[::1]:8787",
+        "[::1]",
+        "127.0.0.53:8787",
+    ] {
+        assert!(
+            policy.allows_host(Some(host)),
+            "{host} is a loopback name and must be accepted"
+        );
+    }
+
+    for host in ["evil.example", "evil.example:8787", "10.0.0.4:8787"] {
+        assert!(
+            !policy.allows_host(Some(host)),
+            "{host} must be rejected by a loopback-only policy"
+        );
+    }
+
+    let bound = HostPolicy::from_parts("192.168.1.166".parse().expect("ip"), None)
+        .expect("a non-loopback bind with no explicit list is valid");
+    assert!(
+        bound.allows_host(Some("anything.example")),
+        "a non-loopback bind with no explicit allowlist must not enforce, or every \
+         existing reverse-proxy deployment breaks"
+    );
+
+    let listed = HostPolicy::from_parts(
+        "0.0.0.0".parse().expect("ip"),
+        Some("relay.example, other.example".to_string()),
+    )
+    .expect("an explicit allowlist is valid");
+    assert!(listed.allows_host(Some("relay.example")));
+    assert!(listed.allows_host(Some("other.example:8787")));
+    assert!(
+        listed.allows_host(Some("localhost:8787")),
+        "loopback stays allowed alongside an explicit list"
+    );
+    assert!(!listed.allows_host(Some("evil.example")));
+}
+
+/// The `!auth.enabled()` short-circuit is what this pins: with no token
+/// configured — the default for the laptop UI — a mutating `/api/` request
+/// carrying a foreign Origin currently sails straight through.
+#[test]
+fn csrf_rejects_a_foreign_origin_when_no_token_is_configured() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://evil.example"),
+    );
+
+    let error = authorize_csrf_protection(
+        &no_auth(),
+        &Method::POST,
+        &headers,
+        &Uri::from_static("/api/session/start"),
+    )
+    .expect_err("a foreign origin must be rejected even with auth disabled");
+
+    assert_eq!(error.0, StatusCode::FORBIDDEN);
+    assert_eq!(error.1 .0.error.code, "csrf_rejected");
+}
+
+/// The counterweight: a browser ALWAYS attaches `Origin` to a cross-site
+/// mutating request, so "no Origin at all" is not reachable from a hostile
+/// page — it is curl, a Node e2e script, or the Tauri shell. Rejecting those
+/// would buy nothing and break every non-browser client.
+#[test]
+fn csrf_allows_a_mutating_request_that_carries_no_origin_at_all() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_ok(),
+        "non-browser clients send no Origin and must keep working"
+    );
+}
+
+/// `vite.config.js` proxies /api with `changeOrigin: true`, so in dev the
+/// browser's Origin is the vite port while Host is rewritten to the relay's —
+/// a legitimate mismatch that must keep working.
+///
+/// The custom header is what makes accepting it safe, and it is why this test
+/// sends one: every mutating call from the real frontend goes through
+/// `createApiFetch` -> `applyCsrfHeader` (`frontend/local/api.js`). Loopback
+/// alone is NOT sufficient — see
+/// `another_loopback_page_cannot_post_without_the_csrf_header`.
+#[test]
+fn csrf_allows_a_loopback_origin_from_the_vite_dev_proxy() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://localhost:5173"),
+    );
+    headers.insert(
+        HeaderName::from_static(CSRF_HEADER_NAME),
+        HeaderValue::from_static(CSRF_HEADER_VALUE),
+    );
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_ok(),
+        "the vite dev proxy must keep working"
+    );
+}
+
+/// These two routes take no body extractor, so they are CORS "simple
+/// requests": no preflight, sendable cross-origin straight from a form.
+/// Impact is denial of service — unpair the user's phone — and `device_id` is
+/// client-chosen at pairing, so `iphone` is a guessable target.
+#[tokio::test]
+async fn body_less_revoke_routes_reject_a_cross_origin_form_post() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    for route in [
+        "/api/devices/iphone/revoke",
+        "/api/devices/iphone/revoke-others",
+    ] {
+        let (context, _project) = test_context(no_auth(), HostPolicy::loopback_only());
+        let router = build_router(context, WebAssets::Embedded);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(route)
+                    .header(header::HOST, "127.0.0.1:8787")
+                    .header(header::ORIGIN, "https://evil.example")
+                    // A real form post: a CORS-simple content type, no preflight.
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{route} must refuse a cross-origin form post"
+        );
+    }
+}
+
+/// `Origin: null` is what a browser sends from an opaque origin. It is a
+/// *declared* origin that names nobody, and it must not be laundered into "no
+/// Origin header, therefore a non-browser client" — an ordinary web page can
+/// arrange to send it, with no Referer alongside.
+///
+/// `relay_http::header_origin` collapses `null` to `None` exactly like an
+/// absent header, so anything built on it has to re-check the raw header.
+/// This is not hypothetical: the first cut of this check did not, and the
+/// body-less revoke routes stayed reachable.
+#[tokio::test]
+async fn an_opaque_origin_is_not_mistaken_for_a_non_browser_client() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (context, _project) = test_context(no_auth(), HostPolicy::loopback_only());
+    let router = build_router(context, WebAssets::Embedded);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/devices/iphone/revoke")
+                .header(header::HOST, "127.0.0.1:8787")
+                .header(header::ORIGIN, "null")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an opaque `Origin: null` must be refused, not treated as undeclared"
+    );
+}
+
+#[test]
+fn an_opaque_or_unparseable_origin_is_refused_rather_than_ignored() {
+    for value in ["null", "NULL", "  null  ", "", "not a url"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_str(value).expect("header"),
+        );
+
+        assert!(
+            authorize_csrf_protection(
+                &no_auth(),
+                &Method::POST,
+                &headers,
+                &Uri::from_static("/api/session/start"),
+            )
+            .is_err(),
+            "`Origin: {value}` is declared but names nobody; it must not pass"
+        );
+    }
+}
+
+/// A present-but-opaque `Origin` must not fall through to `Referer`. Origin is
+/// the authoritative statement; if it says "opaque", a same-origin Referer
+/// alongside it is not a second opinion worth taking.
+#[test]
+fn an_opaque_origin_does_not_fall_through_to_a_friendly_referer() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(header::ORIGIN, HeaderValue::from_static("null"));
+    headers.insert(
+        header::REFERER,
+        HeaderValue::from_static("http://127.0.0.1:8787/app"),
+    );
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_err(),
+        "Origin is authoritative; a friendly Referer must not rescue an opaque one"
+    );
+}
+
+/// Loopback is not a trust boundary. Another page served from this machine —
+/// a second dev server, a static server showing an untrusted file, a local
+/// tool with an XSS — presents `http://localhost:<port>` just as legitimately
+/// as vite does. What separates them is the custom header: a cross-origin page
+/// cannot set it without a CORS preflight this server never grants.
+#[test]
+fn another_loopback_page_cannot_post_without_the_csrf_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8787"));
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://localhost:8000"),
+    );
+
+    assert!(
+        authorize_csrf_protection(
+            &no_auth(),
+            &Method::POST,
+            &headers,
+            &Uri::from_static("/api/session/start"),
+        )
+        .is_err(),
+        "a cross-port loopback origin without the custom header must be refused"
+    );
+}
+
+/// Build a router whose relay is rooted at `cwd` and (optionally) fenced to
+/// `allowed_roots`, for the `/api/workspace/git-context` tests below.
+/// `allowed_roots` fences which paths may be ASKED about; `trusted` is the separate
+/// statement that git may run in them. They were once the same list, which is exactly the
+/// conflation the trust split undid — so a fixture that wants git to run has to say so.
+async fn git_context_router(
+    cwd: &str,
+    allowed_roots: Vec<String>,
+    trusted: Vec<String>,
+) -> axum::Router {
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        cwd.to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    if !allowed_roots.is_empty() {
+        relay.write().await.set_allowed_roots(
+            crate::state::normalize_allowed_roots(allowed_roots).expect("roots"),
+        );
+    }
+    relay.write().await.trusted_workspaces = trusted;
+    let context = AppContext {
+        app: crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx),
+        auth: test_auth(),
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
+    };
+    build_router(context, WebAssets::Embedded)
+}
+
+async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::HOST, "127.0.0.1:8787")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body should read");
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+async fn seed_git_repo(dir: &std::path::Path) -> String {
+    let path = dir.canonicalize().expect("canonicalize");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "t@e.com"],
+        vec!["config", "user.name", "T"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&path)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+    std::fs::write(path.join("seed.txt"), "line1\n").expect("write");
+    for args in [vec!["add", "seed.txt"], vec!["commit", "-q", "-m", "seed"]] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&path)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+    path.to_string_lossy().to_string()
+}
+
+/// A router whose relay already knows `thread_id`, so `/api/thread/workspace` resolves
+/// instead of 400-ing on an unknown thread.
+async fn thread_workspace_router(cwd: &str, thread_id: &str) -> axum::Router {
+    let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+    let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+        cwd.to_string(),
+        change_tx.clone(),
+        crate::state::SecurityProfile::private(),
+    )));
+    {
+        let mut relay = relay.write().await;
+        relay.ensure_runtime_for_thread(thread_id).current_cwd = cwd.to_string();
+        // Granted: enumerating a thread's worktree roots and counting their changes are
+        // both `git` in this directory, which `admit` refuses without a grant.
+        relay.trusted_workspaces = vec![cwd.to_string()];
+    }
+    let context = AppContext {
+        app: crate::state::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx),
+        auth: test_auth(),
+        launch_id: None,
+        security_headers: SecurityHeadersConfig::default(),
+        host_policy: HostPolicy::loopback_only(),
+    };
+    build_router(context, WebAssets::Embedded)
+}
+
+/// Both halves over real HTTP. The default carrying NO counts is the half that keeps a
+/// twice-per-refresh path cheap, and no test of the measurement function can see it.
+#[tokio::test]
+async fn thread_workspace_route_measures_roots_only_when_asked() {
+    let dir = tempfile::TempDir::new().expect("tmp");
+    let cwd = seed_git_repo(dir.path()).await;
+    std::fs::write(std::path::Path::new(&cwd).join("scratch.txt"), "new\n").expect("write");
+
+    let uri = "/api/thread/workspace?thread_id=thread-a";
+    let (status, body) = get_json(thread_workspace_router(&cwd, "thread-a").await, &uri).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    let roots = body["data"]["roots"].as_array().expect("roots");
+    assert_eq!(roots.len(), 1, "body={body}");
+    assert!(
+        roots[0].get("changed_files").is_none(),
+        "an unmeasured root must be ABSENT from the payload, not zero: {body}"
+    );
+
+    let (status, body) = get_json(
+        thread_workspace_router(&cwd, "thread-a").await,
+        &format!("{uri}&roots_status=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["data"]["roots"][0]["changed_files"],
+        serde_json::json!(1),
+        "asking must actually produce the count: {body}"
+    );
+}
+
+/// The local surface must expose the probe the launch dialog's `main · clean` chip
+/// reads, beside `/api/workspace/diff`.
+#[tokio::test]
+async fn workspace_git_context_route_answers_for_a_local_path() {
+    let dir = tempfile::TempDir::new().expect("tmp");
+    let cwd = seed_git_repo(dir.path()).await;
+    std::fs::write(std::path::Path::new(&cwd).join("scratch.txt"), "new\n").expect("write");
+
+    // In the fence AND vouched for: `dirty` is the one field that needs a subprocess, so
+    // this chip only fills it in where the local operator granted the workspace.
+    let router = git_context_router(&cwd, vec![cwd.clone()], vec![cwd.clone()]).await;
+    let (status, body) = get_json(
+        router,
+        &format!("/api/workspace/git-context?cwd={}", cwd.replace(' ', "%20")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["data"]["is_repo"], serde_json::Value::Bool(true));
+    assert_eq!(body["data"]["branch"], serde_json::json!("main"));
+    assert_eq!(body["data"]["detached"], serde_json::Value::Bool(false));
+    assert_eq!(
+        body["data"]["dirty"],
+        serde_json::Value::Bool(true),
+        "an untracked file must show as dirty"
+    );
+}
+
+/// A caller-supplied-path probe, so `allowed_roots` must fence it and the refusal
+/// must be a 4xx that says nothing about the target.
+#[tokio::test]
+async fn workspace_git_context_route_refuses_a_path_outside_the_allowed_roots() {
+    let allowed = tempfile::TempDir::new().expect("tmp");
+    let outside = tempfile::TempDir::new().expect("tmp");
+    let allowed_cwd = seed_git_repo(allowed.path()).await;
+    let outside_cwd = seed_git_repo(outside.path()).await;
+
+    // Deliberately no grants: this asserts the FENCE, which must refuse on its own,
+    // before trust is even consulted.
+    let router = git_context_router(&allowed_cwd, vec![allowed_cwd.clone()], Vec::new()).await;
+    let (status, body) = get_json(
+        router,
+        &format!("/api/workspace/git-context?cwd={outside_cwd}"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains(&outside_cwd) && !message.contains("main"),
+        "the refusal must not describe the target: {message}"
     );
 }

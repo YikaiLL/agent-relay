@@ -67,6 +67,7 @@ fn review_action_input_supports_an_explicit_job_and_keeps_legacy_omission() {
 fn make_snapshot() -> SessionSnapshot {
     SessionSnapshot {
         provider_fork_capabilities: Vec::new(),
+        provider_archive_capabilities: Vec::new(),
         provider_status: Vec::new(),
         revision: 7,
         transcript_revision: 3,
@@ -81,6 +82,7 @@ fn make_snapshot() -> SessionSnapshot {
         e2ee_enabled: true,
         broker_can_read_content: false,
         audit_enabled: false,
+        beta_features_enabled: false,
         active_thread_id: Some("thread-1".to_string()),
         active_thread_promoted_from: None,
         active_controller_device_id: Some("device-1".to_string()),
@@ -95,6 +97,8 @@ fn make_snapshot() -> SessionSnapshot {
         active_flags: vec![],
         thread_activity: vec![],
         current_cwd: "/tmp/project".to_string(),
+        thread_workspace_cwd: None,
+        workspace_missing: None,
         model: "gpt-5.4".to_string(),
         available_models: vec![],
         approval_policy: "untrusted".to_string(),
@@ -154,6 +158,10 @@ fn make_snapshot() -> SessionSnapshot {
         push_vapid_public_key: None,
         projects_revision: 0,
         threads_revision: 0,
+        thread_workspaces_revision: 0,
+        teams_revision: 0,
+        orchestrator_thread_id: None,
+        orchestrator_proposals: Vec::new(),
     }
 }
 
@@ -502,6 +510,61 @@ fn compact_for_broker_drops_legacy_workflow_card_before_conversation_content() {
 }
 
 #[test]
+fn compact_for_broker_keeps_the_teams_cache_key_under_maximum_pressure() {
+    // The Teams channel ships a revision and NOTHING else, so the whole feature
+    // rests on that scalar surviving. The drain loop reclaims lists — reviewer
+    // threads, workflow cards, review jobs, devices, then conversation — and a
+    // client that loses the key stops refetching without ever knowing it went
+    // stale. Pressure this snapshot past every list it can drop and assert the
+    // key is still there.
+    let mut snapshot = workflow_budget_snapshot("escalated", 50_000);
+    snapshot.teams_revision = 4242;
+    snapshot.current_cwd = "/tmp/".to_string() + &"超长路径".repeat(3_000);
+    snapshot.transcript = (0..3)
+        .map(|index| TranscriptEntryView {
+            item_id: Some(format!("item-{index}")),
+            kind: TranscriptEntryKind::AgentText,
+            text: Some(format!("visible conversation tail {index}")),
+            status: "completed".to_string(),
+            turn_id: Some(format!("turn-{index}")),
+            tool: None,
+            content_state: TranscriptContentState::Full,
+        })
+        .collect();
+
+    let compacted = snapshot.compact_for(SessionSnapshotCompactProfile::RemoteSurface);
+    let bytes = serde_json::to_vec(&compacted).unwrap().len();
+
+    assert!(
+        bytes <= SESSION_SNAPSHOT_TARGET_BYTES,
+        "compacted snapshot stayed over budget: {bytes}"
+    );
+    assert!(
+        compacted.active_workflow_runs.is_empty(),
+        "this snapshot has to be under real pressure for the assertion below to mean anything"
+    );
+    assert_eq!(
+        compacted.teams_revision, 4242,
+        "the Teams cache key must outlive every list the budget can reclaim"
+    );
+}
+
+#[test]
+fn a_zero_teams_revision_stays_off_the_wire() {
+    // Every relay that has never run a task carries 0 here. Serialising it would
+    // add a field to every snapshot on every surface to say "no tasks", which is
+    // what `skip_serializing_if` is for — and what keeps this addition free for
+    // the surfaces that will never use it.
+    let snapshot = workflow_budget_snapshot("running", 10);
+    assert_eq!(snapshot.teams_revision, 0);
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(
+        !json.contains("teams_revision"),
+        "the no-tasks wire shape must stay byte-identical"
+    );
+}
+
+#[test]
 fn compact_for_surfaces_bounds_workflow_anchor_and_many_unicode_findings() {
     for (profile, target, max_field_bytes, max_verdict_bytes, max_findings) in [
         (
@@ -589,6 +652,7 @@ fn compact_for_broker_keeps_only_active_parent_reviewers() {
         reviewer_provider: Some("codex".to_string()),
         name: Some(id.to_string()),
         updated_at: Some(1),
+        cwd: None,
     };
     snapshot.reviewer_threads = vec![
         reviewer("active-rev-1", "thread-1"),
@@ -631,6 +695,7 @@ fn compact_for_broker_with_no_active_thread_keeps_reviewers() {
         reviewer_provider: Some("codex".to_string()),
         name: Some(id.to_string()),
         updated_at: Some(1),
+        cwd: None,
     };
     snapshot.reviewer_threads = vec![reviewer("rev-1", "thread-1"), reviewer("rev-2", "thread-2")];
 
@@ -660,6 +725,7 @@ fn compact_for_local_web_keeps_reviewer_threads() {
             reviewer_provider: Some("codex".to_string()),
             name: Some("Reviewer one".to_string()),
             updated_at: Some(42),
+            cwd: None,
         },
         // A reviewer of a NON-active parent — local must still keep it (the
         // delete/archive prompt works on any thread, not just the active one).
@@ -669,6 +735,7 @@ fn compact_for_local_web_keeps_reviewer_threads() {
             reviewer_provider: Some("codex".to_string()),
             name: Some("Reviewer two".to_string()),
             updated_at: Some(7),
+            cwd: None,
         },
     ];
 
@@ -733,6 +800,7 @@ fn local_web_control_plane_metadata_does_not_shell_normal_live_transcript() {
             reviewer_provider: Some("claude_code".to_string()),
             name: Some(format!("Independent Claude review {index:02}")),
             updated_at: Some(1_750_000_000 + index),
+            cwd: None,
         })
         .collect();
     snapshot.device_records = (0..11)
@@ -942,6 +1010,7 @@ fn long_session_snapshot_stays_bounded_in_bytes_and_entry_count() {
                 reviewer_provider: Some("claude_code".to_string()),
                 name: Some(format!("review {index}")),
                 updated_at: Some(1_750_000_000 + index),
+                cwd: None,
             })
             .collect();
         snapshot
@@ -1136,6 +1205,7 @@ fn control_plane_flood_keeps_both_surfaces_bounded_without_shelling_live_text() 
                 reviewer_provider: Some("claude_code".to_string()),
                 name: Some(format!("Independent review {index:03}")),
                 updated_at: Some(1_750_000_000 + index),
+                cwd: None,
             })
             .collect();
         snapshot.device_records = (0..120)
@@ -1266,6 +1336,7 @@ fn control_plane_cap_keeps_active_parent_reviewer_threads() {
             reviewer_provider: Some("claude_code".to_string()),
             name: Some(format!("active review {index}")),
             updated_at: Some(1),
+            cwd: None,
         });
     }
     // 60 other-parent reviewers push the total over the LocalWeb cap of 48.
@@ -1276,6 +1347,7 @@ fn control_plane_cap_keeps_active_parent_reviewer_threads() {
             reviewer_provider: Some("claude_code".to_string()),
             name: Some(format!("other review {index}")),
             updated_at: Some(1),
+            cwd: None,
         });
     }
     snapshot.reviewer_threads = reviewer_threads;
@@ -1592,6 +1664,7 @@ fn threads_response_compact_for_broker_limits_serialized_size() {
     let response = ThreadsResponse {
         threads: (0..120)
             .map(|index| ThreadSummaryView {
+                workspace_trusted: false,
                 id: format!("thread-{index}"),
                 name: Some(format!("{}{}", "名".repeat(80), index)),
                 preview: format!("{}{}", "预览".repeat(300), index),
@@ -1633,6 +1706,7 @@ fn threads_response_stays_in_budget_when_every_session_is_renamed() {
     let response = ThreadsResponse {
         threads: (0..MAX_BROKER_THREADS)
             .map(|index| ThreadSummaryView {
+                workspace_trusted: false,
                 id: format!("thread-{index}"),
                 // A plausible user-chosen title at the length people actually type, not a
                 // pathological one — the point is that ordinary use stays in budget.
@@ -1670,6 +1744,7 @@ fn threads_response_compact_for_local_web_is_less_aggressive() {
     let response = ThreadsResponse {
         threads: (0..120)
             .map(|index| ThreadSummaryView {
+                workspace_trusted: false,
                 id: format!("thread-{index}"),
                 name: Some(format!("{}{}", "名".repeat(80), index)),
                 preview: format!("{}{}", "预览".repeat(300), index),
@@ -1703,6 +1778,7 @@ fn threads_response_compact_for_ios_surface_currently_reuses_remote_budget() {
     let response = ThreadsResponse {
         threads: (0..120)
             .map(|index| ThreadSummaryView {
+                workspace_trusted: false,
                 id: format!("thread-{index}"),
                 name: Some(format!("{}{}", "名".repeat(80), index)),
                 preview: format!("{}{}", "预览".repeat(300), index),
@@ -1819,6 +1895,7 @@ fn compact_for_broker_shells_tool_entries_dropping_heavy_content() {
             item_type: "turnDiff".to_string(),
             name: "turn_diff".to_string(),
             title: "Changed files".to_string(),
+            kind: None,
             detail: Some("详情".repeat(1_000)),
             query: None,
             path: None,
@@ -1870,6 +1947,7 @@ fn strip_file_change_diffs_keeps_summary_and_flags_entry() {
                 item_type: "turnDiff".to_string(),
                 name: "turn_diff".to_string(),
                 title: "Changed files".to_string(),
+                kind: None,
                 detail: None,
                 query: None,
                 path: None,
@@ -1945,6 +2023,7 @@ fn compact_for_broker_shells_bring_oversized_transcript_under_budget() {
                 item_type: "turnDiff".to_string(),
                 name: "turn_diff".to_string(),
                 title: "Changed files".to_string(),
+                kind: None,
                 detail: Some("详情".repeat(2_000)),
                 query: None,
                 path: None,
@@ -2008,6 +2087,7 @@ fn compact_for_broker_trims_many_file_changes_without_clearing_transcript() {
             item_type: "turnDiff".to_string(),
             name: "turn_diff".to_string(),
             title: "Changed files".to_string(),
+            kind: None,
             detail: None,
             query: None,
             path: None,
@@ -2524,6 +2604,7 @@ fn thread_transcript_history_externalizes_large_file_change_diffs() {
             item_type: "turnDiff".to_string(),
             name: "turn_diff".to_string(),
             title: "Changed files".to_string(),
+            kind: None,
             detail: None,
             query: None,
             path: None,
@@ -2658,6 +2739,7 @@ fn thread_entry_detail_response_chunks_large_nested_file_change_diff() {
             item_type: "turnDiff".to_string(),
             name: "turn_diff".to_string(),
             title: "Changed files".to_string(),
+            kind: None,
             detail: None,
             query: None,
             path: None,
@@ -2723,6 +2805,7 @@ mod can_apply_flag_tests {
                 item_type: "turnDiff".to_string(),
                 name: "diff".to_string(),
                 title: "Changes".to_string(),
+                kind: None,
                 detail: None,
                 query: None,
                 path: None,

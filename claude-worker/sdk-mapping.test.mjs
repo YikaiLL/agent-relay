@@ -1001,3 +1001,76 @@ test("a tool_use with no tool_result does not replay as completed", () => {
     "an edit whose result never arrived must not replay as a landed write"
   );
 });
+
+// The relay's token ledger is built on these three fields. `usage` alone was
+// forwarded historically, which is enough for a headline number and not enough
+// to attribute it — a turn can span several models (a subagent on a cheaper
+// one, a fallback after a refusal), and without `modelUsage` the relay has to
+// guess from the thread's configured model.
+test("done carries the turn's full accounting, not just usage", () => {
+  const mapped = mapSdkMessage({
+    type: "result",
+    subtype: "success",
+    usage: { input_tokens: 10, output_tokens: 4 },
+    modelUsage: {
+      "claude-opus-5": { inputTokens: 8, outputTokens: 3, costUSD: 0.02 },
+      "claude-haiku-4-5": { inputTokens: 2, outputTokens: 1, costUSD: 0.001 },
+    },
+    total_cost_usd: 0.021,
+  });
+
+  assert.deepEqual(mapped, {
+    type: "done",
+    usage: { input_tokens: 10, output_tokens: 4 },
+    model_usage: {
+      "claude-opus-5": { inputTokens: 8, outputTokens: 3, costUSD: 0.02 },
+      "claude-haiku-4-5": { inputTokens: 2, outputTokens: 1, costUSD: 0.001 },
+    },
+    total_cost_usd: 0.021,
+  });
+});
+
+// A failed turn still spent its tokens. Billing it is what makes the report's
+// "retries and failed re-runs burned 214k today" figure possible at all, so the
+// accounting must survive the failure path too — and `failed`/`reason` must
+// still be set, since the relay writes a durable transcript failure from them.
+test("a failed result keeps its accounting alongside the failure reason", () => {
+  const [errorEvent, done] = mapSdkMessage({
+    type: "result",
+    subtype: "error_max_turns",
+    usage: { input_tokens: 99 },
+    total_cost_usd: 0.5,
+  });
+
+  assert.equal(errorEvent.type, "error");
+  assert.equal(done.type, "done");
+  assert.equal(done.failed, true);
+  assert.equal(done.reason, failedTurnReason("error_max_turns"));
+  assert.deepEqual(done.usage, { input_tokens: 99 });
+  assert.equal(done.total_cost_usd, 0.5);
+});
+
+// PRIVACY: `done` rides the relay's event stream to every paired device, so a
+// field derived from conversation content would leak a background thread's work
+// to devices with no path scope for it. `permission_denials` carries tool
+// inputs; it must not be forwarded here.
+test("done forwards no content-derived fields", () => {
+  const mapped = mapSdkMessage({
+    type: "result",
+    subtype: "success",
+    usage: { output_tokens: 1 },
+    permission_denials: [{ tool_name: "Bash", tool_input: { command: "cat ~/.ssh/id_rsa" } }],
+    result: "the assistant's final text",
+    errors: ["a raw provider error string"],
+  });
+
+  assert.deepEqual(Object.keys(mapped).sort(), ["type", "usage"]);
+});
+
+// An SDK build that omits a field must not turn it into an explicit undefined.
+test("absent accounting fields are omitted rather than sent as undefined", () => {
+  const mapped = mapSdkMessage({ type: "result", subtype: "success", usage: {} });
+  assert.deepEqual(Object.keys(mapped).sort(), ["type", "usage"]);
+  assert.equal("model_usage" in mapped, false);
+  assert.equal("total_cost_usd" in mapped, false);
+});

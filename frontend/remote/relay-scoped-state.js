@@ -16,9 +16,24 @@
 //     resolve, so the usual outcome is a harmless no-op — but "usually harmless"
 //     is not the same as correct, and a collision is silent when it happens.)
 //
+// The session tab set is relay-scoped too — thread ids inside project-keyed workspaces —
+// but it is deliberately NOT reset here, because it is scoped BY CONSTRUCTION rather than
+// by forgetting: `session-tabs-host.js` caches one host per relay id and gives each its
+// own IndexedDB database, so pointing at another relay selects a different host and a
+// different store with no clearing step. An explicit reset was tried and removed: it also
+// ran on MOUNT (React runs effects on mount, not only on dep change), which discarded the
+// boot host mid-transaction and rebuilt it against an empty snapshot.
+//
 // Anything else added here should meet the same test: is it keyed by something only one
-// relay issues?
-export function resetRelayScopedState({ remoteUiStore, threadListStore } = {}) {
-  remoteUiStore?.getState?.().setThreadFilterRetained?.(new Map());
+// relay issues — AND is forgetting it the way it becomes relay-safe?
+// Both entries live on the SAME store: the bell moved off `remoteUiStore` when it was
+// unified with local's copy, so this takes only `threadListStore`.
+//
+// If you add a relay-scoped field that lives on a different store, ADD THAT STORE TO THE
+// SIGNATURE. Destructuring silently ignores anything it does not name, so a caller passing
+// a store this function no longer accepts gets a no-op with no error — which is the exact
+// class of "the reset forgot a field" bug this module exists to prevent.
+export function resetRelayScopedState({ threadListStore } = {}) {
+  threadListStore?.getState?.().setThreadFilterRetained?.(new Map());
   threadListStore?.getState?.().setActiveProject?.(null);
 }

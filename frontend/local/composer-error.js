@@ -32,6 +32,20 @@ export function recordComposerError({ threadId = "", message = "" } = {}) {
   return errors;
 }
 
+/**
+ * Read one thread's failure without rendering anything.
+ *
+ * `syncComposerError` serves the composer under the session view, which is the
+ * only place with a DOM node to write to. The Orchestrator pane draws its own
+ * failure line from React state and still needs the same sentence, so the read
+ * has to be separable from the write.
+ *
+ * @returns {string} the relay's verbatim message, or "" when it has none
+ */
+export function composerErrorFor(threadId) {
+  return threadError(errors, threadId);
+}
+
 /** Drop one thread's failure. Other threads' failures are untouched. */
 export function clearComposerError(threadId) {
   errors = withoutThreadError(errors, threadId);

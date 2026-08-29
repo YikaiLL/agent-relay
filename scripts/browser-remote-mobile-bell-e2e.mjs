@@ -24,6 +24,7 @@ import process from "node:process";
 import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
 import { attachPageDebugLogging, launchBrowser } from "./e2e/harness/browser.mjs";
 import { startStaticServer } from "./e2e/harness/static-server.mjs";
+import { projectSwitcherOption } from "./e2e/harness/project-switcher.mjs";
 
 const ROOT = process.cwd();
 const WEB_ROOT = path.join(ROOT, "web");
@@ -46,7 +47,6 @@ async function main() {
     indexFile: "remote.html",
     pathAliases: {
       "/manifest.webmanifest": "remote-manifest.webmanifest",
-      "/static/icon.svg": "icon.svg",
       "/static/remote-sw.js": "remote-sw.js",
     },
     stripStaticPrefix: true,
@@ -212,6 +212,12 @@ async function main() {
           };
         };
 
+        // Keep in step with broker-client.js. It drops a payload whose relay version it
+        // does not know via `renderLog`, so a stale fixture reaches no console: the page
+        // connects, sends its requests, and silently ignores every answer.
+        const BROKER_PROTOCOL_VERSION = 1;
+        const RELAY_PROTOCOL_VERSION = 2;
+
         class FakeWebSocket extends EventTarget {
           static OPEN = 1;
           constructor(url) {
@@ -222,7 +228,7 @@ async function main() {
               this.dispatchEvent(new Event("open"));
               this.#emit({
                 type: "welcome",
-                protocol_version: 1,
+                protocol_version: BROKER_PROTOCOL_VERSION,
                 peer_id: "surface-e2e",
                 channel_id: "room-e2e",
                 peers: [{ peer_id: "relay-peer-e2e", role: "relay" }],
@@ -234,7 +240,7 @@ async function main() {
               });
               this.#emit({
                 type: "message",
-                payload: { protocol_version: 1, kind: "session_snapshot", snapshot },
+                payload: { protocol_version: RELAY_PROTOCOL_VERSION, kind: "session_snapshot", snapshot },
               });
               // Lets the test move a thread OUT of needs_input the way answering an
               // approval would, by pushing a fresh snapshot — the same channel the real
@@ -242,7 +248,7 @@ async function main() {
               const push = () => {
                 this.#emit({
                   type: "message",
-                  payload: { protocol_version: 1, kind: "session_snapshot", snapshot },
+                  payload: { protocol_version: RELAY_PROTOCOL_VERSION, kind: "session_snapshot", snapshot },
                 });
               };
               // Answering the approval, the way the real relay would: the thread stops
@@ -376,7 +382,7 @@ async function main() {
           #respond(actionId, result) {
             this.#emit({
               type: "message",
-              payload: { protocol_version: 1, kind: "remote_action_result", action_id: actionId, ...result },
+              payload: { protocol_version: RELAY_PROTOCOL_VERSION, kind: "remote_action_result", action_id: actionId, ...result },
             });
           }
           #emit(frame) {
@@ -437,7 +443,7 @@ async function main() {
     const bellOn = () =>
       page.evaluate(() =>
         Boolean(
-          document.querySelector("#remote-sidebar-bell-toggle")?.classList.contains("is-active")
+          document.querySelector(".sidebar-bell-toggle")?.classList.contains("is-active")
         )
       );
     // Never blind-toggle: read the control, then act. A tap that assumed the wrong
@@ -445,12 +451,12 @@ async function main() {
     // several assertions later, pointing at the wrong thing.
     const setBell = async (want) => {
       if ((await bellOn()) !== want) {
-        await page.tap("#remote-sidebar-bell-toggle");
+        await page.tap(".sidebar-bell-toggle");
         await page.waitForFunction(
           (expected) =>
             Boolean(
               document
-                .querySelector("#remote-sidebar-bell-toggle")
+                .querySelector(".sidebar-bell-toggle")
                 ?.classList.contains("is-active")
             ) === expected,
           want,
@@ -465,27 +471,24 @@ async function main() {
     // already-open menu closes it, and the option wait below would then hang for the
     // full timeout pointing at the wrong thing.
     const openSwitcherMenu = async () => {
-      await page.waitForSelector(".project-switcher-trigger", {
+      await page.waitForSelector(".sidebar .project-switcher-trigger", {
         state: "visible",
         timeout: TIMEOUT_MS,
       });
       const alreadyOpen = await page.evaluate(
         () =>
-          document.querySelector(".project-switcher-trigger")?.getAttribute("aria-expanded")
+          document.querySelector(".sidebar .project-switcher-trigger")?.getAttribute("aria-expanded")
           === "true"
       );
       if (!alreadyOpen) {
-        await page.tap(".project-switcher-trigger");
+        await page.tap(".sidebar .project-switcher-trigger");
       }
-      await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
+      await page.waitForSelector(".sidebar .project-switcher-menu", { timeout: TIMEOUT_MS });
     };
 
     const chooseSwitcherOption = async (label) => {
       await openSwitcherMenu();
-      await page
-        .locator(".project-switcher-option", { hasText: new RegExp(`^${label}$`) })
-        .first()
-        .tap({ timeout: TIMEOUT_MS });
+      await projectSwitcherOption(page, label, { scope: ".sidebar" }).tap({ timeout: TIMEOUT_MS });
       // Settle on the CHIP, not on a timer: the menu closes immediately while the list
       // regroups a render later. The trigger is an icon now and says nothing, so the
       // chip is the only thing that reports which project is pinned.
@@ -514,7 +517,7 @@ async function main() {
     // 960px and only re-shown for `.remote-app-shell` — a CSS edit could remove the only
     // entry point on a phone while every other test still passed.
     const bellBox = await page.evaluate(() => {
-      const button = document.querySelector("#remote-sidebar-bell-toggle");
+      const button = document.querySelector(".sidebar-bell-toggle");
       if (!button) return null;
       const rect = button.getBoundingClientRect();
       const style = getComputedStyle(button);
@@ -548,7 +551,7 @@ async function main() {
     // 2. Turning it on buckets by state and drops the idle row.
     await setBell(true);
     console.error("after click:", JSON.stringify(await page.evaluate(() => ({
-      active: document.querySelector("#remote-sidebar-bell-toggle")?.classList.contains("is-active"),
+      active: document.querySelector(".sidebar-bell-toggle")?.classList.contains("is-active"),
       groups: [...document.querySelectorAll("#remote-threads-list .thread-group-name")].map((n) => n.textContent.trim()),
       rows: [...document.querySelectorAll("#remote-threads-list .conversation-item")].map((n) => n.dataset.threadId),
     }))));
@@ -726,7 +729,7 @@ async function main() {
       await page.setViewportSize({ width, height: 844 });
       await openSwitcherMenu();
       const box = await page.evaluate(() => {
-        const menu = document.querySelector(".project-switcher-menu");
+        const menu = document.querySelector(".sidebar .project-switcher-menu");
         const drawer = document.querySelector(".remote-app-shell .sidebar");
         const m = menu.getBoundingClientRect();
         const d = drawer.getBoundingClientRect();
@@ -739,7 +742,7 @@ async function main() {
       );
       // Escape rather than a blind tap: the trigger may be under the open menu.
       await page.keyboard.press("Escape");
-      await page.waitForSelector(".project-switcher-menu", { state: "detached", timeout: TIMEOUT_MS });
+      await page.waitForSelector(".sidebar .project-switcher-menu", { state: "detached", timeout: TIMEOUT_MS });
     }
     await page.setViewportSize(MOBILE_VIEWPORT);
 
@@ -809,7 +812,7 @@ async function main() {
     }
     assert.equal(
       await page.evaluate(() =>
-        document.querySelector(".project-switcher-trigger")?.classList.contains("is-active")
+        document.querySelector(".sidebar .project-switcher-trigger")?.classList.contains("is-active")
       ),
       false,
       "and the icon must not stay lit for a project that no longer exists"
@@ -835,8 +838,8 @@ async function main() {
     // list is truncated before it ever reaches the device, so a client-side filter could
     // only ever search the page already on screen.
     await setBell(false);
-    await page.tap("#remote-sidebar-search-toggle");
-    await page.waitForSelector("#remote-sidebar-search-input", {
+    await page.tap(".sidebar-search-toggle");
+    await page.waitForSelector(".sidebar-search-input", {
       state: "visible",
       timeout: TIMEOUT_MS,
     });
@@ -844,14 +847,14 @@ async function main() {
     // which is exactly what hid a controlled input bound to the debounced query — real
     // typing had React restore the old value after every keystroke, so a word ended up
     // searching for its last letter.
-    await page.locator("#remote-sidebar-search-input").pressSequentially("Quiet", { delay: 60 });
+    await page.locator(".sidebar-search-input").pressSequentially("Quiet", { delay: 60 });
     await page.waitForFunction(
-      () => document.querySelector("#remote-sidebar-search-input")?.value === "Quiet",
+      () => document.querySelector(".sidebar-search-input")?.value === "Quiet",
       undefined,
       { timeout: TIMEOUT_MS }
     ).catch(async () => {
       throw new Error(
-        `the field lost characters while typing: ${await page.inputValue("#remote-sidebar-search-input")}`
+        `the field lost characters while typing: ${await page.inputValue(".sidebar-search-input")}`
       );
     });
     await page.waitForFunction(
@@ -878,7 +881,7 @@ async function main() {
     // hide a search that had overwritten it. Counting requests pins the mechanism —
     // the list must come back from state, not from a refetch.
     const queriesBeforeClose = (await page.evaluate(() => window.__listThreadQueries)).length;
-    await page.tap("#remote-sidebar-search-toggle");
+    await page.tap(".sidebar-search-toggle");
     await page.waitForFunction((n) =>
       document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
       3,
@@ -895,12 +898,12 @@ async function main() {
     );
 
     // Reopen for the remaining search assertions.
-    await page.tap("#remote-sidebar-search-toggle");
-    await page.waitForSelector("#remote-sidebar-search-input", {
+    await page.tap(".sidebar-search-toggle");
+    await page.waitForSelector(".sidebar-search-input", {
       state: "visible",
       timeout: TIMEOUT_MS,
     });
-    await page.locator("#remote-sidebar-search-input").pressSequentially("Quiet", { delay: 40 });
+    await page.locator(".sidebar-search-input").pressSequentially("Quiet", { delay: 40 });
     await page.waitForFunction(
       (id) => {
         const rows = [...document.querySelectorAll("#remote-threads-list .conversation-item")];
@@ -938,7 +941,7 @@ async function main() {
     });
     await setBell(false);
 
-    await page.tap("#remote-sidebar-search-toggle");
+    await page.tap(".sidebar-search-toggle");
     await page.waitForFunction((n) =>
       document.querySelectorAll("#remote-threads-list .conversation-item").length === n,
       3,
@@ -977,7 +980,7 @@ async function main() {
     await chooseSwitcherOption("Alpha project");
     await openSwitcherMenu();
     await page
-      .locator(".project-switcher-option", { hasText: /^Delete project$/ })
+      .locator(".sidebar .project-switcher-option", { hasText: /^Delete project$/ })
       .first()
       .tap({ timeout: TIMEOUT_MS });
 
@@ -990,7 +993,7 @@ async function main() {
     });
     assert.equal(
       await page.evaluate(() =>
-        document.querySelector(".project-switcher-trigger")?.classList.contains("is-active")
+        document.querySelector(".sidebar .project-switcher-trigger")?.classList.contains("is-active")
       ),
       false,
       "the top-bar icon must not stay lit for a project that no longer exists"
@@ -998,7 +1001,10 @@ async function main() {
     await openSwitcherMenu();
     assert.equal(
       await page.evaluate(() =>
-        document.querySelector(".project-switcher-option.is-active")?.textContent?.trim()
+        document
+          .querySelector(".sidebar .project-switcher-option.is-active")
+          ?.querySelector(".project-switcher-option-label")
+          ?.textContent?.trim()
       ),
       "Default Workspace",
       "and the menu marks where you actually are"

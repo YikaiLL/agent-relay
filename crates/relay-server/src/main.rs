@@ -1,3 +1,5 @@
+mod acp;
+mod acp_local;
 mod auth;
 mod broker;
 mod claude;
@@ -5,13 +7,17 @@ mod codex;
 mod codex_local;
 mod fake_provider;
 mod file_changes;
+mod host_guard;
 mod instance_lock;
+mod orchestrator_tools;
 mod protocol;
 #[cfg(test)]
 mod protocol_tests;
 mod provider;
 mod state;
 mod state_paths;
+mod teams;
+mod usage;
 
 use std::{convert::Infallible, time::Duration};
 use std::{
@@ -35,42 +41,49 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::stream::{self, StreamExt};
+use host_guard::HostPolicy;
 use protocol::{
     AllowedRootsInput, AllowedRootsReceipt, ApiEnvelope, ApiError, ApplyFileChangeInput,
     ApplyFileChangeReceipt, ApprovalDecisionInput, ApprovalReceipt, AskUserAnswerReceipt,
-    AuthSessionInput, AuthSessionView, BulkRevokeDevicesReceipt, DeleteThreadInput,
-    DevicesResponse, ForkSessionInput, HealthResponse, HeartbeatInput, ModelOptionView,
+    AuthSessionInput, AuthSessionView, BulkRevokeDevicesReceipt, CommentHandBackInput,
+    CommentMutationReceipt, CommentResolveInput, CreateCommentInput, DeleteThreadInput,
+    DevicesResponse, ForkSessionInput, HealthResponse, HeartbeatInput, ListCommentsQuery,
+    ListCommentsResponse, ListReviewTicksQuery, ListReviewTicksResponse, ModelOptionView,
     PairingDecisionInput, PairingDecisionReceipt, PairingStartInput, PairingTicketView,
     ProjectActionInput, ProjectActionReceipt, ProjectsResponse, ReadThreadEntryDetailInput,
-    ReadThreadTranscriptInput, RenameThreadInput, RequestReviewInput, RequestReviewReceipt,
-    ResumeSessionInput, ReviewActionInput, ReviewDeleteReceipt, ReviewsResponse,
-    RevokeDeviceReceipt, SendMessageInput, SessionSnapshot, SessionSnapshotCompactProfile,
-    StartSessionInput, StartWorkflowInput, StartWorkflowReceipt, StopTurnInput,
-    SubmitAskUserAnswerInput, TakeOverInput, ThreadArchiveReceipt, ThreadDeleteReceipt,
-    ThreadEntryDetailResponse, ThreadRenameReceipt, ThreadTranscriptResponse, ThreadsQuery,
-    ThreadsResponse, TranscriptDeltaEvent, UpdateSessionSettingsInput, WatchThreadsInput,
-    WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse, WorkspaceDiffResponse,
+    ReadThreadTranscriptInput, RenameThreadInput, RepairWorkspaceInput, RequestReviewInput,
+    RequestReviewReceipt, ResolvedWorkspace, ResumeSessionInput, ReviewActionInput,
+    ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
+    SessionSnapshotCompactProfile, StartSessionInput, StartTeamInput, StartTeamReceipt,
+    StartWorkflowInput, StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput,
+    TakeOverInput, TeamActionInput, TeamActionReceipt, TeamFileResponse, TeamsResponse,
+    ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt,
+    ThreadSettingsView, ThreadTranscriptResponse, ThreadWorkspaceInput, ThreadsQuery,
+    ThreadsResponse, TickReviewFileInput, TranscriptDeltaEvent, UpdateSessionSettingsInput,
+    WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse,
+    WorkspaceDiffResponse, WorkspaceGitContextView, WorkspaceTrustInput, WorkspaceTrustReceipt,
 };
 use provider::ProviderImage;
 use relay_http::{
-    apply_standard_security_headers, header_origin, parse_optional_string_env, request_origin,
-    request_uses_https, SecurityHeadersConfig,
+    apply_standard_security_headers, parse_optional_string_env, request_origin, request_uses_https,
+    SecurityHeadersConfig,
 };
 use serde::Deserialize;
-use state::{AppState, ApprovalError, AskUserAnswerError};
+use state::{AppState, ApprovalError, AskUserAnswerError, TeamAction2};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use tracing::{info, warn};
 
-#[cfg(test)]
 use axum::http::HeaderValue;
 
 const CSP_CONNECT_SRC_ENV: &str = "RELAY_CSP_CONNECT_SRC";
 const ENABLE_HSTS_ENV: &str = "RELAY_ENABLE_HSTS";
 const HSTS_VALUE_ENV: &str = "RELAY_HSTS_VALUE";
 const LAUNCH_ID_ENV: &str = "SEALWIRE_LAUNCH_ID";
+/// Set by `sealwire --beta`.
+const SEALWIRE_BETA_ENV: &str = "SEALWIRE_BETA";
 const WEB_ROOT_ENV: &str = "RELAY_WEB_ROOT";
 const CSRF_HEADER_NAME: &str = "x-agent-relay-csrf";
 const CSRF_HEADER_VALUE: &str = "1";
@@ -98,6 +111,7 @@ struct AppContext {
     auth: AuthConfig,
     launch_id: Option<String>,
     security_headers: SecurityHeadersConfig,
+    host_policy: HostPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,19 +126,31 @@ struct ThreadEntryDetailQuery {
     cursor: Option<usize>,
 }
 
+/// `device_id` for a plain thread-addressed read. Optional so the local surface
+/// can call without one; `thread_settings_view` scopes on whatever it gets.
+#[derive(Debug, Deserialize)]
+struct DeviceQuery {
+    device_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkspaceDiffQuery {
-    /// The session the client is *viewing*. Absent → the global/active workspace
-    /// (legacy behavior). Present → diff that session's own workspace.
+    /// Viewed session; absent = global/active cwd.
     thread_id: Option<String>,
-    /// Which working tree to diff. Absent → the session's own cwd. Present → must be
-    /// one of the roots enumerated for that session's repo, else it fails closed.
-    root: Option<String>,
-    /// Opt in to landing on `suggested_root` (where this thread has actually been
-    /// writing) instead of its own cwd. The client sends this once per thread switch,
-    /// so the panel never re-targets itself underneath a reader.
+    /// Diff preview; must be an enumerated root. Does not pin the session.
+    view_root: Option<String>,
+}
+
+/// Session workspace (not a free path — that is `/api/workspace/git-context`).
+#[derive(Debug, Deserialize)]
+struct ThreadWorkspaceQuery {
+    thread_id: String,
+    /// Optional; local operator has no device identity.
+    device_id: Option<String>,
+    /// Off by default because it costs a `git status` per worktree: only the open
+    /// picker, which actually shows the numbers, asks.
     #[serde(default)]
-    auto_root: bool,
+    roots_status: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +204,8 @@ async fn main() {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
     let auth = AuthConfig::from_env_for_bind_host(host)
         .unwrap_or_else(|error| panic!("relay-server auth config is invalid: {error}"));
+    let host_policy = HostPolicy::from_env_for_bind_host(host)
+        .unwrap_or_else(|error| panic!("relay-server host allowlist is invalid: {error}"));
     let security_headers = security_headers_from_env()
         .unwrap_or_else(|error| panic!("relay-server security header config is invalid: {error}"));
     if auth.enabled() {
@@ -252,6 +280,32 @@ async fn main() {
     let state = AppState::new()
         .await
         .expect("failed to initialize Codex app-server bridge");
+    // Register the private orchestration engines, when this build has them. The
+    // engines take the state as their `RelayPort`; the registry goes onto the
+    // clone everything downstream uses, so it must be installed before the state
+    // is shared. Without the feature there is simply no engine, and every guard
+    // that asks the registry a question gets the "nothing is running" answer.
+    #[cfg(feature = "private")]
+    let state = {
+        let task_list = std::sync::Arc::new(sealwire_private::TaskListEngine::new(state.clone()));
+        let team = std::sync::Arc::new(sealwire_private::TeamEngine::default());
+        state
+            .with_orchestrators(vec![task_list])
+            .with_team_driver(team)
+            .with_private_review_anchors(std::sync::Arc::new(sealwire_private::ReviewAnchorsImpl))
+    };
+
+    // Needs BOTH the user's opt-in and a build that can run the feature: on the
+    // flag alone a stub build gets a live Task screen wired to an engine that is
+    // not there.
+    let beta_features_enabled = parse_optional_bool_env(SEALWIRE_BETA_ENV)
+        .unwrap_or_else(|error| panic!("invalid {SEALWIRE_BETA_ENV}: {error}"))
+        && cfg!(feature = "private");
+    state.set_beta_features_enabled(beta_features_enabled).await;
+    if beta_features_enabled {
+        info!("beta features are ON for this launch (SEALWIRE_BETA)");
+    }
+
     let web_assets = default_web_assets();
     log_web_assets(&web_assets);
     let context = AppContext {
@@ -261,6 +315,7 @@ async fn main() {
             .ok()
             .filter(|value| !value.is_empty()),
         security_headers,
+        host_policy,
     };
     let app = build_router(context, web_assets);
     let address = SocketAddr::from((host, port));
@@ -290,6 +345,31 @@ async fn main() {
 fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
     let router = Router::new()
         .route("/api/health", get(health))
+        .route("/api/usage", get(usage_report))
+        .route("/api/teams", get(team_catalog))
+        .route("/api/orchestrator/ensure", post(ensure_orchestrator))
+        .route("/api/orchestrator/reset", post(reset_orchestrator))
+        .route(
+            "/api/orchestrator/proposals",
+            post(propose_orchestrator_task),
+        )
+        .route(
+            "/api/orchestrator/proposals/:proposal_id/confirm",
+            post(confirm_orchestrator_proposal),
+        )
+        .route("/api/orchestrator/tools", get(list_orchestrator_tools))
+        .route(
+            "/api/orchestrator/tools/:tool_name/call",
+            post(call_orchestrator_tool),
+        )
+        .route(
+            "/api/orchestrator/proposals/:proposal_id/revise",
+            post(revise_orchestrator_proposal),
+        )
+        .route(
+            "/api/orchestrator/proposals/:proposal_id/dismiss",
+            post(dismiss_orchestrator_proposal),
+        )
         .route("/api/providers", get(list_providers))
         .route("/api/providers/:provider/models", get(list_provider_models))
         .route(
@@ -300,6 +380,12 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         )
         .route("/api/session", get(session_snapshot))
         .route("/api/workspace/diff", get(workspace_diff))
+        .route("/api/workspace/git-context", get(workspace_git_context))
+        .route(
+            "/api/thread/workspace",
+            get(thread_workspace).post(pin_thread_workspace),
+        )
+        .route("/api/threads/:thread_id/settings", get(thread_settings))
         .route("/api/stream", get(session_stream))
         .route("/api/threads", get(list_threads))
         .route("/api/threads/:thread_id/transcript", get(thread_transcript))
@@ -308,8 +394,14 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             get(thread_entry_detail),
         )
         .route("/api/allowed-roots", post(update_allowed_roots))
+        .route("/api/usage/budget", post(update_usage_budget))
+        .route("/api/workspace/trust", post(set_workspace_trust))
         .route("/api/projects", get(fetch_projects).post(project_action))
         .route("/api/devices", get(list_devices))
+        .route(
+            "/api/threads/:thread_id/workspace/repair",
+            post(repair_thread_workspace),
+        )
         .route("/api/threads/:thread_id/rename", post(rename_thread))
         .route("/api/threads/:thread_id/archive", post(archive_thread))
         .route(
@@ -341,6 +433,25 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/session/workflow/resolve", post(resolve_workflow))
         .route("/api/session/reviews", get(list_reviews))
         .route("/api/session/workflows", get(list_workflows))
+        .route("/api/session/team", post(start_team))
+        .route("/api/session/team/pause", post(pause_team))
+        .route("/api/session/team/stop", post(stop_team))
+        .route("/api/session/team/cancel", post(cancel_team))
+        .route("/api/session/team/resume", post(resume_team))
+        .route("/api/session/team/resolve", post(resolve_team))
+        .route("/api/session/teams", get(list_teams))
+        .route("/api/session/team/diff", get(team_diff))
+        .route("/api/session/team/file", get(team_file))
+        .route("/api/comments", get(list_comments).post(create_comment))
+        .route("/api/comments/:comment_id/resolve", post(resolve_comment))
+        .route(
+            "/api/comments/:comment_id/hand-back",
+            post(hand_back_comment),
+        )
+        .route(
+            "/api/review-ticks",
+            get(list_review_ticks).post(tick_review_file),
+        )
         .route(
             "/api/session/reviews/:review_id/delete",
             post(delete_review),
@@ -370,6 +481,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
             .nest_service("/static", ServeDir::new(web_root)),
     };
 
+    let host_policy_context = context.clone();
     router
         .with_state(context.clone())
         .layer(middleware::from_fn_with_state(
@@ -382,6 +494,12 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         ))
         .layer(middleware::from_fn(with_cache_headers))
         .layer(TraceLayer::new_for_http())
+        // Outermost on purpose: a request addressed to a hostname we do not
+        // answer to should never reach routing, a handler, or the body reader.
+        .layer(middleware::from_fn_with_state(
+            host_policy_context,
+            with_host_allowlist,
+        ))
 }
 
 /// Cache policy for the static web surface. Without this the HTML shell is served
@@ -498,6 +616,206 @@ async fn health(State(context): State<AppContext>) -> Json<ApiEnvelope<HealthRes
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct UsageReportQuery {
+    since: u64,
+    until: u64,
+    #[serde(default = "default_usage_bucket")]
+    bucket: String,
+    compare: Option<String>,
+}
+
+fn default_usage_bucket() -> String {
+    "day".to_string()
+}
+
+async fn usage_report(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<UsageReportQuery>,
+) -> Result<Json<ApiEnvelope<crate::usage::report::UsageReport>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .usage_report(
+            query.since,
+            query.until,
+            &query.bucket,
+            query.compare.as_deref(),
+        )
+        .await
+        .map(|report| Json(ApiEnvelope::ok(report)))
+        .map_err(bad_request)
+}
+
+async fn team_catalog(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<crate::teams::TeamCatalogReport>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.team_catalog().await)))
+}
+
+async fn ensure_orchestrator(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<crate::protocol::EnsureOrchestratorInput>,
+) -> Result<
+    Json<ApiEnvelope<crate::protocol::EnsureOrchestratorReceipt>>,
+    (StatusCode, Json<ApiError>),
+> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .ensure_orchestrator(input.device_id)
+        .await
+        .map(|thread_id| {
+            Json(ApiEnvelope::ok(
+                crate::protocol::EnsureOrchestratorReceipt { thread_id },
+            ))
+        })
+        .map_err(bad_request)
+}
+
+/// Retire the pinned Orchestrator and open a fresh one.
+///
+/// Separate from `ensure` on purpose: `ensure` is idempotent and must stay so —
+/// every Tasks open calls it. This is the one that throws the old thread away, so
+/// it takes a deliberate press rather than riding on a screen load.
+async fn reset_orchestrator(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<crate::protocol::EnsureOrchestratorInput>,
+) -> Result<
+    Json<ApiEnvelope<crate::protocol::EnsureOrchestratorReceipt>>,
+    (StatusCode, Json<ApiError>),
+> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .reset_orchestrator(input.device_id)
+        .await
+        .map(|thread_id| {
+            Json(ApiEnvelope::ok(
+                crate::protocol::EnsureOrchestratorReceipt { thread_id },
+            ))
+        })
+        .map_err(bad_request)
+}
+
+async fn propose_orchestrator_task(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<crate::protocol::ProposeOrchestratorTaskInput>,
+) -> Result<
+    Json<ApiEnvelope<crate::protocol::ProposeOrchestratorTaskReceipt>>,
+    (StatusCode, Json<ApiError>),
+> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .propose_orchestrator_task(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+async fn confirm_orchestrator_proposal(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(proposal_id): Path<String>,
+    Json(input): Json<crate::protocol::ConfirmOrchestratorProposalInput>,
+) -> Result<Json<ApiEnvelope<crate::protocol::StartTeamReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .confirm_orchestrator_proposal(&proposal_id, input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+#[derive(serde::Deserialize)]
+struct OrchestratorToolCallInput {
+    #[serde(default)]
+    arguments: serde_json::Value,
+    #[serde(default)]
+    device_id: Option<String>,
+}
+
+async fn list_orchestrator_tools(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    let tools = context.app.list_orchestrator_tools().await;
+    Ok(Json(ApiEnvelope::ok(serde_json::json!({ "tools": tools }))))
+}
+
+/// A refused tool call is a 200 carrying `isError`, not a 4xx.
+///
+/// MCP models a tool that says no as a RESULT — the model reads the reason and
+/// corrects itself. Mapping it to an HTTP error would surface to the model as a
+/// transport failure, which it can only respond to by retrying the same call.
+async fn call_orchestrator_tool(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(tool_name): Path<String>,
+    Json(input): Json<OrchestratorToolCallInput>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    let outcome = context
+        .app
+        .call_orchestrator_tool(&tool_name, &input.arguments, input.device_id)
+        .await;
+    Ok(Json(
+        crate::state::app::orchestrator_dispatch::tool_result_envelope(outcome),
+    ))
+}
+
+async fn revise_orchestrator_proposal(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(proposal_id): Path<String>,
+    Json(input): Json<crate::protocol::ReviseOrchestratorProposalInput>,
+) -> Result<
+    Json<ApiEnvelope<crate::protocol::ProposeOrchestratorTaskReceipt>>,
+    (StatusCode, Json<ApiError>),
+> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .revise_orchestrator_proposal(&proposal_id, input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+async fn dismiss_orchestrator_proposal(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(proposal_id): Path<String>,
+    Json(input): Json<crate::protocol::DismissOrchestratorProposalInput>,
+) -> Result<Json<ApiEnvelope<()>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .dismiss_orchestrator_proposal(&proposal_id, input)
+        .await
+        .map(|()| Json(ApiEnvelope::ok(())))
+        .map_err(bad_request)
+}
+
 async fn list_providers(State(context): State<AppContext>) -> Json<ApiEnvelope<Vec<String>>> {
     Json(ApiEnvelope::ok(context.app.available_providers()))
 }
@@ -591,10 +909,89 @@ async fn workspace_diff(
     authorize_api(&context, &headers, &uri)?;
     context
         .app
-        .workspace_diff(None, query.thread_id, query.root, query.auto_root)
+        .workspace_diff(None, query.thread_id, query.view_root)
         .await
         .map(|response| Json(ApiEnvelope::ok(response)))
         .map_err(|error| classify_session_error(error))
+}
+
+/// `cwd` is required and caller-supplied: no fallback to the relay's active cwd,
+/// because answering about a different directory is worse than an error.
+#[derive(Debug, Deserialize)]
+struct WorkspaceGitContextQuery {
+    cwd: String,
+}
+
+async fn workspace_git_context(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<WorkspaceGitContextQuery>,
+) -> Result<Json<ApiEnvelope<WorkspaceGitContextView>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .workspace_git_context(None, query.cwd)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        // Both failures are the caller's, so 400. `classify_session_error` would file
+        // the scope refusal as `bad_gateway` — a client mistake reported as ours.
+        .map_err(bad_request)
+}
+
+/// Resolved working tree for this session.
+async fn thread_workspace(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<ThreadWorkspaceQuery>,
+) -> Result<Json<ApiEnvelope<ResolvedWorkspace>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    let mut resolved = context
+        .app
+        .resolve_thread_workspace(&query.thread_id, query.device_id.as_deref())
+        .await
+        .map_err(|error| bad_request(error.into_message()))?;
+    if query.roots_status {
+        // After resolution, so the measured set is exactly the device-scoped roots the
+        // picker will offer — never a tree this caller may not see.
+        state::app::measure_root_changes(&context.app, &mut resolved.roots).await;
+    }
+    Ok(Json(ApiEnvelope::ok(resolved)))
+}
+
+/// Pin (`cwd`) or un-pin (`cwd: null`); response is the re-resolved state.
+async fn pin_thread_workspace(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<ThreadWorkspaceInput>,
+) -> Result<Json<ApiEnvelope<ResolvedWorkspace>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .pin_thread_workspace(input)
+        .await
+        .map(|resolved| Json(ApiEnvelope::ok(resolved)))
+        .map_err(bad_request)
+}
+
+/// What a fork of this thread would inherit. Read-only, in-memory, and scoped to
+/// the thread's own workspace by `thread_settings_view`.
+async fn thread_settings(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+    Query(query): Query<DeviceQuery>,
+) -> Result<Json<ApiEnvelope<ThreadSettingsView>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .thread_settings_view(query.device_id, &thread_id)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        .map_err(bad_request)
 }
 
 /// Query for `/api/stream`. `device_id` identifies the surface so its declared thread
@@ -742,7 +1139,7 @@ async fn list_threads(
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     context
         .app
-        .list_threads_matching(limit, None, query.q.as_deref())
+        .list_threads_matching(limit, None, query.q.as_deref(), None)
         .await
         .map(|threads| Json(ApiEnvelope::ok(threads)))
         .map_err(bad_gateway)
@@ -789,6 +1186,38 @@ async fn thread_entry_detail(
         .await
         .map(|detail| Json(ApiEnvelope::ok(detail)))
         .map_err(|error| classify_session_error(error))
+}
+
+/// POST, so the CSRF layer covers it — and there is deliberately no broker action
+/// alongside it, which is what keeps the grant a local act.
+async fn set_workspace_trust(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<WorkspaceTrustInput>,
+) -> Result<Json<ApiEnvelope<WorkspaceTrustReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .set_workspace_trust(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+async fn update_usage_budget(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<crate::protocol::UsageBudgetInput>,
+) -> Result<Json<ApiEnvelope<crate::protocol::UsageBudgetReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .update_usage_budget(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
 }
 
 async fn update_allowed_roots(
@@ -863,6 +1292,29 @@ async fn rename_thread(
         // Every failure here is a rejected REQUEST (name too long, reviewer thread,
         // limit reached) — the rename never touches a provider, so there is no upstream
         // to blame with a 502.
+        .map_err(bad_request)
+}
+
+/// Re-create a thread's vanished workspace, then hand back the fresh snapshot so the
+/// caller's banner turns back into a composer without a second round trip.
+async fn repair_thread_workspace(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(thread_id): Path<String>,
+    // Optional body: the repair carries no choices (the recorded path is the only one
+    // that can work), so an absent body is a complete request, not a degraded one.
+    body: Option<Json<RepairWorkspaceInput>>,
+) -> Result<Json<ApiEnvelope<SessionSnapshot>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    let input = body.map(|Json(input)| input).unwrap_or_default();
+    context
+        .app
+        .repair_thread_workspace(&thread_id, input)
+        .await
+        .map(|snapshot| Json(ApiEnvelope::ok(snapshot)))
+        // Nothing upstream is involved — this creates a directory (or runs `git worktree
+        // add`) on this host. A failure is this request's, so it is never a 502.
         .map_err(bad_request)
 }
 
@@ -1165,6 +1617,245 @@ async fn list_workflows(
 ) -> Result<Json<ApiEnvelope<WorkflowsResponse>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
     Ok(Json(ApiEnvelope::ok(context.app.workflows(None).await)))
+}
+
+async fn start_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<StartTeamInput>,
+) -> Result<Json<ApiEnvelope<StartTeamReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .start_team(input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+/// The five whole-run actions share one body; only the verb differs.
+async fn team_action(
+    context: AppContext,
+    headers: HeaderMap,
+    uri: Uri,
+    action: TeamAction2,
+    input: TeamActionInput,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .team_action(action, input)
+        .await
+        .map(|receipt| Json(ApiEnvelope::ok(receipt)))
+        .map_err(bad_request)
+}
+
+async fn pause_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Pause, input).await
+}
+
+async fn stop_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Stop, input).await
+}
+
+async fn cancel_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Cancel, input).await
+}
+
+async fn resume_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Resume, input).await
+}
+
+async fn resolve_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamActionInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    team_action(context, headers, uri, TeamAction2::Resolve, input).await
+}
+
+async fn list_teams(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<ApiEnvelope<TeamsResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    Ok(Json(ApiEnvelope::ok(context.app.teams().await)))
+}
+
+/// Query for `/api/session/team/diff`.
+///
+/// `base` is a key from the response's own `bases` list rather than a ref or a
+/// commit: a caller-supplied revision would be an argument to `git` chosen by
+/// whoever can reach the route, and the useful answers are all named already.
+#[derive(Debug, Deserialize)]
+struct TeamDiffQuery {
+    team_run_id: Option<String>,
+    /// Omitted = against the target branch, which is the question people ask.
+    base: Option<String>,
+    device_id: Option<String>,
+}
+
+/// Query for `/api/session/team/file`.
+#[derive(Debug, Deserialize)]
+struct TeamFileQuery {
+    team_run_id: Option<String>,
+    base: Option<String>,
+    path: String,
+    side: String,
+    device_id: Option<String>,
+}
+
+/// What a task team changed, against a base the caller picks.
+async fn team_diff(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<TeamDiffQuery>,
+) -> Result<Json<ApiEnvelope<crate::protocol::TeamDiffResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .team_diff(query.team_run_id.as_deref(), query.base, query.device_id)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        .map_err(bad_request)
+}
+
+/// One file from a task worktree or its diff base.
+async fn team_file(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<TeamFileQuery>,
+) -> Result<Json<ApiEnvelope<TeamFileResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .team_file(
+            query.team_run_id.as_deref(),
+            query.base,
+            query.path,
+            query.side,
+            query.device_id,
+        )
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        .map_err(bad_request)
+}
+
+async fn list_comments(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<ListCommentsQuery>,
+) -> Result<Json<ApiEnvelope<ListCommentsResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .list_review_comments(query.scope, query.device_id)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        .map_err(bad_request)
+}
+
+async fn create_comment(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<CreateCommentInput>,
+) -> Result<Json<ApiEnvelope<CommentMutationReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .create_review_comment(input)
+        .await
+        .map(|comment| Json(ApiEnvelope::ok(CommentMutationReceipt { comment })))
+        .map_err(bad_request)
+}
+
+async fn resolve_comment(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(comment_id): Path<String>,
+    Json(input): Json<CommentResolveInput>,
+) -> Result<Json<ApiEnvelope<CommentMutationReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .resolve_review_comment(comment_id, input)
+        .await
+        .map(|comment| Json(ApiEnvelope::ok(CommentMutationReceipt { comment })))
+        .map_err(bad_request)
+}
+
+async fn hand_back_comment(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(comment_id): Path<String>,
+    Json(input): Json<CommentHandBackInput>,
+) -> Result<Json<ApiEnvelope<CommentMutationReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .hand_back_review_comment(comment_id, input)
+        .await
+        .map(|comment| Json(ApiEnvelope::ok(CommentMutationReceipt { comment })))
+        .map_err(bad_request)
+}
+
+async fn list_review_ticks(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<ListReviewTicksQuery>,
+) -> Result<Json<ApiEnvelope<ListReviewTicksResponse>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .list_review_ticks(query)
+        .await
+        .map(|response| Json(ApiEnvelope::ok(response)))
+        .map_err(bad_request)
+}
+
+async fn tick_review_file(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TickReviewFileInput>,
+) -> Result<Json<ApiEnvelope<relay_api::FileReviewTickView>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    context
+        .app
+        .tick_review_file(input)
+        .await
+        .map(|tick| Json(ApiEnvelope::ok(tick)))
+        .map_err(bad_request)
 }
 
 async fn list_devices(
@@ -1647,6 +2338,50 @@ async fn with_security_headers(
     response
 }
 
+/// Refuse any request addressed to a hostname this process does not answer to.
+///
+/// This is the DNS-rebinding guard. It cannot be expressed as an `Origin`
+/// check: after a rebind the attacker's page sends `Host: evil.example` AND
+/// `Origin: http://evil.example`, and since the expected origin is *derived*
+/// from `Host` those two agree. Only pinning the hostname breaks the loop.
+async fn with_host_allowlist(
+    State(context): State<AppContext>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (allowed, host) = {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| request.uri().authority().map(|value| value.as_str()));
+        (
+            context.host_policy.allows_host(host),
+            host.unwrap_or("<none>").to_string(),
+        )
+    };
+
+    if !allowed {
+        // Without this the symptom of a legitimate custom hostname (a hosts-file
+        // alias, a local reverse proxy) is an unexplained 421 on every request.
+        warn!(
+            "refused a request addressed to Host `{host}`; \
+             set {} to add it if this hostname is yours",
+            host_guard::ALLOWED_HOSTS_ENV
+        );
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            Json(ApiError::new(
+                "host_not_allowed",
+                "This relay only answers to its own local hostnames.".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
 async fn with_csrf_protection(
     State(context): State<AppContext>,
     request: Request,
@@ -1670,27 +2405,56 @@ fn authorize_csrf_protection(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
-    if !uri.path().starts_with("/api/") || method_is_safe(method) || !auth.enabled() {
+    if !uri.path().starts_with("/api/") || method_is_safe(method) {
         return Ok(());
     }
 
-    if auth.authenticates_with_bearer(headers) || !auth.authenticates_with_cookie(headers) {
+    // A bearer token is not ambient authority: a hostile page cannot read it,
+    // so it cannot be replayed through a confused deputy.
+    if auth.authenticates_with_bearer(headers) {
         return Ok(());
     }
 
-    if !has_valid_csrf_header(headers) {
-        return Err(forbidden_csrf(
-            "Cookie-authenticated requests must include X-Agent-Relay-CSRF.",
-        ));
+    if auth.enabled() && auth.authenticates_with_cookie(headers) {
+        // Cookie credentials ARE ambient. Demand the custom header (which a
+        // cross-origin page cannot set without a preflight this server never
+        // grants) *and* a trusted origin.
+        if !has_valid_csrf_header(headers) {
+            return Err(forbidden_csrf(
+                "Cookie-authenticated requests must include X-Agent-Relay-CSRF.",
+            ));
+        }
+
+        return match classify_request_origin(headers, uri) {
+            RequestOrigin::Trusted => Ok(()),
+            _ => Err(forbidden_csrf(
+                "Cookie-authenticated requests must come from the same Origin or Referer.",
+            )),
+        };
     }
 
-    if request_is_same_origin(headers, uri) {
+    if auth.enabled() {
+        // Authenticated by neither cookie nor bearer: `authorize_api` turns
+        // this away on its own merits, and doing it there keeps the 401/403
+        // distinction honest.
         return Ok(());
     }
 
-    Err(forbidden_csrf(
-        "Cookie-authenticated requests must come from the same Origin or Referer.",
-    ))
+    // No token configured — the laptop default, and the case the old
+    // `!auth.enabled()` short-circuit skipped entirely. Every caller is
+    // ambiently authorized here, so the browser check has to apply.
+    //
+    // Judging on a *declared* origin (rather than demanding one) is what keeps
+    // this from breaking every non-browser client: curl, the Node e2e scripts
+    // and the Tauri shell declare no origin, while a browser always attaches
+    // one to a cross-site mutating request — including the CORS-simple form
+    // posts that reach the body-less revoke routes.
+    match classify_request_origin(headers, uri) {
+        RequestOrigin::Untrusted => Err(forbidden_csrf(
+            "Cross-origin requests are refused on the local API.",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn method_is_safe(method: &Method) -> bool {
@@ -1707,17 +2471,84 @@ fn has_valid_csrf_header(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value == CSRF_HEADER_VALUE)
 }
 
-fn request_is_same_origin(headers: &HeaderMap, uri: &Uri) -> bool {
-    let Some(expected_origin) = request_origin(headers, Some(uri)) else {
-        return false;
+/// What a request says about where it came from.
+enum RequestOrigin {
+    /// Neither `Origin` nor `Referer` was sent. A browser always declares one
+    /// on a cross-site mutating request, so this is curl, a Node script, or
+    /// the Tauri shell — not a page we could be a confused deputy for.
+    Undeclared,
+    Trusted,
+    /// Declared and not trusted. Includes an origin that is *present but names
+    /// nobody* — see the `null` case below.
+    Untrusted,
+}
+
+/// Classify the origin a request declares.
+///
+/// Two things here are load-bearing and easy to undo by accident:
+///
+/// 1. **`Origin: null` is Untrusted, not Undeclared.** That is what a browser
+///    sends from an opaque origin, and a page can arrange to be one. Note that
+///    `relay_http::header_origin` maps `null` to `None`, exactly like an absent
+///    header — so this reads the raw header rather than leaning on it.
+///    Collapsing the two would admit such a page as "not a browser".
+/// 2. **Referer is consulted only when `Origin` is absent entirely.** Origin is
+///    the authoritative statement; if it is present and opaque, a friendly
+///    Referer next to it is not a second opinion worth taking.
+fn classify_request_origin(headers: &HeaderMap, uri: &Uri) -> RequestOrigin {
+    // `.get()` is Some for a present-but-opaque header, so this falls through
+    // to Referer only when Origin was genuinely not sent.
+    let Some(raw) = headers
+        .get(header::ORIGIN)
+        .or_else(|| headers.get(header::REFERER))
+    else {
+        return RequestOrigin::Undeclared;
     };
 
-    if headers.contains_key(header::ORIGIN) {
-        return header_origin(headers, header::ORIGIN)
-            .is_some_and(|origin| origin == expected_origin);
+    let Some(declared) = declared_origin_value(raw) else {
+        return RequestOrigin::Untrusted;
+    };
+
+    if request_origin(headers, Some(uri)).is_some_and(|expected| expected == declared) {
+        return RequestOrigin::Trusted;
     }
 
-    header_origin(headers, header::REFERER).is_some_and(|origin| origin == expected_origin)
+    // A cross-port loopback origin is the vite dev proxy (`changeOrigin: true`
+    // rewrites Host, so `localhost:5173` -> `127.0.0.1:8787` is a legitimate
+    // mismatch) — but loopback is NOT a trust boundary on its own. Any other
+    // page served from this machine has a loopback origin too: a second dev
+    // server, a static server showing an untrusted file, a local tool with an
+    // XSS. The custom header is what separates them, because a cross-origin
+    // page cannot set it without a CORS preflight this server never grants.
+    // Every mutating call from the real frontend carries it already
+    // (`frontend/local/api.js` `applyCsrfHeader`).
+    let loopback = declared
+        .parse::<Uri>()
+        .ok()
+        .and_then(|value| value.authority().map(|value| value.as_str().to_string()))
+        .is_some_and(|authority| host_guard::authority_is_loopback(&authority));
+
+    if loopback && has_valid_csrf_header(headers) {
+        RequestOrigin::Trusted
+    } else {
+        RequestOrigin::Untrusted
+    }
+}
+
+/// `scheme://authority` for an `Origin`/`Referer` value, or `None` when it
+/// names no usable origin: `null`, empty, or unparseable.
+fn declared_origin_value(value: &HeaderValue) -> Option<String> {
+    let raw = value.to_str().ok()?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
+        return None;
+    }
+
+    let parsed = raw.parse::<Uri>().ok()?;
+    Some(format!(
+        "{}://{}",
+        parsed.scheme_str()?,
+        parsed.authority()?
+    ))
 }
 
 fn forbidden_csrf(message: impl Into<String>) -> (StatusCode, Json<ApiError>) {

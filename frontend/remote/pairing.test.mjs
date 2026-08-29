@@ -114,15 +114,20 @@ test("expired pairing link is rejected locally with a clear QR renewal message",
   );
 });
 
-test("expired pairing result from relay is translated into a clear QR renewal message", async () => {
+test("an expired attempt's result is discarded by the handler; the gate owns the message", async () => {
+  // This used to assert the handler itself translated an expired result into the QR
+  // renewal message. The policy now lives one layer up: the socket gate drops every frame
+  // on an expired attempt and calls `retirePairing(expiredPairingMessage())`, so the
+  // user-facing guarantee is unchanged but is covered by
+  // `broker-client.test.mjs` → "a pairing ticket that expires after the socket opens
+  // retires that socket, not the old session". Keeping the handler in step with the gate
+  // is what stops a test from documenting behaviour the product does not have.
   installBrowserStubs();
   const { handleEncryptedPairingResult } = await import("./pairing.js");
   const { encryptJson } = await import("./crypto.js");
   const { state } = await import("./state.js");
 
-  seedSocketState(state, {
-    socketPeerId: "surface-expired",
-  });
+  seedSocketState(state, { socketPeerId: "surface-expired" });
   seedPairingState(state, {
     pairingPhase: "requesting",
     pairingTicket: {
@@ -147,11 +152,12 @@ test("expired pairing result from relay is translated into a clear QR renewal me
     envelope,
   });
 
-  assert.equal(state.pairingPhase, "error");
-  assert.match(
-    state.pairingError,
-    /QR code or pairing link has expired.*Generate a new QR code/i
+  assert.equal(
+    state.pairingPhase,
+    "requesting",
+    "the handler must discard it, leaving the gate as the single place that retires"
   );
+  assert.equal(state.pairingError, null);
 });
 
 test("forgeting one relay does not clear the broker-wide client session cookie", async () => {
@@ -359,4 +365,76 @@ test("forgetting the last relay on a broker still clears its device session", as
     true,
     "forgetting the only relay on a broker should still clear its device session"
   );
+});
+
+test("a retired pairing ignores late results, but a merely-expired one still surfaces its reason", async () => {
+  // Guard-placement regression: gating this handler on `hasActivePairing()` looks like
+  // the tidy unification, but an expired ticket is not "active" — and a result arriving
+  // for it is the relay saying WHY pairing failed. Dropping it strands the user on a
+  // "requesting" spinner with the explanation only in the logs. A ticket that has
+  // already been retired is the only one with nothing left to learn.
+  installBrowserStubs();
+  const { handleEncryptedPairingResult } = await import("./pairing.js");
+  const { encryptJson } = await import("./crypto.js");
+  const { state } = await import("./state.js");
+
+  const secret = "late-result-secret";
+  const ticket = {
+    pairing_id: "pair-late",
+    pairing_secret: secret,
+    broker_url: "ws://192.168.1.47:8788",
+    broker_channel_id: "dev-room",
+    relay_peer_id: "local-relay",
+    security_mode: "private",
+    expires_at: Math.floor(Date.now() / 1000) - 1,
+  };
+  const envelope = await encryptJson(secret, {
+    ok: false,
+    error: "pairing request was rejected on the local relay",
+  });
+  const frame = {
+    pairing_id: ticket.pairing_id,
+    target_peer_id: "surface-late",
+    envelope,
+  };
+
+  // Already retired: nothing should change.
+  seedSocketState(state, { socketPeerId: "surface-late" });
+  seedPairingState(state, {
+    pairingPhase: "error",
+    pairingError: "the original reason",
+    pairingRetired: true,
+    pairingTicket: ticket,
+  });
+  await handleEncryptedPairingResult(frame);
+  assert.equal(
+    state.pairingError,
+    "the original reason",
+    "a late result must not overwrite the reason the pairing was already retired for"
+  );
+
+  // Expired but not yet retired: also discarded, matching the socket gate. The expiry
+  // message the user sees comes from `retirePairing` at that gate, not from here.
+  seedSocketState(state, { socketPeerId: "surface-late" });
+  seedPairingState(state, {
+    pairingPhase: "requesting",
+    pairingTicket: ticket,
+  });
+  await handleEncryptedPairingResult(frame);
+  assert.equal(
+    state.pairingPhase,
+    "requesting",
+    "an expired attempt's result must be discarded here too, exactly as the gate does"
+  );
+
+  // A LIVE attempt is the one whose relay reason must land.
+  seedSocketState(state, { socketPeerId: "surface-late" });
+  seedPairingState(state, {
+    pairingPhase: "requesting",
+    pairingTicket: { ...ticket, expires_at: Math.floor(Date.now() / 1000) + 120 },
+  });
+  await handleEncryptedPairingResult(frame);
+  assert.equal(state.pairingPhase, "error");
+  assert.equal(state.pairingRetired, true, "handling it must also complete retirement");
+  assert.match(state.pairingError, /rejected/i);
 });

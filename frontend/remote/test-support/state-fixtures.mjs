@@ -9,6 +9,10 @@ export function seedPairingState(state, patch = {}) {
     {
       pairingError: null,
       pairingPhase: null,
+      // Must be reset explicitly: a leftover retirement from a previous seed makes
+      // `connectionTarget` refuse the freshly seeded ticket, so the code under test
+      // silently never connects.
+      pairingRetired: false,
       pairingTicket: null,
     },
     patch

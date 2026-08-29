@@ -1,5 +1,6 @@
 # Rust
 /target
+/.claude/
 /bin
 /src-tauri/binaries/
 /src-tauri/.cache/
@@ -31,7 +32,6 @@ node_modules/
 # Local planning docs
 /markdown
 /.agent-relay
-/.githooks
 
 # Web-push VAPID private key material — never commit. The deployed key lives on
 # the Railway /data volume; the local one under /.agent-relay. Belt-and-suspenders.
@@ -47,3 +47,22 @@ node_modules/
 
 # Local design explorations / static preview mocks — not part of the app build.
 design/
+
+# Never let the private crate reach a public commit (scripts/with-private.sh).
+#
+# A whitelist of the files the stub is made of, not a list of the modules
+# the private crate happens to have today: whatever goes private next is ignored
+# here without anyone remembering to add it.
+#
+# Git cannot ignore modifications or deletions of these tracked stub files. The
+# tracked pre-commit and pre-push hooks cover that half by refusing whenever the
+# STUB marker is absent or Cargo.lock carries private dependencies.
+crates/sealwire-private/*
+!crates/sealwire-private/Cargo.toml
+!crates/sealwire-private/STUB
+!crates/sealwire-private/src/
+crates/sealwire-private/src/*
+!crates/sealwire-private/src/lib.rs
+!crates/sealwire-private/frontend/
+crates/sealwire-private/frontend/*
+!crates/sealwire-private/frontend/task-diff-react.js

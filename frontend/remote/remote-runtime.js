@@ -1,11 +1,14 @@
-import { clearClaimLifecycle, configureRemoteActions, handleRemoteBrokerPayload, recoverRemoteSession, rejectPendingActions } from "./actions.js";
+import { clearClaimLifecycle, configureRemoteActions, handleRemoteBrokerPayload, recoverRemoteSession, rejectPendingActions, resendPendingActions, suspendPendingActionDeadlines } from "./actions.js";
 import { closeBrokerSocket, configureBrokerClient, connectBroker, refreshRelayDirectory } from "./broker-client.js";
+import { replaceRemoteIdentity } from "./identity-change.js";
 import { initializeRemoteNavigation, openRemoteNavigation } from "./navigation.js";
+import { initializeRemotePointerClass } from "./pointer-mode.js";
 import { applyPairingQuery, beginPairing, forgetCurrentDevice, handleEncryptedPairingResult, sendPairingRequest } from "./pairing.js";
 import { mountIosInstallHint } from "./ios-install.js";
 import { registerRemotePwa } from "./pwa.js";
 import { renderLog } from "./session-surface.js";
-import { applyFileChange, applySessionSnapshot, applyTranscriptDelta, applyTranscriptEvent, cancelRemoteThreadSearch, cancelRemoteThreadsPoll, clearSessionRuntime, deleteRemoteReview, fetchAskUserQuestionDetail, fetchRemoteProviderModels, fetchRemoteProviders, fetchRemoteThreadTranscript, fetchTranscriptEntryDetail, forkRemoteSession, refreshRemoteThreads, requestRemoteReview, resolveRemoteReview, resolveRemoteWorkflow, resumeRemoteSession, sendMessage, startRemoteSession, startRemoteWorkflow, stopActiveTurn, submitAskUserAnswer, submitDecision, syncRemoteSnapshot, takeOverControl, updateRemoteSessionSettings, viewRemoteThread } from "./session-ops.js";
+import { sidebarGestureDebugEnabled } from "./sidebar-debug-flag.js";
+import { applyFileChange, applySessionSnapshot, applyTranscriptDelta, applyTranscriptEvent, cancelRemoteThreadSearch, cancelRemoteThreadsPoll, clearSessionRuntime, deleteRemoteReview, fetchAskUserQuestionDetail, fetchRemoteProviderModels, fetchRemoteProviders, fetchRemoteThreadTranscript, fetchTranscriptEntryDetail, forkRemoteSession, probeRemoteThreadsExist, refreshRemoteThreads, repairRemoteWorkspace, requestRemoteReview, resolveRemoteReview, resolveRemoteWorkflow, resumeRemoteSession, sendMessage, startRemoteSession, startRemoteWorkflow, stopActiveTurn, submitAskUserAnswer, submitDecision, syncRemoteSnapshot, takeOverControl, updateRemoteSessionSettings, viewRemoteThread } from "./session-ops.js";
 import { clearActiveRelaySelection, ensureDeviceIdentity, hydrateStoredRemoteSecrets, selectRelayProfile, state } from "./state.js";
 import { applyRemoteSurfacePatch, createResetRemoteSurfaceStatePatch } from "./surface-state.js";
 
@@ -17,9 +20,18 @@ export function ensureRemoteRuntimeConfigured() {
   }
 
   configureBrokerClient({
-    onBrokerReady(frame, reason) {
-      if (state.pairingTicket) {
-        void sendPairingRequest();
+    onBrokerReady(frame, reason, connection) {
+      // Decided by what THIS socket was opened for, not by a global predicate. A
+      // retired/expired ticket stays in state for its error card, and when a device
+      // profile also exists a clock-dependent check would flip mid-connection and
+      // recover the old session over the PAIRING room (or send a dead pairing request
+      // into the device's room). `connection.kind` cannot drift.
+      if (connection?.kind === "pairing") {
+        // Catch rather than `void`: the request re-validates its attempt before
+        // publishing, but a socket torn down underneath it still rejects.
+        void sendPairingRequest().catch((error) => {
+          renderLog(`Pairing request could not be sent: ${error.message}`);
+        });
         return;
       }
 
@@ -44,9 +56,22 @@ export function ensureRemoteRuntimeConfigured() {
       rejectPendingActions("broker socket disconnected");
     },
     onRelayPresence(kind, peer) {
-      if (kind === "joined" && peer?.role === "relay" && state.remoteAuth) {
-        void recoverRemoteSession("relay joined");
+      if (peer?.role !== "relay" || !state.remoteAuth) {
+        return;
       }
+      if (kind === "joined") {
+        void recoverRemoteSession("relay joined");
+        // Anything still unanswered is asked again under its ORIGINAL action id, so a
+        // reply lost while the relay was away is served from its replay cache rather
+        // than by running the action a second time.
+        void resendPendingActions();
+        return;
+      }
+      // The relay ending its own session — which is what a dropped publish now causes —
+      // leaves this browser's socket up, so nothing else here notices. Without this the
+      // pending action just waits out its deadline and reports a failure the user is
+      // liable to answer by redoing a write.
+      suspendPendingActionDeadlines();
     },
   });
 
@@ -62,6 +87,7 @@ export function ensureRemoteRuntimeConfigured() {
 
 export function initializeRemoteSurface() {
   initializeRemoteNavigation();
+  initializeRemotePointerClass();
   ensureRemoteRuntimeConfigured();
 }
 
@@ -83,6 +109,19 @@ export async function bootRemoteRuntime() {
   // iOS Safari shows no automatic install prompt, so nudge the user toward
   // Share → Add to Home Screen (no-op on every other platform / when installed).
   mountIosInstallHint();
+
+  // The pairing payload arrives in the URL fragment (it holds the pairing_secret,
+  // which must never reach the broker that serves this page). A fragment-only
+  // navigation is a SAME-document navigation, so re-opening the same pairing link
+  // in an already-loaded tab — re-scanning the QR, or following the link twice —
+  // fires `hashchange` and never re-runs this boot. Watch for it explicitly, or a
+  // second scan silently does nothing.
+  window.addEventListener("hashchange", () => {
+    const rescanned = applyPairingQuery();
+    if (rescanned) {
+      void beginPairing(rescanned, { auto: true });
+    }
+  });
 
   const pairingQuery = applyPairingQuery();
 
@@ -117,19 +156,26 @@ export async function switchRemoteRelay(relayId) {
     return;
   }
 
-  if (!selectRelayProfile(relayId)) {
+  if (!state.remoteProfiles?.[relayId]) {
     renderLog("This relay is not stored in the current browser profile yet.");
     return;
   }
 
   cancelRemoteThreadsPoll();
-  applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
-    cancelThreadSearch: cancelRemoteThreadSearch,
-    clearClaimLifecycle,
-    clearSessionRuntime,
-    rejectPendingActions,
-    reason: "switched to a different relay profile",
-  }));
+  // The profile is validated above rather than by `selectRelayProfile`'s return value, so
+  // that a switch which cannot happen resets nothing. See identity-change.js for why the
+  // reset has to precede the move.
+  replaceRemoteIdentity({
+    resetSurface: () =>
+      applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+        cancelThreadSearch: cancelRemoteThreadSearch,
+        clearClaimLifecycle,
+        clearSessionRuntime,
+        rejectPendingActions,
+        reason: "switched to a different relay profile",
+      })),
+    moveIdentity: () => selectRelayProfile(relayId),
+  });
   renderLog(`Switching to relay ${relayId}.`);
   void connectBroker("switch relay");
 }
@@ -140,14 +186,17 @@ export function returnToRelayHome() {
   }
 
   cancelRemoteThreadsPoll();
-  applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
-    cancelThreadSearch: cancelRemoteThreadSearch,
-    clearClaimLifecycle,
-    clearSessionRuntime,
-    rejectPendingActions,
-    reason: "returned to relay directory before broker actions completed",
-  }));
-  clearActiveRelaySelection();
+  replaceRemoteIdentity({
+    resetSurface: () =>
+      applyRemoteSurfacePatch(createResetRemoteSurfaceStatePatch({
+        cancelThreadSearch: cancelRemoteThreadSearch,
+        clearClaimLifecycle,
+        clearSessionRuntime,
+        rejectPendingActions,
+        reason: "returned to relay directory before broker actions completed",
+      })),
+    moveIdentity: clearActiveRelaySelection,
+  });
   closeBrokerSocket();
   openRemoteNavigation();
   renderLog("Returned to relay directory.");
@@ -166,6 +215,10 @@ export function createRemoteAppHandlers() {
     },
     onRefreshThreads({ reason = "manual refresh", silent = false, fresh = false } = {}) {
       return refreshRemoteThreads(reason, { silent, fresh });
+    },
+    // "Do these sessions still exist?" — asked by id, because a page cannot answer it.
+    onProbeThreadsExist(threadIds) {
+      return probeRemoteThreadsExist(threadIds);
     },
     onFetchProviders() {
       return fetchRemoteProviders();
@@ -218,6 +271,9 @@ export function createRemoteAppHandlers() {
     onTakeOver() {
       return takeOverControl();
     },
+    onRepairWorkspace(threadId) {
+      return repairRemoteWorkspace(threadId);
+    },
     onUpdateSessionSettings(payload) {
       return updateRemoteSessionSettings(payload);
     },
@@ -242,7 +298,36 @@ export function createRemoteAppHandlers() {
   };
 }
 
+/**
+ * Trace every sidebar gesture into the console AND the client log panel.
+ *
+ * OPT-IN: `?sidebarDebug=1`, or `localStorage["sealwire:sidebar-debug"] = "1"` to survive
+ * a reload. Off by default, and off means this returns before attaching anything.
+ *
+ * That matters because the tracer is not a passive observer of the region it watches. It
+ * calls `renderLog()` — `patchRemoteState`, a re-render — on pointerdown, touchstart,
+ * wheel and scroll. A re-render between mousedown and mouseup replaces the
+ * `dangerouslySetInnerHTML` glyph inside a button, and the browser then fires NO click:
+ * the button hovers, depresses, and does nothing. `.inline-icon { pointer-events: none }`
+ * protects the buttons carrying that class, but `.project-switcher-trigger`'s svg does
+ * not, and an e2e run shows this tracer firing with that svg as the pointerdown target.
+ *
+ * It ran unconditionally for ~590 commits behind a "remove after scroll bugs are fixed"
+ * TODO. Gating beats deleting: on a phone there is usually no console to read, which is
+ * why it renders into the log panel, and that is precisely where the next sidebar scroll
+ * report will come from.
+ */
 export function installSidebarGestureDebug() {
+  if (
+    !sidebarGestureDebugEnabled({
+      search: typeof window !== "undefined" ? window.location?.search || "" : "",
+      storage: typeof window !== "undefined" ? window.localStorage : null,
+    })
+  ) {
+    // A no-op cleanup, so the caller's teardown does not have to know it never ran.
+    return () => {};
+  }
+
   const sidebar = document.querySelector(".sidebar");
   const remoteRelaysList = document.querySelector("#remote-relays-list");
   const remoteThreadsList = document.querySelector("#remote-threads-list");
@@ -282,14 +367,15 @@ export function installSidebarGestureDebug() {
     const relaysTop = remoteRelaysList?.scrollTop ?? -1;
     const threadsTop = remoteThreadsList?.scrollTop ?? -1;
     const message = `[sidebar-debug] ${scope} type=${event.type} target=${target} current=${current} sidebarTop=${sidebarTop} relaysTop=${relaysTop} threadsTop=${threadsTop}`;
-    // TODO(remote-monitor-debug): Remove this sidebar gesture console trace after scroll bugs are fixed.
+    // Opt-in only (see the gate at the top of this function): reaching here means the
+    // tracer was explicitly armed, so the re-render below is asked for.
     console.log(message);
     renderLog(message);
   };
 
   const logScrollEvent = (scope, element) => {
     const message = `[sidebar-debug] ${scope} type=scroll current=${describeNode(element)} top=${element.scrollTop} height=${element.scrollHeight} client=${element.clientHeight}`;
-    // TODO(remote-monitor-debug): Remove this sidebar scroll console trace after scroll bugs are fixed.
+    // Opt-in only, as above.
     console.log(message);
     renderLog(message);
   };

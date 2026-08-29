@@ -1,5 +1,6 @@
 import React from "react";
 
+import { providerMarkSlot } from "./provider-mark.js";
 import { clampReviewRounds } from "./review-panel.js";
 import { selectReviewerCatalogState } from "./review-state.js";
 import {
@@ -150,18 +151,23 @@ export function CodeFlowPanel({
       }),
       h("label", { className: "sidebar-label", htmlFor: `${id}-provider` }, "Reviewer provider"),
       h(
-        "select",
-        {
-          id: `${id}-provider`,
-          className: "control-input",
-          value: reviewerProvider,
-          onChange: (event) => {
-            setReviewerProvider(event.target.value);
-            setReviewerModel("");
+        "div",
+        { className: "select-with-mark" },
+        providerMarkSlot(reviewerProvider, { className: "select-mark" }),
+        h(
+          "select",
+          {
+            id: `${id}-provider`,
+            className: "control-input",
+            value: reviewerProvider,
+            onChange: (event) => {
+              setReviewerProvider(event.target.value);
+              setReviewerModel("");
+            },
           },
-        },
-        h("option", { value: "" }, "Select a provider…"),
-        ...providerSelectOptions
+          h("option", { value: "" }, "Select a provider…"),
+          ...providerSelectOptions
+        )
       ),
       providerModels.length
         ? h(
@@ -322,63 +328,57 @@ export function WorkflowRunCard({ run, onResolveWorkflow }) {
       .catch(() => {})
       .finally(() => setResolvePending(false));
   };
+  // A code-flow run is WORK IN FLIGHT; a reviewer job is a RESULT. They used to render as
+  // the same `.reviewer-job` card in the same list, so "still running" and "finished and
+  // approved" were the same object at a glance. This is deliberately a compact ROW rather
+  // than a card: it carries no verdict to headline, and sizing it like one implied it did.
+  const metaParts = ["code flow"];
+  if (stepLabel) metaParts.push(stepLabel.toLowerCase());
+  // `round` is all the wire carries — WorkflowRunView has no max_rounds, so there is no
+  // "1/2" to show without inventing a denominator.
+  if (run?.round) metaParts.push(`round ${run.round}`);
   return h(
     "article",
-    { className: `reviewer-job workflow-run workflow-run-${tone}` },
+    { className: `workflow-run workflow-run-${tone}` },
     h(
       "div",
-      { className: "reviewer-job-head" },
+      { className: "workflow-run-lead" },
+      h("span", { "aria-hidden": "true", className: "workflow-run-mark" }),
       h(
         "div",
-        { className: "reviewer-job-identity" },
-        h("span", { className: "reviewer-job-provider" }, "Code Flow"),
-        stepLabel ? h("span", { className: "reviewer-job-model" }, stepLabel) : null
+        { className: "workflow-run-text" },
+        h("p", { className: "workflow-run-title" }, workflowStatusLabel(run?.status)),
+        h("p", { className: "workflow-run-meta" }, metaParts.join(" · "))
       ),
-      h(
-        "div",
-        { className: "reviewer-job-meta" },
-        h(
-          "span",
-          { className: `reviewer-job-status reviewer-job-status-${tone}` },
-          workflowStatusLabel(run?.status)
-        ),
-        run?.round
-          ? h("span", { className: "reviewer-job-round" }, `Round ${run.round}`)
-          : null
-      )
-    ),
-    run?.last_verdict
-      ? h(
-          "p",
-          { className: "reviewer-job-verdict" },
-          `Verdict: ${run.last_verdict.approved ? "approved" : "needs changes"}`
-        )
-      : null,
-    findings.length
-      ? h(
-          "div",
-          { className: "reviewer-job-review workflow-run-findings" },
-          findings.join("\n\n")
-        )
-      : null,
-    run?.error ? h("p", { className: "reviewer-job-error" }, run.error) : null,
-    showResolveAction
-      ? h(
-          "div",
-          { className: "reviewer-job-actions" },
-          h(
+      showResolveAction
+        ? h(
             "button",
             {
               type: "button",
-              className: "header-button review-resolve-button",
+              className: "header-button review-resolve-button workflow-run-stop",
               disabled: resolveDisabled,
               title:
                 "The workflow is blocked while owned turns are stopped. Stop them to unlock the workspace.",
               onClick: handleResolve,
             },
+            // Kept explicit rather than shortened to "Stop": this button ONLY appears for
+            // a blocked/resolving run, where the workspace is locked and unlocking it is
+            // the actual reason to press it. The tooltip should not be the only place
+            // that says so.
             resolveDisabled ? "Stopping workflow…" : "Stop workflow & unlock"
           )
+        : null
+    ),
+    run?.last_verdict
+      ? h(
+          "p",
+          { className: "workflow-run-verdict" },
+          run.last_verdict.approved ? "Approved" : "Needs changes"
         )
-      : null
+      : null,
+    findings.length
+      ? h("div", { className: "workflow-run-findings" }, findings.join("\n\n"))
+      : null,
+    run?.error ? h("p", { className: "reviewer-job-error" }, run.error) : null
   );
 }

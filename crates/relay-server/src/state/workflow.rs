@@ -100,41 +100,23 @@ pub(crate) struct Workflow {
     pub(crate) loop_: Option<LoopSpec>,
 }
 
-/// A review step's machine-readable result. This is the "structured verdict"
-/// shape decided in the design doc; phase 1 derives it from the reviewer's text
-/// (reusing the existing `VERDICT:` parsing). How a real provider is made to emit
-/// this directly (required tool call vs. parse-last-message) is open for chunk
-/// 2/3 — `fake_provider` returns it deterministically for tests.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WorkflowVerdict {
-    pub(crate) approved: bool,
-    pub(crate) summary: Option<String>,
-    pub(crate) findings: Vec<String>,
-}
+/// A review step's machine-readable result — the "structured verdict" shape.
+///
+/// Defined in `relay-api` because a private orchestrator records one too, and the
+/// seam crate is the one place both sides may name. Re-exported so every call
+/// site here keeps its existing `state::WorkflowVerdict` path.
+pub(crate) use relay_api::WorkflowVerdict;
 
-impl WorkflowVerdict {
-    pub(crate) fn approved() -> Self {
-        Self {
-            approved: true,
-            summary: None,
-            findings: Vec::new(),
-        }
-    }
-
-    pub(crate) fn needs_changes(findings: Vec<String>) -> Self {
-        Self {
-            approved: false,
-            summary: None,
-            findings,
-        }
-    }
-
-    pub(crate) fn view(&self) -> WorkflowVerdictView {
-        WorkflowVerdictView {
-            approved: self.approved,
-            summary: self.summary.clone(),
-            findings: self.findings.clone(),
-        }
+/// The wire projection of a verdict.
+///
+/// A free function rather than a method: an inherent impl has to live in the
+/// crate that declares the type, and that is now `relay-api` — which must not
+/// know about protocol views.
+pub(crate) fn verdict_view(verdict: &WorkflowVerdict) -> WorkflowVerdictView {
+    WorkflowVerdictView {
+        approved: verdict.approved,
+        summary: verdict.summary.clone(),
+        findings: verdict.findings.clone(),
     }
 }
 
@@ -176,67 +158,12 @@ fn normalize_finding(finding: &str) -> String {
 
 /// Lifecycle of a single workflow run. Terminal states are `Done`, `Escalated`,
 /// `Failed`, `Interrupted`, and `Cancelled`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RunStatus {
-    /// Recorded, orchestrator not yet started.
-    Queued,
-    /// The serial runner is driving steps (which step is shown via
-    /// `WorkflowRun::current_step` + the step's role).
-    Running,
-    /// The reviewer approved (or a single-step run finished). TERMINAL.
-    Done,
-    /// Ran out of `max_rounds` without approval; control returns to the user.
-    /// TERMINAL.
-    Escalated,
-    /// Default only for serde forward-compat: a persisted run missing its status
-    /// decodes to a safe TERMINAL state that can never strand a tree lock.
-    #[default]
-    Failed,
-    /// A cleanup/stop path could not confirm that a file-mutating turn actually
-    /// stopped. Non-terminal on purpose: the workflow continues to own its thread
-    /// and workspace until restart reconciliation or an explicit recovery action.
-    Blocked,
-    /// An explicit recovery action is stopping owned turns. Non-terminal so the
-    /// workflow continues to own its thread/workspace and duplicate recovery
-    /// attempts cannot drain the same threads.
-    Resolving,
-    /// The run's orchestrator was lost (relay restart, or mid-session task death)
-    /// while still non-terminal. The restore/lifeguard path reconciles to this so
-    /// the run is never persisted `Running` with no driver. TERMINAL — the card
-    /// offers a one-tap re-run from the last completed step. TREE STATE IS NOT
-    /// RESTORED (see design §5): an interrupted Code Flow may leave a dirty tree.
-    Interrupted,
-    /// The user stopped the run before it finished. TERMINAL.
-    Cancelled,
-}
-
-impl RunStatus {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            RunStatus::Queued => "queued",
-            RunStatus::Running => "running",
-            RunStatus::Done => "done",
-            RunStatus::Escalated => "escalated",
-            RunStatus::Failed => "failed",
-            RunStatus::Blocked => "blocked",
-            RunStatus::Resolving => "resolving",
-            RunStatus::Interrupted => "interrupted",
-            RunStatus::Cancelled => "cancelled",
-        }
-    }
-
-    pub(crate) fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            RunStatus::Done
-                | RunStatus::Escalated
-                | RunStatus::Failed
-                | RunStatus::Interrupted
-                | RunStatus::Cancelled
-        )
-    }
-}
+///
+/// Defined in `relay-api` rather than here: a private orchestrator maps its
+/// children's outcomes through this enum, and the seam crate is the one place
+/// both it and the relay may name. Re-exported so every call site here keeps
+/// its existing `state::RunStatus` path.
+pub(crate) use relay_api::RunStatus;
 
 /// One execution of a `Workflow`. Holds only orchestration metadata; each step's
 /// real agent output lives in the background thread referenced by `step_threads`.
@@ -396,7 +323,7 @@ impl WorkflowRun {
             round: self.round,
             reviewer_thread_id: self.step_threads.get("review").cloned(),
             locked_thread_ids: Vec::new(),
-            last_verdict: self.last_verdict.as_ref().map(|verdict| verdict.view()),
+            last_verdict: self.last_verdict.as_ref().map(verdict_view),
             requested_at: self.requested_at,
             updated_at: self.updated_at,
             error: self.error.clone(),

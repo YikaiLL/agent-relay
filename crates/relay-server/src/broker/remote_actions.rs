@@ -1,8 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use futures_util::stream::SplitSink;
 use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, Duration, Instant};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::{
@@ -11,33 +9,49 @@ use crate::{
         AskUserQuestionDetailResponse, DevicesResponse, ForkSessionInput, HeartbeatInput,
         ModelOptionView, ProjectActionInput, ProjectsResponse, ReadThreadEntriesInput,
         ReadThreadEntryDetailInput, ReadThreadTranscriptInput, RenameThreadInput,
-        RequestReviewInput, ResumeSessionInput, ReviewsResponse, SendMessageInput, SessionSnapshot,
-        StartSessionInput, StartWorkflowInput, StopTurnInput, SubmitAskUserAnswerInput,
-        TakeOverInput, ThreadEntriesResponse, ThreadEntryDetailResponse, ThreadTranscriptResponse,
-        ThreadsQuery, ThreadsResponse, UpdateSessionSettingsInput, WatchThreadsInput,
-        WorkflowActionInput, WorkflowsResponse, WorkspaceDiffResponse,
+        RepairWorkspaceInput, RequestReviewInput, ResolvedWorkspace, ResumeSessionInput,
+        ReviewsResponse, SendMessageInput, SessionSnapshot, StartSessionInput, StartWorkflowInput,
+        StopTurnInput, SubmitAskUserAnswerInput, TakeOverInput, ThreadEntriesResponse,
+        ThreadEntryDetailResponse, ThreadSettingsView, ThreadTranscriptResponse, ThreadsQuery,
+        ThreadsResponse, UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput,
+        WorkflowsResponse, WorkspaceDiffResponse, WorkspaceGitContextView,
     },
     state::{
         AppState, ApprovalError, AskUserAnswerError, CachedRemoteActionResult,
-        PushSubscriptionInput, RemoteActionReplayDecision,
+        PushSubscriptionInput, RemoteActionReplayDecision, ThreadWorkspaceError,
     },
 };
 
 use super::{
     crypto::{decrypt_json, encrypt_json, EncryptedEnvelope},
-    issue_session_claim,
+    frame_message_for_payload, issue_session_claim,
     protocol::{frame_bytes_for_payload, OutboundBrokerPayload},
     publish_payload, verify_device_claim_challenge_proof, verify_device_claim_init_proof,
-    verify_session_claim, BrokerSocket, MAX_BROKER_TEXT_FRAME_BYTES,
+    verify_session_claim,
+    writer::{BrokerWriter, TrainHandoff},
+    MAX_BROKER_TEXT_FRAME_BYTES,
 };
 
 const SESSION_CONTROL_REQUIRED_ERROR: &str =
     "broker transport auth only grants room access; session claim is missing or expired";
-const REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES: usize = 32_768;
-const REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES: usize = 1_024;
-const REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS: u64 = 250;
+/// Target size of one chunk, in **characters** of the serialized JSON.
+///
+/// Characters, not bytes, because a chunk now travels as JSON text rather than base64 —
+/// see `split_on_char_boundaries`. For ASCII content (the overwhelming majority of a
+/// transcript) the two are the same, and the resulting frame is ~25% smaller than the
+/// old double-base64 encoding produced.
+const REMOTE_ACTION_RESULT_CHUNK_TARGET_CHARS: usize = 32_768;
+const REMOTE_ACTION_RESULT_CHUNK_MIN_CHARS: usize = 1_024;
+/// Gap between chunks of one reply.
+///
+/// This used to be 250ms, chosen when every peer shared a 4-publishes-a-second budget.
+/// At that pace 61 chunks take the client's entire 15-second action deadline before the
+/// last one lands, so a large-but-legitimate reply — a workspace diff may be megabytes —
+/// could never arrive at all. Relays now have their own, far larger allowance, and the
+/// writer interleaves ordinary traffic into these gaps rather than being blocked by
+/// them, so the gap only needs to be big enough to stay interleavable.
+pub(super) const REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS: u64 = 50;
 const REMOTE_ACTION_SLOW_WARN_MILLIS: u128 = 1_000;
-const REMOTE_ACTION_CHUNK_SLOW_WARN_MILLIS: u128 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -113,20 +127,55 @@ pub(super) enum RemoteActionRequest {
         thread_id: String,
         input: RenameThreadInput,
     },
+    /// Re-create a session's vanished workspace. Relay-owned like `RenameThread`: it
+    /// creates a directory (or runs `git worktree add`) on the host and never reaches a
+    /// provider, so it needs no session claim — a phone must be able to un-brick a session
+    /// it is merely looking at.
+    RepairWorkspace {
+        thread_id: String,
+        input: RepairWorkspaceInput,
+    },
+    /// The path comes from the CLIENT, so the scope check in `workspace_git_context`
+    /// is what keeps this from being an existence oracle. It reads `device_id`.
+    FetchWorkspaceGitContext {
+        #[serde(default)]
+        device_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// What a fork of this thread would inherit. An in-memory map read, unlike the
+    /// transcript response that also carries settings but pays a provider fetch.
+    FetchThreadSettings {
+        #[serde(default)]
+        device_id: Option<String>,
+        thread_id: String,
+    },
     FetchWorkspaceDiff {
         #[serde(default)]
         device_id: Option<String>,
-        /// The session the client is *viewing*; selects which workspace to diff.
-        /// `#[serde(default)]` keeps legacy clients (which send only `{}`) working.
+        /// Viewed session; default empty for clients that send `{}`.
         #[serde(default)]
         thread_id: Option<String>,
-        /// Which working tree to diff, from the roots enumerated for that session's
-        /// repo. Validated relay-side; a foreign path fails closed.
+        /// Diff preview only; must be an enumerated root. Does not pin the session.
         #[serde(default)]
-        root: Option<String>,
-        /// Opt in to landing on `suggested_root` rather than the session's own cwd.
+        view_root: Option<String>,
+    },
+    /// Read-only, not claim-gated: a paired device can see the tree without taking the lease.
+    FetchThreadWorkspace {
         #[serde(default)]
-        auto_root: bool,
+        device_id: Option<String>,
+        thread_id: String,
+        /// Measure each root's changed-file count (a `git status` per worktree). Only
+        /// the open picker, which displays them, asks — see `measure_root_changes`.
+        #[serde(default)]
+        roots_status: bool,
+    },
+    /// Pin/unpin. Relay-owned (no turn), so not claim-gated — picking a tree must not steal the controller lease.
+    SetThreadWorkspace {
+        #[serde(default)]
+        device_id: Option<String>,
+        #[serde(flatten)]
+        input: crate::protocol::ThreadWorkspaceInput,
     },
     FetchReviews {
         #[serde(default)]
@@ -212,7 +261,12 @@ impl RemoteActionRequest {
             Self::ApplyFileChange { .. } => RemoteActionKind::ApplyFileChange,
             Self::ProjectAction { .. } => RemoteActionKind::ProjectAction,
             Self::RenameThread { .. } => RemoteActionKind::RenameThread,
+            Self::RepairWorkspace { .. } => RemoteActionKind::RepairWorkspace,
             Self::FetchWorkspaceDiff { .. } => RemoteActionKind::FetchWorkspaceDiff,
+            Self::FetchThreadWorkspace { .. } => RemoteActionKind::FetchThreadWorkspace,
+            Self::SetThreadWorkspace { .. } => RemoteActionKind::SetThreadWorkspace,
+            Self::FetchWorkspaceGitContext { .. } => RemoteActionKind::FetchWorkspaceGitContext,
+            Self::FetchThreadSettings { .. } => RemoteActionKind::FetchThreadSettings,
             Self::FetchReviews { .. } => RemoteActionKind::FetchReviews,
             Self::FetchWorkflows { .. } => RemoteActionKind::FetchWorkflows,
             Self::FetchDevices { .. } => RemoteActionKind::FetchDevices,
@@ -315,18 +369,50 @@ impl RemoteActionRequest {
                 input.device_id = Some(device_id);
                 Self::RenameThread { thread_id, input }
             }
+            Self::RepairWorkspace {
+                thread_id,
+                mut input,
+            } => {
+                input.device_id = Some(device_id);
+                Self::RepairWorkspace { thread_id, input }
+            }
             Self::FetchWorkspaceDiff {
                 thread_id,
-                root,
-                auto_root,
+                view_root,
                 ..
             } => Self::FetchWorkspaceDiff {
                 device_id: Some(device_id),
-                // Preserve the viewed session + root selectors; only device_id is
-                // stamped here.
+                // Keep thread_id/view_root; only stamp device_id.
                 thread_id,
-                root,
-                auto_root,
+                view_root,
+            },
+            Self::FetchThreadWorkspace {
+                thread_id,
+                roots_status,
+                ..
+            } => Self::FetchThreadWorkspace {
+                device_id: Some(device_id),
+                // Kept, like thread_id: only device_id is stamped here. Dropping it
+                // would silently downgrade the picker's request to an unmeasured one.
+                thread_id,
+                roots_status,
+            },
+            Self::SetThreadWorkspace { mut input, .. } => {
+                // Stamp both copies so a client-supplied inner device_id cannot decide scope.
+                input.device_id = Some(device_id.clone());
+                Self::SetThreadWorkspace {
+                    device_id: Some(device_id),
+                    input,
+                }
+            }
+            Self::FetchWorkspaceGitContext { cwd, .. } => Self::FetchWorkspaceGitContext {
+                device_id: Some(device_id),
+                // Preserve the path being asked about; only device_id is stamped.
+                cwd,
+            },
+            Self::FetchThreadSettings { thread_id, .. } => Self::FetchThreadSettings {
+                device_id: Some(device_id),
+                thread_id,
             },
             Self::FetchReviews { .. } => Self::FetchReviews {
                 device_id: Some(device_id),
@@ -411,7 +497,12 @@ pub(super) enum RemoteActionKind {
     ApplyFileChange,
     ProjectAction,
     RenameThread,
+    RepairWorkspace,
     FetchWorkspaceDiff,
+    FetchWorkspaceGitContext,
+    FetchThreadWorkspace,
+    SetThreadWorkspace,
+    FetchThreadSettings,
     FetchReviews,
     FetchWorkflows,
     FetchDevices,
@@ -451,7 +542,12 @@ impl RemoteActionKind {
             Self::ApplyFileChange => "apply_file_change",
             Self::ProjectAction => "project_action",
             Self::RenameThread => "rename_thread",
+            Self::RepairWorkspace => "repair_workspace",
             Self::FetchWorkspaceDiff => "fetch_workspace_diff",
+            Self::FetchWorkspaceGitContext => "fetch_workspace_git_context",
+            Self::FetchThreadWorkspace => "fetch_thread_workspace",
+            Self::SetThreadWorkspace => "set_thread_workspace",
+            Self::FetchThreadSettings => "fetch_thread_settings",
             Self::FetchReviews => "fetch_reviews",
             Self::FetchWorkflows => "fetch_workflows",
             Self::FetchDevices => "fetch_devices",
@@ -487,6 +583,12 @@ struct RemoteActionResultPlaintext {
     thread_transcript: Option<ThreadTranscriptResponse>,
     workspace_diff: Option<WorkspaceDiffResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_git_context: Option<WorkspaceGitContextView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_workspace: Option<ResolvedWorkspace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_settings: Option<ThreadSettingsView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<ReviewsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflows: Option<WorkflowsResponse>,
@@ -502,6 +604,49 @@ struct RemoteActionResultPlaintext {
     claim_challenge: Option<String>,
     claim_challenge_expires_at: Option<u64>,
     error: Option<String>,
+}
+
+/// What a client is told when its reply cannot be queued.
+///
+/// Deliberately explicit and recoverable: the alternative is silence, and a chunked
+/// reply resolves only once every chunk lands, so silence costs the client its full
+/// 15-second timeout.
+const REMOTE_ACTION_BUSY_ERROR: &str =
+    "the relay already has too many large replies in flight; retry this request";
+
+fn busy_remote_action_result(
+    kind: RemoteActionResultKind,
+    action: RemoteActionKind,
+) -> RemoteActionResultPlaintext {
+    RemoteActionResultPlaintext {
+        kind,
+        action,
+        ok: false,
+        snapshot: None,
+        receipt: None,
+        ask_user_answer_receipt: None,
+        providers: None,
+        models: None,
+        threads: None,
+        thread_entries: None,
+        thread_entry_detail: None,
+        thread_transcript: None,
+        workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
+        reviews: None,
+        workflows: None,
+        devices: None,
+        projects: None,
+        ask_user_question_detail: None,
+        session_claim: None,
+        session_claim_expires_at: None,
+        claim_challenge_id: None,
+        claim_challenge: None,
+        claim_challenge_expires_at: None,
+        error: Some(REMOTE_ACTION_BUSY_ERROR.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -521,7 +666,12 @@ struct RemoteActionResultChunkPlaintext {
     action: RemoteActionKind,
     chunk_index: usize,
     chunk_count: usize,
-    data_base64: String,
+    /// A slice of the serialized result as **text**.
+    ///
+    /// Was `data_base64`. The value being chunked is already JSON, so base64'ing it before
+    /// wrapping it in another JSON document (which is then encrypted and base64'd again)
+    /// paid for the encoding twice — ~1.78x the payload on the wire instead of ~1.35x.
+    data: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -533,6 +683,9 @@ struct RemoteActionResultSizeBreakdown {
     thread_entry_detail_bytes: usize,
     thread_transcript_bytes: usize,
     workspace_diff_bytes: usize,
+    workspace_git_context_bytes: usize,
+    thread_workspace_bytes: usize,
+    thread_settings_bytes: usize,
     reviews_bytes: usize,
     workflows_bytes: usize,
     devices_bytes: usize,
@@ -555,6 +708,9 @@ pub(super) struct RemoteActionOutcome {
     pub(super) thread_entry_detail: Option<ThreadEntryDetailResponse>,
     pub(super) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(super) workspace_diff: Option<WorkspaceDiffResponse>,
+    pub(super) workspace_git_context: Option<WorkspaceGitContextView>,
+    pub(super) thread_workspace: Option<ResolvedWorkspace>,
+    pub(super) thread_settings: Option<ThreadSettingsView>,
     pub(super) reviews: Option<ReviewsResponse>,
     pub(super) workflows: Option<WorkflowsResponse>,
     pub(super) devices: Option<DevicesResponse>,
@@ -569,7 +725,7 @@ pub(super) struct RemoteActionOutcome {
 
 pub(super) async fn handle_remote_action(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     from_peer_id: String,
     action_id: String,
     session_claim: Option<String>,
@@ -626,7 +782,8 @@ pub(super) async fn handle_remote_action(
             let snapshot = state.snapshot().await;
             let result_device_id = device_id.unwrap_or_else(|| "unknown-device".to_string());
             return publish_plain_remote_action_result(
-                sender,
+                state,
+                writer,
                 from_peer_id,
                 action_id,
                 action_kind,
@@ -657,7 +814,8 @@ pub(super) async fn handle_remote_action(
         Ok(RemoteActionReplayDecision::Execute) => {}
         Ok(RemoteActionReplayDecision::Replay(cached)) => {
             return replay_plain_remote_action_result(
-                sender,
+                state,
+                writer,
                 from_peer_id,
                 action_id,
                 action_kind,
@@ -694,7 +852,8 @@ pub(super) async fn handle_remote_action(
                 .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
                 .await;
             return replay_plain_remote_action_result(
-                sender,
+                state,
+                writer,
                 from_peer_id,
                 action_id,
                 action_kind,
@@ -775,9 +934,15 @@ pub(super) async fn handle_remote_action(
     state
         .store_remote_action_result(&resolved_device_id, &action_id, cached.clone())
         .await;
-    let replay_result =
-        replay_plain_remote_action_result(sender, from_peer_id, action_id, action_kind, cached)
-            .await;
+    let replay_result = replay_plain_remote_action_result(
+        state,
+        writer,
+        from_peer_id,
+        action_id,
+        action_kind,
+        cached,
+    )
+    .await;
     let elapsed_ms = action_started_at.elapsed().as_millis();
     if elapsed_ms >= REMOTE_ACTION_SLOW_WARN_MILLIS {
         warn!(
@@ -799,7 +964,7 @@ pub(super) async fn handle_remote_action(
 
 pub(super) async fn handle_encrypted_remote_action(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     from_peer_id: String,
     action_id: String,
     session_claim: Option<String>,
@@ -842,7 +1007,7 @@ pub(super) async fn handle_encrypted_remote_action(
             let snapshot = state.snapshot().await;
             if let Err(publish_error) = publish_remote_action_result_private(
                 state,
-                sender,
+                writer,
                 from_peer_id,
                 device_id,
                 action_id,
@@ -911,7 +1076,7 @@ pub(super) async fn handle_encrypted_remote_action(
         Ok(RemoteActionReplayDecision::Replay(cached)) => {
             return replay_encrypted_remote_action_result(
                 state,
-                sender,
+                writer,
                 from_peer_id,
                 device_id,
                 action_id,
@@ -950,7 +1115,7 @@ pub(super) async fn handle_encrypted_remote_action(
                 .await;
             return replay_encrypted_remote_action_result(
                 state,
-                sender,
+                writer,
                 from_peer_id,
                 device_id,
                 action_id,
@@ -1031,7 +1196,7 @@ pub(super) async fn handle_encrypted_remote_action(
 
     let replay_result = replay_encrypted_remote_action_result(
         state,
-        sender,
+        writer,
         from_peer_id,
         device_id,
         action_id,
@@ -1175,6 +1340,7 @@ async fn execute_remote_action(
                 query.limit.unwrap_or(80).clamp(1, 200),
                 query.device_id.clone(),
                 query.q.as_deref(),
+                query.ids.as_deref(),
             )
             .await
             .map(|threads| RemoteActionOutcome {
@@ -1278,16 +1444,64 @@ async fn execute_remote_action(
             .rename_thread(&thread_id, input)
             .await
             .map(|_| RemoteActionOutcome::default()),
+        // Ack-only, like RenameThread: the repair's own receipt is the fresh snapshot,
+        // which every client is about to be sent anyway.
+        RemoteActionRequest::RepairWorkspace { thread_id, input } => state
+            .repair_thread_workspace(&thread_id, input)
+            .await
+            .map(|_| RemoteActionOutcome::default()),
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
-            root,
-            auto_root,
+            view_root,
         } => state
-            .workspace_diff(device_id, thread_id, root, auto_root)
+            .workspace_diff(device_id, thread_id, view_root)
             .await
             .map(|workspace_diff| RemoteActionOutcome {
                 workspace_diff: Some(workspace_diff),
+                ..RemoteActionOutcome::default()
+            }),
+        RemoteActionRequest::FetchThreadWorkspace {
+            device_id,
+            thread_id,
+            roots_status,
+        } => {
+            let mut thread_workspace = state
+                .resolve_thread_workspace(&thread_id, device_id.as_deref())
+                .await
+                .map_err(ThreadWorkspaceError::into_message)?;
+            if roots_status {
+                // After resolution, so the measured set is exactly the device-scoped
+                // roots this device may see — never a tree outside its path scope.
+                crate::state::app::measure_root_changes(state, &mut thread_workspace.roots).await;
+            }
+            Ok(RemoteActionOutcome {
+                thread_workspace: Some(thread_workspace),
+                ..RemoteActionOutcome::default()
+            })
+        }
+        RemoteActionRequest::SetThreadWorkspace { input, .. } => state
+            .pin_thread_workspace(input)
+            .await
+            .map(|thread_workspace| RemoteActionOutcome {
+                thread_workspace: Some(thread_workspace),
+                ..RemoteActionOutcome::default()
+            }),
+        RemoteActionRequest::FetchThreadSettings {
+            device_id,
+            thread_id,
+        } => state
+            .thread_settings_view(device_id, &thread_id)
+            .await
+            .map(|thread_settings| RemoteActionOutcome {
+                thread_settings: Some(thread_settings),
+                ..RemoteActionOutcome::default()
+            }),
+        RemoteActionRequest::FetchWorkspaceGitContext { device_id, cwd } => state
+            .workspace_git_context(device_id, cwd.unwrap_or_default())
+            .await
+            .map(|workspace_git_context| RemoteActionOutcome {
+                workspace_git_context: Some(workspace_git_context),
                 ..RemoteActionOutcome::default()
             }),
         RemoteActionRequest::FetchReviews { device_id } => Ok(RemoteActionOutcome {
@@ -1369,6 +1583,9 @@ fn remote_action_emits_info_log(action: RemoteActionKind) -> bool {
             | RemoteActionKind::FetchThreadEntryDetail
             | RemoteActionKind::FetchThreadTranscript
             | RemoteActionKind::FetchWorkspaceDiff
+            | RemoteActionKind::FetchWorkspaceGitContext
+            | RemoteActionKind::FetchThreadWorkspace
+            | RemoteActionKind::FetchThreadSettings
             | RemoteActionKind::FetchReviews
             | RemoteActionKind::FetchWorkflows
             | RemoteActionKind::FetchDevices
@@ -1625,7 +1842,8 @@ fn ask_user_answer_error_message(error: AskUserAnswerError) -> String {
 }
 
 async fn publish_plain_remote_action_result(
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    state: &AppState,
+    writer: &BrokerWriter,
     target_peer_id: String,
     action_id: String,
     action: RemoteActionKind,
@@ -1672,6 +1890,9 @@ async fn publish_plain_remote_action_result(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_workspace,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -1696,6 +1917,9 @@ async fn publish_plain_remote_action_result(
         thread_entry_detail.as_ref(),
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
+        workspace_git_context.as_ref(),
+        thread_workspace.as_ref(),
+        thread_settings.as_ref(),
         reviews.as_ref(),
         workflows.as_ref(),
         devices.as_ref(),
@@ -1722,6 +1946,9 @@ async fn publish_plain_remote_action_result(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_workspace,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -1739,7 +1966,7 @@ async fn publish_plain_remote_action_result(
     let frame_bytes = frame_bytes_for_payload(&payload);
     log_remote_action_result_sizes("plaintext", action, &size_breakdown, None, frame_bytes);
     if frame_bytes <= MAX_BROKER_TEXT_FRAME_BYTES {
-        return publish_payload(sender, payload)
+        return publish_payload(writer, payload)
             .await
             .map_err(|error| format!("broker action result publish failed: {error}"));
     }
@@ -1753,42 +1980,71 @@ async fn publish_plain_remote_action_result(
         chunk_count = chunk_payloads.len(),
         "falling back to chunked remote action result transport"
     );
-    publish_remote_action_result_chunks(sender, chunk_payloads, "broker action result chunk")
-        .await?;
+    if publish_remote_action_result_chunks(
+        state,
+        writer,
+        chunk_payloads,
+        "broker action result chunk",
+        &target_peer_id,
+    )
+    .await?
+        == TrainHandoff::Busy
+    {
+        let busy = busy_remote_action_result(plaintext.kind, action);
+        let payload = build_plain_remote_action_result_payload(&action_id, &target_peer_id, &busy)?;
+        return publish_payload(writer, payload)
+            .await
+            .map_err(|error| format!("busy remote action result publish failed: {error}"));
+    }
     Ok(())
 }
 
+/// Hand a chunked action reply to the writer, paced but not awaited.
+///
+/// This used to publish every chunk here, sleeping
+/// `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS` between them. Because
+/// `broker.rs` awaits `handle_server_message` INLINE in the `select!` arm that reads
+/// the socket, a 21-chunk reply meant ~5 seconds during which the relay read nothing
+/// from any surface. The pacing now happens in the writer task, so this returns as
+/// soon as the train is queued and the read loop keeps serving everyone else.
 async fn publish_remote_action_result_chunks(
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    state: &AppState,
+    writer: &BrokerWriter,
     chunk_payloads: Vec<OutboundBrokerPayload>,
     error_context: &str,
-) -> Result<(), String> {
+    target_peer_id: &str,
+) -> Result<TrainHandoff, String> {
     let chunk_count = chunk_payloads.len();
     info!(
         chunk_count,
         publish_interval_ms = REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS,
-        "publishing broker remote action result chunks"
+        "queueing broker remote action result chunks"
     );
-    for (index, payload) in chunk_payloads.into_iter().enumerate() {
-        let chunk_started_at = Instant::now();
-        publish_payload(sender, payload)
-            .await
-            .map_err(|error| format!("{error_context} publish failed: {error}"))?;
-        let elapsed_ms = chunk_started_at.elapsed().as_millis();
-        if elapsed_ms >= REMOTE_ACTION_CHUNK_SLOW_WARN_MILLIS {
-            warn!(
-                chunk_index = index,
-                chunk_count, elapsed_ms, "broker remote action result chunk publish was slow"
-            );
-        }
-        if index + 1 < chunk_count {
-            sleep(Duration::from_millis(
-                REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS,
-            ))
-            .await;
-        }
+    let chunks = chunk_payloads
+        .iter()
+        .map(frame_message_for_payload)
+        .collect::<Vec<_>>();
+    // Probe ONCE, here, while we still know the request we are answering just arrived
+    // from this peer. Recording "it was here" is what later lets the writer distinguish
+    // an observed departure from a presence set that never knew about it.
+    let watch_target = state
+        .surface_peer_is_online(target_peer_id)
+        .await
+        .then(|| target_peer_id.to_string());
+    let handoff = writer
+        .send_train(
+            chunks,
+            Duration::from_millis(REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS),
+            watch_target,
+        )
+        .map_err(|error| format!("{error_context} publish failed: {error}"))?;
+    if handoff == TrainHandoff::Busy {
+        warn!(
+            chunk_count,
+            error_context, "refusing a chunked reply: too many large replies outstanding"
+        );
     }
-    Ok(())
+    Ok(handoff)
 }
 
 fn build_plain_remote_action_result_payload(
@@ -1861,6 +2117,9 @@ fn build_plain_remote_action_result_payload(
                 thread_entry_detail: result.thread_entry_detail.clone(),
                 thread_transcript: result.thread_transcript.clone(),
                 workspace_diff: result.workspace_diff.clone(),
+                workspace_git_context: result.workspace_git_context.clone(),
+                thread_workspace: result.thread_workspace.clone(),
+                thread_settings: result.thread_settings.clone(),
                 reviews: result.reviews.clone(),
                 workflows: result.workflows.clone(),
                 devices: result.devices.clone(),
@@ -1873,14 +2132,16 @@ fn build_plain_remote_action_result_payload(
 }
 
 async fn replay_plain_remote_action_result(
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    state: &AppState,
+    writer: &BrokerWriter,
     target_peer_id: String,
     action_id: String,
     action: RemoteActionKind,
     cached: CachedRemoteActionResult,
 ) -> Result<(), String> {
     publish_plain_remote_action_result(
-        sender,
+        state,
+        writer,
         target_peer_id,
         action_id,
         action,
@@ -1895,6 +2156,9 @@ async fn replay_plain_remote_action_result(
             thread_entry_detail: cached.thread_entry_detail,
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
+            workspace_git_context: cached.workspace_git_context,
+            thread_workspace: cached.thread_workspace,
+            thread_settings: cached.thread_settings,
             reviews: cached.reviews,
             workflows: cached.workflows,
             devices: cached.devices,
@@ -1915,7 +2179,7 @@ async fn replay_plain_remote_action_result(
 
 async fn publish_remote_action_result_private(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     target_peer_id: String,
     device_id: String,
     action_id: String,
@@ -1963,6 +2227,9 @@ async fn publish_remote_action_result_private(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_workspace,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -1991,6 +2258,9 @@ async fn publish_remote_action_result_private(
         thread_entry_detail.as_ref(),
         thread_transcript.as_ref(),
         workspace_diff.as_ref(),
+        workspace_git_context.as_ref(),
+        thread_workspace.as_ref(),
+        thread_settings.as_ref(),
         reviews.as_ref(),
         workflows.as_ref(),
         devices.as_ref(),
@@ -2017,6 +2287,9 @@ async fn publish_remote_action_result_private(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_workspace,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -2046,7 +2319,7 @@ async fn publish_remote_action_result_private(
         frame_bytes,
     );
     if frame_bytes <= MAX_BROKER_TEXT_FRAME_BYTES {
-        return publish_payload(sender, payload)
+        return publish_payload(writer, payload)
             .await
             .map_err(|error| format!("encrypted broker action result publish failed: {error}"));
     }
@@ -2065,17 +2338,37 @@ async fn publish_remote_action_result_private(
         chunk_count = chunk_payloads.len(),
         "falling back to chunked remote action result transport"
     );
-    publish_remote_action_result_chunks(
-        sender,
+    if publish_remote_action_result_chunks(
+        state,
+        writer,
         chunk_payloads,
         "encrypted broker action result chunk",
+        &target_peer_id,
     )
-    .await
+    .await?
+        == TrainHandoff::Busy
+    {
+        let busy = busy_remote_action_result(plaintext.kind, action);
+        let envelope = encrypt_json(&secret, &busy)
+            .map_err(|error| format!("failed to seal busy remote action result: {error}"))?;
+        return publish_payload(
+            writer,
+            OutboundBrokerPayload::EncryptedRemoteActionResult {
+                action_id,
+                target_peer_id,
+                device_id,
+                envelope,
+            },
+        )
+        .await
+        .map_err(|error| format!("busy remote action result publish failed: {error}"));
+    }
+    Ok(())
 }
 
 async fn replay_encrypted_remote_action_result(
     state: &AppState,
-    sender: &mut SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     target_peer_id: String,
     device_id: String,
     action_id: String,
@@ -2084,7 +2377,7 @@ async fn replay_encrypted_remote_action_result(
 ) -> Result<(), String> {
     publish_remote_action_result_private(
         state,
-        sender,
+        writer,
         target_peer_id,
         device_id,
         action_id,
@@ -2100,6 +2393,9 @@ async fn replay_encrypted_remote_action_result(
             thread_entry_detail: cached.thread_entry_detail,
             thread_transcript: cached.thread_transcript,
             workspace_diff: cached.workspace_diff,
+            workspace_git_context: cached.workspace_git_context,
+            thread_workspace: cached.thread_workspace,
+            thread_settings: cached.thread_settings,
             reviews: cached.reviews,
             workflows: cached.workflows,
             devices: cached.devices,
@@ -2118,30 +2414,104 @@ async fn replay_encrypted_remote_action_result(
     .await
 }
 
+/// Split `value` into pieces of at most `max_chars` characters without ever splitting a
+/// character.
+///
+/// Chunking used to slice raw bytes, which is safe only because the pieces were then
+/// base64'd. Sending the JSON *text* instead removes that encoding — and with it the
+/// freedom to cut anywhere, since a byte slice can land mid-character and produce invalid
+/// UTF-8 that no client can reassemble.
+fn split_on_char_boundaries(value: &str, max_chars: usize) -> Vec<&str> {
+    let max_chars = max_chars.max(1);
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut chars_in_piece = 0;
+    for (index, _) in value.char_indices() {
+        if chars_in_piece == max_chars {
+            pieces.push(&value[start..index]);
+            start = index;
+            chars_in_piece = 0;
+        }
+        chars_in_piece += 1;
+    }
+    pieces.push(&value[start..]);
+    pieces
+}
+
+/// Shrink the chunk size until **every** piece produces a frame within the broker's limit.
+///
+/// Checking only the first piece would be enough for uniform byte slices, which is what
+/// this used to produce. Character-boundary pieces are not uniform: a piece dense in
+/// multi-byte characters, or one dense in the quotes and backslashes that JSON escapes,
+/// serializes larger than its neighbours. Sampling one and assuming the rest match is how
+/// an oversized frame reaches the broker and gets the whole session torn down.
+fn fit_chunks<'a, F>(
+    serialized: &'a str,
+    target_chars: usize,
+    mut frame_bytes: F,
+) -> Option<Vec<&'a str>>
+where
+    F: FnMut(&str, usize, usize) -> usize,
+{
+    let total_chars = serialized.chars().count();
+    let mut chunk_chars = total_chars.min(target_chars).max(1);
+    loop {
+        let pieces = split_on_char_boundaries(serialized, chunk_chars);
+        let chunk_count = pieces.len();
+        let last_index = chunk_count.saturating_sub(1);
+        let largest = pieces
+            .iter()
+            // The last index, not the first: `chunk_index` is serialized as a number, and
+            // a three-digit index is two bytes wider than a one-digit one.
+            .map(|piece| frame_bytes(piece, last_index, chunk_count))
+            .max()
+            .unwrap_or(0);
+        if largest <= MAX_BROKER_TEXT_FRAME_BYTES {
+            return Some(pieces);
+        }
+        if chunk_chars <= REMOTE_ACTION_RESULT_CHUNK_MIN_CHARS {
+            return None;
+        }
+        chunk_chars = (chunk_chars / 2).max(REMOTE_ACTION_RESULT_CHUNK_MIN_CHARS);
+    }
+}
+
 fn build_plain_remote_action_result_chunk_payloads(
     action_id: &str,
     target_peer_id: &str,
     plaintext: &RemoteActionResultPlaintext,
 ) -> Result<Vec<OutboundBrokerPayload>, String> {
-    let serialized = serialized_json_vec(plaintext)?;
-    let chunk_size = fit_plain_remote_action_result_chunk_size(
-        action_id,
-        target_peer_id,
-        plaintext.action,
+    let serialized = serialized_json_string(plaintext)?;
+    let pieces = fit_chunks(
         &serialized,
-    )?;
-    let chunk_count = serialized.len().div_ceil(chunk_size);
-    Ok(serialized
-        .chunks(chunk_size)
-        .enumerate()
-        .map(
-            |(chunk_index, chunk)| OutboundBrokerPayload::RemoteActionResultChunk {
+        REMOTE_ACTION_RESULT_CHUNK_TARGET_CHARS,
+        |piece, chunk_index, chunk_count| {
+            frame_bytes_for_payload(&OutboundBrokerPayload::RemoteActionResultChunk {
                 action_id: action_id.to_string(),
                 target_peer_id: target_peer_id.to_string(),
                 action: plaintext.action,
                 chunk_index,
                 chunk_count,
-                data_base64: STANDARD.encode(chunk),
+                data: piece.to_string(),
+            })
+        },
+    )
+    .ok_or_else(|| {
+        "remote action result chunk payload still exceeds broker frame limit".to_string()
+    })?;
+
+    let chunk_count = pieces.len();
+    Ok(pieces
+        .into_iter()
+        .enumerate()
+        .map(
+            |(chunk_index, piece)| OutboundBrokerPayload::RemoteActionResultChunk {
+                action_id: action_id.to_string(),
+                target_peer_id: target_peer_id.to_string(),
+                action: plaintext.action,
+                chunk_index,
+                chunk_count,
+                data: piece.to_string(),
             },
         )
         .collect())
@@ -2154,20 +2524,56 @@ fn build_encrypted_remote_action_result_chunk_payloads(
     secret: &str,
     plaintext: &RemoteActionResultPlaintext,
 ) -> Result<Vec<OutboundBrokerPayload>, String> {
-    let serialized = serialized_json_vec(plaintext)?;
-    let chunk_size = fit_encrypted_remote_action_result_chunk_size(
-        action_id,
-        target_peer_id,
-        device_id,
-        secret,
-        plaintext.action,
+    let serialized = serialized_json_string(plaintext)?;
+    // Fitting has to encrypt each candidate, because the ciphertext length is what ends up
+    // on the wire and only encryption reveals it.
+    let mut fit_error: Option<String> = None;
+    let pieces = fit_chunks(
         &serialized,
-    )?;
-    let chunk_count = serialized.len().div_ceil(chunk_size);
-    serialized
-        .chunks(chunk_size)
+        REMOTE_ACTION_RESULT_CHUNK_TARGET_CHARS,
+        |piece, chunk_index, chunk_count| {
+            match encrypt_json(
+                secret,
+                &RemoteActionResultChunkPlaintext {
+                    action_id: action_id.to_string(),
+                    action: plaintext.action,
+                    chunk_index,
+                    chunk_count,
+                    data: piece.to_string(),
+                },
+            ) {
+                Ok(envelope) => frame_bytes_for_payload(
+                    &OutboundBrokerPayload::EncryptedRemoteActionResultChunk {
+                        action_id: action_id.to_string(),
+                        target_peer_id: target_peer_id.to_string(),
+                        device_id: device_id.to_string(),
+                        action: plaintext.action,
+                        chunk_index,
+                        chunk_count,
+                        envelope,
+                    },
+                ),
+                Err(error) => {
+                    fit_error.get_or_insert(error);
+                    // Force the caller to shrink rather than silently accept a size it
+                    // could not actually measure.
+                    usize::MAX
+                }
+            }
+        },
+    );
+    if let Some(error) = fit_error {
+        return Err(error);
+    }
+    let pieces = pieces.ok_or_else(|| {
+        "encrypted remote action result chunk payload still exceeds broker frame limit".to_string()
+    })?;
+
+    let chunk_count = pieces.len();
+    pieces
+        .into_iter()
         .enumerate()
-        .map(|(chunk_index, chunk)| {
+        .map(|(chunk_index, piece)| {
             let envelope = encrypt_json(
                 secret,
                 &RemoteActionResultChunkPlaintext {
@@ -2175,7 +2581,7 @@ fn build_encrypted_remote_action_result_chunk_payloads(
                     action: plaintext.action,
                     chunk_index,
                     chunk_count,
-                    data_base64: STANDARD.encode(chunk),
+                    data: piece.to_string(),
                 },
             )?;
             Ok(OutboundBrokerPayload::EncryptedRemoteActionResultChunk {
@@ -2189,86 +2595,6 @@ fn build_encrypted_remote_action_result_chunk_payloads(
             })
         })
         .collect()
-}
-
-fn fit_plain_remote_action_result_chunk_size(
-    action_id: &str,
-    target_peer_id: &str,
-    action: RemoteActionKind,
-    serialized: &[u8],
-) -> Result<usize, String> {
-    let mut chunk_size = serialized
-        .len()
-        .min(REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES)
-        .max(1);
-    loop {
-        let chunk_count = serialized.len().div_ceil(chunk_size);
-        let sample = &serialized[..serialized.len().min(chunk_size)];
-        let payload = OutboundBrokerPayload::RemoteActionResultChunk {
-            action_id: action_id.to_string(),
-            target_peer_id: target_peer_id.to_string(),
-            action,
-            chunk_index: 0,
-            chunk_count,
-            data_base64: STANDARD.encode(sample),
-        };
-        if frame_bytes_for_payload(&payload) <= MAX_BROKER_TEXT_FRAME_BYTES {
-            return Ok(chunk_size);
-        }
-        if chunk_size <= REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES {
-            return Err(
-                "remote action result chunk payload still exceeds broker frame limit".to_string(),
-            );
-        }
-        chunk_size = (chunk_size / 2).max(REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES);
-    }
-}
-
-fn fit_encrypted_remote_action_result_chunk_size(
-    action_id: &str,
-    target_peer_id: &str,
-    device_id: &str,
-    secret: &str,
-    action: RemoteActionKind,
-    serialized: &[u8],
-) -> Result<usize, String> {
-    let mut chunk_size = serialized
-        .len()
-        .min(REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES)
-        .max(1);
-    loop {
-        let chunk_count = serialized.len().div_ceil(chunk_size);
-        let sample = &serialized[..serialized.len().min(chunk_size)];
-        let envelope = encrypt_json(
-            secret,
-            &RemoteActionResultChunkPlaintext {
-                action_id: action_id.to_string(),
-                action,
-                chunk_index: 0,
-                chunk_count,
-                data_base64: STANDARD.encode(sample),
-            },
-        )?;
-        let payload = OutboundBrokerPayload::EncryptedRemoteActionResultChunk {
-            action_id: action_id.to_string(),
-            target_peer_id: target_peer_id.to_string(),
-            device_id: device_id.to_string(),
-            action,
-            chunk_index: 0,
-            chunk_count,
-            envelope,
-        };
-        if frame_bytes_for_payload(&payload) <= MAX_BROKER_TEXT_FRAME_BYTES {
-            return Ok(chunk_size);
-        }
-        if chunk_size <= REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES {
-            return Err(
-                "encrypted remote action result chunk payload still exceeds broker frame limit"
-                    .to_string(),
-            );
-        }
-        chunk_size = (chunk_size / 2).max(REMOTE_ACTION_RESULT_CHUNK_MIN_BYTES);
-    }
 }
 
 fn cached_remote_action_result(
@@ -2295,6 +2621,9 @@ fn cached_remote_action_result(
         thread_entry_detail: outcome.thread_entry_detail,
         thread_transcript: outcome.thread_transcript,
         workspace_diff: outcome.workspace_diff,
+        workspace_git_context: outcome.workspace_git_context,
+        thread_workspace: outcome.thread_workspace,
+        thread_settings: outcome.thread_settings,
         reviews: outcome.reviews,
         workflows: outcome.workflows,
         devices: outcome.devices,
@@ -2322,6 +2651,9 @@ fn measure_remote_action_result_sizes(
     thread_entry_detail: Option<&ThreadEntryDetailResponse>,
     thread_transcript: Option<&ThreadTranscriptResponse>,
     workspace_diff: Option<&WorkspaceDiffResponse>,
+    workspace_git_context: Option<&WorkspaceGitContextView>,
+    thread_workspace: Option<&ResolvedWorkspace>,
+    thread_settings: Option<&ThreadSettingsView>,
     reviews: Option<&ReviewsResponse>,
     workflows: Option<&WorkflowsResponse>,
     devices: Option<&DevicesResponse>,
@@ -2347,6 +2679,9 @@ fn measure_remote_action_result_sizes(
         thread_entry_detail,
         thread_transcript,
         workspace_diff,
+        workspace_git_context,
+        thread_workspace,
+        thread_settings,
         reviews,
         workflows,
         devices,
@@ -2367,6 +2702,9 @@ fn measure_remote_action_result_sizes(
         thread_entry_detail_bytes: maybe_serialized_json_bytes(thread_entry_detail),
         thread_transcript_bytes: maybe_serialized_json_bytes(thread_transcript),
         workspace_diff_bytes: maybe_serialized_json_bytes(workspace_diff),
+        workspace_git_context_bytes: maybe_serialized_json_bytes(workspace_git_context),
+        thread_workspace_bytes: maybe_serialized_json_bytes(thread_workspace),
+        thread_settings_bytes: maybe_serialized_json_bytes(thread_settings),
         reviews_bytes: maybe_serialized_json_bytes(reviews),
         workflows_bytes: maybe_serialized_json_bytes(workflows),
         devices_bytes: maybe_serialized_json_bytes(devices),
@@ -2464,6 +2802,13 @@ fn serialized_json_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("serialize remote action result failed: {error}"))
 }
 
+/// The serialized result as text, so it can be chunked on character boundaries and sent
+/// without a base64 layer.
+fn serialized_json_string<T: Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value)
+        .map_err(|error| format!("serialize remote action result failed: {error}"))
+}
+
 fn maybe_serialized_json_bytes<T: Serialize>(value: Option<&T>) -> usize {
     value.map(serialized_json_bytes).unwrap_or(0)
 }
@@ -2483,6 +2828,10 @@ struct RemoteActionResultPlaintextRef<'a> {
     thread_entry_detail: Option<&'a ThreadEntryDetailResponse>,
     thread_transcript: Option<&'a ThreadTranscriptResponse>,
     workspace_diff: Option<&'a WorkspaceDiffResponse>,
+    workspace_git_context: Option<&'a WorkspaceGitContextView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_workspace: Option<&'a ResolvedWorkspace>,
+    thread_settings: Option<&'a ThreadSettingsView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reviews: Option<&'a ReviewsResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2526,6 +2875,10 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         | RemoteActionKind::FetchThreadEntryDetail
         | RemoteActionKind::FetchThreadTranscript
         | RemoteActionKind::FetchWorkspaceDiff
+        | RemoteActionKind::FetchWorkspaceGitContext
+        | RemoteActionKind::FetchThreadWorkspace
+        | RemoteActionKind::SetThreadWorkspace
+        | RemoteActionKind::FetchThreadSettings
         | RemoteActionKind::FetchReviews
         | RemoteActionKind::FetchWorkflows
         | RemoteActionKind::FetchDevices
@@ -2540,6 +2893,7 @@ fn remote_action_result_kind(action: RemoteActionKind) -> RemoteActionResultKind
         | RemoteActionKind::ApplyFileChange
         | RemoteActionKind::ProjectAction
         | RemoteActionKind::RenameThread
+        | RemoteActionKind::RepairWorkspace
         | RemoteActionKind::RequestReview
         | RemoteActionKind::StartWorkflow
         | RemoteActionKind::ResolveReview

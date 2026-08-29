@@ -44,10 +44,11 @@ export const startSessionButton = document.querySelector("#start-session-button"
 export const openLaunchSettingsButton = document.querySelector("#open-launch-settings");
 export const launchSettingsModal = document.querySelector("#launch-settings-modal");
 export const closeLaunchSettingsModalButton = document.querySelector("#close-launch-settings-modal");
-export const launchStartSessionDialog = document.querySelector("#launch-start-session-dialog");
+// Not queried here: the dialog renders on demand, so an import-time query would
+// capture null forever. Callers use getElementById when they need it.
 export const cwdInput = document.querySelector("#cwd-input");
 export const startPromptInput = document.querySelector("#start-prompt");
-export const startPromptAttachments = document.querySelector("#start-prompt-attachments");
+// Not queried here either, for the same reason as the dialog above.
 export const providerInput = document.querySelector("#provider-input");
 export const modelInput = document.querySelector("#model-input");
 export const modelInputLabel = document.querySelector("#model-input-label");
@@ -58,6 +59,27 @@ export const startEffortLabel = document.querySelector("#start-effort-label");
 export const threadsList = document.querySelector("#threads-list");
 export const threadsCount = document.querySelector("#threads-count");
 export const projectOverviewMount = document.querySelector("#project-overview");
+export const taskTeamMount = document.querySelector("#task-team");
+export const teamsLibraryMount = document.querySelector("#teams-library");
+export const reviewScreenMount = document.querySelector("#review-screen");
+export const usageReportMount = document.querySelector("#usage-report");
+// The sidebar's destinations, in both forms, are one shared prop-driven component
+// (shared/sidebar-nav.js) rendered into these two mounts. That replaced SIX handles —
+// a Sessions button, a Tasks button and a count badge in the sidebar, plus a Sessions
+// button, a Tasks button and a dot on the rail — with two, and took the "you are here"
+// state off `[data-view]` CSS and an imperative `aria-current` write at the same time.
+export const sidebarNavMount = document.querySelector("#sidebar-nav");
+export const iconRailNavMount = document.querySelector("#icon-rail-nav");
+// The search + bell toggles, and the search FIELD. Two mounts in place of five
+// `getElementById` calls in app.js — and, more to the point, in place of the rule that
+// made the field always-mounted-and-hidden. A mount is a container the shell always
+// renders; the CONTROL inside it is free to be absent, which is what a hidden node could
+// never be.
+export const sidebarTopActionsMount = document.querySelector("#sidebar-top-actions");
+export const sidebarSearchMount = document.querySelector("#sidebar-search-mount");
+export const sidebarTaskListMount = document.querySelector("#sidebar-task-list");
+export const sidebarTeamsListMount = document.querySelector("#sidebar-teams-list");
+export const startTaskDialogMount = document.querySelector("#start-task-dialog-mount");
 export const threadContextMenu = document.querySelector("#thread-context-menu");
 export const forkThreadButton = document.querySelector("#fork-thread-button");
 export const archiveThreadButton = document.querySelector("#archive-thread-button");
@@ -73,7 +95,6 @@ export const threadProjectCurrentLabel = document.querySelector("#thread-project
 export const forkSessionDialogRoot = document.querySelector("#fork-session-dialog-root");
 export const pairedDevicesList = document.querySelector("#paired-devices-list");
 export const chatShell = document.querySelector(".chat-shell");
-export const headerNewAgentButton = document.querySelector("#header-new-agent");
 export const workspaceSubtitle = document.querySelector("#workspace-subtitle");
 export const workspaceSuggestionsList = document.querySelector("#workspace-suggestions");
 export const localModelBadge = document.querySelector("#local-model-badge");

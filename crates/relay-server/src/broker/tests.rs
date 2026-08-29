@@ -5,6 +5,8 @@ use std::{
 };
 
 use super::*;
+// The relay itself no longer writes to a socket directly (see `writer.rs`), so this
+// module needs its own `SinkExt` for the fake broker it stands up.
 use crate::protocol::{
     SendMessageInput, ThreadTranscriptResponse, TranscriptEntryKind, TranscriptEntryView,
 };
@@ -14,6 +16,7 @@ use crate::state::{
 use axum::{extract::Path, routing::post, Json, Router};
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
+use futures_util::sink::SinkExt;
 use rand::{rngs::StdRng, SeedableRng};
 use relay_broker::public_control::{
     ClientGrantRequest, ClientGrantResponse, DeviceGrantBulkRevokeRequest,
@@ -118,8 +121,9 @@ async fn spawn_public_control_mock() -> String {
 
     async fn client_grant(Json(request): Json<ClientGrantRequest>) -> Json<ClientGrantResponse> {
         Json(ClientGrantResponse {
-            client_id: format!("client-for-{}", request.device_id),
-            client_refresh_token: format!("client-refresh-{}", request.device_id),
+            claim_id: format!("claim-for-{}", request.device_id),
+            claim_nonce: format!("nonce-for-{}", request.device_id),
+            claim_expires_at: 999,
             relay_id: request.relay_id,
             broker_room_id: request.broker_room_id,
             device_id: request.device_id,
@@ -507,8 +511,9 @@ async fn broker_config_public_mode_uses_control_plane_tokens() {
         .await
         .expect("public mode should fetch a client grant")
         .expect("public mode should issue a client grant");
-    assert_eq!(client_grant.client_id, "client-for-device-1");
-    assert_eq!(client_grant.refresh_token, "client-refresh-device-1");
+    assert_eq!(client_grant.claim_id, "claim-for-device-1");
+    assert_eq!(client_grant.claim_nonce, "nonce-for-device-1");
+    assert_eq!(client_grant.claim_expires_at, 999);
     assert_eq!(client_grant.relay_id, "relay-owner-1");
     assert_eq!(client_grant.relay_label.as_deref(), Some("Demo Relay"));
 }
@@ -1719,4 +1724,719 @@ mod transcript_delta_delivery {
             "a device whose scope no longer covers the thread must receive nothing"
         );
     }
+}
+
+#[test]
+fn a_pairing_result_is_addressed_to_one_peer_and_never_broadcast() {
+    // SECURITY: the pairing result seals payload_secret + refresh tokens with the
+    // pairing_secret printed into the QR. If it goes out as a bare payload the
+    // broker fans it out to the whole room, so any bystander replaying the same
+    // pairing join ticket gets the envelope and can open it with the QR's secret.
+    // The `targeted_messages` wrapper is what confines it to one peer.
+    let result = crate::state::PendingPairingResult {
+        pairing_id: "pair-abc".to_string(),
+        target_peer_id: "surface-intended".to_string(),
+        pairing_secret: "pairing-secret-from-the-qr".to_string(),
+        device: None,
+        payload_secret: Some("payload-secret-must-stay-sealed".to_string()),
+        relay_id: Some("relay-1".to_string()),
+        relay_label: None,
+        client_claim_id: Some("claim-1".to_string()),
+        client_claim_nonce: Some("cn-must-stay-sealed".to_string()),
+        client_claim_expires_at: Some(300),
+        device_refresh_token: Some("dref-must-stay-sealed".to_string()),
+        device_join_ticket: Some("join-ticket-must-stay-sealed".to_string()),
+        device_join_ticket_expires_at: Some(300),
+        error: None,
+    };
+
+    let message = pairing_result_targeted_message(result).expect("pairing result should seal");
+    assert_eq!(
+        message.target_peer_id, "surface-intended",
+        "the wrapper must address the peer that completed the handshake"
+    );
+
+    let frame = frame_text_for_payload(&OutboundBrokerPayload::TargetedMessages {
+        messages: vec![message],
+    });
+    let parsed: serde_json::Value =
+        serde_json::from_str(&frame).expect("outbound frame should parse");
+    assert_eq!(
+        parsed["payload"]["kind"], "targeted_messages",
+        "a pairing result published bare is broadcast by the broker; frame was {frame}"
+    );
+    assert_eq!(
+        parsed["payload"]["messages"][0]["target_peer_id"], "surface-intended",
+        "the broker routes on the wrapper's target_peer_id"
+    );
+
+    for secret in [
+        "payload-secret-must-stay-sealed",
+        "cref-must-stay-sealed",
+        "dref-must-stay-sealed",
+        "join-ticket-must-stay-sealed",
+    ] {
+        assert!(
+            !frame.contains(secret),
+            "{secret} must be sealed inside the envelope, not readable in the frame"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broker session integration: does a paced chunk train still deafen the relay?
+//
+// The unit tests around `publish_chunk_train` and `drive_writer` pin the pieces. This
+// drives the REAL session loop (`run_broker_session_with_liveness`) against a real
+// websocket, because the defect being guarded was never visible in a piece: it was the
+// coupling between them. `handle_server_message` is awaited inline in the `select!` arm
+// that reads the socket, so publishing a reply used to stop the relay reading anything
+// at all — from any surface — for the length of that reply.
+//
+// Slow by nature (a real socket, a real git diff, and real 250ms pacing), so it is
+// opt-in the way the live-provider tests are: set AGENT_RELAY_BROKER_SESSION_E2E=1.
+// ---------------------------------------------------------------------------
+
+fn broker_session_e2e_enabled() -> bool {
+    std::env::var("AGENT_RELAY_BROKER_SESSION_E2E")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// A workspace whose `git diff HEAD` is comfortably past
+/// `MAX_BROKER_TEXT_FRAME_BYTES`, so `fetch_workspace_diff` has to chunk its reply.
+fn workspace_with_a_large_diff() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("tmpdir");
+    let root = dir.path();
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git should run");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    run(&["init", "-q", "."]);
+    run(&["config", "user.email", "test@example.test"]);
+    run(&["config", "user.name", "test"]);
+    let baseline: String = (0..4000).map(|i| format!("original line {i}\n")).collect();
+    std::fs::write(root.join("big.txt"), baseline).expect("baseline written");
+    run(&["add", "-A"]);
+    run(&["commit", "-qm", "baseline"]);
+    let modified: String = (0..4000)
+        .map(|i| format!("MODIFIED line {i} with padding to widen the diff\n"))
+        .collect();
+    std::fs::write(root.join("big.txt"), modified).expect("modification written");
+    dir
+}
+
+/// Managed mode so the test can build plaintext action frames by hand. The chunked
+/// publish path under test is shared with the encrypted one — both reach
+/// `publish_remote_action_result_chunks` — so this exercises the same coupling.
+async fn managed_broker_state(cwd: &str) -> AppState {
+    let (change_tx, _) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        cwd.to_string(),
+        change_tx.clone(),
+        SecurityProfile::managed(),
+    )));
+    relay.write().await.paired_devices.insert(
+        "phone-1".to_string(),
+        crate::state::PairedDevice {
+            device_id: "phone-1".to_string(),
+            label: "phone-1".to_string(),
+            payload_secret: "secret".to_string(),
+            device_verify_key: "verify".to_string(),
+            created_at: 1,
+            last_seen_at: Some(1),
+            last_peer_id: None,
+            broker_join_ticket_expires_at: None,
+            path_scope: Vec::new(),
+        },
+    );
+    AppState::from_parts(relay, HashMap::new(), change_tx)
+}
+
+/// What the fake broker saw, with arrival times, so the test can talk about latency
+/// rather than just ordering.
+#[derive(Default)]
+struct BrokerObservations {
+    frames: Vec<(String, std::time::Instant)>,
+}
+
+impl BrokerObservations {
+    fn kinds(&self) -> Vec<String> {
+        self.frames.iter().map(|(kind, _)| kind.clone()).collect()
+    }
+
+    fn count_of(&self, kind: &str) -> usize {
+        self.frames.iter().filter(|(seen, _)| seen == kind).count()
+    }
+
+    fn first_at(&self, kind: &str) -> Option<std::time::Instant> {
+        self.frames
+            .iter()
+            .find(|(seen, _)| seen == kind)
+            .map(|(_, at)| *at)
+    }
+}
+
+fn surface_peer(peer_id: &str, device_id: &str) -> relay_broker::protocol::PeerSummary {
+    relay_broker::protocol::PeerSummary {
+        peer_id: peer_id.to_string(),
+        role: PeerRole::Surface,
+        device_id: Some(device_id.to_string()),
+    }
+}
+
+fn plain_action_frame(from_peer_id: &str, action_id: &str, request: serde_json::Value) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": "message",
+        "channel_id": "room-e2e",
+        "from_peer_id": from_peer_id,
+        "from_role": "surface",
+        "payload": {
+            "kind": "remote_action",
+            // The constant, not a literal. A payload the relay considers the wrong version
+            // is a PARSE-level failure that kills the whole session, so a stale literal
+            // here does not fail one action — it produces a session that publishes
+            // nothing at all, which reads like a hang rather than a version mismatch.
+            "protocol_version": RELAY_PROTOCOL_VERSION,
+            "action_id": action_id,
+            "device_id": "phone-1",
+            "request": request,
+        }
+    }))
+    .expect("action frame serializes")
+}
+
+/// A surface that leaves mid-reply must not cost every other surface the rest of that
+/// reply's pacing.
+///
+/// Surface A asks for a workspace diff big enough to be chunked (~10 chunks, 250ms
+/// apart — about 2.3s of pacing). While that reply is going out, A leaves and B asks a
+/// question. Two things must hold, and before this work neither did:
+///
+///   * B is answered promptly, because the relay is still READING. Previously the
+///     session loop awaited the whole chunked publish inline, so B's frame sat unread
+///     on the socket until A's reply had finished.
+///   * A's train stops, because the departure is now observable while the train paces.
+///     Previously the presence frame announcing it could not be read until afterwards,
+///     which is what made the first attempt at this fix a no-op.
+#[tokio::test]
+async fn a_departing_surface_does_not_stall_the_relay_for_everyone_else() {
+    if !broker_session_e2e_enabled() {
+        eprintln!("skipping: set AGENT_RELAY_BROKER_SESSION_E2E=1 to run the broker session e2e");
+        return;
+    }
+
+    let workspace = workspace_with_a_large_diff();
+    let cwd = workspace.path().to_string_lossy().to_string();
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should resolve");
+    let observations = Arc::new(std::sync::Mutex::new(BrokerObservations::default()));
+    let broker_view = Arc::clone(&observations);
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("broker should accept");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+
+        // Both surfaces are in the room, so the relay records them as online — which is
+        // what later makes A's departure an *observed* one.
+        let welcome = ServerMessage::Welcome {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            channel_id: "room-e2e".to_string(),
+            peer_id: "relay-e2e".to_string(),
+            peers: vec![
+                surface_peer("surface-a", "phone-1"),
+                surface_peer("surface-b", "phone-1"),
+            ],
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&welcome).expect("welcome serializes"),
+            ))
+            .await
+            .expect("welcome sends");
+
+        // A asks for the big diff.
+        socket
+            .send(Message::Text(plain_action_frame(
+                "surface-a",
+                "action-diff",
+                serde_json::json!({ "type": "fetch_workspace_diff" }),
+            )))
+            .await
+            .expect("diff request sends");
+
+        let mut announced_departure = false;
+        while let Some(frame) = socket.next().await {
+            let Ok(frame) = frame else { break };
+            match frame {
+                Message::Ping(payload) => {
+                    let _ = socket.send(Message::Pong(payload)).await;
+                }
+                Message::Close(_) => break,
+                Message::Text(text) => {
+                    let kind = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("payload")
+                                .and_then(|payload| payload.get("kind"))
+                                .and_then(|kind| kind.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    broker_view
+                        .lock()
+                        .unwrap()
+                        .frames
+                        .push((kind.clone(), std::time::Instant::now()));
+
+                    // The moment A's reply starts streaming, A goes away and B asks
+                    // something. This is the interleaving the old code could not serve.
+                    if kind == "remote_action_result_chunk" && !announced_departure {
+                        announced_departure = true;
+                        let left = ServerMessage::Presence {
+                            channel_id: "room-e2e".to_string(),
+                            kind: PresenceKind::Left,
+                            peer: surface_peer("surface-a", "phone-1"),
+                        };
+                        socket
+                            .send(Message::Text(
+                                serde_json::to_string(&left).expect("presence serializes"),
+                            ))
+                            .await
+                            .expect("presence sends");
+                        socket
+                            .send(Message::Text(plain_action_frame(
+                                "surface-b",
+                                "action-threads",
+                                serde_json::json!({ "type": "list_threads", "query": { "limit": 5 } }),
+                            )))
+                            .await
+                            .expect("second request sends");
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let config = heartbeat_test_config(format!("ws://{address}")).await;
+    let state = managed_broker_state(&cwd).await;
+    let mut change_rx = state.subscribe();
+
+    let _session = tokio::time::timeout(
+        Duration::from_secs(3),
+        run_broker_session_with_liveness(
+            &state,
+            &mut change_rx,
+            &config,
+            BrokerLivenessConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(30),
+            },
+        ),
+    )
+    .await;
+
+    let seen = observations.lock().unwrap();
+    let kinds = seen.kinds();
+
+    // `expect` takes a literal, so the `{kinds:?}` this used to pass never interpolated —
+    // the failure told you nothing about what actually arrived.
+    let first_chunk_at = seen
+        .first_at("remote_action_result_chunk")
+        .unwrap_or_else(|| panic!("the diff reply must be chunked; saw {kinds:?}"));
+    let threads_at = seen
+        .first_at("remote_threads_result")
+        .unwrap_or_else(|| panic!("surface B was never answered at all; saw {kinds:?}"));
+
+    let b_waited = threads_at.saturating_duration_since(first_chunk_at);
+    assert!(
+        b_waited < Duration::from_millis(750),
+        "surface B waited {}ms behind another surface's chunked reply. The reply paces \
+         ~2.3s, so anything near that means the relay stopped reading while it wrote — \
+         the exact stall this test exists for. Frames: {kinds:?}",
+        b_waited.as_millis()
+    );
+
+    let chunks = seen.count_of("remote_action_result_chunk");
+    assert!(
+        chunks < 8,
+        "surface A left after its first chunk, so its train should have been abandoned; \
+         got {chunks} chunks. Frames: {kinds:?}"
+    );
+}
+
+/// A dropped publish must never pass unnoticed.
+///
+/// The broker's answer to an over-budget peer is to discard that frame and keep the
+/// socket open. The relay used to treat the resulting `rate_limited` as mild
+/// backpressure and merely delay its next snapshot — but nothing about that recovers
+/// the frame that was already thrown away, and the relay cannot even tell which one it
+/// was. A discarded transcript delta the client can repair; a discarded chunk it
+/// cannot, and the reply it belongs to can then only time out.
+///
+/// So it is fatal. The session ends, reconnects, and resyncs — and the surface fails its
+/// in-flight actions immediately on the disconnect rather than waiting out a deadline
+/// for chunks that will never come. A visible, self-healing reconnect beats silent
+/// corruption; the allowance is sized so this should not happen in the first place.
+#[tokio::test]
+async fn a_dropped_publish_ends_the_session_instead_of_passing_unnoticed() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should resolve");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("broker should accept");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        let welcome = ServerMessage::Welcome {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            channel_id: "room-stalled".to_string(),
+            peer_id: "relay-stalled".to_string(),
+            peers: Vec::new(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&welcome).expect("welcome serializes"),
+            ))
+            .await
+            .expect("welcome sends");
+        let rate_limited = ServerMessage::Error {
+            code: "rate_limited".to_string(),
+            message: "broker publish rate limit exceeded for this peer".to_string(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&rate_limited).expect("error serializes"),
+            ))
+            .await
+            .expect("error sends");
+        std::future::pending::<()>().await;
+    });
+
+    let config = heartbeat_test_config(format!("ws://{address}")).await;
+    let state = broker_test_state();
+    let mut change_rx = state.subscribe();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_broker_session_with_liveness(
+            &state,
+            &mut change_rx,
+            &config,
+            BrokerLivenessConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(30),
+            },
+        ),
+    )
+    .await
+    .expect("the session must not sit there after a frame was dropped");
+
+    assert!(
+        outcome.is_err(),
+        "a dropped publish must end the session so it reconnects and resyncs, rather \
+         than continuing with a hole in what the surface received"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One bad payload must not disconnect the room
+//
+// The payload version is a hard cut: relay and surface ship together, so an older
+// version is simply not served. What must NOT happen is the rest of the room paying for
+// it. A rejected payload is a parse-level failure, and that error used to end the whole
+// broker session — every surface, not just the one that sent the bad frame. A tab left
+// open across a relay restart is enough to trigger it, and each teardown resyncs a full
+// snapshot. These run in CI (no git, no pacing) because they guard an availability
+// property nobody can test by hand.
+// ---------------------------------------------------------------------------
+
+fn plain_action_frame_versioned(
+    from_peer_id: &str,
+    action_id: &str,
+    request: serde_json::Value,
+    protocol_version: u64,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": "message",
+        "channel_id": "room-version",
+        "from_peer_id": from_peer_id,
+        "from_role": "surface",
+        "payload": {
+            "kind": "remote_action",
+            "protocol_version": protocol_version,
+            "action_id": action_id,
+            "device_id": "phone-1",
+            "request": request,
+        }
+    }))
+    .expect("action frame serializes")
+}
+
+/// Same as [`managed_broker_state`] but in PRIVATE mode, which is the default and the
+/// one where plaintext remote actions are refused.
+async fn private_broker_state(cwd: &str) -> AppState {
+    let (change_tx, _) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        cwd.to_string(),
+        change_tx.clone(),
+        SecurityProfile::private(),
+    )));
+    relay.write().await.paired_devices.insert(
+        "phone-1".to_string(),
+        crate::state::PairedDevice {
+            device_id: "phone-1".to_string(),
+            label: "phone-1".to_string(),
+            payload_secret: "secret".to_string(),
+            device_verify_key: "verify".to_string(),
+            created_at: 1,
+            last_seen_at: Some(1),
+            last_peer_id: None,
+            broker_join_ticket_expires_at: None,
+            path_scope: Vec::new(),
+        },
+    );
+    AppState::from_parts(relay, HashMap::new(), change_tx)
+}
+
+/// Drive one relay session against a fake broker that sends `frames` after the welcome,
+/// and report every payload kind the relay published back.
+async fn observe_relay_session_for_frames(frames: Vec<String>) -> Vec<String> {
+    observe_relay_session_with_state(frames, None).await
+}
+
+async fn observe_relay_session_with_state(
+    frames: Vec<String>,
+    state_override: Option<AppState>,
+) -> Vec<String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener should resolve");
+    let observations = Arc::new(std::sync::Mutex::new(BrokerObservations::default()));
+    let broker_view = Arc::clone(&observations);
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("broker should accept");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+
+        let welcome = ServerMessage::Welcome {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            channel_id: "room-version".to_string(),
+            peer_id: "relay-version".to_string(),
+            peers: vec![surface_peer("surface-a", "phone-1")],
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&welcome).expect("welcome serializes"),
+            ))
+            .await
+            .expect("welcome sends");
+        for frame in frames {
+            socket
+                .send(Message::Text(frame))
+                .await
+                .expect("frame sends");
+        }
+
+        while let Some(frame) = socket.next().await {
+            let Ok(frame) = frame else { break };
+            match frame {
+                Message::Ping(payload) => {
+                    let _ = socket.send(Message::Pong(payload)).await;
+                }
+                Message::Close(_) => break,
+                Message::Text(text) => {
+                    let kind = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("payload")
+                                .and_then(|payload| payload.get("kind"))
+                                .and_then(|kind| kind.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    broker_view
+                        .lock()
+                        .unwrap()
+                        .frames
+                        .push((kind, std::time::Instant::now()));
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let dir = tempfile::TempDir::new().expect("tmpdir");
+    let cwd = dir.path().to_string_lossy().to_string();
+    let config = heartbeat_test_config(format!("ws://{address}")).await;
+    let state = match state_override {
+        Some(state) => state,
+        None => managed_broker_state(&cwd).await,
+    };
+    let mut change_rx = state.subscribe();
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_broker_session_with_liveness(
+            &state,
+            &mut change_rx,
+            &config,
+            BrokerLivenessConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(30),
+            },
+        ),
+    )
+    .await;
+
+    let seen = observations.lock().unwrap();
+    seen.kinds()
+}
+
+/// A stale tab's previous-version request is ignored — and costs only that request.
+///
+/// The version is a hard cut, so the old request is deliberately NOT served. But a tab
+/// left open across a relay restart will send one, and if that ends the session then
+/// every other surface in the room is disconnected by somebody else's stale JavaScript,
+/// with a full snapshot resync on the way back.
+#[tokio::test]
+async fn a_previous_version_request_does_not_end_the_session() {
+    let kinds = observe_relay_session_for_frames(vec![
+        plain_action_frame_versioned(
+            "surface-a",
+            "action-old",
+            serde_json::json!({ "type": "list_threads", "query": { "limit": 5 } }),
+            1,
+        ),
+        plain_action_frame_versioned(
+            "surface-a",
+            "action-new",
+            serde_json::json!({ "type": "list_threads", "query": { "limit": 5 } }),
+            RELAY_PROTOCOL_VERSION,
+        ),
+    ])
+    .await;
+
+    let answered = kinds
+        .iter()
+        .filter(|kind| kind.as_str() == "remote_threads_result")
+        .count();
+    assert_eq!(
+        answered, 1,
+        "the current-version request must still be answered after a previous-version one \
+         was refused — exactly one reply, proving the stale frame was dropped on its own \
+         rather than taking the session with it. Saw {kinds:?}"
+    );
+}
+
+/// …and a payload the relay genuinely cannot understand must still not end the session.
+///
+/// This is the general form of the same hazard, and it is not limited to version skew: a
+/// single authenticated surface sending junk should cost that surface its request, not
+/// cost every other surface the connection. Fixing only the version case would leave the
+/// denial-of-service intact behind a different malformed frame.
+#[tokio::test]
+async fn an_unparseable_payload_does_not_end_the_session() {
+    let kinds = observe_relay_session_for_frames(vec![
+        plain_action_frame_versioned(
+            "surface-a",
+            "action-garbage",
+            serde_json::json!({ "type": "list_threads", "query": { "limit": 5 } }),
+            9_999,
+        ),
+        plain_action_frame_versioned(
+            "surface-a",
+            "action-good",
+            serde_json::json!({ "type": "list_threads", "query": { "limit": 5 } }),
+            2,
+        ),
+    ])
+    .await;
+
+    assert!(
+        kinds.iter().any(|kind| kind == "remote_threads_result"),
+        "a valid request after an unparseable one must still be answered; one surface \
+         sending junk must not disconnect the room. Saw {kinds:?}"
+    );
+}
+
+/// A message that fails AFTER it parses must not end the session either.
+///
+/// The parse-level guard is not enough on its own. A structurally valid request can still
+/// be refused by its handler, and the commonest case needs no malice at all: plaintext
+/// remote actions are disabled in **private mode, which is the default**, so any surface
+/// that sends one gets an error returned from the handler. That error used to propagate out
+/// of `handle_server_message` and take the whole session with it — every other surface
+/// disconnected, and a full snapshot resync on the way back — which a surface could repeat
+/// at will.
+///
+/// Connection-level failures still end the session, and do not need this path to do it: a
+/// dead writer has its own `select!` arm, and a broker `rate_limited` is handled in its own
+/// match arm.
+#[tokio::test]
+async fn a_handler_error_after_parsing_does_not_end_the_session() {
+    let dir = tempfile::TempDir::new().expect("tmpdir");
+    let state = private_broker_state(&dir.path().to_string_lossy()).await;
+
+    // Structurally valid, current version, and refused by the handler because this relay
+    // is private.
+    let refused = plain_action_frame_versioned(
+        "surface-a",
+        "action-plaintext",
+        serde_json::json!({ "type": "list_threads", "query": { "limit": 5 } }),
+        RELAY_PROTOCOL_VERSION,
+    );
+
+    // A request the private relay WILL serve, so the assertion is about the session
+    // surviving rather than about plaintext being refused.
+    let envelope = encrypt_json(
+        "secret",
+        &RemoteActionRequest::ListThreads {
+            query: serde_json::from_value(serde_json::json!({ "limit": 5 }))
+                .expect("threads query parses"),
+        },
+    )
+    .expect("request encrypts");
+    let sealed = serde_json::to_string(&serde_json::json!({
+        "type": "message",
+        "channel_id": "room-version",
+        "from_peer_id": "surface-a",
+        "from_role": "surface",
+        "payload": {
+            "kind": "encrypted_remote_action",
+            "protocol_version": RELAY_PROTOCOL_VERSION,
+            "action_id": "action-sealed",
+            "device_id": "phone-1",
+            "envelope": envelope,
+        }
+    }))
+    .expect("sealed frame serializes");
+
+    let kinds = observe_relay_session_with_state(vec![refused, sealed], Some(state)).await;
+
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| kind == "encrypted_remote_action_result" || kind == "targeted_messages"),
+        "the sealed request must still be answered after the plaintext one was refused. \
+         A handler error belongs to the surface that caused it, not to the room. Saw {kinds:?}"
+    );
 }

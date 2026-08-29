@@ -19,6 +19,8 @@ import {
   closeSettingsModalButton,
   settingsModal,
   iconRailSettingsButton,
+  sidebarTaskListMount,
+  startTaskDialogMount,
   composerAttachments,
   connectionForm,
   controlBanner,
@@ -32,8 +34,6 @@ import {
   forkSessionDialogRoot,
   forkThreadButton,
   goConsoleHomeButton,
-  headerNewAgentButton,
-  launchStartSessionDialog,
   launchSettingsModal,
   loadDirectoryButton,
   messageEffort,
@@ -61,7 +61,6 @@ import {
   startEffortInput,
   startEffortLabel,
   startPairingButton,
-  startPromptAttachments,
   startPromptInput,
   startSessionButton,
   statusBadge,
@@ -97,6 +96,7 @@ import {
 import React from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
+import { StartSessionSplitButton } from "./shared/start-session-split-button.js";
 import {
   createApiFetch,
   createAuthSession,
@@ -105,6 +105,25 @@ import {
   getDevices,
   getReviews,
   getWorkflows,
+  getTeams,
+  startTeam,
+  teamAction,
+  getUsage,
+  getTeamCatalog,
+  ensureOrchestrator,
+  resetOrchestrator,
+  getTeamDiff,
+  listLineComments,
+  createLineComment,
+  resolveLineComment,
+  handBackLineComment,
+  listReviewTicks,
+  tickReviewFile,
+  teamRunCommentScope,
+  proposeOrchestratorTask,
+  confirmOrchestratorProposal,
+  dismissOrchestratorProposal,
+  setUsageBudget,
 } from "./local/api.js";
 import {
   createWorkspaceDiffStore,
@@ -119,6 +138,7 @@ import {
   createVerbCycler,
   isProgressStalled,
   progressPhaseLabel,
+  VERB_CYCLE_MS,
 } from "./progress-verbs.js";
 import {
   configureSecurityRenderers,
@@ -139,10 +159,13 @@ import {
   buildNavigationThreadGroups,
 } from "./shared/thread-groups.js";
 import { findThreadInSearchResults, findVisibleThread } from "./shared/thread-search.js";
+import { createTranscriptInteractionHandler } from "./shared/transcript-interactions.js";
+import { refreshedPinPage } from "./local/pin-page.js";
 
 import {
   createThreadListStore,
   readActiveProjectId,
+  readThreadFilter,
   readThreadListContextMenu,
   readThreadListUi,
 } from "./shared/thread-list-store.js";
@@ -150,6 +173,9 @@ import { createProjectsStore } from "./shared/projects-store.js";
 import { createDevicesCache } from "./shared/devices-cache.js";
 import { createReviewsCache } from "./shared/reviews-cache.js";
 import { createWorkflowsCache } from "./shared/workflows-cache.js";
+import { createTeamsCache } from "./shared/teams-cache.js";
+import { markTaskSeen } from "./local/task-seen-prefs.js";
+import { StartTaskDialog } from "./shared/start-task-dialog.js";
 import {
   fetchProjectsPayload,
   createProject,
@@ -182,15 +208,19 @@ import {
 } from "./shared/context-menu-position.js";
 import { fetchBuildInfo } from "./shared/build-badge.js";
 import { providerLabel } from "./shared/provider-labels.js";
+import { applyProviderMark } from "./shared/provider-mark.js";
 import { ForkSessionDialog } from "./shared/fork-session-dialog.js";
 import { forkCompletionEffect } from "./local/fork-submit-ownership.js";
 import {
+  INHERIT,
   applyForkProviderChange,
   defaultForkFields,
   forkPointIsTranscriptTip,
   resolveForkSourceThread,
   threadIsBusyForFork,
 } from "./shared/fork-fields.js";
+import { providerSupportsArchive } from "./shared/thread-actions-model.js";
+import { reportDestructiveActionFailure } from "./shared/destructive-action-failure.js";
 import {
   buildReviewingThreadSet,
   isReviewInProgressForThread,
@@ -202,7 +232,6 @@ import { isWorkflowInProgressForThread } from "./shared/workflow-state.js";
 import {
   buildViewOnlyPin,
   mergeOlderViewOnlyPage,
-  mergeRefreshedViewOnlyPage,
   viewOnlyEligible,
   viewOnlyPinNextAction,
   viewOnlySelfHealThreadId,
@@ -216,6 +245,13 @@ import { ClientLog } from "./shared/client-log.js";
 import { mapRelayLogEntries, mergeLogEntries } from "./shared/client-log-merge.js";
 import { SessionTabStrip, buildSessionTabItems } from "./shared/session-tab-strip.js";
 import { ProjectSwitcher } from "./shared/project-switcher.js";
+import { StartSessionDialog } from "./shared/start-session-dialog.js";
+import { selectWorkspaceSuggestionsModel } from "./shared/workspace-suggestions.js";
+import {
+  decideWorkspaceRefresh,
+  localViewedWorkspaceKey,
+} from "./shared/viewed-workspace-key.js";
+import { createProjectAndSelect } from "./shared/project-create.js";
 import {
   layoutThreadIds,
 } from "./shared/tab-layout.js";
@@ -223,14 +259,21 @@ import {
   createBrowserSessionViewHistoryAdapter,
   createSessionViewController,
   createSessionViewStore,
-} from "./local/session-view-controller.js";
+} from "./shared/session-view-controller.js";
+import {
+  openReviewDestination,
+  openSessionsDestination,
+  openTasksDestination,
+  openTeamsDestination,
+  openUsageDestination,
+} from "./shared/nav-destinations.js";
 import {
   browserSessionViewPersistence,
-} from "./local/session-view-persistence.js";
+} from "./shared/session-view-persistence.js";
 import {
   selectContextAfterProjectDelete,
   sessionViewContextKey,
-} from "./local/session-view-state.js";
+} from "./shared/session-view-state.js";
 import {
   loadRemovedThreadIds,
   rememberRemovedThreadId,
@@ -257,6 +300,7 @@ import {
   providerOptions,
   providerSettings,
   sandboxOptions,
+  scopedProviderModels,
 } from "./shared/provider-settings.js";
 import { localQueryClient } from "./local/query-client.js";
 import { attachTranscriptHistoryLoader } from "./shared/transcript-history-loader.js";
@@ -342,6 +386,12 @@ const state = {
   // loadViewOnlyTranscript() below; paginated by loadOlderViewOnlyTranscript().
   viewOnlyThread: null,
   viewOnlyGeneration: 0,
+  // Per-thread "your workspace is gone" state, keyed by thread id:
+  // `{ workspaceMissing, pending, error }` (see local/workspace-repair.js). Written
+  // from each transcript TAIL response — `workspace_missing` rides `thread_state`,
+  // which no session snapshot carries — and read by the control banner, which turns
+  // into the repair action instead of a take-over the user cannot use.
+  workspaceRepairByThread: new Map(),
   // True while a composer submit is in flight.
   // Freezes the composer and rejects re-entry so a draft edit / navigation /
   // double-submit during the async request can't change or duplicate the send.
@@ -349,6 +399,15 @@ const state = {
   composerImageAttachments: [],
   nextComposerImageAttachmentId: 1,
   newSessionSubmitInFlight: false,
+  // Git standing of the launch dialog's chosen directory; null when unknown or
+  // when the directory is not a repo.
+  launchGitContext: null,
+  // Bumped on every opening. A DOM `open` check cannot tell a reopened dialog from
+  // the one an in-flight request was started against.
+  launchDialogGeneration: 0,
+  // Same, for the fork dialog. Separate because the two dialogs can hold
+  // different directories and neither should show the other's answer.
+  forkGitContext: null,
   newSessionImageAttachments: [],
   nextNewSessionImageAttachmentId: 1,
   forkImageAttachments: [],
@@ -388,21 +447,25 @@ const state = {
   // fallbacks and the context-menu liveness check read them); a narrowed copy in there
   // would make every non-matching session look deleted. See shared/thread-search.js.
   threadSearch: { query: "", groups: [], loading: false, error: null, unavailableProviders: [] },
-  // The bell. `retained` is the monotonic retention map (thread id → the state it was
-  // last seen in): while the filter is on, a thread that has matched stays listed even
-  // after its state moves on, so a row cannot vanish from under the pointer because the
-  // agent answered. See shared/thread-filter.js.
-  threadFilter: { on: false, retained: new Map() },
+  // The bell used to be a field right here. It now lives on `threadListStore` — see
+  // shared/thread-list-store.js — because remote held a byte-identical copy of it and the
+  // two were free to drift. Read it with `readThreadFilter(state.threadListStore)`.
   projects: [],
   threadProjectId: {},
   projectsLoading: false,
   projectsError: null,
   projectsLoaded: false,
+  // Task screen. `teamActionPending` holds the verb in flight so the buttons can
+  // disable together — five whole-run actions on one run must not overlap, and the
+  // backend's own gate would refuse the second with an error the user never asked
+  // to see.
+  teamsError: null,
+  teamActionPending: null,
+  teamActionError: null,
   // When a session is started via a project overview's "New agent" button, this holds
   // that project's id so the freshly-created thread can be auto-assigned to it. Set at
   // "New agent" time, consumed once by the next start, and cleared by any plain
   // new-session opener so a normal launch never inherits a stale project.
-  pendingProjectAssignment: null,
   threadHistoryScrollTop: 0,
   // Sessions this browser archived/deleted. History entries outlive threads, so
   // back/forward can land on a `?thread=` that no longer exists; without a tombstone
@@ -509,16 +572,25 @@ const apiFetch = createApiFetch({
 const devicesCache = createDevicesCache();
 const reviewsCache = createReviewsCache();
 const workflowsCache = createWorkflowsCache();
+const teamsCache = createTeamsCache();
 
 const viewedThreadId = () => state.viewThreadId || state.session?.active_thread_id || null;
 const workspaceDiffStore = createWorkspaceDiffStore({
   apiFetch,
   surface: "local",
+  // The local surface is the only one that can grant, so it is the only one that passes
+  // this: the remote store omits it and its panels go read-only. `trustWorkspace` is a
+  // hoisted function declaration further down this module.
+  trustWorkspace,
   // Diff follows the session the user is viewing, not whichever thread is active.
   getThreadId: viewedThreadId,
   // Reset identity = viewed thread + its cwd, so a same-thread cwd change also
   // clears the stale diff during loading (not just a thread switch).
-  getWorkspaceKey: () => JSON.stringify([viewedThreadId() || "", state.session?.current_cwd || ""]),
+  getWorkspaceKey: () => localViewedWorkspaceKey({
+    session: state.session,
+    viewThreadId: viewedThreadId(),
+    viewOnlyThread: state.viewOnlyThread,
+  }),
 });
 // Projects ride a dedicated channel off the byte-budgeted snapshot; this store fetches
 // the payload when `projects_revision` changes (see createProjectsStore) and feeds it
@@ -537,6 +609,9 @@ projectsStore.subscribe((projectsState) => {
   state.projectsLoading = projectsState.loading;
   state.projectsError = projectsState.error;
   state.projectsLoaded = projectsState.loaded;
+  // The launch dialog's project chip reads this list; without a nudge a project
+  // created or refreshed while the dialog is open never appears in its menu.
+  renderLaunchSessionDialogIfOpen();
   if (!projectsState.loaded) {
     reconciledProjectSignature = null;
   }
@@ -661,6 +736,23 @@ mountReviewerChip({
 });
 void workspaceDiffStore.refresh();
 
+// The resolved working tree arrives asynchronously and decides which reviewer threads
+// are reusable at all, so a snapshot render that happened before it landed would leave
+// the reuse picker offering cross-tree reviewers the relay refuses. Repaint once the
+// answer (or a later, different one) is in. Guarded on the cwd so the setReview →
+// notify → render loop closes: a repaint that changes nothing re-enters here and stops.
+let renderedWorkspaceCwd = null;
+workspaceDiffStore.subscribe((workspaceState) => {
+  const cwd = workspaceState.workspace?.cwd || null;
+  if (cwd === renderedWorkspaceCwd) {
+    return;
+  }
+  renderedWorkspaceCwd = cwd;
+  if (state.session) {
+    renderSession(state.session);
+  }
+});
+
 const leftPanelControl = createPanelControl({
   cssVarName: "--sidebar-width",
   widthStorageKey: "agent-relay:local-sidebar-width",
@@ -677,7 +769,7 @@ leftPanelControl.subscribe(({ isOpen }) => {
   document.body.classList.toggle("sidebar-collapsed", !isOpen);
 });
 newSessionComposeButton?.addEventListener("click", () => {
-  document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+  openStartSessionDialog();
 });
 
 const rightPanelControl = createPanelControl({
@@ -710,8 +802,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 let lastTurnDiffItemId = null;
-let lastWorkspaceCwd = null;
-let lastViewThreadId = null;
+let lastWorkspaceKey = null;
 window.addEventListener("agent-relay:session-updated", () => {
   refreshWorkspaceDiffIfChanged();
   // Fetch the dedicated Projects payload when the snapshot's revision changes (a
@@ -761,34 +852,24 @@ function refreshThreadsIfRenamedElsewhere() {
 function refreshWorkspaceDiffIfChanged() {
   const session = state.session;
   if (!session) return;
-  const cwd = session.current_cwd || "";
-  // The viewed session id is also part of the key: switching between two threads
-  // that share a cwd must still refetch (each has its own workspace state).
+  // Viewed session + birth cwd + remembered tree: observation does not move
+  // current_cwd, so an open panel would otherwise keep showing the previous tree.
   const viewThreadId = state.viewThreadId || session.active_thread_id || null;
-  const cwdChanged = lastWorkspaceCwd !== null && cwd !== lastWorkspaceCwd;
-  const viewChanged = lastViewThreadId !== null && viewThreadId !== lastViewThreadId;
-  if (cwdChanged || viewChanged) {
-    lastWorkspaceCwd = cwd;
-    lastViewThreadId = viewThreadId;
-    lastTurnDiffItemId = null;
+  const workspaceKey = localViewedWorkspaceKey({
+    session,
+    viewThreadId,
+    viewOnlyThread: state.viewOnlyThread,
+  });
+  const decision = decideWorkspaceRefresh({
+    session,
+    workspaceKey,
+    lastWorkspaceKey,
+    lastTurnDiffId: lastTurnDiffItemId,
+  });
+  lastWorkspaceKey = decision.workspaceKey;
+  lastTurnDiffItemId = decision.turnDiffId;
+  if (decision.refresh) {
     void workspaceDiffStore.refresh();
-    return;
-  }
-  lastWorkspaceCwd = cwd;
-  lastViewThreadId = viewThreadId;
-  const entries = session.transcript || [];
-  let latest = null;
-  for (let i = entries.length - 1; i >= 0; i -= 1) {
-    if (entries[i]?.tool?.item_type === "turnDiff") {
-      latest = entries[i].item_id || null;
-      break;
-    }
-  }
-  if (latest && latest !== lastTurnDiffItemId) {
-    lastTurnDiffItemId = latest;
-    void workspaceDiffStore.refresh();
-  } else if (!latest) {
-    lastTurnDiffItemId = null;
   }
 }
 
@@ -817,7 +898,6 @@ fetchBuildInfo("relay").then((info) => {
 // transitions reported in session snapshots — when phase clears we tear it
 // down.
 
-const VERB_CYCLE_MS = 2500;
 const verbCycler = createVerbCycler();
 let currentProgressVerb = null;
 let verbTimer = null;
@@ -942,6 +1022,15 @@ const renderer = createSessionRenderer({
   setReviewSlice(slice) {
     workspaceDiffStore.setReview(slice);
   },
+  // One answer to "which working tree is this session's work in", shared by the Changes
+  // panel, the Reviewer panel and the review dialog — and stored on the relay, so it
+  // survives a reload and is the same tree the phone sees.
+  getThreadWorkspace: () => workspaceDiffStore.getState().workspace,
+  pinThreadWorkspace: (path) => workspaceDiffStore.pinWorkspace(path),
+  // Goes through the store rather than calling `trustWorkspace` directly, so the review
+  // dialog's grant refreshes the same panel state the Changes tab reads — one grant, one
+  // refetch, one answer about the tree.
+  trustThreadWorkspace: (path) => void workspaceDiffStore.trustWorkspace(path),
   reviewsCache,
   workflowsCache,
   // Dedicated, uncompacted reviewer data. The snapshot carries only its revision
@@ -954,6 +1043,121 @@ const renderer = createSessionRenderer({
   fetchWorkflows() {
     return getWorkflows(apiFetch);
   },
+  teamsCache,
+  fetchTeams() {
+    return getTeams(apiFetch);
+  },
+  fetchUsage(params) {
+    return getUsage(apiFetch, params);
+  },
+  fetchTeamCatalog() {
+    return getTeamCatalog(apiFetch);
+  },
+  ensureOrchestrator() {
+    return ensureOrchestrator(apiFetch, state.deviceId);
+  },
+  resetOrchestrator() {
+    return resetOrchestrator(apiFetch, state.deviceId);
+  },
+  fetchTeamDiff(teamRunId, base) {
+    return getTeamDiff(apiFetch, teamRunId, base, state.deviceId);
+  },
+  fetchTaskLineComments(teamRunId) {
+    return listLineComments(apiFetch, teamRunCommentScope(teamRunId), state.deviceId);
+  },
+  createTaskLineComment(teamRunId, anchor, body) {
+    return createLineComment(apiFetch, {
+      scope: teamRunCommentScope(teamRunId),
+      body,
+      anchor,
+      device_id: state.deviceId,
+    });
+  },
+  resolveTaskLineComment(commentId, action) {
+    return resolveLineComment(apiFetch, commentId, action, state.deviceId);
+  },
+  handBackTaskLineComment(commentId) {
+    return handBackLineComment(apiFetch, commentId, state.deviceId);
+  },
+  fetchTaskReviewTicks(teamRunId) {
+    return listReviewTicks(apiFetch, teamRunCommentScope(teamRunId), state.deviceId);
+  },
+  tickTaskReviewFile(teamRunId, path, side, baseCommit) {
+    return tickReviewFile(apiFetch, {
+      scope: teamRunCommentScope(teamRunId),
+      path,
+      side,
+      base_commit: baseCommit || null,
+      device_id: state.deviceId,
+    });
+  },
+  proposeOrchestratorTask(body) {
+    return proposeOrchestratorTask(apiFetch, {
+      ...body,
+      device_id: state.deviceId,
+    });
+  },
+  confirmOrchestratorProposal(proposalId) {
+    return confirmOrchestratorProposal(apiFetch, proposalId, state.deviceId);
+  },
+  dismissOrchestratorProposal(proposalId) {
+    return dismissOrchestratorProposal(apiFetch, proposalId, state.deviceId);
+  },
+  sendMessage(text, threadId) {
+    return controller?.sendMessage(text, threadId);
+  },
+  fetchTranscriptPage(threadId, opts) {
+    return controller?.fetchTranscriptPage(threadId, opts);
+  },
+  setUsageBudget(patch) {
+    return setUsageBudget(apiFetch, patch);
+  },
+  getViewContext: () => sessionViewStore.getState().location.context,
+  // The sidebar nav's two destinations. Both go through `showOverview` so both are real
+  // history entries — the back button has to be able to leave the Task screen the same
+  // way it leaves a project. Declared as functions further down the file, so these
+  // wrappers keep the hoisting honest.
+  onOpenSessionsScreen: () => openSessionsScreen(),
+  onOpenTasksScreen: () => openTaskScreen(),
+  onOpenUsageScreen: () => openUsageScreen(),
+  onOpenTeamsScreen: (teamId) => openTeamsScreen(teamId),
+  // The narrowing controls. Each wraps a transport the shared components must not see:
+  // the search field's debounce + HTTP query, and the bell's list re-render.
+  onSetSearchOpen: (open) => setSearchOpen(open),
+  onSearchInput: (value) => onSearchInput(value),
+  onToggleActivityFilter: (next) => setActivityFilter(next),
+  onOpenTask(teamRunId) {
+    // Clear the action error on the way out. It belongs to the task that produced
+    // it; carrying it across would render "this task is blocked" attributed to a
+    // task that is not.
+    state.teamActionError = null;
+    // Opening a FINISHED task is how its badge is discharged — there is no action
+    // left to take on one, so reading it is the only thing that can. A task still
+    // asking for something is unaffected; `teamNeedsYouNow` refuses to let a
+    // glance clear a request.
+    const opened = (teamsCache.current().teams || []).find(
+      (run) => run?.team_run_id === teamRunId
+    );
+    if (opened) {
+      markTaskSeen(opened.team_run_id, opened.updated_at);
+    }
+    void sessionViewController.showOverview({ kind: "tasks", teamRunId });
+  },
+  onBackToTasks() {
+    state.teamActionError = null;
+    void sessionViewController.showOverview({ kind: "tasks", teamRunId: null });
+  },
+  // The full-screen merge review (15a). Routed through the same controller as
+  // every other destination so Back leaves it the way it leaves a project, and
+  // a reload lands on the run rather than on the task list.
+  onOpenReviewScreen(teamRunId) {
+    if (!teamRunId) {
+      return;
+    }
+    void openReviewDestination(sessionViewController, teamRunId);
+  },
+  onTeamAction: runTeamAction,
+  onStartTask: openStartTaskDialog,
   // Hoisted module-level declarations below. `viewThread` is shared rather than a
   // method here because several call sites (sidebar rows, tab strip) need the one
   // implementation — they used to each inline a copy of its body.
@@ -999,6 +1203,7 @@ renderer.renderSession = function wrappedRenderSession(session) {
       threadId: state.viewThreadId,
       priorEntries: previousLiveSession.transcript || [],
       cwd: summary?.cwd ?? previousLiveSession.current_cwd ?? null,
+      threadWorkspaceCwd: previousLiveSession.thread_workspace_cwd ?? null,
       provider: summary?.provider ?? previousLiveSession.provider ?? null,
       status: previousLiveSession.current_status || "idle",
       lastRefreshAt: Date.now(),
@@ -1073,6 +1278,7 @@ async function loadViewOnlyTranscript(threadId) {
     workflowLocked,
     reviewSig,
     cwd,
+    threadWorkspaceCwd: prior?.threadWorkspaceCwd ?? null,
     provider,
     status,
     activeTurnId: prior?.activeTurnId || null,
@@ -1096,18 +1302,9 @@ async function loadViewOnlyTranscript(threadId) {
   try {
     const page = await controller?.fetchTranscriptPage(threadId, {});
     if (generation !== state.viewOnlyGeneration) return;
-    const normalized =
-      page && Array.isArray(page.entries)
-        ? page
-        : { thread_id: threadId, entries: Array.isArray(page) ? page : [], prev_cursor: null };
-    if (normalized.thread_id !== threadId) {
-      throw new Error(
-        `Transcript response thread mismatch (expected ${threadId}, received ${
-          normalized.thread_id || "missing"
-        })`
-      );
-    }
-    const refreshed = mergeRefreshedViewOnlyPage(prior, normalized);
+    // Normalize + validate + merge, shared with the Orchestrator pane so the
+    // three reasons those steps exist are written down once (local/pin-page.js).
+    const { page: normalized, ...refreshed } = refreshedPinPage(prior, page, threadId);
     const exactReview = Boolean(normalized.thread_state?.review_locked ?? review);
     state.viewOnlyThread = buildViewOnlyPin({
       threadId,
@@ -1121,6 +1318,10 @@ async function loadViewOnlyTranscript(threadId) {
       workflowLocked: Boolean(normalized.thread_state?.workflow_locked ?? workflowLocked),
       reviewSig: exactReview ? viewOnlyReviewSignature(session, threadId) : reviewSig,
       cwd: normalized.thread_state?.current_cwd ?? cwd,
+      threadWorkspaceCwd:
+        normalized.thread_state?.thread_workspace_cwd
+        ?? prior?.threadWorkspaceCwd
+        ?? null,
       provider: normalized.thread_state?.provider ?? provider,
       status,
       activeTurnId: normalized.thread_state?.active_turn_id || null,
@@ -1152,6 +1353,7 @@ async function loadViewOnlyTranscript(threadId) {
       workflowLocked,
       reviewSig,
       cwd,
+      threadWorkspaceCwd: prior?.threadWorkspaceCwd ?? null,
       provider,
       status,
       activeTurnId: prior?.activeTurnId || null,
@@ -1253,8 +1455,25 @@ const syncWatchedThreads = createWatchedThreadsSync({
 });
 state.resetWatchedThreadsDeclaration = () => syncWatchedThreads.reset();
 
+/**
+ * The Orchestrator thread, while the Tasks screen is drawing it.
+ *
+ * It is rendered BESIDE the conversation, not instead of it, so it never shows
+ * up in `viewThreadId` and the active-thread fallback does not reach it either
+ * (`viewThreadId` still names the session you last opened). Undeclared, the
+ * relay streams it nothing and the pane updates only when the next full
+ * snapshot happens to carry it.
+ */
+function orchestratorWatchIds() {
+  if (sessionViewStore.getState().location.context?.kind !== "tasks") {
+    return [];
+  }
+  const threadId = state.orchestratorThreadId || state.session?.orchestrator_thread_id || null;
+  return threadId ? [threadId] : [];
+}
+
 function maybeRefreshViewOnly(session) {
-  void syncWatchedThreads(session, state.viewThreadId);
+  void syncWatchedThreads(session, state.viewThreadId, orchestratorWatchIds());
   const pin = state.viewOnlyThread;
   if (pin && session) {
     const action = viewOnlyPinNextAction(session, pin, {
@@ -1275,6 +1494,9 @@ function maybeRefreshViewOnly(session) {
         elapsedMs: Date.now() - (pin.lastRefreshAt || 0),
         historyLoading: viewOnlyOlderLoading,
         loading: pin.loading,
+        // Set by the delta reducer when it refused a chunk. `buildViewOnlyPin`
+        // does not carry it, so the refetch that answers it clears it.
+        needsRepair: Boolean(pin.tailGap),
         wasWorking: pin.wasWorking,
         working,
       })) {
@@ -1344,6 +1566,13 @@ const {
   renderAuthRequiredState,
   renderSession,
   renderSessionMeta,
+  // The search + bell toggles and the search field. Repainted on its own rather than
+  // through a whole `renderSession` pass, because a keystroke has to reach a CONTROLLED
+  // input immediately — the field would otherwise appear to swallow characters until the
+  // search debounce fired and something else triggered a render.
+  renderSidebarChrome,
+  // Also called once at module scope, before boot's awaits — see paintInitialSidebarChrome.
+  renderSidebarNav,
   renderThreads,
   runViewTransition,
   syncThreadHistoryScroll,
@@ -1355,6 +1584,7 @@ const {
 sessionViewController.subscribe((change) => {
   renderProjectSwitcher();
   renderSessionTabs();
+  renderStartSessionSplit();
   renderThreads();
   if (state.session) {
     renderSession(state.session);
@@ -1388,6 +1618,7 @@ const {
   startSession,
   submitDecision,
   takeOverControl,
+  repairWorkspace,
   toggleTranscriptEntry,
   toggleTranscriptExpandKey,
   applyFileChange,
@@ -1509,10 +1740,15 @@ async function dropStaleProjectSelection() {
 // Session title search
 // ---------------------------------------------------------------------------
 
-const sidebarSearchToggle = document.getElementById("sidebar-search-toggle");
-const sidebarSearch = document.getElementById("sidebar-search");
-const sidebarSearchInput = document.getElementById("sidebar-search-input");
-const sidebarSearchClear = document.getElementById("sidebar-search-clear");
+// No handles here any more. The toggle, the field, its input and its clear button were
+// four `getElementById` calls, and the field's own OPEN/DRAFT state was kept in the DOM —
+// `open` read back off `sidebarSearch.hidden`, the draft off `sidebarSearchInput.value`.
+// Using the DOM as the state is precisely why local could not conditionally render the
+// field: the nodes had to exist for the state to be readable.
+//
+// Both now live in `threadListStore` (see shared/thread-list-store.js `searchUi`), which
+// remote reads too, and the field itself is `SidebarSearchField`. What stays here is the
+// part that is genuinely local: the debounce and the HTTP query it triggers.
 
 // Each keystroke is a relay round trip, so coalesce a burst of typing into one. Short
 // enough to feel live, long enough that a word costs one request rather than five.
@@ -1536,49 +1772,25 @@ function queueSearch(query) {
   searchDebounceTimer = window.setTimeout(() => runSearch(query), SEARCH_DEBOUNCE_MS);
 }
 
-function setSearchOpen(open, { focus = true } = {}) {
-  if (!sidebarSearch || !sidebarSearchInput) {
-    return;
+// Opening and closing the field. The store enforces "closing clears the draft" — the rule
+// both shells used to state in prose and could each have lost — so all that is left here
+// is the half that is local's: telling the relay the query is gone.
+function setSearchOpen(open) {
+  state.threadListStore.getState().setSearchOpen(open);
+  if (!open) {
+    runSearch("");
   }
-  sidebarSearch.hidden = !open;
-  sidebarSearchToggle?.setAttribute("aria-expanded", String(open));
-  sidebarSearchToggle?.classList.toggle("is-active", open);
-  if (open) {
-    if (focus) {
-      sidebarSearchInput.focus();
-      sidebarSearchInput.select();
-    }
-    return;
-  }
-  // Closing must also clear: a hidden field still filtering the list is a sidebar that
-  // looks like it lost sessions, with the reason off screen.
-  sidebarSearchInput.value = "";
-  runSearch("");
+  renderSidebarChrome();
 }
 
-sidebarSearchToggle?.addEventListener("click", () => {
-  setSearchOpen(Boolean(sidebarSearch?.hidden));
-});
-
-sidebarSearchInput?.addEventListener("input", (event) => {
-  queueSearch(event.target.value);
-});
-
-sidebarSearchInput?.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    event.preventDefault();
-    setSearchOpen(false);
-  }
-});
-
-sidebarSearchClear?.addEventListener("click", () => {
-  if (!sidebarSearchInput) {
-    return;
-  }
-  sidebarSearchInput.value = "";
-  runSearch("");
-  sidebarSearchInput.focus();
-});
+// A keystroke has to repaint immediately: the input is CONTROLLED by the draft, so a
+// re-render that waited for the search results to land would make the field appear to
+// swallow every character until the debounce fired.
+function onSearchInput(value) {
+  state.threadListStore.getState().setSearchDraft(value);
+  renderSidebarChrome();
+  queueSearch(value);
+}
 
 window.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
@@ -1591,26 +1803,18 @@ window.addEventListener("keydown", (event) => {
 // Activity filter (the bell)
 // ---------------------------------------------------------------------------
 
-const sidebarBellToggle = document.getElementById("sidebar-bell-toggle");
-
-function syncActivityFilterChrome() {
-  const { on } = state.threadFilter;
-  sidebarBellToggle?.classList.toggle("is-active", on);
-  sidebarBellToggle?.setAttribute("aria-pressed", String(on));
-}
-
-// Toggling the filter RESETS retention. The retention set exists so a row cannot
-// vanish mid-reach; carrying it across a deliberate off/on would instead re-list
-// rows that stopped being interesting long ago.
+// No handle and no chrome sync. `is-active` and `aria-pressed` used to be written onto
+// the button here, from a function whose only job was to keep the DOM in step with the
+// store; `SidebarBellToggle` now derives both from the `on` prop in the same render.
+//
+// Toggling the filter RESETS retention. The retention set exists so a row cannot vanish
+// mid-reach; carrying it across a deliberate off/on would instead re-list rows that
+// stopped being interesting long ago.
 function setActivityFilter(next) {
-  state.threadFilter = { ...state.threadFilter, ...next, retained: new Map() };
-  syncActivityFilterChrome();
+  state.threadListStore.getState().setThreadFilter(next);
+  renderSidebarChrome();
   renderThreads();
 }
-
-sidebarBellToggle?.addEventListener("click", () => {
-  setActivityFilter({ on: !state.threadFilter.on });
-});
 
 // Prompt for a Project name (trimmed; null aborts). Native prompt mirrors the
 // window.confirm flow the archive/delete affordances already use.
@@ -1640,6 +1844,56 @@ async function createProjectFromToolbar() {
   } catch (error) {
     logLine(`Failed to create project: ${error.message}`);
   }
+}
+
+// Selects the new project instead of navigating to it, unlike the toolbar version.
+async function createProjectForLaunchDraft(apply, isCurrent) {
+  const name = promptProjectName();
+  if (!name) {
+    return;
+  }
+  try {
+    const projectId = await createProjectAndSelect({
+      apply,
+      create: (projectName) => createProject(apiFetch, projectName),
+      isCurrent,
+      name,
+      store: projectsStore,
+    });
+    logLine(
+      projectId
+        ? `Created project "${name}".`
+        : `Created project "${name}", but could not tell which one is new — pick it manually.`
+    );
+  } catch (error) {
+    logLine(`Failed to create project: ${error.message}`);
+  }
+}
+
+// Grant this relay permission to run git in `cwd`.
+//
+// Local only, and by construction rather than by a check: no `RemoteActionRequest`
+// variant maps to `POST /api/workspace/trust`, so a paired phone can report an
+// ungranted folder but has no way to clear it. That is why this lives here, in the
+// local app, and is handed to the workspace-diff store instead of being reachable
+// from shared panel code.
+//
+// Throws on refusal: the caller shows it next to the control the user just used. A
+// swallowed error here would read as "the button does nothing".
+async function trustWorkspace(cwd) {
+  if (!cwd) {
+    return;
+  }
+  const response = await apiFetch("/api/workspace/trust", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, trusted: true }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to trust workspace");
+  }
+  logLine(`Trusted workspace ${cwd}.`);
 }
 
 // Rename a Project from its group header (Projects view). Prompt pre-filled with the
@@ -2088,19 +2342,149 @@ goConsoleHomeButton?.addEventListener("click", goConsoleHome);
 // Remember which project the next Start belongs to, then open the launcher. Shared
 // by the project overview's "New agent" and the chat header's.
 function startProjectAgent(projectId) {
-  state.pendingProjectAssignment = projectId || null;
-  document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
+  openStartSessionDialog({ projectId: projectId || null });
 }
 
-// "New agent" in the header — the header only shows it while it is naming a
-// project (header-labels.js), and render-session stamps that project's id onto the
-// element, so this reuses the project overview's flow verbatim.
-headerNewAgentButton?.addEventListener("click", () => {
-  const projectId = headerNewAgentButton.dataset.projectId || "";
-  if (projectId) {
-    startProjectAgent(projectId);
+/**
+ * Run one of the five whole-run task actions.
+ *
+ * All five share a body and a receipt, so they share this. The run id is sent
+ * explicitly even though the backend accepts it as optional: that shortcut only
+ * holds while one task runs at a time, and a UI that relied on it would break
+ * silently the day that relaxes.
+ */
+async function runTeamAction(action, teamRunId) {
+  if (!teamRunId || state.teamActionPending) {
+    return;
   }
-});
+  state.teamActionPending = action;
+  state.teamActionError = null;
+  renderer.renderSession(state.session);
+  try {
+    const receipt = await teamAction(apiFetch, action, {
+      teamRunId,
+      deviceId: state.deviceId,
+    });
+    logLine(`Task ${teamRunId}: ${receipt.message}`);
+  } catch (error) {
+    // Surface the relay's own words. It refuses with the reason ("this task is
+    // blocked; resolve it first"), and paraphrasing loses the instruction.
+    state.teamActionError = error?.message || String(error);
+  } finally {
+    state.teamActionPending = null;
+    renderer.renderSession(state.session);
+  }
+}
+
+// ── New task dialog ─────────────────────────────────────────────────────────
+// Its own React sub-root, for the same reason the tab strip has one: the shell is
+// rendered once, so anything data-driven needs one.
+let startTaskRootHandle = null;
+let startTaskFields = {};
+let startTaskPending = false;
+let startTaskError = null;
+
+function renderStartTaskDialog() {
+  if (!startTaskDialogMount) {
+    return;
+  }
+  if (!startTaskRootHandle) {
+    startTaskRootHandle = createRoot(startTaskDialogMount);
+  }
+  flushSync(() => {
+    startTaskRootHandle.render(
+      React.createElement(StartTaskDialog, {
+        fields: startTaskFields,
+        pending: startTaskPending,
+        error: startTaskError,
+        defaultCwd: state.session?.current_cwd || "",
+        onFieldChange(key, value) {
+          startTaskFields = { ...startTaskFields, [key]: value };
+          renderStartTaskDialog();
+        },
+        onRequestClose() {
+          startTaskError = null;
+        },
+        onStart: submitStartTask,
+      })
+    );
+  });
+}
+
+function openStartTaskDialog() {
+  startTaskError = null;
+  renderStartTaskDialog();
+  document.getElementById("start-task-dialog")?.setAttribute("open", "");
+}
+
+async function submitStartTask() {
+  if (startTaskPending) {
+    return;
+  }
+  startTaskPending = true;
+  startTaskError = null;
+  renderStartTaskDialog();
+  try {
+    const receipt = await startTeam(apiFetch, {
+      title: startTaskFields.title || "",
+      context: startTaskFields.context || "",
+      acceptance_criteria: startTaskFields.acceptance_criteria || "",
+      agreed_scope: startTaskFields.agreed_scope || "",
+      quality_rules: startTaskFields.quality_rules || "",
+      // Omitted rather than blank: the relay reads absent as "the current
+      // workspace" and "the workspace's own branch", and an empty string is a
+      // path/ref that resolves to nothing.
+      cwd: startTaskFields.cwd?.trim() || null,
+      target_branch: startTaskFields.target_branch?.trim() || null,
+      device_id: state.deviceId,
+    });
+    logLine(`Task ${receipt.team_run_id}: ${receipt.message}`);
+    // The relay's teams_revision will move, but not before the next render — and
+    // the next render is the one that shows the new task's detail. Without this
+    // the screen looks the task up in a pre-create list and reports it gone.
+    teamsCache.invalidate();
+    // Clear only on success — a rejected form must keep what the user typed.
+    startTaskFields = {};
+    document.getElementById("start-task-dialog")?.close();
+    void sessionViewController.showOverview({
+      kind: "tasks",
+      teamRunId: receipt.team_run_id,
+    });
+  } catch (error) {
+    startTaskError = error?.message || String(error);
+  } finally {
+    startTaskPending = false;
+    renderStartTaskDialog();
+  }
+}
+
+// The sidebar's two destinations. What each one does — and why Sessions restores a
+// selection where Tasks blanks it — lives in shared/nav-destinations.js, next to a
+// test that drives it against a real controller.
+function openTaskScreen() {
+  void openTasksDestination(sessionViewController);
+}
+
+function openUsageScreen() {
+  void openUsageDestination(sessionViewController);
+}
+
+function openTeamsScreen(teamId = null) {
+  void openTeamsDestination(sessionViewController, teamId || null);
+}
+
+function openSessionsScreen() {
+  // No project check here: the reducer validates the remembered context against the
+  // same `projectIds` / `projectIdsComplete` facts history restoration already uses,
+  // so an unloaded catalogue cannot be mistaken for a deletion.
+  void openSessionsDestination(sessionViewController);
+}
+
+// No listeners here for either of them, and none for the icon rail's copies. Both
+// forms of the nav are one shared component (shared/sidebar-nav.js) taking these two
+// functions as props — see the `onOpenSessionsScreen` / `onOpenTasksScreen` injections
+// into createSessionRenderer below. Four id-addressed listeners became two props, and
+// the rail can no longer offer a different set of destinations than the rows.
 
 threadsRefreshButton.addEventListener("click", () => {
   void loadThreads("manual refresh");
@@ -2179,90 +2563,41 @@ window.addEventListener("popstate", (event) => {
   );
 });
 
-directoryForm?.addEventListener("submit", (event) => {
-  event.preventDefault();
-  void clearThreadRoute();
-  setSelectedCwd(cwdInput.value.trim());
-  void loadThreads("directory change");
-});
-
-// A plain new-session opener (launcher, header compose, empty-state CTA) resets any
-// pending project assignment, so a session started from the normal launcher never
-// inherits a project the user only glanced at via "New agent".
-document.addEventListener("click", (event) => {
-  const el = event.target instanceof Element ? event.target : null;
-  if (!el) return;
-  if (
-    el.closest("#open-start-session-dialog") ||
-    el.closest("#new-session-compose-button") ||
-    el.closest("[data-start-session]")
-  ) {
-    state.pendingProjectAssignment = null;
-  }
-});
-
-document.addEventListener("click", (event) => {
-  const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-  if (!target?.closest("#start-session-button")) {
-    return;
-  }
+async function submitStartSession() {
   if (state.newSessionSubmitInFlight) {
     return;
   }
-  // Consume any pending "New agent" project synchronously (so a failed/cancelled
-  // start can't leave it dangling), then assign the freshly-created thread once
-  // startSession resolves with its id.
-  const assignToProject = state.pendingProjectAssignment;
-  state.pendingProjectAssignment = null;
   const imageAttachments = state.newSessionImageAttachments.slice();
   state.newSessionSubmitInFlight = true;
   renderNewSessionImageAttachments();
-  void startSession(imageAttachments).then((newThreadId) => {
+  renderLaunchSessionDialogIfOpen();
+  try {
+    const newThreadId = await startSession(imageAttachments);
     if (newThreadId) {
       const sentIds = new Set(imageAttachments.map((attachment) => attachment.id));
       state.newSessionImageAttachments = state.newSessionImageAttachments.filter(
         (attachment) => !sentIds.has(attachment.id)
       );
     }
-    if (newThreadId && assignToProject) {
-      void assignNewSessionToProject(newThreadId, assignToProject);
-    }
-  }).finally(() => {
+  } finally {
     state.newSessionSubmitInFlight = false;
     renderNewSessionImageAttachments();
-  });
-});
+    renderLaunchSessionDialogIfOpen();
+  }
+}
 
 // Assign a just-started session to the project its "New agent" button belongs to. The
 // membership change rides the snapshot's projects_revision bump (assign calls notify),
 // same as every other project mutation, so the sidebar/overview refresh on their own.
-async function assignNewSessionToProject(threadId, projectId) {
-  try {
-    await assignThreadToProject(apiFetch, threadId, projectId);
-    const name = (state.projects || []).find((project) => project.id === projectId)?.name || "project";
-    logLine(`Added the new session to "${name}".`);
-  } catch (error) {
-    logLine(`Started the session, but couldn't add it to the project: ${error.message}`);
-  }
-}
 
-document.addEventListener("change", (event) => {
-  const target = event.target;
-  if (!(target instanceof HTMLSelectElement) && !(target instanceof HTMLTextAreaElement) && !(target instanceof HTMLInputElement)) {
-    return;
-  }
-  handleLaunchFieldInput(target.id, target.value);
-});
 
-document.addEventListener("input", (event) => {
-  const target = event.target;
-  if (!(target instanceof HTMLTextAreaElement) && !(target instanceof HTMLInputElement)) {
-    return;
-  }
-  handleLaunchFieldInput(target.id, target.value);
-});
-
+// The banner is one slot with one button, but which button it is depends on why the
+// banner is up (see local/control-banner.js), so both are bound here by id.
 controlBanner?.addEventListener("click", (event) => {
+  if (event.target.closest("#workspace-repair-button")) {
+    void repairWorkspace();
+    return;
+  }
   if (!event.target.closest("#take-over-button")) {
     return;
   }
@@ -2305,9 +2640,11 @@ function clearComposerImageAttachments() {
 }
 
 function renderNewSessionImageAttachments() {
-  if (!startPromptAttachments) return;
-  startPromptAttachments.replaceChildren();
-  startPromptAttachments.hidden = state.newSessionImageAttachments.length === 0;
+  // Resolved live: the mount ships with the dialog, so a module-level query is null.
+  const mount = document.getElementById("start-prompt-attachments");
+  if (!mount) return;
+  mount.replaceChildren();
+  mount.hidden = state.newSessionImageAttachments.length === 0;
 
   for (const attachment of state.newSessionImageAttachments) {
     const chip = document.createElement("span");
@@ -2328,7 +2665,7 @@ function renderNewSessionImageAttachments() {
     remove.textContent = "×";
     chip.append(remove);
 
-    startPromptAttachments.append(chip);
+    mount.append(chip);
   }
 }
 
@@ -2422,23 +2759,13 @@ document.addEventListener("click", (event) => {
   document.getElementById(FORK_PROMPT_INPUT_ID)?.focus();
 });
 
-// Treat each opening as a fresh attachment draft. In particular, reopening
-// after dismissing the dialog or after a failed start cannot silently carry a
-// screenshot into an unrelated workspace/session. An in-flight start already
-// captured its own attachment slice before the dialog closed.
-if (launchStartSessionDialog && typeof MutationObserver === "function") {
-  const newSessionDialogObserver = new MutationObserver(() => {
-    if (launchStartSessionDialog.hasAttribute("open")) {
-      clearNewSessionImageAttachments();
-    }
-  });
-  newSessionDialogObserver.observe(launchStartSessionDialog, {
-    attributeFilter: ["open"],
-    attributes: true,
-  });
-}
 
-startPromptInput?.addEventListener("paste", (event) => {
+// Delegated: the dialog renders on demand, so there is nothing to bind at boot.
+document.addEventListener("paste", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target?.closest("#launch-start-session-dialog-start-prompt")) {
+    return;
+  }
   const files = pastedImageFiles(event.clipboardData);
   if (files.length === 0) return;
   event.preventDefault();
@@ -2464,7 +2791,8 @@ startPromptInput?.addEventListener("paste", (event) => {
   }
 });
 
-startPromptAttachments?.addEventListener("click", (event) => {
+// Delegated for the same reason as the paste handler above.
+document.addEventListener("click", (event) => {
   const button =
     event.target instanceof Element
       ? event.target.closest("[data-remove-new-session-image-attachment]")
@@ -2474,7 +2802,7 @@ startPromptAttachments?.addEventListener("click", (event) => {
     (attachment) => attachment.id !== button.dataset.removeNewSessionImageAttachment
   );
   renderNewSessionImageAttachments();
-  startPromptInput.focus();
+  document.getElementById("launch-start-session-dialog-start-prompt")?.focus();
 });
 
 messageInput?.addEventListener("paste", (event) => {
@@ -2578,17 +2906,11 @@ messageForm.addEventListener("submit", (event) => {
   void runComposerSubmit();
 });
 
-providerInput?.addEventListener("change", () => {
-  void selectLaunchProvider(providerInput.value);
-});
-
-modelInput?.addEventListener("change", () => {
-  const provider = providerInput?.value || state.session?.provider || "codex";
-  const models = modelsForProvider(provider, state.session?.available_models || []);
-  syncEffortSuggestions(startEffortInput, models, modelInput.value, startEffortInput.value, provider);
-});
-
 messageModel?.addEventListener("change", () => {
+  // Keep the chip's logo on the model the user just picked. Unconditional and
+  // first, because the effort bookkeeping below bails out when there's no
+  // session provider — the mark must not be left showing the previous vendor.
+  syncComposerModelMark();
   // Effort is no longer in the composer; the popover owns it. Just react
   // to model changes so an effort default can still be persisted for this
   // provider+model pair.
@@ -2607,79 +2929,43 @@ stopButton?.addEventListener("click", () => {
   void stopActiveTurn();
 });
 
-transcript.addEventListener("click", (event) => {
-  const copyButton = event.target.closest("[data-copy-message]");
-  if (copyButton) {
-    void copyTextToClipboard(copyButton.dataset.copyMessage || "", copyButton);
-    return;
-  }
-
-  const forkButton = event.target.closest("[data-fork-from-item]");
-  if (forkButton) {
-    const threadId = state.viewThreadId || state.session?.active_thread_id || null;
-    openForkDialogForThread(threadId, forkButton.dataset.forkFromItem || "");
-    return;
-  }
-
-  const approvalButton = event.target.closest("[data-approval-decision]");
-  if (approvalButton) {
-    void submitDecision(
-      approvalButton.dataset.approvalDecision,
-      approvalButton.dataset.approvalScope || "once"
-    );
-    return;
-  }
-
-  const transcriptGroupToggleButton = event.target.closest("[data-transcript-toggle='group']");
-  if (transcriptGroupToggleButton) {
-    toggleTranscriptExpandKey(transcriptGroupToggleButton.dataset.expandKey || "");
-    return;
-  }
-
-  const transcriptToggleButton = event.target.closest("[data-transcript-toggle='entry']");
-  if (transcriptToggleButton) {
-    void toggleTranscriptEntry(transcriptToggleButton.dataset.itemId);
-    return;
-  }
-
-  const fileChangeActionButton = event.target.closest("[data-file-change-action]");
-  if (fileChangeActionButton) {
-    void applyFileChange(
-      fileChangeActionButton.dataset.itemId,
-      fileChangeActionButton.dataset.fileChangeAction
-    );
-    return;
-  }
-
-  const suggestionButton = event.target.closest("[data-suggestion]");
-  if (suggestionButton) {
-    messageInput.value = suggestionButton.dataset.suggestion || "";
-    messageInput.focus();
-    return;
-  }
-
-  // Standby "start a task" actions (#9): open the real New session dialog, seeding its
-  // initial-prompt field when the starter carries one. This is the actionable path — the
-  // composer is disabled with no active thread, so prefilling it (data-suggestion) dead-ends.
-  const startSessionAction = event.target.closest("[data-start-session]");
-  if (startSessionAction) {
-    const seedPrompt = startSessionAction.dataset.startPrompt || "";
-    if (seedPrompt) {
-      state.localUiStore.getState().setSessionDraftField("initialPrompt", seedPrompt);
-      const promptInput = document.getElementById("start-prompt");
-      if (promptInput) promptInput.value = seedPrompt;
-    }
-    document.getElementById("launch-start-session-dialog")?.setAttribute("open", "");
-    return;
-  }
-
-  const openThreadButton = event.target.closest("[data-open-thread-id]");
-  if (openThreadButton) {
-    const threadId = openThreadButton.dataset.openThreadId;
-    if (threadId) {
-      // Was a line-for-line copy of controller.viewThread. Routed through the one
-      // implementation so every way of opening a session shares its behaviour —
-      // including landing in the tab strip.
+// One dispatcher, three surfaces. The chain that used to live inline here was
+// copied into remote/react-app.js and absent from the Orchestrator pane, which
+// is why that pane's Copy button and tool toggles rendered dead. Which button
+// was clicked is now decided in shared/transcript-interactions.js; what to do
+// about it stays here, where it needs this module's dialogs and state.
+transcript.addEventListener(
+  "click",
+  createTranscriptInteractionHandler({
+    copyMessage: ({ text, element }) => void copyTextToClipboard(text, element),
+    forkFromItem: ({ itemId }) => {
+      const threadId = state.viewThreadId || state.session?.active_thread_id || null;
+      openForkDialogForThread(threadId, itemId);
+    },
+    approvalDecision: ({ decision, scope }) => void submitDecision(decision, scope),
+    toggleGroup: ({ expandKey }) => toggleTranscriptExpandKey(expandKey),
+    toggleEntry: ({ itemId }) => void toggleTranscriptEntry(itemId),
+    fileChangeAction: ({ itemId, action }) => void applyFileChange(itemId, action),
+    suggestion: ({ text }) => {
+      messageInput.value = text;
+      messageInput.focus();
+    },
+    // Standby "start a task" actions (#9): open the real New session dialog,
+    // seeding its initial-prompt field when the starter carries one. This is the
+    // actionable path — the composer is disabled with no active thread, so
+    // prefilling it (data-suggestion) dead-ends.
+    startSession: ({ prompt }) => {
+      if (prompt) {
+        state.localUiStore.getState().setSessionDraftField("initialPrompt", prompt);
+        const promptInput = document.getElementById("start-prompt");
+        if (promptInput) promptInput.value = prompt;
+      }
+      openStartSessionDialog();
+    },
+    openThread: ({ threadId }) => {
+      if (!threadId) return;
+      // Routed through the one implementation so every way of opening a session
+      // shares its behaviour — including landing in the tab strip.
       //
       // These buttons ("Open live conversation" on Home, "Continue" on the
       // standby empty state) each name ONE session and you pressed it on
@@ -2688,17 +2974,10 @@ transcript.addEventListener("click", (event) => {
       // already peeked would stay in the disposable slot and be thrown away by
       // the next sidebar click.
       void viewThreadById(threadId, { preview: false });
-    }
-    return;
-  }
-
-  const goHomeButton = event.target.closest("[data-go-console-home]");
-  if (goHomeButton) {
-    void runViewTransition(() => clearThreadRoute());
-    return;
-  }
-
-});
+    },
+    goHome: () => void runViewTransition(() => clearThreadRoute()),
+  })
+);
 
 // IntersectionObserver-driven prefetch: when the zero-height history sentinel
 // (the first child of TranscriptContent) gets within ~600px of the top edge of
@@ -2776,9 +3055,48 @@ pendingPairingsList.addEventListener("click", (event) => {
   );
 });
 
+// Paint the sidebar's chrome BEFORE boot awaits anything.
+//
+// `renderLocalShell()` is synchronous but paints only the empty mounts; the nav, the search
+// toggle and the bell are rendered by render-session, and `boot()` below does not reach its
+// first `renderSession` until two network round trips have completed. Without this the
+// sidebar sits chromeless until the relay answers — and because `createPanelControl` has
+// already restored the collapsed state from localStorage at module scope, a user who quit
+// collapsed boots into an icon rail holding a logo, a gear, and no way to go anywhere.
+// That is the exact bug the shared nav exists to prevent, and on an unreachable relay the
+// window is unbounded rather than brief.
+//
+// Safe here: `sessionViewStore` (which `getViewContext` reads) is created at module scope
+// well above, and `teamsCache` answers `{ teams: [] }` before its first sync.
+function paintInitialSidebarChrome() {
+  renderSidebarNav();
+  renderSidebarChrome();
+}
+paintInitialSidebarChrome();
+
+// The React sub-roots this module owns, declared HERE rather than beside the render
+// functions that use them, because `void boot();` on the next line runs boot()'s prologue
+// synchronously — in the middle of this module's evaluation. A `let` further down the file
+// is in its temporal dead zone at that moment, so a render call in that prologue throws
+// `Cannot access 'X' before initialization` and the app never paints. That is not a
+// hypothetical: renderStartSessionSplit() is boot()'s first statement.
+// Pinned by frontend/boot-tdz-guard.test.mjs.
+let sessionTabsRootHandle = null;
+let sessionTabsRootElement = null;
+let projectSwitcherRootHandle = null;
+let projectSwitcherRootElement = null;
+let launchDialogRootHandle = null;
+let launchDialogRootElement = null;
+let startSessionSplitRootHandle = null;
+let startSessionSplitRootElement = null;
+
 void boot();
 
 async function boot() {
+  // Painted before anything is fetched: the LEFT half needs no catalogue, and the sidebar
+  // must not be missing its primary action while auth and providers settle. The caret
+  // half appears on the re-render below, once there is more than one agent to pick.
+  renderStartSessionSplit();
   apiTokenInput.value = state.apiToken;
   updateConnectionForm();
 
@@ -2971,7 +3289,11 @@ function seedDefaults(session) {
   void refreshProviderCatalogs(session);
   const activeProvider = session.provider || defaultProvider(state.providers);
   const launchProvider = providerInput?.value || activeProvider;
-  const launchModels = modelsForProvider(launchProvider, session.available_models || []);
+  const launchModels = modelsForProvider(
+    launchProvider,
+    session.available_models || [],
+    session.provider
+  );
 
   syncModelSuggestions(
     messageModel,
@@ -2987,6 +3309,9 @@ function seedDefaults(session) {
     }
     state.defaultsSeeded = true;
   }
+  // After both the option refresh and the seed assignment above — a direct
+  // `.value =` fires no change event, so the mark would otherwise lag a render.
+  syncComposerModelMark();
 
   // Effort is no longer rendered in the composer (it lives in the settings
   // popover and persists via localStorage). If a stale messageEffort element
@@ -3019,6 +3344,8 @@ async function refreshProviderCatalogs(session) {
       if (providersResponse.ok && providersPayload.ok) {
         state.providers = normalizeProviderList(providersPayload.data);
         syncProviderSuggestions(liveProviderInput, state.providers, selectedProvider);
+        // The split button's agent menu is this same list.
+        renderStartSessionSplit();
       }
     }
     await Promise.all(state.providers.map(async (provider) => {
@@ -3029,18 +3356,21 @@ async function refreshProviderCatalogs(session) {
         state.providerModels[provider] = payload.data || [];
       }
     }));
+    // The merged Model pill is built from these catalogues. Opening the dialog
+    // before they land left an empty menu that never refilled.
+    renderLaunchSessionDialogIfOpen();
     const provider = selectedProvider || defaultProvider(state.providers);
     const liveModelInput = document.getElementById("model-input") || modelInput;
     const liveStartEffortInput = document.getElementById("start-effort") || startEffortInput;
     syncLaunchSettingLabels(provider);
     syncModelSuggestions(
       liveModelInput,
-      modelsForProvider(provider, session.available_models || []),
+      modelsForProvider(provider, session.available_models || [], session.provider),
       liveModelInput?.value || defaultModelForProvider(provider)
     );
     syncEffortSuggestions(
       liveStartEffortInput,
-      modelsForProvider(provider, session.available_models || []),
+      modelsForProvider(provider, session.available_models || [], session.provider),
       liveModelInput?.value || defaultModelForProvider(provider),
       liveStartEffortInput?.value || "",
       provider
@@ -3073,6 +3403,9 @@ function syncModelSuggestions(
 
   const renderedOptions = options.map((model) => ({
     label: model.display_name || model.model,
+    // Carried onto the <option> so a picker's logo slot can resolve the vendor
+    // from the DOM alone (this surface renders options outside React).
+    provider: model.provider || "",
     value: model.model,
   }));
   if (replaceExisting) {
@@ -3080,6 +3413,21 @@ function syncModelSuggestions(
   } else {
     renderSelectOptions(select, renderedOptions, currentValue);
   }
+}
+
+// The composer chip's logo, for the surface that renders its options outside
+// React. Reads the vendor off the selected <option> rather than re-deriving it
+// from state, so it stays correct whether the change came from the user or from
+// a snapshot reasserting the session's model.
+function syncComposerModelMark() {
+  if (!messageModel) {
+    return;
+  }
+  const selected = messageModel.selectedOptions?.[0];
+  applyProviderMark(
+    document.getElementById("message-model-mark"),
+    selected?.dataset?.provider || ""
+  );
 }
 
 function syncComposerModelForRenderedSession(session) {
@@ -3104,6 +3452,7 @@ function syncComposerModelForRenderedSession(session) {
     !session.view_only,
     true
   );
+  syncComposerModelMark();
 }
 
 function syncProviderSuggestions(select, providers, selectedProvider) {
@@ -3114,65 +3463,173 @@ function syncProviderSuggestions(select, providers, selectedProvider) {
   renderSelectOptions(select, options, selectedProvider || defaultProvider(providers));
 }
 
-function modelsForProvider(provider, fallbackModels = []) {
-  const normalized = provider || "codex";
-  return state.providerModels[normalized]?.length
-    ? state.providerModels[normalized]
-    : fallbackModels;
+// `fallbackModels` is always the session snapshot's `available_models`, which
+// belong to the snapshot's OWN provider — hence `fallbackProvider`. Defaulting
+// it to `state.session?.provider` matches every call site that passes
+// `state.session.available_models`; the few that pass a session object around
+// name its provider explicitly.
+function modelsForProvider(
+  provider,
+  fallbackModels = [],
+  fallbackProvider = state.session?.provider
+) {
+  return scopedProviderModels(provider, state.providerModels, fallbackProvider, fallbackModels);
 }
 
-function handleLaunchFieldInput(id, value) {
-  const fieldById = {
-    "approval-policy-input": "approvalPolicy",
-    "cwd-input": "cwd",
-    "model-input": "model",
-    "provider-input": "provider",
-    "sandbox-input": "sandbox",
-    "start-effort": "effort",
-    "start-prompt": "initialPrompt",
-  };
-  const field = fieldById[id];
+function handleLaunchFieldInput(field, value) {
   if (!field) {
     return;
   }
-  state.localUiStore.getState().setSessionDraftField(field, value);
+  const ui = state.localUiStore.getState();
+  ui.setSessionDraftField(field, value);
+
   const draftProvider = readLocalUiState(state.localUiStore).sessionDraft?.provider || "codex";
   if (field === "effort") saveLastEffort(draftProvider, value);
   if (field === "approvalPolicy") saveLastApprovalPolicy(draftProvider, value);
-  if (field !== "provider") {
-    return;
+
+  if (field === "cwd") {
+    void refreshLaunchGitContext(value);
   }
 
-  const session = state.session || {};
-  void refreshProviderCatalogs(session);
-  const nextModels = modelsForProvider(value, session.available_models || []);
-  const liveModelInput = document.getElementById("model-input") || modelInput;
-  const liveStartEffortInput = document.getElementById("start-effort") || startEffortInput;
-  const liveApprovalInput = document.getElementById("approval-policy-input") || approvalPolicyInput;
-  const nextModel = defaultModelForProvider(value);
-  const storedEffort = loadLastEffort(value);
-  const storedApproval = loadLastApprovalPolicy(value);
-  if (storedApproval) {
-    state.localUiStore.getState().setSessionDraftField("approvalPolicy", storedApproval);
-    if (liveApprovalInput) liveApprovalInput.value = storedApproval;
+  if (field === "provider") {
+    // Model, effort and approval are all per-provider; restore this one's last used.
+    void refreshProviderCatalogs(state.session || {});
+    const storedApproval = loadLastApprovalPolicy(value);
+    const storedEffort = loadLastEffort(value);
+    if (storedApproval) ui.setSessionDraftField("approvalPolicy", storedApproval);
+    if (storedEffort) ui.setSessionDraftField("effort", storedEffort);
   }
-  if (storedEffort) {
-    state.localUiStore.getState().setSessionDraftField("effort", storedEffort);
+
+  renderLaunchSessionDialog();
+}
+
+// Generation-guarded: a late answer must not seed a dialog reopened on another
+// thread. Display only — these are never written into the submitted fields.
+let forkSettingsGeneration = 0;
+async function refreshForkSourceSettings(threadId) {
+  const generation = ++forkSettingsGeneration;
+  try {
+    const response = await apiFetch(
+      `/api/threads/${encodeURIComponent(threadId)}/settings?device_id=${encodeURIComponent(state.deviceId || "")}`
+    );
+    const payload = await response.json();
+    if (generation !== forkSettingsGeneration) return;
+    if (!response.ok || !payload.ok) return;
+    const dialog = state.forkDialog;
+    if (!dialog?.open || dialog.sourceThread?.id !== threadId) return;
+
+    // DISPLAY only. Writing these into `fields` would submit them, freezing a
+    // permission the source may tighten while the dialog is open.
+    state.forkDialog = { ...dialog, sourceSettings: payload.data };
+    renderForkSessionDialog();
+  } catch {
+    // A failed fetch just leaves the fields inherited, which is what they were
+    // before this existed and is still a correct request.
   }
-  syncLaunchSettingLabels(value);
-  syncModelSuggestions(liveModelInput, nextModels, nextModel);
-  syncEffortSuggestions(
-    liveStartEffortInput,
-    nextModels,
-    nextModel,
-    storedEffort || liveStartEffortInput?.value || "",
-    value
+}
+
+// Separate counter and slot from the launch dialog's: both can be open on
+// different directories.
+let forkGitContextGeneration = 0;
+let forkGitContextTimer = null;
+async function refreshForkGitContext(cwd) {
+  const generation = ++forkGitContextGeneration;
+  if (forkGitContextTimer) clearTimeout(forkGitContextTimer);
+  const target = String(cwd || "").trim();
+  state.forkGitContext = null;
+  if (!target) {
+    return;
+  }
+  forkGitContextTimer = setTimeout(async () => {
+    try {
+      const response = await apiFetch(
+        `/api/workspace/git-context?cwd=${encodeURIComponent(target)}`
+      );
+      const payload = await response.json();
+      if (generation !== forkGitContextGeneration) return;
+      state.forkGitContext = !response.ok || !payload.ok ? null : payload.data || null;
+    } catch {
+      if (generation === forkGitContextGeneration) state.forkGitContext = null;
+    }
+    if (state.forkDialog?.open) renderForkSessionDialog();
+  }, 250);
+}
+
+// The static per-provider constant is a seed, not an answer: prefer the catalogue.
+function defaultModelForProviderCatalog(provider) {
+  const models = state.providerModels[provider] || [];
+  return (
+    models.find((option) => option.is_default)?.model
+    || models[0]?.model
+    || defaultModelForProvider(provider)
   );
+}
+
+// One step, because effort is per MODEL: a Codex `xhigh` carried onto a Claude
+// model that offers only high/max is honoured by the relay, not corrected.
+function handleLaunchModelSelection({ provider, model }) {
+  const ui = state.localUiStore.getState();
+  const previousProvider = readLocalUiState(state.localUiStore).sessionDraft?.provider || "";
+  if (provider && provider !== previousProvider) {
+    ui.setSessionDraftField("provider", provider);
+    const storedApproval = loadLastApprovalPolicy(provider);
+    if (storedApproval) ui.setSessionDraftField("approvalPolicy", storedApproval);
+    void refreshProviderCatalogs(state.session || {});
+  }
+  ui.setSessionDraftField("model", model);
+
+  const draft = readLocalUiState(state.localUiStore).sessionDraft || {};
+  const models = state.providerModels[provider] || [];
+  // Clamp against the NEW model's catalogue. Falls back to the model's own
+  // default when the current level is not offered.
+  const effort = resolveReasoningEffortValue(models, model, draft.effort);
+  if (effort !== draft.effort) {
+    ui.setSessionDraftField("effort", effort);
+    saveLastEffort(provider, effort);
+  }
+  renderLaunchSessionDialog();
+}
+
+// Debounced and generation-guarded: the field is free text, so a probe per
+// keystroke would spawn a git subprocess per character.
+let launchGitContextGeneration = 0;
+let launchGitContextTimer = null;
+async function refreshLaunchGitContext(cwd) {
+  const generation = ++launchGitContextGeneration;
+  if (launchGitContextTimer) clearTimeout(launchGitContextTimer);
+  const target = String(cwd || "").trim();
+  // Drop the old answer now: otherwise path B wears path A's branch until the reply.
+  state.launchGitContext = null;
+  renderLaunchSessionDialogIfOpen();
+  if (!target) {
+    return;
+  }
+  launchGitContextTimer = setTimeout(async () => {
+    try {
+      const response = await apiFetch(
+        `/api/workspace/git-context?cwd=${encodeURIComponent(target)}`
+      );
+      const payload = await response.json();
+      if (generation !== launchGitContextGeneration) return;
+      // No path-equality check: the relay answers about the NORMALIZED cwd, and the
+      // generation counter above already makes a stale answer safe to drop.
+      state.launchGitContext = !response.ok || !payload.ok ? null : payload.data || null;
+    } catch {
+      // A failed probe is not worth surfacing: the chip is an extra, and the
+      // dialog is fully usable without it.
+      if (generation === launchGitContextGeneration) state.launchGitContext = null;
+    }
+    renderLaunchSessionDialog();
+  }, 250);
 }
 
 function syncLaunchSettingsModal(session, provider, launchModels, activeProvider) {
   const prov = provider || activeProvider || "codex";
-  const models = launchModels?.length ? launchModels : (session?.available_models || []);
+  // Scoped, not raw: `available_models` is the ACTIVE session's catalog, and
+  // this modal is showing the LAUNCH provider's picker.
+  const models = launchModels?.length
+    ? launchModels
+    : modelsForProvider(prov, session?.available_models || [], session?.provider);
   const settings = providerSettings(prov);
   const launchDraft = readLocalUiState(state.localUiStore).sessionDraft || {};
   const fields = {
@@ -3252,7 +3709,8 @@ function syncEffortSuggestions(select, models, selectedModel, selectedEffort, pr
 function setSelectedCwd(cwd) {
   state.threadListStore.getState().setSelectedCwd(cwd);
   state.selectedCwd = readThreadListUi(state.threadListStore).selectedCwd;
-  cwdInput.value = state.selectedCwd;
+  // The field only exists while the dialog is open, so mirror into the draft.
+  state.localUiStore?.getState?.().setSessionDraftField?.("cwd", state.selectedCwd);
 }
 
 function resolveActiveThread(threadId) {
@@ -3288,14 +3746,35 @@ function renderForkSessionDialog() {
     fields,
     pending: dialogState.pending,
     error: dialogState.error || "",
-    providerOptions: providerOptions(state.providers),
-    models: models.length
-      ? models
-      : [{ model: selectedModel, display_name: selectedModel }],
+    // The merged Model pill needs every provider's catalogue, not one flattened
+    // list — a cross-provider fork is chosen from the same menu.
+    providers: state.providers || [],
+    providerModels: state.providerModels,
     modelsStatus: models.length ? "ready" : "loading",
+    gitContext: state.forkGitContext,
+    workspaceSuggestions: selectWorkspaceSuggestionsModel({
+      selectedCwd: fields.cwd || "",
+      session: state.session,
+      threads: state.threads || [],
+    }),
+    onSelectModel: handleForkModelSelection,
     approvalOptions: settings.approvalOptions,
     effortOptions: buildReasoningEffortOptions(models, selectedModel, provider),
     forkCapabilities: state.session?.provider_fork_capabilities || [],
+    sourceSettings: dialogState.sourceSettings || null,
+    sourceProjectId: state.threadProjectId?.[dialogState.sourceThread?.id] || null,
+    onCreateProject() {
+      // The generation, not the source id: reopening on the SAME thread is still a
+      // different opening, and the earlier answer does not belong to it.
+      const opening = state.forkDialogGeneration;
+      void createProjectForLaunchDraft(
+        (projectId) => handleForkDialogFieldChange("projectId", projectId),
+        () => state.forkDialog?.open && state.forkDialogGeneration === opening
+      );
+    },
+    projects: state.projects || [],
+    threadProjectId: state.threadProjectId || {},
+    threads: state.threads || [],
     onFieldChange: handleForkDialogFieldChange,
     onFork: submitForkDialog,
     onRequestClose: closeForkDialog,
@@ -3344,6 +3823,8 @@ function openForkDialogForThread(threadId, upToItemId = "") {
     return;
   }
   const models = modelsForProvider(thread.provider, state.session?.available_models || []);
+  // Not awaited: the dialog opens on inherited fields and re-seeds when this lands.
+  void refreshForkSourceSettings(thread.id);
   state.forkDialog = {
     open: true,
     pending: false,
@@ -3409,10 +3890,35 @@ async function ensureForkProviderModels(provider) {
 function handleForkDialogFieldChange(field, value) {
   const current = state.forkDialog.fields;
   let next = { ...current, [field]: value };
+  if (field === "cwd") {
+    void refreshForkGitContext(value);
+  }
   if (field === "provider") {
     const models = modelsForProvider(value, state.session?.available_models || []);
     next = applyForkProviderChange(next, value, models);
     void ensureForkProviderModels(value);
+  }
+  state.forkDialog = { ...state.forkDialog, fields: next, error: "" };
+  renderForkSessionDialog();
+}
+
+// One step, like the launch dialog. The INHERIT row must NOT re-resolve: that one
+// is deliberately sent as null for the relay to read off the source.
+function handleForkModelSelection({ provider, model }) {
+  const current = state.forkDialog.fields;
+  let next = { ...current };
+  if (provider && provider !== current.provider) {
+    const models = modelsForProvider(provider, state.session?.available_models || []);
+    next = applyForkProviderChange(next, provider, models);
+    void ensureForkProviderModels(provider);
+  }
+  next.model = model;
+  if (model !== INHERIT) {
+    next.effort = resolveReasoningEffortValue(
+      state.providerModels[provider] || [],
+      model,
+      next.effort
+    );
   }
   state.forkDialog = { ...state.forkDialog, fields: next, error: "" };
   renderForkSessionDialog();
@@ -3503,16 +4009,35 @@ function openThreadContextMenu(threadId, clientX, clientY) {
   const isActive = state.session?.active_thread_id === threadId;
   const isRunningActiveSession =
     isActive && Boolean(state.session?.active_turn_id);
+  const contextThread = resolveActiveThread(threadId);
   if (forkThreadButton) {
     // Background threads can be mid-turn too, and the relay rejects those as
     // well — gate on the same rule the server uses, not just "is active".
-    const contextThread = resolveActiveThread(threadId);
     const forkBlocked = threadIsBusy(contextThread);
     forkThreadButton.disabled = forkBlocked;
     forkThreadButton.textContent = forkBlocked
       ? "Running session cannot be forked"
       : "Fork session";
   }
+  // Hidden, not disabled: a provider without an archive will never grow one at
+  // runtime, so there is nothing for the user to wait for. (Disabled is for
+  // "momentarily unavailable", which is what the running-session case below is.)
+  // Cursor is why this exists — ACP has no archive method, so the action used to
+  // report success and hand the session back on the very next list.
+  //
+  // `resolveActiveThread` misses the active session when history has not loaded
+  // or pagination left it out, so fall back to the snapshot's own provider
+  // before giving up. An unresolved provider leaves the action ALONE rather than
+  // hiding it: this decides whether a control exists, and guessing "no" would
+  // make a working Codex archive vanish on a slow list.
+  const contextProvider =
+    contextThread?.provider || (isActive ? state.session?.provider : "") || "";
+  archiveThreadButton.hidden =
+    Boolean(contextProvider)
+    && !providerSupportsArchive({
+      provider: contextProvider,
+      capabilities: state.session?.provider_archive_capabilities || [],
+    });
   archiveThreadButton.disabled = isRunningActiveSession;
   archiveThreadButton.textContent = isRunningActiveSession
     ? "Running session cannot be archived"
@@ -3737,7 +4262,16 @@ async function archiveThreadFromContextMenu() {
     await loadThreads("post-archive refresh");
     logLine(payload.data?.message || `Archived local session ${shortId(threadId)}.`);
   } catch (error) {
-    logLine(`Failed to archive local session: ${error.message}`);
+    // Both channels: the log for the record, a modal so the user sees it. A
+    // refused archive leaves the row exactly where it was, which is
+    // indistinguishable from the button doing nothing.
+    reportDestructiveActionFailure({
+      action: "archive",
+      title,
+      error,
+      log: logLine,
+      notify: (message) => window.alert(message),
+    });
   }
 }
 
@@ -3812,7 +4346,17 @@ async function deleteThreadFromContextMenu() {
     await loadSession("post-delete refresh");
     logLine(payload.data?.message || `Deleted local session ${shortId(threadId)} permanently.`);
   } catch (error) {
-    logLine(`Failed to permanently delete local session: ${error.message}`);
+    // See the archive path above. This matters more now that delete really
+    // deletes: it has genuine failure modes (directory already gone, a
+    // permissions error, a session held by a running turn) where it previously
+    // had exactly one, constant, one.
+    reportDestructiveActionFailure({
+      action: "delete",
+      title,
+      error,
+      log: logLine,
+      notify: (message) => window.alert(message),
+    });
   }
 }
 
@@ -3978,17 +4522,6 @@ function classifyAuditEntry(entry) {
   }
 
   return "neutral";
-}
-
-function shouldShowAuditEntry(entry) {
-  const kind = String(entry?.kind || "").toLowerCase();
-  const message = String(entry?.message || "");
-
-  if (kind !== "codex") {
-    return true;
-  }
-
-  return /approval|pair|revoke|connected|disconnected|take over|control|broker|session/i.test(message);
 }
 
 function isCurrentDeviceActiveController(session) {
@@ -4164,10 +4697,6 @@ function renderClientLogLines(lines) {
 // Focusing a tab goes through `viewThread`, the view-only path. It must NOT call
 // resume_session, which moves the relay's single active thread for EVERY connected
 // client — a tab is a per-client view, not a claim on the relay.
-let sessionTabsRootHandle = null;
-let sessionTabsRootElement = null;
-let projectSwitcherRootHandle = null;
-let projectSwitcherRootElement = null;
 
 // The Project switcher above the tab strip. Its own sub-root for the same reason
 // the strip has one: the shell renders once, so anything data-driven needs its own.
@@ -4176,6 +4705,80 @@ let projectSwitcherRootElement = null;
 // last labels are remembered because navigation and Projects-store changes also
 // re-render this control, and they have no opinion about the title.
 let lastSwitcherLabels = { label: "", labelTooltip: "" };
+// Its own sub-root, like renderProjectSwitcher: the shell renders once, so
+// anything whose props change needs a root that can re-render.
+function renderLaunchSessionDialog() {
+  const mount = document.getElementById("launch-dialog-root");
+  if (!mount) {
+    return;
+  }
+  if (launchDialogRootElement !== mount) {
+    launchDialogRootHandle?.unmount();
+    launchDialogRootHandle = createRoot(mount);
+    launchDialogRootElement = mount;
+  }
+
+  const draft = readLocalUiState(state.localUiStore).sessionDraft || {};
+  const provider = draft.provider || defaultProvider(state.providers);
+  const models = state.providerModels[provider] || [];
+  const model = draft.model || defaultModelForProvider(provider);
+
+  launchDialogRootHandle.render(
+    React.createElement(StartSessionDialog, {
+      approvalOptions: providerSettings(provider).approvalOptions,
+      effortOptions: buildReasoningEffortOptions(models, model, provider),
+      fields: {
+        ...draft,
+        cwd: draft.cwd || state.selectedCwd || state.session?.current_cwd || "",
+        model,
+        provider,
+      },
+      gitContext: state.launchGitContext,
+      id: "launch-start-session-dialog",
+      initialPromptAttachmentsId: "start-prompt-attachments",
+      onCreateProject() {
+        const opening = state.launchDialogGeneration;
+        void createProjectForLaunchDraft(
+          (projectId) => handleLaunchFieldInput("projectId", projectId),
+          () =>
+            state.launchDialogGeneration === opening
+            && document.getElementById("launch-start-session-dialog")?.open === true
+        );
+      },
+      onFieldChange: handleLaunchFieldInput,
+      onSelectModel: handleLaunchModelSelection,
+      onRequestClose() {
+        clearNewSessionImageAttachments();
+      },
+      onStart() {
+        void submitStartSession();
+      },
+      projects: state.projects || [],
+      providerModels: state.providerModels,
+      providers: state.providers || [],
+      // Matches remote: Claude supports deferred start, so an empty prompt is
+      // allowed and the relay promotes the session on the first message.
+      requireInitialPrompt: false,
+      startPending: Boolean(state.newSessionSubmitInFlight),
+      threadProjectId: state.threadProjectId || {},
+      threads: state.threads || [],
+      workspaceSuggestions: selectWorkspaceSuggestionsModel({
+        selectedCwd: state.selectedCwd || "",
+        session: state.session,
+        threads: state.threads || [],
+      }),
+    })
+  );
+}
+
+// The dialog is controlled, so anything arriving asynchronously (catalogues,
+// projects, the pending flag) is invisible until something re-renders it.
+function renderLaunchSessionDialogIfOpen() {
+  if (document.getElementById("launch-start-session-dialog")?.open) {
+    renderLaunchSessionDialog();
+  }
+}
+
 function renderProjectSwitcher(labels = null) {
   if (labels) {
     lastSwitcherLabels = labels;
@@ -4230,6 +4833,92 @@ function resolveTabThread(threadId) {
     // strip can hold tabs from several providers at once.
     provider: thread.provider || "",
   };
+}
+
+function openStartSessionDialog({ projectId = undefined } = {}) {
+  state.launchDialogGeneration += 1;
+  // At open time, not per render: re-seeding per render would overwrite a choice
+  // made inside the dialog.
+  const context = sessionViewStore.getState().location.context;
+  const seeded =
+    projectId !== undefined
+      ? projectId
+      : context?.kind === "project"
+        ? context.projectId
+        : null;
+  const ui = state.localUiStore.getState();
+  ui.setSessionDraftField("projectId", seeded || null);
+  // Submit reads the draft, so a render-time-only fallback would post empty.
+  const draft = readLocalUiState(state.localUiStore).sessionDraft || {};
+  if (!draft.cwd) {
+    ui.setSessionDraftField(
+      "cwd",
+      state.selectedCwd || state.session?.current_cwd || ""
+    );
+  }
+  // Repaired, not just filled when empty: the draft defaults to "codex", which a
+  // relay that does not run Codex would reject at start.
+  const available = state.providers || [];
+  const provider =
+    draft.provider && available.includes(draft.provider)
+      ? draft.provider
+      : defaultProvider(available);
+  if (provider !== draft.provider) {
+    ui.setSessionDraftField("provider", provider);
+    // The model belonged to the provider just replaced.
+    ui.setSessionDraftField("model", defaultModelForProvider(provider));
+  } else if (!draft.model) {
+    ui.setSessionDraftField("model", defaultModelForProvider(provider));
+  }
+  void refreshLaunchGitContext(
+    readLocalUiState(state.localUiStore).sessionDraft?.cwd || ""
+  );
+  // Fresh attachment draft per opening: a dismissed paste must not follow the
+  // user into an unrelated workspace.
+  clearNewSessionImageAttachments();
+  // flushSync because showModal() below needs the element to exist: createRoot's
+  // render is async, so the first open found nothing and failed silently.
+  flushSync(() => renderLaunchSessionDialog());
+  // The mount only exists once the dialog has rendered.
+  renderNewSessionImageAttachments();
+  // showModal(), not setAttribute("open"): only a modal dialog gets `::backdrop`
+  // and the Escape close-request the pickers inside it cooperate with.
+  document.getElementById("launch-start-session-dialog")?.showModal();
+}
+
+// The sidebar's primary action. It lives in a mount rather than in react-shell.js because
+// its right half lists the AVAILABLE agents, and that catalogue is fetched after boot —
+// the shell renders once and could only ever hand it an empty array.
+function renderStartSessionSplit() {
+  const mount = document.getElementById("start-session-split-mount");
+  if (!mount) {
+    return;
+  }
+
+  if (startSessionSplitRootElement !== mount) {
+    startSessionSplitRootHandle?.unmount();
+    startSessionSplitRootHandle = createRoot(mount);
+    startSessionSplitRootElement = mount;
+  }
+
+  startSessionSplitRootHandle.render(
+    React.createElement(StartSessionSplitButton, {
+      buttonId: "open-start-session-dialog",
+      menuId: "start-session-agent-menu",
+      providerOptions: providerOptions(state.providers || []),
+      activeProvider: readLocalUiState(state.localUiStore).sessionDraft?.provider || "",
+      onStart: () => openStartSessionDialog(),
+      onStartWithProvider: (provider) => {
+        // The same atomic handler the Model pill uses, so effort is re-resolved
+        // against the new model rather than carried over.
+        handleLaunchModelSelection({
+          model: defaultModelForProviderCatalog(provider),
+          provider,
+        });
+        openStartSessionDialog();
+      },
+    })
+  );
 }
 
 function renderSessionTabs() {

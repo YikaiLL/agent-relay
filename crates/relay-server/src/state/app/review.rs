@@ -95,7 +95,12 @@ fn workspace_gone_recap() -> String {
 
 /// What driving a recap turn on the reviewed thread produced.
 enum RecapOutcome {
-    Text(String),
+    /// `(the parent's id AFTER the recap turn, the recap text)`. The id is returned
+    /// because a recap can be the reviewed thread's very first turn, which promotes a
+    /// Claude session off its `claude-pending-…` placeholder — every later step of the
+    /// review (resolving the workspace, driving fix turns, posting back) has to follow
+    /// it or it addresses a thread that no longer exists.
+    Text(String, String),
     /// The thread's workspace no longer exists, so it cannot be asked for anything. The
     /// review continues read-only with whatever briefing is already available.
     WorkspaceGone,
@@ -141,7 +146,7 @@ impl From<String> for ThreadDriveError {
 }
 
 pub(super) fn classify_workspace_result<T>(
-    workspace: &LiveWorkspace,
+    workspace: &LiveDir,
     result: Result<T, String>,
 ) -> Result<T, ThreadDriveError> {
     match result {
@@ -165,6 +170,30 @@ pub(super) struct ReviewWorkspace {
     pub(super) fallback_from: Option<String>,
     /// Every in-scope working tree of that repo, for naming the branch/kind in the prompt.
     pub(super) roots: Vec<WorkspaceRootView>,
+}
+
+/// What a dispatched turn is running as.
+///
+/// `thread_id` exists so a caller physically cannot carry on with the id it sent
+/// to. For a deferred-start provider (Claude) that id is a `claude-pending-…`
+/// placeholder whose runtime is REMOVED mid-`start_turn`, when the turn creates the
+/// SDK session and promotion re-keys everything onto the real id. Waiting on the
+/// placeholder then reads "no runtime" as "idle", so a turn that has only just
+/// started looks finished — the run gives up, releases its locks, and the agent
+/// keeps working. That was the reported bug for a clean Claude reviewer, and the
+/// same shape reaches every parent/author turn on a Claude session that has not
+/// been messaged yet.
+///
+/// Returning it is the point: promotion re-keys the relay's own ownership maps
+/// (review `reviewer_thread_id`, workflow `step_threads`, team seats) but NOT the
+/// parent ids, and never the local variables a driver is holding. So the id has to
+/// come back out of the dispatch rather than be looked up afterwards by each caller.
+pub(super) struct DispatchedTurn {
+    /// The thread the turn actually runs under, after any promotion.
+    pub(super) thread_id: String,
+    /// The provider's turn id, when it gave one. `None` is an UNCERTAIN start: the
+    /// provider may still have begun work.
+    pub(super) turn_id: Option<String>,
 }
 
 /// Immutable fields captured once at the top of the orchestrator.
@@ -251,6 +280,18 @@ starting a review"
             let parent_cwd = relay
                 .thread_cwd(&parent_thread_id)
                 .ok_or_else(|| "cannot resolve the thread to review".to_string())?;
+            // The reciprocal of the task team's cwd lock, and the one place the
+            // "a review only needs its own thread to be idle" rule does not hold:
+            // a review reads the whole working tree, and a task team has three
+            // agents writing that tree continuously. The snapshot would not just
+            // be a moving target, it would be someone else's half-finished edit.
+            if relay.is_cwd_team_locked(&parent_cwd) {
+                return Err(
+                    "a task is running in this workspace; wait for it to finish before \
+starting a review"
+                        .to_string(),
+                );
+            }
             // Liveness is checked on the NAMED parent, not the active thread.
             if relay
                 .runtime_for_thread(&parent_thread_id)
@@ -333,20 +374,14 @@ reviewer thread"
             )
         };
 
-        // Which working tree this review reads (see `resolve_review_workspace`). Resolved
-        // once here so an unresolvable workspace is refused with a clear message at request
-        // time, and re-resolved per round by the orchestrator.
+        // Which working tree this review reads. Resolve once so an unresolvable workspace is refused at request time.
         let review_workspace = self
             .resolve_review_workspace(&parent_thread_id, &device_id)
             .await?;
         let cwd = review_workspace.cwd.clone();
         let initial_fallback_from = review_workspace.fallback_from.clone();
 
-        // An explicitly requested reviewer thread must live IN the tree we are about to
-        // review. A provider thread cannot be relocated, so "reuse" across trees would hand it
-        // one tree's diff while its file tools read another — refuse instead of accepting with
-        // a caveat the reviewer may ignore, or (worse) silently substituting a different
-        // reviewer than the receipt promises.
+        // Reviewer must live in the tree we are about to review; a provider thread cannot relocate.
         if let Some(reviewer_id) = &reuse_thread_id {
             let reviewer_cwd = self
                 .thread_recorded_cwd(reviewer_id)
@@ -586,7 +621,7 @@ to this thread."
             return;
         };
         let ReviewJobFields {
-            parent_thread_id,
+            mut parent_thread_id,
             reviewer_provider,
             reviewer_model,
             reviewer_effort,
@@ -633,7 +668,10 @@ last message (no recap turn)."
                         text
                     }
                     _ => match self.drive_parent_recap(&job_id, &parent_thread_id).await {
-                        RecapOutcome::Text(text) => text,
+                        RecapOutcome::Text(promoted, text) => {
+                            parent_thread_id = promoted;
+                            text
+                        }
                         RecapOutcome::WorkspaceGone => workspace_gone_recap(),
                         RecapOutcome::Aborted => return,
                     },
@@ -641,7 +679,13 @@ last message (no recap turn)."
             }
             ReviewRecapSource::Recap => {
                 match self.drive_parent_recap(&job_id, &parent_thread_id).await {
-                    RecapOutcome::Text(text) => text,
+                    // The recap may have been this thread's FIRST turn, which promotes
+                    // a Claude session off its placeholder. Everything after — the
+                    // workspace resolve, the fix turns, the post-back — must follow it.
+                    RecapOutcome::Text(promoted, text) => {
+                        parent_thread_id = promoted;
+                        text
+                    }
                     // Lost the race: the workspace vanished as the recap turn reached the
                     // provider. Continue read-only rather than failing the review.
                     RecapOutcome::WorkspaceGone => workspace_gone_recap(),
@@ -678,10 +722,7 @@ last message (no recap turn)."
                 return;
             }
 
-            // --- re-resolve the workspace, then collect a fresh diff for this round ---
-            // Re-resolved (not pinned at job creation) so a worktree removed mid-review, or
-            // an author whose fix landed in another tree, degrades or follows instead of
-            // failing the job / re-reviewing a stale tree.
+            // Re-resolve each round so a vanished/moved tree degrades or follows instead of failing.
             let workspace = match self
                 .resolve_review_workspace(&parent_thread_id, &device_id)
                 .await
@@ -841,7 +882,7 @@ review ({round_cwd}); starting a clean reviewer there instead."
                     // file tools land there. Construct the live handle immediately before
                     // crossing into the provider; if cleanup won the race, use the same
                     // typed retry path as a provider-side ENOENT.
-                    let started = match LiveWorkspace::from_path(&round_cwd) {
+                    let started = match LiveDir::from_path(&round_cwd) {
                         Some(workspace) => {
                             self.start_background_reviewer_thread(
                                 &job_id,
@@ -944,7 +985,10 @@ reviewer ({error}); re-resolving the workspace and retrying the round."
             if self.review_aborted(&job_id).await {
                 return;
             }
-            match self
+            // The id the turn RUNS under: a clean Claude reviewer is promoted from its
+            // placeholder during this call, and everything after it — the idle wait and
+            // the read-back — must follow the turn, not the id we addressed.
+            let current_id = match self
                 .send_message_to_thread(
                     &this_reviewer_id,
                     &prompt,
@@ -953,11 +997,11 @@ reviewer ({error}); re-resolving the workspace and retrying the round."
                 )
                 .await
             {
-                Ok(Some(_)) => {}
-                Ok(None) => {
+                Ok(dispatched) if dispatched.turn_id.is_some() => dispatched.thread_id,
+                Ok(dispatched) => {
                     self.fail_after_uncertain_turn_start(
                         &job_id,
-                        &this_reviewer_id,
+                        &dispatched.thread_id,
                         "reviewer did not return a turn id",
                     )
                     .await;
@@ -982,19 +1026,13 @@ started ({error}); re-resolving the workspace and retrying the round."
                 Err(error) => {
                     self.fail_after_uncertain_turn_start(
                         &job_id,
-                        &this_reviewer_id,
+                        &self.dispatched_thread_id(&this_reviewer_id).await,
                         format!("failed to send the reviewer prompt: {error}"),
                     )
                     .await;
                     return;
                 }
-            }
-            // A background Claude reviewer's synthetic `claude-pending-…` id is
-            // promoted to its real session id once its turn starts; re-read it.
-            let current_id = self
-                .current_reviewer_thread_id(&job_id)
-                .await
-                .unwrap_or(this_reviewer_id);
+            };
             // (The loop-reuse `reviewer_thread_id` is re-set from the post-wait,
             // post-promotion id at the read-back below; no need to stash the pre-wait id.)
             match self
@@ -1103,15 +1141,23 @@ started ({error}); re-resolving the workspace and retrying the round."
             if self.review_aborted(&job_id).await {
                 return;
             }
-            match self
+            // The author may itself be a Claude session that has never been messaged,
+            // in which case THIS turn creates its SDK session and promotes it. Follow
+            // the turn from here on, for the wait and for every cleanup below.
+            let fix_thread_id = match self
                 .send_message_to_thread(&parent_thread_id, &fix_prompt, None, None)
                 .await
             {
-                Ok(Some(_)) => {}
-                Ok(None) => {
+                Ok(dispatched) if dispatched.turn_id.is_some() => {
+                    // A fix turn can be the author's first too (a review whose recap
+                    // came from `LastMessage` never drove one).
+                    parent_thread_id = dispatched.thread_id.clone();
+                    dispatched.thread_id
+                }
+                Ok(dispatched) => {
                     self.fail_after_uncertain_turn_start(
                         &job_id,
-                        &parent_thread_id,
+                        &dispatched.thread_id,
                         "the author did not return a turn id for the fix",
                     )
                     .await;
@@ -1139,15 +1185,15 @@ started ({error}); finishing with round {round}'s findings."
                 Err(error) => {
                     self.fail_after_uncertain_turn_start(
                         &job_id,
-                        &parent_thread_id,
+                        &self.dispatched_thread_id(&parent_thread_id).await,
                         format!("failed to ask the author to address findings: {error}"),
                     )
                     .await;
                     return;
                 }
-            }
+            };
             match self
-                .wait_for_thread_idle_outcome(&job_id, &parent_thread_id)
+                .wait_for_thread_idle_outcome(&job_id, &fix_thread_id)
                 .await
             {
                 WaitOutcome::Completed => {}
@@ -1157,11 +1203,11 @@ started ({error}); finishing with round {round}'s findings."
                 | WaitOutcome::TimedOut => {
                     // The author's fix needs a human (its sandbox prompts on a write,
                     // or it asked a question). Stop the turn and escalate to the user.
-                    if self.stop_thread_or_block(&job_id, &parent_thread_id).await {
+                    if self.stop_thread_or_block(&job_id, &fix_thread_id).await {
                         let message = review_escalated_message(&reviewer_provider, &review);
                         self.finish_review_to_parent(
                             &job_id,
-                            &parent_thread_id,
+                            &fix_thread_id,
                             message,
                             ReviewJobStatus::Escalated,
                         )
@@ -1200,7 +1246,7 @@ started ({error}); finishing with round {round}'s findings."
             .send_message_to_thread(parent_thread_id, &message, None, None)
             .await
         {
-            Ok(turn_id) => turn_id,
+            Ok(dispatched) => dispatched.turn_id,
             Err(error) if error.is_workspace_gone() => {
                 // The review is already recorded on the job (and rendered in the reviewer
                 // panel), so settle instead of failing a finished review on delivery.
@@ -1211,7 +1257,7 @@ started ({error}); finishing with round {round}'s findings."
             Err(error) => {
                 self.fail_after_uncertain_turn_start(
                     job_id,
-                    parent_thread_id,
+                    &self.dispatched_thread_id(parent_thread_id).await,
                     format!("failed to post the review back to the parent: {error}"),
                 )
                 .await;
@@ -1275,15 +1321,23 @@ started ({error}); finishing with round {round}'s findings."
             .latest_assistant_entry(parent_thread_id)
             .await
             .map(|(item_id, _)| item_id);
-        let recap_turn = match self
+        // Reviewing a Claude session that has never been messaged makes THIS the turn
+        // that creates its SDK session, so the parent is promoted off its placeholder
+        // mid-send. Everything below follows the turn's own id: waiting on (or
+        // stopping, or reading back from) the placeholder would find no runtime, call
+        // a turn that just started finished, and fail the review — the parent-side
+        // twin of the clean-reviewer bug.
+        let (parent_thread_id, recap_turn) = match self
             .send_message_to_thread(parent_thread_id, parent_recap_prompt(), None, None)
             .await
         {
-            Ok(Some(turn_id)) => Some(turn_id),
-            Ok(None) => {
+            Ok(dispatched) if dispatched.turn_id.is_some() => {
+                (dispatched.thread_id, dispatched.turn_id)
+            }
+            Ok(dispatched) => {
                 self.fail_after_uncertain_turn_start(
                     job_id,
-                    parent_thread_id,
+                    &dispatched.thread_id,
                     "parent did not return a recap turn id",
                 )
                 .await;
@@ -1293,13 +1347,14 @@ started ({error}); finishing with round {round}'s findings."
             Err(error) => {
                 self.fail_after_uncertain_turn_start(
                     job_id,
-                    parent_thread_id,
+                    &self.dispatched_thread_id(parent_thread_id).await,
                     format!("failed to ask the parent for a recap: {error}"),
                 )
                 .await;
                 return RecapOutcome::Aborted;
             }
         };
+        let parent_thread_id = parent_thread_id.as_str();
         self.update_job(job_id, |job| job.parent_recap_turn_id = recap_turn)
             .await;
         match self
@@ -1341,7 +1396,7 @@ started ({error}); finishing with round {round}'s findings."
         }
         match self.latest_assistant_entry(parent_thread_id).await {
             Some((item_id, text)) if recap_baseline.as_deref() != Some(item_id.as_str()) => {
-                RecapOutcome::Text(text)
+                RecapOutcome::Text(parent_thread_id.to_string(), text)
             }
             _ => {
                 // The recap turn settled without a fresh assistant reply (e.g. it ended
@@ -1398,86 +1453,25 @@ started ({error}); finishing with round {round}'s findings."
         relay.notify();
     }
 
-    /// Which working tree a review of `parent_thread_id` should read RIGHT NOW.
-    ///
-    /// Two routine reasons that is not the thread's recorded cwd:
-    ///  - the directory no longer exists (an agent worktree removed once its work landed):
-    ///    every git command spawned there dies with ENOENT, which used to fail the whole
-    ///    job with "failed to collect the workspace diff: … (os error 2)". It degrades to a
-    ///    provably-related workspace, or refuses — never to an unrelated repo;
-    ///  - the thread has moved between the repo and a worktree, so its landed writes are in
-    ///    a different tree. Reviewing the tree it was born in means reviewing none of the
-    ///    work.
-    ///
-    /// Called per round, not pinned at job creation: a worktree that disappears — or an
-    /// author whose fix lands in another tree — mid-review must not strand the loop on a
-    /// dead or stale workspace.
+    /// Per-round so a vanished/moved worktree does not strand the loop. Delegates to `resolve_thread_workspace`.
     pub(super) async fn resolve_review_workspace(
         &self,
         parent_thread_id: &str,
         device_id: &str,
     ) -> Result<ReviewWorkspace, String> {
-        let (recorded_cwd, relay_cwd, device_scope, allowed_roots, write_evidence) = {
-            let relay = self.relay.read().await;
-            let recorded_cwd = relay
-                .thread_cwd(parent_thread_id)
-                .ok_or_else(|| "cannot resolve the thread to review".to_string())?;
-            let device_scope = relay.device_path_scope(device_id);
-            ensure_path_within_device_scope(&recorded_cwd, &device_scope, &relay.allowed_roots)?;
-            // Where this thread has actually been WRITING, lifted out under the lock as
-            // paths only (never whole tool views with their diff bodies): turning them into
-            // a working tree needs git, and the lock must not be held across an await.
-            let write_evidence = relay
-                .runtime_for_thread(parent_thread_id)
-                .map(|runtime| {
-                    landed_write_paths(
-                        runtime
-                            .transcript
-                            .iter()
-                            .rev()
-                            .take(SUGGESTED_ROOT_SCAN_LIMIT)
-                            .filter_map(|record| {
-                                record
-                                    .tool
-                                    .as_ref()
-                                    .map(|tool| (tool, record.status.as_str()))
-                            }),
-                    )
-                })
-                .unwrap_or_default();
-            (
-                recorded_cwd,
-                relay.current_cwd.clone(),
-                device_scope,
-                relay.allowed_roots.clone(),
-                write_evidence,
-            )
-        };
-
-        let (usable, fallback_from) =
-            resolve_workspace_cwd(&recorded_cwd, &relay_cwd, &device_scope, &allowed_roots)
-                .await
-                .into_readable()
-                .ok_or_else(|| {
-                    format!(
-                    "the workspace this thread ran in ({recorded_cwd}) no longer exists, and no \
-workspace related to it is available to review instead"
-                )
-                })?;
-        // Roots come from git, so all of them still exist; filtered to the requesting
-        // device's scope so a review can never be steered outside it.
-        let roots: Vec<_> = list_worktrees_in(&usable)
+        let resolved = self
+            .resolve_thread_workspace(parent_thread_id, Some(device_id))
             .await
-            .into_iter()
-            .filter(|root| path_within_device_scope(&root.path, &device_scope, &allowed_roots))
-            .collect();
-        let cwd = suggested_root_from_paths(&write_evidence, &roots)
-            .unwrap_or_else(|| usable.as_str().to_string());
+            .map_err(ThreadWorkspaceError::into_message)?;
         Ok(ReviewWorkspace {
-            cwd,
-            recorded_cwd,
-            fallback_from,
-            roots,
+            cwd: resolved.cwd,
+            recorded_cwd: resolved.birth_cwd,
+            // Only a vanished birth tree is a fallback; a live move is not "deleted".
+            fallback_from: match resolved.origin {
+                WorkspaceOrigin::Substituted { gone } => Some(gone),
+                _ => None,
+            },
+            roots: resolved.roots,
         })
     }
 
@@ -1502,7 +1496,8 @@ workspace related to it is available to review instead"
         device_id: &str,
     ) -> Result<(WorkspaceDiffResponse, ReviewWorkspace, String), String> {
         let cwd = workspace.cwd.clone();
-        match collect_workspace_diff(&cwd).await {
+        let grants = { self.relay.read().await.trust_grants() };
+        match collect_workspace_diff(&cwd, &grants).await {
             Ok(diff) => Ok((diff, workspace, cwd)),
             // Only a vanished tree is retried; a real git error still surfaces.
             Err(error) if !dir_exists(&cwd) => {
@@ -1510,9 +1505,11 @@ workspace related to it is available to review instead"
                     .resolve_review_workspace(parent_thread_id, device_id)
                     .await?;
                 let cwd = retried.cwd.clone();
-                let diff = collect_workspace_diff(&cwd).await.map_err(|retry_error| {
-                    format!("{error}; retrying in {cwd} also failed: {retry_error}")
-                })?;
+                let diff = collect_workspace_diff(&cwd, &grants)
+                    .await
+                    .map_err(|retry_error| {
+                        format!("{error}; retrying in {cwd} also failed: {retry_error}")
+                    })?;
                 Ok((diff, retried, cwd))
             }
             Err(error) => Err(error),
@@ -1536,9 +1533,14 @@ workspace related to it is available to review instead"
     /// proves its recorded cwd existed immediately before the provider boundary; if it
     /// disappears after this check, `classify_workspace_result` turns the provider error
     /// into the same `WorkspaceGone` variant.
-    async fn drivable_thread(&self, thread_id: &str) -> Result<LiveWorkspace, ThreadDriveError> {
+    ///
+    /// `LiveDir`, not a trusted workspace: this hands a directory to a PROVIDER, and an
+    /// agent starting in a tree is gated by its own permission harness, visibly and with
+    /// the user's intent behind it. Requiring a git grant to open a session would be
+    /// asking the wrong question — and answering it would not make anything safer.
+    async fn drivable_thread(&self, thread_id: &str) -> Result<LiveDir, ThreadDriveError> {
         let recorded = self.thread_recorded_cwd(thread_id).await?;
-        LiveWorkspace::from_path(&recorded).ok_or(ThreadDriveError::WorkspaceGone { recorded })
+        LiveDir::from_path(&recorded).ok_or(ThreadDriveError::WorkspaceGone { recorded })
     }
 
     /// Whether `thread_id`'s own workspace IS `tree`, and still exists. When the relay
@@ -1549,7 +1551,8 @@ workspace related to it is available to review instead"
         tree: &str,
     ) -> Result<bool, ThreadDriveError> {
         let recorded = self.thread_recorded_cwd(thread_id).await?;
-        let workspace = LiveWorkspace::from_path(&recorded)
+        // Comparing two paths, spawning nothing.
+        let workspace = LiveDir::from_path(&recorded)
             .ok_or_else(|| ThreadDriveError::WorkspaceGone { recorded })?;
         Ok(paths_equivalent(workspace.as_str(), tree))
     }
@@ -1564,7 +1567,7 @@ workspace related to it is available to review instead"
         text: &str,
         model: Option<&str>,
         effort: Option<&str>,
-    ) -> Result<Option<String>, ThreadDriveError> {
+    ) -> Result<DispatchedTurn, ThreadDriveError> {
         let defaults = self.defaults().await;
         // When the caller doesn't pin a model/effort, use the TARGET thread's OWN
         // remembered settings — not the active session's — passed as the EXPLICIT
@@ -1610,7 +1613,24 @@ workspace related to it is available to review instead"
         // Gate immediately before the provider call, after model-catalog work. The
         // directory can still disappear in the provider call itself; classify that
         // result against the same handle so callers see one stable error variant.
+        // Autonomous: a reviewer job spends without anyone watching, which is
+        // what the default policy holds back when the day's cap is reached.
+        if let crate::usage::budget::BudgetVerdict::Refuse(reason) = self
+            .usage_budget_verdict(crate::usage::budget::TurnOrigin::Autonomous)
+            .await
+        {
+            return Err(reason.into());
+        }
+
         let workspace = self.drivable_thread(thread_id).await?;
+        // Snapshot the thread's turn clock BEFORE crossing into the provider. The
+        // relay reads provider output on its own task, so this turn can start AND
+        // finish while we are still queued for the write lock below; the revision is
+        // how we tell "nothing has happened yet" from "the turn already settled".
+        // Taken on the id we are about to send to, which is the same clock the real
+        // id carries afterwards — `promote_background_thread` max-folds `turn_revision`
+        // across the handoff precisely so a promoted thread's clock never rewinds.
+        let turn_revision = { self.relay.read().await.thread_turn_revision(thread_id) };
         let turn_id = classify_workspace_result(
             &workspace,
             bridge
@@ -1618,30 +1638,49 @@ workspace related to it is available to review instead"
                 .await,
         )?;
 
+        // Which thread the turn ACTUALLY runs under. A deferred-start provider
+        // (Claude) has no session id until it sees a user message, so this very turn
+        // is what creates the session: the synthetic `claude-pending-…` id is
+        // promoted to the real one *during* `start_turn`, which returns only after
+        // `session_started`. The bookkeeping below must land on that id — the
+        // placeholder's runtime no longer exists, and seeding the turn against it
+        // would spawn a phantom working thread. Every other provider returns the
+        // requested id unchanged, so this is a no-op for them. Same call the ordinary
+        // send path makes (`sessions.rs`).
+        let effective_thread_id = bridge.resolve_started_thread_id(thread_id).await;
+        let thread_id = effective_thread_id.as_str();
+
         {
             let mut relay = self.relay.write().await;
+            // A provider may publish this turn's start AND its completion before
+            // `start_turn` returns. Seeding the turn id afterwards would write a live
+            // turn back over settled state, and nothing is left to clear it: the
+            // waiter then sits on a ghost until the stall timeout kills the review.
+            // Only seed when no turn event has landed for this thread in the meantime.
+            let turn_settled_meanwhile = relay.thread_turn_revision(thread_id) != turn_revision;
             if relay.active_thread_id.as_deref() == Some(thread_id) {
                 relay.set_provider_name(provider_name.clone());
                 if let Some(models) = provider_models {
                     relay.set_available_models(models);
                 }
-                relay.set_active_turn(turn_id.clone());
+                if !turn_settled_meanwhile {
+                    relay.set_active_turn(turn_id.clone());
+                }
                 relay.model = model.clone();
                 relay.reasoning_effort = effort.clone();
                 relay.remember_active_thread_settings();
-            } else if relay.runtime_for_thread(thread_id).is_some() {
-                // Background turn. Only set the turn if this thread still has a
-                // runtime: a Claude reviewer's synthetic pending id may have already
-                // been promoted to its real id during `start_turn` (which returns
-                // after `session_started`), in which case the pending runtime is
-                // gone and the real runtime is already marked working by promotion.
-                // Touching the pending id here would spawn a phantom working thread.
+            } else if !turn_settled_meanwhile && relay.runtime_for_thread(thread_id).is_some() {
+                // Background turn. Guarded on the runtime still existing so a thread
+                // deleted mid-call can't be resurrected as a ghost working row.
                 relay.bg_set_active_turn(thread_id, turn_id.clone(), unix_now());
             }
             relay.notify();
         }
 
-        Ok(turn_id)
+        Ok(DispatchedTurn {
+            thread_id: effective_thread_id,
+            turn_id,
+        })
     }
 
     /// Create a clean reviewer thread as a BACKGROUND thread — it never becomes
@@ -1657,7 +1696,7 @@ workspace related to it is available to review instead"
     async fn start_background_reviewer_thread(
         &self,
         job_id: &str,
-        workspace: &LiveWorkspace,
+        workspace: &LiveDir,
         reviewer_provider: &str,
         reviewer_model: Option<&str>,
         reviewer_effort: Option<&str>,
@@ -1692,7 +1731,12 @@ workspace related to it is available to review instead"
         let start = classify_workspace_result(
             workspace,
             bridge
-                .start_thread(workspace.as_str(), &model, &approval_policy, &sandbox, None)
+                .start_thread(StartThreadRequest::new(
+                    workspace.as_str(),
+                    &model,
+                    &approval_policy,
+                    &sandbox,
+                ))
                 .await,
         )?;
         let mut thread = start.thread;
@@ -1867,6 +1911,34 @@ workspace related to it is available to review instead"
         }
 
         Ok((model, effort))
+    }
+
+    /// The thread a turn we just dispatched is actually running under.
+    ///
+    /// Pair this with every `send_message_to_thread` call whose FAILURE path acts on
+    /// the thread — reviews, workflows and task teams all share that dispatch.
+    ///
+    /// A failed or empty turn-start response is not proof the provider did no work,
+    /// and for a deferred-start provider it is the case where work is MOST likely to
+    /// be in flight: the SDK session is created by this very turn, so a `start` that
+    /// gets as far as `session_started` and only then loses its response has left a
+    /// real, running session behind. By that point the placeholder's runtime is gone,
+    /// so cleanup aimed at it finds nothing, reads that absence as "nothing to stop",
+    /// and lets the run go terminal — releasing its locks while the agent keeps
+    /// working on the tree. For a task-team seat that agent has `bypass` permissions.
+    ///
+    /// Resolved from the relay's own promotion record, NOT from the bridge: a bridge
+    /// only learns the real id from a SUCCESSFUL start (`claude.rs` populates
+    /// `promoted_thread_ids` after the response), which is exactly the case this does
+    /// not cover. It is also why this is keyed off the id we sent to rather than each
+    /// caller's own ownership map — one rule, and it holds for callers that have no
+    /// such map.
+    ///
+    /// Returns `sent_to` unchanged for every provider that hands back a real thread id
+    /// up front, and for a placeholder whose promotion never happened — where the
+    /// placeholder is itself the correct (and still present) cleanup target.
+    pub(super) async fn dispatched_thread_id(&self, sent_to: &str) -> String {
+        self.relay.read().await.resolve_promoted_thread_id(sent_to)
     }
 
     /// The current reviewer thread id recorded on the job (re-read because a
@@ -2503,12 +2575,38 @@ pub(super) fn reviewer_thread_settings(
             parent_sandbox.to_string(),
             false,
         ),
+        // The fake provider has no filesystem at all — it cannot write whatever
+        // it is told, which is exactly the property `read_only_enforced` names.
+        "fake" => ("never".to_string(), "read-only".to_string(), true),
+        // Cursor over ACP has modes (`agent`/`plan`/`ask`), not an OS sandbox.
+        // `review_read_only` is what the ACP bridge maps onto `plan`, so the
+        // reviewer is contained at the prompt/tool level — but that is NOT
+        // isolation, hence `false`.
+        "cursor" => (
+            "review_read_only".to_string(),
+            parent_sandbox.to_string(),
+            false,
+        ),
+        // Unknown provider: never inherit the parent's policy. A parent
+        // typically runs `bypass` + `workspace-write`, so falling through would
+        // hand an unrecognized reviewer full write access to the artifact it is
+        // judging. Restrict to the strongest mode we have a name for and claim
+        // no enforcement.
         _ => (
-            parent_approval.to_string(),
+            "review_read_only".to_string(),
             parent_sandbox.to_string(),
             false,
         ),
     }
+}
+
+/// Whether a provider's read-only reviewer mode is enforced by something
+/// stronger than a prompt.
+///
+/// The single source of truth for "may this provider judge an artifact it could
+/// otherwise edit?", shared by workflow validation so the two cannot drift.
+pub(super) fn reviewer_read_only_is_enforced(provider: &str) -> bool {
+    reviewer_thread_settings(provider, "on-request", "workspace-write").2
 }
 
 fn reviewer_failure_message(outcome: &WaitOutcome) -> &'static str {
@@ -2544,4 +2642,47 @@ pub(super) fn random_suffix() -> String {
         .map(char::from)
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod reviewer_settings_tests {
+    use super::reviewer_thread_settings;
+
+    /// A reviewer must never be handed the parent's write-capable settings just
+    /// because its provider wasn't recognized. The parent is typically running
+    /// `bypass` + `workspace-write`, so falling through hands the reviewer full
+    /// write access to the artifact it was asked to judge.
+    #[test]
+    fn an_unrecognized_provider_is_not_given_the_parents_write_access() {
+        let (approval, _sandbox, enforced) =
+            reviewer_thread_settings("some-future-agent", "bypass", "workspace-write");
+        assert_ne!(
+            approval, "bypass",
+            "an unknown reviewer must not inherit an auto-approve policy"
+        );
+        assert!(!enforced, "an unknown provider cannot claim hard read-only");
+    }
+
+    #[test]
+    fn cursor_reviews_read_only_and_does_not_claim_a_hard_sandbox() {
+        let (approval, _sandbox, enforced) =
+            reviewer_thread_settings("cursor", "bypass", "workspace-write");
+        // `review_read_only` is what the ACP bridge maps onto `plan` mode.
+        assert_eq!(approval, "review_read_only");
+        // Cursor's plan mode is prompt/tool-level containment, not OS isolation.
+        assert!(
+            !enforced,
+            "ACP modes are not a sandbox; claiming enforcement would let a \
+             cursor reviewer be accepted where a hard read-only one is required"
+        );
+    }
+
+    #[test]
+    fn codex_remains_the_enforced_case_and_claude_the_unenforced_one() {
+        assert_eq!(
+            reviewer_thread_settings("codex", "bypass", "workspace-write"),
+            ("never".to_string(), "read-only".to_string(), true)
+        );
+        assert!(!reviewer_thread_settings("claude_code", "bypass", "workspace-write").2);
+    }
 }

@@ -2,15 +2,33 @@ import React from "react";
 import { ClientLog } from "../shared/client-log.js";
 import { ConversationComposer } from "../shared/composer.js";
 import { RefreshButton } from "../shared/refresh-button.js";
-import { StartSessionDialog } from "../shared/start-session-dialog.js";
 import { ThemePickerRow } from "../shared/theme-picker.js";
-import { BELL_SVG, PLUS_SVG, CHEVRON_RIGHT_SVG, SEARCH_SVG, SETTINGS_SVG, X_SVG } from "../svg.js";
+import { SidebarBrand, SidebarCollapseToggle, SidebarResizeHandle } from "../shared/sidebar-chrome.js";
+import { ConversationHeader, ConversationHeadingBody } from "../shared/conversation-header.js";
+// The back arrow, the compose mark and the left-panel toggle moved into
+// shared/conversation-header.js with the header markup that used them; only the right-rail
+// toggle is still drawn here, because the rail is not part of the shared header.
+import { ToggleRightPanelIcon } from "../shared/panel-icons.js";
+import {
+  CHEVRON_RIGHT_SVG,
+  SETTINGS_SVG,
+} from "../svg.js";
 
 const h = React.createElement;
 
-// Far-left 64px icon rail: brand logo (top) and a Settings gear (bottom). The
-// rail lives OUTSIDE the .app-shell grid (in .local-frame) so the grid math is
-// untouched. The gear is wired imperatively in app.js by id (#icon-rail-settings).
+// Far-left 64px icon rail: brand logo (top), the same two destinations SidebarNav
+// offers, and a Settings gear (bottom). The rail lives OUTSIDE the .app-shell grid
+// (in .local-frame) so the grid math is untouched.
+//
+// The two destinations are no longer written out here. They are the SAME list the
+// sidebar rows render, mounted from `shared/sidebar-nav.js` as `SidebarNavRail` —
+// which is what stops the rail and the rows drifting. It shipped with a Tasks
+// button and no Sessions button for exactly as long as the two were separate
+// pieces of markup, so a user who collapsed the panel on the Task screen had no
+// way back to their sessions.
+//
+// The gear stays imperative (wired in app.js by id): it is not a destination, it
+// opens a modal.
 function IconRail() {
   return h(
     "nav",
@@ -22,6 +40,10 @@ function IconRail() {
       width: 30,
       height: 30,
     }),
+    // `display: contents`, so the two buttons rendered in here stay flex children
+    // of `.icon-rail` itself — the rail's `gap`, `align-items` and the spacer's
+    // `flex: 1` all depend on that.
+    h("div", { className: "icon-rail-nav-mount", id: "icon-rail-nav" }),
     h("div", { className: "icon-rail-spacer" }),
     h(
       "button",
@@ -45,7 +67,7 @@ function iconNode(svgMarkup, extraClass = "") {
   });
 }
 
-function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
+function Sidebar() {
   return h(
     "aside",
     // No `data-thread-view`: it gated the primary action on the Sessions/Projects
@@ -55,76 +77,49 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
     h(
       "div",
       { className: "sidebar-top-bar" },
-      h(
-        "button",
-        {
-          "aria-label": "Hide navigation panel",
-          className: "header-button header-panel-toggle sidebar-top-toggle",
-          id: "sidebar-top-toggle",
-          title: "Hide navigation panel (⌘B)",
-          type: "button",
-        },
-        h(ToggleLeftPanelIcon)
-      ),
-      // The seal sits in the lockup, not in the icon rail. The rail is only up
-      // while the sidebar is collapsed, so leaving the brand there would mean the
-      // app has no mark at all in its normal, expanded state. Matches how the
-      // remote shell has always built this row. `alt` is empty because the
-      // wordmark beside it already names the app.
-      h(
-        "div",
-        { className: "sidebar-brand" },
-        h("img", {
-          className: "sidebar-brand-logo",
-          src: "/static/sealwire_logo.png",
-          alt: "",
-          width: 24,
-          height: 24,
-        }),
-        h("span", { className: "sidebar-brand-name" }, "Sealwire")
-      ),
-      // Trailing actions. Search is a RELAY query, not a filter over the loaded rows —
-      // the list is truncated to the newest 120, so the session worth searching for is
-      // usually not in it. Wired imperatively in app.js by id.
-      h(
-        "div",
-        { className: "sidebar-top-actions" },
-        h(
-          "button",
-          {
-            className: "header-button sidebar-search-toggle",
-            id: "sidebar-search-toggle",
-            type: "button",
-            title: "Search sessions (⌘F)",
-            "aria-label": "Search sessions",
-            "aria-expanded": "false",
-          },
-          iconNode(SEARCH_SVG)
-        ),
-        h(
-          "button",
-          {
-            className: "header-button sidebar-bell-toggle",
-            id: "sidebar-bell-toggle",
-            type: "button",
-            title: "Filter by activity",
-            "aria-label": "Filter by activity",
-            // A toggle, not a disclosure: it re-groups the list in place and there is
-            // no popover under it to expand.
-            "aria-pressed": "false",
-          },
-          iconNode(BELL_SVG)
-        )
-      )
+      h(SidebarCollapseToggle, { id: "sidebar-top-toggle" }),
+      // Byte-for-byte identical to remote's, so it is now literally the same
+      // component. It takes no props, which is why it can render HERE rather than
+      // into a mount: this file renders exactly once, and a propless component has
+      // nothing to miss out on.
+      h(SidebarBrand),
+      // Trailing actions — the search and bell toggles. A mount rather than markup,
+      // because both of them report state (`is-active`, `aria-expanded`,
+      // `aria-pressed`) that app.js used to write onto them by hand.
+      //
+      // The div IS the mount: local's action row holds nothing but these two, so
+      // there is no wrapper to make layout-transparent. Remote's row also carries the
+      // Project switcher, which is why the row itself is not the shared thing.
+      h("div", { className: "sidebar-top-actions", id: "sidebar-top-actions" })
     ),
-    h(SessionSearch),
+    // The search field. Search is a RELAY query, not a filter over the loaded rows —
+    // the list is truncated to the newest 120, so the session worth searching for is
+    // usually not in it.
+    //
+    // This mount is the point of the whole exercise. The field used to be static
+    // markup here, permanently mounted and toggled with `hidden`, because app.js
+    // reached three ids inside it. It is now ABSENT when closed, which is what
+    // remote always did — the two implementations of one control have become one.
+    h("div", { className: "sidebar-search-mount", id: "sidebar-search-mount" }),
     // No state pills under the bell: turning it on re-groups the list by state, and
     // those bucket headers already say everything a pill row could.
     h(AuthForm),
     // No Sessions/Projects toggle: selecting a project PINS it to the top of a list
     // that stays complete, so there was never a second mode to be in. The Project
     // switcher in the header is the whole control.
-    h(LaunchPanel, { launchModel, onLaunchFieldChange, onLaunchStart }),
+    // Mount point, not markup: the rows come from `shared/sidebar-nav.js` and are
+    // rendered by render-session with the current destination and the waiting-task
+    // count as props. `display: contents`, so `.sidebar-nav` stays a direct flex
+    // child of the sidebar column and keeps its own margins.
+    h("div", { className: "sidebar-nav-mount", id: "sidebar-nav" }),
+    h(LaunchPanel),
+    // The Task list, in the sidebar. Filled by renderSidebarTaskList(); CSS-gated
+    // to the Tasks view, which also hides the launch panel and the thread drawer
+    // below — one sidebar, two mutually exclusive bodies.
+    h("div", { className: "sidebar-task-list", id: "sidebar-task-list" }),
+    // Teams library list (13a). Same slot pattern as the task list — CSS shows
+    // one or the other based on data-view.
+    h("div", { className: "sidebar-teams-list", id: "sidebar-teams-list" }),
     h(ThreadDrawer),
     h(ThreadContextMenu),
     h(ProjectContextMenu),
@@ -151,46 +146,22 @@ function Sidebar({ launchModel = null, onLaunchFieldChange = null, onLaunchStart
         iconNode(SETTINGS_SVG)
       )
     ),
-    h("div", {
-      className: "sidebar-resize",
-      id: "sidebar-resize",
-      role: "separator",
-      "aria-orientation": "vertical",
-      "aria-label": "Resize navigation panel",
-      tabIndex: 0,
-    })
+    // Same handle remote renders. The id stays local's, because app.js finds it by id
+    // to attach the drag maths.
+    h(SidebarResizeHandle, { id: "sidebar-resize" })
   );
 }
 
-// The search field. Always mounted and toggled with `hidden`, per the shell's rule that
-// nothing holding a `dom.js` handle may be conditionally rendered away.
-function SessionSearch() {
-  return h(
-    "div",
-    { className: "sidebar-search", id: "sidebar-search", hidden: true },
-    iconNode(SEARCH_SVG, "sidebar-search-glyph"),
-    h("input", {
-      autoComplete: "off",
-      className: "sidebar-search-input",
-      id: "sidebar-search-input",
-      placeholder: "Search session titles",
-      spellCheck: false,
-      type: "search",
-      "aria-label": "Search session titles",
-    }),
-    h(
-      "button",
-      {
-        className: "sidebar-search-clear",
-        id: "sidebar-search-clear",
-        type: "button",
-        title: "Clear search",
-        "aria-label": "Clear search",
-      },
-      iconNode(X_SVG)
-    )
-  );
-}
+/*
+ * `SessionSearch` used to be here: the search field as static markup, always
+ * mounted, `hidden: true`.
+ *
+ * It is now `SidebarSearchField` in `shared/sidebar-chrome.js`, rendered into
+ * `#sidebar-search-mount` and ABSENT when closed. This was the one control in the
+ * repo whose two implementations were incompatible in kind rather than in detail —
+ * remote rendered it conditionally, local could not, because three ids inside it had
+ * to resolve for app.js. Retiring those ids is what made one component possible.
+ */
 
 function AuthForm() {
   return h(
@@ -211,59 +182,42 @@ function AuthForm() {
   );
 }
 
-function LaunchPanel({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
-  const m = launchModel || {};
+// A mount, not the control. The split button's right half lists the AVAILABLE agents,
+// which this file cannot know: the provider catalogue is fetched after boot into
+// `state.providers`, and this shell renders exactly once (see the note above ThreadDrawer),
+// so a prop would be frozen empty forever. app.js owns the root and re-renders it, the
+// same arrangement the session tab strip already uses.
+function LaunchPanel() {
   return h(
     "section",
     { className: "launch-panel" },
-    h(
-      "div",
-      { className: "launch-actions" },
-      h(
-        "button",
-        {
-          className: "start-session-button",
-          id: "open-start-session-dialog",
-          onClick: () => document.getElementById("launch-start-session-dialog")?.setAttribute("open", ""),
-          type: "button",
-        },
-        iconNode(PLUS_SVG),
-        h("span", null, "New session")
-      )
-    ),
+    h("div", { className: "launch-actions", id: "start-session-split-mount" })
   );
 }
 
-function LaunchStartSessionDialog({ launchModel, onLaunchFieldChange }) {
-  const m = launchModel || {};
-  return h(StartSessionDialog, {
-    id: "launch-start-session-dialog",
-    cwd: m.fields?.cwd || "",
-    fields: m.fields || {},
-    onFieldChange: onLaunchFieldChange || (() => {}),
-    // StartSessionDialog auto-closes itself on Start click; the actual API
-    // call fires from app.js via the #start-session-button document listener.
-    onStart: null,
-    startPending: false,
-    providerOptions: m.providerOptions || [],
-    models: m.models || [],
-    approvalOptions: m.approvalOptions || [],
-    effortOptions: m.effortOptions || [],
-    workspaceInputId: "cwd-input",
-    suggestionsListId: "workspace-suggestions",
-    startButtonId: "start-session-button",
-    initialPromptAttachmentsId: "start-prompt-attachments",
-    labels: {
-      initialPromptPlaceholder: "Optional first task. Paste an image to attach it.",
-    },
-    settingsPrefix: "",
-    directoryFormId: "directory-form",
-    loadButtonId: "load-directory-button",
-    // Claude supports deferred start — the relay accepts no initial prompt
-    // and promotes the session on the first composer message.
-    requireInitialPrompt: false,
-  });
-}
+
+/*
+ * The sidebar's two destinations used to be written out here, as `SidebarNav`.
+ *
+ * They now live in `shared/sidebar-nav.js`, rendered into `#sidebar-nav` (and
+ * `#icon-rail-nav`) by render-session, with `current` and the waiting-task count
+ * passed as props. The reasoning that shaped them is preserved there; the two
+ * points worth keeping in view from the shell side:
+ *
+ *   Sessions used to be the implicit background state and Tasks a lone button
+ *   below the launch panel, which made them read as different kinds of thing —
+ *   one a place, one an action. They are both places, named at the same level.
+ *
+ *   Rows rather than a two-up segmented control, because a segment strip is sized
+ *   by its member count: a third destination would force a redesign, where a row
+ *   just joins the stack.
+ *
+ * Why they left the shell: this file renders EXACTLY ONCE (see local-app.js), so
+ * anything living here can never take a prop that changes. A nav has to know which
+ * destination you are on, and that was previously smuggled in through CSS on
+ * `[data-view]` plus an imperative `aria-current` write — two sources of truth for
+ * one fact. A mount point plus a prop is one.
+ */
 
 function ThreadDrawer() {
   return h(
@@ -275,8 +229,10 @@ function ThreadDrawer() {
       h(
         "div",
         null,
-        h("p", { className: "sidebar-caption" }, "Sessions"),
-        h("p", { className: "sidebar-hint", id: "threads-count" }, "Loading workspace groups...")
+        // No "Sessions" caption here any more — the nav row directly above names
+        // this view, and saying it twice was the clearest symptom of the old
+        // arrangement. The count carries the label's job now.
+        h("p", { className: "sidebar-caption", id: "threads-count" }, "Loading workspace groups...")
       ),
       h(RefreshButton, { id: "threads-refresh-button", label: "Refresh sessions" })
     ),
@@ -379,134 +335,39 @@ function InfoIcon() {
   );
 }
 
-function BackArrowIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "14",
-      viewBox: "0 0 16 16",
-      width: "14",
-      stroke: "currentColor",
-      strokeWidth: "1.6",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M10 3.5L5.5 8L10 12.5" })
-  );
-}
 
-function ToggleLeftPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "6", y1: "2.5", x2: "6", y2: "13.5" })
-  );
-}
 
-function ToggleRightPanelIcon() {
-  return h(
-    "svg",
-    { "aria-hidden": "true", fill: "none", height: "16", viewBox: "0 0 16 16", width: "16", stroke: "currentColor", strokeWidth: "1.4" },
-    h("rect", { x: "1.5", y: "2.5", width: "13", height: "11", rx: "2" }),
-    h("line", { x1: "10", y1: "2.5", x2: "10", y2: "13.5" })
-  );
-}
 
-function ComposeIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: "16",
-      viewBox: "0 0 16 16",
-      width: "16",
-      stroke: "currentColor",
-      strokeWidth: "1.4",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    h("path", { d: "M2.5 13.5h4l6.5-6.5a1.8 1.8 0 0 0-2.5-2.5L4 11v2.5z" }),
-    h("path", { d: "M10 5.5l2 2" })
-  );
-}
 
 function ChatHeader() {
-  return h(
-    "header",
-    { className: "chat-header" },
-    h(
-      "div",
-      { className: "chat-header-leading" },
-      h(
-        "div",
-        { className: "chat-header-collapsed-actions" },
-        h(
-          "button",
-          {
-            "aria-label": "Show navigation panel",
-            className: "header-button header-panel-toggle header-panel-toggle-left",
-            id: "toggle-left-panel",
-            type: "button",
-            title: "Show navigation panel (⌘B)",
-          },
-          h(ToggleLeftPanelIcon)
-        ),
-        h(
-          "button",
-          {
-            "aria-label": "Start new session",
-            className: "header-button header-compose-button",
-            id: "new-session-compose-button",
-            type: "button",
-            title: "Start new session",
-          },
-          h(ComposeIcon)
-        )
-      ),
-      h(
+  return h(ConversationHeader, {
+    backButtonId: "go-console-home",
+    backLabel: "Back to console",
+    composeButtonId: "new-session-compose-button",
+    leftPanelToggleId: "toggle-left-panel",
+    // No handlers: every button in here is wired by id from app.js, which is what lets
+    // this render once and never take a changing prop.
+    heading: h(ConversationHeadingBody, {
+      // The Project switcher IS the header title — one control answering "where am I",
+      // not a title plus a switcher naming the same thing one row below it. Its own
+      // sub-root, filled by renderProjectSwitcher().
+      titleNode: h("div", { className: "project-switcher-mount", id: "project-switcher-mount" }),
+      infoButton: h(
         "button",
         {
-          className: "header-icon-button chat-heading-back-button",
-          hidden: true,
-          id: "go-console-home",
-          title: "Back to console",
-          "aria-label": "Back to console",
+          "aria-label": "Session details",
+          className: "header-icon-button chat-heading-info-button",
+          id: "open-session-details",
           type: "button",
+          title: "Session details",
         },
-        h(BackArrowIcon)
+        h(InfoIcon)
       ),
-      h(
-        "div",
-        { className: "chat-heading" },
-        h(
-          "div",
-          { className: "chat-heading-title-row" },
-          // The Project switcher IS the header title — one control answering
-          // "where am I", not a title plus a switcher naming the same thing one
-          // row below it. Its own sub-root, filled by renderProjectSwitcher().
-          h("div", { className: "project-switcher-mount", id: "project-switcher-mount" }),
-          h(
-            "button",
-            {
-              "aria-label": "Session details",
-              className: "header-icon-button chat-heading-info-button",
-              id: "open-session-details",
-              type: "button",
-              title: "Session details",
-            },
-            h(InfoIcon)
-          ),
-        ),
-        h("p", { className: "chat-subtitle", id: "workspace-subtitle" })
-      )
-    ),
-    h(
-      "div",
-      { className: "chat-header-actions" },
+      subtitleNode: h("p", { className: "chat-subtitle", id: "workspace-subtitle" }),
+    }),
+    actions: h(
+      React.Fragment,
+      null,
       h("span", {
         className: "model-badge-compact",
         hidden: true,
@@ -514,7 +375,7 @@ function ChatHeader() {
       }),
       h("span", { className: "status-badge", id: "status-badge" }, "Idle"),
       // Mobile-only Settings entry: the icon rail (which holds the gear) is hidden
-      // ≤960px, so this keeps Providers/Devices/Log/Appearance reachable in every
+      // <=960px, so this keeps Providers/Devices/Log/Appearance reachable in every
       // view (the header is always present, even in conversation where the sidebar
       // collapses). Hidden on desktop via CSS.
       h(
@@ -528,23 +389,6 @@ function ChatHeader() {
         },
         iconNode(SETTINGS_SVG)
       ),
-      // Shown only when the title is naming a PROJECT (see header-labels.js): starting
-      // an agent into a project is the action that belongs to one. render-session.js
-      // owns the hidden flag and the project id. Lives in the header actions — beside
-      // the panel toggle — rather than inline with the title, so it reads as an action
-      // and lines up with the other header controls.
-      h(
-        "button",
-        {
-          className: "header-new-agent-button",
-          hidden: true,
-          id: "header-new-agent",
-          type: "button",
-          title: "Start an agent in this project",
-        },
-        iconNode(PLUS_SVG),
-        h("span", null, "New agent")
-      ),
       h(
         "button",
         {
@@ -552,12 +396,12 @@ function ChatHeader() {
           className: "header-button header-panel-toggle header-panel-toggle-right",
           id: "toggle-right-panel",
           type: "button",
-          title: "Toggle side panel (⌥⌘B)",
+          title: "Toggle side panel (\u2325\u2318B)",
         },
         h(ToggleRightPanelIcon)
       )
-    )
-  );
+    ),
+  });
 }
 
 function OverviewStrip() {
@@ -719,6 +563,17 @@ function ChatShell() {
     // Projects "card overview" main-area view. Filled by renderProjectOverview();
     // shown only when data-view="project-overview" (CSS-gated like console/conversation).
     h("section", { className: "project-overview-mount", id: "project-overview" }),
+    // The Task screen. Filled by renderTaskTeam(); shown only when
+    // data-view="tasks", which hides every sibling above and below it.
+    h("section", { className: "task-team-mount", id: "task-team" }),
+    // Teams library (13a). Same full-area pattern as Tasks / Usage.
+    h("section", { className: "teams-library-mount", id: "teams-library" }),
+    // The full-screen merge review (15a). Same full-area pattern again — it is a
+    // screen, not a wider panel inside task detail, which is what the columns in
+    // the mockup require.
+    h("section", { className: "review-screen-mount", id: "review-screen" }),
+    // The Usage report. Same full-area pattern as Tasks.
+    h("section", { className: "usage-report-mount", id: "usage-report" }),
     h(ConsoleGrid),
     h("div", { className: "pending-action-banner", id: "pending-action-banner", hidden: true }),
     h(
@@ -1020,7 +875,9 @@ function PairingApprovalModal() {
   );
 }
 
-export function LocalShell({ launchModel = null, onLaunchFieldChange = null, onLaunchStart = null }) {
+// The shell renders once, at boot, and never again. Anything data-driven lives
+// in its own sub-root (see the mount points below) rather than taking props here.
+export function LocalShell() {
   return h(
     React.Fragment,
     null,
@@ -1031,12 +888,17 @@ export function LocalShell({ launchModel = null, onLaunchFieldChange = null, onL
       h(
         "div",
         { className: "app-shell app-shell-with-rail", "data-view": "console" },
-        h(Sidebar, { launchModel, onLaunchFieldChange, onLaunchStart }),
+        h(Sidebar),
         h(ChatShell),
         h(WorkspaceChangesRail)
       )
     ),
-    h(LaunchStartSessionDialog, { launchModel, onLaunchFieldChange }),
+    // Filled by renderLaunchSessionDialog() through its own React sub-root: this
+    // shell renders exactly once, and a controlled dialog must re-render.
+    h("div", { className: "launch-dialog-mount", id: "launch-dialog-root" }),
+    // Filled by renderStartTaskDialog() through its own React sub-root — the shell
+    // renders once, so anything data-driven needs one.
+    h("div", { className: "start-task-dialog-mount", id: "start-task-dialog-mount" }),
     h(SessionDetailsModal),
     h(WorkspaceDiffModal),
     h(SettingsModal),

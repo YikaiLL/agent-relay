@@ -55,13 +55,19 @@ function trigger(host) {
   return host.querySelector(".project-switcher-trigger");
 }
 
+// A row's textContent now concatenates label, subtitle and tick; the action rows
+// are still plain text buttons.
+function optionLabel(node) {
+  return node.querySelector(".project-switcher-option-label")?.textContent ?? node.textContent;
+}
+
 function options(host) {
-  return [...host.querySelectorAll(".project-switcher-option")].map((node) => node.textContent);
+  return [...host.querySelectorAll(".project-switcher-option")].map(optionLabel);
 }
 
 function clickOption(host, label) {
   const node = [...host.querySelectorAll(".project-switcher-option")].find(
-    (candidate) => candidate.textContent === label
+    (candidate) => optionLabel(candidate) === label
   );
   assert.ok(node, `no option labelled "${label}"`);
   act(() => {
@@ -144,7 +150,8 @@ test("the current selection is marked so the menu says where you already are", (
   const view = mount({ activeProjectId: "proj_docs" });
   open(view.host);
   const active = view.host.querySelector(".project-switcher-option.is-active");
-  assert.equal(active?.textContent, "Docs");
+  assert.equal(optionLabel(active), "Docs");
+  assert.equal(active.getAttribute("aria-checked"), "true", "and says so to a screen reader");
   view.cleanup();
 });
 
@@ -184,11 +191,9 @@ test("Escape closes the menu without letting the key reach the surface behind it
   view.cleanup();
 });
 
-// Remote hosts this control in its SIDEBAR while its chat header already owns an
-// `<h1 id="remote-workspace-title">`. Rendering the heading there would put two page
-// headings on one screen — the same duplication local's header rule exists to
-// prevent, one surface over. So the heading is opt-out, and opting out has to leave
-// a control that still works rather than a stripped one.
+// Remote also hosts this control as a compact SIDEBAR icon. That placement already has
+// surrounding chrome, so it opts out of the heading wrapper while keeping the same menu
+// behavior as the full header switcher.
 test("renderHeading:false drops the heading element and keeps the control whole", () => {
   const view = mount({ activeProjectId: "proj_pay", onCreateProject() {}, renderHeading: false });
 
@@ -323,7 +328,7 @@ test("a stale selection reads as the default workspace in the marking too, not j
 
   open(view.host);
   const active = view.host.querySelector(".project-switcher-option.is-active");
-  assert.equal(active?.textContent, DEFAULT_WORKSPACE_LABEL, "the default is the marked row");
+  assert.equal(optionLabel(active), DEFAULT_WORKSPACE_LABEL, "the default is the marked row");
   view.cleanup();
 });
 

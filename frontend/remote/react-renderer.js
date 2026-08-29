@@ -1,5 +1,6 @@
 import React from "react";
 import { StartSessionDialog } from "../shared/start-session-dialog.js";
+import { ConversationHeadingBody } from "../shared/conversation-header.js";
 export { ConversationComposer as Composer } from "../shared/composer.js";
 export { SessionSettingsFields } from "../shared/session-settings-fields.js";
 import { formatTimestamp, shortId } from "./utils.js";
@@ -10,32 +11,31 @@ function compactStatusLabel(label) {
   const normalized = String(label || "").trim().toLowerCase();
 
   switch (normalized) {
-    case "idle":
-    case "ready":
-      return "Ready";
-    case "connected":
-      return "Connected";
-    case "home":
-      return "Home";
-    case "offline":
-      return "Offline";
-    case "connecting":
-      return "Connecting";
     case "approval required":
       return "Approval";
     case "re-pair required":
       return "Re-pair";
     case "pairing failed":
       return "Failed";
-    case "approval pending":
-      return "Pending";
+    case "review in progress":
+      return "Review";
+    case "review blocked — action needed":
+      return "Review blocked";
+    case "code flow in progress":
+      return "Code Flow";
+    case "code flow blocked — action needed":
+      return "Code Flow blocked";
     default:
       return label
         ? String(label)
             .trim()
             .replace(/\b\w/g, (char) => char.toUpperCase())
-        : "Ready";
+        : "";
   }
+}
+
+function shouldShowHeaderStatusBadge(statusBadge) {
+  return Boolean(statusBadge?.label && statusBadge.headerVisible === true);
 }
 
 function relaySubtitle(relay) {
@@ -70,62 +70,51 @@ function InfoIcon() {
   );
 }
 
-export function WorkspaceHeading({ header, statusBadge, onOpenInfo }) {
-  const statusTone = statusBadge?.tone || "offline";
-  const statusLabel = statusBadge?.label || "Offline";
+export function WorkspaceHeading({ header, statusBadge, onOpenInfo, titleNode = null }) {
   const subtitle = header?.subtitle || "";
+  const showStatus = shouldShowHeaderStatusBadge(statusBadge);
 
-  return h(
-    React.Fragment,
-    null,
-    h(
-      "div",
-      { className: "chat-heading-title-row" },
-      h(
-        "h1",
-        {
-          id: "remote-workspace-title",
-          title: header?.titleTitle || "",
-        },
-        header?.title || "Pair this browser"
-      ),
-      h(
-        "span",
-        {
-          "aria-label": statusLabel,
-          className: `status-badge status-badge-${statusTone} status-badge-compact`,
-          id: "remote-status-badge",
-          title: statusLabel,
-        },
-        compactStatusLabel(statusLabel)
-      ),
-      header?.modelLabel
-        ? h(
-            "span",
-            {
-              className: "model-badge-compact",
-              id: "remote-model-badge",
-              title: header.modelTitle || header.modelLabel,
-            },
-            header.modelLabel
-          )
-        : null,
-      onOpenInfo
-        ? h(
-            "button",
-            {
-              "aria-label": "Session details",
-              className: "header-icon-button chat-heading-info-button",
-              id: "remote-open-session-details",
-              onClick: onOpenInfo,
-              title: "Session details",
-              type: "button",
-            },
-            h(InfoIcon)
-          )
-        : null
-    ),
-    h(
+  // The title row + subtitle structure is shared with local now — this function is down to
+  // deciding WHICH nodes go in the slots, which is the part that is genuinely remote's
+  // (a status badge that can be absent, a pairing-aware fallback title).
+  return h(ConversationHeadingBody, {
+    titleNode: titleNode
+      ? titleNode
+      : h(
+          "h1",
+          {
+            id: "remote-workspace-title",
+            title: header?.titleTitle || "",
+          },
+          header?.title || "Pair this browser"
+        ),
+    statusNode: showStatus
+      ? h(
+          "span",
+          {
+            "aria-label": statusBadge.label,
+            className: `status-badge status-badge-${statusBadge.tone} status-badge-compact`,
+            id: "remote-status-badge",
+            title: statusBadge.label,
+          },
+          compactStatusLabel(statusBadge.label)
+        )
+      : null,
+    infoButton: onOpenInfo
+      ? h(
+          "button",
+          {
+            "aria-label": "Session details",
+            className: "header-icon-button chat-heading-info-button",
+            id: "remote-open-session-details",
+            onClick: onOpenInfo,
+            title: "Session details",
+            type: "button",
+          },
+          h(InfoIcon)
+        )
+      : null,
+    subtitleNode: h(
       "p",
       {
         className: "chat-subtitle",
@@ -134,13 +123,14 @@ export function WorkspaceHeading({ header, statusBadge, onOpenInfo }) {
         title: header?.subtitleTitle || subtitle,
       },
       subtitle
-    )
-  );
+    ),
+  });
 }
 
 export function SessionPanel({
   model,
   onFieldChange = null,
+  onSelectModel = null,
   onStartSession = null,
 }) {
   if (!model.hasRemoteAuth) {
@@ -158,19 +148,31 @@ export function SessionPanel({
 
   return h(StartSessionDialog, {
     id: "remote-start-session-dialog",
-    cwd: model.fields.cwd,
-    onCwdChange: (value) => onFieldChange?.("cwd", value),
+    // `cwd` now travels inside `fields` like every other value, so the dialog has
+    // one shape of input instead of one field plus a special case.
     fields: model.fields,
     onFieldChange,
+    onSelectModel,
     onStart: onStartSession,
     startPending: model.startPending,
     workspaceSuggestions: model.workspaceSuggestions,
-    providerOptions: model.providerOptions,
-    models: model.models,
+    gitContext: model.gitContext,
+    // The merged Model pill needs every provider's catalog, not just the
+    // selected one's. Remote already pre-fetches them all on connect.
+    providers: model.providers,
+    providerModels: model.providerModels,
     modelsStatus: model.modelsStatus,
     approvalOptions: model.approvalOptions,
     effortOptions,
-    settingsPrefix: "remote-launch",
+    projects: model.projects,
+    threads: model.threads,
+    threadProjectId: model.threadProjectId,
+    threadActivity: model.threadActivity,
+    threadAttention: model.threadAttention,
+    threadReviewing: model.threadReviewing,
+    onCreateProject: model.onCreateProject,
+    // Remote passes no attachment mount: a paired device cannot send image
+    // bytes, so the placeholder must not invite a paste.
     // Mirror local: Claude supports deferred start — the relay accepts no
     // initial prompt and promotes the session on the first composer message.
     requireInitialPrompt: false,
@@ -232,15 +234,31 @@ export function DeviceMetaPanel({ model }) {
   );
 }
 
-export function ControlBanner({ model, onTakeOver = null }) {
+export function ControlBanner({ model, onRepairWorkspace = null, onTakeOver = null }) {
   if (model.hidden) {
     return null;
   }
 
+  // `{ label, pending, error, kind, threadId }` when the viewed thread's workspace is
+  // gone — see remote/workspace-repair.js. The banner is one slot, so this and Take over
+  // are mutually exclusive by construction: the model never offers both.
+  const repair = model.repair || null;
+
   return h(
     React.Fragment,
     null,
-    h("span", { className: "control-summary" }, model.summary),
+    h(
+      "span",
+      {
+        className: "control-summary",
+        // The summary carries a recorded cwd shortened from the middle to survive a
+        // phone; this puts the whole path back within reach.
+        title: model.summaryTitle || undefined,
+      },
+      model.summary
+    ),
+    // Stays mounted (hidden) rather than swapped out, so nothing that resolves
+    // `#remote-take-over-button` loses its element when the repair banner takes over.
     h(
       "button",
       {
@@ -251,7 +269,36 @@ export function ControlBanner({ model, onTakeOver = null }) {
         type: "button",
       },
       "Take over"
-    )
+    ),
+    repair
+      ? h(
+        "button",
+        {
+          className: "control-button",
+          disabled: repair.pending,
+          id: "remote-workspace-repair-button",
+          onClick: () => onRepairWorkspace?.(repair.threadId),
+          type: "button",
+        },
+        repair.label
+      )
+      : null,
+    // Which branch comes back with the worktree, or what re-creating a folder buys. Only
+    // the repair banner shows a hint line — the compact bar has no room otherwise.
+    // `flexBasis` inline because the banner's own class has no full-width hint rule.
+    repair
+      ? h(
+        "p",
+        { className: "control-hint", style: { flexBasis: "100%", margin: 0 } },
+        model.hint
+      )
+      : null,
+    // The relay's own failure text, verbatim, on its own line. Swallowing it would put
+    // the user back where this change started: an action that stops working with nothing
+    // on screen to say why.
+    repair?.error
+      ? h("p", { className: "control-banner-error", role: "alert" }, repair.error)
+      : null
   );
 }
 

@@ -1,0 +1,9 @@
+#!/bin/sh
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+guard="$repo_root/scripts/check-no-private.sh"
+if [ -x "$guard" ]; then
+  "$guard"
+fi

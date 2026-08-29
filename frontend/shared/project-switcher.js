@@ -29,6 +29,10 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { DEFAULT_WORKSPACE_LABEL } from "./project-labels.js";
+import { ProjectMenu } from "./project-menu-react.js";
+import { MenuPortal, useAnchoredMenu } from "./use-anchored-menu.js";
+import { useDismissableMenu } from "./use-dismissable-menu.js";
+import { buildProjectPickerRows } from "./project-picker-model.js";
 
 const h = React.createElement;
 
@@ -53,11 +57,16 @@ export function ProjectSwitcher({
   onRenameProject = null,
   onSelectProject = null,
   projects = [],
-  // Whether this control is the PAGE HEADING. True on local, where the switcher
-  // replaced the header title outright. False on remote, whose chat header already
-  // owns `<h1 id="remote-workspace-title">` — rendering a second one there would put
-  // two page headings on one screen, which is the duplication header-labels.js
-  // exists to prevent, one surface over.
+  // Live signals for the rows' second line; all optional.
+  threads = [],
+  threadProjectId = {},
+  threadActivity = null,
+  threadAttention = null,
+  threadReviewing = null,
+  // Whether this control is the PAGE HEADING. True in the local and remote chat
+  // headers, where the switcher replaced the title outright. False for compact
+  // placements such as remote's drawer icon, where surrounding chrome already names
+  // the region and the control should stay a plain button.
   //
   // Defaults to true so the surface that IS a heading does not have to say so.
   renderHeading = true,
@@ -70,40 +79,16 @@ export function ProjectSwitcher({
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef(null);
+  const triggerRef = useRef(null);
+  const menuRef = useRef(null);
   const menuId = useId();
 
   const close = useCallback(() => setOpen(false), []);
 
-  // Dismiss on outside pointer or Escape. Bound only while open, so a closed
-  // switcher costs nothing — there is one of these per surface and it outlives
-  // every render.
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    const onPointerDown = (event) => {
-      if (!rootRef.current?.contains(event.target)) {
-        close();
-      }
-    };
-    // Escape must not bubble: the sidebar search treats a bare Escape as "close
-    // and clear", so letting it through would wipe a query the user never
-    // touched.
-    const onKeyDown = (event) => {
-      if (event.key === "Escape") {
-        event.stopPropagation();
-        close();
-      }
-    };
-
-    document.addEventListener("pointerdown", onPointerDown, true);
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown, true);
-      document.removeEventListener("keydown", onKeyDown, true);
-    };
-  }, [open, close]);
+  // Dismissal and placement both come from the shared hooks: a menu here is the
+  // same kind of object as a picker menu, and used to hand-roll both.
+  useDismissableMenu({ menuRef, onClose: close, open, rootRef });
+  const assignMenuRef = useAnchoredMenu({ menuRef, open, triggerRef });
 
   const activeProject = activeProjectId
     ? projects.find((project) => project.id === activeProjectId) || null
@@ -143,6 +128,7 @@ export function ProjectSwitcher({
         + (triggerIcon && resolvedProjectId ? " is-active" : ""),
       "data-active-project-id": resolvedProjectId || "",
       onClick: () => setOpen((wasOpen) => !wasOpen),
+      ref: triggerRef,
       title: labelTooltip || currentLabel,
       type: "button",
     },
@@ -175,89 +161,43 @@ export function ProjectSwitcher({
     renderHeading
       ? h("h1", { className: "project-switcher-heading" }, triggerButton)
       : triggerButton,
-    open
-      ? h(
-          "div",
-          { className: "project-switcher-menu", id: menuId, role: "menu" },
-          h(
-            "button",
-            {
-              className:
-                "project-switcher-option"
-                + (resolvedProjectId ? "" : " is-active"),
-              onClick: () => choose(null),
-              role: "menuitem",
-              type: "button",
-            },
-            DEFAULT_WORKSPACE_LABEL
-          ),
-          projects.map((project) =>
-            h(
-              "button",
-              {
-                className:
-                  "project-switcher-option"
-                  + (project.id === resolvedProjectId ? " is-active" : ""),
-                "data-project-id": project.id,
-                key: project.id,
-                onClick: () => choose(project.id),
-                role: "menuitem",
-                type: "button",
-              },
-              project.name || project.id
-            )
-          ),
-          onCreateProject
-            ? h(
-                "button",
-                {
-                  className: "project-switcher-option project-switcher-create",
-                  onClick: () => {
-                    close();
-                    onCreateProject();
-                  },
-                  role: "menuitem",
-                  type: "button",
-                },
-                createLabel
-              )
+    h(
+      MenuPortal,
+      { anchorRef: triggerRef, open },
+      h(ProjectMenu, {
+          activeProject,
+          createLabel,
+          id: menuId,
+          menuRef: assignMenuRef,
+          onCreateProject: onCreateProject
+            ? () => {
+                close();
+                onCreateProject();
+              }
             : null,
-          // Destructive pair last and behind their own divider, never mixed into the
-          // list of places you can navigate to. Only for the ACTIVE project: the menu
-          // names many projects but can only act on the one you are in, and a rename
-          // that silently applied to a different row would be unrecoverable.
-          activeProject && onRenameProject
-            ? h(
-                "button",
-                {
-                  className: "project-switcher-option project-switcher-manage",
-                  onClick: () => {
-                    close();
-                    onRenameProject(activeProject.id, activeProject.name || activeProject.id);
-                  },
-                  role: "menuitem",
-                  type: "button",
-                },
-                "Rename project"
-              )
+          onDeleteProject: onDeleteProject
+            ? (projectId, name) => {
+                close();
+                onDeleteProject(projectId, name);
+              }
             : null,
-          activeProject && onDeleteProject
-            ? h(
-                "button",
-                {
-                  className:
-                    "project-switcher-option project-switcher-manage project-switcher-danger",
-                  onClick: () => {
-                    close();
-                    onDeleteProject(activeProject.id, activeProject.name || activeProject.id);
-                  },
-                  role: "menuitem",
-                  type: "button",
-                },
-                "Delete project"
-              )
-            : null
-        )
-      : null
+          onRenameProject: onRenameProject
+            ? (projectId, name) => {
+                close();
+                onRenameProject(projectId, name);
+              }
+            : null,
+          onSelect: choose,
+          rows: buildProjectPickerRows({
+            activeProjectId: resolvedProjectId,
+            projects,
+            threadActivity,
+            threadAttention,
+            threadProjectId,
+            threadReviewing,
+            threads,
+          }),
+        })
+    )
   );
 }

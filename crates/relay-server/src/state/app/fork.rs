@@ -69,7 +69,7 @@ impl AppState {
         let up_to_item_id =
             normalize_fork_point(&source_data.transcript, requested_fork_point.as_deref());
 
-        let source_settings = {
+        let (source_settings, source_project_id) = {
             let relay = self.relay.read().await;
             // Re-check under the lock we will act on: the provider read above
             // is a multi-second await during which another paired device can
@@ -89,7 +89,22 @@ impl AppState {
             {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
             }
-            relay.remembered_thread_settings(&source_thread_id)
+            (
+                relay.remembered_thread_settings(&source_thread_id),
+                // A dangling membership resolves to None, so the fork lands
+                // Unassigned rather than re-creating a deleted project.
+                relay
+                    .project_for_thread(&source_thread_id)
+                    .map(|project| project.id.clone()),
+            )
+        };
+
+        // Three states (see ForkSessionInput). Deliberately NOT `non_empty`, which
+        // collapses `Some("")` into `None` and would silently re-inherit.
+        let target_project_id = match input.project_id {
+            Some(explicit) if explicit.is_empty() => None,
+            Some(explicit) => Some(explicit),
+            None => source_project_id,
         };
 
         let target_provider_requested = non_empty(input.provider);
@@ -186,6 +201,7 @@ impl AppState {
                         &effort,
                         &device_id,
                         &source_thread_id,
+                        target_project_id.as_deref(),
                         user_prompt,
                         images,
                     )
@@ -217,6 +233,7 @@ impl AppState {
             &sandbox,
             &effort,
             &device_id,
+            target_project_id.as_deref(),
             replay_prompt,
             images,
         )
@@ -235,6 +252,7 @@ impl AppState {
         effort: &str,
         device_id: &str,
         source_thread_id: &str,
+        project_id: Option<&str>,
         user_prompt: Option<String>,
         images: Vec<ProviderImage>,
     ) -> Result<SessionSnapshot, String> {
@@ -255,6 +273,15 @@ impl AppState {
                 device_id,
             );
             relay.set_thread_forked_from(&forked_thread_id, source_thread_id);
+            if let Some(project_id) = project_id {
+                if super::projects::attach_new_thread_to_project(
+                    &mut relay,
+                    &forked_thread_id,
+                    project_id,
+                ) {
+                    relay.bump_projects_revision();
+                }
+            }
             relay.push_log(
                 "info",
                 format!(
@@ -300,6 +327,7 @@ impl AppState {
         sandbox: &str,
         effort: &str,
         device_id: &str,
+        project_id: Option<&str>,
         replay_prompt: String,
         images: Vec<ProviderImage>,
     ) -> Result<SessionSnapshot, String> {
@@ -310,7 +338,10 @@ impl AppState {
         // provider consume the prompt at creation would strand the images.
         let initial_prompt = images.is_empty().then_some(replay_prompt.as_str());
         let start_result = target_bridge
-            .start_thread(cwd, model, approval_policy, sandbox, initial_prompt)
+            .start_thread(
+                StartThreadRequest::new(cwd, model, approval_policy, sandbox)
+                    .with_initial_prompt(initial_prompt),
+            )
             .await?;
         let consumed_initial_prompt = start_result.consumed_initial_prompt;
         let started_thread_id = start_result.thread.id.clone();
@@ -358,6 +389,15 @@ impl AppState {
                 }
             }
             relay.set_thread_forked_from(&started_thread_id, source_thread_id);
+            if let Some(project_id) = project_id {
+                if super::projects::attach_new_thread_to_project(
+                    &mut relay,
+                    &started_thread_id,
+                    project_id,
+                ) {
+                    relay.bump_projects_revision();
+                }
+            }
             relay.push_log(
                 "info",
                 format!(
@@ -690,6 +730,7 @@ mod tests {
     fn source_with_transcript(transcript: Vec<TranscriptEntryView>) -> ThreadSyncData {
         ThreadSyncData {
             thread: crate::protocol::ThreadSummaryView {
+                workspace_trusted: false,
                 id: "source-thread".to_string(),
                 name: Some("Source".to_string()),
                 preview: String::new(),

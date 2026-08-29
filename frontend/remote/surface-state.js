@@ -6,6 +6,7 @@ import {
   createClearedTranscriptHydrationPatch as createSharedClearedTranscriptHydrationPatch,
 } from "../shared/transcript-hydration-store.js";
 import { resetRemoteProjectsStore } from "./projects-host.js";
+import { resetRemoteWorkspaceCounts } from "./workspace-diff-host.js";
 import { EMPTY_THREAD_SEARCH } from "../shared/thread-search.js";
 
 export function applyRemoteSurfacePatch(patch) {
@@ -53,6 +54,9 @@ export function createResetRemoteSurfaceStatePatch({
   // A different relay may advertise an equal projects_revision — forget fetched
   // Projects so the next syncToRevision refetches unconditionally.
   resetRemoteProjectsStore();
+  // Counts are cached by path, which only identifies a directory while the relay is the
+  // same machine — another host would inherit this one's numbers.
+  resetRemoteWorkspaceCounts();
   return createClearedRemoteSurfaceSessionStatePatch();
 }
 
@@ -71,6 +75,7 @@ export function createRemoteThreadSearchPatch(threadSearch) {
 export function createPairingStatePatch({
   pairingError,
   pairingPhase,
+  pairingRetired,
   pairingTicket,
 }) {
   const patch = {};
@@ -79,6 +84,9 @@ export function createPairingStatePatch({
   }
   if (pairingPhase !== undefined) {
     patch.pairingPhase = pairingPhase;
+  }
+  if (pairingRetired !== undefined) {
+    patch.pairingRetired = pairingRetired;
   }
   if (pairingTicket !== undefined) {
     patch.pairingTicket = pairingTicket;

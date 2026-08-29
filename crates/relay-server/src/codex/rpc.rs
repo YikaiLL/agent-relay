@@ -257,6 +257,11 @@ async fn handle_server_request_for_provider(
             );
         }
         relay.add_pending_approval(pending.clone());
+        if let Some(cwd) = pending.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            if !pending.thread_id.is_empty() {
+                relay.observe_thread_cwd(&pending.thread_id, cwd);
+            }
+        }
         if matches!(route, ThreadRoute::Active) {
             relay.touch_progress(Some("waiting_approval"), None);
         }
@@ -305,6 +310,9 @@ async fn handle_notification_for_provider(
                 changed = true;
             }
         }
+        "thread/settings/updated" => {
+            observe_notification_cwd(&mut relay, notification_thread_id.as_deref(), &params);
+        }
         "thread/status/changed" => {
             let thread_id = string_at(&params, &["threadId"]).unwrap_or_default();
             if thread_id.is_empty() {
@@ -322,6 +330,51 @@ async fn handle_notification_for_provider(
                 );
             }
             changed = true;
+        }
+        // Codex reports usage on every model request. This arm did not exist,
+        // so the notification fell through the match and the relay's entire
+        // token history was discarded as it arrived.
+        //
+        // Routed like any other thread notification: every team seat is
+        // background-started, so a version that only handled the active thread
+        // would silently drop exactly the spend a task run is made of.
+        "thread/tokenUsage/updated" => {
+            let route = thread_route(&relay, notification_thread_id.as_deref(), provider_key);
+            let thread_id = match &route {
+                ThreadRoute::Drop => {
+                    log_ignored_session_notification(
+                        method,
+                        notification_thread_id.as_deref(),
+                        &relay,
+                    );
+                    return;
+                }
+                ThreadRoute::Background(bg_thread_id) => bg_thread_id.clone(),
+                ThreadRoute::Active => relay.active_thread_id.clone().unwrap_or_default(),
+            };
+            if let Some(observation) = relay.codex_usage.observe(&params) {
+                // The tracker keys its baselines off the id Codex sent, which is
+                // the same id the route resolved except when the active thread
+                // is implied. Bill against the resolved one.
+                relay.record_token_usage(
+                    &thread_id,
+                    observation.turn_id,
+                    provider_key,
+                    observation.usage,
+                    // Codex reports no cost. Leaving this `None` is what keeps
+                    // an unpriced group from rendering as a confident $0.00.
+                    None,
+                    observation.context_window,
+                    None,
+                    // Not knowable here: Codex reports usage per model request
+                    // and the turn's outcome later, on `turn/completed`. That
+                    // arm stamps failure retroactively via `mark_turn_failed`.
+                    false,
+                );
+            }
+            // Deliberately no `changed = true`: usage is not part of the
+            // snapshot, so notifying every connected surface for it would wake
+            // a snapshot build per model request for a number they cannot see.
         }
         "turn/started" => {
             let route = thread_route(&relay, notification_thread_id.as_deref(), provider_key);
@@ -378,6 +431,13 @@ async fn handle_notification_for_provider(
                     if let Some(reason) =
                         value_at(&params, &["turn"]).and_then(codex_turn_failure_reason)
                     {
+                        // The usage rows for this turn were written before the
+                        // outcome was known — Codex reports spend per request
+                        // and failure only here. Stamp them now, so retry waste
+                        // is not silently a Claude-only figure.
+                        if let Some(turn) = completed_turn.as_deref() {
+                            relay.usage_store.mark_turn_failed(turn);
+                        }
                         // Operator log keeps the RAW provider message when present
                         // (never rides remote snapshots).
                         if let Some(raw) =
@@ -439,6 +499,13 @@ async fn handle_notification_for_provider(
                     if let Some(reason) =
                         value_at(&params, &["turn"]).and_then(codex_turn_failure_reason)
                     {
+                        // The usage rows for this turn were written before the
+                        // outcome was known — Codex reports spend per request
+                        // and failure only here. Stamp them now, so retry waste
+                        // is not silently a Claude-only figure.
+                        if let Some(turn) = completed_turn.as_deref() {
+                            relay.usage_store.mark_turn_failed(turn);
+                        }
                         // Operator log keeps the RAW provider message when present
                         // (never rides remote snapshots).
                         if let Some(raw) =
@@ -554,6 +621,11 @@ async fn handle_notification_for_provider(
                 ) {
                     let status = string_at(&params, &["item", "status"])
                         .unwrap_or_else(|| "running".to_string());
+                    observe_notification_cwd(
+                        &mut relay,
+                        notification_thread_id.as_deref(),
+                        &params,
+                    );
                     if let ThreadRoute::Background(bg_thread_id) = route {
                         relay.bg_start_command_execution(
                             &bg_thread_id,
@@ -755,6 +827,11 @@ async fn handle_notification_for_provider(
                     let output = string_at(&params, &["item", "aggregatedOutput"]);
                     let status = string_at(&params, &["item", "status"])
                         .unwrap_or_else(|| "completed".to_string());
+                    observe_notification_cwd(
+                        &mut relay,
+                        notification_thread_id.as_deref(),
+                        &params,
+                    );
                     if let ThreadRoute::Background(bg_thread_id) = route {
                         relay.bg_add_command_result(
                             &bg_thread_id,
@@ -912,6 +989,27 @@ fn notification_thread_id(params: &Value) -> Option<String> {
         .or_else(|| string_at(params, &["item", "threadId"]))
 }
 
+fn observe_notification_cwd(relay: &mut RelayState, thread_id: Option<&str>, params: &Value) {
+    let Some(thread_id) = thread_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let settings_cwd = string_at(params, &["threadSettings", "cwd"]);
+    let cwd = string_at(params, &["item", "cwd"])
+        .or_else(|| string_at(params, &["cwd"]))
+        .or_else(|| settings_cwd.clone());
+    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return;
+    };
+    // Configured session cwd is restated on every settings update (model, sandbox).
+    // Restating birth is not "went home" and must not wipe a command-proven worktree.
+    if settings_cwd.as_deref() == Some(cwd.as_str()) {
+        if relay.thread_cwd(thread_id).as_deref() == Some(cwd.as_str()) {
+            return;
+        }
+    }
+    relay.observe_thread_cwd(thread_id, &cwd);
+}
+
 fn is_session_notification_method(method: &str) -> bool {
     matches!(
         method,
@@ -992,6 +1090,7 @@ mod disconnect_tests {
             SecurityProfile::private(),
         );
         let summary = ThreadSummaryView {
+            workspace_trusted: false,
             id: "codex-thread".to_string(),
             name: None,
             preview: String::new(),

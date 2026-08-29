@@ -13,12 +13,14 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { DEFAULT_WORKSPACE_LABEL } from "../frontend/local/header-labels.js";
+import { DEFAULT_WORKSPACE_LABEL } from "../frontend/shared/header-labels.js";
 import { prepareSeededCodexHome } from "./e2e-codex-home.mjs";
 import { launchBrowser } from "./e2e/harness/browser.mjs";
+import { openSessionsDrawer } from "./e2e/harness/drawer.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import { dumpProcessLogs, stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
+import { projectSwitcherOption } from "./e2e/harness/project-switcher.mjs";
 
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
 
@@ -53,16 +55,9 @@ async function waitForMembership(relayPort, threadId, expectedProjectId) {
 }
 
 // The sessions/projects list lives in a collapsed <details> drawer off the
-// conversation view — open it so its rows are laid out.
-async function openDrawer(page) {
-  await page.evaluate(() => {
-    const drawer = document.querySelector(".sidebar-drawer");
-    if (drawer && !drawer.open) {
-      drawer.open = true;
-      drawer.dispatchEvent(new Event("toggle"));
-    }
-  });
-}
+// conversation view — open it so its rows are laid out. Shared, because opening it
+// by assigning `.open` races the store that owns the flag; see the harness note.
+const openDrawer = (page) => openSessionsDrawer(page, { timeoutMs: TIMEOUT_MS });
 
 const projectNames = (page) =>
   page.evaluate(() =>
@@ -204,10 +199,7 @@ async function selectProjectInSwitcher(page, name) {
     await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
   }
   await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
-  await page
-    .locator(".project-switcher-option", { hasText: new RegExp(`^${name}$`) })
-    .first()
-    .click({ timeout: TIMEOUT_MS });
+  await projectSwitcherOption(page, name).click({ timeout: TIMEOUT_MS });
   await page.waitForFunction(
     (n) => [...document.querySelectorAll("#threads-list .thread-group-header-project .thread-group-name")]
       .some((r) => r.textContent.trim() === n),
@@ -226,10 +218,7 @@ async function selectDefaultWorkspaceInSwitcher(page) {
     await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
   }
   await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
-  await page
-    .locator(".project-switcher-option", { hasText: /^Default Workspace$/ })
-    .first()
-    .click({ timeout: TIMEOUT_MS });
+  await projectSwitcherOption(page, "Default Workspace").click({ timeout: TIMEOUT_MS });
   await page.waitForFunction(
     () => !document.querySelector("#threads-list .thread-group-header-project"),
     undefined,

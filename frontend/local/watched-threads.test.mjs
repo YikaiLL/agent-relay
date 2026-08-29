@@ -217,3 +217,31 @@ test("the connection generation rides along with the declaration", async () => {
 
   assert.equal(calls[0].body.surface_generation, 1730000000000);
 });
+
+// The bug this pins: the Tasks screen draws the Orchestrator conversation, but
+// the watch set only ever named the viewed session thread — so the relay never
+// streamed the Orchestrator's deltas here. Its text arrived only on the next
+// full snapshot, in chunks, and (local snapshots cap the transcript) truncated.
+// It reads as "the Orchestrator has no streaming". `viewThreadId` is not
+// cleared when you open Tasks, so this is not rescued by the active-thread
+// fallback either.
+test("a thread drawn beside the conversation is watched too", () => {
+  const ids = watchedThreadIds(
+    { active_thread_id: "thread-1" },
+    "thread-1",
+    ["orch-1"]
+  );
+
+  assert.deepEqual(ids, ["orch-1", "thread-1"]);
+});
+
+test("the extra thread is watched even when nothing else is", () => {
+  assert.deepEqual(watchedThreadIds(null, null, ["orch-1"]), ["orch-1"]);
+});
+
+test("extras are deduped and blanks ignored, so the key stays stable", () => {
+  assert.deepEqual(
+    watchedThreadIds({ active_thread_id: "orch-1" }, null, ["orch-1", "", null, "orch-1"]),
+    ["orch-1"]
+  );
+});

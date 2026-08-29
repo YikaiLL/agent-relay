@@ -82,6 +82,39 @@ statuses aren't misread as busy:\n  {line}",
     }
 }
 
+#[cfg(test)]
+mod workspace_resolve_lock_lint {
+    #[test]
+    fn resolve_write_lock_does_not_touch_the_filesystem() {
+        let src = include_str!("thread_workspace.rs");
+        let marker = "String-only persist: path identity was decided outside this lock.";
+        let start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing write-lock marker in thread_workspace.rs"));
+        let block = &src[start..];
+        let end = block
+            .find("\n        };")
+            .or_else(|| block.find("\n        }"))
+            .expect("write-lock block should close");
+        let locked = &block[..end];
+        for needle in [
+            "paths_equivalent",
+            "root_containing_writes",
+            "normalize_cwd",
+            "canonicalize",
+            // Admission reads `.git` from disk AND takes the relay read lock to copy the
+            // grants: called from inside the write lock it would deadlock outright, not
+            // merely stall. Decide standing before taking the lock.
+            "admit",
+        ] {
+            assert!(
+                !locked.contains(needle),
+                "resolve_thread_workspace holds the relay write lock while calling {needle}"
+            );
+        }
+    }
+}
+
 /// Shared provider-double contract: a thread keeps the cwd it was created with, and
 /// provider operations that drive it fail once that directory has been removed.
 fn require_live_test_cwd(
@@ -101,12 +134,72 @@ fn require_live_test_cwd(
 #[cfg(test)]
 mod workspace_diff_tests {
     use super::super::{
-        apply_unified_diff, collect_workspace_diff, synthesize_untracked_diff,
-        truncate_to_char_boundary,
+        apply_unified_diff, collect_workspace_diff, collect_workspace_diff_against,
+        merge_base_with, synthesize_untracked_diff, truncate_to_char_boundary, TrustedWorkspace,
     };
     use crate::protocol::FileChangeApplyDirection;
     use tempfile::TempDir;
     use tokio::process::Command;
+
+    /// Minimal relay whose only interesting state is the grant list: measuring counts
+    /// now asks it whether the repository was trusted.
+    async fn app_trusting(paths: &[String]) -> crate::state::app::AppState {
+        let (change_tx, _rx) = tokio::sync::watch::channel(0_u64);
+        let relay = std::sync::Arc::new(tokio::sync::RwLock::new(crate::state::RelayState::new(
+            paths.first().cloned().unwrap_or_default(),
+            change_tx.clone(),
+            crate::state::security::SecurityProfile::private(),
+        )));
+        relay.write().await.trusted_workspaces = paths.to_vec();
+        crate::state::app::AppState::from_parts(relay, std::collections::HashMap::new(), change_tx)
+    }
+
+    /// The same statement `granted_for_test` makes about one directory, in the form the
+    /// git helpers take: a fixture this test built is a fixture it may run git in.
+    fn grants_for(paths: &[&str]) -> crate::state::app::TrustGrants {
+        crate::state::app::TrustGrants::new(paths.iter().map(|path| path.to_string()))
+    }
+
+    // The rule, both directions. A linked worktree shares the main tree's `.git/config`,
+    // which is the only place an executable `filter.<driver>` can live — so granting the
+    // repository grants its worktrees. Granting NOTHING measures nothing, because
+    // counting means running `git status` in a tree the operator never vouched for.
+    #[tokio::test]
+    async fn a_grant_on_the_main_tree_covers_its_linked_worktrees() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let linked = root.join("wt");
+        run(Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "feature"])
+            .arg(&linked)
+            .current_dir(&root))
+        .await;
+        std::fs::write(linked.join("only-here.txt"), "x\n").expect("write");
+
+        let workspace =
+            TrustedWorkspace::granted_for_test(root.to_str().unwrap()).expect("workspace");
+        let ungranted = app_trusting(&[]).await;
+        let mut roots = super::super::list_worktrees_in(&workspace).await;
+        super::super::measure_root_changes(&ungranted, &mut roots).await;
+        assert!(
+            roots.iter().all(|root| root.changed_files.is_none()),
+            "an ungranted repository must not be walked at all"
+        );
+
+        // Only the MAIN tree is granted.
+        let granted = app_trusting(&[root.to_string_lossy().to_string()]).await;
+        let mut roots = super::super::list_worktrees_in(&workspace).await;
+        super::super::measure_root_changes(&granted, &mut roots).await;
+        let linked_root = roots
+            .iter()
+            .find(|entry| !entry.is_main)
+            .expect("the linked worktree");
+        assert_eq!(
+            linked_root.changed_files,
+            Some(1),
+            "the worktree inherits the repository's grant"
+        );
+    }
 
     async fn run(cmd: &mut Command) {
         let output = cmd.output().await.expect("git command should run");
@@ -142,6 +235,354 @@ mod workspace_diff_tests {
             .current_dir(&path))
         .await;
         dir
+    }
+
+    #[tokio::test]
+    async fn the_mr_diff_uses_the_merge_base_so_target_only_commits_are_excluded() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+
+        // Fork a task branch and land a commit on it.
+        let task_dir = root.join("task-wt");
+        run(Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--no-track",
+                "-b",
+                "task/x",
+                task_dir.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&root))
+        .await;
+        std::fs::write(task_dir.join("task.txt"), "task work\n").unwrap();
+        run(Command::new("git")
+            .args(["add", "task.txt"])
+            .current_dir(&task_dir))
+        .await;
+        run(Command::new("git")
+            .args(["commit", "-q", "-m", "task work"])
+            .current_dir(&task_dir))
+        .await;
+
+        // Meanwhile the target moves on. THIS is the commit a two-dot
+        // `git diff main` would report reversed, as if the task had deleted it.
+        std::fs::write(root.join("main-only.txt"), "landed on main\n").unwrap();
+        run(Command::new("git")
+            .args(["add", "main-only.txt"])
+            .current_dir(&root))
+        .await;
+        run(Command::new("git")
+            .args(["commit", "-q", "-m", "main moves on"])
+            .current_dir(&root))
+        .await;
+
+        // And the team still has work in flight.
+        std::fs::write(task_dir.join("wip.txt"), "not committed yet\n").unwrap();
+
+        let workspace =
+            TrustedWorkspace::granted_for_test(task_dir.to_str().unwrap()).expect("workspace");
+        let base = merge_base_with(&workspace, "main")
+            .await
+            .expect("merge base should resolve");
+        let diff = collect_workspace_diff_against(&workspace, Some(&base))
+            .await
+            .expect("diff");
+
+        let paths: Vec<&str> = diff
+            .file_changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"task.txt"),
+            "committed task work belongs in the MR view, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"wip.txt"),
+            "a mid-run MR view must be honest about uncommitted work, got {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"main-only.txt"),
+            "a commit that landed on the target AFTER the fork is not this task's change, got {paths:?}"
+        );
+        assert_eq!(diff.base_commit.as_deref(), Some(base.as_str()));
+    }
+
+    #[tokio::test]
+    async fn omitting_a_base_keeps_the_existing_head_behaviour() {
+        // Regression guard for the refactor: the default path must still be
+        // "working tree vs HEAD", byte for byte.
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("seed.txt"), "line1\nline2\nline3\n").unwrap();
+
+        let workspace =
+            TrustedWorkspace::granted_for_test(root.to_str().unwrap()).expect("workspace");
+        let against_head = collect_workspace_diff_against(&workspace, None)
+            .await
+            .expect("diff");
+        let legacy = collect_workspace_diff(
+            root.to_str().unwrap(),
+            &grants_for(&[root.to_str().unwrap()]),
+        )
+        .await
+        .expect("diff");
+
+        assert_eq!(against_head.diff, legacy.diff);
+        assert_eq!(
+            against_head.file_changes.len(),
+            legacy.file_changes.len(),
+            "the default path must be unchanged"
+        );
+        assert!(
+            against_head.base_commit.is_none(),
+            "no base means the plain working-tree-vs-HEAD view, with nothing to label"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_merge_base_is_none_rather_than_an_error() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let workspace =
+            TrustedWorkspace::granted_for_test(root.to_str().unwrap()).expect("workspace");
+
+        assert!(
+            merge_base_with(&workspace, "no-such-branch")
+                .await
+                .is_none(),
+            "a missing target degrades to None so the caller can fall back to HEAD"
+        );
+    }
+
+    // `list_worktrees_in` runs twice per panel refresh, so measuring there would cost a
+    // subprocess per tree per turn for numbers only the open picker displays.
+    #[tokio::test]
+    async fn enumerating_roots_does_not_measure_their_changes() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("dirty.txt"), "x\n").expect("write");
+        let workspace =
+            TrustedWorkspace::granted_for_test(root.to_str().unwrap()).expect("workspace");
+
+        let roots = super::super::list_worktrees_in(&workspace).await;
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].changed_files, None,
+            "a tree with a real change still reports no count until someone asks"
+        );
+        assert!(!roots[0].changed_files_capped);
+    }
+
+    #[tokio::test]
+    async fn measuring_roots_counts_each_tree_separately() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        // Outside the repo: nested, it shows in the main tree's own status as an
+        // untracked directory — the fixture lying rather than the code being wrong.
+        let sibling = TempDir::new().expect("tmpdir");
+        let linked = sibling
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("linked");
+        run(Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "feature"])
+            .arg(&linked)
+            .current_dir(&root))
+        .await;
+        // Only the linked tree is touched, so a shared or leaked count would show up
+        // as the main tree reporting changes it does not have.
+        std::fs::write(linked.join("a.txt"), "one\n").expect("write");
+        std::fs::write(linked.join("b.txt"), "two\n").expect("write");
+
+        let workspace =
+            TrustedWorkspace::granted_for_test(root.to_str().unwrap()).expect("workspace");
+        let mut roots = super::super::list_worktrees_in(&workspace).await;
+        // Grant the MAIN tree only: the linked tree must be measured too, because a
+        // worktree shares the repository config that trust is really about.
+        let app = app_trusting(&[root.to_string_lossy().to_string()]).await;
+        super::super::measure_root_changes(&app, &mut roots).await;
+
+        let main_root = roots
+            .iter()
+            .find(|root| root.is_main)
+            .expect("the main worktree");
+        let linked_root = roots
+            .iter()
+            .find(|root| !root.is_main)
+            .expect("the linked worktree");
+
+        assert_eq!(
+            main_root.changed_files,
+            Some(0),
+            "the untouched tree is clean; the linked tree's changes must not leak into it"
+        );
+        assert_eq!(linked_root.changed_files, Some(2));
+        assert!(!linked_root.changed_files_capped);
+    }
+
+    // Inspecting a repository must not break the agent working in it. Racing six probes
+    // against six `git add`s: 4 failures in 72 without the flag, 0 with it.
+    #[test]
+    fn relay_git_probes_do_not_take_optional_locks() {
+        use std::ffi::OsStr;
+
+        let dir = TempDir::new().expect("tmp");
+        let workspace = TrustedWorkspace::granted_for_test(&dir.path().to_string_lossy())
+            .expect("live workspace");
+
+        let command = super::super::background_git(&workspace);
+        let disabled = command.as_std().get_envs().any(|(key, value)| {
+            key == OsStr::new("GIT_OPTIONAL_LOCKS") && value == Some(OsStr::new("0"))
+        });
+
+        assert!(
+            disabled,
+            "every relay-initiated git command must decline optional locking"
+        );
+    }
+
+    // A future probe spelled `Command::new("git")` directly would work, pass review, and
+    // silently restore the hazard. Checked at the source: no runtime seam can see it.
+    #[test]
+    fn no_relay_git_probe_bypasses_background_git() {
+        // `apply_unified_diff_in` is the deliberate exception: a WRITE made on the
+        // user's behalf, which must take its locks.
+        const ALLOWED: &[&str] = &["background_git", "apply_unified_diff_in"];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/state/app");
+        let mut offenders = Vec::new();
+        let mut checked = 0_usize;
+
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("app sources should be readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                // These are test modules; their fixtures may spawn git however they like.
+                if matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("tests.rs" | "team_mechanism_tests.rs")
+                ) {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("source should be readable");
+                // Anchored on the module BLOCK: `#[cfg(test)]` also marks test-only
+                // struct fields partway up `mod.rs`, which once emptied this scan.
+                let production = match source.find("\nmod tests {") {
+                    Some(at) => &source[..at],
+                    None => &source[..],
+                };
+
+                for (offset, _) in production.match_indices("Command::new(\"git\")") {
+                    checked += 1;
+                    // Names beat counting: a refactor that moves code should not fail
+                    // this, and a new probe should.
+                    let owner = production[..offset]
+                        .rmatch_indices("fn ")
+                        .next()
+                        .map(|(at, _)| {
+                            production[at + 3..]
+                                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .next()
+                                .unwrap_or("")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    if !ALLOWED.contains(&owner.as_str()) {
+                        offenders.push(format!("{}: fn {owner}", path.display()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked >= ALLOWED.len(),
+            "the scan found {checked} git spawns, so it is no longer looking where it thinks"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these spawn git without `background_git`, so they take optional locks and can \
+break the agent's own git commands: {offenders:?}"
+        );
+    }
+
+    // `buffered` bounds ONE request; every concurrent one starts its own eight probes,
+    // and obsolete replies are dropped without cancelling the requests behind them.
+    #[tokio::test]
+    async fn measuring_waits_for_a_relay_wide_permit() {
+        let dir = init_repo().await;
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("dirty.txt"), "x\n").expect("write");
+        let mut roots = vec![crate::state::app::WorkspaceRootView {
+            path: root.to_string_lossy().to_string(),
+            branch: Some("main".to_string()),
+            is_main: true,
+            changed_files: None,
+            changed_files_capped: false,
+        }];
+        let grants = grants_for(&[roots[0].path.as_str()]);
+
+        // A private pool so this test cannot stall the relay-wide one other tests share.
+        let permits = tokio::sync::Semaphore::new(1);
+        let held = permits.acquire().await.expect("permit");
+
+        // One-sided, so not load-sensitive: the call can only finish by acquiring the
+        // held permit, and load makes it slower rather than faster.
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            super::super::measure_root_changes_with(&mut roots, &permits, &grants),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "with the pool exhausted no probe may spawn; got {roots:?}"
+        );
+        // The timing-free half of the same claim: it queued rather than helping itself.
+        assert_eq!(permits.available_permits(), 0);
+        assert_eq!(roots[0].changed_files, None, "and nothing was written");
+
+        drop(held);
+        super::super::measure_root_changes_with(&mut roots, &permits, &grants).await;
+        assert_eq!(
+            roots[0].changed_files,
+            Some(1),
+            "and once a permit frees up the measurement proceeds normally"
+        );
+    }
+
+    // `None` and `Some(0)` render differently and must not be confused: `Some(0)` says
+    // "clean", which is a claim, while `None` says nothing.
+    #[tokio::test]
+    async fn a_root_that_cannot_be_measured_stays_unmeasured_rather_than_clean() {
+        let dir = TempDir::new().expect("tmp");
+        let missing = dir.path().join("gone");
+        let mut roots = vec![crate::state::app::WorkspaceRootView {
+            path: missing.to_string_lossy().to_string(),
+            branch: Some("feature".to_string()),
+            is_main: false,
+            changed_files: None,
+            changed_files_capped: false,
+        }];
+
+        let app = app_trusting(&[roots[0].path.clone()]).await;
+        super::super::measure_root_changes(&app, &mut roots).await;
+
+        assert_eq!(
+            roots[0].changed_files, None,
+            "a directory that is not there must never report as clean"
+        );
     }
 
     #[test]
@@ -290,18 +731,28 @@ branch refs/heads/alive
                     -line2\n\
                     +LINE2\n";
 
-        apply_unified_diff(&cwd, diff, FileChangeApplyDirection::Rollback)
-            .await
-            .expect("rollback must succeed");
+        apply_unified_diff(
+            &cwd,
+            diff,
+            FileChangeApplyDirection::Rollback,
+            &grants_for(&[cwd.as_str()]),
+        )
+        .await
+        .expect("rollback must succeed");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "line1\nline2\n",
             "Undo must actually revert the file, not just report success"
         );
 
-        apply_unified_diff(&cwd, diff, FileChangeApplyDirection::Reapply)
-            .await
-            .expect("reapply must succeed");
+        apply_unified_diff(
+            &cwd,
+            diff,
+            FileChangeApplyDirection::Reapply,
+            &grants_for(&[cwd.as_str()]),
+        )
+        .await
+        .expect("reapply must succeed");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "line1\nLINE2\n",
@@ -339,7 +790,13 @@ branch refs/heads/alive
                     .to_string(),
             ),
         ] {
-            let result = apply_unified_diff(&cwd, &diff, FileChangeApplyDirection::Rollback).await;
+            let result = apply_unified_diff(
+                &cwd,
+                &diff,
+                FileChangeApplyDirection::Rollback,
+                &grants_for(&[cwd.as_str()]),
+            )
+            .await;
             assert!(
                 result.is_err(),
                 "{label}: git cannot apply this, so it must report an error"
@@ -406,7 +863,8 @@ branch refs/heads/alive
     #[tokio::test]
     async fn collect_returns_not_a_git_repo_outside_git() {
         let dir = TempDir::new().unwrap();
-        let response = collect_workspace_diff(&dir.path().to_string_lossy())
+        let cwd = dir.path().to_string_lossy().to_string();
+        let response = collect_workspace_diff(&cwd, &grants_for(&[cwd.as_str()]))
             .await
             .unwrap();
         assert!(response.not_a_git_repo);
@@ -417,7 +875,8 @@ branch refs/heads/alive
     async fn collect_shows_tracked_modification() {
         let dir = init_repo().await;
         std::fs::write(dir.path().join("seed.txt"), "line1\nLINE2\n").unwrap();
-        let response = collect_workspace_diff(&dir.path().to_string_lossy())
+        let cwd = dir.path().to_string_lossy().to_string();
+        let response = collect_workspace_diff(&cwd, &grants_for(&[cwd.as_str()]))
             .await
             .unwrap();
         assert!(!response.not_a_git_repo);
@@ -433,7 +892,8 @@ branch refs/heads/alive
     async fn collect_includes_untracked_files_as_adds() {
         let dir = init_repo().await;
         std::fs::write(dir.path().join("fresh.txt"), "hello\nworld\n").unwrap();
-        let response = collect_workspace_diff(&dir.path().to_string_lossy())
+        let cwd = dir.path().to_string_lossy().to_string();
+        let response = collect_workspace_diff(&cwd, &grants_for(&[cwd.as_str()]))
             .await
             .unwrap();
         let fresh = response
@@ -449,7 +909,8 @@ branch refs/heads/alive
     #[tokio::test]
     async fn collect_clean_tree_returns_no_changes() {
         let dir = init_repo().await;
-        let response = collect_workspace_diff(&dir.path().to_string_lossy())
+        let cwd = dir.path().to_string_lossy().to_string();
+        let response = collect_workspace_diff(&cwd, &grants_for(&[cwd.as_str()]))
             .await
             .unwrap();
         assert!(!response.not_a_git_repo);
@@ -458,7 +919,7 @@ branch refs/heads/alive
 }
 
 #[cfg(test)]
-mod path_scope_tests {
+pub(crate) mod path_scope_tests {
     use super::super::threads::MAX_THREAD_NAME_CHARS;
     use super::super::*;
     use super::require_live_test_cwd;
@@ -483,7 +944,20 @@ mod path_scope_tests {
     use tempfile::TempDir;
     use tokio::sync::{watch, Mutex, RwLock};
 
-    async fn build_app(cwd: &str) -> (AppState, TempDir, TempDir) {
+    pub(crate) async fn build_app(cwd: &str) -> (AppState, TempDir, TempDir) {
+        let (app, _bridge, project, outside) = build_app_with_bridge(cwd).await;
+        (app, project, outside)
+    }
+
+    /// `build_app`, also handing back the fake bridge.
+    ///
+    /// Some tests have to configure the double itself — a check-then-act race
+    /// needs `start_thread` to actually take time, because a provider that
+    /// answers without yielding lets concurrent callers take turns and the
+    /// window never opens.
+    pub(crate) async fn build_app_with_bridge(
+        cwd: &str,
+    ) -> (AppState, Arc<FakeProviderBridge>, TempDir, TempDir) {
         let project = TempDir::new().expect("project tempdir");
         let outside = TempDir::new().expect("outside tempdir");
         let (change_tx, _) = watch::channel(0_u64);
@@ -492,16 +966,63 @@ mod path_scope_tests {
             change_tx.clone(),
             SecurityProfile::private(),
         )));
-        let bridge = FakeProviderBridge::spawn(relay.clone())
-            .await
-            .expect("fake provider should spawn");
+        let bridge = Arc::new(
+            FakeProviderBridge::spawn(relay.clone())
+                .await
+                .expect("fake provider should spawn"),
+        );
         let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
-        providers.insert("fake".to_string(), Arc::new(bridge));
+        providers.insert(
+            "fake".to_string(),
+            Arc::clone(&bridge) as Arc<dyn ProviderBridge>,
+        );
         (
             AppState::from_parts(relay, providers, change_tx),
+            bridge,
             project,
             outside,
         )
+    }
+
+    /// Vouch for a workspace this fixture built, the way an operator vouches for their
+    /// own project.
+    ///
+    /// Newly required: reading a repository RUNS git — enumerating worktrees is
+    /// `git worktree list`, and a diff is `git diff` — so `admit` refuses a directory
+    /// nobody granted, and an ungranted fixture reports no roots and no diff. That is the
+    /// intended production behaviour, so the fixture is what has to say which trees it
+    /// owns.
+    ///
+    /// Grant the MAIN tree, not a worktree: trust is per-repository, so the main tree's
+    /// grant is what its linked worktrees inherit. Tests whose point is a refusal
+    /// deliberately do not call this.
+    async fn grant_workspace(app: &AppState, path: &str) {
+        app.relay
+            .write()
+            .await
+            .trusted_workspaces
+            .push(path.to_string());
+    }
+
+    /// The resolved workspace for a thread, as the local operator surface asks for it.
+    async fn resolve(app: &AppState, thread_id: &str) -> crate::protocol::ResolvedWorkspace {
+        app.resolve_thread_workspace(thread_id, None)
+            .await
+            .unwrap_or_else(|error| panic!("{thread_id} should resolve: {}", error.into_message()))
+    }
+
+    /// Pin (`Some`) or un-pin (`None`) a thread's working tree as the local operator.
+    async fn pin(
+        app: &AppState,
+        thread_id: &str,
+        cwd: Option<&str>,
+    ) -> Result<crate::protocol::ResolvedWorkspace, String> {
+        app.pin_thread_workspace(ThreadWorkspaceInput {
+            thread_id: thread_id.to_string(),
+            cwd: cwd.map(str::to_string),
+            device_id: None,
+        })
+        .await
     }
 
     // Part A: the interactive diff must follow the *viewed* session's workspace,
@@ -511,10 +1032,27 @@ mod path_scope_tests {
     async fn workspace_diff_follows_viewed_thread_not_active() {
         let cwd_a_dir = TempDir::new().expect("cwd a");
         let cwd_b_dir = TempDir::new().expect("cwd b");
-        let cwd_a = cwd_a_dir.path().to_string_lossy().to_string();
-        let cwd_b = cwd_b_dir.path().to_string_lossy().to_string();
+        // Canonicalized for the same reason `init_repo` is: a granted workspace now
+        // reports the path `normalize_cwd` resolved (macOS `/var` → `/private/var`), so an
+        // un-resolved fixture path would compare unequal to the very directory it named.
+        let cwd_a = cwd_a_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize a")
+            .to_string_lossy()
+            .to_string();
+        let cwd_b = cwd_b_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize b")
+            .to_string_lossy()
+            .to_string();
 
         let (app, _project, _outside) = build_app(&cwd_a).await;
+        // Granted: both, because the point is WHICH workspace gets diffed, and an
+        // ungranted one answers `unavailable` for a reason this test is not about.
+        grant_workspace(&app, &cwd_a).await;
+        grant_workspace(&app, &cwd_b).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -525,7 +1063,7 @@ mod path_scope_tests {
         // Absent selector → the global/active workspace (legacy back-compat).
         let expected_global = { app.relay.read().await.current_cwd.clone() };
         let global = app
-            .workspace_diff(None, None, None, false)
+            .workspace_diff(None, None, None)
             .await
             .expect("global diff");
         assert_eq!(global.cwd, expected_global);
@@ -534,7 +1072,7 @@ mod path_scope_tests {
 
         // Viewing thread-b returns B's workspace even though A is active — the fix.
         let viewed_b = app
-            .workspace_diff(None, Some("thread-b".to_string()), None, false)
+            .workspace_diff(None, Some("thread-b".to_string()), None)
             .await
             .expect("viewed-b diff");
         assert_eq!(
@@ -545,7 +1083,7 @@ mod path_scope_tests {
 
         // Viewing thread-a returns A's workspace.
         let viewed_a = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("viewed-a diff");
         assert_eq!(viewed_a.cwd, cwd_a);
@@ -566,7 +1104,7 @@ mod path_scope_tests {
         }
 
         let ghost = app
-            .workspace_diff(None, Some("does-not-exist".to_string()), None, false)
+            .workspace_diff(None, Some("does-not-exist".to_string()), None)
             .await
             .expect("unresolvable selector returns unavailable, not an error");
         assert!(
@@ -578,6 +1116,280 @@ mod path_scope_tests {
             "fail-closed must NOT leak the active workspace's cwd"
         );
         assert!(ghost.file_changes.is_empty());
+    }
+
+    // THE bypass. `workspace_git_context` (the launch/fork dialog probe) consults the
+    // trust set before it spawns anything — but `resolve_thread_workspace` reaches the
+    // SAME `collect_git_context`, including its `git status`, with no check at all. That
+    // path is passive: the sidebar chip re-resolves on every session-updated event, so
+    // merely having a session pointed at a directory runs that directory's code.
+    //
+    // The payload is `filter.<driver>.clean`, not `core.fsmonitor`: the driver name comes
+    // out of the repo's own `.gitattributes`, so no `-c` can pre-empt a name we cannot
+    // know, and `UNTRUSTED_REPO_FLAGS` does not cover it. Answering "is this tree dirty"
+    // has to convert worktree content, which is what runs the filter.
+    //
+    // Unix-only: the payload is a shell command. A mitigation that merely made `git` fail
+    // would satisfy a marker-only assertion, so the answer is checked too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolving_a_thread_workspace_does_not_execute_an_ungranted_repo() {
+        async fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git should run");
+            assert!(out.status.success(), "git {} failed", args.join(" "));
+        }
+
+        let relay_dir = TempDir::new().expect("relay cwd");
+        let hostile_dir = TempDir::new().expect("hostile repo");
+        let hostile = hostile_dir.path().canonicalize().expect("canonicalize");
+        git(&hostile, &["init", "-q", "-b", "main"]).await;
+        git(&hostile, &["config", "user.email", "test@example.com"]).await;
+        git(&hostile, &["config", "user.name", "Test"]).await;
+        std::fs::write(hostile.join("seed.txt"), "line1\n").expect("seed");
+        git(&hostile, &["add", "seed.txt"]).await;
+        git(&hostile, &["commit", "-q", "-m", "seed"]).await;
+
+        // Exactly what an extracted archive or a freshly cloned repo would carry.
+        let marker = hostile.join("EXECUTED");
+        std::fs::write(hostile.join(".gitattributes"), "* filter=whatever\n").expect("attrs");
+        let config = hostile.join(".git").join("config");
+        let existing = std::fs::read_to_string(&config).expect("read config");
+        std::fs::write(
+            &config,
+            format!(
+                "{existing}[filter \"whatever\"]\n\tclean = touch {m}; cat\n",
+                m = marker.display()
+            ),
+        )
+        .expect("write config");
+        // Stale mtime with UNCHANGED content is what forces git to compare contents. A
+        // size change would let it answer "modified" from stat alone, never reach the
+        // filter, and let this test pass while proving nothing.
+        let aged = tokio::process::Command::new("touch")
+            .args(["-m", "-t", "202001010000"])
+            .arg(hostile.join("seed.txt"))
+            .status()
+            .await
+            .expect("touch should run");
+        assert!(aged.success(), "touch failed");
+
+        // A different relay cwd and no allowed roots: this directory was never granted.
+        // A session merely POINTS at it, which is not the same as vouching for it.
+        let (app, _project, _outside) = build_app(&relay_dir.path().to_string_lossy()).await;
+        let hostile_cwd = hostile.to_string_lossy().to_string();
+        seed_thread_cwd(&app, "thread-hostile", &hostile_cwd).await;
+
+        let resolved = resolve(&app, "thread-hostile").await;
+
+        assert!(
+            !marker.exists(),
+            "resolving a thread's workspace executed a command from an ungranted repo's \
+             own config; the sidebar chip is a passive probe and must read, never run"
+        );
+        // The chip must still be USEFUL without git, or the fix is just a regression:
+        // reading `.git/HEAD` costs no subprocess and still names the repo and branch.
+        assert!(
+            resolved.git.is_repo,
+            "reading HEAD must still identify the repo"
+        );
+        assert_eq!(
+            resolved.git.branch.as_deref(),
+            Some("main"),
+            "reading HEAD must still name the branch"
+        );
+        assert!(
+            !resolved.git.dirty_known,
+            "an ungranted repo must not be reported as clean; `dirty` is the one field \
+             that genuinely needs git"
+        );
+        assert!(
+            resolved.git.restricted,
+            "withholding dirty without restricted=true hides the Trust affordance"
+        );
+    }
+
+    // Stamping the pill asks the GATE, and `AppState::admit` takes `relay.read()` to copy
+    // the grants — so doing it while `list_threads_matching`'s own `relay.write()` guard is
+    // still alive is an unconditional self-deadlock, not a stall: the exclusive guard is
+    // held by the very task that then waits for a reader.
+    //
+    // Timed rather than left to hang, because that is the difference between a test that
+    // reports a bug and a test that takes the suite down with it. This one hung the whole
+    // `relay-server` run — every test that lists threads, plus the review suite — with no
+    // failure output to say why.
+    #[tokio::test]
+    async fn listing_threads_stamps_trust_without_deadlocking_on_the_relay_lock() {
+        let dir = TempDir::new().expect("tmp");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _project, _outside) = build_app(&cwd).await;
+        seed_thread_cwd(&app, "thread-trust-stamp", &cwd).await;
+        // A row must actually reach the stamping loop, or the per-row `admit` await —
+        // the second place this could hold the lock — never runs. The active-thread
+        // carve-out is the cheapest way to get one listed without a provider session.
+        {
+            let mut relay = app.relay.write().await;
+            relay.threads = vec![ThreadSummaryView {
+                workspace_trusted: false,
+                id: "thread-trust-stamp".to_string(),
+                name: None,
+                preview: String::new(),
+                cwd: cwd.clone(),
+                updated_at: 1,
+                source: "fake".to_string(),
+                status: "idle".to_string(),
+                model_provider: "fake".to_string(),
+                provider: "fake".to_string(),
+                forked_from: None,
+                renamed: false,
+            }];
+            relay.active_thread_id = Some("thread-trust-stamp".to_string());
+        }
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.list_threads(50, None),
+        )
+        .await
+        .expect(
+            "list_threads deadlocked: the trust stamp took the relay read lock while the \
+             function still held the write lock",
+        )
+        .expect("list");
+
+        assert!(
+            listed
+                .threads
+                .iter()
+                .any(|thread| thread.id == "thread-trust-stamp"),
+            "the seeded thread must still be listed once the stamp stops deadlocking"
+        );
+    }
+
+    // The label must mean what it says. `workspace_trusted` renders the "restricted" pill,
+    // and its own doc promises "the relay declines to run git there" — so it is not a
+    // decoration, it is a claim ABOUT THE GATE. Deriving it from a second, independently
+    // written rule is how a chip ends up saying restricted while git runs anyway, which is
+    // the exact defect class this whole change exists to end.
+    //
+    // Pinned as an equivalence rather than as two fixed expectations: whatever the gate
+    // decides, the row must say the same thing. A future change to either one that forgets
+    // the other fails here.
+    #[tokio::test]
+    async fn the_restricted_pill_agrees_with_whether_git_actually_runs() {
+        async fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git should run");
+            assert!(out.status.success(), "git {} failed", args.join(" "));
+        }
+
+        let dir = TempDir::new().expect("tmp");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        git(&repo, &["init", "-q", "-b", "main"]).await;
+        git(&repo, &["config", "user.email", "test@example.com"]).await;
+        git(&repo, &["config", "user.name", "Test"]).await;
+        std::fs::write(repo.join("seed.txt"), "line1\n").expect("seed");
+        git(&repo, &["add", "seed.txt"]).await;
+        git(&repo, &["commit", "-q", "-m", "seed"]).await;
+        // A linked worktree: it runs the MAIN repo's config, so the gate inherits the
+        // grant. An exact-path rule cannot see that, and would mislabel this row.
+        let linked = root.join("linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &linked.to_string_lossy(),
+                "-b",
+                "side",
+            ],
+        )
+        .await;
+
+        let (app, _project, _outside) = build_app(&repo.to_string_lossy()).await;
+        {
+            let mut relay = app.relay.write().await;
+            // Granted: the repository itself.
+            relay
+                .trusted_workspaces
+                .push(repo.to_string_lossy().to_string());
+            // Reachable but NOT vouched for — the fence, which must not read as a grant.
+            relay.allowed_roots = normalize_allowed_roots(vec![root.to_string_lossy().to_string()])
+                .expect("roots should normalize");
+        }
+
+        let ungranted = root.join("elsewhere");
+        std::fs::create_dir_all(&ungranted).expect("mkdir");
+        for (index, cwd) in [
+            repo.to_string_lossy().to_string(),
+            linked.to_string_lossy().to_string(),
+            ungranted.to_string_lossy().to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let thread_id = format!("thread-{index}");
+            seed_thread_cwd(&app, &thread_id, &cwd).await;
+            // A runtime alone is not a listed row: `list_threads` rebuilds from the
+            // providers, and this fixture never starts a session with one. The
+            // active-thread carve-out is what carries a cached row into the response, so
+            // the row has to be cached AND active for the pill to be stamped at all.
+            {
+                let mut relay = app.relay.write().await;
+                relay.threads = vec![ThreadSummaryView {
+                    workspace_trusted: false,
+                    id: thread_id.clone(),
+                    name: None,
+                    preview: String::new(),
+                    cwd: cwd.clone(),
+                    updated_at: 1,
+                    source: "fake".to_string(),
+                    status: "idle".to_string(),
+                    model_provider: "fake".to_string(),
+                    provider: "fake".to_string(),
+                    forked_from: None,
+                    renamed: false,
+                }];
+                relay.active_thread_id = Some(thread_id.clone());
+            }
+
+            let listed = app.list_threads(50, None).await.expect("list");
+            let row = listed
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .unwrap_or_else(|| panic!("{thread_id} should be listed"));
+
+            // What the gate ACTUALLY did: `dirty_known` is set only when git ran.
+            let context = app
+                .workspace_git_context(None, cwd.clone())
+                .await
+                .expect("context");
+
+            assert_eq!(
+                row.workspace_trusted,
+                context.dirty_known,
+                "the pill and the gate disagree about {cwd}: the row says trusted={}, but \
+                 git {} actually run",
+                row.workspace_trusted,
+                if context.dirty_known {
+                    "DID"
+                } else {
+                    "did NOT"
+                }
+            );
+        }
     }
 
     // ---- L1: worktree roots in the diff panel ----------------------------------
@@ -638,14 +1450,15 @@ mod path_scope_tests {
             }
     }
 
-    // L1: the panel must offer every working tree of the viewed session's repo,
-    // so the user can look at a worktree the agent went off and worked in.
+    // L1: the panel must offer every working tree of the viewed session's repo.
     #[tokio::test]
     async fn workspace_diff_enumerates_worktree_roots() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -653,7 +1466,7 @@ mod path_scope_tests {
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
 
@@ -746,6 +1559,8 @@ mod path_scope_tests {
         let (main_cwd, nested_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -764,7 +1579,7 @@ mod path_scope_tests {
         std::fs::remove_dir_all(&nested_cwd).unwrap();
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("a removed worktree must not surface a raw git spawn error");
 
@@ -826,10 +1641,18 @@ mod path_scope_tests {
         // Stands in for "it existed when we resolved it, and was deleted a moment later".
         std::fs::remove_dir_all(&vanishing_cwd).unwrap();
 
-        let (response, fallback_from) =
-            super::super::collect_workspace_diff_resilient(&vanishing_cwd, &main_cwd, &[], &[])
-                .await
-                .expect("a workspace that vanished mid-flight must not surface a git spawn error");
+        // The surviving repo is granted, because the claim under test is that the RETRY
+        // lands there and produces its diff — an ungranted fallback has nothing to retry.
+        let grants = crate::state::app::TrustGrants::new([main_cwd.clone()]);
+        let (response, fallback_from) = super::super::collect_workspace_diff_resilient(
+            &vanishing_cwd,
+            &main_cwd,
+            &[],
+            &[],
+            &grants,
+        )
+        .await
+        .expect("a workspace that vanished mid-flight must not surface a git spawn error");
 
         assert!(
             same_path(&response.cwd, &main_cwd),
@@ -860,10 +1683,15 @@ mod path_scope_tests {
         let orphan_cwd = orphan.to_string_lossy().to_string();
         std::fs::remove_dir_all(&orphan).unwrap();
 
-        let (response, fallback_from) =
-            super::super::collect_workspace_diff_resilient(&orphan_cwd, "", &[], &[])
-                .await
-                .expect("no error, just unavailable");
+        let (response, fallback_from) = super::super::collect_workspace_diff_resilient(
+            &orphan_cwd,
+            "",
+            &[],
+            &[],
+            &crate::state::app::TrustGrants::default(),
+        )
+        .await
+        .expect("no error, just unavailable");
         assert!(response.unavailable);
         assert!(fallback_from.is_none());
     }
@@ -900,7 +1728,7 @@ mod path_scope_tests {
         std::fs::remove_dir_all(&gone_cwd).unwrap();
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("a deleted workspace must not error");
         assert!(
@@ -959,6 +1787,9 @@ got cwd {}",
         .unwrap();
 
         let (app, _project, _outside) = build_app(&other_cwd).await;
+        // Granted: the fallback diff runs git, and one grant on the main tree is what
+        // covers every worktree cut from it.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -967,7 +1798,7 @@ got cwd {}",
         std::fs::remove_dir_all(&gone_cwd).unwrap();
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("a deleted worktree must not error");
         assert!(!response.unavailable);
@@ -1019,7 +1850,6 @@ got {}",
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 None,
-                false,
             )
             .await
             .expect("a removed worktree must not error, even for a scoped device");
@@ -1032,6 +1862,99 @@ got {}",
             "the fallback must not reach outside the device scope"
         );
         assert!(response.fallback_from.is_none());
+    }
+
+    // Substitute must name the vanished tree so UI does not present another tree as the session's.
+    #[tokio::test]
+    async fn a_vanished_birth_tree_resolves_to_a_substitute_that_names_what_is_gone() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, nested_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = nested_cwd.clone();
+        }
+
+        // While it still exists, this is an ordinary birth-tree answer.
+        let before = resolve(&app, "thread-a").await;
+        assert!(same_path(&before.cwd, &nested_cwd));
+        assert!(matches!(before.origin, WorkspaceOrigin::Birth));
+        assert!(before.birth_cwd_exists);
+
+        // Removed WITHOUT `git worktree remove` — what deleting a `.claude/worktrees/<x>`
+        // leaves behind (git keeps listing it, as prunable).
+        std::fs::remove_dir_all(&nested_cwd).unwrap();
+
+        let after = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&after.cwd, &main_cwd),
+            "the substitute must be the repo the worktree lived in; got {}",
+            after.cwd
+        );
+        match &after.origin {
+            WorkspaceOrigin::Substituted { gone } => assert!(
+                same_path(gone, &nested_cwd),
+                "the substitute must name WHICH workspace vanished; got {gone}"
+            ),
+            other => panic!("a vanished birth tree must report itself as such: {other:?}"),
+        }
+        assert!(
+            same_path(&after.birth_cwd, &nested_cwd) && !after.birth_cwd_exists,
+            "the birth cwd is still reported — it is the provider contract — and flagged \
+as gone"
+        );
+    }
+
+    // Git standing is live; storing a branch would go stale on checkout.
+    #[tokio::test]
+    async fn a_resolved_workspace_reports_live_git_standing_it_never_stored() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        let clean = resolve(&app, "thread-a").await;
+        assert!(same_path(&clean.git.cwd, &main_cwd));
+        assert!(clean.git.is_repo);
+        assert_eq!(clean.git.branch.as_deref(), Some("main"));
+        assert!(!clean.git.detached);
+        assert!(!clean.git.dirty, "nothing has been touched yet");
+
+        // Move the tree underneath the relay: same path, different branch, now dirty.
+        async fn git(dir: &str, args: &[&str]) {
+            let out = tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        git(&main_cwd, &["checkout", "-q", "-b", "feat/later"]).await;
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\n",
+        )
+        .unwrap();
+
+        let moved = resolve(&app, "thread-a").await;
+        assert_eq!(
+            moved.git.branch.as_deref(),
+            Some("feat/later"),
+            "the branch must be re-read, not remembered from the first answer"
+        );
+        assert!(moved.git.dirty);
+        assert!(
+            same_path(&moved.cwd, &main_cwd),
+            "and the TREE is unchanged by any of that — it is what the answer is about"
+        );
     }
 
     // A real repo with SEVERAL linked worktrees, including a detached one. Every other
@@ -1095,13 +2018,15 @@ got {}",
 
         let main_cwd = main.to_string_lossy().to_string();
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
 
@@ -1133,13 +2058,12 @@ got {}",
         // Every enumerated root must actually be selectable — the picker must not offer
         // an option that fails to load.
         for root in &response.roots {
+            let pinned = pin(&app, "thread-a", Some(&root.path))
+                .await
+                .unwrap_or_else(|error| panic!("root {} should pin: {error}", root.path));
+            assert!(same_path(&pinned.cwd, &root.path));
             let selected = app
-                .workspace_diff(
-                    None,
-                    Some("thread-a".to_string()),
-                    Some(root.path.clone()),
-                    false,
-                )
+                .workspace_diff(None, Some("thread-a".to_string()), None)
                 .await
                 .unwrap_or_else(|error| panic!("root {} should load: {error}", root.path));
             assert!(!selected.unavailable, "root {} must resolve", root.path);
@@ -1147,11 +2071,68 @@ got {}",
         }
     }
 
-    // L1: selecting a root re-points the diff at THAT working tree. This is the whole
-    // feature — a change made only in the linked worktree is invisible from the
-    // session's own cwd, and must become visible once that root is selected.
+    // view_root re-points this response only; looking is not relocating.
     #[tokio::test]
-    async fn workspace_diff_selected_root_diffs_that_worktree() {
+    async fn workspace_diff_view_root_diffs_without_pinning() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nCHANGED-IN-WORKTREE\n",
+        )
+        .unwrap();
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+
+        let preview = app
+            .workspace_diff(None, Some("thread-a".to_string()), Some(linked_cwd.clone()))
+            .await
+            .expect("diff");
+        assert!(
+            same_path(&preview.cwd, &linked_cwd),
+            "view_root must re-point this diff response: got {}",
+            preview.cwd
+        );
+        assert_eq!(preview.file_changes.len(), 1);
+        assert!(
+            preview.file_changes[0].diff.contains("CHANGED-IN-WORKTREE"),
+            "must show the linked worktree's own change"
+        );
+
+        // The session's settled tree is still the birth/main tree — preview did not pin.
+        let settled = app
+            .resolve_thread_workspace("thread-a", None)
+            .await
+            .expect("resolve");
+        assert!(
+            same_path(&settled.cwd, &main_cwd),
+            "a Diff preview must leave ThreadWorkspace alone; got {}",
+            settled.cwd
+        );
+        assert!(matches!(settled.origin, WorkspaceOrigin::Birth));
+
+        let again = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(&again.cwd, &main_cwd),
+            "without view_root the diff follows the session again"
+        );
+        assert!(again.file_changes.is_empty());
+    }
+
+    // Pin re-points the session (and therefore the default diff).
+    #[tokio::test]
+    async fn workspace_diff_pinned_root_diffs_that_worktree() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
@@ -1163,6 +2144,8 @@ got {}",
         .unwrap();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -1171,7 +2154,7 @@ got {}",
 
         // Session cwd (main worktree) is clean — this is the symptom being fixed.
         let unselected = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(same_path(&unselected.cwd, &main_cwd));
@@ -1180,14 +2163,13 @@ got {}",
             "the agent's worktree edit must NOT show up in the session's own cwd"
         );
 
-        // Selecting the linked worktree surfaces it.
+        // Pinning the linked worktree surfaces it.
+        let pinned = pin(&app, "thread-a", Some(&linked_cwd))
+            .await
+            .expect("a worktree of this session's own repo must be pinnable");
+        assert!(matches!(pinned.origin, WorkspaceOrigin::Pinned));
         let selected = app
-            .workspace_diff(
-                None,
-                Some("thread-a".to_string()),
-                Some(linked_cwd.clone()),
-                false,
-            )
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(!selected.unavailable, "a legitimate root must resolve");
@@ -1203,14 +2185,18 @@ got {}",
                 .contains("CHANGED-IN-WORKTREE"),
             "must show the linked worktree's own change"
         );
+
+        // Unpin must restore inference.
+        let cleared = pin(&app, "thread-a", None)
+            .await
+            .expect("un-pinning must be accepted");
+        assert!(matches!(cleared.origin, WorkspaceOrigin::Birth));
+        assert!(same_path(&cleared.cwd, &main_cwd));
     }
 
-    // L1 fail-closed (security): the `root` selector must only ever name a worktree of
-    // the viewed session's own repo. An arbitrary path — even a perfectly valid git repo
-    // the caller happens to know about — must be refused, never diffed. Without this the
-    // selector becomes an arbitrary-path read primitive over the broker.
+    // Pin of an unrelated repo must be refused — otherwise it is a durable arbitrary-path read.
     #[tokio::test]
-    async fn workspace_diff_rejects_root_outside_the_session_repo() {
+    async fn pinning_a_tree_outside_the_session_repo_is_refused() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, _linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
@@ -1230,27 +2216,26 @@ got {}",
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
         }
 
-        let refused = app
-            .workspace_diff(
-                None,
-                Some("thread-a".to_string()),
-                Some(other_cwd.clone()),
-                false,
-            )
+        let error = pin(&app, "thread-a", Some(&other_cwd))
             .await
-            .expect("a foreign root fails closed rather than erroring");
-
+            .expect_err("a tree outside the session's repo must be refused, not stored");
         assert!(
-            refused.unavailable,
-            "a root outside the session's repo must fail closed"
+            error.contains("working trees"),
+            "the refusal must say the tree is not one of this session's: {error}"
         );
+
+        // And nothing was recorded: the next read still resolves to the session's own
+        // tree, so a refused pin cannot half-apply.
+        let after = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
         assert!(
-            !same_path(&refused.cwd, &other_cwd),
+            !same_path(&after.cwd, &other_cwd),
             "must not diff the foreign repo"
         );
-        assert!(refused.file_changes.is_empty());
         assert!(
-            !refused.diff.contains("TOP-SECRET-FROM-OTHER-REPO"),
+            !after.diff.contains("TOP-SECRET-FROM-OTHER-REPO"),
             "must never leak a foreign repo's contents"
         );
     }
@@ -1265,6 +2250,8 @@ got {}",
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -1278,7 +2265,6 @@ got {}",
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 None,
-                false,
             )
             .await
             .expect("diff");
@@ -1293,22 +2279,38 @@ got {}",
             "a worktree outside the device scope must not be listed; got {paths:?}"
         );
 
-        // ...and it must remain unselectable.
-        let refused = app
+        // A narrow device must not pin a tree it cannot see (that pin would be served to everyone).
+        let error = app
+            .pin_thread_workspace(ThreadWorkspaceInput {
+                thread_id: "thread-a".to_string(),
+                cwd: Some(linked_cwd.clone()),
+                device_id: Some("device-narrow".to_string()),
+            })
+            .await
+            .expect_err("an out-of-scope tree must be refused");
+        assert!(
+            error.contains("working trees"),
+            "an out-of-scope tree must be refused as 'not one of this session's', which \
+is also what keeps the refusal from confirming it exists: {error}"
+        );
+        let after = app
             .workspace_diff(
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
-                Some(linked_cwd.clone()),
-                false,
+                None,
             )
             .await
-            .expect("out-of-scope root fails closed rather than erroring");
-        assert!(refused.unavailable, "out-of-scope root must fail closed");
+            .expect("diff");
+        assert!(
+            same_path(&after.cwd, &main_cwd),
+            "a refused pin must leave the session where it was; got {}",
+            after.cwd
+        );
 
         // A device with no narrow scope still sees both (the filter is scope-driven,
         // not a blanket removal of linked worktrees).
         let unscoped = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert_eq!(
@@ -1325,6 +2327,7 @@ got {}",
             item_type: "fileChange".to_string(),
             name: "Edit".to_string(),
             title: "Edit".to_string(),
+            kind: None,
             detail: None,
             query: None,
             path: None,
@@ -1358,6 +2361,7 @@ got {}",
             item_type: "toolCall".to_string(),
             name: "Read".to_string(),
             title: "Read".to_string(),
+            kind: None,
             detail: None,
             query: None,
             path: Some(path.to_string()),
@@ -1389,6 +2393,7 @@ got {}",
                     status: status.to_string(),
                     turn_id: Some("turn-1".to_string()),
                     tool: Some(tool),
+                    seq: None,
                 });
         }
     }
@@ -1409,14 +2414,14 @@ got {}",
                     status: "completed".to_string(),
                     turn_id: Some("turn-1".to_string()),
                     tool: Some(tool),
+                    seq: None,
                 });
         }
     }
 
-    // The feature: the agent went off and edited files in a linked worktree, so that is
-    // where the panel should land — but only when the client opts in via `auto_root`.
+    // Writes in a linked worktree are the session's tree until a pin says otherwise.
     #[tokio::test]
-    async fn auto_root_lands_on_the_worktree_the_thread_wrote_to() {
+    async fn the_panel_follows_the_worktree_the_thread_wrote_to() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
         std::fs::write(
@@ -1426,6 +2431,8 @@ got {}",
         .unwrap();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -1434,41 +2441,1012 @@ got {}",
             seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
         }
 
-        // Reported as a fact even without opting in — but the target is untouched, so a
-        // plain refresh can never move the panel under a reader.
-        let plain = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, false)
-            .await
-            .expect("diff");
+        let resolved = resolve(&app, "thread-a").await;
         assert!(
-            same_path(plain.suggested_root.as_deref().unwrap_or(""), &linked_cwd),
-            "the worktree the thread wrote to must be suggested; got {:?}",
-            plain.suggested_root
+            same_path(&resolved.cwd, &linked_cwd),
+            "the worktree the thread wrote to is where its work is; got {}",
+            resolved.cwd
         );
         assert!(
-            same_path(&plain.cwd, &main_cwd),
-            "without auto_root the target must stay the session cwd"
+            matches!(resolved.origin, WorkspaceOrigin::Proven),
+            "and the caller must be told it was INFERRED, not chosen: {:?}",
+            resolved.origin
+        );
+        assert!(
+            same_path(&resolved.birth_cwd, &main_cwd) && resolved.birth_cwd_exists,
+            "the birth cwd is reported alongside, never replaced"
         );
 
-        // Opting in lands there.
-        let auto = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+        let diff = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(&auto.cwd, &linked_cwd),
-            "auto_root must target the observed worktree; got {}",
-            auto.cwd
+            same_path(&diff.cwd, &linked_cwd),
+            "the diff must target the observed worktree; got {}",
+            diff.cwd
         );
-        assert!(auto.file_changes[0].diff.contains("EDITED-IN-WORKTREE"));
+        assert!(diff.file_changes[0].diff.contains("EDITED-IN-WORKTREE"));
     }
 
-    // The MIRROR of the case above, which nothing pinned: a thread that was born in a
-    // worktree and has moved back to the main tree (its worktree merged, the agent
-    // carried on in the repo). The panel has to follow in that direction too, or every
-    // post-merge session shows a stale worktree's diff.
+    // Agent-reported cwd is enough: read-only work in a worktree never leaves write traces.
     #[tokio::test]
-    async fn auto_root_lands_back_on_the_main_tree_when_the_thread_moved_back() {
+    async fn an_observed_cwd_proves_the_tree_without_any_writes() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a reported cwd must land the session in that tree with no writes; got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+        assert!(
+            same_path(&resolved.birth_cwd, &main_cwd) && resolved.birth_cwd_exists,
+            "birth cwd stays the directory the thread was created in"
+        );
+    }
+
+    // Hooks and command cwd report the process cwd, which is often a subdirectory.
+    #[tokio::test]
+    async fn an_observed_subdirectory_still_proves_the_containing_worktree() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let nested = format!("{linked_cwd}/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &nested);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a cwd inside a linked worktree must prove that tree, not birth: got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+    }
+
+    // Resolve maps `$wt/src` onto the git root for callers, but must not persist that
+    // spelling: the next PostToolUse reports `$wt/src` again and would otherwise look
+    // like a path change (revision bump → open Changes panel refetch).
+    #[tokio::test]
+    async fn a_repeated_subdirectory_observation_keeps_workspace_identity_stable() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let nested = format!("{linked_cwd}/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &nested);
+        }
+
+        let first = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&first.cwd, &linked_cwd),
+            "callers still see the containing worktree; got {}",
+            first.cwd
+        );
+        let revision_after_resolve = app.snapshot().await.thread_workspaces_revision;
+        let proven_after_resolve = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &nested);
+        }
+        let _ = resolve(&app, "thread-a").await;
+
+        let snap = app.snapshot().await;
+        assert_eq!(
+            snap.thread_workspaces_revision, revision_after_resolve,
+            "the same tree must not bump the workspace cache key on every tool"
+        );
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert_eq!(
+            proven, proven_after_resolve,
+            "resolve must not rewrite a subdirectory observation to the git root spelling"
+        );
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &nested)),
+            "stored proven stays the observed subdirectory; proven={proven:?}"
+        );
+    }
+
+    // Nested git worktrees are distinct trees even though one path contains the other.
+    #[tokio::test]
+    async fn observing_a_nested_worktree_is_not_the_enclosing_tree() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, nested_cwd) = init_repo_with_nested_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        let on_main = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&on_main.cwd, &main_cwd),
+            "precondition: session starts on the enclosing tree; got {}",
+            on_main.cwd
+        );
+        let revision_on_main = app.snapshot().await.thread_workspaces_revision;
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &nested_cwd);
+        }
+        let on_nested = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&on_nested.cwd, &nested_cwd),
+            "moving into a nested worktree must follow the observation; got {}",
+            on_nested.cwd
+        );
+        let revision_on_nested = app.snapshot().await.thread_workspaces_revision;
+        assert_ne!(
+            revision_on_nested, revision_on_main,
+            "a real worktree move must bump the workspace cache key"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        let back_on_main = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&back_on_main.cwd, &main_cwd),
+            "moving back to the enclosing tree must follow the observation; got {}",
+            back_on_main.cwd
+        );
+        assert_ne!(
+            app.snapshot().await.thread_workspaces_revision,
+            revision_on_nested,
+            "returning to the enclosing tree is another workspace identity change"
+        );
+    }
+
+    // Writes in A, then a later observed cwd in B: B is where the session is now.
+    // Older write traces must not win, and must not be written back over B.
+    #[tokio::test]
+    async fn a_newer_observed_cwd_outranks_older_write_traces() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        assert!(
+            same_path(&resolve(&app, "thread-a").await.cwd, &main_cwd),
+            "precondition: writes in the birth tree prove that tree"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "read-only work after a move must follow the observed cwd, not older writes; got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &linked_cwd)),
+            "resolve must not write the older tree back over the observation; proven={proven:?}"
+        );
+
+        let diff = app
+            .workspace_diff(None, Some("thread-a".to_string()), None)
+            .await
+            .expect("diff");
+        assert!(
+            same_path(&diff.cwd, &linked_cwd),
+            "the already-open panel's next resolve must target B; got {}",
+            diff.cwd
+        );
+    }
+
+    // Loading older history prepends records and shifts every live index. An observation
+    // stamped with `transcript.len()` would then treat those old writes as newer.
+    #[tokio::test]
+    async fn prepending_older_history_does_not_outrank_an_observed_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+            let edited = format!("{main_cwd}/seed.txt");
+            relay
+                .ensure_runtime_for_thread("thread-a")
+                .prepend_provider_history(
+                    vec![crate::protocol::TranscriptEntryView {
+                        item_id: Some("old-write".to_string()),
+                        kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                        text: None,
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-old".to_string()),
+                        tool: Some(file_tool(&[&edited])),
+                        content_state: crate::protocol::TranscriptContentState::Full,
+                    }],
+                    Some(1),
+                    None,
+                );
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "older prepended writes must not look newer than the cwd observation; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Claude rebuilds only a bounded tail after restart, so array indices reset near
+    // zero while a persisted high watermark stays. A genuine new write must still win.
+    #[tokio::test]
+    async fn a_new_write_after_cold_bounded_tail_hydration_outranks_persisted_proven_at() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            seed_transcript(&mut relay, "thread-a", Vec::new());
+            let runtime = relay.ensure_runtime_for_thread("thread-a");
+            for index in 0..50 {
+                runtime
+                    .transcript
+                    .push(crate::state::relay::TranscriptRecord {
+                        item_id: format!("history-{index}"),
+                        kind: crate::protocol::TranscriptEntryKind::AgentText,
+                        text: Some("older tail that will not be rebuilt".to_string()),
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-old".to_string()),
+                        tool: None,
+                        seq: None,
+                    });
+            }
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+            let persisted = crate::state::persistence::PersistedRelayState::from_relay(&relay);
+            relay.runtimes.remove("thread-a");
+            relay.apply_persisted(&persisted);
+            relay.load_thread_data(
+                crate::provider::ThreadSyncData {
+                    thread: crate::protocol::ThreadSummaryView {
+                        workspace_trusted: false,
+                        id: "thread-a".to_string(),
+                        name: Some("thread-a".to_string()),
+                        preview: String::new(),
+                        cwd: main_cwd.clone(),
+                        updated_at: 1,
+                        source: "fake".to_string(),
+                        status: "idle".to_string(),
+                        model_provider: "fake".to_string(),
+                        provider: "fake".to_string(),
+                        forked_from: None,
+                        renamed: false,
+                    },
+                    status: "idle".to_string(),
+                    active_flags: Vec::new(),
+                    transcript: vec![crate::protocol::TranscriptEntryView {
+                        item_id: Some("tail".to_string()),
+                        kind: crate::protocol::TranscriptEntryKind::AgentText,
+                        text: Some("bounded rebuilt tail".to_string()),
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-tail".to_string()),
+                        tool: None,
+                        content_state: crate::protocol::TranscriptContentState::Full,
+                    }],
+                },
+                DEFAULT_APPROVAL_POLICY,
+                DEFAULT_SANDBOX,
+                DEFAULT_EFFORT,
+                DEFAULT_MODEL,
+                "device-a",
+            );
+            let edited = format!("{main_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "fresh-write".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-fresh".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "a write that landed after restart must outrank a stale high watermark; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Legacy persisted rows have `proven` and no `proven_at`. Undated writes still in
+    // the window must not clobber it; a later live write must be allowed to move.
+    #[tokio::test]
+    async fn legacy_undated_proven_survives_old_writes_but_yields_to_a_new_one() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+        let linked_root = resolve(&app, "thread-a")
+            .await
+            .roots
+            .into_iter()
+            .find(|root| same_path(&root.path, &linked_cwd))
+            .expect("linked worktree is enumerated")
+            .path;
+        {
+            let mut relay = app.relay.write().await;
+            relay.restore_thread_workspace_from_json(
+                "thread-a",
+                &format!(r#"{{"proven":{}}}"#, serde_json::json!(linked_root)),
+            );
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        assert!(
+            same_path(&resolve(&app, "thread-a").await.cwd, &linked_cwd),
+            "undated writes already in the window must not freeze-break a pre-upgrade proven tree"
+        );
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven_at,
+            None,
+            "matching spelling must leave a pre-upgrade row undated"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            let edited = format!("{main_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "live-after-upgrade".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-live".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+        }
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "a live write after upgrade must be allowed to move an undated proven tree; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Snapshot writes, drop the lock for git, then an observation lands before write-back.
+    #[tokio::test]
+    async fn an_observed_cwd_wins_a_race_with_resolver_writeback() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let hold = app.hold_workspace_resolve_barrier().await;
+        let arrivals_before = app.workspace_resolve_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "an observation that lands during resolve must survive write-back; got {}",
+            resolved.cwd
+        );
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &main_cwd)),
+            "persisted proven must stay on the observation; proven={proven:?}"
+        );
+    }
+
+    // Recency is a clock, not a set of distinct paths: a later observation that the
+    // agent is still in A must outrank a write that landed in B in between.
+    #[tokio::test]
+    async fn a_repeated_cwd_observation_outranks_a_contrary_live_write() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+            let edited = format!("{main_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "write-in-b".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-b".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a later same-tree observation must outrank an intervening write; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Claude's worker emits PostToolUse cwd *after* the completed write record, so
+    // the observation clock is newer than the write seq and must win.
+    #[tokio::test]
+    async fn a_post_tool_cwd_observation_outranks_the_write_it_followed() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+            let edited = format!("{linked_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "tool:write-in-b".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-1".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "PostToolUse cwd after a write in another tree must keep the session put; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Completion order is the live seq, not insertion order: an earlier row can finish last.
+    #[tokio::test]
+    async fn write_evidence_follows_the_record_with_the_highest_live_seq() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let runtime = relay.ensure_runtime_for_thread("thread-a");
+            let linked_edit = format!("{linked_cwd}/seed.txt");
+            let main_edit = format!("{main_cwd}/seed.txt");
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: "inserted-first-finished-last".to_string(),
+                    kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                    text: None,
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    tool: Some(file_tool(&[&linked_edit])),
+                    seq: Some(20),
+                });
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id: "inserted-second-finished-first".to_string(),
+                    kind: crate::protocol::TranscriptEntryKind::ToolCall,
+                    text: None,
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    tool: Some(file_tool(&[&main_edit])),
+                    seq: Some(10),
+                });
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "the write with the highest seq is the newest, even if it sits earlier in the array; got {}",
+            resolved.cwd
+        );
+    }
+
+    // Unsequenced inference must not mint a clock after the snapshot: an observation
+    // in the post-snapshot / pre-writeback window would otherwise be overwritten.
+    #[tokio::test]
+    async fn an_observation_survives_unsequenced_inference_after_the_reread() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the unsequenced write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &main_cwd);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &main_cwd),
+            "unsequenced inference must not mint past a newer observation; got {}",
+            resolved.cwd
+        );
+        let proven = {
+            app.relay
+                .read()
+                .await
+                .thread_workspace("thread-a")
+                .proven
+                .clone()
+        };
+        assert!(
+            proven
+                .as_deref()
+                .is_some_and(|path| same_path(path, &main_cwd)),
+            "persisted proven must stay on the observation; proven={proven:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_spelled_observation_wins_the_writeback_race() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let alias = tmp.path().join("alias-to-linked");
+        std::os::unix::fs::symlink(&linked_cwd, &alias).expect("symlink");
+        let alias = alias.to_string_lossy().to_string();
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &alias);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a symlink-spelled observation after the snapshot must still win; got {}",
+            resolved.cwd
+        );
+    }
+
+    // A pin is the operator's explicit SoT. An observation in the snapshot-to-writeback
+    // window must not hijack a review/Changes resolve onto another tree.
+    #[tokio::test]
+    async fn a_pin_survives_an_observation_in_the_writeback_window() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+        pin(&app, "thread-a", Some(&main_cwd))
+            .await
+            .expect("pin the enclosing tree");
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Pinned),
+            "a live pin must outrank a PostToolUse observation in the writeback window; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
+    }
+
+    // The CAS must re-read the live pin, not the snapshot pin: parking a different
+    // tree while resolve is in flight is still a pin.
+    #[tokio::test]
+    async fn a_pin_change_in_the_writeback_window_is_honored() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+        }
+        let linked_root = resolve(&app, "thread-a")
+            .await
+            .roots
+            .into_iter()
+            .find(|root| same_path(&root.path, &linked_cwd))
+            .expect("linked worktree is enumerated")
+            .path;
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_thread_workspace("thread-a", Some(&linked_root));
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Pinned),
+            "a pin set after the snapshot must still win; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
+    }
+
+    // Inverse: unpinning during the window must drop the snapshot pin and follow
+    // write evidence, not keep returning A as Pinned.
+    #[tokio::test]
+    async fn an_unpin_in_the_writeback_window_follows_write_evidence() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        pin(&app, "thread-a", Some(&main_cwd))
+            .await
+            .expect("pin the enclosing tree over contrary writes");
+        let parked = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&parked.cwd, &main_cwd) && matches!(parked.origin, WorkspaceOrigin::Pinned),
+            "precondition: the pin parks the session on the enclosing tree"
+        );
+
+        let hold = app.hold_workspace_resolve_writeback_barrier().await;
+        let arrivals_before = app.workspace_resolve_writeback_arrivals();
+        let app_resolve = app.clone();
+        let resolve_task = tokio::spawn(async move { resolve(&app_resolve, "thread-a").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.workspace_resolve_writeback_arrivals() == arrivals_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolver should reach the post-snapshot write-back gate");
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_thread_workspace("thread-a", None);
+        }
+        drop(hold);
+        let resolved = resolve_task.await.expect("resolve task");
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Proven),
+            "unpinning must follow write evidence, not keep the snapshot pin; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
+    }
+
+    // Inverse of the observation case: a later landed write must be allowed to move
+    // the session even when Codex never emitted a cwd notification for that edit.
+    #[tokio::test]
+    async fn a_newer_landed_write_outranks_an_older_remembered_tree() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{main_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        assert!(
+            same_path(&resolve(&app, "thread-a").await.cwd, &main_cwd),
+            "precondition: the first resolve persists the birth tree as proven"
+        );
+
+        {
+            let mut relay = app.relay.write().await;
+            let edited = format!("{linked_cwd}/seed.txt");
+            relay.upsert_transcript_item_for_thread(
+                "thread-a",
+                "item-later-write".to_string(),
+                crate::protocol::TranscriptEntryKind::ToolCall,
+                None,
+                "completed".to_string(),
+                Some("turn-2".to_string()),
+                Some(file_tool(&[&edited])),
+            );
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &linked_cwd),
+            "a later successful write must move the session without a cwd hook; got {}",
+            resolved.cwd
+        );
+        assert!(matches!(resolved.origin, WorkspaceOrigin::Proven));
+    }
+
+    // Observation does not move birth `current_cwd`; the snapshot still has to carry the
+    // remembered tree so an already-open Changes panel can notice and refetch.
+    #[tokio::test]
+    async fn observing_cwd_rides_the_snapshot_without_moving_birth_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.active_thread_id = Some("thread-a".to_string());
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            relay.observe_thread_cwd("thread-a", &linked_cwd);
+        }
+
+        let snap = app.snapshot().await;
+        assert!(
+            same_path(&snap.current_cwd, &main_cwd),
+            "birth cwd stays on the snapshot; got {}",
+            snap.current_cwd
+        );
+        assert!(
+            snap.thread_workspace_cwd
+                .as_deref()
+                .is_some_and(|path| same_path(path, &linked_cwd)),
+            "the remembered tree must ride the snapshot so surfaces can refresh; got {:?}",
+            snap.thread_workspace_cwd
+        );
+        assert!(
+            snap.thread_workspaces_revision > 0,
+            "a proven-tree change must bump the cache key so a view-only panel can refetch"
+        );
+    }
+
+    // The older walk is capped by records, not by collecting 200 write paths — a
+    // write-sparse transcript must not be scanned to the start under the relay lock.
+    #[tokio::test]
+    async fn write_evidence_does_not_scan_the_whole_transcript_for_write_paths() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+            let runtime = relay.ensure_runtime_for_thread("thread-a");
+            for index in 0..2_000 {
+                runtime
+                    .transcript
+                    .push(crate::state::relay::TranscriptRecord {
+                        item_id: format!("chatter-{index}"),
+                        kind: crate::protocol::TranscriptEntryKind::AgentText,
+                        text: Some("still working, no files touched".to_string()),
+                        status: "completed".to_string(),
+                        turn_id: Some("turn-chatter".to_string()),
+                        tool: None,
+                        seq: None,
+                    });
+            }
+        }
+
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "an ancient write past the record cap is not evidence; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
+        );
+    }
+
+    // Pin outranks fresh contrary evidence; one field would drag the panel off a parked tree.
+    #[tokio::test]
+    async fn a_pin_outranks_fresh_evidence_pointing_somewhere_else() {
+        let tmp = TempDir::new().expect("tmp");
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+
+        let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+
+        // Inference says the worktree.
+        assert!(same_path(&resolve(&app, "thread-a").await.cwd, &linked_cwd));
+
+        // User pins the main tree.
+        let pinned = pin(&app, "thread-a", Some(&main_cwd))
+            .await
+            .expect("pinning the main tree");
+        assert!(same_path(&pinned.cwd, &main_cwd));
+        assert!(matches!(pinned.origin, WorkspaceOrigin::Pinned));
+
+        // More writes land in the worktree. The pin still wins.
+        {
+            let mut relay = app.relay.write().await;
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "thread-a", vec![file_tool(&[&edited])]);
+        }
+        let after = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&after.cwd, &main_cwd) && matches!(after.origin, WorkspaceOrigin::Pinned),
+            "a user's choice must not move under them on the next write; got {:?} at {}",
+            after.origin,
+            after.cwd
+        );
+
+        // Unpin must restore the write evidence, which has been the worktree all along.
+        let cleared = pin(&app, "thread-a", None).await.expect("un-pin");
+        assert!(
+            same_path(&cleared.cwd, &linked_cwd)
+                && matches!(cleared.origin, WorkspaceOrigin::Proven)
+        );
+    }
+
+    // Unpinned: follow writes back to main after merge, or post-merge diffs stay on the stale tree.
+    #[tokio::test]
+    async fn the_panel_lands_back_on_the_main_tree_when_the_thread_moved_back() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
         std::fs::write(
@@ -1478,6 +3456,8 @@ got {}",
         .unwrap();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.active_thread_id = Some("thread-a".to_string());
@@ -1489,17 +3469,12 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(response.suggested_root.as_deref().unwrap_or(""), &main_cwd),
-            "the main tree must be suggested once the thread writes there; got {:?}",
-            response.suggested_root
-        );
-        assert!(
             same_path(&response.cwd, &main_cwd),
-            "auto_root must follow the thread back to the main tree; got {}",
+            "the panel must follow the thread back to the main tree; got {}",
             response.cwd
         );
         assert!(
@@ -1511,14 +3486,17 @@ got {}",
         );
     }
 
-    // No evidence, or evidence pointing at the session's own cwd, is nothing to suggest:
-    // the panel already defaults there and a self-suggestion would pin every thread.
+    // Evidence pointing at the session's OWN cwd resolves there, exactly as it would for
+    // any other tree. There is no special case: the answer is the tree, not "the tree
+    // minus the boring one".
     #[tokio::test]
-    async fn no_suggestion_when_the_thread_writes_in_its_own_cwd() {
+    async fn a_thread_writing_in_its_own_cwd_resolves_there() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
@@ -1527,10 +3505,9 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
-        assert_eq!(response.suggested_root, None);
         assert!(same_path(&response.cwd, &main_cwd));
     }
 
@@ -1548,11 +3525,13 @@ got {}",
             seed_transcript(&mut relay, "thread-a", vec![file_tool(&["src/x.rs"])]);
         }
 
-        let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
-            .await
-            .expect("diff");
-        assert_eq!(response.suggested_root, None);
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "with no usable evidence the answer is the birth tree, and says so; got {:?}",
+            resolved.origin
+        );
     }
 
     // Reading a file is not working in it. A plain Read carries an absolute `path` just
@@ -1575,15 +3554,14 @@ got {}",
             );
         }
 
-        let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
-            .await
-            .expect("diff");
-        assert_eq!(
-            response.suggested_root, None,
-            "a Read must not be treated as writing there"
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "a Read must not be treated as writing there; got {:?} at {}",
+            resolved.origin,
+            resolved.cwd
         );
-        assert!(same_path(&response.cwd, &main_cwd));
     }
 
     // An edit that failed or is still running never landed on disk, so it is not
@@ -1600,6 +3578,8 @@ got {}",
         .unwrap();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
@@ -1619,73 +3599,90 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(
-                response.suggested_root.as_deref().unwrap_or(""),
-                &linked_cwd
-            ),
-            "the completed worktree edit must win over a failed/running/read on main; got {:?}",
-            response.suggested_root
+            same_path(&response.cwd, &linked_cwd),
+            "the completed worktree edit must win over a failed/running/read on main; got {}",
+            response.cwd
         );
     }
 
-    // A thread the client just navigated to may have a cwd (from its summary) but no
-    // loaded transcript yet. "No evidence" and "could not look yet" are different
-    // answers: conflating them makes the client burn its one-shot auto-resolve on a
-    // thread whose history has not arrived, and it never re-resolves.
+    // No loaded transcript (cold thread / restart) is not "went home"; remember proven.
     #[tokio::test]
-    async fn a_cold_thread_reports_the_suggestion_as_not_yet_known() {
+    async fn a_cold_thread_still_resolves_to_the_tree_it_was_proven_to_write_in() {
         let tmp = TempDir::new().expect("tmp");
-        let (main_cwd, _linked) = init_repo_with_worktree(tmp.path()).await;
+        let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nEDITED-IN-WORKTREE\n",
+        )
+        .unwrap();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
+        let cold_thread = ThreadSummaryView {
+            workspace_trusted: false,
+            id: "cold-thread".to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: main_cwd.clone(),
+            updated_at: 1,
+            source: "local".to_string(),
+            status: "idle".to_string(),
+            model_provider: "anthropic".to_string(),
+            provider: "claude_code".to_string(),
+            forked_from: None,
+            renamed: false,
+        };
         {
             let mut relay = app.relay.write().await;
-            // Summary only — deliberately NO runtime for this thread.
-            relay.threads = vec![ThreadSummaryView {
-                id: "cold-thread".to_string(),
-                name: None,
-                preview: String::new(),
-                cwd: main_cwd.clone(),
-                updated_at: 1,
-                source: "local".to_string(),
-                status: "idle".to_string(),
-                model_provider: "anthropic".to_string(),
-                provider: "claude_code".to_string(),
-                forked_from: None,
-                renamed: false,
-            }];
+            relay.threads = vec![cold_thread.clone()];
+            relay.ensure_runtime_for_thread("cold-thread").current_cwd = main_cwd.clone();
+            let edited = format!("{linked_cwd}/seed.txt");
+            seed_transcript(&mut relay, "cold-thread", vec![file_tool(&[&edited])]);
         }
 
-        let cold = app
-            .workspace_diff(None, Some("cold-thread".to_string()), None, true)
-            .await
-            .expect("a cold thread still diffs its own cwd");
-        assert!(same_path(&cold.cwd, &main_cwd));
-        assert_eq!(cold.suggested_root, None);
+        // While the transcript is loaded, the evidence proves the worktree.
+        let warm = resolve(&app, "cold-thread").await;
         assert!(
-            !cold.suggested_root_known,
-            "an unloaded transcript must report the suggestion as UNKNOWN, not as none"
+            same_path(&warm.cwd, &linked_cwd) && matches!(warm.origin, WorkspaceOrigin::Proven)
         );
 
-        // Once the transcript is loaded the answer becomes known.
+        // The runtime goes away — an eviction, or a restart, which is the case that
+        // matters. Summary only now, and the summary carries only the BIRTH tree.
         {
             let mut relay = app.relay.write().await;
-            relay.ensure_runtime_for_thread("cold-thread").current_cwd = main_cwd.clone();
-            seed_transcript_with_status(&mut relay, "cold-thread", vec![]);
+            relay.runtimes.remove("cold-thread");
+            relay.threads = vec![cold_thread];
+            assert!(
+                same_path(&relay.thread_cwd("cold-thread").expect("row"), &main_cwd),
+                "precondition: with no runtime the thread only knows where it was born"
+            );
         }
-        let warm = app
-            .workspace_diff(None, Some("cold-thread".to_string()), None, true)
+
+        let cold = resolve(&app, "cold-thread").await;
+        assert!(
+            same_path(&cold.cwd, &linked_cwd),
+            "an unloaded transcript is not evidence that the work moved back to the birth \
+tree; got {}",
+            cold.cwd
+        );
+        assert!(
+            matches!(cold.origin, WorkspaceOrigin::Proven),
+            "and it is still an inference, not a pin: {:?}",
+            cold.origin
+        );
+        let diff = app
+            .workspace_diff(None, Some("cold-thread".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            warm.suggested_root_known,
-            "a loaded thread with no worktree evidence is a KNOWN 'nothing to suggest'"
+            diff.diff.contains("EDITED-IN-WORKTREE"),
+            "the panel must show the remembered tree's real diff"
         );
-        assert_eq!(warm.suggested_root, None);
     }
 
     // A failed edit that still arrives with status "completed". `claude.rs` now maps the
@@ -1723,15 +3720,15 @@ got {}",
             );
         }
 
-        let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
-            .await
-            .expect("diff");
-        assert_eq!(
-            response.suggested_root, None,
-            "an edit that never landed must not suggest that worktree"
+        let resolved = resolve(&app, "thread-a").await;
+        assert!(
+            same_path(&resolved.cwd, &main_cwd)
+                && matches!(resolved.origin, WorkspaceOrigin::Birth),
+            "an edit that never landed must not move the session into that worktree; got \
+{:?} at {}",
+            resolved.origin,
+            resolved.cwd
         );
-        assert!(same_path(&response.cwd, &main_cwd));
     }
 
     #[tokio::test]
@@ -1745,6 +3742,8 @@ got {}",
         .unwrap();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
@@ -1763,16 +3762,13 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(
-                response.suggested_root.as_deref().unwrap_or(""),
-                &linked_cwd
-            ),
-            "the older LANDED write must win over a newer failed one; got {:?}",
-            response.suggested_root
+            same_path(&response.cwd, &linked_cwd),
+            "the older LANDED write must win over a newer failed one; got {}",
+            response.cwd
         );
     }
 
@@ -1826,6 +3822,8 @@ got {}",
             .to_string();
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
@@ -1834,27 +3832,26 @@ got {}",
         }
 
         let response = app
-            .workspace_diff(None, Some("thread-a".to_string()), None, true)
+            .workspace_diff(None, Some("thread-a".to_string()), None)
             .await
             .expect("diff");
         assert!(
-            same_path(
-                response.suggested_root.as_deref().unwrap_or(""),
-                &nested_cwd
-            ),
-            "the NESTED worktree must win over the enclosing main one; got {:?}",
-            response.suggested_root
+            same_path(&response.cwd, &nested_cwd),
+            "the NESTED worktree must win over the enclosing main one; got {}",
+            response.cwd
         );
     }
 
-    // Safety: auto-selection must obey the same boundary as manual selection. An
-    // out-of-scope worktree is not in `roots`, so it can never be suggested either.
+    // Safety: inference must obey the same boundary as an explicit pin. An out-of-scope
+    // worktree is not in `roots`, so evidence pointing at it resolves to nothing.
     #[tokio::test]
-    async fn auto_root_never_escapes_the_device_scope() {
+    async fn inference_never_escapes_the_device_scope() {
         let tmp = TempDir::new().expect("tmp");
         let (main_cwd, linked_cwd) = init_repo_with_worktree(tmp.path()).await;
 
         let (app, _project, _outside) = build_app(&main_cwd).await;
+        // Granted: the assertions below need git to actually run in this repository.
+        grant_workspace(&app, &main_cwd).await;
         {
             let mut relay = app.relay.write().await;
             relay.ensure_runtime_for_thread("thread-a").current_cwd = main_cwd.clone();
@@ -1868,17 +3865,20 @@ got {}",
                 Some("device-narrow".to_string()),
                 Some("thread-a".to_string()),
                 None,
-                true,
             )
             .await
             .expect("diff");
-        assert_eq!(
-            response.suggested_root, None,
-            "an out-of-scope worktree must not be suggested"
-        );
         assert!(
             same_path(&response.cwd, &main_cwd),
-            "auto must fall back to the session cwd, not escape scope"
+            "inference must stay at the session cwd, not escape scope; got {}",
+            response.cwd
+        );
+        assert!(
+            !response
+                .roots
+                .iter()
+                .any(|root| same_path(&root.path, &linked_cwd)),
+            "and the out-of-scope tree must not even be listed"
         );
     }
 
@@ -1995,6 +3995,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session");
@@ -2046,6 +4047,7 @@ got {}",
         {
             let mut relay = app.relay.write().await;
             relay.upsert_thread(ThreadSummaryView {
+                workspace_trusted: false,
                 id: thread_id.clone(),
                 name: Some("Provider Retitled Me".to_string()),
                 preview: "later message".to_string(),
@@ -2467,6 +4469,7 @@ got {}",
             let mut relay = app.relay.write().await;
             relay.register_background_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "reviewer-1".to_string(),
                     name: None,
                     preview: String::new(),
@@ -2660,6 +4663,473 @@ got {}",
             .is_ok());
     }
 
+    /// Must be the SAME resolution `fork_session` performs, or the dialog
+    /// advertises one thing and the fork does another.
+    #[tokio::test]
+    async fn thread_settings_report_what_a_fork_would_actually_inherit() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: Some("fake-echo".to_string()),
+            effort: Some("high".to_string()),
+            approval_policy: Some("never".to_string()),
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        let settings = app
+            .thread_settings_view(Some("device-1".to_string()), &thread_id)
+            .await
+            .expect("settings");
+
+        assert!(settings.remembered, "the relay ran this thread");
+        assert_eq!(settings.model, "fake-echo");
+        assert_eq!(settings.reasoning_effort, "high");
+        assert_eq!(settings.approval_policy, "never");
+    }
+
+    /// Local is already authorized and names no device; `allowed_roots` still bind
+    /// the read. Remote never takes this branch — `bind_device` stamps an id.
+    #[tokio::test]
+    async fn thread_settings_are_readable_without_a_device_id() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: Some("fake-echo".to_string()),
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        let settings = app
+            .thread_settings_view(None, &thread_id)
+            .await
+            .expect("readable without a device id");
+        assert_eq!(settings.model, "fake-echo");
+    }
+
+    /// Still usable — a fork WILL get these — but flagged, so the dialog does not
+    /// claim a choice the user never made.
+    #[tokio::test]
+    async fn an_unrecorded_thread_reports_relay_defaults_and_says_so() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let settings = app
+            .thread_settings_view(Some("device-1".to_string()), "never-seen-thread")
+            .await
+            .expect("settings");
+
+        assert!(!settings.remembered);
+        assert!(
+            !settings.approval_policy.is_empty(),
+            "a usable value is still returned, because a fork would get one"
+        );
+    }
+
+    /// At SUBMIT time, not when the dialog opened — otherwise tightening the
+    /// source's permissions elsewhere is undone by a fork already in progress.
+    #[tokio::test]
+    async fn an_omitted_fork_setting_uses_the_sources_value_at_submit_time() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: Some("never".to_string()),
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: None,
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        // What the dialog would have shown when it opened.
+        let at_open = app
+            .thread_settings_view(None, &source_thread_id)
+            .await
+            .expect("settings");
+        assert_eq!(at_open.approval_policy, "never");
+
+        // Another device tightens the source while the dialog sits open.
+        {
+            let mut relay = app.relay.write().await;
+            relay.remember_thread_settings(
+                &source_thread_id,
+                "untrusted",
+                "read-only",
+                "medium",
+                "fake-echo",
+            );
+        }
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id: source_thread_id.clone(),
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: None,
+        })
+        .await
+        .expect("fork_session");
+
+        let forked = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        let settings = app
+            .thread_settings_view(None, &forked)
+            .await
+            .expect("fork settings");
+        assert_eq!(
+            settings.approval_policy, "untrusted",
+            "the fork must take the TIGHTENED policy, not the one the dialog read"
+        );
+        assert_eq!(settings.sandbox, "read-only");
+    }
+
+    async fn project_with_session(cwd: &str) -> (AppState, TempDir, TempDir, String) {
+        let (app, p, o) = build_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "Small improvement".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create project");
+        let project_id = receipt.projects[0].id.clone();
+        (app, p, o, project_id)
+    }
+
+    /// Server-side, because remote cannot fake it client-side: its broker
+    /// `start_session` returns no thread id for a phone to follow up on.
+    #[tokio::test]
+    async fn start_session_assigns_the_new_thread_to_the_requested_project() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, project_id) = project_with_session(&cwd).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(project_id.clone()),
+        })
+        .await
+        .expect("start_session");
+
+        let listed = app.list_threads(50, None).await.expect("list");
+        let thread_id = listed.threads[0].id.clone();
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay.project_for_thread(&thread_id).map(|p| p.id.clone()),
+            Some(project_id),
+            "the started thread must be a member of the project it was started into"
+        );
+    }
+
+    /// A project deleted on another device mid-dialog must not cost the user the
+    /// session they asked for.
+    #[tokio::test]
+    async fn an_unknown_project_id_still_starts_the_session_unassigned() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o) = build_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some("proj_deadbeefdeadbeef".to_string()),
+        })
+        .await
+        .expect("start_session must survive a stale project id");
+
+        let listed = app.list_threads(50, None).await.expect("list");
+        let thread_id = listed.threads[0].id.clone();
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay.project_for_thread(&thread_id).map(|p| p.id.clone()),
+            None
+        );
+    }
+
+    /// Fork assigned no project at all before this, so branching a project session
+    /// dropped it into Unassigned.
+    #[tokio::test]
+    async fn fork_inherits_the_source_threads_project_by_default() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, project_id) = project_with_session(&cwd).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(project_id.clone()),
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id: source_thread_id.clone(),
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: None,
+        })
+        .await
+        .expect("fork_session");
+
+        let forked_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        assert_ne!(
+            forked_thread_id, source_thread_id,
+            "precondition: a new thread"
+        );
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay
+                .project_for_thread(&forked_thread_id)
+                .map(|p| p.id.clone()),
+            Some(project_id),
+            "a fork stays in the project its source belongs to"
+        );
+    }
+
+    /// `None` already means inherit, so it cannot also mean "none". Ids are always
+    /// `proj_%016x`, so the empty string is safe as the third value.
+    #[tokio::test]
+    async fn an_empty_fork_project_files_the_branch_out_of_the_source_project() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, project_id) = project_with_session(&cwd).await;
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(project_id.clone()),
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id,
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: Some(String::new()),
+        })
+        .await
+        .expect("fork_session");
+
+        let forked_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay
+                .project_for_thread(&forked_thread_id)
+                .map(|p| p.id.clone()),
+            None,
+            "an explicit empty project must NOT fall back to inheriting the source's"
+        );
+    }
+
+    /// ...but an explicit project on the fork input overrides that inheritance,
+    /// so the fork dialog's picker can redirect the branch elsewhere.
+    #[tokio::test]
+    async fn an_explicit_fork_project_overrides_the_inherited_one() {
+        let dir = TempDir::new().expect("project tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (app, _p, _o, source_project) = project_with_session(&cwd).await;
+        let receipt = app
+            .project_action(ProjectActionInput {
+                action: ProjectAction::Create {
+                    name: "UI Redesign".to_string(),
+                },
+                device_id: None,
+            })
+            .await
+            .expect("create second project");
+        let other_project = receipt
+            .projects
+            .iter()
+            .find(|p| p.name == "UI Redesign")
+            .expect("second project")
+            .id
+            .clone();
+
+        app.start_session(StartSessionInput {
+            device_id: Some("device-1".to_string()),
+            cwd: Some(cwd.clone()),
+            model: None,
+            effort: None,
+            approval_policy: None,
+            sandbox: None,
+            provider: Some("fake".to_string()),
+            initial_prompt: None,
+            project_id: Some(source_project),
+        })
+        .await
+        .expect("start_session");
+        let source_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+
+        app.fork_session(ForkSessionInput {
+            source_thread_id,
+            up_to_item_id: None,
+            cwd: None,
+            initial_prompt: None,
+            model: None,
+            approval_policy: None,
+            sandbox: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            provider: None,
+            project_id: Some(other_project.clone()),
+        })
+        .await
+        .expect("fork_session");
+
+        let forked_thread_id = app
+            .relay
+            .read()
+            .await
+            .active_thread_id
+            .clone()
+            .expect("active");
+        let relay = app.relay.read().await;
+        assert_eq!(
+            relay
+                .project_for_thread(&forked_thread_id)
+                .map(|p| p.id.clone()),
+            Some(other_project)
+        );
+    }
+
     async fn build_status_app(cwd: &str, read_status: &str) -> (AppState, TempDir, TempDir) {
         let project = TempDir::new().expect("project tempdir");
         let outside = TempDir::new().expect("outside tempdir");
@@ -2819,6 +5289,7 @@ got {}",
             let mut relay = relay.write().await;
             relay.activate_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "ghost-thread".to_string(),
                     name: None,
                     preview: String::new(),
@@ -2916,7 +5387,7 @@ got {}",
         );
 
         // Model the REAL fresh-boot state: apply_persisted leaves active_thread_id
-        // SET, provider startup leaves the global provider on the last-spawned
+        // SET, provider startup leaves the global provider on the preferred
         // provider (claude_code), the startup refresh stamped Claude's catalog, and
         // the relay thread/runtime caches are empty (not persisted). Critically,
         // active_thread_id stays set — clearing it would hide the
@@ -2944,7 +5415,7 @@ got {}",
         // and the Codex model catalog loaded (no Claude leakage).
         assert_eq!(
             snapshot.provider, "codex",
-            "a restored Codex session must come back as codex, not the last-spawned provider"
+            "a restored Codex session must come back as codex, not the boot-default provider"
         );
         assert_eq!(
             snapshot.active_thread_id.as_deref(),
@@ -3145,6 +5616,7 @@ got {}",
             let mut relay = app.relay.write().await;
             relay.activate_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: thread_id.to_string(),
                     name: None,
                     preview: String::new(),
@@ -3174,6 +5646,7 @@ got {}",
                     item_type: "turnDiff".to_string(),
                     name: "turn_diff".to_string(),
                     title: "Changed files".to_string(),
+                    kind: None,
                     detail: None,
                     query: None,
                     path: None,
@@ -3215,7 +5688,7 @@ got {}",
         assert!(!tool.file_changes_omitted);
     }
 
-    async fn pair_device(app: &AppState, device_id: &str, path_scope: Vec<String>) {
+    pub(crate) async fn pair_device(app: &AppState, device_id: &str, path_scope: Vec<String>) {
         // Normalize the scope the same way start_pairing does in production, so symlinked
         // tmpdirs on macOS (/var/folders → /private/var/folders) don't produce false misses.
         let path_scope = if path_scope.is_empty() {
@@ -3282,6 +5755,10 @@ got {}",
         // Models a provider that is down: `list_threads` errors, and the merge is
         // expected to carry on with the remaining providers rather than failing.
         list_threads_should_fail: Arc<AtomicBool>,
+        // Reproduces the cold-page race: a stream event lands and builds the
+        // runtime WHILE the relay is awaiting this provider's page read, so the
+        // page the relay gets back is already stale by the time it is served.
+        advance_runtime_during_page_read: Arc<AtomicBool>,
     }
 
     impl RecordingProvider {
@@ -3310,11 +5787,13 @@ got {}",
                 consumes_initial_prompt: Arc::new(AtomicBool::new(false)),
                 start_turn_should_fail: Arc::new(AtomicBool::new(false)),
                 list_threads_should_fail: Arc::new(AtomicBool::new(false)),
+                advance_runtime_during_page_read: Arc::new(AtomicBool::new(false)),
             }
         }
 
         fn thread_summary(&self, id: &str, cwd: &str) -> ThreadSummaryView {
             ThreadSummaryView {
+                workspace_trusted: false,
                 id: id.to_string(),
                 name: Some(format!("{} thread", self.name)),
                 preview: String::new(),
@@ -3371,12 +5850,15 @@ got {}",
 
         async fn start_thread(
             &self,
-            cwd: &str,
-            _model: &str,
-            _approval_policy: &str,
-            _sandbox: &str,
-            initial_prompt: Option<&str>,
+            request: crate::provider::StartThreadRequest,
         ) -> Result<crate::provider::StartThreadResult, String> {
+            let cwd = request.cwd.as_str();
+            let model = request.model.as_str();
+            let approval_policy = request.approval_policy.as_str();
+            let sandbox = request.sandbox.as_str();
+            let initial_prompt = request.initial_prompt.as_deref();
+            let _ = (model, approval_policy, sandbox, initial_prompt);
+
             let mut threads = self.threads.lock().await;
             let id = format!("{}-thread-{}", self.name, threads.len() + 1);
             let thread = self.thread_summary(&id, cwd);
@@ -3467,6 +5949,22 @@ got {}",
             thread_id: &str,
             before: Option<usize>,
         ) -> Result<Option<crate::provider::ThreadTranscriptPageData>, String> {
+            if self
+                .advance_runtime_during_page_read
+                .load(Ordering::Relaxed)
+            {
+                // A live event arrives while the relay is parked on this await.
+                let mut relay = self.state.write().await;
+                relay.upsert_transcript_item_for_thread(
+                    thread_id,
+                    "live-entry".to_string(),
+                    crate::protocol::TranscriptEntryKind::AgentText,
+                    Some("streamed while the page read was in flight".to_string()),
+                    "completed".to_string(),
+                    Some("live-turn".to_string()),
+                    None,
+                );
+            }
             Ok(self
                 .transcript_pages
                 .lock()
@@ -3726,10 +6224,229 @@ got {}",
         );
     }
 
+    #[tokio::test]
+    async fn an_approval_receipt_names_the_provider_that_actually_got_it() {
+        // The receipt said "sent to Codex." for every provider. A Cursor user
+        // denying a plan, or a Claude user approving an edit, was told their
+        // decision went somewhere it did not — on the one surface whose whole
+        // job is to report what just happened to a permission.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, codex, claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let codex_thread = codex.thread_summary("codex-thread", cwd);
+        let claude_thread = claude.thread_summary("claude-thread", cwd);
+        codex
+            .threads
+            .lock()
+            .await
+            .insert(codex_thread.id.clone(), codex_thread.clone());
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+
+        let pending = |request_id: &str, thread_id: &str| PendingApproval {
+            request_id: request_id.to_string(),
+            raw_request_id: serde_json::json!(request_id),
+            kind: ApprovalKind::Command,
+            thread_id: thread_id.to_string(),
+            summary: "Run command".to_string(),
+            detail: None,
+            command: Some("true".to_string()),
+            cwd: Some(cwd.to_string()),
+            context_preview: None,
+            requested_permissions: None,
+            available_decisions: vec!["approve".to_string(), "deny".to_string()],
+            supports_session_scope: false,
+        };
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(codex_thread.id.clone());
+            relay.threads = vec![codex_thread, claude_thread];
+            relay
+                .pending_approvals
+                .insert("a-codex".to_string(), pending("a-codex", "codex-thread"));
+            relay
+                .pending_approvals
+                .insert("a-claude".to_string(), pending("a-claude", "claude-thread"));
+        }
+
+        let decide = |request_id: &'static str, decision| {
+            let app = &app;
+            async move {
+                app.decide_approval(
+                    request_id,
+                    ApprovalDecisionInput {
+                        decision,
+                        scope: Some(ApprovalScope::Once),
+                        device_id: Some("device-1".to_string()),
+                    },
+                )
+                .await
+                .expect("decision should route")
+                .message
+            }
+        };
+
+        let claude_message = decide("a-claude", ApprovalDecision::Deny).await;
+        assert!(
+            claude_message.contains("Claude Code"),
+            "a denial routed to claude must say so: {claude_message}"
+        );
+        assert!(
+            !claude_message.contains("Codex"),
+            "the receipt named the wrong provider: {claude_message}"
+        );
+
+        // And the provider that IS Codex still reads correctly.
+        let codex_message = decide("a-codex", ApprovalDecision::Approve).await;
+        assert!(
+            codex_message.contains("Codex"),
+            "wrong provider named: {codex_message}"
+        );
+    }
+
     // P0b: a send carrying an explicit thread_id must take over that thread and
     // start the turn ON it — even when a different thread is currently active.
     // This is what closes the wrong-thread send race: the send targets the thread
     // the user meant, not "whatever happens to be active when it lands".
+    /// The gate is WIRED, not merely correct.
+    ///
+    /// `usage::budget` unit-tests the decision; this proves a real send reaches
+    /// it. The two are separate failures — a perfect decision function nobody
+    /// calls refuses nothing — and only this one would catch the gate being
+    /// dropped from the turn path.
+    #[tokio::test]
+    async fn a_spent_budget_refuses_a_typed_send_when_set_to_stop_everything() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, _p, _o) = build_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let session = app
+            .start_session(StartSessionInput {
+                device_id: Some("device-1".to_string()),
+                cwd: Some(cwd.to_string()),
+                model: Some("fake-echo".to_string()),
+                effort: None,
+                approval_policy: None,
+                sandbox: None,
+                provider: Some("fake".to_string()),
+                initial_prompt: Some("first".to_string()),
+                project_id: None,
+            })
+            .await
+            .expect("start session");
+        let thread_id = session.active_thread_id.clone().expect("thread id");
+        wait_for_completed_agent_text(&app).await;
+
+        // A real ledger with today's spend already past the cap. Written through
+        // the store rather than stubbed, because the gate reads the same query
+        // the Usage screen does and a stub would not exercise the day boundary.
+        let ledger = TempDir::new().expect("ledger tempdir");
+        let store = crate::usage::store::UsageStore::open(&ledger.path().join("token-usage.db"));
+        store.record(&crate::usage::store::TokenEvent {
+            at: crate::state::unix_now(),
+            provider: "fake".to_string(),
+            thread_id: thread_id.clone(),
+            usage: crate::usage::TokenUsage {
+                total: 9_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        {
+            let mut relay = app.relay.write().await;
+            relay.usage_store = store;
+            relay.usage_budget = crate::usage::budget::BudgetSettings {
+                daily_cap: Some(1_000),
+                policy: crate::usage::budget::BudgetPolicy::StopEverything,
+            };
+        }
+
+        let error = app
+            .send_message(SendMessageInput {
+                text: "one more".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: thread_id.clone(),
+            })
+            .await
+            .expect_err("a send past the cap must be refused under stop_everything");
+        assert!(
+            error.contains("daily token budget is used up"),
+            "the refusal must say why, got: {error}"
+        );
+        assert!(
+            error.contains("9k of 1k"),
+            "the refusal must carry the numbers, got: {error}"
+        );
+    }
+
+    /// The half of the policy that is easy to get backwards: the softer setting
+    /// must NOT lock a person out of their own transcript at the moment they
+    /// most need to look at it.
+    #[tokio::test]
+    async fn holding_new_work_still_lets_a_person_send_past_the_cap() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, _p, _o) = build_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let session = app
+            .start_session(StartSessionInput {
+                device_id: Some("device-1".to_string()),
+                cwd: Some(cwd.to_string()),
+                model: Some("fake-echo".to_string()),
+                effort: None,
+                approval_policy: None,
+                sandbox: None,
+                provider: Some("fake".to_string()),
+                initial_prompt: Some("first".to_string()),
+                project_id: None,
+            })
+            .await
+            .expect("start session");
+        let thread_id = session.active_thread_id.clone().expect("thread id");
+        wait_for_completed_agent_text(&app).await;
+
+        let ledger = TempDir::new().expect("ledger tempdir");
+        let store = crate::usage::store::UsageStore::open(&ledger.path().join("token-usage.db"));
+        store.record(&crate::usage::store::TokenEvent {
+            at: crate::state::unix_now(),
+            provider: "fake".to_string(),
+            thread_id: thread_id.clone(),
+            usage: crate::usage::TokenUsage {
+                total: 9_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        {
+            let mut relay = app.relay.write().await;
+            relay.usage_store = store;
+            relay.usage_budget = crate::usage::budget::BudgetSettings {
+                daily_cap: Some(1_000),
+                policy: crate::usage::budget::BudgetPolicy::HoldNewWork,
+            };
+        }
+
+        app.send_message(SendMessageInput {
+            text: "let me look at this".to_string(),
+            model: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            thread_id,
+        })
+        .await
+        .expect("hold_new_work must not refuse a person");
+    }
+
     #[tokio::test]
     async fn send_message_with_thread_id_takes_over_and_targets_that_thread() {
         let project = TempDir::new().expect("project tempdir");
@@ -3801,6 +6518,7 @@ got {}",
                     effort: None,
                     device_id: Some("device-1".to_string()),
                     provider: Some("codex".to_string()),
+                    project_id: None,
                 },
                 vec![image.clone()],
             )
@@ -3836,6 +6554,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -3926,7 +6645,13 @@ got {}",
         // what the healed thread inherits. Healing binds the strictest policy
         // instead, and the snapshot says so, so the UI cannot claim write
         // access the thread does not have.
-        let app = build_fake_codex_app("/tmp/project").await;
+        // A REAL directory, not a stand-in path: a send now refuses a workspace that is
+        // not on disk (see `a_send_into_a_vanished_workspace_is_refused_visibly_…`), so a
+        // fixture cwd that never existed would exercise that refusal instead of the
+        // cold-hydration heal this test is about.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = build_fake_codex_app(&cwd).await;
         pair_device(&app, "device-1", Vec::new()).await;
         let thread_id = "thread-imported";
         {
@@ -3935,10 +6660,11 @@ got {}",
             relay.approval_policy = "bypass".to_string();
             relay.sandbox = "danger-full-access".to_string();
             relay.threads = vec![ThreadSummaryView {
+                workspace_trusted: false,
                 id: thread_id.to_string(),
                 name: Some("imported codex thread".to_string()),
                 preview: String::new(),
-                cwd: "/tmp/project".to_string(),
+                cwd: cwd.clone(),
                 updated_at: unix_now(),
                 source: "codex".to_string(),
                 status: "idle".to_string(),
@@ -3947,6 +6673,13 @@ got {}",
                 forked_from: None,
                 renamed: false,
             }];
+            // The runtime carries the live cwd too, so the send reads it from here rather
+            // than from `thread/read`. The fake app-server answers every read with a
+            // hardcoded `/tmp/project` (208 fixtures in this crate lean on that string),
+            // and a send now refuses a workspace that is not on disk — so without this the
+            // test would exercise the vanished-workspace refusal instead of the cold
+            // hydration heal it exists to pin.
+            relay.ensure_runtime_for_thread(thread_id).current_cwd = cwd.clone();
         }
 
         let snapshot = app
@@ -4334,6 +7067,158 @@ got {}",
                 .as_ref()
                 .and_then(|summary| summary.name.clone()),
             expected_name
+        );
+    }
+
+    /// A transcript page must report the revision of the runtime it was built
+    /// from. The paged provider-history branch used to hard-code 0 while its
+    /// sibling branches read the runtime — invisible only for as long as a fresh
+    /// runtime also started at 0. A client that adopts a page revision of 0 for a
+    /// runtime sitting at N then rejects every delta as stale.
+    #[tokio::test]
+    async fn a_cold_paged_transcript_page_reports_the_runtimes_revision() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, _codex, claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = claude.thread_summary("claude-paged-revision", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(thread.id.clone(), thread.clone());
+        {
+            let mut pages = claude.transcript_pages.lock().await;
+            pages.insert(
+                (thread.id.clone(), None),
+                crate::provider::ThreadTranscriptPageData {
+                    sync: crate::provider::ThreadSyncData {
+                        thread: thread.clone(),
+                        status: "idle".to_string(),
+                        active_flags: Vec::new(),
+                        transcript: vec![crate::protocol::TranscriptEntryView {
+                            item_id: Some("tail".to_string()),
+                            kind: crate::protocol::TranscriptEntryKind::AgentText,
+                            text: Some("tail".to_string()),
+                            status: "completed".to_string(),
+                            turn_id: Some("tail".to_string()),
+                            tool: None,
+                            content_state: crate::protocol::TranscriptContentState::Full,
+                        }],
+                    },
+                    prev_cursor: Some(123),
+                    paged: true,
+                },
+            );
+        }
+        app.relay.write().await.threads = vec![thread.clone()];
+
+        let tail = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: thread.id.clone(),
+                cursor: None,
+                before: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("cold tail page");
+        assert_eq!(
+            tail.prev_cursor,
+            Some(123),
+            "precondition: took the paged branch"
+        );
+
+        let relay = app.relay.read().await;
+        let runtime_revision = relay
+            .runtime_for_thread(&thread.id)
+            .expect("paged runtime")
+            .transcript_revision;
+        assert!(
+            runtime_revision > 0,
+            "precondition: the hydrated runtime drew a revision from the shared clock"
+        );
+        assert_eq!(
+            tail.revision, runtime_revision,
+            "the page claims revision {} but the runtime it was built from is at {}",
+            tail.revision, runtime_revision
+        );
+    }
+
+    /// A page's `revision` is a claim about WHICH state its entries came from.
+    /// `runtime_missing` is decided before the provider await, so a stream event can
+    /// build and advance the runtime while that read is in flight. Serving the now
+    /// stale provider entries under the runtime's current revision tells the client
+    /// "you are caught up at R" while withholding what R actually contains — and
+    /// because the chain then lines up, no gap repair ever fires.
+    #[tokio::test]
+    async fn a_cold_page_that_lost_the_hydration_race_does_not_claim_a_revision_it_does_not_cover()
+    {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (app, _codex, claude) = build_recording_provider_app(cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = claude.thread_summary("claude-raced-thread", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(thread.id.clone(), thread.clone());
+        {
+            let mut pages = claude.transcript_pages.lock().await;
+            pages.insert(
+                (thread.id.clone(), None),
+                crate::provider::ThreadTranscriptPageData {
+                    sync: crate::provider::ThreadSyncData {
+                        thread: thread.clone(),
+                        status: "idle".to_string(),
+                        active_flags: Vec::new(),
+                        transcript: vec![crate::protocol::TranscriptEntryView {
+                            item_id: Some("stale-tail".to_string()),
+                            kind: crate::protocol::TranscriptEntryKind::AgentText,
+                            text: Some("stale".to_string()),
+                            status: "completed".to_string(),
+                            turn_id: Some("stale-tail".to_string()),
+                            tool: None,
+                            content_state: crate::protocol::TranscriptContentState::Full,
+                        }],
+                    },
+                    prev_cursor: Some(123),
+                    paged: true,
+                },
+            );
+        }
+        app.relay.write().await.threads = vec![thread.clone()];
+        claude
+            .advance_runtime_during_page_read
+            .store(true, Ordering::Relaxed);
+
+        let page = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: thread.id.clone(),
+                cursor: None,
+                before: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("cold tail page");
+
+        let runtime_revision = {
+            let relay = app.relay.read().await;
+            relay
+                .runtime_for_thread(&thread.id)
+                .expect("runtime")
+                .transcript_revision
+        };
+        let covers_live_entry = page
+            .entries
+            .iter()
+            .any(|entry| entry.item_id.as_deref() == Some("live-entry"));
+        assert!(
+            page.revision < runtime_revision || covers_live_entry,
+            "the page claims revision {} (runtime is at {runtime_revision}) but omits              the entry that revision includes; the client would believe it is caught              up and never repair",
+            page.revision
         );
     }
 
@@ -5376,6 +8261,7 @@ got {}",
             let mut relay = app.relay.write().await;
             relay.activate_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "thread-1".to_string(),
                     name: Some("AskUser thread".to_string()),
                     preview: "pending ask-user".to_string(),
@@ -5473,6 +8359,7 @@ got {}",
 
         fn summary(&self, id: &str, cwd: &str) -> ThreadSummaryView {
             ThreadSummaryView {
+                workspace_trusted: false,
                 id: id.to_string(),
                 name: Some(format!("{} thread", self.name)),
                 preview: String::new(),
@@ -5521,12 +8408,15 @@ got {}",
 
         async fn start_thread(
             &self,
-            cwd: &str,
-            model: &str,
-            _approval_policy: &str,
-            _sandbox: &str,
-            initial_prompt: Option<&str>,
+            request: crate::provider::StartThreadRequest,
         ) -> Result<StartThreadResult, String> {
+            let cwd = request.cwd.as_str();
+            let model = request.model.as_str();
+            let approval_policy = request.approval_policy.as_str();
+            let sandbox = request.sandbox.as_str();
+            let initial_prompt = request.initial_prompt.as_deref();
+            let _ = (model, approval_policy, sandbox, initial_prompt);
+
             self.seen_models.lock().unwrap().push(model.to_string());
             let id = format!(
                 "{}-thread-{}",
@@ -5694,6 +8584,7 @@ got {}",
 
         fn thread_summary(thread_id: String, cwd: &str, preview: String) -> ThreadSummaryView {
             ThreadSummaryView {
+                workspace_trusted: false,
                 id: thread_id,
                 name: Some("Consumed Initial Prompt Session".to_string()),
                 preview,
@@ -5730,12 +8621,15 @@ got {}",
 
         async fn start_thread(
             &self,
-            cwd: &str,
-            _model: &str,
-            _approval_policy: &str,
-            _sandbox: &str,
-            initial_prompt: Option<&str>,
+            request: crate::provider::StartThreadRequest,
         ) -> Result<crate::provider::StartThreadResult, String> {
+            let cwd = request.cwd.as_str();
+            let model = request.model.as_str();
+            let approval_policy = request.approval_policy.as_str();
+            let sandbox = request.sandbox.as_str();
+            let initial_prompt = request.initial_prompt.as_deref();
+            let _ = (model, approval_policy, sandbox, initial_prompt);
+
             let thread_id = self.next_thread_id();
             let preview = initial_prompt.unwrap_or_default().to_string();
             let thread = Self::thread_summary(thread_id, cwd, preview.clone());
@@ -5948,6 +8842,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect_err("start_session outside scope should fail");
@@ -5966,6 +8861,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session inside scope should succeed");
@@ -5990,6 +8886,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("unscoped device should succeed within relay roots");
@@ -6070,6 +8967,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("EARLY-MARKER first goal".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6111,6 +9009,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork at message");
@@ -6163,6 +9062,7 @@ got {}",
                 sandbox: Some("read-only".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("restricted work".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6180,6 +9080,7 @@ got {}",
             sandbox: Some("danger-full-access".to_string()),
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start permissive session");
@@ -6196,6 +9097,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork inherits");
@@ -6230,6 +9132,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("source work".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6250,6 +9153,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect("replay fork");
@@ -6288,6 +9192,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("some work".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6306,6 +9211,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
+                project_id: None,
             })
             .await
             .expect_err("unknown fork point must not silently fork the whole thread");
@@ -6331,6 +9237,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("source goal: build fork support".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6349,6 +9256,7 @@ got {}",
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
                 up_to_item_id: None,
+                project_id: None,
             })
             .await
             .expect("fork source");
@@ -6417,6 +9325,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -6480,6 +9389,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -6537,6 +9447,7 @@ got {}",
                     effort: None,
                     device_id: Some("device-1".to_string()),
                     provider: Some("codex".to_string()),
+                    project_id: None,
                 },
                 vec![ProviderImage {
                     media_type: "image/png".to_string(),
@@ -6601,6 +9512,7 @@ got {}",
                 effort: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("codex".to_string()),
+                project_id: None,
             },
             vec![image.clone()],
         )
@@ -6651,6 +9563,7 @@ got {}",
             effort: None,
             device_id: Some("device-1".to_string()),
             provider: Some("codex".to_string()),
+            project_id: None,
         })
         .await
         .expect("fork without a prompt should succeed");
@@ -6734,6 +9647,7 @@ got {}",
                 sandbox: None,
                 provider: Some("statusy".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6753,6 +9667,7 @@ got {}",
                 sandbox: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("statusy".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork");
@@ -6793,6 +9708,7 @@ got {}",
                 sandbox: None,
                 provider: Some("statusy".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6812,6 +9728,7 @@ got {}",
                 sandbox: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("statusy".to_string()),
+                project_id: None,
             })
             .await
             .expect("fork with an explicit model");
@@ -6844,6 +9761,7 @@ got {}",
                 sandbox: None,
                 provider: Some("alpha".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -6861,6 +9779,7 @@ got {}",
                 sandbox: None,
                 device_id: Some("device-1".to_string()),
                 provider: Some("beta".to_string()),
+                project_id: None,
             })
             .await
             .expect("cross-provider fork");
@@ -6919,6 +9838,7 @@ got {}",
                 sandbox: None,
                 provider: Some("beta".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start beta session")
@@ -6941,6 +9861,7 @@ got {}",
                 sandbox: None,
                 provider: Some("alpha".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start alpha session")
@@ -7036,6 +9957,7 @@ got {}",
                 sandbox: None,
                 provider: Some("beta".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start beta session")
@@ -7053,6 +9975,7 @@ got {}",
             sandbox: None,
             provider: Some("alpha".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start alpha session");
@@ -7121,6 +10044,7 @@ got {}",
                 sandbox: None,
                 provider: Some("statusy".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -7137,6 +10061,7 @@ got {}",
             effort: None,
             device_id: Some("device-1".to_string()),
             provider: Some("statusy".to_string()),
+            project_id: None,
         })
         .await
         .expect("a saved (notLoaded) thread must be forkable");
@@ -7162,6 +10087,7 @@ got {}",
                 sandbox: None,
                 provider: Some(forked.to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start quiet thread");
@@ -7177,6 +10103,7 @@ got {}",
             sandbox: None,
             provider: Some(busy.to_string()),
             initial_prompt: Some("keep this turn running briefly".to_string()),
+            project_id: None,
         })
         .await
         .expect("start busy thread");
@@ -7192,6 +10119,7 @@ got {}",
             effort: None,
             device_id: Some("device-1".to_string()),
             provider: Some(forked.to_string()),
+            project_id: None,
         })
         .await
         .unwrap_or_else(|error| {
@@ -7226,6 +10154,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("keep this turn running briefly".to_string()),
+                project_id: None,
             })
             .await
             .expect("start source");
@@ -7243,6 +10172,7 @@ got {}",
                 device_id: Some("device-1".to_string()),
                 provider: Some("fake".to_string()),
                 up_to_item_id: None,
+                project_id: None,
             })
             .await
             .expect_err("running source must not fork");
@@ -7275,6 +10205,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7290,6 +10221,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7409,6 +10341,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: Some("Hellooo".to_string()),
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7427,6 +10360,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7487,6 +10421,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7518,6 +10453,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7586,6 +10522,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start");
@@ -7627,6 +10564,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7662,6 +10600,7 @@ got {}",
                 sandbox: Some("workspace-write".to_string()),
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7754,6 +10693,7 @@ got {}",
                 sandbox: None,
                 provider: Some("consumed-initial".to_string()),
                 initial_prompt: Some("finish before start returns".to_string()),
+                project_id: None,
             })
             .await
             .expect("start consumed initial prompt");
@@ -7800,6 +10740,7 @@ got {}",
                 sandbox: None,
                 provider: Some("consumed-initial".to_string()),
                 initial_prompt: Some("Hellooo".to_string()),
+                project_id: None,
             })
             .await
             .expect("start A");
@@ -7838,6 +10779,7 @@ got {}",
                 sandbox: None,
                 provider: Some("consumed-initial".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("start B");
@@ -7917,6 +10859,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("wide device should start session");
@@ -7960,6 +10903,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("wide device should start session");
@@ -8013,6 +10957,7 @@ got {}",
                 sandbox: None,
                 provider: Some("fake".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("wide device should start session");
@@ -8091,18 +11036,22 @@ got {}",
 
         async fn start_thread(
             &self,
-            cwd: &str,
-            model: &str,
-            _approval_policy: &str,
-            _sandbox: &str,
-            _initial_prompt: Option<&str>,
+            request: crate::provider::StartThreadRequest,
         ) -> Result<crate::provider::StartThreadResult, String> {
+            let cwd = request.cwd.as_str();
+            let model = request.model.as_str();
+            let approval_policy = request.approval_policy.as_str();
+            let sandbox = request.sandbox.as_str();
+            let initial_prompt = request.initial_prompt.as_deref();
+            let _ = (model, approval_policy, sandbox, initial_prompt);
+
             self.seen_models.lock().await.push(model.to_string());
             if let Some(err) = self.reject(model) {
                 return Err(err);
             }
             let id = format!("{}-thread-1", self.name);
             let thread = ThreadSummaryView {
+                workspace_trusted: false,
                 id: id.clone(),
                 name: Some(format!("{} thread", self.name)),
                 preview: String::new(),
@@ -8264,6 +11213,7 @@ got {}",
                 sandbox: None,
                 provider: Some("codex".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("codex inherited default alias should normalize to a concrete model");
@@ -8316,6 +11266,7 @@ got {}",
             sandbox: None,
             provider: Some("claude_code".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("claude resolves \"default\" and should start successfully");
@@ -8335,6 +11286,7 @@ got {}",
             let id = format!("seeded-thread-{index}");
             let is_oldest = index + 1 == count;
             let mut summary = ThreadSummaryView {
+                workspace_trusted: false,
                 id: id.clone(),
                 name: Some(format!("Routine session {index}")),
                 preview: String::new(),
@@ -8377,7 +11329,7 @@ got {}",
         let buried_id = seed_listable_threads(&codex, &cwd, 300, "Refactor the auth guard").await;
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8427,7 +11379,7 @@ got {}",
         );
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("search");
         assert!(
@@ -8461,6 +11413,7 @@ got {}",
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session");
@@ -8485,7 +11438,7 @@ got {}",
 
         // Case-insensitive, and finds the user's title.
         let found = app
-            .list_threads_matching(50, None, Some("auth WORK"))
+            .list_threads_matching(50, None, Some("auth WORK"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8495,7 +11448,7 @@ got {}",
         );
 
         let stale = app
-            .list_threads_matching(50, None, Some("Fake E2E"))
+            .list_threads_matching(50, None, Some("Fake E2E"), None)
             .await
             .expect("search");
         assert!(
@@ -8517,6 +11470,7 @@ got {}",
             threads.insert(
                 "untitled".to_string(),
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "untitled".to_string(),
                     name: None,
                     preview: "fix the scroll jitter".to_string(),
@@ -8535,6 +11489,7 @@ got {}",
             threads.insert(
                 "titled".to_string(),
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "titled".to_string(),
                     name: Some("Something else entirely".to_string()),
                     preview: "unrelated".to_string(),
@@ -8551,7 +11506,7 @@ got {}",
         }
 
         let found = app
-            .list_threads_matching(20, None, Some("scroll jitter"))
+            .list_threads_matching(20, None, Some("scroll jitter"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8583,7 +11538,7 @@ got {}",
         );
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("search");
         assert_eq!(found.threads.len(), 1, "the response must be narrowed");
@@ -8593,6 +11548,121 @@ got {}",
             cached.threads.len(),
             3,
             "a search must not strip non-matching threads from the routing cache"
+        );
+    }
+
+    /// The same invariant, for the id probe — which is NARROWER than a search and now
+    /// fires automatically on every remote boot rather than on a keystroke.
+    ///
+    /// Writing a probe's answer into `relay.threads` would leave the routing cache holding
+    /// only the handful of ids one client happened to ask about. Everything else stops
+    /// being routable while every sidebar keeps rendering it: `find_thread_provider` loses
+    /// its cache hit, `thread_cwd` returns `None` (and its callers reject the request),
+    /// push labels lose their names, and `upsert_thread` stops restoring previews. Worst
+    /// case — every probed session really is gone — the answer is empty and the cache is
+    /// wiped to reviewer rows.
+    #[tokio::test]
+    async fn thread_id_probe_does_not_evict_the_routing_cache() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+        let listed = app.list_threads(20, None).await.expect("list");
+        assert_eq!(
+            app.relay.read().await.threads.len(),
+            3,
+            "precondition: the unfiltered list must populate the routing cache"
+        );
+        let probed_id = listed.threads[0].id.clone();
+
+        let found = app
+            .list_threads_matching(20, None, None, Some(&[probed_id]))
+            .await
+            .expect("probe");
+        assert_eq!(found.threads.len(), 1, "the response must be narrowed");
+
+        assert_eq!(
+            app.relay.read().await.threads.len(),
+            3,
+            "a probe must not strip the threads it did not ask about out of the routing cache"
+        );
+    }
+
+    /// ...and a probe that resolves NOTHING is the same claim, at its most destructive.
+    #[tokio::test]
+    async fn thread_id_probe_that_resolves_nothing_leaves_the_routing_cache_alone() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+        app.list_threads(20, None).await.expect("list");
+
+        let found = app
+            .list_threads_matching(20, None, None, Some(&["not-a-thread".to_string()]))
+            .await
+            .expect("probe");
+        assert!(found.threads.is_empty(), "nothing resolves");
+
+        assert_eq!(
+            app.relay.read().await.threads.len(),
+            3,
+            "an empty answer must not be mistaken for an authoritative empty list"
+        );
+    }
+
+    /// An over-cap probe is REFUSED, not truncated.
+    ///
+    /// Truncating drops the overflow, and a dropped id is absent from the answer — which
+    /// is precisely how a probe's caller concludes "deleted". That turns one number
+    /// disagreeing across two languages into mass closure of live sessions, silently, in
+    /// the one direction (lowering this cap) that looks harmless from the Rust side.
+    ///
+    /// Refusing makes the contract enforced rather than documented: a client that asks for
+    /// too much gets an error, and `sweepMissingThreads` discards any sweep it could not
+    /// complete — so the failure mode is "nothing happened" rather than "everything
+    /// closed". The client still chunks, which is why this is a backstop and not a
+    /// behaviour anyone should meet.
+    ///
+    /// Duplicates still collapse BEFORE the cap, or a caller repeating one id would spend
+    /// its budget twice on the same question and be refused a probe that is really about
+    /// a handful of sessions.
+    #[tokio::test]
+    async fn thread_id_probe_refuses_to_exceed_its_cap_rather_than_truncating() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+
+        seed_listable_threads(&codex, &cwd, 3, "Refactor the auth guard").await;
+        let listed = app.list_threads(20, None).await.expect("list");
+        let real = listed.threads[0].id.clone();
+
+        let mut ids = (0..200).map(|n| format!("junk-{n}")).collect::<Vec<_>>();
+        ids.push(real.clone());
+        assert!(
+            app.list_threads_matching(20, None, None, Some(&ids))
+                .await
+                .is_err(),
+            "an over-cap probe must fail loudly; answering about a subset is \
+             indistinguishable from the rest being gone"
+        );
+
+        // Same real id, repeated far past the cap: dedup first, so this is a probe about
+        // ONE session and must succeed.
+        let repeated = vec![real.clone(); 200];
+        let deduped = app
+            .list_threads_matching(20, None, None, Some(&repeated))
+            .await
+            .expect("probe");
+        assert_eq!(
+            deduped
+                .threads
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec![real],
+            "duplicates must collapse before the cap is applied"
         );
     }
 
@@ -8612,7 +11682,7 @@ got {}",
             .store(true, Ordering::Relaxed);
 
         let found = app
-            .list_threads_matching(20, None, Some("auth guard"))
+            .list_threads_matching(20, None, Some("auth guard"), None)
             .await
             .expect("a partial listing must still succeed");
         assert_eq!(
@@ -8650,6 +11720,7 @@ got {}",
             threads.insert(
                 "abcd1234-blank".to_string(),
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "abcd1234-blank".to_string(),
                     name: None,
                     preview: String::new(),
@@ -8668,7 +11739,7 @@ got {}",
 
         // Exactly the 8 characters the row displays.
         let found = app
-            .list_threads_matching(20, None, Some("abcd1234"))
+            .list_threads_matching(20, None, Some("abcd1234"), None)
             .await
             .expect("search");
         assert_eq!(
@@ -8680,7 +11751,7 @@ got {}",
         // A titled row must NOT be reachable by its id: the id is a fallback, not a
         // second searchable field, or every query would risk hitting unrelated rows.
         let by_id = app
-            .list_threads_matching(20, None, Some("seeded-thread-0"))
+            .list_threads_matching(20, None, Some("seeded-thread-0"), None)
             .await
             .expect("search");
         assert!(
@@ -8706,6 +11777,7 @@ got {}",
             threads.insert(
                 "long".to_string(),
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "long".to_string(),
                     name: None,
                     preview: format!("{prefix}TAIL"),
@@ -8722,13 +11794,13 @@ got {}",
         }
 
         let hit = app
-            .list_threads_matching(20, None, Some(&format!("{prefix}TAIL")))
+            .list_threads_matching(20, None, Some(&format!("{prefix}TAIL")), None)
             .await
             .expect("search");
         assert_eq!(hit.threads.len(), 1, "the full query must still match");
 
         let miss = app
-            .list_threads_matching(20, None, Some(&format!("{prefix}NOPE")))
+            .list_threads_matching(20, None, Some(&format!("{prefix}NOPE")), None)
             .await
             .expect("search");
         assert!(
@@ -8749,7 +11821,7 @@ got {}",
 
         for blank in ["", "   "] {
             let listed = app
-                .list_threads_matching(20, None, Some(blank))
+                .list_threads_matching(20, None, Some(blank), None)
                 .await
                 .expect("search");
             assert_eq!(
@@ -8758,6 +11830,343 @@ got {}",
                 "a blank query ({blank:?}) must behave as no query at all"
             );
         }
+    }
+
+    /// A thread carries the cwd it was born in forever, and that directory can stop
+    /// existing — an agent `git worktree` is removed once its work lands, and the thread
+    /// that lived in it keeps pointing at the vanished path.
+    ///
+    /// What that used to do: the send reached the provider, the provider spawned into a
+    /// path with no inode, and the OS answered ENOENT — which the Claude SDK reports as
+    /// "native binary exists but failed to launch … musl/glibc mismatch", a message that
+    /// sends anyone reading it in completely the wrong direction. Nothing landed in the
+    /// transcript at all, so the user saw their own message and then silence, and pressing
+    /// it again did the same thing. That is the "一直被中断，按继续也没用" report.
+    ///
+    /// So the workspace is checked BEFORE the provider is asked to do anything, and the
+    /// refusal is written where the user is already looking: the transcript.
+    #[tokio::test]
+    async fn a_send_into_a_vanished_workspace_is_refused_visibly_instead_of_reaching_the_provider()
+    {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(thread.id.clone());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+
+        // The workspace disappears the way `git worktree remove` takes one out.
+        drop(project);
+
+        let error = app
+            .send_message(SendMessageInput {
+                text: "继续".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .expect_err(
+                "the send must FAIL, so the composer keeps the draft: both surfaces clear \
+                 their input and drop image attachments on success, and a message recorded \
+                 here reached no provider — a later \"continue\" would be continuing from \
+                 something the agent never saw",
+            );
+        assert!(
+            error.contains(&cwd),
+            "the returned error must name the directory that is gone: {error}"
+        );
+
+        assert!(
+            codex.turn_thread_ids.lock().await.is_empty(),
+            "a turn must never be started in a workspace that no longer exists"
+        );
+
+        let state = app
+            .read_thread_transcript(ReadThreadTranscriptInput {
+                thread_id: thread.id.clone(),
+                before: None,
+                cursor: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("a broken workspace must not make the thread unreadable")
+            .thread_state
+            .expect("a first page carries the thread state");
+        let missing = state.workspace_missing.expect(
+            "the thread state must say the workspace is gone, so a surface can offer \
+             the repair instead of a dead composer",
+        );
+        assert_eq!(missing.recorded_cwd, cwd);
+
+        let relay = app.relay.read().await;
+        let transcript = &relay
+            .runtime_for_thread(&thread.id)
+            .expect("the target thread keeps its runtime")
+            .transcript;
+
+        assert!(
+            !transcript.iter().any(|entry| {
+                entry.kind == crate::protocol::TranscriptEntryKind::UserText
+                    && entry.text.as_deref() == Some("继续")
+            }),
+            "the refused message must NOT be recorded: the transcript would then show text \
+             (and silently drop images) that no provider ever received: {transcript:?}"
+        );
+
+        let error = transcript
+            .iter()
+            .find(|entry| entry.kind == crate::protocol::TranscriptEntryKind::Error)
+            .expect(
+                "a vanished workspace must be reported IN the transcript — a toast that \
+                 disappears is what made this look like nothing happened at all",
+            );
+        let text = error.text.clone().unwrap_or_default();
+        assert!(
+            text.contains(&cwd),
+            "the error must name the directory that is gone, so the user can see WHICH \
+             workspace died: {text}"
+        );
+    }
+
+    /// Opening the thread is how the user REACHES the repair, so opening must not be the
+    /// thing that fails. Resuming asks the provider to materialize a session in the cwd —
+    /// which, for Claude, spawns the CLI there and dies at ENOENT — so a thread whose
+    /// workspace vanished would refuse to open at all, and the banner offering to rebuild
+    /// it would have nowhere to render. The provider is simply not asked.
+    #[tokio::test]
+    async fn a_thread_whose_workspace_vanished_still_opens_so_the_repair_is_reachable() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+
+        drop(project);
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: thread.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            })
+            .await
+            .expect("a thread with a dead workspace must still open — the repair lives in its UI");
+
+        assert_eq!(
+            snapshot.active_thread_id.as_deref(),
+            Some(thread.id.as_str())
+        );
+        assert!(
+            codex.resume_thread_ids.lock().await.is_empty(),
+            "the provider must not be asked to materialize a session in a directory that \
+             is not there"
+        );
+    }
+
+    /// The state after every relay restart: the thread exists in the cached list, but
+    /// nothing has hydrated it yet. That is exactly when a user comes back to a worktree
+    /// that was cleaned up while they were away — and the path that every other test in
+    /// this file hid, by seeding a runtime first.
+    ///
+    /// It matters because the provider read is not inert. ACP answers `read_thread` with
+    /// `session/load` IN the recorded cwd, so a cold thread whose workspace vanished used
+    /// to fail inside the provider — raw error, no banner, nothing in the transcript —
+    /// before any of this could refuse it. The cached thread row already carries the cwd,
+    /// so the decision costs no round trip and happens first.
+    #[tokio::test]
+    async fn a_cold_thread_with_no_runtime_is_refused_before_its_provider_is_touched() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-cold", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            // The cached LIST only — deliberately no runtime, the way a restarted relay
+            // knows a thread it has not opened yet.
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+        }
+        drop(project);
+        let reads_before = codex.read_thread_calls.load(Ordering::Relaxed);
+
+        let error = app
+            .send_message(SendMessageInput {
+                text: "继续".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .expect_err("a cold thread with a dead workspace must be refused, not hydrated");
+        assert!(
+            error.contains(&cwd),
+            "the refusal must name the directory: {error}"
+        );
+        assert_eq!(
+            codex.read_thread_calls.load(Ordering::Relaxed),
+            reads_before,
+            "the provider must not be read at all: for ACP that read runs session/load IN \
+             the workspace that is gone"
+        );
+        assert!(codex.turn_thread_ids.lock().await.is_empty());
+
+        // And the same thread still OPENS, because opening is how the repair is reached.
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: thread.id.clone(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("codex".to_string()),
+            })
+            .await
+            .expect("a cold thread with a dead workspace must still open");
+        assert!(
+            snapshot
+                .workspace_missing
+                .as_ref()
+                .is_some_and(|missing| missing.recorded_cwd == cwd),
+            "the snapshot must carry the verdict, so the banner needs no extra round trip"
+        );
+        assert!(codex.resume_thread_ids.lock().await.is_empty());
+    }
+
+    /// The whole point of the banner: one press and the thread is usable again. Anything
+    /// short of "a send now reaches the provider" is a button that only looks like a fix.
+    #[tokio::test]
+    async fn repairing_the_workspace_puts_the_thread_back_to_work() {
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(&app, "device-1", Vec::new()).await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut threads = codex.threads.lock().await;
+            threads.insert(thread.id.clone(), thread.clone());
+        }
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(thread.id.clone());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+        drop(project);
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("re-creating a vanished workspace should succeed");
+
+        app.send_message(SendMessageInput {
+            text: "继续".to_string(),
+            model: None,
+            effort: None,
+            device_id: Some("device-1".to_string()),
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .expect("send after repair");
+
+        assert_eq!(
+            *codex.turn_thread_ids.lock().await,
+            vec![thread.id.clone()],
+            "after the repair the turn must actually reach the provider"
+        );
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect(
+            "repairing an already-live workspace must SUCCEED: there is a real gap between \
+             the verdict a surface was shown and the press that follows it (another device \
+             repaired it, the user made the directory by hand, two taps raced), and in every \
+             one of those the postcondition already holds",
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A device confined to one project must not be able to make the relay write outside
+    /// it — the repair creates directories, so it is a write like any other.
+    #[tokio::test]
+    async fn repairing_a_workspace_outside_the_devices_scope_is_refused() {
+        let project = TempDir::new().expect("project tempdir");
+        let scope = TempDir::new().expect("scope tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, codex, _claude) = build_recording_provider_app(&cwd).await;
+        pair_device(
+            &app,
+            "device-1",
+            vec![scope.path().to_string_lossy().to_string()],
+        )
+        .await;
+
+        let thread = codex.thread_summary("codex-thread-gone", &cwd);
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.threads = vec![thread.clone()];
+            relay.ensure_runtime_for_thread(&thread.id).current_cwd = cwd.clone();
+        }
+        drop(project);
+
+        app.repair_thread_workspace(
+            &thread.id,
+            RepairWorkspaceInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect_err("a scoped device must not re-create a workspace outside its scope");
+        assert!(
+            !std::path::Path::new(&cwd).exists(),
+            "a refused repair must leave nothing behind"
+        );
     }
 }
 
@@ -8806,6 +12215,11 @@ mod review_tests {
         // When true, `request_turn_stop` errors.
         interrupt_fails: Arc<AtomicBool>,
         interrupts: Arc<Mutex<Vec<String>>>,
+        // Test-only latch for one selected stop request. This creates the exact
+        // multi-thread drain window where an earlier owned thread has stopped
+        // but a later one is still working.
+        hold_turn_stop_for: Arc<Mutex<Option<String>>>,
+        turn_stop_barrier: Arc<Mutex<()>>,
         // When set, the first completing turn also injects a pending approval for
         // an unrelated background thread — it must NOT fail the review.
         inject_unrelated_approval: Arc<AtomicBool>,
@@ -8844,6 +12258,34 @@ mod review_tests {
         // guard that must refuse to reuse a thread's PRIOR review as this turn's
         // result. Recap/other turns still reply normally.
         suppress_reviewer_reply: Arc<AtomicBool>,
+        // Replies to emit, one popped per turn (FIFO), overriding every other
+        // reply rule. Lets a test script a whole multi-role pipeline in order.
+        scripted_replies: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // Errors `start_turn` should return, one popped per turn (FIFO). Models a
+        // provider refusing a turn — a full context window is the case that
+        // matters, since it is the only honest re-seed trigger.
+        fail_next_turn_with: Arc<Mutex<std::collections::VecDeque<String>>>,
+        // When true, a turn that fails via `fail_next_turn_with` first publishes
+        // liveness. That is the DANGEROUS shape of a failed start: the provider
+        // began work and only the response was lost, so the turn may still be
+        // running and a drain cannot confirm otherwise. Without this the thread is
+        // idle when the error arrives, the drain confirms trivially, and the path
+        // worth testing is never reached.
+        fail_next_turn_live: Arc<AtomicBool>,
+        // Milliseconds AFTER the error before liveness appears. The real
+        // response-lost shape: `start_turn` returns an error and the turn it
+        // started announces itself a beat later. A stop issued before that beat
+        // looks at an idle thread and answers "stopped" for a turn that is running.
+        fail_next_turn_live_delay_ms: Arc<AtomicU64>,
+        // When set, every turn EXCEPT a team-lead handover fails with this error.
+        // Models a lead that can always be briefed but always dies on real work,
+        // which is what drives the succession chain to its cap.
+        fail_work_turns_with: Arc<Mutex<Option<String>>>,
+        // AskUserQuestion request ids that were actually ANSWERED through the
+        // bridge. A parked turn watches this rather than the pending map, because
+        // cleanup also empties that map — and a turn that was drained must not
+        // then behave as though someone had answered it.
+        answered_asks: Arc<Mutex<std::collections::HashSet<String>>>,
         // Verdicts the reviewer should emit, one popped per reviewer turn (FIFO).
         // Empty → default NEEDS_CHANGES. Drives the iterative loop in tests.
         reviewer_verdicts: Arc<Mutex<std::collections::VecDeque<String>>>,
@@ -8891,6 +12333,29 @@ mod review_tests {
         // models a provider whose updated_at is a bumpable mtime (like Codex) →
         // resume freezes (or-insert) to avoid click-to-top creep.
         report_activity_time: Arc<AtomicBool>,
+        // When true, models Claude's DEFERRED START: `start_thread` with no
+        // initial prompt cannot get a session id out of the SDK, so it hands back
+        // a synthetic `claude-pending-…` placeholder and the real session is only
+        // created by the FIRST turn — which promotes the placeholder to the real
+        // id (`RelayState::promote_background_thread`) before `start_turn`
+        // returns, exactly as `claude.rs` does off the worker's ordered stdout.
+        // Codex has no such phase: `thread/start` returns a real id.
+        deferred_start: Arc<AtomicBool>,
+        // When true, a turn that PROMOTED a deferred-start placeholder then loses its
+        // start response — the SDK session exists and is running, but the caller only
+        // sees an error. Distinct from `fail_next_turn_with`, which fails BEFORE
+        // promotion (nothing was ever created). This is the shape where an orphaned
+        // agent can keep working after its run is torn down.
+        fail_turn_after_promotion: Arc<AtomicBool>,
+        // When true, the turn runs to completion BEFORE `start_turn` returns.
+        // The relay reads a provider's stdout on its own task, so a turn's terminal
+        // line can be processed while the caller of `start_turn` is still waiting to
+        // re-acquire the relay lock — the caller then writes its turn bookkeeping on
+        // top of already-settled state.
+        settle_turn_before_start_returns: Arc<AtomicBool>,
+        // placeholder id -> the real id its first turn promoted it to, drained by
+        // `resolve_started_thread_id` exactly as the Claude bridge does.
+        promoted_thread_ids: Arc<Mutex<HashMap<String, String>>>,
         next_id: Arc<AtomicU64>,
     }
 
@@ -8910,6 +12375,8 @@ mod review_tests {
                 deny_fails: Arc::new(AtomicBool::new(false)),
                 interrupt_fails: Arc::new(AtomicBool::new(false)),
                 interrupts: Arc::new(Mutex::new(Vec::new())),
+                hold_turn_stop_for: Arc::new(Mutex::new(None)),
+                turn_stop_barrier: Arc::new(Mutex::new(())),
                 inject_unrelated_approval: Arc::new(AtomicBool::new(false)),
                 raise_ask_user: Arc::new(AtomicBool::new(false)),
                 ask_user_on_reviewer_turn: Arc::new(AtomicBool::new(false)),
@@ -8922,6 +12389,12 @@ mod review_tests {
                 fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
+                scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                fail_next_turn_with: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                fail_next_turn_live: Arc::new(AtomicBool::new(false)),
+                fail_next_turn_live_delay_ms: Arc::new(AtomicU64::new(0)),
+                fail_work_turns_with: Arc::new(Mutex::new(None)),
+                answered_asks: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 reviewer_verdicts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 raise_approval_on_fix_turn: Arc::new(AtomicBool::new(false)),
                 suppress_fix_reply: Arc::new(AtomicBool::new(false)),
@@ -8934,8 +12407,56 @@ mod review_tests {
                 resumes: Arc::new(Mutex::new(Vec::new())),
                 complete_delay_ms: Arc::new(AtomicU64::new(15)),
                 report_activity_time: Arc::new(AtomicBool::new(false)),
+                deferred_start: Arc::new(AtomicBool::new(false)),
+                fail_turn_after_promotion: Arc::new(AtomicBool::new(false)),
+                settle_turn_before_start_returns: Arc::new(AtomicBool::new(false)),
+                promoted_thread_ids: Arc::new(Mutex::new(HashMap::new())),
                 next_id: Arc::new(AtomicU64::new(1)),
             }
+        }
+
+        /// Promote a `claude-pending-…` placeholder to a real session id, the way
+        /// `claude.rs` does when the worker's `session_started` lands (which the
+        /// relay processes BEFORE the `start` response resolves `start_turn`).
+        /// Returns the real id the rest of the turn runs under.
+        async fn promote_pending_thread(&self, pending_id: &str) -> String {
+            let real_id = self.next_token("session");
+            let cwd = {
+                let cwds = self.start_thread_cwds.lock().await;
+                cwds.iter()
+                    .find(|(id, _)| id == pending_id)
+                    .map(|(_, cwd)| cwd.clone())
+                    .unwrap_or_default()
+            };
+            let mut summary = self.summary(&real_id, &cwd);
+            summary.status = "active".to_string();
+            {
+                let mut threads = self.threads.lock().await;
+                threads.remove(pending_id);
+                threads.insert(real_id.clone(), summary.clone());
+            }
+            self.start_thread_cwds
+                .lock()
+                .await
+                .push((real_id.clone(), cwd.clone()));
+            {
+                let mut relay = self.state.write().await;
+                // claude.rs moves the ACTIVE pointer first when the promoted thread is
+                // the user's own (claude.rs:1136-1143); a workflow's author turn runs
+                // on exactly such a thread.
+                if relay.active_thread_id.as_deref() == Some(pending_id) {
+                    relay.active_thread_id = Some(real_id.clone());
+                }
+                relay.promote_background_thread(pending_id, &real_id);
+                // claude.rs upserts the real row off the same `session_started`.
+                relay.upsert_thread(summary);
+                relay.notify();
+            }
+            self.promoted_thread_ids
+                .lock()
+                .await
+                .insert(pending_id.to_string(), real_id.clone());
+            real_id
         }
 
         fn next_token(&self, prefix: &str) -> String {
@@ -8948,6 +12469,7 @@ mod review_tests {
 
         fn summary(&self, id: &str, cwd: &str) -> ThreadSummaryView {
             ThreadSummaryView {
+                workspace_trusted: false,
                 id: id.to_string(),
                 name: Some(format!("{} thread", self.name)),
                 preview: String::new(),
@@ -9008,14 +12530,31 @@ mod review_tests {
 
         async fn start_thread(
             &self,
-            cwd: &str,
-            _model: &str,
-            approval_policy: &str,
-            sandbox: &str,
-            _initial_prompt: Option<&str>,
+            request: crate::provider::StartThreadRequest,
         ) -> Result<crate::provider::StartThreadResult, String> {
-            let id = self.next_token("thread");
-            let thread = self.summary(&id, cwd);
+            let cwd = request.cwd.as_str();
+            let model = request.model.as_str();
+            let approval_policy = request.approval_policy.as_str();
+            let sandbox = request.sandbox.as_str();
+            let initial_prompt = request.initial_prompt.as_deref();
+            let _ = (model, approval_policy, sandbox, initial_prompt);
+
+            // Claude's deferred start: no prompt means the SDK cannot mint a
+            // session id yet, so the bridge hands back a synthetic placeholder and
+            // creates the real session on the first turn.
+            let id = if self.deferred_start.load(Ordering::Relaxed) && initial_prompt.is_none() {
+                format!(
+                    "claude-pending-{}",
+                    self.next_id.fetch_add(1, Ordering::Relaxed)
+                )
+            } else {
+                self.next_token("thread")
+            };
+            let mut thread = self.summary(&id, cwd);
+            if self.deferred_start.load(Ordering::Relaxed) {
+                // The placeholder row a Claude deferred start hands back is "active".
+                thread.status = "active".to_string();
+            }
             self.threads.lock().await.insert(id.clone(), thread.clone());
             self.start_thread_cwds
                 .lock()
@@ -9145,6 +12684,58 @@ mod review_tests {
                 }
             }
             self.require_live_cwd(thread_id, "start a turn for").await?;
+            if let Some(error) = self.fail_next_turn_with.lock().await.pop_front() {
+                if self.fail_next_turn_live.load(Ordering::Relaxed) {
+                    let delay = self.fail_next_turn_live_delay_ms.load(Ordering::Relaxed);
+                    let state = self.state.clone();
+                    let thread_id = thread_id.to_string();
+                    let turn = self.next_token("turn");
+                    tokio::spawn(async move {
+                        sleep(Duration::from_millis(delay)).await;
+                        let mut relay = state.write().await;
+                        let now = unix_now();
+                        relay.bg_set_active_turn(&thread_id, Some(turn), now);
+                        relay.bg_set_thread_status(
+                            &thread_id,
+                            "active".to_string(),
+                            Vec::new(),
+                            now,
+                        );
+                        relay.notify();
+                    });
+                }
+                return Err(error);
+            }
+            if !text.contains("taking over as team lead") {
+                if let Some(error) = self.fail_work_turns_with.lock().await.clone() {
+                    return Err(error);
+                }
+            }
+            // Claude's deferred start: the first turn on a `claude-pending-…`
+            // placeholder is what creates the SDK session. The relay learns the real
+            // id — and moves the runtime, the reviewer map and the review job onto it
+            // — from the worker's `session_started`, which it processes BEFORE the
+            // `start` response resolves this call (claude.rs:823).
+            //
+            // Deliberately AFTER the failure hooks above: a `start` that errors
+            // restores the pending config and never emits `session_started`
+            // (claude.rs:814), so a failed first turn leaves the placeholder — and the
+            // fact that it never ran — completely intact.
+            let promoted = if thread_id.starts_with("claude-pending-") {
+                Some(self.promote_pending_thread(thread_id).await)
+            } else {
+                None
+            };
+            let thread_id: &str = promoted.as_deref().unwrap_or(thread_id);
+            if promoted.is_some() && self.fail_turn_after_promotion.load(Ordering::Relaxed) {
+                // The session was created and the prompt delivered; only the response
+                // was lost. Publish liveness on the PROMOTED id so there is something
+                // real for cleanup to find — and fail to stop.
+                let mut relay = self.state.write().await;
+                relay.set_thread_status(thread_id, "active".to_string(), Vec::new());
+                relay.notify();
+                return Err("start response lost after the session was created".to_string());
+            }
             self.turns
                 .lock()
                 .await
@@ -9209,40 +12800,42 @@ mod review_tests {
                     // A real provider also reports the write, which is the evidence that
                     // says WHERE the author is now working.
                     let mut relay = self.state.write().await;
-                    let runtime = relay.ensure_runtime_for_thread(&thread_id);
-                    let item_id = format!("fix-edit-{}", runtime.transcript.len());
-                    runtime
-                        .transcript
-                        .push(crate::state::relay::TranscriptRecord {
-                            item_id,
-                            kind: crate::protocol::TranscriptEntryKind::ToolCall,
-                            text: None,
-                            status: "completed".to_string(),
-                            turn_id: Some("turn-fix".to_string()),
-                            tool: Some(crate::protocol::ToolCallView {
-                                item_type: "fileChange".to_string(),
-                                name: "Edit".to_string(),
-                                title: "Edit".to_string(),
-                                detail: None,
-                                query: None,
-                                path: None,
-                                url: None,
-                                command: None,
-                                input_preview: None,
-                                result_preview: None,
-                                diff: None,
-                                file_changes: vec![crate::protocol::FileChangeDiffView {
-                                    path: path.clone(),
-                                    change_type: "update".to_string(),
-                                    diff: format!(
-                                        "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
-                                    ),
-                                }],
-                                apply_state: None,
-                                file_changes_omitted: false,
-                                can_apply: None,
-                            }),
-                        });
+                    let item_id = format!(
+                        "fix-edit-{}",
+                        relay.ensure_runtime_for_thread(&thread_id).transcript.len()
+                    );
+                    relay.upsert_transcript_item_for_thread(
+                        &thread_id,
+                        item_id,
+                        crate::protocol::TranscriptEntryKind::ToolCall,
+                        None,
+                        "completed".to_string(),
+                        Some("turn-fix".to_string()),
+                        Some(crate::protocol::ToolCallView {
+                            item_type: "fileChange".to_string(),
+                            name: "Edit".to_string(),
+                            title: "Edit".to_string(),
+                            kind: None,
+                            detail: None,
+                            query: None,
+                            path: None,
+                            url: None,
+                            command: None,
+                            input_preview: None,
+                            result_preview: None,
+                            diff: None,
+                            file_changes: vec![crate::protocol::FileChangeDiffView {
+                                path: path.clone(),
+                                change_type: "update".to_string(),
+                                diff: format!(
+                                    "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
+                                ),
+                            }],
+                            apply_state: None,
+                            file_changes_omitted: false,
+                            can_apply: None,
+                        }),
+                    );
                     relay.notify();
                 }
                 if let Some(marker) = self.mutate_cwd_on_fix_turn.lock().await.clone() {
@@ -9266,7 +12859,10 @@ mod review_tests {
                 && !(is_reviewer_diff_turn && self.suppress_reviewer_reply.load(Ordering::Relaxed))
                 && !(is_fix_turn && self.suppress_fix_reply.load(Ordering::Relaxed));
             // A reviewer turn ends with the verdict the test queued (default needs-changes).
-            let reply_text = if is_reviewer_diff_turn {
+            let scripted = self.scripted_replies.lock().await.pop_front();
+            let reply_text = if let Some(scripted) = scripted {
+                scripted
+            } else if is_reviewer_diff_turn {
                 let verdict = self
                     .reviewer_verdicts
                     .lock()
@@ -9291,7 +12887,64 @@ mod review_tests {
                 .swap(false, Ordering::Relaxed);
             let raise_ask_user = self.raise_ask_user.load(Ordering::Relaxed)
                 || (is_reviewer_turn && self.ask_user_on_reviewer_turn.load(Ordering::Relaxed));
+            // The whole turn lands before this call returns. Everything the caller is
+            // about to record is therefore already stale.
+            if self
+                .settle_turn_before_start_returns
+                .load(Ordering::Relaxed)
+            {
+                let now = unix_now();
+                {
+                    let mut relay = self.state.write().await;
+                    relay.bg_set_active_turn(&thread_id, Some(turn.clone()), now);
+                    relay.bg_upsert_user_message(
+                        &thread_id,
+                        user_item.clone(),
+                        user_text.clone(),
+                        turn.clone(),
+                        now,
+                    );
+                    relay.bg_start_agent_message(
+                        &thread_id,
+                        assistant_item.clone(),
+                        turn.clone(),
+                        now,
+                    );
+                    relay.bg_complete_agent_message(
+                        &thread_id,
+                        assistant_item.clone(),
+                        reply_text.clone(),
+                        turn.clone(),
+                        now,
+                    );
+                    relay.bg_set_active_turn(&thread_id, None, now);
+                    relay.bg_set_thread_status(&thread_id, "idle".to_string(), Vec::new(), now);
+                    relay.notify();
+                }
+                let mut transcripts = transcripts.lock().await;
+                let entries = transcripts.entry(thread_id).or_default();
+                entries.push(TranscriptEntryView {
+                    item_id: Some(user_item),
+                    kind: TranscriptEntryKind::UserText,
+                    text: Some(user_text),
+                    status: "completed".to_string(),
+                    turn_id: Some(turn.clone()),
+                    tool: None,
+                    content_state: crate::protocol::TranscriptContentState::Full,
+                });
+                entries.push(TranscriptEntryView {
+                    item_id: Some(assistant_item),
+                    kind: TranscriptEntryKind::AgentText,
+                    text: Some(reply_text),
+                    status: "completed".to_string(),
+                    turn_id: Some(turn),
+                    tool: None,
+                    content_state: crate::protocol::TranscriptContentState::Full,
+                });
+                return Ok(Some(turn_id));
+            }
             let complete_delay_ms = self.complete_delay_ms.load(Ordering::Relaxed);
+            let answered_asks = self.answered_asks.clone();
             let approval_id = self.next_token("approval");
             let ask_id = self.next_token("ask");
             let unrelated_approval_id = self.next_token("unrelated-approval");
@@ -9321,7 +12974,25 @@ mod review_tests {
                         },
                     );
                     relay.notify();
-                    return;
+                    drop(relay);
+                    // A parked turn is NOT stopped: a real provider is blocked
+                    // inside `canUseTool` and the SAME turn carries on the moment
+                    // the answer lands. Nothing "resumes" it, so this waits for a
+                    // real answer and then falls through to the ordinary
+                    // completion. Watching `answered_asks` rather than the pending
+                    // map matters — cleanup empties that map too, and a drained
+                    // turn must not behave as though it had been answered.
+                    let mut answered = false;
+                    for _ in 0..2_000 {
+                        if answered_asks.lock().await.contains(&ask_id) {
+                            answered = true;
+                            break;
+                        }
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                    if !answered {
+                        return;
+                    }
                 }
                 if inject_unrelated {
                     // An unrelated background thread parks on its own approval. The
@@ -9449,6 +13120,17 @@ mod review_tests {
             if self.interrupt_fails.load(Ordering::Relaxed) {
                 return Err("interrupt rejected".to_string());
             }
+            // A placeholder never reached the SDK, so there is no session to cancel:
+            // the worker answers `cancel` with "session was not found" (worker.mjs)
+            // and nothing settles. Modelling this matters — a fake that helpfully
+            // settles an unstartable thread hides every "we tried to stop something
+            // that was never running" bug.
+            if thread_id.starts_with("claude-pending-") {
+                return Err(format!("{} session '{thread_id}' was not found", self.name));
+            }
+            if self.hold_turn_stop_for.lock().await.as_deref() == Some(thread_id) {
+                drop(self.turn_stop_barrier.lock().await);
+            }
             // Simulate the provider acknowledging the cancel by ending the turn — a
             // real provider clears `active_turn` via a turn/completed event, which
             // is the only signal the orchestrator trusts as "stopped".
@@ -9479,10 +13161,22 @@ mod review_tests {
 
         async fn respond_to_ask_user_question(
             &self,
-            _request_id: &str,
+            request_id: &str,
             _answers: &serde_json::Map<String, serde_json::Value>,
         ) -> Result<(), String> {
+            self.answered_asks
+                .lock()
+                .await
+                .insert(request_id.to_string());
             Ok(())
+        }
+
+        async fn resolve_started_thread_id(&self, requested_thread_id: &str) -> String {
+            self.promoted_thread_ids
+                .lock()
+                .await
+                .remove(requested_thread_id)
+                .unwrap_or_else(|| requested_thread_id.to_string())
         }
 
         fn provider_name(&self) -> &'static str {
@@ -9504,6 +13198,17 @@ mod review_tests {
             change_tx.clone(),
             SecurityProfile::private(),
         )));
+        {
+            let mut relay = relay.write().await;
+            // These exercise the FEATURE, not the gate; locked, the team suite would
+            // go green by never running. The gate's own tests are `beta_gate_tests`.
+            relay.set_beta_features_enabled(true);
+            // Granted because a review RUNS git in this directory — it collects the
+            // relay's own diff to brief the reviewer, and provisioning a task worktree
+            // writes to the repo — and `admit` now refuses a workspace nobody vouched
+            // for. This fixture is the operator's own project, so it is vouched for.
+            relay.trusted_workspaces.push(cwd.to_string());
+        }
         let mut bridges: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
         let mut map = HashMap::new();
         for name in provider_names {
@@ -9511,7 +13216,28 @@ mod review_tests {
             bridges.insert(name.to_string(), Arc::new(provider.clone()));
             map.insert(*name, provider);
         }
-        (AppState::from_parts(relay, bridges, change_tx), map)
+        let app = AppState::from_parts(relay, bridges, change_tx);
+        // A build with the private engines linked gets the real driver, so the
+        // included private scenarios exercise the same code the product ships.
+        #[cfg(feature = "private")]
+        let app = {
+            let team = std::sync::Arc::new(sealwire_private::TeamEngine::default());
+            app.with_team_driver(team)
+        };
+        (app, map)
+    }
+
+    /// Vouch for a second workspace, beyond the one `build_review_app` already granted.
+    ///
+    /// Trust is per-REPOSITORY and decided by exact path or by the repo a path resolves
+    /// to, so a fixture whose review falls back from a deleted worktree to the main tree
+    /// is naming a directory the grant on the worktree never covered.
+    async fn grant_workspace(app: &AppState, path: &str) {
+        app.relay
+            .write()
+            .await
+            .trusted_workspaces
+            .push(path.to_string());
     }
 
     async fn start_parent(app: &AppState, cwd: &str, provider: &str) -> ThreadSummaryView {
@@ -9525,11 +13251,13 @@ mod review_tests {
                 sandbox: None,
                 provider: Some(provider.to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("parent session should start");
         let thread_id = snap.active_thread_id.clone().expect("parent thread id");
         ThreadSummaryView {
+            workspace_trusted: false,
             id: thread_id,
             name: None,
             preview: String::new(),
@@ -9619,6 +13347,614 @@ mod review_tests {
             max_rounds: None,
             device_id: Some("device-1".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_promotes_a_deferred_start_thread_seeds_the_real_ids_turn_marker() {
+        // `send_message_to_thread` seeds the active-turn marker "so the wait loop
+        // sees 'working' before the provider's first event". For a deferred-start
+        // provider the placeholder runtime is GONE by the time `start_turn` returns
+        // (its first turn promoted it), so the `else if runtime_for_thread(id)`
+        // guard skips the seeding entirely and the turn is tracked nowhere.
+        //
+        // The marker belongs on the PROMOTED id — which the bridge reports through
+        // `resolve_started_thread_id`, exactly as the ordinary send path does.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap().clone();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+        // Leave the turn in flight so we can look at it mid-turn.
+        claude.complete_turns.store(false, Ordering::Relaxed);
+
+        let bridge: Arc<dyn crate::provider::ProviderBridge> = Arc::new(claude.clone());
+        let started = bridge
+            .start_thread(crate::provider::StartThreadRequest::new(
+                cwd,
+                "claude_code-model",
+                "review_read_only",
+                "workspace-write",
+            ))
+            .await
+            .expect("start_thread");
+        let pending = started.thread.id.clone();
+        assert!(
+            pending.starts_with("claude-pending-"),
+            "a deferred start hands back a placeholder: {pending}"
+        );
+        {
+            let mut relay = app.relay.write().await;
+            relay.register_background_thread(
+                started.thread,
+                cwd,
+                "claude_code-model",
+                "review_read_only",
+                "workspace-write",
+                "medium",
+            );
+        }
+
+        let dispatched = app
+            .send_message_to_thread(&pending, "review this", None, None)
+            .await
+            .expect("the turn starts");
+        let turn_id = dispatched
+            .turn_id
+            .clone()
+            .expect("the provider returns a turn id");
+
+        let relay = app.relay.read().await;
+        assert!(
+            relay.runtime_for_thread(&pending).is_none(),
+            "the placeholder runtime is gone once its first turn promoted it"
+        );
+        let promoted = relay
+            .runtimes
+            .keys()
+            .find(|id| id.starts_with("claude_code-session-"))
+            .cloned()
+            .expect("the promoted runtime exists");
+        assert_eq!(
+            dispatched.thread_id, promoted,
+            "the dispatch reports the id the turn actually runs under, so a caller cannot carry on with the removed placeholder"
+        );
+        let runtime = relay
+            .runtime_for_thread(&promoted)
+            .expect("the promoted runtime exists");
+        assert_eq!(
+            runtime.active_turn_id.as_deref(),
+            Some(turn_id.as_str()),
+            "the in-flight turn must be tracked under the promoted id, or a stop \
+targets no turn and the idle wait sees a just-started turn as finished"
+        );
+        assert!(
+            runtime.is_working(),
+            "a thread with a turn in flight must read as working"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_start_reviewer_whose_first_turn_fails_ends_failed_not_blocked() {
+        // A `start` that errors restores the pending config and never emits
+        // `session_started` (claude.rs:814), so the placeholder is left exactly as it
+        // was: no SDK session, nothing running. `fail_after_uncertain_turn_start` must
+        // therefore see an idle thread and make the job terminally `Failed`.
+        //
+        // If the placeholder ever read as working — its provider summary says
+        // "active" before it has had a single turn — this would instead try to
+        // interrupt a session that was never created, fail to confirm a stop, and
+        // park the job in non-terminal `Blocked`, which keeps the REVIEWED thread
+        // frozen for send/stop until someone resolves it by hand.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        // Keep the drain window short: if the placeholder is (wrongly) treated as
+        // running, this is the wait that ends in `Blocked`.
+        app.set_review_drain_max_ms(200);
+        let claude = providers.get("claude_code").unwrap();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+        // The recap turn runs on the codex provider, so this only hits the reviewer.
+        claude
+            .fail_next_turn_with
+            .lock()
+            .await
+            .push_back("claude worker refused the start".to_string());
+        let parent = start_parent(&app, cwd, "codex").await;
+
+        let receipt = app
+            .request_review(review_input("claude_code"))
+            .await
+            .expect("the review is accepted");
+        let job =
+            wait_for_review_status(&app, &receipt.review_job_id, &["failed", "blocked"]).await;
+        assert_eq!(
+            job.status, "failed",
+            "a start that never created a session must fail the job outright, not \
+strand it in Blocked: {:?}",
+            job.error
+        );
+        assert!(
+            !app.relay.read().await.is_thread_review_locked(&parent.id),
+            "a terminally-failed review must release the reviewed thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_after_promotion_stops_the_session_it_really_started() {
+        // The dangerous half of a deferred start: `session_started` lands (so the SDK
+        // session EXISTS and the relay has already promoted the placeholder), and then
+        // the start response is lost or rejected. The turn may well be running.
+        //
+        // The orchestrator's uncertain-start cleanup exists precisely for that, but it
+        // was handed `this_reviewer_id` — the placeholder, whose runtime promotion had
+        // just removed. Reading "not working" off a thread that no longer exists, it
+        // skipped the stop entirely, marked the job terminal and unlocked the parent,
+        // leaving a real reviewer session running against the tree under review.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        app.set_review_drain_max_ms(200);
+        let claude = providers.get("claude_code").unwrap();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+        // Publishes liveness on the PROMOTED id, then loses the start response.
+        claude.fail_reviewer_start.store(true, Ordering::Relaxed);
+        let parent = start_parent(&app, cwd, "codex").await;
+
+        let receipt = app
+            .request_review(review_input("claude_code"))
+            .await
+            .expect("the review is accepted");
+        let job =
+            wait_for_review_status(&app, &receipt.review_job_id, &["failed", "blocked"]).await;
+
+        let reviewer = job
+            .reviewer_thread_id
+            .as_deref()
+            .expect("the job records the reviewer thread");
+        assert!(
+            !reviewer.starts_with("claude-pending-"),
+            "promotion rewrote the job's reviewer id: {reviewer}"
+        );
+        let interrupts = claude.interrupts.lock().await.clone();
+        assert!(
+            interrupts.iter().any(|id| id == reviewer),
+            "the session that actually started must be interrupted, not abandoned \
+(interrupted: {interrupts:?})"
+        );
+        assert!(
+            !app.relay
+                .read()
+                .await
+                .runtime_for_thread(reviewer)
+                .is_some_and(|runtime| runtime.is_working()),
+            "no reviewer turn may still be running once the job is terminal and the \
+parent {} is unlocked",
+            parent.id
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_author_start_that_fails_after_promotion_stops_the_real_session() {
+        // Same orphan as the review path, in the other consumer of the shared
+        // dispatch. Note this targets the AUTHOR turn, not the reviewer one: a
+        // workflow refuses any reviewer without a hard read-only sandbox, so its
+        // reviewer can never be Claude. The author can — and a workflow started on a
+        // Claude session that has never been messaged runs its execute step as that
+        // session's FIRST turn, which is the promoting one.
+        //
+        // That makes this the WRITE-CAPABLE case: `run_turn`'s uncertain-start branch
+        // drained the id it sent to, and the placeholder is gone by then, so
+        // `stop_and_drain` reads the missing runtime as "not working" and answers
+        // "stopped" for a session it never looked at.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+        claude
+            .fail_turn_after_promotion
+            .store(true, Ordering::Relaxed);
+        // Never messaged, so it is still a placeholder when the workflow starts.
+        let parent = start_parent(&app, cwd, "claude_code").await;
+        assert!(
+            parent.id.starts_with("claude-pending-"),
+            "the author thread starts as a placeholder: {}",
+            parent.id
+        );
+
+        let receipt = app
+            .start_code_workflow(StartWorkflowInput {
+                workflow_id: Some("code_flow".to_string()),
+                task_prompt: "implement the retry fix".to_string(),
+                reviewer_provider: "codex".to_string(),
+                reviewer_model: None,
+                reviewer_instructions: None,
+                max_rounds: Some(1),
+                anchor_item_id: Some("anchor-item".to_string()),
+                parent_thread_id: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("code flow should start");
+
+        let mut terminal = WORKFLOW_TERMINAL.to_vec();
+        terminal.push("blocked");
+        wait_for_workflow_status(&app, &receipt.workflow_run_id, &terminal).await;
+
+        let promoted = {
+            let relay = app.relay.read().await;
+            relay
+                .runtimes
+                .keys()
+                .find(|id| id.starts_with("claude_code-session-"))
+                .cloned()
+                .expect("the author thread was promoted to a real session id")
+        };
+        let interrupts = claude.interrupts.lock().await.clone();
+        assert!(
+            interrupts.iter().any(|id| id == &promoted),
+            "the session that actually started must be interrupted, not abandoned \
+(interrupted: {interrupts:?})"
+        );
+        assert!(
+            !app.relay
+                .read()
+                .await
+                .runtime_for_thread(&promoted)
+                .is_some_and(|runtime| runtime.is_working()),
+            "no author turn may still be writing once the run is torn down"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_author_turn_that_promotes_is_waited_on_under_its_real_id() {
+        // The SUCCESS path, which is the common one — no lost response, nothing
+        // unusual: a workflow started on a Claude session that was never messaged
+        // runs its execute step as that session's FIRST turn, which promotes it.
+        //
+        // `promote_background_thread` re-keys workflow STEP threads and team seats,
+        // but not a run's `parent_thread_id`, and the author turn runs on the parent.
+        // So the runner kept waiting on the placeholder: no runtime, read as idle
+        // immediately, no reply found, "the execute step produced no output" — while
+        // the real, write-capable author session carried on with the workflow's
+        // workspace lock released.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        providers
+            .get("claude_code")
+            .unwrap()
+            .deferred_start
+            .store(true, Ordering::Relaxed);
+        queue_verdicts(providers.get("codex").unwrap(), &["APPROVE"]).await;
+        let parent = start_parent(&app, cwd, "claude_code").await;
+        assert!(
+            parent.id.starts_with("claude-pending-"),
+            "the author thread starts as a placeholder: {}",
+            parent.id
+        );
+
+        let receipt = app
+            .start_code_workflow(StartWorkflowInput {
+                workflow_id: Some("code_flow".to_string()),
+                task_prompt: "implement the retry fix".to_string(),
+                reviewer_provider: "codex".to_string(),
+                reviewer_model: None,
+                reviewer_instructions: None,
+                max_rounds: Some(1),
+                anchor_item_id: Some("anchor-item".to_string()),
+                parent_thread_id: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("code flow should start");
+
+        let status =
+            wait_for_workflow_status(&app, &receipt.workflow_run_id, WORKFLOW_TERMINAL).await;
+        assert_eq!(
+            status, "done",
+            "a promoting author turn must be waited on and read under its real id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promoted_workflow_author_survives_a_revise_round() {
+        // The single-round version of this test passes even with a stale caller-local
+        // id, because nothing after the execute turn ever addresses the author again.
+        // A NEEDS_CHANGES verdict does: the run reads the author's recap and then
+        // dispatches a revise turn to it.
+        //
+        // `run_turn` follows the promotion internally but hands back only the reply
+        // text, so `run_workflow_job` keeps the placeholder — and promotion has by now
+        // rewritten the persisted run's parent id, so preflight no longer recognises
+        // that placeholder as owned by this run and blocks it.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap().clone();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+        // Round 1 rejects, round 2 approves — so the author must take a revise turn.
+        queue_verdicts(
+            providers.get("codex").unwrap(),
+            &["NEEDS_CHANGES", "APPROVE"],
+        )
+        .await;
+        let parent = start_parent(&app, cwd, "claude_code").await;
+        assert!(parent.id.starts_with("claude-pending-"));
+
+        let receipt = app
+            .start_code_workflow(StartWorkflowInput {
+                workflow_id: Some("code_flow".to_string()),
+                task_prompt: "implement the retry fix".to_string(),
+                reviewer_provider: "codex".to_string(),
+                reviewer_model: None,
+                reviewer_instructions: None,
+                max_rounds: Some(2),
+                anchor_item_id: Some("anchor-item".to_string()),
+                parent_thread_id: None,
+                device_id: Some("device-1".to_string()),
+            })
+            .await
+            .expect("code flow should start");
+
+        let status =
+            wait_for_workflow_status(&app, &receipt.workflow_run_id, WORKFLOW_TERMINAL).await;
+        assert_eq!(
+            status, "done",
+            "the author must still be reachable for its revise turn after promotion"
+        );
+
+        let turns = claude.turns.lock().await.clone();
+        let promoted = {
+            let relay = app.relay.read().await;
+            relay
+                .runtimes
+                .keys()
+                .find(|id| id.starts_with("claude_code-session-"))
+                .cloned()
+                .expect("the author was promoted")
+        };
+        assert!(
+            turns
+                .iter()
+                .any(|(id, text)| id == &promoted && text.contains("Address the findings")),
+            "the revise turn must be dispatched to the promoted id: {turns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_recap_turn_that_promotes_is_waited_on_under_its_real_id() {
+        // Same shape on the review side: reviewing a Claude session that has never
+        // been messaged drives a recap turn, which is that session's FIRST turn and
+        // therefore the promoting one. `job.parent_thread_id` is not re-keyed either,
+        // so the recap was waited on and read back under the removed placeholder and
+        // the review died with "the parent produced no recap for this turn".
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        providers
+            .get("claude_code")
+            .unwrap()
+            .deferred_start
+            .store(true, Ordering::Relaxed);
+        let parent = start_parent(&app, cwd, "claude_code").await;
+        assert!(parent.id.starts_with("claude-pending-"));
+
+        let mut input = review_input("codex");
+        input.parent_thread_id = Some(parent.id.clone());
+        let receipt = app
+            .request_review(input)
+            .await
+            .expect("reviewing an untouched Claude session should be accepted");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "a promoting recap turn must be waited on and read under its real id: {:?}",
+            job.error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promoted_review_parent_survives_a_second_round() {
+        // The review-side twin of the workflow revise case, and the same reason the
+        // single-round tests could not see it: nothing addresses the author again
+        // until a NEEDS_CHANGES verdict drives a fix turn on it.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap().clone();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+        queue_verdicts(
+            providers.get("codex").unwrap(),
+            &["NEEDS_CHANGES", "APPROVE"],
+        )
+        .await;
+        let parent = start_parent(&app, cwd, "claude_code").await;
+        assert!(parent.id.starts_with("claude-pending-"));
+
+        let mut input = review_input("codex");
+        input.parent_thread_id = Some(parent.id.clone());
+        input.max_rounds = Some(2);
+        let receipt = app.request_review(input).await.expect("review accepted");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "the author must stay reachable for its fix turn after promotion: {:?}",
+            job.error
+        );
+
+        let promoted = {
+            let relay = app.relay.read().await;
+            relay
+                .runtimes
+                .keys()
+                .find(|id| id.starts_with("claude_code-session-"))
+                .cloned()
+                .expect("the author was promoted")
+        };
+        let turns = claude.turns.lock().await.clone();
+        assert!(
+            turns
+                .iter()
+                .any(|(id, text)| id == &promoted && text.contains("Address the findings")),
+            "the fix turn must be dispatched to the promoted id: {turns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_settles_before_start_turn_returns_is_not_resurrected() {
+        // The relay reads provider output on its own task, so a turn's terminal line
+        // can be processed while the caller of `start_turn` is still queued for the
+        // relay lock. Seeding the returned turn id unconditionally then writes a live
+        // turn back over settled state — a ghost with no completion event left to
+        // clear it, which the reviewer waits on until the stall timeout.
+        //
+        // The ordinary send path guards this with `thread_turn_revision`; the
+        // background dispatch must too, carrying the pre-call revision across the
+        // pending-to-real promotion.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        // Fail fast instead of hanging for the real 600s stall window.
+        app.set_review_step_timeout_ms(300);
+        let claude = providers.get("claude_code").unwrap();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+        claude
+            .settle_turn_before_start_returns
+            .store(true, Ordering::Relaxed);
+        let _parent = start_parent(&app, cwd, "codex").await;
+
+        let receipt = app
+            .request_review(review_input("claude_code"))
+            .await
+            .expect("the review is accepted");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "a turn that finished before start_turn returned must be READ, not \
+resurrected into a turn that never completes: {:?}",
+            job.error
+        );
+
+        let reviewer = job
+            .reviewer_thread_id
+            .as_deref()
+            .expect("the job records the reviewer thread");
+        let relay = app.relay.read().await;
+        let runtime = relay
+            .runtime_for_thread(reviewer)
+            .expect("the reviewer runtime exists");
+        assert!(
+            runtime.active_turn_id.is_none(),
+            "the settled turn must not be reopened: {:?}",
+            runtime.active_turn_id
+        );
+        assert!(!runtime.is_working(), "the reviewer must read as idle");
+    }
+
+    #[tokio::test]
+    async fn a_blank_deferred_start_session_can_still_change_its_settings() {
+        // A Claude session is visible and editable before its first prompt: it has no
+        // SDK session and no turn, only a placeholder whose provider summary reports
+        // "active". `update_session_settings` refuses a `runtime.is_working()` thread,
+        // so if that summary status were ever trusted as liveness the model/effort
+        // pickers would be dead on every freshly-created Claude session.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap().clone();
+        claude.deferred_start.store(true, Ordering::Relaxed);
+
+        let bridge: Arc<dyn crate::provider::ProviderBridge> = Arc::new(claude);
+        let started = bridge
+            .start_thread(crate::provider::StartThreadRequest::new(
+                cwd,
+                "claude_code-model",
+                "on-request",
+                "workspace-write",
+            ))
+            .await
+            .expect("start_thread");
+        let pending = started.thread.id.clone();
+        assert!(pending.starts_with("claude-pending-"));
+        {
+            let mut relay = app.relay.write().await;
+            relay.activate_started_thread(
+                started.thread,
+                cwd,
+                "claude_code-model",
+                "on-request",
+                "workspace-write",
+                "medium",
+                "device-1",
+            );
+        }
+
+        app.update_session_settings(crate::protocol::UpdateSessionSettingsInput {
+            approval_policy: None,
+            sandbox: None,
+            effort: Some("high".to_string()),
+            model: None,
+            device_id: Some("device-1".to_string()),
+            thread_id: pending.clone(),
+        })
+        .await
+        .expect("a blank session with no turn must accept a settings change");
+
+        assert_eq!(
+            app.relay
+                .read()
+                .await
+                .thread_settings(&pending)
+                .expect("settings recorded")
+                .reasoning_effort,
+            "high"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_deferred_start_reviewer_completes_its_first_review() {
+        // THE "first review with Claude always fails, you have to click twice" bug.
+        //
+        // Codex hands back a real thread id from `thread/start`, so the reviewer
+        // runtime the orchestrator waits on is the one the turn runs under. Claude
+        // cannot: the SDK only mints a session id once it has seen a user message,
+        // so a clean reviewer is created as a synthetic `claude-pending-…`
+        // placeholder and the FIRST turn promotes it to the real id — moving the
+        // runtime, the reviewer map and the job's `reviewer_thread_id` across
+        // before `start_turn` returns.
+        //
+        // Every existing review test uses the codex-shaped provider, so this whole
+        // phase is untested. Round 1 must still complete.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        providers
+            .get("claude_code")
+            .unwrap()
+            .deferred_start
+            .store(true, Ordering::Relaxed);
+        let parent = start_parent(&app, cwd, "codex").await;
+
+        let receipt = app
+            .request_review(review_input("claude_code"))
+            .await
+            .expect("a clean deferred-start reviewer should be accepted");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(
+            job.status, "complete",
+            "the FIRST review on a deferred-start reviewer must not fail: {:?}",
+            job.error
+        );
+        assert_eq!(job.parent_thread_id, parent.id);
+        let reviewer_id = job
+            .reviewer_thread_id
+            .as_deref()
+            .expect("the job records the reviewer thread");
+        assert!(
+            !reviewer_id.starts_with("claude-pending-"),
+            "the job must end up on the promoted session id, not the placeholder: {reviewer_id}"
+        );
     }
 
     #[tokio::test]
@@ -9784,6 +14120,7 @@ mod review_tests {
         {
             let mut relay = app.relay.write().await;
             let thread = ThreadSummaryView {
+                workspace_trusted: false,
                 id: reviewer_id.to_string(),
                 name: None,
                 preview: String::new(),
@@ -9828,6 +14165,7 @@ mod review_tests {
         {
             let mut relay = app.relay.write().await;
             let thread = ThreadSummaryView {
+                workspace_trusted: false,
                 id: reviewer_id.to_string(),
                 name: None,
                 preview: String::new(),
@@ -9949,6 +14287,7 @@ mod review_tests {
         {
             let mut relay = app.relay.write().await;
             let mk_thread = |id: &str, cwd: &str| ThreadSummaryView {
+                workspace_trusted: false,
                 id: id.to_string(),
                 name: None,
                 preview: String::new(),
@@ -10060,6 +14399,7 @@ mod review_tests {
         {
             let mut relay = app.relay.write().await;
             let mk_thread = |id: &str, cwd: &str| ThreadSummaryView {
+                workspace_trusted: false,
                 id: id.to_string(),
                 name: None,
                 preview: String::new(),
@@ -10157,6 +14497,7 @@ mod review_tests {
         {
             let mut relay = app.relay.write().await;
             let thread = ThreadSummaryView {
+                workspace_trusted: false,
                 id: reviewer_id.to_string(),
                 name: None,
                 preview: String::new(),
@@ -10198,6 +14539,7 @@ mod review_tests {
         {
             let mut relay = app.relay.write().await;
             let mut thread = ThreadSummaryView {
+                workspace_trusted: false,
                 id: reviewer_id.to_string(),
                 name: None,
                 preview: String::new(),
@@ -11112,117 +15454,6 @@ mod review_tests {
 
     const WORKFLOW_TERMINAL: &[&str] = &["done", "escalated", "failed", "interrupted", "cancelled"];
 
-    async fn wait_for_task_list_status(app: &AppState, run_id: &str, statuses: &[&str]) -> String {
-        for _ in 0..800 {
-            if let Some(status) = app
-                .relay
-                .read()
-                .await
-                .task_list_run(run_id)
-                .map(|run| run.status.as_str().to_string())
-            {
-                if statuses.contains(&status.as_str()) {
-                    return status;
-                }
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-        panic!("task list {run_id} never reached {statuses:?}");
-    }
-
-    #[tokio::test]
-    async fn task_list_runs_two_tasks_serially_to_done() {
-        use crate::state::{CheckpointMode, EscalatePolicy, TaskItem};
-        let dir = TempDir::new().expect("tmpdir");
-        let cwd = dir.path().to_str().unwrap();
-        let (app, providers) = build_review_app(cwd, &["codex"]).await;
-        let _parent = start_parent(&app, cwd, "codex").await;
-        // Each task's Code Flow is execute -> review APPROVE -> Done, so two tasks
-        // consume two reviewer verdicts. If the driver ran them concurrently (or
-        // skipped one) the counts below would be wrong.
-        queue_verdicts(providers.get("codex").unwrap(), &["APPROVE", "APPROVE"]).await;
-
-        let tasks = vec![
-            TaskItem::new("t0", "do task 0", "codex", None, None, 1),
-            TaskItem::new("t1", "do task 1", "codex", None, None, 1),
-        ];
-        let run_id = app
-            .start_task_list(
-                Some("device-1".to_string()),
-                "Nightly".to_string(),
-                tasks,
-                None,
-                EscalatePolicy::Halt,
-                CheckpointMode::None,
-                String::new(),
-            )
-            .await
-            .expect("task list should start");
-
-        let status =
-            wait_for_task_list_status(&app, &run_id, &["done", "escalated", "failed"]).await;
-        assert_eq!(status, "done", "both tasks approved -> list Done");
-
-        let relay = app.relay.read().await;
-        let run = relay.task_list_run(&run_id).expect("run exists");
-        assert_eq!(run.done_count(), 2, "both tasks reached Done");
-        assert_eq!(run.current_index, 2, "cursor advanced past both tasks");
-        assert!(
-            run.tasks.iter().all(|task| task.child_run_id.is_some()),
-            "each task recorded the child workflow that ran it"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_halts_and_skips_remaining_on_escalation() {
-        use crate::state::{CheckpointMode, EscalatePolicy, TaskItem, TaskStatus};
-        let dir = TempDir::new().expect("tmpdir");
-        let cwd = dir.path().to_str().unwrap();
-        let (app, providers) = build_review_app(cwd, &["codex"]).await;
-        let _parent = start_parent(&app, cwd, "codex").await;
-        // Task 0's single review round is NEEDS_CHANGES -> escalates (max_rounds=1).
-        // Only ONE verdict is queued: task 1 must never run, so it never consumes one.
-        queue_verdicts(providers.get("codex").unwrap(), &["NEEDS_CHANGES"]).await;
-
-        let tasks = vec![
-            TaskItem::new("t0", "do task 0", "codex", None, None, 1),
-            TaskItem::new("t1", "do task 1", "codex", None, None, 1),
-        ];
-        let run_id = app
-            .start_task_list(
-                Some("device-1".to_string()),
-                "Halt list".to_string(),
-                tasks,
-                None,
-                EscalatePolicy::Halt,
-                CheckpointMode::None,
-                String::new(),
-            )
-            .await
-            .expect("task list should start");
-
-        let status =
-            wait_for_task_list_status(&app, &run_id, &["done", "escalated", "failed"]).await;
-        assert_eq!(
-            status, "escalated",
-            "escalation under Halt -> list Escalated"
-        );
-
-        let relay = app.relay.read().await;
-        let run = relay.task_list_run(&run_id).expect("run exists");
-        assert_eq!(run.tasks[0].status, TaskStatus::Escalated);
-        assert_eq!(
-            run.tasks[1].status,
-            TaskStatus::Skipped,
-            "the later task is skipped by the halt"
-        );
-        assert!(
-            run.tasks[1].child_run_id.is_none(),
-            "a skipped task never started a workflow"
-        );
-        assert_eq!(run.done_count(), 0);
-    }
-
     #[tokio::test]
     async fn workflow_completes_after_revise_then_approve() {
         let dir = TempDir::new().expect("tmpdir");
@@ -11400,6 +15631,7 @@ mod review_tests {
             let mut relay = app.relay.write().await;
             relay.register_background_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: "codex-busy".to_string(),
                     name: None,
                     preview: String::new(),
@@ -12133,6 +16365,7 @@ settings update: {error}"
                 sandbox: None,
                 provider: Some("codex".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect_err("new same-cwd session must be locked while workflow runs");
@@ -12477,6 +16710,10 @@ settings update: {error}"
         // The session lives in the worktree, so the relay's own cwd is that worktree too:
         // the fallback cannot come from `current_cwd` here, it has to find the repo.
         let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        // Granted on its own standing: this review falls back to the MAIN tree once the
+        // worktree above is deleted, and a grant on a worktree is not a grant on the
+        // repository it was cut from.
+        grant_workspace(&app, &main_cwd).await;
         start_parent(&app, &nested_cwd, "codex").await;
 
         // The worktree disappears under the running session.
@@ -12619,6 +16856,7 @@ settings update: {error}"
             item_type: "fileChange".to_string(),
             name: "Edit".to_string(),
             title: "Edit".to_string(),
+            kind: None,
             detail: None,
             query: None,
             path: None,
@@ -12650,7 +16888,42 @@ settings update: {error}"
                 status: "completed".to_string(),
                 turn_id: Some("turn-evidence".to_string()),
                 tool: Some(tool),
+                seq: None,
             });
+    }
+
+    /// The working tree a review job actually ran in. `ReviewJobView` deliberately does
+    /// not carry it, so read it off the stored job.
+    async fn review_job_cwd(app: &AppState, job_id: &str) -> String {
+        app.relay
+            .read()
+            .await
+            .review_job(job_id)
+            .expect("review job")
+            .cwd
+            .clone()
+    }
+
+    /// Append `count` ordinary transcript records — the reads, greps and plain replies an
+    /// agent produces after its last edit. Enough of them push that edit out of the
+    /// recent window `thread_write_evidence` looks at first.
+    async fn seed_chatter(app: &AppState, thread: &str, count: usize) {
+        let mut relay = app.relay.write().await;
+        let runtime = relay.ensure_runtime_for_thread(thread);
+        for _ in 0..count {
+            let item_id = format!("chatter-{}", runtime.transcript.len());
+            runtime
+                .transcript
+                .push(crate::state::relay::TranscriptRecord {
+                    item_id,
+                    kind: crate::protocol::TranscriptEntryKind::AgentText,
+                    text: Some("still working, no files touched".to_string()),
+                    status: "completed".to_string(),
+                    turn_id: Some("turn-chatter".to_string()),
+                    tool: None,
+                    seq: None,
+                });
+        }
     }
 
     /// A repo plus a SIBLING linked worktree, both with a committed `seed.txt`. Sibling
@@ -12757,6 +17030,10 @@ settings update: {error}"
         std::fs::write(main_dir.join("seed.txt"), "line1\nline2\nMAIN_TREE_EDIT\n").unwrap();
 
         let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        // Granted on its own standing: this review falls back to the MAIN tree once the
+        // worktree above is deleted, and a grant on a worktree is not a grant on the
+        // repository it was cut from.
+        grant_workspace(&app, &main_cwd).await;
         start_parent(&app, &nested_cwd, "codex").await;
         let provider = providers.get("codex").unwrap();
         // Round 1 rejects → the parent gets a fix turn, during which the worktree is
@@ -13060,6 +17337,10 @@ settings update: {error}"
         .unwrap();
 
         let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        // Granted on its own standing: this review falls back to the MAIN tree once the
+        // worktree above is deleted, and a grant on a worktree is not a grant on the
+        // repository it was cut from.
+        grant_workspace(&app, &main_cwd).await;
         let parent = start_parent(&app, &nested_cwd, "codex").await;
         // The workspace exists when the review starts and is deleted exactly when the recap
         // turn reaches the provider.
@@ -13167,6 +17448,10 @@ settings update: {error}"
         .unwrap();
 
         let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        // Granted on its own standing: this review falls back to the MAIN tree once the
+        // worktree above is deleted, and a grant on a worktree is not a grant on the
+        // repository it was cut from.
+        grant_workspace(&app, &main_cwd).await;
         start_parent(&app, &nested_cwd, "codex").await;
         let mut input = review_input("codex");
         input.recap_source = Some("last_message".to_string());
@@ -13218,6 +17503,10 @@ settings update: {error}"
         add_worktree(&main_cwd, &nested_cwd, "worktree-wt-gone");
 
         let (app, providers) = build_review_app(&nested_cwd, &["codex"]).await;
+        // Granted on its own standing: this review falls back to the MAIN tree once the
+        // worktree above is deleted, and a grant on a worktree is not a grant on the
+        // repository it was cut from.
+        grant_workspace(&app, &main_cwd).await;
         let parent = start_parent(&app, &nested_cwd, "codex").await;
         std::fs::remove_dir_all(&nested_cwd).unwrap();
         std::fs::write(
@@ -13340,6 +17629,174 @@ settings update: {error}"
         );
     }
 
+    // The reported failure: a reviewer works for a couple of reviews and then breaks
+    // PERMANENTLY with "that reviewer thread works in <repo>, but the work to review is in
+    // <repo>/.claude/worktrees/<name> — start a clean reviewer instead".
+    //
+    // The thread was born in the repo and has since moved into a worktree, so the only
+    // thing that says "review the worktree" is its landed writes — and those are read from
+    // a bounded window of the most recent transcript records. Keep working after the last
+    // edit (reads, greps, plain replies) and that window scrolls past it, at which point
+    // the review silently snaps back to the tree the thread was BORN in. A reviewer
+    // created against that snapped-back answer is in the wrong tree, and the moment the
+    // next edit re-enters the window the review targets the worktree again — so that
+    // reviewer is cross-tree, and refused, forever.
+    //
+    // Absence of evidence is not evidence that the work moved back.
+    #[tokio::test]
+    async fn the_review_target_survives_the_last_edit_scrolling_out_of_the_evidence_window() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &main_cwd, "codex").await;
+        // The thread moved into the worktree and did its work there.
+        seed_landed_edit(&app, &parent.id, &format!("{linked_cwd}/seed.txt")).await;
+
+        // Review 1, while that edit is still in the window: targets the worktree and
+        // leaves a reviewer thread bound there.
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("the first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        assert_eq!(first_job.status, "complete", "{:?}", first_job.error);
+        let first_cwd = review_job_cwd(&app, &first.review_job_id).await;
+        assert!(
+            same_dir(&first_cwd, &linked_cwd),
+            "review 1 must target the tree the thread is editing: {first_cwd}"
+        );
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // The author keeps working in the SAME worktree — reading, explaining, running
+        // tests — without touching another file. Nothing moved; only the window scrolled.
+        seed_chatter(&app, &parent.id, WRITE_EVIDENCE_SCAN_LIMIT * 2).await;
+
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer.clone());
+        let receipt = app.request_review(reuse).await.expect(
+            "a quiet stretch after the last edit must not strand the reviewer in another tree",
+        );
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "{:?}", job.error);
+        let second_cwd = review_job_cwd(&app, &receipt.review_job_id).await;
+        assert!(
+            same_dir(&second_cwd, &linked_cwd),
+            "review 2 must stay in the worktree the thread proved it works in, not snap \
+back to the tree it was born in: {second_cwd}"
+        );
+
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        let last_review_prompt = turns
+            .iter()
+            .rev()
+            .map(|(_, prompt)| prompt.as_str())
+            .find(|prompt| prompt.contains("Workspace diff collected by the relay"))
+            .expect("a reviewer turn carrying the workspace diff")
+            .to_string();
+        assert!(
+            last_review_prompt.contains("WORKTREE_EDIT")
+                && !last_review_prompt.contains("MAIN_TREE_EDIT"),
+            "the reviewer must still be handed the worktree's diff: {last_review_prompt}"
+        );
+    }
+
+    // The same defect one level deeper, and why it outlives a relay restart: the write
+    // evidence lives ONLY in the parent's in-memory transcript. Restart the relay and the
+    // parent has no runtime at all until someone opens it, so a review requested in that
+    // window sees no evidence whatsoever and resolves to the tree the thread was born in —
+    // stranding the reviewer that was created while the evidence was still there.
+    //
+    // Which tree a thread's work is in is a durable fact about the thread, not a property
+    // of whatever transcript happens to be loaded right now.
+    #[tokio::test]
+    async fn a_proven_review_tree_outlives_the_parents_runtime() {
+        let dir = TempDir::new().expect("tmpdir");
+        let (main_cwd, linked_cwd) = init_repo_with_sibling_worktree(dir.path());
+        std::fs::write(
+            std::path::Path::new(&main_cwd).join("seed.txt"),
+            "line1\nline2\nMAIN_TREE_EDIT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            std::path::Path::new(&linked_cwd).join("seed.txt"),
+            "line1\nline2\nWORKTREE_EDIT\n",
+        )
+        .unwrap();
+
+        let (app, providers) = build_review_app(&main_cwd, &["codex"]).await;
+        let parent = start_parent(&app, &main_cwd, "codex").await;
+        seed_landed_edit(&app, &parent.id, &format!("{linked_cwd}/seed.txt")).await;
+
+        let first = app
+            .request_review(review_input("codex"))
+            .await
+            .expect("the first review should start");
+        let first_job = wait_for_review(&app, &first.review_job_id).await;
+        assert_eq!(first_job.status, "complete", "{:?}", first_job.error);
+        let reviewer = first_job
+            .reviewer_thread_id
+            .clone()
+            .expect("reviewer thread id");
+        wait_for_active_turn_idle(&app).await;
+
+        // The restart: runtimes are process-local, so the parent's transcript — and with
+        // it every trace of where it has been writing — is gone. Only its cached row (the
+        // cwd it was BORN in) survives, which is exactly the tree it left.
+        {
+            let mut relay = app.relay.write().await;
+            relay.runtimes.remove(&parent.id);
+            let recorded = relay.thread_cwd(&parent.id).expect("a cached thread row");
+            assert!(
+                same_dir(&recorded, &main_cwd),
+                "precondition: with no runtime the thread only knows its birth tree, got \
+{recorded}"
+            );
+        }
+
+        let mut reuse = review_input("codex");
+        reuse.reviewer_thread_id = Some(reviewer.clone());
+        let receipt = app
+            .request_review(reuse)
+            .await
+            .expect("a restart must not strand the reviewer in another tree");
+        let job = wait_for_review(&app, &receipt.review_job_id).await;
+        assert_eq!(job.status, "complete", "{:?}", job.error);
+        let cwd = review_job_cwd(&app, &receipt.review_job_id).await;
+        assert!(
+            same_dir(&cwd, &linked_cwd),
+            "the review must still target the tree the thread proved it works in: {cwd}"
+        );
+
+        let turns = providers.get("codex").unwrap().turns.lock().await.clone();
+        let last_review_prompt = turns
+            .iter()
+            .rev()
+            .map(|(_, prompt)| prompt.as_str())
+            .find(|prompt| prompt.contains("Workspace diff collected by the relay"))
+            .expect("a reviewer turn carrying the workspace diff")
+            .to_string();
+        assert!(
+            last_review_prompt.contains("WORKTREE_EDIT")
+                && !last_review_prompt.contains("MAIN_TREE_EDIT"),
+            "the reviewer must still be handed the worktree's diff: {last_review_prompt}"
+        );
+    }
+
     // Switching, direction 2 — the thread STARTED in a worktree (that still exists) and
     // has since moved back to the main tree. Same requirement, mirrored: follow the work
     // to `main`, and say `main` in the prompt.
@@ -13359,6 +17816,10 @@ settings update: {error}"
         .unwrap();
 
         let (app, providers) = build_review_app(&linked_cwd, &["codex"]).await;
+        // Granted on its own standing: this review falls back to the MAIN tree once the
+        // worktree above is deleted, and a grant on a worktree is not a grant on the
+        // repository it was cut from.
+        grant_workspace(&app, &main_cwd).await;
         let parent = start_parent(&app, &linked_cwd, "codex").await;
         seed_landed_edit(&app, &parent.id, &format!("{main_cwd}/seed.txt")).await;
 
@@ -13890,6 +18351,7 @@ settings update: {error}"
                 sandbox: None,
                 provider: Some("codex".to_string()),
                 initial_prompt: None,
+                project_id: None,
             })
             .await
             .expect("starting another session must be allowed during a review");
@@ -14018,6 +18480,7 @@ settings update: {error}"
             // Atomic: register the row AND assign reviewer_thread_id together.
             relay.register_background_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: pending.to_string(),
                     name: None,
                     preview: String::new(),
@@ -14118,6 +18581,110 @@ settings update: {error}"
         assert!(
             pos_active < pos_stale,
             "recent-activity thread must outrank the merely-selected one (active={pos_active}, stale={pos_stale})"
+        );
+    }
+
+    /// The question a client holding open tabs actually has, and the one a page cannot
+    /// answer: is THIS id still resolvable?
+    ///
+    /// `limit` bounds the provider SCAN, not just the result (`bridge.list_threads`
+    /// truncates), so a session older than the page is absent from it while being
+    /// perfectly alive. A client diffing its tabs against a page would read that as
+    /// deletion and close them — which is the normal state of any long-lived relay, not a
+    /// corner case. An `ids` probe therefore scans as deeply as a search and is not
+    /// truncated to `limit`.
+    #[tokio::test]
+    async fn list_threads_by_id_finds_a_session_older_than_the_page() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, _providers) = build_review_app(cwd, &["codex"]).await;
+
+        let oldest = start_parent(&app, cwd, "codex").await;
+        let middle = start_parent(&app, cwd, "codex").await;
+        let newest = start_parent(&app, cwd, "codex").await;
+        {
+            let mut relay = app.relay.write().await;
+            relay
+                .thread_last_activity_at
+                .insert(oldest.id.clone(), 1_000);
+            relay
+                .thread_last_activity_at
+                .insert(middle.id.clone(), 2_000);
+            relay
+                .thread_last_activity_at
+                .insert(newest.id.clone(), 3_000);
+        }
+
+        // A page of one shows only the newest — this is the trap being avoided.
+        let page = app.list_threads(1, None).await.expect("page");
+        assert!(
+            page.threads.iter().all(|thread| thread.id != oldest.id),
+            "precondition: the oldest session must be off the page"
+        );
+
+        // TWO off-page ids against a page size of one, deliberately: asking for a single
+        // id would leave `truncate(limit)` a no-op and so would not notice a probe still
+        // being cut down to the sidebar's page size.
+        let probed = app
+            .list_threads_matching(1, None, None, Some(&[oldest.id.clone(), middle.id.clone()]))
+            .await
+            .expect("probe");
+
+        let mut answered = probed
+            .threads
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>();
+        answered.sort();
+        let mut expected = vec![oldest.id.clone(), middle.id.clone()];
+        expected.sort();
+        assert_eq!(
+            answered, expected,
+            "an id probe must answer for every id it was given, at any depth, and for nothing else"
+        );
+    }
+
+    /// The other half: a session that is genuinely gone must be ABSENT from the answer,
+    /// which is how the caller learns it. Archive is the case with no tombstone anywhere —
+    /// it removes the row and the provider stops listing it, and that is the entire signal.
+    #[tokio::test]
+    async fn list_threads_by_id_omits_a_session_that_was_archived() {
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, _providers) = build_review_app(cwd, &["codex"]).await;
+
+        let kept = start_parent(&app, cwd, "codex").await;
+        let doomed = start_parent(&app, cwd, "codex").await;
+        // A live session that is NOT asked about. Without it this test would pass on a
+        // plain page too — two threads minus the archived one look identical either way —
+        // and would therefore prove nothing about the id filter.
+        let unrelated = start_parent(&app, cwd, "codex").await;
+
+        app.archive_thread(&doomed.id, None)
+            .await
+            .expect("archive should succeed");
+
+        let probed = app
+            .list_threads_matching(80, None, None, Some(&[kept.id.clone(), doomed.id.clone()]))
+            .await
+            .expect("probe");
+
+        let answered = probed
+            .threads
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            answered.contains(&kept.id),
+            "a live session must still be resolvable: {answered:?}"
+        );
+        assert!(
+            !answered.contains(&doomed.id),
+            "an archived session must be absent, because absence is the only signal there is"
+        );
+        assert!(
+            !answered.contains(&unrelated.id),
+            "and a probe must answer only for what it asked about: {answered:?}"
         );
     }
 
@@ -15572,6 +20139,7 @@ turn) must allow a review: {error:?}"
             });
             relay.register_background_thread(
                 ThreadSummaryView {
+                    workspace_trusted: false,
                     id: pending.to_string(),
                     name: None,
                     preview: String::new(),
@@ -16042,6 +20610,7 @@ turn) must allow a review: {error:?}"
         {
             let mut relay = app.relay.write().await;
             relay.threads.push(ThreadSummaryView {
+                workspace_trusted: false,
                 id: "bg-thread".to_string(),
                 name: None,
                 preview: String::new(),
@@ -16089,6 +20658,7 @@ turn) must allow a review: {error:?}"
         {
             let mut relay = app.relay.write().await;
             relay.threads.push(ThreadSummaryView {
+                workspace_trusted: false,
                 id: "bg-thread".to_string(),
                 name: None,
                 preview: String::new(),
@@ -16176,6 +20746,28 @@ turn) must allow a review: {error:?}"
             app.relay.read().await.pending_ask_user_questions.is_empty(),
             "pending questions must be cleared"
         );
+    }
+
+    // Product workflow scenarios are private source. They are compiled here so
+    // they retain access to the relay's in-process provider harness, but a public
+    // checkout has neither their source nor the feature that includes them.
+    #[cfg(feature = "private")]
+    mod private_task_team_tests {
+        use super::*;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sealwire-private/relay_server_tests/task_team.rs"
+        ));
+    }
+
+    mod public_task_team_mechanism_tests {
+        use super::*;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/state/app/team_mechanism_tests.rs"
+        ));
     }
 
     #[tokio::test]
@@ -16280,8 +20872,9 @@ mod double_approve_race {
         };
         let client_grant = |Json(body): Json<serde_json::Value>| async move {
             Json(serde_json::json!({
-                "client_id": "client-1",
-                "client_refresh_token": "cref-attempt",
+                "claim_id": "claim-attempt",
+                "claim_nonce": "nonce-attempt",
+                "claim_expires_at": 4102444800_u64,
                 "relay_id": "relay-owner-1",
                 "broker_room_id": "demo-room",
                 "device_id": body["device_id"],
@@ -16580,5 +21173,596 @@ mod local_snapshot_sharing {
             "the fresh build must repopulate the cache, not bypass and abandon it"
         );
         assert!(Arc::ptr_eq(&connecting, &later_waiter));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A provider whose model catalog only becomes knowable once it has been asked
+// to do something — which is ACP's actual shape: `cursor-agent acp` has no
+// `model/list` method at all, and the catalog rides along on `session/new` and
+// `session/load` responses. On the first-ever boot in a workspace there is no
+// cached catalog, so the relay asks before the bridge can possibly answer.
+// ---------------------------------------------------------------------------
+mod late_catalog_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{watch, Mutex, RwLock};
+
+    use crate::protocol::{
+        ApprovalDecisionInput, ResumeSessionInput, ThreadSummaryView, TranscriptEntryView,
+    };
+    use crate::provider::ProviderBridge;
+    use crate::state::{
+        unix_now, AppState, PendingApproval, RelayState, SecurityProfile, DEFAULT_MODEL,
+    };
+
+    struct LateCatalogProvider {
+        name: &'static str,
+        threads: Mutex<HashMap<String, ThreadSummaryView>>,
+        /// Flips once a session operation has happened, exactly as the ACP
+        /// bridge's in-memory catalog is populated by `absorb_catalog`.
+        catalog_known: Mutex<bool>,
+        /// Whether this provider's catalog contains the id `DEFAULT_MODEL`
+        /// happens to be. Codex does — for it "gpt-5.5" is a real, choosable
+        /// model. Cursor does not. That difference is the whole discriminator.
+        offers_seed_named_model: bool,
+    }
+
+    impl LateCatalogProvider {
+        fn new(name: &'static str, cwd: &str) -> Self {
+            let mut threads = HashMap::new();
+            threads.insert(
+                "late-thread".to_string(),
+                ThreadSummaryView {
+                    workspace_trusted: false,
+                    id: "late-thread".to_string(),
+                    name: Some("late".to_string()),
+                    preview: String::new(),
+                    cwd: cwd.to_string(),
+                    updated_at: unix_now(),
+                    source: name.to_string(),
+                    status: "idle".to_string(),
+                    model_provider: name.to_string(),
+                    provider: name.to_string(),
+                    forked_from: None,
+                    renamed: false,
+                },
+            );
+            Self {
+                name,
+                threads: Mutex::new(threads),
+                catalog_known: Mutex::new(false),
+                offers_seed_named_model: false,
+            }
+        }
+
+        fn offering_seed_named_model(name: &'static str, cwd: &str) -> Self {
+            Self {
+                offers_seed_named_model: true,
+                ..Self::new(name, cwd)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderBridge for LateCatalogProvider {
+        async fn list_threads(&self, _limit: usize) -> Result<Vec<ThreadSummaryView>, String> {
+            Ok(self.threads.lock().await.values().cloned().collect())
+        }
+
+        async fn list_models(&self) -> Result<Vec<crate::protocol::ModelOptionView>, String> {
+            if !*self.catalog_known.lock().await {
+                // "Answered before it was ready" — the relay treats an empty
+                // list as a soft miss and keeps whatever it had.
+                return Ok(Vec::new());
+            }
+            let option = |model: &str, is_default: bool| crate::protocol::ModelOptionView {
+                model: model.to_string(),
+                display_name: model.to_string(),
+                supported_reasoning_efforts: vec!["medium".to_string()],
+                default_reasoning_effort: "medium".to_string(),
+                is_default,
+                hidden: false,
+                provider: self.name.to_string(),
+            };
+            let mut catalog = vec![option("agent-default", true)];
+            if self.offers_seed_named_model {
+                catalog.push(option(DEFAULT_MODEL, false));
+            }
+            Ok(catalog)
+        }
+
+        async fn start_thread(
+            &self,
+            request: crate::provider::StartThreadRequest,
+        ) -> Result<crate::provider::StartThreadResult, String> {
+            let cwd = request.cwd.as_str();
+            let model = request.model.as_str();
+            let approval_policy = request.approval_policy.as_str();
+            let sandbox = request.sandbox.as_str();
+            let initial_prompt = request.initial_prompt.as_deref();
+            let _ = (model, approval_policy, sandbox, initial_prompt);
+
+            // ACP learns its catalog from the `session/new` response, i.e. only
+            // once the thread has actually been created.
+            *self.catalog_known.lock().await = true;
+            let thread = ThreadSummaryView {
+                workspace_trusted: false,
+                id: "late-new-thread".to_string(),
+                name: Some("late new".to_string()),
+                preview: String::new(),
+                cwd: cwd.to_string(),
+                updated_at: unix_now(),
+                source: self.name.to_string(),
+                status: "idle".to_string(),
+                model_provider: self.name.to_string(),
+                provider: self.name.to_string(),
+                forked_from: None,
+                renamed: false,
+            };
+            self.threads
+                .lock()
+                .await
+                .insert(thread.id.clone(), thread.clone());
+            Ok(crate::provider::StartThreadResult {
+                thread,
+                consumed_initial_prompt: false,
+                initial_user_message: None,
+                started_turn_id: None,
+            })
+        }
+
+        async fn resume_thread(&self, _t: &str, _a: &str, _s: &str) -> Result<(), String> {
+            *self.catalog_known.lock().await = true;
+            Ok(())
+        }
+
+        async fn read_thread(
+            &self,
+            thread_id: &str,
+        ) -> Result<crate::provider::ThreadSyncData, String> {
+            // The session read is what teaches the bridge its catalog.
+            *self.catalog_known.lock().await = true;
+            let thread = self
+                .threads
+                .lock()
+                .await
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| format!("thread '{thread_id}' not found"))?;
+            Ok(crate::provider::ThreadSyncData {
+                thread,
+                status: "idle".to_string(),
+                active_flags: Vec::new(),
+                transcript: Vec::new(),
+            })
+        }
+
+        async fn read_thread_entry_detail(
+            &self,
+            _t: &str,
+            _i: &str,
+        ) -> Result<Option<TranscriptEntryView>, String> {
+            Ok(None)
+        }
+
+        async fn archive_thread(&self, _t: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn delete_thread_permanently(
+            &self,
+            _t: &str,
+        ) -> Result<crate::codex_local::LocalThreadDeleteSummary, String> {
+            Err("unsupported".to_string())
+        }
+
+        async fn start_turn(
+            &self,
+            _t: &str,
+            _x: &str,
+            _m: &str,
+            _e: &str,
+            _i: &[crate::provider::ProviderImage],
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn request_turn_stop(&self, _t: &str, _u: Option<&str>) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn respond_to_approval(
+            &self,
+            _p: &PendingApproval,
+            _i: &ApprovalDecisionInput,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn respond_to_ask_user_question(
+            &self,
+            _r: &str,
+            _a: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn a_thread_never_records_the_global_seed_model_of_another_provider() {
+        // `DEFAULT_MODEL` is "gpt-5.5" — a provider-agnostic SEED that happens to
+        // be Codex's id, and which `set_available_models` also uses as its
+        // "nobody has chosen yet" sentinel. On a first-ever boot the relay asks a
+        // provider for its catalog before that provider can answer, gets nothing,
+        // falls back to the seed, and records Codex's model id on a thread that
+        // is not Codex's — then persists it, so it survives every later restart.
+        //
+        // Measured on a real cursor relay: process 1 reports `gpt-5.5`, process 2
+        // (catalog now cached on disk) reports the provider's real default. The
+        // live e2e's "model must survive a relay restart" is what caught it.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+        }
+
+        // Cold: the bridge cannot answer yet.
+        assert!(
+            bridge.list_models().await.expect("list").is_empty(),
+            "precondition: the catalog is not knowable before a session op"
+        );
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_ne!(
+            snapshot.model, DEFAULT_MODEL,
+            "the relay recorded another provider's model id because it asked \
+             before the bridge could answer"
+        );
+        assert_eq!(
+            snapshot.model, "agent-default",
+            "once the provider has been consulted, its own default is what counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_thread_never_records_the_global_seed_model_either() {
+        // The sibling of the resume case. A provider that publishes its catalog
+        // on thread creation cannot answer beforehand, so the model the relay
+        // picks for `start_thread` is the seed — and without healing afterwards
+        // that seed is what gets recorded and persisted on the new thread.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+        }
+
+        let snapshot = app
+            .start_session(crate::protocol::StartSessionInput {
+                cwd: Some(cwd.to_string()),
+                initial_prompt: None,
+                model: None,
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+                project_id: None,
+            })
+            .await
+            .expect("start should succeed");
+
+        assert_ne!(
+            snapshot.model, DEFAULT_MODEL,
+            "a brand-new thread recorded another provider's seed model id"
+        );
+        assert_eq!(snapshot.model, "agent-default");
+    }
+
+    #[tokio::test]
+    async fn a_deliberately_chosen_model_is_not_overwritten_just_because_it_looks_like_the_seed() {
+        // The trap in the cold-run fix. `DEFAULT_MODEL` is "gpt-5.5" — for Codex
+        // that is not a seed at all, it is a real model a user can pick. So
+        // "this value equals DEFAULT_MODEL" does NOT mean "the relay invented
+        // it": it may be exactly what the user chose for this thread.
+        //
+        // Two threads on one provider, one pinned to the seed-named model and
+        // the global sitting on the other. Resuming the pinned thread must not
+        // adopt the global.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // The user pinned THIS thread to the seed-named model...
+            relay.remember_thread_settings(
+                "late-thread",
+                "untrusted",
+                "workspace-write",
+                "medium",
+                DEFAULT_MODEL,
+            );
+            // ...while the relay's global model is something else entirely.
+            relay.model = "agent-default".to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "resuming silently replaced the model this thread was pinned to"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_requested_model_is_not_overwritten_either() {
+        // Same trap on the start path, and worse: here the id was typed by the
+        // user in this very request.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            relay.model = "agent-default".to_string();
+        }
+
+        let snapshot = app
+            .start_session(crate::protocol::StartSessionInput {
+                cwd: Some(cwd.to_string()),
+                initial_prompt: None,
+                model: Some(DEFAULT_MODEL.to_string()),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+                project_id: None,
+            })
+            .await
+            .expect("start should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "the model the caller explicitly asked for was replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_catalog_failure_is_not_treated_as_an_invented_model() {
+        // `catalog_was_unknown` was a false proxy for "the relay invented this".
+        // `load_provider_model_catalog` returns `None` for three different
+        // reasons, and only one of them justifies healing: the provider has no
+        // catalog YET (the ACP case), it answered empty ("not ready"), or the
+        // call errored. Codex's app-server produces the latter two when it is
+        // busy or restarting — and codex genuinely offers the id `DEFAULT_MODEL`
+        // happens to be, so healing there discards the user's actual model.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        // A provider whose catalog CONTAINS the seed-named id, i.e. codex.
+        let bridge = Arc::new(LateCatalogProvider::offering_seed_named_model("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // The user's global choice IS the seed-named model. No per-thread
+            // setting exists, so the resume falls back to it — which is not the
+            // relay inventing anything, it is the user's choice arriving by the
+            // only route it has.
+            relay.model = DEFAULT_MODEL.to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, DEFAULT_MODEL,
+            "a catalog read that merely failed is not evidence the model was invented"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_model_is_healed_even_when_it_is_not_the_seed() {
+        // The other half of the same mistake: the heal also gated on
+        // `model == DEFAULT_MODEL`, so it only ever fired on a brand-new relay.
+        // After any codex use — or a global restored from disk — the fallback
+        // carries codex's REAL id, and a cursor thread recorded and persisted
+        // that instead. Nothing about `DEFAULT_MODEL` is special here; what
+        // matters is that the provider does not offer the id.
+        let project = TempDir::new().expect("project tempdir");
+        let cwd = project.path().to_str().unwrap();
+        let (change_tx, _) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            cwd.to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        // A provider whose catalog does NOT contain it, i.e. cursor.
+        let bridge = Arc::new(LateCatalogProvider::new("late", cwd));
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("late".to_string(), bridge.clone());
+        let app = AppState::from_parts(relay.clone(), providers, change_tx);
+        {
+            let mut relay = relay.write().await;
+            relay.set_provider_name("late".to_string());
+            // A warm relay: the global is another provider's real model id.
+            relay.model = "gpt-5.5-codex".to_string();
+        }
+
+        let snapshot = app
+            .resume_session(ResumeSessionInput {
+                thread_id: "late-thread".to_string(),
+                approval_policy: None,
+                sandbox: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                provider: Some("late".to_string()),
+            })
+            .await
+            .expect("resume should succeed");
+
+        assert_eq!(
+            snapshot.model, "agent-default",
+            "a foreign model id the relay fell back to must not be recorded on this thread"
+        );
+    }
+}
+
+#[cfg(test)]
+mod beta_gate_tests {
+    //! The server half of the beta gate: the relay refuses the team endpoints and
+    //! reports the gate on the snapshot. The UI's blur is presentation only.
+
+    use super::super::*;
+    use crate::fake_provider::FakeProviderBridge;
+    use crate::protocol::StartTeamInput;
+    use crate::state::security::SecurityProfile;
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    async fn build_app() -> (AppState, Arc<RwLock<RelayState>>) {
+        let (change_tx, _keep) = watch::channel(0_u64);
+        let relay = Arc::new(RwLock::new(RelayState::new(
+            ".".to_string(),
+            change_tx.clone(),
+            SecurityProfile::private(),
+        )));
+        let bridge = FakeProviderBridge::spawn(relay.clone())
+            .await
+            .expect("fake provider should spawn");
+        let mut providers: HashMap<String, Arc<dyn ProviderBridge>> = HashMap::new();
+        providers.insert("fake".to_string(), Arc::new(bridge));
+        (
+            AppState::from_parts(relay.clone(), providers, change_tx),
+            relay,
+        )
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_beta_locked_by_default() {
+        let (_app, relay) = build_app().await;
+        let snapshot = relay.read().await.snapshot();
+        assert!(
+            !snapshot.beta_features_enabled,
+            "a relay nobody opted in must describe itself as locked"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_beta_unlocked_once_enabled() {
+        let (_app, relay) = build_app().await;
+        relay.write().await.set_beta_features_enabled(true);
+        let snapshot = relay.read().await.snapshot();
+        assert!(snapshot.beta_features_enabled);
+    }
+
+    #[tokio::test]
+    async fn starting_a_task_is_refused_while_beta_is_locked() {
+        let (app, _relay) = build_app().await;
+        let error = app
+            .start_team(StartTeamInput {
+                title: "Rewrite the parser".to_string(),
+                device_id: Some("device-1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a locked relay must refuse to start a task");
+        assert!(
+            error.contains("development"),
+            "the refusal should name the reason the UI is showing; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_tasks_is_empty_while_beta_is_locked() {
+        let (app, _relay) = build_app().await;
+        // A locked client should never receive run data even if runs exist on
+        // disk from an earlier unlocked launch.
+        let response = app.teams().await;
+        assert!(response.teams.is_empty());
     }
 }

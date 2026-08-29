@@ -7,13 +7,13 @@ use serde_json::json;
 async fn join_publish_and_leave_broadcast_presence() {
     let state = BrokerState::default();
     let mut relay = state
-        .join("room-a", "relay-1", PeerRole::Relay, None)
+        .join("room-a", "relay-1", PeerRole::Relay, None, None)
         .await
         .expect("relay should join");
     assert!(relay.existing_peers.is_empty());
 
     let mut surface = state
-        .join("room-a", "phone-1", PeerRole::Surface, None)
+        .join("room-a", "phone-1", PeerRole::Surface, None, None)
         .await
         .expect("surface should join");
     assert_eq!(
@@ -86,18 +86,18 @@ async fn join_publish_and_leave_broadcast_presence() {
 async fn duplicate_peer_ids_are_rejected_per_channel() {
     let state = BrokerState::default();
     state
-        .join("room-a", "phone-1", PeerRole::Surface, None)
+        .join("room-a", "phone-1", PeerRole::Surface, None, None)
         .await
         .expect("first peer should join");
 
     let error = state
-        .join("room-a", "phone-1", PeerRole::Surface, None)
+        .join("room-a", "phone-1", PeerRole::Surface, None, None)
         .await
         .expect_err("duplicate peer should fail");
     assert!(error.contains("already connected"));
 
     state
-        .join("room-b", "phone-1", PeerRole::Surface, None)
+        .join("room-b", "phone-1", PeerRole::Surface, None, None)
         .await
         .expect("same peer id in another channel should work");
 }
@@ -106,18 +106,18 @@ async fn duplicate_peer_ids_are_rejected_per_channel() {
 async fn relay_reconnect_replaces_old_connection_without_old_leave_removing_new_peer() {
     let state = BrokerState::default();
     let mut surface = state
-        .join("room-a", "phone-1", PeerRole::Surface, None)
+        .join("room-a", "phone-1", PeerRole::Surface, None, None)
         .await
         .expect("surface should join");
     let mut old_relay = state
-        .join("room-a", "relay-1", PeerRole::Relay, None)
+        .join("room-a", "relay-1", PeerRole::Relay, None, None)
         .await
         .expect("old relay should join");
     let old_connection_id = old_relay.connection_id;
     drain_presence(&mut surface.receiver).await;
 
     let new_relay = state
-        .join("room-a", "relay-1", PeerRole::Relay, None)
+        .join("room-a", "relay-1", PeerRole::Relay, None, None)
         .await
         .expect("authenticated relay reconnect should replace its stale connection");
     assert_ne!(new_relay.connection_id, old_connection_id);
@@ -168,19 +168,19 @@ async fn relay_reconnect_replaces_old_connection_without_old_leave_removing_new_
 async fn targeted_messages_publish_only_to_listed_peers() {
     let state = BrokerState::default();
     let mut surface_a = state
-        .join("room-a", "surface-a", PeerRole::Surface, None)
+        .join("room-a", "surface-a", PeerRole::Surface, None, None)
         .await
         .expect("surface a should join");
     let mut surface_b = state
-        .join("room-a", "surface-b", PeerRole::Surface, None)
+        .join("room-a", "surface-b", PeerRole::Surface, None, None)
         .await
         .expect("surface b should join");
     let mut surface_c = state
-        .join("room-a", "surface-c", PeerRole::Surface, None)
+        .join("room-a", "surface-c", PeerRole::Surface, None, None)
         .await
         .expect("surface c should join");
     let mut relay = state
-        .join("room-a", "relay-1", PeerRole::Relay, None)
+        .join("room-a", "relay-1", PeerRole::Relay, None, None)
         .await
         .expect("relay should join");
 
@@ -256,11 +256,12 @@ async fn records_usage_events_for_connect_publish_and_disconnect() {
             "relay-1",
             PeerRole::Relay,
             Some("device-xyz".to_string()),
+            None,
         )
         .await
         .expect("relay should join");
     state
-        .join("room-a", "phone-1", PeerRole::Surface, None)
+        .join("room-a", "phone-1", PeerRole::Surface, None, None)
         .await
         .expect("surface should join");
     state
@@ -317,7 +318,7 @@ async fn malformed_targeted_publish_is_not_counted_as_activity() {
     let state = BrokerState::with_event_sink(sink.clone());
 
     state
-        .join("room-a", "relay-1", PeerRole::Relay, None)
+        .join("room-a", "relay-1", PeerRole::Relay, None, None)
         .await
         .expect("relay should join");
 
@@ -362,6 +363,94 @@ async fn malformed_targeted_publish_is_not_counted_as_activity() {
         1,
         "only the relay connect should be recorded; got {events:?}"
     );
+}
+
+#[tokio::test]
+async fn a_refused_bare_pairing_result_is_not_counted_as_activity() {
+    let sink = Arc::new(CollectingSink::default());
+    let state = BrokerState::with_event_sink(sink.clone());
+
+    state
+        .join("room-a", "relay-1", PeerRole::Relay, None, None)
+        .await
+        .expect("relay should join");
+
+    // A pairing result published without the `targeted_messages` wrapper is
+    // refused (it would hand the sealed device credentials to any bystander that
+    // photographed the QR), so like any other rejected frame it must not land in
+    // the usage stream.
+    let result = state
+        .publish(
+            "room-a",
+            "relay-1",
+            json!({
+                "kind": "encrypted_pairing_result",
+                "pairing_id": "pair-1",
+                "target_peer_id": "phone-1",
+                "envelope": {"nonce": "n", "ciphertext": "c"},
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a bare pairing result should be rejected, got {result:?}"
+    );
+
+    let events = sink
+        .events
+        .lock()
+        .expect("sink mutex should not be poisoned")
+        .clone();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event != UsageEventKind::Publish),
+        "a refused publish must not be recorded as activity; got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_directed_remote_action_result_still_fans_out() {
+    let state = BrokerState::default();
+
+    let relay = state
+        .join("room-a", "relay-1", PeerRole::Relay, None, None)
+        .await
+        .expect("relay should join");
+    let mut surface = state
+        .join("room-a", "phone-1", PeerRole::Surface, None, None)
+        .await
+        .expect("surface should join")
+        .receiver;
+    drop(relay);
+
+    // `target_peer_id` is a client-side filter hint on most payloads, not a
+    // routing directive. Refusing every payload that carries one would silently
+    // drop every remote action response and strand the surface waiting.
+    state
+        .publish(
+            "room-a",
+            "relay-1",
+            json!({
+                "kind": "encrypted_remote_action_result",
+                "action_id": "action-1",
+                "target_peer_id": "phone-1",
+                "device_id": "device-1",
+                "envelope": {"nonce": "n", "ciphertext": "c"},
+            }),
+        )
+        .await
+        .expect("a directed remote action result should publish");
+
+    // No drain here: the surface joined last, so nothing was queued for it before
+    // the publish (and `drain_presence` would swallow the very frame under test —
+    // its `try_recv` consumes the first non-Presence message).
+    match surface.try_recv() {
+        Ok(ServerMessage::Message { payload, .. }) => {
+            assert_eq!(payload["kind"], "encrypted_remote_action_result");
+        }
+        other => panic!("surface should receive the remote action result: {other:?}"),
+    }
 }
 
 async fn drain_presence(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMessage>) {

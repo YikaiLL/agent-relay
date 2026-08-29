@@ -3,7 +3,7 @@ import React from "react";
 import { SegmentedControl } from "./session-settings-panel.js";
 import { ReviewerPanel } from "./reviewer-panel.js";
 import { isTerminalReviewStatus } from "./review-state.js";
-import { isTerminalWorkflowStatus } from "./workflow-state.js";
+import { CODE_FLOW_ENABLED, isTerminalWorkflowStatus } from "./workflow-state.js";
 
 const h = React.createElement;
 
@@ -40,9 +40,11 @@ export function RightPanelTabs({ store, changes, reviewer = {}, panelId = "revie
   const inProgress = (review.reviewJobs || []).filter(
     (job) => !isTerminalReviewStatus(job.status)
   ).length;
-  const workflowInProgress = (review.workflowRuns || []).filter(
-    (run) => !isTerminalWorkflowStatus(run.status)
-  ).length;
+  // Hidden Code Flow must not badge the tab either — a dot on "Reviewer" that leads to a
+  // panel showing no running anything is worse than no dot at all.
+  const workflowInProgress = CODE_FLOW_ENABLED
+    ? (review.workflowRuns || []).filter((run) => !isTerminalWorkflowStatus(run.status)).length
+    : 0;
 
   // NEVER auto-switch the tab — the review must not yank the user's view around.
   // A running/blocked review only surfaces PASSIVELY here: the tab label gets a dot
@@ -79,6 +81,20 @@ export function RightPanelTabs({ store, changes, reviewer = {}, panelId = "revie
           reusableReviewers: review.reusableReviewers || [],
           reviewerThreads: review.reviewerThreads || [],
           parentThreadId: review.parentThreadId || null,
+          // The working tree comes off the store, not the review slice: it is the SAME
+          // resolved workspace the Changes tab is diffing, so the two tabs can never
+          // disagree about which tree the panel is about.
+          workspace: state.workspace || null,
+          workspaceBusy: Boolean(state.workspacePinning),
+          workspaceError: state.workspaceError || null,
+          onPinWorkspace: (path) => store.pinWorkspace?.(path),
+          onOpenWorkspace: (owner) => store.measureRoots?.(owner),
+          onCloseWorkspace: (owner) => store.stopMeasuringRoots?.(owner),
+          // Null on a paired device: granting is local-only, so the review dialog there
+          // explains the ungranted tree instead of offering to fix it.
+          onTrustWorkspace: store.canTrustWorkspace
+            ? (path) => void store.trustWorkspace?.(path)
+            : null,
           canRequest: Boolean(review.canRequest),
           canStartWorkflow: Boolean(review.canStartWorkflow),
           requesting: Boolean(review.requesting),

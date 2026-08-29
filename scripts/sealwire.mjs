@@ -86,6 +86,12 @@ const env = {
   [LAUNCH_ID_ENV]: launchId,
 };
 
+// OFF is *absence*, not "SEALWIRE_BETA=0", so this can never re-lock a user who
+// set the variable themselves (dev scripts do).
+if (args.beta) {
+  env.SEALWIRE_BETA = "1";
+}
+
 // Point the relay-server at the Claude worker shipped inside this package.
 // Without this, the binary falls back to a compile-time path baked in at build
 // time (the CI machine's checkout), which never exists on a user's machine —
@@ -201,6 +207,7 @@ child.on("exit", (code, signal) => {
 
 function parseArgs(argv) {
   const parsed = {
+    beta: false,
     broker: null,
     cloud: false,
     command: null,
@@ -216,6 +223,10 @@ function parseArgs(argv) {
     const arg = argv[index];
     if (arg === "--help" || arg === "-h") {
       parsed.help = true;
+    } else if (arg === "--beta") {
+      // A modifier, not a mode: orthogonal to local/cloud, so
+      // `sealwire cloud --beta` has to be expressible.
+      parsed.beta = true;
     } else if (arg === "--no-broker") {
       parsed.noBroker = true;
     } else if (arg === "--no-open") {
@@ -560,7 +571,7 @@ function printHelp() {
 Run a local relay-server from the npm package.
 
 Usage:
-  sealwire [local|cloud] [--broker <url>] [--port <port>] [--host <ip>] [--no-broker] [--no-open]
+  sealwire [local|cloud] [--beta] [--broker <url>] [--port <port>] [--host <ip>] [--no-broker] [--no-open]
 
 Commands:
   local         Run with no broker; remote pairing is disabled (alias for
@@ -573,6 +584,12 @@ Commands:
                 is set (--broker / AGENT_RELAY_PUBLIC_BROKER_URL / packaged
                 default); otherwise falls back to ${HOSTED_PUBLIC_BROKER_ORIGIN}.
                 Cannot be combined with local/--no-broker.
+
+Flags:
+  --beta        Unlock in-development features (currently: Tasks). Off by
+                default, where those features appear as a blurred preview
+                labelled "in development" rather than being hidden. Combine
+                freely with local/cloud. Equivalent to SEALWIRE_BETA=1.
 
 Defaults:
   --host        127.0.0.1
@@ -594,5 +611,7 @@ Examples:
   AGENT_RELAY_PUBLIC_BROKER_URL=https://broker.example.com npx sealwire
   sealwire --no-broker
   sealwire --no-open
+  sealwire --beta
+  sealwire cloud --beta
 `);
 }

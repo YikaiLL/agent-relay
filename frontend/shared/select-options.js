@@ -15,6 +15,7 @@ export function renderSelectOptions(select, options = [], selectedValue = "") {
     optionsKey: JSON.stringify(
       options.map((option) => ({
         label: option.label,
+        provider: option.provider || "",
         value: option.value,
       }))
     ),
@@ -45,6 +46,9 @@ export function renderSelectOptions(select, options = [], selectedValue = "") {
             {
               key: option.value,
               value: option.value,
+              // Lets a picker's logo slot resolve the selected vendor straight
+              // from the DOM, with no parallel lookup table to keep in sync.
+              "data-provider": option.provider || undefined,
             },
             option.label
           )
@@ -69,12 +73,16 @@ export function replaceSelectOptions(select, options = [], selectedValue = "") {
       (option, index) =>
         option.value === options[index]?.value
         && option.textContent === options[index]?.label
+        && (option.dataset.provider || "") === (options[index]?.provider || "")
     );
   if (!sameOptions) {
     const nodes = options.map((option) => {
       const node = document.createElement("option");
       node.value = option.value;
       node.textContent = option.label;
+      if (option.provider) {
+        node.dataset.provider = option.provider;
+      }
       return node;
     });
     select.replaceChildren(...nodes);

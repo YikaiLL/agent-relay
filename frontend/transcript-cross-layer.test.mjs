@@ -17,6 +17,7 @@ import {
   createClearedTranscriptHydrationPatch,
   createMergedTranscriptHydrationPagePatch,
   createTranscriptHydrationCompletePatch,
+  createTranscriptHydrationRevisionPatch,
   prepareTranscriptHydrationState,
   restoreHydratedTranscriptSnapshot,
 } from "./shared/transcript-hydration-store.js";
@@ -53,8 +54,14 @@ function makeStore() {
     setTranscriptHydrationIdle(state) {
       state.transcriptHydrationStatus = "idle";
     },
-    markTranscriptHydrationComplete(state) {
-      Object.assign(state, createTranscriptHydrationCompletePatch());
+    // Same shape as the real stores, including the revision each answers for:
+    // `fetchedRevision` gates the once-per-revision re-arm, `bodyRevision`
+    // records which revision the cached bodies came from.
+    markTranscriptHydrationComplete(state, fetchedRevision) {
+      Object.assign(state, createTranscriptHydrationCompletePatch(fetchedRevision));
+    },
+    recordTranscriptHydrationRevision(state, bodyRevision) {
+      Object.assign(state, createTranscriptHydrationRevisionPatch(bodyRevision));
     },
     mergeTranscriptHydrationPage(state, page, { prepend = false } = {}) {
       Object.assign(state, createMergedTranscriptHydrationPagePatch(state, page, { prepend }));

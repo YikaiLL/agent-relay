@@ -25,6 +25,7 @@ import {
   createMergedTranscriptHydrationPagePatch,
   createTranscriptHydrationCompletePatch,
   prepareTranscriptHydrationState,
+  createTranscriptHydrationRevisionPatch,
   restoreHydratedTranscriptSnapshot,
 } from "./shared/transcript-hydration-store.js";
 
@@ -52,8 +53,13 @@ function makeStore() {
     setTranscriptHydrationIdle(state) {
       state.transcriptHydrationStatus = "idle";
     },
-    markTranscriptHydrationComplete(state) {
-      Object.assign(state, createTranscriptHydrationCompletePatch());
+    // Forwarding the revision matters: it is what gates the once-per-revision
+    // re-arm, so a stub that drops it models a client that re-fetches forever.
+    markTranscriptHydrationComplete(state, fetchedRevision) {
+      Object.assign(state, createTranscriptHydrationCompletePatch(fetchedRevision));
+    },
+    recordTranscriptHydrationRevision(state, bodyRevision) {
+      Object.assign(state, createTranscriptHydrationRevisionPatch(bodyRevision));
     },
     mergeTranscriptHydrationPage(state, page, { prepend = false } = {}) {
       Object.assign(state, createMergedTranscriptHydrationPagePatch(state, page, { prepend }));
@@ -78,6 +84,8 @@ function createConversation(threadId, { perEntryChars = PER_ENTRY_CHARS } = {}) 
     backend.push({ tool: null, status: "completed", ...entry });
   }
 
+  let lastBackendKey = null;
+
   function compactedSnapshot() {
     let truncated = false;
     const transcript = backend.map((entry) => {
@@ -94,7 +102,16 @@ function createConversation(threadId, { perEntryChars = PER_ENTRY_CHARS } = {}) 
       }
       return { ...entry, content_state: "full" };
     });
-    revision += 1;
+    // Mirror the relay: `bump_thread_transcript_revision` fires on transcript
+    // WRITES only (state/relay.rs:863) -- `notify()` bumps the session revision
+    // and leaves `transcript_revision` alone. Bumping on every snapshot made a
+    // status-only frame look like new transcript data, which is precisely the
+    // signal the tail-freshness check reads.
+    const backendKey = JSON.stringify(backend);
+    if (backendKey !== lastBackendKey) {
+      lastBackendKey = backendKey;
+      revision += 1;
+    }
     return {
       active_thread_id: threadId,
       active_turn_id: activeTurnId,

@@ -266,3 +266,93 @@ test("a successful send clears a previously shown composer error", async () => {
   assert.equal(error.hidden, true, "a send that succeeds must clear the stale error");
   assert.equal(String(error.textContent), "", "and must not leave its text behind");
 });
+
+// The Orchestrator has no model picker and no settings gear — its model and
+// approval policy are settled when its thread is created. But `sendMessage`
+// unconditionally attached the SESSION composer's model and effort to every
+// send, so chatting with the Orchestrator while looking at a codex session put
+// a codex model id on a Claude thread. The relay does not validate an
+// explicitly named model (see state/app/mod.rs: "the Claude worker does not
+// validate the id at all, and a foreign one both fails the turn and tears down
+// the live SDK session"), so the turn dies and the composer says only that the
+// message was refused.
+test("a send that inherits no composer settings names no model or effort", async () => {
+  const bodies = [];
+  const { controller } = buildController({
+    respond: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true, data: {} }) };
+    },
+  });
+  const model = fakeNode("#message-model");
+  const effort = fakeNode("#message-effort");
+  model.value = "gpt-5.5";
+  effort.value = "low";
+
+  await controller.sendMessage("hello", "orch-thread", [], {
+    inheritComposerSettings: false,
+  });
+
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].thread_id, "orch-thread");
+  assert.equal(bodies[0].model, undefined, "no picker was shown, so name no model");
+  assert.equal(bodies[0].effort, undefined, "same for effort — the thread's own wins");
+});
+
+// The ordinary conversation still sends what its picker says.
+test("an ordinary send still carries the composer's model", async () => {
+  const bodies = [];
+  const { controller } = buildController({
+    respond: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true, data: {} }) };
+    },
+  });
+  fakeNode("#message-model").value = "gpt-5.5";
+
+  await controller.sendMessage("hello", "thread-1");
+
+  assert.equal(bodies[0].model, "gpt-5.5");
+});
+
+// The bug this pins, from review: the Orchestrator pane wired its Stop button to
+// the untargeted `stopActiveTurn()`, which posts
+// `state.viewOnlyThread?.threadId || state.session.active_thread_id` -- never the
+// Orchestrator's id. The Orchestrator is drawn beside the conversation and is
+// routinely NOT the active thread, so pressing its Stop could interrupt an
+// unrelated turn on whatever thread happened to be active, or report that
+// nothing is running while the Orchestrator worked on.
+test("stopping names the thread it was asked to stop", async () => {
+  const bodies = [];
+  const { controller, state } = buildController({
+    respond: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true, data: {} }) };
+    },
+  });
+  // Another thread is the active one and is mid-turn — the ordinary case while
+  // the Orchestrator runs in the background.
+  state.session.active_thread_id = "thread-1";
+  state.session.active_turn_id = "turn-1";
+
+  await controller.stopActiveTurn("orch-1");
+
+  assert.equal(bodies.length, 1, "an explicitly named thread is always stoppable");
+  assert.equal(bodies[0].thread_id, "orch-1");
+});
+
+test("stopping with no thread named still stops the viewed/active one", async () => {
+  const bodies = [];
+  const { controller, state } = buildController({
+    respond: async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true, data: {} }) };
+    },
+  });
+  state.session.active_thread_id = "thread-1";
+  state.session.active_turn_id = "turn-1";
+
+  await controller.stopActiveTurn();
+
+  assert.equal(bodies[0].thread_id, "thread-1");
+});

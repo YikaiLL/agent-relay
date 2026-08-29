@@ -11,6 +11,7 @@
     "approval_policy": "untrusted",
     "audit_enabled": false,
     "available_models": [],
+    "beta_features_enabled": false,
     "broker_can_read_content": false,
     "broker_channel_id": "room",
     "broker_connected": true,
@@ -29,6 +30,7 @@
     "pending_approvals": [],
     "pending_ask_user_questions": [],
     "provider": "codex",
+    "provider_archive_capabilities": [],
     "provider_connected": true,
     "provider_fork_capabilities": [],
     "provider_status": [],
@@ -73,7 +75,8 @@
     ],
     "transcript_revision": 3,
     "transcript_truncated": true,
-    "workflows_revision": 0
+    "workflows_revision": 0,
+    "workspace_missing": null
   },
   "remote_omitted_authoritative_entries": [
     {
@@ -106,6 +109,7 @@
     "approval_policy": "untrusted",
     "audit_enabled": false,
     "available_models": [],
+    "beta_features_enabled": false,
     "broker_can_read_content": false,
     "broker_channel_id": "room",
     "broker_connected": true,
@@ -124,6 +128,7 @@
     "pending_approvals": [],
     "pending_ask_user_questions": [],
     "provider": "codex",
+    "provider_archive_capabilities": [],
     "provider_connected": true,
     "provider_fork_capabilities": [],
     "provider_status": [],
@@ -159,6 +164,7 @@
     ],
     "transcript_revision": 3,
     "transcript_truncated": true,
-    "workflows_revision": 0
+    "workflows_revision": 0,
+    "workspace_missing": null
   }
 }

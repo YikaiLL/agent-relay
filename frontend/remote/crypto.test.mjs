@@ -172,3 +172,19 @@ test("software-stored device keypair persists across module reloads", async () =
 
   assert.equal(secondKeypair.verifyKey, firstKeypair.verifyKey);
 });
+
+// The exact bytes the broker verifies. This literal is duplicated in
+// `the_client_claim_message_matches_the_frontend_contract`
+// (crates/relay-broker/src/public_control.rs); both sides assert against it, so
+// a change to either format fails a test here instead of silently rejecting
+// every pairing at runtime. The relay id is part of the message on purpose: a
+// signature made for one relay must not redeem another relay's attestation.
+test("the client claim message matches the broker contract", async () => {
+  installBrowserStubs({});
+  const crypto = await importCrypto(`claim-message-${Date.now()}`);
+
+  assert.equal(
+    crypto.clientClaimProofMessage("ccl-abc", "cn-def", "relay-1"),
+    "agent-relay:client-claim:ccl-abc:cn-def:relay-1"
+  );
+});

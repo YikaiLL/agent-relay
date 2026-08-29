@@ -122,6 +122,14 @@ pub(super) enum OutboundBrokerPayload {
         thread_entry_detail: Option<ThreadEntryDetailResponse>,
         thread_transcript: Option<ThreadTranscriptResponse>,
         workspace_diff: Option<crate::protocol::WorkspaceDiffResponse>,
+        /// Missing from THIS variant means dropped on the plaintext path only —
+        /// the same silent-drop trap `reviews` and `projects` each fell into.
+        workspace_git_context: Option<crate::protocol::WorkspaceGitContextView>,
+        /// Must be copied on the plaintext path or the picker is empty on that transport.
+        thread_workspace: Option<crate::protocol::ResolvedWorkspace>,
+        /// Same plaintext-vs-sealed asymmetry as the fields above: absent here and
+        /// the fork dialog's settings arrive only on sealed transport.
+        thread_settings: Option<crate::protocol::ThreadSettingsView>,
         /// The `fetch_reviews` payload (review cards + reviewer threads). Without this the
         /// PLAINTEXT path silently dropped it — the sealed path serializes
         /// `RemoteActionResultPlaintext` wholesale and always carried it — so a phone's
@@ -142,7 +150,9 @@ pub(super) enum OutboundBrokerPayload {
         action: RemoteActionKind,
         chunk_index: usize,
         chunk_count: usize,
-        data_base64: String,
+        /// A text slice of the serialized result. Was `data_base64`; see
+        /// `RemoteActionResultChunkPlaintext::data`.
+        data: String,
     },
     EncryptedSessionSnapshot {
         target_peer_id: String,
@@ -187,8 +197,9 @@ pub(super) struct PairingResultPlaintext {
     pub(super) payload_secret: Option<String>,
     pub(super) relay_id: Option<String>,
     pub(super) relay_label: Option<String>,
-    pub(super) client_id: Option<String>,
-    pub(super) client_refresh_token: Option<String>,
+    pub(super) client_claim_id: Option<String>,
+    pub(super) client_claim_nonce: Option<String>,
+    pub(super) client_claim_expires_at: Option<u64>,
     pub(super) device_refresh_token: Option<String>,
     pub(super) device_join_ticket: Option<String>,
     pub(super) device_join_ticket_expires_at: Option<u64>,

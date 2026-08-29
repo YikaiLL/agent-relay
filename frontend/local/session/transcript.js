@@ -1,4 +1,5 @@
 import { transcript } from "../dom.js";
+import { displayedEntriesFrom, displayedThreadIdFrom } from "../displayed-thread.js";
 import { fetchTranscriptEntryDetailViaRequester } from "../../shared/transcript-entry-detail.js";
 import { normalizeThreadTranscriptPage } from "../../shared/transcript-page.js";
 import { createThreadTranscriptPageQueryOptions } from "../../shared/thread-queries.js";
@@ -89,19 +90,19 @@ export function createTranscriptController(ctx) {
   });
 
   async function fetchTranscriptPage(threadId, { before = null } = {}) {
-    if (!queryClient) {
-      return fetchCachedTranscriptPage({ threadId, before });
-    }
+    const page = queryClient
+      ? await queryClient.fetchQuery(
+        createThreadTranscriptPageQueryOptions({
+          before,
+          fetchPage: fetchCachedTranscriptPage,
+          scope: "local",
+          surface: "local",
+          threadId,
+        })
+      )
+      : await fetchCachedTranscriptPage({ threadId, before });
 
-    return queryClient.fetchQuery(
-      createThreadTranscriptPageQueryOptions({
-        before,
-        fetchPage: fetchCachedTranscriptPage,
-        scope: "local",
-        surface: "local",
-        threadId,
-      })
-    );
+    return page;
   }
 
   async function ensureConversationTranscript(session = state.session) {
@@ -174,20 +175,18 @@ export function createTranscriptController(ctx) {
     }
   }
 
-  // In a read-only view-only projection the displayed transcript is the PINNED
-  // thread (state.viewOnlyThread), not the relay's live active thread. Detail
-  // expansion / file-diff loading must resolve and fetch against THAT thread —
-  // otherwise they query the active thread, the viewed thread's details never
-  // load, and an item-id collision could surface another thread's detail.
+  // Which thread is on screen, and its entries. The precedence (Tasks screen's
+  // Orchestrator > view-only pin > active thread) and the reasons for it live in
+  // local/displayed-thread.js — it used to know only the last two, so a detail
+  // fetch from the Orchestrator pane would have queried the session's thread.
   function displayedThreadId() {
-    return state.viewOnlyThread?.threadId || state.session?.active_thread_id || null;
+    return displayedThreadIdFrom(state);
   }
   function displayedEntries() {
-    const pin = state.viewOnlyThread;
-    if (pin) {
-      return pin.entries || [];
-    }
-    return restoreHydratedTranscript(state, state.session)?.transcript || [];
+    return displayedEntriesFrom(
+      state,
+      restoreHydratedTranscript(state, state.session)?.transcript || []
+    );
   }
 
   async function toggleTranscriptEntry(itemId) {

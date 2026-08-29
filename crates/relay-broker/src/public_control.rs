@@ -51,6 +51,14 @@ const DEFAULT_PUBLIC_ROTATION_GRACE_SECS: u64 = 60 * 60 * 48;
 /// re-approvals cannot grow rows without bound (oldest entries drop first).
 const MAX_SUPERSEDED_TOKENS: usize = 16;
 const DEFAULT_RELAY_ENROLLMENT_CHALLENGE_TTL_SECS: u64 = 300;
+/// How long a client has to claim a credential the relay attested for it. The
+/// hop is machine-to-machine (relay -> sealed pairing result -> device), so this
+/// only has to cover transport, not a human deciding anything.
+const DEFAULT_CLIENT_CLAIM_TTL_SECS: u64 = 300;
+/// Ceiling on unclaimed attestations. Unlike the enrollment challenge map this
+/// one is writable by any authenticated relay, so it needs a bound: without it
+/// a hostile relay can grow it without limit inside the TTL window.
+const MAX_PENDING_CLIENT_CLAIMS: usize = 512;
 const PUBLIC_CONTROL_STATE_VERSION: u32 = 2;
 
 /// Stable prefix on the per-license device-cap error, so the HTTP layer can map
@@ -153,8 +161,37 @@ pub struct ClientGrantRequest {
     pub device_label: Option<String>,
 }
 
+/// What a relay gets back for attesting a client key.
+///
+/// Deliberately carries **no client credential**. The relay is only allowed to
+/// say "this key may reach me"; the client itself proves possession of the key
+/// against `/api/public/client/claim` and receives the token directly. That
+/// split is the whole point — see `a_relay_must_not_mint_a_credential_for_another_relays_client`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientGrantResponse {
+    /// Opaque handle the client presents when claiming. Safe to forward to the
+    /// device: on its own it authorises nothing without a signature.
+    pub claim_id: String,
+    /// Broker-chosen nonce the client signs over.
+    pub claim_nonce: String,
+    pub claim_expires_at: u64,
+    pub relay_id: String,
+    pub broker_room_id: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub relay_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientClaimRequest {
+    pub claim_id: String,
+    /// Signature over `agent-relay:client-claim:{claim_id}:{nonce}:{relay_id}:{client_verify_key}`
+    /// by the private half of the attested client key.
+    pub claim_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientClaimResponse {
     pub client_id: String,
     pub client_refresh_token: String,
     pub relay_id: String,
@@ -274,6 +311,7 @@ struct PublicControlPlaneInner {
     persistence: PublicControlPersistence,
     state: Mutex<PublicControlStateStore>,
     relay_enrollment_challenges: Mutex<HashMap<String, PendingRelayEnrollmentChallenge>>,
+    pending_client_claims: Mutex<HashMap<String, PendingClientClaim>>,
 }
 
 #[derive(Clone)]
@@ -306,6 +344,25 @@ struct PendingRelayEnrollmentChallenge {
     relay_verify_key: String,
     challenge: String,
     relay_label: Option<String>,
+    expires_at: u64,
+}
+
+/// A relay's attestation that `client_verify_key` may reach it, held until the
+/// client proves possession of that key.
+///
+/// Nothing is written to durable state while a claim is pending: no identity,
+/// no grant row. That is what stops a hostile relay from inserting itself into
+/// someone's relay directory just by naming their public key.
+#[derive(Debug, Clone)]
+struct PendingClientClaim {
+    relay_id: String,
+    broker_room_id: String,
+    device_id: String,
+    client_verify_key: String,
+    client_label: Option<String>,
+    device_label: Option<String>,
+    relay_label: Option<String>,
+    nonce: String,
     expires_at: u64,
 }
 
@@ -519,6 +576,7 @@ impl PublicControlPlane {
                 persistence,
                 state: Mutex::new(state),
                 relay_enrollment_challenges: Mutex::new(HashMap::new()),
+                pending_client_claims: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -950,31 +1008,109 @@ impl PublicControlPlane {
             .device_label
             .and_then(|label| trimmed_option_string(Some(label)))
             .filter(|label| !label.is_empty());
+        // Nothing durable is written here. The relay is only attesting that this
+        // key may reach it; until the key's owner signs, there is no identity to
+        // rotate and no grant row to enumerate. Writing either at this point is
+        // what let any relay speak for any client it could name.
+        let claim_id = format!("ccl-{}", random_token(24).to_ascii_lowercase());
+        let nonce = format!("cn-{}", random_token(40).to_ascii_lowercase());
+        let expires_at = unix_now().saturating_add(DEFAULT_CLIENT_CLAIM_TTL_SECS);
+        {
+            let mut pending = self.inner.pending_client_claims.lock().await;
+            let now = unix_now();
+            pending.retain(|_, claim| claim.expires_at > now);
+            if pending.len() >= MAX_PENDING_CLIENT_CLAIMS {
+                return Err("too many pending client claims; retry shortly".to_string());
+            }
+            pending.insert(
+                claim_id.clone(),
+                PendingClientClaim {
+                    relay_id: registration.relay_id.clone(),
+                    broker_room_id: registration.broker_room_id.clone(),
+                    device_id: request.device_id.clone(),
+                    client_verify_key,
+                    client_label,
+                    device_label,
+                    relay_label: registration.relay_label.clone(),
+                    nonce: nonce.clone(),
+                    expires_at,
+                },
+            );
+        }
+
+        Ok(ClientGrantResponse {
+            claim_id,
+            claim_nonce: nonce,
+            claim_expires_at: expires_at,
+            relay_id: registration.relay_id.clone(),
+            broker_room_id: registration.broker_room_id.clone(),
+            device_id: request.device_id,
+            relay_label: registration.relay_label.clone(),
+        })
+    }
+
+    /// Exchange a relay's attestation for a client credential, on proof that the
+    /// caller holds the private half of the attested key.
+    ///
+    /// Unauthenticated by design: the signature *is* the authentication, and it
+    /// is the client's, not the relay's. The token is returned straight to the
+    /// browser over TLS and never transits a relay.
+    pub async fn claim_client_identity(
+        &self,
+        request: ClientClaimRequest,
+    ) -> Result<ClientClaimResponse, String> {
+        let claim_id = trimmed_option_string(Some(request.claim_id))
+            .ok_or_else(|| "client claim id is required".to_string())?;
+        let claim_signature = trimmed_option_string(Some(request.claim_signature))
+            .ok_or_else(|| "client claim signature is required".to_string())?;
+
+        // Removed up front so a claim reference is single-use: a replay finds
+        // nothing, whether or not the signature checks out.
+        let pending = {
+            let mut claims = self.inner.pending_client_claims.lock().await;
+            let now = unix_now();
+            claims.retain(|_, claim| claim.expires_at > now);
+            claims
+                .remove(&claim_id)
+                .ok_or_else(|| "client claim is invalid".to_string())?
+        };
+        if pending.expires_at <= unix_now() {
+            return Err("client claim has expired".to_string());
+        }
+        verify_client_claim_signature(
+            &pending.client_verify_key,
+            &claim_id,
+            &pending.nonce,
+            &pending.relay_id,
+            &claim_signature,
+        )?;
+
         let created_at = unix_now();
         let mut store = self.lock_state().await?;
         let (client_id, client_refresh_token) = store.issue_or_rotate_client_identity(
-            &client_verify_key,
-            client_label,
+            &pending.client_verify_key,
+            pending.client_label,
             created_at,
             self.inner.rotation_grace_secs,
         );
         store.upsert_client_relay_grant(PersistedClientRelayGrant {
             client_id: client_id.clone(),
-            relay_id: registration.relay_id.clone(),
-            broker_room_id: registration.broker_room_id.clone(),
-            device_id: request.device_id.clone(),
+            relay_id: pending.relay_id.clone(),
+            broker_room_id: pending.broker_room_id.clone(),
+            device_id: pending.device_id.clone(),
             granted_at: created_at,
-            relay_label: registration.relay_label.clone(),
-            device_label,
+            relay_label: pending.relay_label.clone(),
+            device_label: pending.device_label,
         });
         self.inner.persistence.save(&mut store).await?;
-        Ok(ClientGrantResponse {
+
+        Ok(ClientClaimResponse {
             client_id,
             client_refresh_token,
-            relay_id: registration.relay_id.clone(),
-            broker_room_id: registration.broker_room_id.clone(),
-            device_id: request.device_id,
-            relay_label: registration.relay_label.clone(),
+            relay_id: pending.relay_id,
+            broker_room_id: pending.broker_room_id,
+            device_id: pending.device_id,
+            relay_label: pending.relay_label,
         })
     }
 
@@ -2898,6 +3034,32 @@ fn relay_enrollment_challenge_message(challenge_id: &str, challenge: &str) -> St
     format!("agent-relay:relay-enroll:{challenge_id}:{challenge}")
 }
 
+/// Domain-separated and bound to the relay: a signature harvested from one
+/// relay's pairing cannot be replayed to claim against a different one.
+pub fn client_claim_message(claim_id: &str, nonce: &str, relay_id: &str) -> String {
+    format!("agent-relay:client-claim:{claim_id}:{nonce}:{relay_id}")
+}
+
+fn verify_client_claim_signature(
+    client_verify_key_b64: &str,
+    claim_id: &str,
+    nonce: &str,
+    relay_id: &str,
+    signature_b64: &str,
+) -> Result<(), String> {
+    let signature_bytes =
+        decode_base64_array::<64>(signature_b64, "client claim signature is invalid")?;
+    let verify_key = parse_relay_verifying_key(client_verify_key_b64)
+        .map_err(|_| "client claim signature is invalid".to_string())?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verify_key
+        .verify(
+            client_claim_message(claim_id, nonce, relay_id).as_bytes(),
+            &signature,
+        )
+        .map_err(|_| "client claim signature is invalid".to_string())
+}
+
 /// Live-Postgres round-trip tests.
 ///
 /// SAFETY / ISOLATION: these tests write and delete public-control rows and some
@@ -3262,6 +3424,51 @@ mod device_limit_tests {
         STANDARD.encode(signing_key.verifying_key().to_bytes())
     }
 
+    /// The exact bytes the browser signs. This literal is duplicated in
+    /// `frontend/remote/crypto.test.mjs`; both sides assert against it, so a
+    /// change to either format drifts loudly instead of silently rejecting
+    /// every pairing at runtime.
+    #[test]
+    fn the_client_claim_message_matches_the_frontend_contract() {
+        assert_eq!(
+            client_claim_message("ccl-abc", "cn-def", "relay-1"),
+            "agent-relay:client-claim:ccl-abc:cn-def:relay-1"
+        );
+    }
+
+    /// A full pairing: the relay attests, then the key holder redeems. Most
+    /// tests only care about the resulting credential, not the two-step shape.
+    async fn attest_and_claim(
+        plane: &PublicControlPlane,
+        enrolled: &RelayEnrollmentResponse,
+        device_id: &str,
+        seed: u8,
+    ) -> ClientClaimResponse {
+        let claim = plane
+            .issue_client_grant(
+                &enrolled.relay_refresh_token,
+                client_grant_request(enrolled, device_id, &test_client_verify_key(seed)),
+            )
+            .await
+            .expect("relay attests the client key");
+        plane
+            .claim_client_identity(ClientClaimRequest {
+                claim_id: claim.claim_id.clone(),
+                claim_signature: sign_client_claim(seed, &claim),
+            })
+            .await
+            .expect("key holder redeems the attestation")
+    }
+
+    /// Sign a claim the way the browser does: over the domain-separated message
+    /// binding claim id, nonce and relay.
+    fn sign_client_claim(seed: u8, claim: &ClientGrantResponse) -> String {
+        use ed25519_dalek::Signer;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let message = client_claim_message(&claim.claim_id, &claim.claim_nonce, &claim.relay_id);
+        STANDARD.encode(signing_key.sign(message.as_bytes()).to_bytes())
+    }
+
     fn client_grant_request(
         enrolled: &RelayEnrollmentResponse,
         device_id: &str,
@@ -3277,6 +3484,168 @@ mod device_limit_tests {
         }
     }
 
+    /// A client identity belongs to the key holder, never to a relay.
+    ///
+    /// `client_id` is derived from the client key alone and is therefore global,
+    /// so a relay that merely *names* someone's public key must gain nothing by
+    /// it. Knowing the key is not a secret: every relay a browser pairs with
+    /// learns it. What separates them is proof of possession.
+    ///
+    /// Three things this pins, in order of how much they cost if lost:
+    ///   1. the attestation call hands back no credential at all,
+    ///   2. an attestation cannot be redeemed without the key holder's signature,
+    ///   3. no grant row exists until that signature lands, so a hostile relay
+    ///      cannot insert itself into someone's relay directory.
+    #[tokio::test]
+    async fn a_relay_must_not_mint_a_credential_for_another_relays_client() {
+        let plane = in_memory_plane().await;
+        let victim_relay = enroll(&plane, "victim").await;
+        let attacker_relay = enroll(&plane, "attacker").await;
+        let client_seed = 77;
+        let client_verify_key = test_client_verify_key(client_seed);
+
+        // The legitimate pairing: attest, then the key holder redeems it.
+        let victim_claim = plane
+            .issue_client_grant(
+                &victim_relay.relay_refresh_token,
+                client_grant_request(&victim_relay, "victim-phone", &client_verify_key),
+            )
+            .await
+            .expect("the victim relay attests its own phone");
+        let victim = plane
+            .claim_client_identity(ClientClaimRequest {
+                claim_id: victim_claim.claim_id.clone(),
+                claim_signature: sign_client_claim(client_seed, &victim_claim),
+            })
+            .await
+            .expect("the key holder redeems its own attestation");
+
+        // The attacker presents the SAME client verify key under its own bearer.
+        // It gets an attestation — that much is unavoidable, anyone may attest a
+        // public key — but it must be worthless without the private half.
+        let stolen = plane
+            .issue_client_grant(
+                &attacker_relay.relay_refresh_token,
+                client_grant_request(&attacker_relay, "attacker-phone", &client_verify_key),
+            )
+            .await
+            .expect("attacker attestation call");
+
+        // 1. Nothing usable came back.
+        assert!(
+            !stolen.claim_id.is_empty() && !stolen.claim_nonce.is_empty(),
+            "an attestation is a claim reference, not a credential"
+        );
+
+        // 2. Redeeming it needs a signature the attacker cannot produce. A
+        //    signature lifted from the victim's own claim must not transfer,
+        //    which is why the message binds the claim id and the relay.
+        let replayed = sign_client_claim(client_seed, &victim_claim);
+        let forged = plane
+            .claim_client_identity(ClientClaimRequest {
+                claim_id: stolen.claim_id.clone(),
+                claim_signature: replayed,
+            })
+            .await;
+        assert!(
+            forged.is_err(),
+            "a signature bound to another claim must not redeem this one"
+        );
+
+        // 3. The victim's directory must be untouched: no grant row was created
+        //    for the attacker's relay, because no key holder ever signed for it.
+        let visible = plane
+            .list_client_relays(&victim.client_refresh_token)
+            .await
+            .expect("the victim lists its own relays");
+        assert!(
+            !visible
+                .relays
+                .iter()
+                .any(|entry| entry.relay_id == attacker_relay.relay_id),
+            "an unredeemed attestation must not appear in the client's relay directory; saw {:?}",
+            visible.relays
+        );
+        assert!(
+            visible
+                .relays
+                .iter()
+                .any(|entry| entry.relay_id == victim_relay.relay_id),
+            "the legitimately claimed relay must still be listed"
+        );
+    }
+
+    /// A claim reference is single-use: redeeming it twice must not mint a
+    /// second credential. Without this, an observer of the sealed pairing result
+    /// could re-run the claim and rotate the phone's token out from under it —
+    /// the same lockout shape as `reapprove_must_not_brick_previous_client_token`.
+    #[tokio::test]
+    async fn a_client_claim_reference_cannot_be_redeemed_twice() {
+        let plane = in_memory_plane().await;
+        let relay = enroll(&plane, "single-use").await;
+        let seed = 88;
+        let claim = plane
+            .issue_client_grant(
+                &relay.relay_refresh_token,
+                client_grant_request(&relay, "phone", &test_client_verify_key(seed)),
+            )
+            .await
+            .expect("attest");
+        let signature = sign_client_claim(seed, &claim);
+
+        plane
+            .claim_client_identity(ClientClaimRequest {
+                claim_id: claim.claim_id.clone(),
+                claim_signature: signature.clone(),
+            })
+            .await
+            .expect("first redemption succeeds");
+
+        let replay = plane
+            .claim_client_identity(ClientClaimRequest {
+                claim_id: claim.claim_id.clone(),
+                claim_signature: signature,
+            })
+            .await;
+        assert!(replay.is_err(), "a claim reference must be single-use");
+    }
+
+    /// The signature must be over the broker's nonce, not merely *a* valid
+    /// signature by the right key. Guards against a verifier that checks the key
+    /// but forgets to bind the challenge.
+    #[tokio::test]
+    async fn a_client_claim_rejects_a_signature_over_the_wrong_message() {
+        let plane = in_memory_plane().await;
+        let relay = enroll(&plane, "wrong-message").await;
+        let seed = 99;
+        let claim = plane
+            .issue_client_grant(
+                &relay.relay_refresh_token,
+                client_grant_request(&relay, "phone", &test_client_verify_key(seed)),
+            )
+            .await
+            .expect("attest");
+
+        use ed25519_dalek::Signer;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let wrong = STANDARD.encode(
+            signing_key
+                .sign(b"agent-relay:client-claim:whatever")
+                .to_bytes(),
+        );
+
+        assert!(
+            plane
+                .claim_client_identity(ClientClaimRequest {
+                    claim_id: claim.claim_id,
+                    claim_signature: wrong,
+                })
+                .await
+                .is_err(),
+            "the signature must cover the broker's own nonce"
+        );
+    }
+
     /// Approving a pairing rotates the client identity token; the fresh token is
     /// only delivered to the session that completes THAT pairing handshake. When a
     /// relay re-approves (duplicate tap, stale request, "re-authorizing" a device
@@ -3287,25 +3656,12 @@ mod device_limit_tests {
     async fn reapprove_must_not_brick_previous_client_token() {
         let plane = in_memory_plane().await;
         let enrolled = enroll(&plane, "regrant-client").await;
-        let bearer = &enrolled.relay_refresh_token;
-        let verify_key = test_client_verify_key(21);
 
-        let first = plane
-            .issue_client_grant(
-                bearer,
-                client_grant_request(&enrolled, "phone-1", &verify_key),
-            )
-            .await
-            .expect("first approve");
-        // The phone holds `first.client_refresh_token`. The relay approves again;
-        // the phone never receives the rotated credential.
-        plane
-            .issue_client_grant(
-                bearer,
-                client_grant_request(&enrolled, "phone-1", &verify_key),
-            )
-            .await
-            .expect("re-approve");
+        let first = attest_and_claim(&plane, &enrolled, "phone-1", 21).await;
+        // The phone holds `first.client_refresh_token`. Pairing runs again — a
+        // duplicate tap, a re-authorize — and rotates the identity. The phone
+        // that completed the FIRST handshake never receives the new credential.
+        attest_and_claim(&plane, &enrolled, "phone-1", 21).await;
 
         plane
             .issue_client_session(&first.client_refresh_token)
@@ -3471,23 +3827,9 @@ mod device_limit_tests {
     async fn revoke_kills_superseded_tokens_immediately() {
         let plane = in_memory_plane().await;
         let enrolled = enroll(&plane, "grace-revoke").await;
-        let bearer = &enrolled.relay_refresh_token;
-        let verify_key = test_client_verify_key(23);
 
-        let first = plane
-            .issue_client_grant(
-                bearer,
-                client_grant_request(&enrolled, "phone-1", &verify_key),
-            )
-            .await
-            .expect("first approve");
-        let second = plane
-            .issue_client_grant(
-                bearer,
-                client_grant_request(&enrolled, "phone-1", &verify_key),
-            )
-            .await
-            .expect("re-approve");
+        let first = attest_and_claim(&plane, &enrolled, "phone-1", 23).await;
+        let second = attest_and_claim(&plane, &enrolled, "phone-1", 23).await;
 
         plane
             .revoke_client_identity(&second.client_refresh_token)
@@ -4365,6 +4707,7 @@ mod postgres_persistence_opt_tests {
                 },
                 state: Mutex::new(PublicControlStateStore::default()),
                 relay_enrollment_challenges: Mutex::new(HashMap::new()),
+                pending_client_claims: Mutex::new(HashMap::new()),
             }),
         }
     }

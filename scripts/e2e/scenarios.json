@@ -10,11 +10,13 @@
       "local-allowed-roots",
       "local-file-diff",
       "local-file-diff-cards",
+      "local-file-diff-path",
       "local-command-group",
       "local-history-scroll",
       "local-drawer-scroll",
       "local-transcript-load",
       "local-thread-settings",
+      "local-dialog-menus",
       "local-thread-groups",
       "local-projects",
       "local-search-filter",
@@ -23,7 +25,8 @@
       "local-session-rename",
       "local-session-tab-scroll",
       "local-rail-toggle-align",
-      "local-permission-modes"
+      "local-permission-modes",
+      "local-workspace-repair"
     ],
     "local-full": [
       "local-session",
@@ -36,6 +39,7 @@
       "local-allowed-roots",
       "local-file-diff",
       "local-file-diff-cards",
+      "local-file-diff-path",
       "local-command-group",
       "local-history-scroll",
       "local-drawer-scroll",
@@ -50,7 +54,8 @@
       "local-session-tab-scroll",
       "local-rail-toggle-align",
       "local-delete",
-      "local-permission-modes"
+      "local-permission-modes",
+      "local-workspace-repair"
     ],
     "public-core": [
       "public-transcript-delta",
@@ -58,6 +63,7 @@
       "remote-mobile-header",
       "remote-mobile-session-actions",
       "remote-mobile-bell",
+      "remote-desktop-tabs",
       "public-session-rename",
       "public-broker",
       "public-enrollment",
@@ -75,6 +81,7 @@
       "remote-mobile-header",
       "remote-mobile-session-actions",
       "remote-mobile-bell",
+      "remote-desktop-tabs",
       "public-session-rename",
       "public-refresh",
       "public-thread-settings",
@@ -184,6 +191,17 @@
         "activity-filter-mobile"
       ]
     },
+    "remote-desktop-tabs": {
+      "script": "browser-remote-desktop-tabs-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "static-remote",
+      "coverage": [
+        "session-tabs",
+        "device-gate",
+        "mobile-layout"
+      ]
+    },
     "remote-mobile-session-actions": {
       "script": "browser-remote-mobile-session-actions-e2e.mjs",
       "tier": "core",
@@ -231,6 +249,17 @@
       "coverage": [
         "file-diff",
         "file-diff-cards"
+      ]
+    },
+    "local-file-diff-path": {
+      "script": "browser-local-file-diff-path-e2e.mjs",
+      "tier": "core",
+      "provider": "fake-compatible",
+      "transport": "local",
+      "coverage": [
+        "file-diff",
+        "file-diff-path",
+        "responsive"
       ]
     },
     "local-command-group": {
@@ -531,6 +560,25 @@
         "mobile-layout"
       ]
     },
+    "local-workspace-repair": {
+      "script": "browser-local-workspace-repair-e2e.mjs",
+      "tier": "core",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "workspace-repair"
+      ]
+    },
+    "workflow-code-flow": {
+      "script": "workflow-code-flow-e2e.mjs",
+      "_comment": "In no suite: the run it starts stays queued forever and never reaches active_workflow_runs (reproduced at a 300s timeout, so not the tree-size latency its header warns about). Wire into local-core once diagnosed.",
+      "tier": "manual",
+      "provider": "fake",
+      "transport": "local",
+      "coverage": [
+        "workflow-code-flow"
+      ]
+    },
     "local-multi-live-follow": {
       "script": "browser-local-multi-live-follow-e2e.mjs",
       "tier": "full",
@@ -540,6 +588,29 @@
         "multi-session-live-follow",
         "tool-call-streaming",
         "thread-switch-scroll"
+      ]
+    },
+    "local-dialog-menus": {
+      "script": "browser-mobile-dialog-menus-e2e.mjs",
+      "tier": "core",
+      "provider": "fake-compatible",
+      "transport": "local",
+      "coverage": [
+        "dialog-menu-anchoring",
+        "mobile-layout",
+        "fork-dialog",
+        "touch-input"
+      ]
+    },
+    "android-dialog-menus": {
+      "script": "browser-android-dialog-menus-e2e.mjs",
+      "tier": "manual",
+      "provider": "fake-compatible",
+      "transport": "local",
+      "coverage": [
+        "dialog-menu-anchoring",
+        "real-mobile-browser",
+        "touch-input"
       ]
     }
   }

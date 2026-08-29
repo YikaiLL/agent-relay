@@ -223,3 +223,129 @@ test("a newer delta still advances the revision", () => {
   assert.equal(h.state.session.transcript_revision, 11);
   assert.equal(h.renderedText(), "Hello world");
 });
+
+// ---- the Orchestrator's transcript -----------------------------------------
+
+// The Orchestrator is drawn BESIDE the conversation, so while you are reading a
+// session it is never the active thread. Every non-active delta was routed to
+// `state.viewOnlyThread` — the CONVERSATION's pin — and with no pin of its own
+// the Orchestrator's deltas were dropped on the floor. Its pane then moved only
+// when something re-fetched the whole page, which reads as "no streaming".
+//
+// The fix reuses `applyDeltaToViewOnlyPin` rather than growing a second reducer:
+// offset reconciliation, gap refusal and thread-id ownership get decided once.
+function orchHarness({ orchThreadId = "orch-1", entries = null } = {}) {
+  const state = {
+    session: {
+      active_thread_id: "thread-1",
+      transcript: [],
+      transcript_revision: 1,
+    },
+    viewOnlyThread: null,
+    orchestratorEntriesThreadId: orchThreadId,
+    orchestratorEntries: entries ?? [
+      { item_id: "orch-item-1", kind: "agent_text", text: "Look", status: "running" },
+    ],
+  };
+  const rendered = [];
+  const controller = createStreamController({
+    state,
+    ensureConversationTranscript: () => {},
+    logLine: () => {},
+    seedDefaults: () => {},
+    renderSession: (session) => rendered.push(session),
+    handleUnauthorized: () => {},
+    applySessionSnapshot: () => {},
+    cancelSessionPoll: () => {},
+    cancelStreamReconnect: () => {},
+    scheduleSessionPoll: () => {},
+    scheduleStreamReconnect: () => {},
+    scheduleRenderFrame: (callback) => callback(),
+  });
+  const deliver = (event) =>
+    controller.applySessionStreamEvent("transcript_entry_delta", {
+      item_id: "orch-item-1",
+      delta_kind: "agent_text",
+      turn_id: "orch-turn-1",
+      ...event,
+    });
+  const orchText = () =>
+    state.orchestratorEntries.find((entry) => entry.item_id === "orch-item-1")?.text;
+  return { state, deliver, orchText, rendered };
+}
+
+test("a delta for the Orchestrator extends its entries and repaints", () => {
+  const h = orchHarness();
+
+  h.deliver({ thread_id: "orch-1", delta: "ing at it", text_offset: 4 });
+
+  assert.equal(h.orchText(), "Looking at it");
+  assert.equal(h.rendered.length, 1, "the pane must be repainted, not just mutated");
+});
+
+test("the Orchestrator gets the same offset reconciliation as a pinned thread", () => {
+  const h = orchHarness();
+
+  // Re-delivery of a chunk the entries already carry must not double-append.
+  h.deliver({ thread_id: "orch-1", delta: "ok", text_offset: 4 });
+  h.deliver({ thread_id: "orch-1", delta: "ok", text_offset: 4 });
+
+  assert.equal(h.orchText(), "Lookok");
+});
+
+test("a delta for the Orchestrator leaves the conversation's own pin alone", () => {
+  const h = orchHarness();
+  h.state.viewOnlyThread = {
+    threadId: "pinned-1",
+    entries: [{ item_id: "pinned-item", text: "untouched", status: "running" }],
+  };
+  const pinBefore = h.state.viewOnlyThread;
+
+  h.deliver({ thread_id: "orch-1", delta: "ing", text_offset: 4 });
+
+  assert.equal(h.state.viewOnlyThread, pinBefore, "the pin object must not be replaced");
+});
+
+test("a delta for some third thread touches neither", () => {
+  const h = orchHarness();
+
+  h.deliver({ thread_id: "someone-else", delta: "nope", text_offset: 4 });
+
+  assert.equal(h.orchText(), "Look");
+  assert.equal(h.rendered.length, 0);
+});
+
+test("nothing happens when the Tasks screen has never loaded a transcript", () => {
+  const h = orchHarness({ entries: [] });
+  h.state.orchestratorEntriesThreadId = null;
+
+  h.deliver({ thread_id: "orch-1", delta: "hi", text_offset: 0 });
+
+  assert.deepEqual(h.state.orchestratorEntries, []);
+  assert.equal(h.rendered.length, 0);
+});
+
+// The bug this pins: the reducer returns `wasWorking: true` and an
+// `activeTurnId` alongside the entries (view-only-thread.js:146-148) precisely
+// so a pin carrying live deltas is known to be mid-turn. The Orchestrator's
+// routing kept only `.entries` and threw the rest away, and then derived
+// "was working" from `thread_activity` instead. When that array does not list
+// the Orchestrator -- or the Tasks screen is not mounted for the frame that
+// carries the phase -- the working->idle refresh never fires and the last
+// message renders as forever-streaming.
+test("a streamed delta marks the Orchestrator as mid-turn", () => {
+  const h = orchHarness();
+  assert.notEqual(h.state.orchestratorWasWorking, true);
+
+  h.deliver({ thread_id: "orch-1", delta: "ing", text_offset: 4 });
+
+  assert.equal(h.state.orchestratorWasWorking, true, "text is arriving, so it is working");
+});
+
+test("a delta for another thread does not mark the Orchestrator working", () => {
+  const h = orchHarness();
+
+  h.deliver({ thread_id: "someone-else", delta: "x", text_offset: 4 });
+
+  assert.notEqual(h.state.orchestratorWasWorking, true);
+});

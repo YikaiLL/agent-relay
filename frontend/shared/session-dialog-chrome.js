@@ -1,0 +1,131 @@
+// The chrome both launch dialogs share. They ask the same question and differ only
+// in what they inherit; hand-built separately, they had already drifted.
+
+import React from "react";
+
+const h = React.createElement;
+
+// Order: "where", then "what", then "how". The old dialogs led with Provider —
+// the least-changed decision first.
+export function SessionDialogShell({
+  actions = null,
+  badge = null,
+  children,
+  footerHint = null,
+  id,
+  onRequestClose = null,
+  title,
+}) {
+  const close = () => {
+    onRequestClose?.();
+    document.getElementById(id)?.close?.();
+  };
+
+  return h(
+    "dialog",
+    {
+      className: "panel-modal session-dialog",
+      id,
+      onClose: () => onRequestClose?.(),
+      // Only the backdrop matches: every child renders inside the sections below.
+      onClick: (event) => {
+        if (event.target === event.currentTarget) {
+          close();
+        }
+      },
+    },
+    h(
+      "div",
+      { className: "session-dialog-header" },
+      h(
+        "div",
+        { className: "session-dialog-title" },
+        h("h2", null, title),
+        badge
+      ),
+      h(
+        "button",
+        {
+          "aria-label": "Close",
+          className: "session-dialog-close",
+          onClick: close,
+          type: "button",
+        },
+        "×"
+      )
+    ),
+    h("section", { className: "session-dialog-body" }, children),
+    h(
+      "div",
+      { className: "session-dialog-footer" },
+      h("p", { className: "session-dialog-hint" }, footerHint),
+      h("div", { className: "session-dialog-actions" }, actions)
+    )
+  );
+}
+
+// One row, because keeping them adjacent shows the project is NOT derived from
+// the path — projects are deliberately not bound to a cwd.
+export function SessionContextBar({ project = null, workspace = null }) {
+  return h(
+    "div",
+    { className: "session-context-bar" },
+    project,
+    project && workspace
+      ? h("span", { "aria-hidden": "true", className: "session-context-sep" }, "/")
+      : null,
+    workspace
+  );
+}
+
+// The prompt, as the largest thing in the dialog. It is the only field most
+// launches actually fill in, and the old layout buried it under four dropdowns.
+export function PromptCard({
+  accessory = null,
+  attachControl = null,
+  hint = null,
+  id,
+  onChange = null,
+  onSubmit = null,
+  placeholder = "",
+  value,
+}) {
+  return h(
+    "div",
+    { className: "session-prompt-card" },
+    h("textarea", {
+      className: "session-prompt-input",
+      id,
+      onChange: (event) => onChange?.(event.target.value),
+      // Plain Enter stays a newline: this is a task description, not a message.
+      onKeyDown: (event) => {
+        if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+          event.preventDefault();
+          onSubmit?.();
+        }
+      },
+      placeholder,
+      rows: 5,
+      // Left undefined when the caller does not manage the value, which keeps
+      // the textarea uncontrolled for hosts that read it at submit time.
+      value: value ?? undefined,
+    }),
+    accessory,
+    h(
+      "div",
+      { className: "session-prompt-foot" },
+      attachControl || h("span"),
+      hint ? h("span", { className: "session-prompt-hint" }, hint) : null
+    )
+  );
+}
+
+// Named so both dialogs wrap identically and mobile has one CSS hook.
+export function SettingPillRow({ children }) {
+  return h("div", { className: "session-setting-pills" }, children);
+}
+
+// Its own element so touch can hide it: there is no ⌘ to press there.
+export function SubmitShortcutHint() {
+  return h("span", { "aria-hidden": "true", className: "session-submit-shortcut" }, "⌘↵");
+}

@@ -2,6 +2,8 @@
 // functions so it can be unit-tested without a DOM. The composer wires these to
 // its `onKeyDown` handler; see frontend/shared/composer.js.
 
+import { hasFinePrimaryPointer } from "./pointer-class.js";
+
 // Should a keydown submit the composer? On desktop, a plain Enter sends the
 // message and Shift+Enter inserts a newline. We deliberately bail while an IME
 // composition is in flight so confirming a Chinese/Japanese candidate with Enter
@@ -112,18 +114,15 @@ export function matchesApplePlatform(platform = "", userAgent = "") {
 
 // Resolve whether Enter should submit for the current environment when the
 // composer isn't given an explicit `enterSubmits` prop. We gate on the PRIMARY
-// pointer being fine (a mouse/trackpad), i.e. a real desktop/laptop. We use
-// `(pointer: fine)` rather than `(any-pointer: fine)` on purpose: a touch-first
-// device with an accessory mouse/trackpad attached (e.g. an iPad with a Magic
-// Keyboard) still reports a *coarse primary* pointer, so it keeps Enter as a
-// newline and relies on the Send button. `win` is injectable for tests.
+// pointer being fine (a mouse/trackpad), i.e. a real desktop/laptop — an iPad with a
+// Magic Keyboard keeps Enter as a newline and relies on the Send button. The primary-
+// vs-any reasoning lives in `pointer-class.js`; this is the composer's reading of it.
+//
+// Note the fail-open default there is load-bearing HERE and not shared by every caller:
+// an environment that cannot answer gets a submitting Enter, because the alternative is
+// a composer whose Enter key silently does nothing useful. `win` is injectable for tests.
 export function defaultEnterSubmits(win = typeof window !== "undefined" ? window : undefined) {
-  if (!win || typeof win.matchMedia !== "function") return true;
-  try {
-    return win.matchMedia("(pointer: fine)").matches;
-  } catch {
-    return true;
-  }
+  return hasFinePrimaryPointer(win);
 }
 
 // Resolve whether to remap Home/End for the current environment when the

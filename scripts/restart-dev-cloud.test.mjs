@@ -22,7 +22,11 @@ const script = path.join(here, "restart-dev-cloud.sh");
 // we must NOT inherit an ambient RELAY_BROKER_CONTROL_URL, because the whole
 // point is to prove the documented two-variable quickstart works from a clean
 // shell (README: only RELAY_BROKER_URL + RELAY_BROKER_AUTH_MODE are set).
-function runScript({ envFileBody, envFileName = ".env.cloud.local" } = {}) {
+function runScript({
+  envFileBody,
+  envFileName = ".env.cloud.local",
+  extraEnv = {},
+} = {}) {
   const workdir = mkdtempSync(path.join(os.tmpdir(), "restart-dev-cloud-"));
   const pkillLog = path.join(workdir, "pkill.log");
   // CRITICAL: stub `pkill` too. The script runs broad `pkill -f "vite"/"cargo
@@ -32,7 +36,15 @@ function runScript({ envFileBody, envFileName = ".env.cloud.local" } = {}) {
   // records its invocation so we can assert it (not the system pkill) ran.
   for (const [name, body] of [
     ["npm", "#!/bin/sh\nexit 0\n"],
-    ["cargo", "#!/bin/sh\necho STUB_CARGO_RAN\nexit 0\n"],
+    [
+      // Reports its own env: the beta default only counts where the relay
+      // inherits it, not where the script sets it.
+      "cargo",
+      "#!/bin/sh\n" +
+        "echo STUB_CARGO_RAN\n" +
+        'printf "SEALWIRE_BETA=%s\\n" "${SEALWIRE_BETA:-<unset>}"\n' +
+        "exit 0\n",
+    ],
     ["pkill", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$PKILL_LOG"\nexit 0\n'],
   ]) {
     const p = path.join(workdir, name);
@@ -53,6 +65,7 @@ function runScript({ envFileBody, envFileName = ".env.cloud.local" } = {}) {
         PATH: `${workdir}:/usr/bin:/bin`,
         HOME: workdir,
         PKILL_LOG: pkillLog,
+        ...extraEnv,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -93,6 +106,34 @@ test("restart-dev-cloud.sh starts the relay from the documented two-variable env
   // dev/CI processes): the script targets these patterns at startup.
   assert.match(pkillCalls, /dev-full\.mjs/, "pkill must be the stub, not system pkill");
   assert.match(pkillCalls, /relay-server/);
+});
+
+// Opposite default from the shipped `sealwire`, which stays locked without
+// `--beta` — see scripts/sealwire-beta-flag.test.mjs.
+test("restart-dev-cloud.sh unlocks beta features by default, like the rest of npm run dev:*", async () => {
+  const { code, stdout, stderr } = await runScript({
+    envFileBody: README_MINIMAL_ENV,
+  });
+  assert.equal(code, 0, `exit=${code}\nstderr:\n${stderr}`);
+  assert.match(
+    stdout,
+    /SEALWIRE_BETA=1/,
+    `a dev cloud relay must come up with Tasks unlocked\nstdout:\n${stdout}`
+  );
+});
+
+test("restart-dev-cloud.sh lets an explicit SEALWIRE_BETA win over the dev default", async () => {
+  // The escape hatch for seeing the locked preview without editing the script.
+  const { code, stdout, stderr } = await runScript({
+    envFileBody: README_MINIMAL_ENV,
+    extraEnv: { SEALWIRE_BETA: "0" },
+  });
+  assert.equal(code, 0, `exit=${code}\nstderr:\n${stderr}`);
+  assert.match(
+    stdout,
+    /SEALWIRE_BETA=0/,
+    `an explicit opt-out must not be overwritten by the default\nstdout:\n${stdout}`
+  );
 });
 
 test("restart-dev-cloud.sh falls back to the legacy .env.public.local", async () => {

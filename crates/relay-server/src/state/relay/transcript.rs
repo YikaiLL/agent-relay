@@ -48,6 +48,9 @@ pub(crate) struct TranscriptRecord {
     pub(crate) status: String,
     pub(crate) turn_id: Option<String>,
     pub(crate) tool: Option<ToolCallView>,
+    /// Relay-global clock at the last live upsert. Hydrated/prepended history leaves this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) seq: Option<u64>,
 }
 
 impl TranscriptRecord {
@@ -84,6 +87,18 @@ impl RelayState {
         )
     }
 
+    fn stamp_transcript_item_seq(&mut self, thread_id: &str, item_id: &str, revision: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(thread_id) {
+            if let Some(entry) = runtime
+                .transcript
+                .iter_mut()
+                .find(|entry| entry.item_id == item_id)
+            {
+                entry.seq = Some(revision);
+            }
+        }
+    }
+
     pub fn upsert_transcript_item_for_thread(
         &mut self,
         thread_id: &str,
@@ -94,6 +109,7 @@ impl RelayState {
         turn_id: Option<String>,
         tool: Option<ToolCallView>,
     ) -> TranscriptMutationMeta {
+        let stamp_id = item_id.clone();
         let entry_seq = {
             let runtime = self.ensure_runtime_for_thread(thread_id);
             if let Some(index) = runtime
@@ -121,11 +137,13 @@ impl RelayState {
                     status,
                     turn_id,
                     tool,
+                    seq: None,
                 });
                 entry_seq
             }
         };
         let (base_revision, revision) = self.bump_thread_transcript_revision(thread_id);
+        self.stamp_transcript_item_seq(thread_id, &stamp_id, revision);
         if self.active_thread_id.as_deref() == Some(thread_id) {
             self.sync_selected_runtime_to_fields();
         }
@@ -157,6 +175,7 @@ impl RelayState {
             } else {
                 tool
             };
+            entry.seq = Some(revision);
             return transcript_mutation_meta(base_revision, revision, index as u64 + 1);
         }
 
@@ -169,6 +188,7 @@ impl RelayState {
             status,
             turn_id,
             tool,
+            seq: Some(revision),
         });
         transcript_mutation_meta(base_revision, revision, entry_seq)
     }
@@ -191,6 +211,13 @@ impl RelayState {
         if self.logs.len() > super::super::MAX_LOG_LINES {
             self.logs.truncate(super::super::MAX_LOG_LINES);
         }
+    }
+
+    /// The audit log, for tests that assert a line was filed on the channel a
+    /// user can actually see (see `push_log`'s channel classification).
+    #[cfg(test)]
+    pub(crate) fn logs_for_test(&self) -> &[LogEntryView] {
+        &self.logs
     }
 
     pub fn start_agent_message(&mut self, item_id: String, turn_id: String) {
@@ -269,6 +296,7 @@ impl RelayState {
                     status: "streaming".to_string(),
                     turn_id: Some(turn_id.to_string()),
                     tool: None,
+                    seq: None,
                 });
                 (entry_seq, 0)
             }
@@ -583,6 +611,7 @@ impl RelayState {
                     status: "running".to_string(),
                     turn_id: None,
                     tool: None,
+                    seq: None,
                 });
                 entry_seq
             }
@@ -804,6 +833,7 @@ pub(super) fn merge_tool_call_view(
                 },
                 name: name.clone(),
                 title: select_tool_title(&existing.title, &incoming.title, &name),
+                kind: incoming.kind.or(existing.kind),
                 detail: incoming.detail.or(existing.detail),
                 query: incoming.query.or(existing.query),
                 path: incoming.path.or(existing.path),

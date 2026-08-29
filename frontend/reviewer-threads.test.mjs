@@ -127,6 +127,83 @@ test("selectReusableReviewers filters by provider but keeps unknown-provider ent
   assert.equal(ghost.label, "rev-ghost");
 });
 
+// A provider thread cannot be relocated, so a reviewer minted in the main repo can
+// never review work that has since moved into a worktree — `request_review` refuses it
+// ("that reviewer thread works in X, but the work to review is in Y"). The picker used
+// to offer it anyway, and, being newest, PRESELECTED it: the user hit a backend refusal
+// they had no way to see coming. Which tree the review targets is now part of the
+// filter, not an afterthought discovered on submit.
+const CROSS_TREE_REVIEWERS = [
+  {
+    reviewer_thread_id: "rev-in-worktree",
+    parent_thread_id: "parent-A",
+    reviewer_provider: "codex",
+    name: "Worktree reviewer",
+    updated_at: 100,
+    cwd: "/repo/.worktrees/feature",
+  },
+  {
+    reviewer_thread_id: "rev-in-main",
+    parent_thread_id: "parent-A",
+    reviewer_provider: "codex",
+    name: "Main-repo reviewer",
+    updated_at: 200,
+    cwd: "/repo",
+  },
+  {
+    // Restart amnesia: the reviewer→parent identity survives, the enrichment does not.
+    // Unknowable is not the same as wrong, so this stays on offer — exactly as an
+    // unknown `reviewer_provider` does — and the backend re-checks it on submit.
+    reviewer_thread_id: "rev-unknown-tree",
+    parent_thread_id: "parent-A",
+    reviewer_provider: "codex",
+    name: "Restarted reviewer",
+    updated_at: 50,
+    cwd: null,
+  },
+];
+
+test("selectReusableReviewers only offers reviewers bound to the tree under review", () => {
+  const offered = selectReusableReviewers(
+    CROSS_TREE_REVIEWERS,
+    "parent-A",
+    "codex",
+    "/repo/.worktrees/feature"
+  ).map((r) => r.reviewerThreadId);
+
+  assert.ok(
+    !offered.includes("rev-in-main"),
+    "a reviewer bound to another working tree must not be offered — the backend refuses it"
+  );
+  assert.ok(offered.includes("rev-in-worktree"), "the same-tree reviewer is reusable");
+  assert.ok(
+    offered.includes("rev-unknown-tree"),
+    "an unknown tree (null after a restart) must still be offered, like an unknown provider"
+  );
+  // And the newest OFFERED one is the same-tree reviewer, so the prefill can't land
+  // on a refusal.
+  assert.equal(offered[0], "rev-in-worktree");
+});
+
+test("selectReusableReviewers tolerates a trailing slash on either side of the tree", () => {
+  const offered = selectReusableReviewers(
+    CROSS_TREE_REVIEWERS,
+    "parent-A",
+    "codex",
+    "/repo/.worktrees/feature/"
+  ).map((r) => r.reviewerThreadId);
+  assert.ok(offered.includes("rev-in-worktree"));
+  assert.ok(!offered.includes("rev-in-main"));
+});
+
+test("selectReusableReviewers cannot filter by a tree it was not told, and does not pretend to", () => {
+  // Workspace still resolving: do not empty the list on a fact nobody has.
+  const offered = selectReusableReviewers(CROSS_TREE_REVIEWERS, "parent-A", "codex").map(
+    (r) => r.reviewerThreadId
+  );
+  assert.deepEqual(offered, ["rev-in-main", "rev-in-worktree", "rev-unknown-tree"]);
+});
+
 test("selectReusableReviewers is defensive about missing inputs", () => {
   assert.deepEqual(selectReusableReviewers(undefined, "parent-A", null), []);
   assert.deepEqual(selectReusableReviewers(REVIEWERS, undefined, null), []);

@@ -13,6 +13,7 @@ import {
   observeElementRect,
 } from "@tanstack/virtual-core";
 import { CHECK_SVG, COPY_SVG, FORK_SVG, SPARKLES_SVG } from "../svg.js";
+import { approvalKindLabel } from "./approval-labels.js";
 import { providerIconSvg } from "./provider-icons.js";
 import { computeForkableItemIds, isForkableEntry } from "./transcript-fork.js";
 import {
@@ -82,11 +83,22 @@ function commandExpandKey(itemId) {
   return itemId ? `command:${itemId}` : "";
 }
 
-function transcriptEntryDomAttrs(entry, className, extras = null, { justPrepended = false } = {}) {
+// `inGroup` marks an entry that is being shown because the user opened a tool
+// or reasoning group above it. It only paints: the entry keeps its own article,
+// its own item id and its own place in the flat node list, because that list is
+// what the virtualizer measures and what scroll anchoring addresses. See
+// frontend/transcript-group-rail.test.mjs.
+function transcriptEntryDomAttrs(
+  entry,
+  className,
+  extras = null,
+  { justPrepended = false, inGroup = false } = {}
+) {
   const itemId = entry?.item_id || entry?.id || "";
-  const finalClassName = justPrepended
-    ? `${className} chat-message-just-prepended`
-    : className;
+  let finalClassName = inGroup ? `${className} is-group-member` : className;
+  if (justPrepended) {
+    finalClassName = `${finalClassName} chat-message-just-prepended`;
+  }
   return {
     className: finalClassName,
     ...(itemId ? { "data-transcript-entry-id": itemId } : {}),
@@ -277,7 +289,7 @@ function AgentEntryImpl({ entry, isJustPrepended = false, isForkable = false, pr
 
 const AgentEntry = React.memo(AgentEntryImpl);
 
-function CommandEntry({ entry, isJustPrepended = false, options = null }) {
+function CommandEntry({ entry, isJustPrepended = false, options = null, inGroup = false }) {
   const itemId = entry.item_id || "";
   const expandKey = itemId ? `entry:${itemId}` : commandExpandKey(itemId);
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
@@ -290,6 +302,7 @@ function CommandEntry({ entry, isJustPrepended = false, options = null }) {
     "article",
     transcriptEntryDomAttrs(entry, "chat-message chat-message-system", null, {
       justPrepended: isJustPrepended,
+      inGroup,
     }),
     h(
       "div",
@@ -320,12 +333,13 @@ function CommandEntry({ entry, isJustPrepended = false, options = null }) {
   );
 }
 
-function ReasoningEntryImpl({ entry, isJustPrepended = false }) {
+function ReasoningEntryImpl({ entry, isJustPrepended = false, inGroup = false }) {
   const hasText = Boolean(String(entry.text || "").trim());
   return h(
     "article",
     transcriptEntryDomAttrs(entry, "chat-message chat-message-system", null, {
       justPrepended: isJustPrepended,
+      inGroup,
     }),
     h(
       "div",
@@ -548,7 +562,18 @@ function FileDiffSection({
       h(
         "div",
         { className: "diff-file-section-primary" },
-        h("strong", { className: "diff-file-section-name" }, displayPath),
+        // Same dir/base split as the rail. This used to be one flat string,
+        // deliberately — which held while the transcript column was wide enough
+        // to show a path whole. On remote the column relaxes to the viewport
+        // and `.diff-file-section-name` ellipsises from the END, so the
+        // basename — the thing actually being scanned for — was the first part
+        // to disappear. See frontend/shared/diff-file-name.test.mjs.
+        h(
+          "span",
+          { className: "diff-file-section-name" },
+          dir ? h("span", { className: "diff-file-dir" }, dir) : null,
+          h("span", { className: "diff-file-base" }, base)
+        ),
         added > 0 ? h("span", { className: "file-change-chip-add" }, `+${added}`) : null,
         removed > 0 ? h("span", { className: "file-change-chip-del" }, `-${removed}`) : null
       )
@@ -712,6 +737,31 @@ function findPendingAskUserRequest(itemId, pendingList) {
   }
   const toolUseId = itemId.startsWith("tool:") ? itemId.slice(5) : itemId;
   return pendingList.find((pending) => pending?.tool_use_id === toolUseId) || null;
+}
+
+// Item ids of EVERY question the session is currently blocked on. Nothing
+// guarantees there is only one: the relay and the worker both key pending
+// questions by id, and a turn can issue several AskUserQuestion tool uses in
+// parallel. All of them get pinned, in their original relative order, so a
+// second question can never end up buried in history behind the first.
+// Already-answered ask-user entries are not in the pending list and stay put.
+const EMPTY_PINNED_ASK_USER_IDS = new Set();
+
+function findPinnedAskUserItemIds(entries, pendingList) {
+  if (!Array.isArray(pendingList) || !pendingList.length || !Array.isArray(entries)) {
+    return EMPTY_PINNED_ASK_USER_IDS;
+  }
+  let pinned = null;
+  for (const entry of entries) {
+    if (!isAskUserQuestionTool(entry?.tool)) {
+      continue;
+    }
+    const itemId = entry.item_id || "";
+    if (itemId && findPendingAskUserRequest(itemId, pendingList)) {
+      (pinned ||= new Set()).add(itemId);
+    }
+  }
+  return pinned || EMPTY_PINNED_ASK_USER_IDS;
 }
 
 // Build the answer value the SDK should see for a single question. We support
@@ -1235,7 +1285,7 @@ function AskUserQuestionStep({
   );
 }
 
-function GenericToolEntry({ entry, isJustPrepended = false, options = null }) {
+function GenericToolEntry({ entry, isJustPrepended = false, options = null, inGroup = false }) {
   const itemId = entry.item_id || "";
   const expandKey = itemId ? `entry:${itemId}` : "";
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
@@ -1284,7 +1334,7 @@ function GenericToolEntry({ entry, isJustPrepended = false, options = null }) {
       entry,
       `chat-message chat-message-system chat-message-tool${isFileChange ? " chat-message-file-change" : ""}`,
       null,
-      { justPrepended: isJustPrepended }
+      { justPrepended: isJustPrepended, inGroup }
     ),
     h(
       "div",
@@ -1384,13 +1434,13 @@ function GenericToolEntry({ entry, isJustPrepended = false, options = null }) {
   );
 }
 
-function ToolEntry({ entry, isJustPrepended = false, options = null }) {
+function ToolEntry({ entry, isJustPrepended = false, options = null, inGroup = false }) {
   const detailEntry = resolveTranscriptDetailEntry(entry, options);
   const tool = (detailEntry || entry)?.tool || entry?.tool || {};
   if (isAskUserQuestionTool(tool)) {
     return h(AskUserEntry, { entry, isJustPrepended, options });
   }
-  return h(GenericToolEntry, { entry, isJustPrepended, options });
+  return h(GenericToolEntry, { entry, isJustPrepended, options, inGroup });
 }
 
 // A turn that ended in failure. The relay injects this (kind "error", status
@@ -1465,16 +1515,129 @@ function isEmptyReasoning(entry) {
   return isSettledReasoning(entry) && reasoningText(entry) === "";
 }
 
-// A settled reasoning entry that DOES carry a summary body. Consecutive ones
-// fold into a collapsible reasoning-group, mirroring the tool-call group.
 function isGroupableReasoning(entry) {
   return isSettledReasoning(entry) && reasoningText(entry) !== "";
+}
+
+// `tool.kind` (ACP) wins: a Cursor tool's `name` IS its human title, so no
+// name heuristic can classify it.
+const ACP_KIND_ALIASES = {
+  execute: "run",
+  delete: "edit",
+  move: "edit",
+  switch_mode: "other",
+};
+const TOOL_NAME_KINDS = {
+  read: "read",
+  notebookread: "read",
+  edit: "edit",
+  write: "edit",
+  multiedit: "edit",
+  notebookedit: "edit",
+  bash: "run",
+  bashoutput: "run",
+  killshell: "run",
+  grep: "search",
+  glob: "search",
+  websearch: "search",
+  webfetch: "fetch",
+};
+const KNOWN_TOOL_KINDS = new Set([
+  "read",
+  "edit",
+  "search",
+  "run",
+  "fetch",
+  "think",
+  "other",
+]);
+
+export function toolKindOf(tool) {
+  if (!tool) {
+    return null;
+  }
+  const acpKind = String(tool.kind || "").trim().toLowerCase();
+  if (acpKind) {
+    const mapped = ACP_KIND_ALIASES[acpKind] || acpKind;
+    if (KNOWN_TOOL_KINDS.has(mapped)) {
+      return mapped;
+    }
+  }
+  const itemType = String(tool.item_type || "").trim();
+  if (itemType === "command_execution") {
+    return "run";
+  }
+  if (itemType === "fileChange" || itemType === "turnDiff") {
+    return "edit";
+  }
+  const name = String(tool.name || "").trim().toLowerCase();
+  return TOOL_NAME_KINDS[name] || null;
+}
+
+const KIND_NOUNS = {
+  read: ["read", "reads"],
+  edit: ["edit", "edits"],
+  search: ["search", "searches"],
+  run: ["command", "commands"],
+  fetch: ["fetch", "fetches"],
+  think: ["thought", "thoughts"],
+  other: ["tool", "tools"],
+};
+// Fixed order so the label does not reshuffle between renders.
+const KIND_ORDER = ["read", "edit", "search", "run", "fetch", "other", "think"];
+// Beyond this the chip stops being scannable and starts being a list.
+const MAX_LABEL_PARTS = 4;
+
+export function workGroupLabel(group) {
+  const entries = group?.entries || [];
+  const counts = new Map();
+  const bump = (kind) => counts.set(kind, (counts.get(kind) || 0) + 1);
+
+  for (const entry of entries) {
+    if (entry?.kind === "reasoning") {
+      bump("think");
+      continue;
+    }
+    if (entry?.kind === "command") {
+      bump(toolKindOf(entry?.tool) || "run");
+      continue;
+    }
+    bump(toolKindOf(entry?.tool) || "other");
+  }
+
+  const parts = [];
+  let dropped = 0;
+  for (const kind of KIND_ORDER) {
+    const count = counts.get(kind);
+    if (!count) {
+      continue;
+    }
+    if (parts.length >= MAX_LABEL_PARTS) {
+      dropped += count;
+      continue;
+    }
+    const [one, many] = KIND_NOUNS[kind];
+    parts.push(`${count} ${count === 1 ? one : many}`);
+  }
+  if (dropped > 0) {
+    parts.push(`+${dropped} more`);
+  }
+  if (!parts.length) {
+    return `··· ${entries.length} steps`;
+  }
+  return `··· ${parts.join(" · ")}`;
+}
+
+// One shared run, not one per kind: Cursor and Codex interleave reasoning with
+// tool calls, so splitting by kind fragments a single stretch of work.
+function isGroupableWork(entry) {
+  return isGroupableCompletedTool(entry) || isGroupableReasoning(entry);
 }
 
 function isGroupableCompletedTool(entry) {
   // Claude routes every tool use through kind "tool_call"; Codex routes shell
   // commands through kind "command" (its file edits are tool_call/fileChange).
-  // Fold both into the same collapsible tool-group so Codex command runs
+  // Fold both into the same collapsible work-group so Codex command runs
   // collapse just like Claude tool calls instead of stacking as loose cards.
   if (!entry || (entry.kind !== "tool_call" && entry.kind !== "command")) {
     return false;
@@ -1556,15 +1719,11 @@ export function groupToolEntries(entries) {
       return;
     }
 
-    // Everything else groups by adjacency: tools into a tool-group, and any
-    // diff entry without a turn_id into an inline diff-group.
     let nextType = null;
-    if (isGroupableCompletedTool(entry)) {
-      nextType = "tool-group";
-    } else if (diffEntry) {
+    if (diffEntry) {
       nextType = "diff-group";
-    } else if (isGroupableReasoning(entry)) {
-      nextType = "reasoning-group";
+    } else if (isGroupableWork(entry)) {
+      nextType = "work-group";
     }
 
     if (nextType) {
@@ -1587,8 +1746,8 @@ export function groupToolEntries(entries) {
     result.push(group);
   }
 
-  // Finally, merge adjacent diff-groups into one — so several file diffs in a
-  // row collapse into a single group, exactly like consecutive tool calls do.
+  // Merge adjacent diff-groups into one — so several file diffs in a row
+  // collapse into a single group, exactly like consecutive tool calls do.
   const merged = [];
   for (const item of result) {
     const prev = merged[merged.length - 1];
@@ -1598,7 +1757,14 @@ export function groupToolEntries(entries) {
       merged.push(item);
     }
   }
-  return merged;
+
+  // A group of one costs a click and hides nothing the chip could have told
+  // you. diff-groups are exempt: the chip carries their +N/−N badge and Undo.
+  return merged.map((item) =>
+    item?.type === "work-group" && item.entries.length === 1
+      ? item.entries[0]
+      : item
+  );
 }
 
 function groupExpandKey(group) {
@@ -1669,72 +1835,47 @@ function aggregateDiffGroupStats(group, options = null) {
   return { added, removed, fileCount: files.size };
 }
 
-function ToolGroupEntry({ group, options = null }) {
+function WorkGroupEntry({ group, options = null }) {
   const expandKey = groupExpandKey(group);
   const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
-  const count = group?.entries?.length || 0;
   const { added, removed } = aggregateGroupDiffStats(group, options);
-  const label = `··· ${count} tool ${count === 1 ? "call" : "calls"}`;
+  const label = workGroupLabel(group);
+  const hasReasoning = (group?.entries || []).some(
+    (entry) => entry?.kind === "reasoning"
+  );
 
   return h(
     "article",
     {
-      className: "chat-message chat-message-system chat-message-tool-group",
-      ...(expandKey ? { "data-tool-group-key": expandKey } : {}),
+      className: "chat-message chat-message-system chat-message-work-group",
+      ...(expandKey ? { "data-work-group-key": expandKey } : {}),
     },
     h(
       "button",
       {
-        className: `tool-group-chip${expanded ? " tool-group-chip-open" : ""}`,
+        className: [
+          "work-group-chip",
+          expanded ? "work-group-chip-open" : "",
+          hasReasoning ? "work-group-chip-thinking" : "",
+        ]
+          .filter(Boolean)
+          .join(" "),
         ...(expandKey ? { "data-expand-key": expandKey } : {}),
         "data-transcript-toggle": "group",
         type: "button",
       },
       h(
         "span",
-        { "aria-hidden": "true", className: "tool-group-chevron" },
+        { "aria-hidden": "true", className: "work-group-chevron" },
         expanded ? "▾" : "▸"
       ),
-      h("span", { className: "tool-group-count" }, label),
+      h("span", { className: "work-group-count" }, label),
       added > 0
-        ? h("span", { className: "tool-group-chip-add" }, `+${added}`)
+        ? h("span", { className: "work-group-chip-add" }, `+${added}`)
         : null,
       removed > 0
-        ? h("span", { className: "tool-group-chip-del" }, `−${removed}`)
+        ? h("span", { className: "work-group-chip-del" }, `−${removed}`)
         : null
-    )
-  );
-}
-
-// Collapsed chip for a run of consecutive reasoning summaries, mirroring the
-// tool-call group. Empty reasoning is dropped before grouping, so every member
-// here carries a real summary body; the chip expands to reveal those cards.
-function ReasoningGroupEntry({ group, options = null }) {
-  const expandKey = groupExpandKey(group);
-  const expanded = Boolean(expandKey && options?.expandedKeys?.has(expandKey));
-  const count = group?.entries?.length || 0;
-  const label = `··· ${count} reasoning ${count === 1 ? "step" : "steps"}`;
-
-  return h(
-    "article",
-    {
-      className: "chat-message chat-message-system chat-message-reasoning-group",
-      ...(expandKey ? { "data-reasoning-group-key": expandKey } : {}),
-    },
-    h(
-      "button",
-      {
-        className: `reasoning-group-chip${expanded ? " reasoning-group-chip-open" : ""}`,
-        ...(expandKey ? { "data-expand-key": expandKey } : {}),
-        "data-transcript-toggle": "group",
-        type: "button",
-      },
-      h(
-        "span",
-        { "aria-hidden": "true", className: "reasoning-group-chevron" },
-        expanded ? "▾" : "▸"
-      ),
-      h("span", { className: "reasoning-group-count" }, label)
     )
   );
 }
@@ -1867,6 +2008,7 @@ export function TranscriptEntry({
   isJustPrepended = false,
   isLatestUser = false,
   options = null,
+  inGroup = false,
 }) {
   // An omitted-content entry must never render its clipped shell or an
   // "(empty)" body — show the unified loading placeholder until hydration
@@ -1893,13 +2035,13 @@ export function TranscriptEntry({
     });
   }
   if (kind === "command") {
-    return h(CommandEntry, { entry, isJustPrepended, options });
+    return h(CommandEntry, { entry, isJustPrepended, options, inGroup });
   }
   if (kind === "tool_call") {
-    return h(ToolEntry, { entry, isJustPrepended, options });
+    return h(ToolEntry, { entry, isJustPrepended, options, inGroup });
   }
   if (kind === "reasoning") {
-    return h(ReasoningEntry, { entry, isJustPrepended });
+    return h(ReasoningEntry, { entry, isJustPrepended, inGroup });
   }
   if (kind === "error") {
     return h(ErrorEntry, { entry, isJustPrepended });
@@ -1912,6 +2054,7 @@ export function ApprovalCard({ approval, options = null }) {
   const approvalCommandExpandKey = approval.request_id ? `approval:${approval.request_id}:command` : "";
   const contextExpandKey = approval.request_id ? `approval:${approval.request_id}:context` : "";
   const permissionsExpandKey = approval.request_id ? `approval:${approval.request_id}:permissions` : "";
+  const approvalKind = approvalKindLabel(approval.kind);
 
   return h(
     "article",
@@ -1926,11 +2069,35 @@ export function ApprovalCard({ approval, options = null }) {
         "div",
         { className: "message-meta" },
         h("strong", null, "Approval required"),
-        h("span", null, approval.kind)
+        // Named in words, and in its own element: printing the wire enum here
+        // put "command_execution" on screen, run into the label because
+        // `.message-meta` is not a flex row. See frontend/approval-card.test.mjs.
+        approvalKind
+          ? h("span", { className: "approval-kind" }, approvalKind)
+          : null
       ),
       h("h3", { className: "approval-title" }, approval.summary),
-      h("p", { className: "approval-copy" }, approval.detail || "Codex is waiting for a remote approval."),
-      approval.cwd ? h("p", { className: "approval-copy" }, `cwd: ${approval.cwd}`) : null,
+      // No provider name: the card carries no provider field, and guessing one
+      // told every non-Codex user their agent was Codex.
+      h("p", { className: "approval-copy" }, approval.detail || "The agent is waiting for a remote approval."),
+      // The working directory is the best available answer to "what can this
+      // touch", so it reads as scope rather than as a third line of prose in
+      // the same style as the explanation above it.
+      approval.cwd
+        ? h(
+            "div",
+            { className: "approval-scope" },
+            h(
+              "span",
+              // The exact value, not just the field name: this is the blast
+              // radius of a decision being authorised, so it has to stay
+              // recoverable even where the layout is tightest.
+              { className: "approval-scope-chip", title: `Working directory: ${approval.cwd}` },
+              h("span", { className: "approval-scope-label" }, "cwd"),
+              h("span", { className: "approval-scope-path" }, approval.cwd)
+            )
+          )
+        : null,
       approval.command
         ? h(ExpandableBlock, {
             className: "message-pre",
@@ -2137,6 +2304,20 @@ export function TranscriptContent({
     return { ...options, lastTurnDiffItemId, forkableItemIds };
   }, [options, lastTurnDiffItemId, forkableItemIds]);
   const justPrependedItemIds = useJustPrependedItemIds(entries);
+  // An UNANSWERED question is the one thing the session is waiting on, so it
+  // belongs at the bottom of the transcript wherever its tool call actually
+  // sits. It is MOVED, not copied — rendering it in place as well would put two
+  // live question dialogs on screen at once. Answering it clears the pending
+  // request, which un-pins it back to its original position in the
+  // conversation. (Ask-user tool calls are never folded into a group —
+  // `isGroupableCompletedTool` excludes them — so the pinned entry is always a
+  // plain item in `groupedItems`; if that ever changed, the id simply would not
+  // match and it would render in place, which is the safe degradation.)
+  const pinnedAskUserItemIds = React.useMemo(
+    () => findPinnedAskUserItemIds(entries, options?.pendingAskUserQuestions),
+    [entries, options?.pendingAskUserQuestions]
+  );
+  const pinnedAskUserNodes = [];
   const nodes = [];
 
   // Top sentinel: the IntersectionObserver in render-session.js / react-app.js
@@ -2156,12 +2337,12 @@ export function TranscriptContent({
   }
 
   groupedItems.forEach((item, index) => {
-    if (item?.type === "tool-group") {
+    if (item?.type === "work-group") {
       const expandKey = groupExpandKey(item);
       const expanded = Boolean(expandKey && effectiveOptions?.expandedKeys?.has(expandKey));
-      const groupKey = expandKey || `tool-group:${index}`;
+      const groupKey = expandKey || `work-group:${index}`;
       nodes.push(
-        h(ToolGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
+        h(WorkGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
       );
       if (expanded) {
         item.entries.forEach((memberEntry, memberIndex) => {
@@ -2169,33 +2350,9 @@ export function TranscriptContent({
           nodes.push(
             h(TranscriptEntry, {
               entry: memberEntry,
-              isJustPrepended: Boolean(memberId && justPrependedItemIds.has(memberId)),
-              isLatestUser: false,
-              key:
-                memberId
-                || memberEntry.id
-                || `${groupKey}:member:${memberIndex}`,
-              options: effectiveOptions,
-            })
-          );
-        });
-      }
-      return;
-    }
-
-    if (item?.type === "reasoning-group") {
-      const expandKey = groupExpandKey(item);
-      const expanded = Boolean(expandKey && effectiveOptions?.expandedKeys?.has(expandKey));
-      const groupKey = expandKey || `reasoning-group:${index}`;
-      nodes.push(
-        h(ReasoningGroupEntry, { group: item, key: groupKey, options: effectiveOptions })
-      );
-      if (expanded) {
-        item.entries.forEach((memberEntry, memberIndex) => {
-          const memberId = memberEntry.item_id || "";
-          nodes.push(
-            h(TranscriptEntry, {
-              entry: memberEntry,
+              // Painted as a rail row: this member is on screen only because
+              // the group chip above it is open.
+              inGroup: true,
               isJustPrepended: Boolean(memberId && justPrependedItemIds.has(memberId)),
               isLatestUser: false,
               key:
@@ -2246,20 +2403,34 @@ export function TranscriptContent({
     }
 
     const entryId = item.item_id || item.id || "";
-    nodes.push(
-      h(TranscriptEntry, {
-        entry: item,
-        isJustPrepended: Boolean(entryId && justPrependedItemIds.has(entryId)),
-        isLatestUser:
-          item.kind === "user_text" && entryId && entryId === latestUserEntryId,
-        key: entryId || `${item.kind || "entry"}:${index}`,
-        options: effectiveOptions,
-      })
-    );
+    const node = h(TranscriptEntry, {
+      entry: item,
+      isJustPrepended: Boolean(entryId && justPrependedItemIds.has(entryId)),
+      isLatestUser:
+        item.kind === "user_text" && entryId && entryId === latestUserEntryId,
+      key: entryId || `${item.kind || "entry"}:${index}`,
+      options: effectiveOptions,
+    });
+    if (entryId && pinnedAskUserItemIds.has(entryId)) {
+      // Hold it back — it is re-emitted at the bottom below. Skipping the push
+      // here is what keeps it a MOVE rather than a duplicate. Collected in
+      // iteration order, so several pending questions keep their relative order.
+      pinnedAskUserNodes.push(node);
+      return;
+    }
+    nodes.push(node);
   });
 
   if (approval) {
     nodes.push(h(ApprovalCard, { approval, key: "approval", options: effectiveOptions }));
+  }
+
+  // Last of all: every question the agent is blocked on. (An approval and a
+  // question can in principle both be pending; the questions sit below the
+  // approval card. Nothing enforces mutual exclusion — a turn blocks on one
+  // thing in practice — and this ordering is the deliberate default.)
+  for (const pinnedNode of pinnedAskUserNodes) {
+    nodes.push(pinnedNode);
   }
 
   // Bottom-follow: no top-anchor, so there is no bottom spacer and no

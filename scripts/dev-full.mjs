@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFileSync, unwatchFile, watchFile } from "node:fs";
+import { existsSync, readFileSync, unwatchFile, watchFile } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -140,7 +140,36 @@ spawnManaged(
   buildEnv
 );
 spawnManaged("relay-broker", "cargo", ["run", "-p", "relay-broker"], brokerEnv);
-spawnManaged("relay-server", "cargo", ["run", "-p", "relay-server"], relayEnv);
+// Build with the private crate when this checkout has it (see PRIVATE_CRATE.md).
+// Without this, `scripts/with-private.sh npm run dev:full` would swap the private
+// crate in and then build a relay that ignores it — a dev loop where task teams
+// answer "not available in this build".
+//
+// The tell is the stub's own marker file, not a module the private crate happens
+// to have today, so whatever goes private next needs no change here.
+const isStub = existsSync(
+  new URL("../crates/sealwire-private/STUB", import.meta.url)
+);
+const relayArgs = ["run", "-p", "relay-server"];
+if (isStub) {
+  console.log("[dev:full] stub private crate — task list and task team are off");
+} else {
+  relayArgs.push("--features", "private");
+  console.log("[dev:full] private crate present — building with it");
+}
+
+// The dev loop runs with in-development features unlocked. Set SEALWIRE_BETA=0
+// to see the locked preview a plain `npx sealwire` gets.
+if (relayEnv.SEALWIRE_BETA === undefined) {
+  relayEnv.SEALWIRE_BETA = "1";
+}
+console.log(
+  relayEnv.SEALWIRE_BETA === "1"
+    ? "[dev:full] beta features ON (Tasks unlocked)"
+    : `[dev:full] beta features OFF (SEALWIRE_BETA=${relayEnv.SEALWIRE_BETA})`
+);
+
+spawnManaged("relay-server", "cargo", relayArgs, relayEnv);
 
 function runCommand(command, args, env) {
   return new Promise((resolve, reject) => {

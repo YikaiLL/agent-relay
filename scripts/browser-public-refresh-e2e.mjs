@@ -171,10 +171,6 @@ async function main() {
     await remotePage.evaluate(() => window.__agentRelayForceSocketClose("test_token_expired"));
     await waitFor(() => refreshRequests.length >= 1, TIMEOUT_MS);
 
-    await remotePage.waitForFunction(() => {
-      const badge = document.querySelector("#remote-status-badge")?.textContent || "";
-      return badge.trim().length > 0 && !badge.toLowerCase().includes("offline");
-    }, null, { timeout: TIMEOUT_MS });
     await waitForRemoteMessageInput(remotePage, TIMEOUT_MS);
 
     await sendPromptAndWaitForReply(remotePage, AFTER_REFRESH_PROMPT, {

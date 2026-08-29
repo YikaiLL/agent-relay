@@ -25,6 +25,7 @@
  *   {"type":"tool_call_result", "id":"...","content":"..."}
  *   {"type":"approval_requested","id":"...","action":"...","data":{}}
  *   {"type":"ask_user_question_requested","id":"...","tool_use_id":"...","questions":[...]}
+ *   {"type":"cwd_changed",     "provider_session_id":"...","cwd":"..."}
  *   {"type":"error",           "message":"..."}
  *   {"type":"response","id":"...","ok":true,"result":{}}   // reply to a command carrying an `id`
  *   {"type":"response","id":"...","ok":false,"error":"..."}
@@ -61,7 +62,7 @@ import {
   mcpStatusLogLines,
   userMessageTranscriptText,
 } from "./sdk-mapping.mjs";
-import { buildSessionOptionsBase } from "./session-options.mjs";
+import { buildSessionOptionsBase, createCwdReporter } from "./session-options.mjs";
 import { createProgressTracker } from "./progress-tracker.mjs";
 import { checkInstalledClaudeBinary } from "./native-binary-check.mjs";
 import {
@@ -175,6 +176,7 @@ async function flushEvents(
   onProviderSessionId = null,
   decorateEvent = null,
   progressTracker = null,
+  afterEmit = null,
 ) {
   let streamProviderSessionId = initialProviderSessionId;
   try {
@@ -202,20 +204,9 @@ async function flushEvents(
       const mapped = mapSdkMessage(msg);
       if (!mapped) continue;
 
-      if (Array.isArray(mapped)) {
-        for (const ev of mapped) {
-          const enriched = await enrichEvent(ev, fileDiffTracker);
-          decorateEvent?.(enriched);
-          streamProviderSessionId = stampProviderSession(
-            enriched,
-            streamProviderSessionId,
-            onProviderSessionId,
-          );
-          emit(enriched, progressTracker);
-          onEvent?.(enriched);
-        }
-      } else {
-        const enriched = await enrichEvent(mapped, fileDiffTracker);
+      const events = Array.isArray(mapped) ? mapped : [mapped];
+      for (const ev of events) {
+        const enriched = await enrichEvent(ev, fileDiffTracker);
         decorateEvent?.(enriched);
         streamProviderSessionId = stampProviderSession(
           enriched,
@@ -224,7 +215,12 @@ async function flushEvents(
         );
         emit(enriched, progressTracker);
         onEvent?.(enriched);
+        afterEmit?.(enriched);
       }
+      // PostToolUse may run for every tool in a parallel batch before any
+      // result is published. Flush remaining cwd reports after the whole mapped
+      // message so a later write result cannot outrank the observation.
+      afterEmit?.({ type: "mapped_batch_end" });
     }
   } catch (err) {
     if (!shouldCancel.current) {
@@ -258,6 +254,14 @@ async function enrichEvent(event, fileDiffTracker) {
   return event;
 }
 
+function cwdChangedEvent(cwd, providerSessionId) {
+  return {
+    type: "cwd_changed",
+    ...(providerSessionId ? { provider_session_id: providerSessionId } : {}),
+    cwd,
+  };
+}
+
 function buildSessionOptions(
   cmd,
   pendingApprovals,
@@ -266,6 +270,7 @@ function buildSessionOptions(
   nextAskUserRequestId,
   getProviderSessionId = () => null,
   emitEvent = rawEmit,
+  observeCwd = null,
 ) {
   return buildSessionOptionsBase(cmd, {
     canUseTool: createPermissionHandler(pendingApprovals, nextApprovalId, {
@@ -275,6 +280,7 @@ function buildSessionOptions(
       emitEvent,
     }),
     defaultSettingSources: DEFAULT_SETTING_SOURCES,
+    observeCwd,
   });
 }
 
@@ -318,6 +324,36 @@ function ensureClaudeBinaryHealthy() {
   claudeBinaryHealthy = true;
 }
 
+// Preflight, the other half: the SDK spawns that binary WITH `cwd` set to the
+// thread's recorded workspace, and a thread keeps the cwd it was born in forever
+// — including after that directory is removed (a `git worktree` deleted once its
+// work landed). Spawning into a missing cwd fails with a bare ENOENT, which the
+// SDK misreports as a problem with the binary itself: "Claude Code native binary
+// at .../claude exists but failed to launch ... does not match this system's
+// libc ... Specify a matching binary with options.pathToClaudeCodeExecutable."
+// That story points debugging at the install instead of at the vanished
+// directory, so refuse first and name the path. No suggested fix here on
+// purpose: the relay UI owns the repair action.
+//
+// Deliberately NOT skipped under CLAUDE_WORKER_SDK_MODULE the way the binary
+// check is — a custom SDK module ships no native binary to vet, but the cwd is
+// real filesystem state whichever module is loaded (which also keeps this
+// testable through that seam).
+async function ensureWorkspaceCwdUsable(cwd) {
+  // Empty/absent means "inherit the worker's own cwd" — a valid, always-live case.
+  if (!cwd) return;
+  let info = null;
+  try {
+    info = await stat(cwd);
+  } catch {
+    info = null;
+  }
+  // A path that exists but is a file is the same failure: no directory to run in.
+  if (!info?.isDirectory()) {
+    throw new Error(`workspace directory ${cwd} no longer exists`);
+  }
+}
+
 // claude-agent-sdk 0.3.x removed `unstable_v2_createSession`/`resumeSession`,
 // which returned a persistent session exposing `{ send, stream, close }`. The
 // streaming `query()` API replaces them: the returned Query is itself the
@@ -325,7 +361,11 @@ function ensureClaudeBinaryHealthy() {
 // iterable we push user messages onto (our `send()`). This shim re-creates the
 // small surface the worker relies on so the command loop below is unchanged.
 // `resume` (a prior session id) is passed through `options.resume`.
-function createWorkerSession(sdk, options, resume) {
+//
+// Async only because of the cwd preflight below: both preflights live here, at
+// the one seam every session spawn goes through, so a future call site cannot
+// route around them.
+async function createWorkerSession(sdk, options, resume) {
   const queue = [];
   let wake = null;
   let ended = false;
@@ -346,6 +386,7 @@ function createWorkerSession(sdk, options, resume) {
   }
 
   ensureClaudeBinaryHealthy();
+  await ensureWorkspaceCwdUsable(options?.cwd);
   const query = sdk.query({
     prompt: inputStream(),
     options: resume ? { ...options, resume } : options,
@@ -465,6 +506,7 @@ async function readSupportedModels(sdk, cmd) {
   }
 
   ensureClaudeBinaryHealthy();
+  await ensureWorkspaceCwdUsable(cmd.cwd);
   const query = sdk.query({
     prompt: idlePrompt(),
     options: { cwd: cmd.cwd || process.cwd() },
@@ -858,6 +900,13 @@ function startSessionStream(sessions, entry, context) {
       }
     },
     entry.progressTracker,
+    (event) => {
+      if (event?.type === "tool_call_result") {
+        entry.flushPostToolCwd?.(event.id);
+      } else if (event?.type === "mapped_batch_end") {
+        entry.flushPostToolCwd?.();
+      }
+    },
   ).finally(() => {
     settleUnexpectedStreamEnd(sessions, entry, context);
     if (entry.streamTask === streamTask) {
@@ -919,14 +968,23 @@ function handleSessionEvent(sessions, entry, event, context) {
 }
 
 function buildEntryOptions(entry, cmd, pendingApprovals, nextApprovalId, pendingAskUserQuestions, nextAskUserRequestId) {
+  const reporter = createCwdReporter((cwd) => {
+    if (!cwd) return;
+    emit(
+      cwdChangedEvent(cwd, entry.providerSessionId || entry.pendingThreadId),
+      entry.progressTracker,
+    );
+  });
+  entry.flushPostToolCwd = reporter.flushPostToolCwd;
   return buildSessionOptions(
     cmd,
     pendingApprovals,
     nextApprovalId,
     pendingAskUserQuestions,
     nextAskUserRequestId,
-    () => entry.providerSessionId,
+    () => entry.providerSessionId || entry.pendingThreadId,
     (event) => emit(event, entry.progressTracker),
+    reporter.observeCwd,
   );
 }
 
@@ -940,6 +998,20 @@ function sessionOptionsChanged(prev, next) {
   // `model` is only present when the command specified one; a resume omits it,
   // so treat "unspecified" as "unchanged" rather than forcing a needless rebuild.
   if (next.model && prev.model !== next.model) return true;
+  // A persona is baked in at query() time like permissionMode and model. Omitted
+  // on a live command means cleared — the relay must re-send an authoritative
+  // persona when it wants one kept (Orchestrator send/resume). Sticky inheritance
+  // here would leave a secretary prompt on a non-Orchestrator thread when MCP
+  // drops off and the session rebuilds.
+  if ((prev.systemPrompt ?? "") !== (next.systemPrompt ?? "")) return true;
+  // Same reasoning as the persona: baked in at query() time, so a live session
+  // would keep the old toolset while the relay believed it had swapped one in.
+  if (JSON.stringify(prev.mcpServers ?? null) !== JSON.stringify(next.mcpServers ?? null)) {
+    return true;
+  }
+  if (JSON.stringify(prev.allowedTools ?? null) !== JSON.stringify(next.allowedTools ?? null)) {
+    return true;
+  }
   return false;
 }
 
@@ -986,7 +1058,7 @@ async function ensureLiveSession(
   entry.stopOperation = null;
   entry.cancelFlag = { current: false };
   entry.fileDiffTracker = createFileDiffTracker(entry.options.cwd || entry.cwd);
-  entry.session = createWorkerSession(sdk, entry.options, resumeId || undefined);
+  entry.session = await createWorkerSession(sdk, entry.options, resumeId || undefined);
   startSessionStream(sessions, entry, context);
 }
 
@@ -1110,7 +1182,7 @@ async function main() {
         sessions.set(entry.key, entry);
 
         try {
-          entry.session = createWorkerSession(sdk, entry.options);
+          entry.session = await createWorkerSession(sdk, entry.options);
 
           if (cmd.prompt || cmd.images?.length) {
             const userTurn = createUserTurn(cmd.prompt, {
@@ -1468,6 +1540,7 @@ export {
   createSessionEntry,
   createUserTurn,
   createWorkerSession,
+  cwdChangedEvent,
   ensureLiveSession,
   evictSessionsIfNeeded,
   findSessionEntry,

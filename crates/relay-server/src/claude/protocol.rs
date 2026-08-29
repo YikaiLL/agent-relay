@@ -16,6 +16,7 @@ pub(super) fn parse_thread_array(value: Option<&Value>) -> Result<Vec<ThreadSumm
 
 pub(super) fn parse_thread_summary(value: &Value) -> Result<ThreadSummaryView, String> {
     Ok(ThreadSummaryView {
+        workspace_trusted: false,
         id: string_at(value, &["id"]).ok_or_else(|| "Claude thread id is missing".to_string())?,
         name: string_at(value, &["name"]),
         preview: string_at(value, &["preview"]).unwrap_or_default(),

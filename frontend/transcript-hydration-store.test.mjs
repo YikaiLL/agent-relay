@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildHydratedTranscriptProgress,
+  createMergedTranscriptHydrationPagePatch,
   prepareTranscriptHydrationState,
   restoreHydratedTranscriptSnapshot,
 } from "./shared/transcript-hydration-store.js";
@@ -684,4 +685,303 @@ test("a longer preview replaces a stale shorter cached body and re-hydrates", ()
     longPreview,
     "the longer preview must win over the stale shorter cached body"
   );
+});
+
+// --- entry ORDER (Bug A) ----------------------------------------------------
+//
+// `transcriptHydrationOrder` is the ONLY thing that decides render order — there
+// is no comparator anywhere on the render path, and `TranscriptEntryView` carries
+// no seq/timestamp for settled entries. Three writers feed that array (tail page
+// merge, snapshot tail merge, live SSE delta), and they used to disagree about
+// where a late-arriving id belongs. These tests pin the conversation order the
+// server actually reported.
+
+function orderedEntry(itemId, kind, text, turnId, overrides = {}) {
+  return {
+    item_id: itemId,
+    kind,
+    text,
+    status: "completed",
+    turn_id: turnId,
+    tool: null,
+    content_state: "full",
+    ...overrides,
+  };
+}
+
+test("a user message that settles AFTER its reply already streamed still renders above it", () => {
+  // The SSE delta stream and the snapshot stream are independent, so the
+  // agent_text delta for turn 2's reply can join the window BEFORE the settled
+  // user_text that triggered it ever appears in a snapshot. (This is the review
+  // post-back shape: the relay injects the user message server-side while the
+  // reply is already streaming.) Appending that late user message at the tail is
+  // what rendered it BELOW its own reply. The snapshot's transcript IS the
+  // server's authoritative order, so a genuinely-new id must be spliced in where
+  // the snapshot puts it, not blindly at the end.
+  const streamingReply = orderedEntry("a2", "agent_text", "Test suite is green", "turn-2", {
+    status: "running",
+  });
+  const state = {
+    session: { active_thread_id: "thread-1", transcript_revision: 10 },
+    transcriptHydrationBaseSnapshot: { active_thread_id: "thread-1" },
+    transcriptHydrationEntries: new Map([
+      ["u1", orderedEntry("u1", "user_text", "first prompt", "turn-1")],
+      ["a1", orderedEntry("a1", "agent_text", "first reply", "turn-1")],
+      // a2 arrived over SSE before any snapshot carried u2.
+      ["a2", streamingReply],
+    ]),
+    transcriptHydrationOrder: ["u1", "a1", "a2"],
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationPromise: null,
+    transcriptHydrationSignature: "thread-1|turn-1|stale",
+    transcriptHydrationStatus: "complete",
+    transcriptHydrationTailReady: true,
+    transcriptHydrationThreadId: "thread-1",
+  };
+  const snapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-2",
+    transcript_revision: 11,
+    transcript_truncated: true,
+    transcript: [
+      orderedEntry("u1", "user_text", "first prompt", "turn-1"),
+      orderedEntry("a1", "agent_text", "first reply", "turn-1"),
+      orderedEntry("u2", "user_text", "Run the relay-server test suite", "turn-2"),
+      streamingReply,
+    ],
+  };
+
+  // The immediate render overlay must already be in conversation order...
+  const rendered = restoreHydratedTranscriptSnapshot(state, snapshot);
+  assert.deepEqual(
+    rendered.transcript.map((entry) => entry.item_id),
+    ["u1", "a1", "u2", "a2"],
+    "the settled user message must render ABOVE the reply it triggered"
+  );
+
+  // ...and so must the merged window every later render reads back.
+  const prepared = prepareTranscriptHydrationState(state, snapshot);
+  Object.assign(state, prepared.patch);
+  assert.deepEqual(
+    state.transcriptHydrationOrder,
+    ["u1", "a1", "u2", "a2"],
+    "the merged window keeps the server's order, not transport-arrival order"
+  );
+});
+
+test("a tail page merges into the loaded window instead of replacing its order", () => {
+  // `createMergedTranscriptHydrationPagePatch` used to RESET order to the page's
+  // ids on a non-prepend (tail) merge while `entries` kept everything. Anything
+  // the page did not carry — older history the reader scrolled in, or an id a
+  // live SSE delta had just appended — was orphaned in the map: still present,
+  // never rendered again, and unrecoverable, because both re-add sites only fire
+  // for ids that are NEW to `entries`.
+  const state = {
+    transcriptHydrationEntries: new Map([
+      ["old-1", orderedEntry("old-1", "user_text", "scrolled-in prompt", "turn-0")],
+      ["old-2", orderedEntry("old-2", "agent_text", "scrolled-in reply", "turn-0")],
+      ["u1", orderedEntry("u1", "user_text", "prompt", "turn-1")],
+      ["a1", orderedEntry("a1", "agent_text", "reply", "turn-1")],
+      ["live", orderedEntry("live", "agent_text", "streaming now", "turn-2", { status: "running" })],
+    ]),
+    transcriptHydrationOrder: ["old-1", "old-2", "u1", "a1", "live"],
+    transcriptHydrationOlderCursor: "cursor-older",
+    transcriptHydrationSignature: "thread-1|turn-2|sig",
+    transcriptHydrationStatus: "idle",
+    transcriptHydrationTailReady: true,
+    transcriptHydrationThreadId: "thread-1",
+  };
+  const page = {
+    thread_id: "thread-1",
+    prev_cursor: "cursor-older",
+    entries: [
+      orderedEntry("u1", "user_text", "prompt", "turn-1"),
+      orderedEntry("a1", "agent_text", "reply", "turn-1"),
+    ],
+  };
+
+  const patch = createMergedTranscriptHydrationPagePatch(state, page, { prepend: false });
+
+  assert.deepEqual(
+    patch.transcriptHydrationOrder,
+    ["old-1", "old-2", "u1", "a1", "live"],
+    "a tail page is authoritative for the ids it carries, not for the whole window"
+  );
+  assert.equal(
+    patch.transcriptHydrationEntries.size,
+    5,
+    "no entry may be left orphaned in the map without a slot in the order"
+  );
+});
+
+test("a new user message that OPENS the snapshot tail still lands above its reply", () => {
+  // The compacted snapshot carries only the last few entries (8 local / 6 remote,
+  // protocol.rs), so a turn's user message can be the FIRST thing in the tail
+  // while the reply that follows it is already in the window via a live delta.
+  // With no EARLIER tail entry to anchor against, appending at the end of the
+  // window puts the user message below its own reply all over again — the same
+  // bug, one row further left. Fall back to the first LATER tail id we can locate
+  // and land just before it.
+  const streamingReply = orderedEntry("a2", "agent_text", "Test suite is green", "turn-2", {
+    status: "running",
+  });
+  const state = {
+    session: { active_thread_id: "thread-1", transcript_revision: 10 },
+    transcriptHydrationBaseSnapshot: { active_thread_id: "thread-1" },
+    transcriptHydrationEntries: new Map([
+      ["old-1", orderedEntry("old-1", "agent_text", "older, below the tail window", "turn-0")],
+      ["a2", streamingReply],
+    ]),
+    transcriptHydrationOrder: ["old-1", "a2"],
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationPromise: null,
+    transcriptHydrationSignature: "thread-1|turn-1|stale",
+    transcriptHydrationStatus: "complete",
+    transcriptHydrationTailReady: true,
+    transcriptHydrationThreadId: "thread-1",
+  };
+  // The tail window has slid forward: it now STARTS with the new user message.
+  const snapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-2",
+    transcript_revision: 11,
+    transcript_truncated: true,
+    transcript: [
+      orderedEntry("u2", "user_text", "Run the relay-server test suite", "turn-2"),
+      streamingReply,
+    ],
+  };
+
+  const rendered = restoreHydratedTranscriptSnapshot(state, snapshot);
+  assert.deepEqual(
+    rendered.transcript.map((entry) => entry.item_id),
+    ["old-1", "u2", "a2"],
+    "immediate overlay: the tail-opening user message goes above its reply, below older history"
+  );
+
+  const prepared = prepareTranscriptHydrationState(state, snapshot);
+  Object.assign(state, prepared.patch);
+  assert.deepEqual(
+    state.transcriptHydrationOrder,
+    ["old-1", "u2", "a2"],
+    "merged window: same placement, persisted"
+  );
+});
+
+test("a tail page that shares nothing with the window keeps the live delta BELOW it", () => {
+  // Reviewer open question: what is the invariant when a tail page and the window
+  // do not intersect? It is reachable — a thread switch clears the window, a live
+  // delta lands before the first page does, and cold hydration then merges a page
+  // that predates it. The window cannot be OLDER than a tail page it does not
+  // intersect (older pages are only ever prepended onto a window that already
+  // holds the tail), so the leftover is the NEWER entry and must stay last.
+  const state = {
+    transcriptHydrationEntries: new Map([
+      ["live", orderedEntry("live", "agent_text", "streaming now", "turn-9", { status: "running" })],
+    ]),
+    transcriptHydrationOrder: ["live"],
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationSignature: "thread-1|turn-9|sig",
+    transcriptHydrationStatus: "idle",
+    transcriptHydrationTailReady: true,
+    transcriptHydrationThreadId: "thread-1",
+  };
+  const page = {
+    thread_id: "thread-1",
+    prev_cursor: null,
+    entries: [
+      orderedEntry("u1", "user_text", "prompt", "turn-8"),
+      orderedEntry("a1", "agent_text", "reply", "turn-8"),
+    ],
+  };
+
+  const patch = createMergedTranscriptHydrationPagePatch(state, page, { prepend: false });
+
+  assert.deepEqual(
+    patch.transcriptHydrationOrder,
+    ["u1", "a1", "live"],
+    "the live entry is newer than a page it does not intersect, so it stays last"
+  );
+});
+
+test("a snapshot tail with no anchor at all appends — the window really is older", () => {
+  // Pins the invariant behind the asymmetry with mergeTailPageOrder. A snapshot
+  // tail is just the last N entries, so an empty intersection with the window is
+  // the ordinary "a burst of new entries pushed the whole window out of the tail"
+  // case: the window is older and the tail belongs at the end. (The page branch
+  // assumes the opposite, for a reason spelled out at that call site.)
+  const state = {
+    session: { active_thread_id: "thread-1", transcript_revision: 10 },
+    transcriptHydrationBaseSnapshot: { active_thread_id: "thread-1" },
+    transcriptHydrationEntries: new Map([
+      ["e1", orderedEntry("e1", "user_text", "older prompt", "turn-1")],
+      ["e2", orderedEntry("e2", "agent_text", "older reply", "turn-1")],
+    ]),
+    transcriptHydrationOrder: ["e1", "e2"],
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationPromise: null,
+    transcriptHydrationSignature: "thread-1|turn-1|stale",
+    transcriptHydrationStatus: "complete",
+    transcriptHydrationTailReady: true,
+    transcriptHydrationThreadId: "thread-1",
+  };
+  const snapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-2",
+    transcript_revision: 11,
+    transcript_truncated: true,
+    transcript: [
+      orderedEntry("e3", "user_text", "next prompt", "turn-2"),
+      orderedEntry("e4", "agent_text", "next reply", "turn-2"),
+    ],
+  };
+
+  const prepared = prepareTranscriptHydrationState(state, snapshot);
+  Object.assign(state, prepared.patch);
+  assert.deepEqual(state.transcriptHydrationOrder, ["e1", "e2", "e3", "e4"]);
+});
+
+test("a newly sent user message at the end of a compact tail lands at the END of a deep window", () => {
+  // The shape a long virtualized thread produces: the window holds the whole
+  // conversation, the snapshot carries only the last few entries, and the newest
+  // of those is a just-sent user message. It must land at the very end — putting
+  // it anywhere else hides it below the fold of a virtualized list.
+  const windowIds = Array.from({ length: 30 }, (_, i) => `e${i}`);
+  const state = {
+    session: { active_thread_id: "thread-1", transcript_revision: 30 },
+    transcriptHydrationBaseSnapshot: { active_thread_id: "thread-1" },
+    transcriptHydrationEntries: new Map(
+      windowIds.map((id, i) => [id, orderedEntry(id, i % 3 === 0 ? "user_text" : "agent_text", `msg ${i}`, `turn-${i}`)])
+    ),
+    transcriptHydrationOrder: [...windowIds],
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationPromise: null,
+    transcriptHydrationSignature: "thread-1|stale",
+    transcriptHydrationStatus: "complete",
+    transcriptHydrationTailReady: true,
+    transcriptHydrationThreadId: "thread-1",
+  };
+  const tail = windowIds.slice(-7).map((id, i) =>
+    orderedEntry(id, "agent_text", `msg ${23 + i}`, `turn-${23 + i}`)
+  );
+  const snapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-new",
+    transcript_revision: 31,
+    transcript_truncated: true,
+    transcript: [...tail, orderedEntry("sent", "user_text", "ask-user-live", "turn-new")],
+  };
+
+  const rendered = restoreHydratedTranscriptSnapshot(state, snapshot);
+  assert.equal(
+    rendered.transcript.at(-1).item_id,
+    "sent",
+    "the just-sent message must render as the LAST entry"
+  );
+  assert.equal(rendered.transcript.length, 31);
+
+  const prepared = prepareTranscriptHydrationState(state, snapshot);
+  Object.assign(state, prepared.patch);
+  assert.equal(state.transcriptHydrationOrder.at(-1), "sent");
+  assert.equal(state.transcriptHydrationOrder.length, 31);
 });

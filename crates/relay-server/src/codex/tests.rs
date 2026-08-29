@@ -1847,6 +1847,7 @@ async fn handle_notification_drops_unthreaded_codex_events_when_active_thread_is
         relay.active_thread_id = Some("claude-thread".to_string());
         relay.active_turn_id = Some("claude-turn".to_string());
         relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
             id: "claude-thread".to_string(),
             name: None,
             preview: String::new(),
@@ -1898,6 +1899,7 @@ async fn handle_notification_tracks_background_thread_status_activity() {
         relay.set_provider_name("claude_code".to_string());
         relay.active_thread_id = Some("claude-thread".to_string());
         relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
             id: "codex-thread".to_string(),
             name: None,
             preview: String::new(),
@@ -1949,6 +1951,7 @@ async fn handle_server_request_for_background_thread_does_not_touch_active_progr
         relay.set_provider_name("claude_code".to_string());
         relay.active_thread_id = Some("claude-thread".to_string());
         relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
             id: "codex-thread".to_string(),
             name: None,
             preview: String::new(),
@@ -1986,6 +1989,223 @@ async fn handle_server_request_for_background_thread_does_not_touch_active_progr
             .iter()
             .any(|activity| activity.thread_id == "codex-thread"),
         "background approval should surface the Codex thread as active"
+    );
+}
+
+#[tokio::test]
+async fn command_execution_cwd_records_proven_without_clobbering_birth_cwd() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
+            id: "thread-1".to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            updated_at: 1,
+            source: "codex".to_string(),
+            status: "active".to_string(),
+            model_provider: "codex".to_string(),
+            provider: "codex".to_string(),
+            forked_from: None,
+            renamed: false,
+        });
+        relay.active_thread_id = Some("thread-1".to_string());
+    }
+
+    handle_notification(
+        json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-command",
+                    "type": "commandExecution",
+                    "command": "ls",
+                    "cwd": "/tmp/project/.worktrees/feature",
+                    "status": "running"
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    assert_eq!(
+        relay.thread_workspace("thread-1").proven.as_deref(),
+        Some("/tmp/project/.worktrees/feature"),
+        "a command's cwd is where this session is, even with no file writes"
+    );
+    assert_eq!(
+        relay.thread_cwd("thread-1").as_deref(),
+        Some("/tmp/project"),
+        "birth cwd stays the directory the thread was created in"
+    );
+}
+
+#[tokio::test]
+async fn thread_settings_updated_records_proven_from_thread_settings_cwd() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
+            id: "thread-1".to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            updated_at: 1,
+            source: "codex".to_string(),
+            status: "active".to_string(),
+            model_provider: "codex".to_string(),
+            provider: "codex".to_string(),
+            forked_from: None,
+            renamed: false,
+        });
+        relay.active_thread_id = Some("thread-1".to_string());
+    }
+
+    handle_notification(
+        json!({
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thread-1",
+                "threadSettings": {
+                    "cwd": "/tmp/project/.worktrees/feature"
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    assert_eq!(
+        relay.thread_workspace("thread-1").proven.as_deref(),
+        Some("/tmp/project/.worktrees/feature"),
+        "Codex threadSettings.cwd is the session cwd this notification carries"
+    );
+    assert_eq!(
+        relay.thread_cwd("thread-1").as_deref(),
+        Some("/tmp/project"),
+        "birth cwd stays the directory the thread was created in"
+    );
+}
+
+#[tokio::test]
+async fn thread_settings_updated_restating_birth_must_not_clobber_proven() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
+            id: "thread-1".to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            updated_at: 1,
+            source: "codex".to_string(),
+            status: "active".to_string(),
+            model_provider: "codex".to_string(),
+            provider: "codex".to_string(),
+            forked_from: None,
+            renamed: false,
+        });
+        relay.active_thread_id = Some("thread-1".to_string());
+        relay.observe_thread_cwd("thread-1", "/tmp/project/.worktrees/feature");
+    }
+
+    handle_notification(
+        json!({
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thread-1",
+                "threadSettings": {
+                    "cwd": "/tmp/project",
+                    "model": "gpt-5.5"
+                }
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    assert_eq!(
+        relay.thread_workspace("thread-1").proven.as_deref(),
+        Some("/tmp/project/.worktrees/feature"),
+        "a settings update that restates birth cwd is not 'went home'"
+    );
+}
+
+#[tokio::test]
+async fn command_approval_cwd_records_proven_without_clobbering_birth_cwd() {
+    let (change_tx, _) = watch::channel(0_u64);
+    let state = std::sync::Arc::new(RwLock::new(RelayState::new(
+        "/tmp/project".to_string(),
+        change_tx,
+        SecurityProfile::private(),
+    )));
+    {
+        let mut relay = state.write().await;
+        relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
+            id: "thread-1".to_string(),
+            name: None,
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            updated_at: 1,
+            source: "codex".to_string(),
+            status: "active".to_string(),
+            model_provider: "codex".to_string(),
+            provider: "codex".to_string(),
+            forked_from: None,
+            renamed: false,
+        });
+        relay.active_thread_id = Some("thread-1".to_string());
+    }
+
+    handle_server_request(
+        json!({
+            "id": 1,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "command": "ls",
+                "cwd": "/tmp/project/.worktrees/feature",
+                "availableDecisions": ["approve", "deny"]
+            }
+        }),
+        &state,
+    )
+    .await;
+
+    let relay = state.read().await;
+    assert_eq!(
+        relay.thread_workspace("thread-1").proven.as_deref(),
+        Some("/tmp/project/.worktrees/feature")
+    );
+    assert_eq!(
+        relay.thread_cwd("thread-1").as_deref(),
+        Some("/tmp/project")
     );
 }
 
@@ -2364,6 +2584,7 @@ async fn turn_completed_clears_progress_state() {
 
 fn test_thread_summary(id: &str) -> ThreadSummaryView {
     ThreadSummaryView {
+        workspace_trusted: false,
         id: id.to_string(),
         name: None,
         preview: String::new(),

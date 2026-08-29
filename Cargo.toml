@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "crates/relay-api",
     "crates/relay-broker",
+    "crates/sealwire-private",
     "crates/relay-http",
     "crates/relay-server",
     "crates/relay-util",

@@ -208,9 +208,15 @@ test("WorkflowRunCard renders final negative reviewer findings", () => {
     })
   );
 
-  assert.match(html, /Verdict: needs changes/);
+  // A run is work in flight, so its verdict is a trailing detail rather than a headline —
+  // the "Verdict:" prefix went with the card treatment that used to wrap it.
+  assert.match(html, /workflow-run-verdict[^>]*>Needs changes</);
   assert.match(html, /Finding A/);
   assert.match(html, /VERDICT: NEEDS_CHANGES/);
+  // Findings are RAW text, not markdown elements, so the pre-wrap that preserves their
+  // blank lines has to live on this class rather than being inherited from the reviewer
+  // body (which is real markup and was being double-spaced by it).
+  assert.match(html, /class="workflow-run-findings"/);
 });
 
 test("WorkflowRunCard renders a recovery action for blocked runs", () => {

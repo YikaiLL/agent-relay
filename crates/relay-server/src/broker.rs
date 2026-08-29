@@ -4,6 +4,7 @@ mod crypto;
 mod protocol;
 mod remote_actions;
 mod session_claim;
+mod writer;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use futures_util::{sink::SinkExt, stream::StreamExt};
+use futures_util::stream::StreamExt;
 use rand::{Rng, RngCore};
 use relay_broker::auth::{BrokerAuthMode, BROKER_AUTH_MODE_ENV};
 use relay_broker::join_ticket::unix_now;
@@ -46,6 +47,7 @@ use self::protocol::{
 use self::remote_actions::RemoteActionRequest;
 use self::remote_actions::{handle_encrypted_remote_action, handle_remote_action};
 use self::session_claim::{issue_session_claim, verify_session_claim};
+use self::writer::{spawn_broker_writer, BrokerWriter};
 #[cfg(test)]
 use relay_broker::protocol::BROKER_PROTOCOL_VERSION;
 
@@ -58,12 +60,17 @@ const PUBLIC_RELAY_AUTH_REQUEST_RETRY_SECS: u64 = 5;
 const PUBLIC_RELAY_REGISTRATION_SCHEMA_VERSION: u32 = 1;
 const PUBLIC_RELAY_IDENTITY_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_PUBLISH_MIN_INTERVAL_MILLIS: u64 = 500;
-const BROKER_RATE_LIMIT_SNAPSHOT_COOLDOWN_SECS: u64 = 5;
 const TRANSCRIPT_DELTA_PUBLISH_WINDOW_MILLIS: u64 = 100;
 const BROKER_MESSAGE_HANDLER_SLOW_WARN_MILLIS: u128 = 1_000;
 pub(crate) const RELAY_BROKER_IDENTITY_PATH_ENV: &str = "RELAY_BROKER_IDENTITY_PATH";
 const MAX_BROKER_TEXT_FRAME_BYTES: usize = 65_536;
-const RELAY_PROTOCOL_VERSION: u64 = 1;
+/// Bumped to 2 when chunked action results stopped base64'ing their payload: the field
+/// `data_base64` became `data` and now carries JSON text rather than base64 of bytes. A
+/// client that still expects `data_base64` rejects a v2 payload and tells the user to
+/// refresh — which is the whole fix, since the surface bundle is served by the broker —
+/// instead of silently failing to reassemble and sitting out the action deadline.
+const RELAY_PROTOCOL_VERSION: u64 = 2;
+
 type BrokerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone, Debug)]
@@ -175,11 +182,6 @@ fn snapshot_publish_decision(
         Ok(()) => SnapshotPublishDecision::PublishSnapshot,
         Err(deadline) => SnapshotPublishDecision::DelayUntil(deadline),
     }
-}
-
-enum ServerMessageOutcome {
-    Continue,
-    RateLimited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -856,7 +858,13 @@ async fn run_broker_session_with_liveness(
     let (socket, _) = connect_async(connect_url.as_str()).await.map_err(|error| {
         BrokerSessionError::before_connected(format!("failed to connect to broker: {error}"))
     })?;
-    let (mut sender, mut receiver) = socket.split();
+    let (sink, mut receiver) = socket.split();
+    // The write half moves into its own task. Nothing on the read path may ever await a
+    // socket write again: that coupling is what let a paced chunk train block the relay
+    // from reading for seconds at a time. See `writer.rs`.
+    // The guard aborts the writer on every exit path from this session. The socket is
+    // the session: a writer left draining into a dead socket can outlive its reconnect.
+    let (writer, mut writer_error, _writer_guard) = spawn_broker_writer(sink, state.clone());
 
     let welcome = receiver
         .next()
@@ -920,7 +928,7 @@ async fn run_broker_session_with_liveness(
             format!("Connected to broker room {}.", config.broker_room_id()),
         )
         .await;
-    publish_pending_broker_messages(&mut sender, state)
+    publish_pending_broker_messages(&writer, state)
         .await
         .map_err(|error| {
             BrokerSessionError::after_connected(
@@ -928,14 +936,12 @@ async fn run_broker_session_with_liveness(
                 connected_at,
             )
         })?;
-    publish_snapshot(&mut sender, state)
-        .await
-        .map_err(|error| {
-            BrokerSessionError::after_connected(
-                format!("initial broker publish failed: {error}"),
-                connected_at,
-            )
-        })?;
+    publish_snapshot(&writer, state).await.map_err(|error| {
+        BrokerSessionError::after_connected(
+            format!("initial broker publish failed: {error}"),
+            connected_at,
+        )
+    })?;
     let mut snapshot_publish_gate =
         SnapshotPublishGate::new(Duration::from_millis(SNAPSHOT_PUBLISH_MIN_INTERVAL_MILLIS));
     snapshot_publish_gate.mark_published(Instant::now());
@@ -956,9 +962,17 @@ async fn run_broker_session_with_liveness(
 
     loop {
         tokio::select! {
+            // The socket is the session, so a write failure still ends it. It now
+            // arrives here instead of as the return value of a publish call, because
+            // publishing is a hand-off to the writer task.
+            writer_failed = &mut writer_error => {
+                let error = writer_failed
+                    .unwrap_or_else(|_| "broker writer task stopped".to_string());
+                return Err(BrokerSessionError::after_connected(error, connected_at));
+            }
             changed = change_rx.changed() => {
                 changed.map_err(|_| BrokerSessionError::after_connected("relay change channel closed", connected_at))?;
-                let deltas = drain_pending_broker_messages_for_publish(&mut sender, state)
+                let deltas = drain_pending_broker_messages_for_publish(&writer, state)
                     .await
                     .map_err(|error| BrokerSessionError::after_connected(format!("broker direct publish failed: {error}"), connected_at))?;
                 if !deltas.is_empty() {
@@ -977,13 +991,12 @@ async fn run_broker_session_with_liveness(
                     !pending_transcript_deltas.is_empty(),
                 ) {
                     SnapshotPublishDecision::PublishSnapshot => {
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::FlushTranscriptDeltasThenPublishSnapshot => {
-                        flush_pending_transcript_deltas(
-                            &mut sender,
+                        flush_pending_transcript_deltas(&writer,
                             state,
                             &mut pending_transcript_deltas,
                         )
@@ -994,7 +1007,7 @@ async fn run_broker_session_with_liveness(
                                 connected_at,
                             )
                         })?;
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
@@ -1005,7 +1018,7 @@ async fn run_broker_session_with_liveness(
             }
             () = &mut pending_transcript_delta_timer, if !pending_transcript_deltas.is_empty() => {
                 let deltas = std::mem::take(&mut pending_transcript_deltas);
-                pending_transcript_deltas = publish_transcript_delta_batch(&mut sender, state, deltas)
+                pending_transcript_deltas = publish_transcript_delta_batch(&writer, state, deltas)
                     .await
                     .map_err(|error| BrokerSessionError::after_connected(format!("broker transcript delta publish failed: {error}"), connected_at))?;
                 if !pending_transcript_deltas.is_empty() {
@@ -1022,13 +1035,12 @@ async fn run_broker_session_with_liveness(
                     !pending_transcript_deltas.is_empty(),
                 ) {
                     SnapshotPublishDecision::PublishSnapshot => {
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
                     SnapshotPublishDecision::FlushTranscriptDeltasThenPublishSnapshot => {
-                        flush_pending_transcript_deltas(
-                            &mut sender,
+                        flush_pending_transcript_deltas(&writer,
                             state,
                             &mut pending_transcript_deltas,
                         )
@@ -1039,7 +1051,7 @@ async fn run_broker_session_with_liveness(
                                 connected_at,
                             )
                         })?;
-                        publish_snapshot(&mut sender, state)
+                        publish_snapshot(&writer, state)
                             .await
                             .map_err(|error| BrokerSessionError::after_connected(format!("broker publish failed: {error}"), connected_at))?;
                     }
@@ -1057,9 +1069,8 @@ async fn run_broker_session_with_liveness(
                 }
                 heartbeat_seq = heartbeat_seq.wrapping_add(1);
                 let payload = heartbeat_seq.to_be_bytes().to_vec();
-                sender
-                    .send(Message::Ping(payload.clone()))
-                    .await
+                writer
+                    .send_ping(Message::Ping(payload.clone()))
                     .map_err(|error| BrokerSessionError::after_connected(format!("broker heartbeat ping failed: {error}"), connected_at))?;
                 debug!(heartbeat_seq, "sent broker heartbeat ping");
                 awaiting_pong = Some(payload);
@@ -1093,7 +1104,7 @@ async fn run_broker_session_with_liveness(
                 {
                     let message_name = server_message_name(&message);
                     let started_at = Instant::now();
-                    let outcome = handle_server_message(state, &mut sender, message)
+                    handle_server_message(state, &writer, message)
                         .await
                         .map_err(|error| BrokerSessionError::after_connected(error, connected_at))?;
                     let elapsed_ms = started_at.elapsed().as_millis();
@@ -1103,15 +1114,6 @@ async fn run_broker_session_with_liveness(
                             elapsed_ms,
                             "broker server message handling was slow"
                         );
-                    }
-                    match outcome {
-                        ServerMessageOutcome::Continue => {}
-                        ServerMessageOutcome::RateLimited => {
-                            let deadline = Instant::now()
-                                + Duration::from_secs(BROKER_RATE_LIMIT_SNAPSHOT_COOLDOWN_SECS);
-                            snapshot_publish_gate.defer_until(deadline);
-                            pending_snapshot_timer.as_mut().reset(deadline);
-                        }
                     }
                 }
             }
@@ -1133,14 +1135,13 @@ fn decode_server_frame(frame: Message) -> Result<Option<ServerMessage>, String> 
 
 async fn handle_server_message(
     state: &AppState,
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     message: ServerMessage,
-) -> Result<ServerMessageOutcome, String> {
+) -> Result<(), String> {
     match message {
         ServerMessage::Welcome {
             protocol_version, ..
-        } => validate_broker_protocol_version(protocol_version)
-            .map(|()| ServerMessageOutcome::Continue),
+        } => validate_broker_protocol_version(protocol_version),
         ServerMessage::Presence {
             channel_id,
             kind,
@@ -1179,7 +1180,7 @@ async fn handle_server_message(
                     )
                     .await;
             }
-            Ok(ServerMessageOutcome::Continue)
+            Ok(())
         }
         ServerMessage::Message {
             from_peer_id,
@@ -1193,65 +1194,117 @@ async fn handle_server_message(
                     ?from_role,
                     "ignoring broker message from non-surface peer"
                 );
-                return Ok(ServerMessageOutcome::Continue);
+                return Ok(());
             }
 
-            match parse_inbound_payload(payload)? {
+            // A payload this relay cannot parse costs the SURFACE its request, not the
+            // room its session.
+            //
+            // This used to propagate, and `handle_server_message`'s error ends the whole
+            // broker session — so one authenticated surface sending something malformed
+            // disconnected every other surface, and the reconnect resynced a full
+            // snapshot. Version skew is the likeliest trigger (see
+            // `SUPPORTED_INBOUND_RELAY_PROTOCOL_VERSIONS`), but any junk frame did it.
+            //
+            // Errors that genuinely mean the CONNECTION is unusable — a dropped socket, a
+            // `rate_limited` admission that a frame was discarded — still end the session
+            // below. This narrows only the "one bad message" case.
+            let parsed = match parse_inbound_payload(payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    warn!(
+                        from_peer_id,
+                        %error,
+                        "ignoring an unparseable surface payload; the session continues"
+                    );
+                    return Ok(());
+                }
+            };
+            let from_peer_id_for_log = from_peer_id.clone();
+            let outcome = match parsed {
                 Some(InboundBrokerPayload::PairingRequest {
                     pairing_id,
                     envelope,
-                }) => handle_pairing_request(state, sender, from_peer_id, pairing_id, envelope)
-                    .await
-                    .map(|()| ServerMessageOutcome::Continue),
+                }) => {
+                    handle_pairing_request(state, writer, from_peer_id, pairing_id, envelope).await
+                }
                 Some(InboundBrokerPayload::RemoteAction {
                     action_id,
                     session_claim,
                     device_id,
                     request,
-                }) => handle_remote_action(
-                    state,
-                    sender,
-                    from_peer_id,
-                    action_id,
-                    session_claim,
-                    device_id,
-                    request,
-                )
-                .await
-                .map(|()| ServerMessageOutcome::Continue),
+                }) => {
+                    handle_remote_action(
+                        state,
+                        writer,
+                        from_peer_id,
+                        action_id,
+                        session_claim,
+                        device_id,
+                        request,
+                    )
+                    .await
+                }
                 Some(InboundBrokerPayload::EncryptedRemoteAction {
                     action_id,
                     session_claim,
                     device_id,
                     envelope,
-                }) => handle_encrypted_remote_action(
-                    state,
-                    sender,
-                    from_peer_id,
-                    action_id,
-                    session_claim,
-                    device_id,
-                    envelope,
-                )
-                .await
-                .map(|()| ServerMessageOutcome::Continue),
-                None => Ok(ServerMessageOutcome::Continue),
+                }) => {
+                    handle_encrypted_remote_action(
+                        state,
+                        writer,
+                        from_peer_id,
+                        action_id,
+                        session_claim,
+                        device_id,
+                        envelope,
+                    )
+                    .await
+                }
+                None => Ok(()),
+            };
+
+            // A handler's failure belongs to the surface that caused it, not to the room.
+            //
+            // Parsing is not the only way a surface's message can fail, and refusing it is
+            // not even unusual: plaintext remote actions are rejected in private mode,
+            // which is the DEFAULT, so an ordinary misconfigured client produces one of
+            // these on every request. Propagating it ends `run_broker_session`, which
+            // disconnects every other surface in the room and resyncs a full snapshot on
+            // the way back — repeatable at will by whoever sent the message.
+            //
+            // Nothing that genuinely requires a reconnect is lost by swallowing this:
+            // - a dead writer has its own `select!` arm in the session loop, which is
+            //   where write failures have arrived since publishing became a hand-off;
+            // - a broker `rate_limited` is a `ServerMessage::Error`, handled in the arm
+            //   below and still fatal on purpose.
+            if let Err(error) = outcome {
+                warn!(
+                    from_peer_id = from_peer_id_for_log,
+                    %error,
+                    "a surface's message failed; answering nothing and keeping the session"
+                );
             }
+            Ok(())
         }
         ServerMessage::Error { code, message } => {
             if code == "rate_limited" {
-                warn!(%message, "broker requested publish backpressure");
-                Ok(ServerMessageOutcome::RateLimited)
-            } else {
-                Err(message)
+                // Not backpressure — an admission that a frame was already discarded,
+                // with no way to learn which. Deferring the next snapshot cannot bring
+                // it back. Ending the session reconnects and resyncs, and the surface
+                // fails its in-flight actions on the disconnect instead of waiting out
+                // a deadline for chunks that will never arrive.
+                warn!(%message, "broker dropped a publish; ending the session to resync");
             }
+            Err(message)
         }
     }
 }
 
 async fn handle_pairing_request(
     state: &AppState,
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     from_peer_id: String,
     pairing_id: String,
     envelope: EncryptedEnvelope,
@@ -1321,7 +1374,7 @@ async fn handle_pairing_request(
         }
     };
     if let Some(result) = replay_result {
-        publish_pairing_result(sender, result).await?;
+        publish_pairing_result(writer, result).await?;
         state
             .push_runtime_log(
                 "info",
@@ -1379,10 +1432,7 @@ fn server_message_name(message: &ServerMessage) -> &'static str {
     }
 }
 
-async fn publish_snapshot(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
-    state: &AppState,
-) -> Result<(), String> {
+async fn publish_snapshot(writer: &BrokerWriter, state: &AppState) -> Result<(), String> {
     let snapshot = state.snapshot().await;
     let broker_can_read_content = state.broker_can_read_content().await;
     let compacted = snapshot
@@ -1406,7 +1456,7 @@ async fn publish_snapshot(
     );
     if broker_can_read_content {
         publish_payload(
-            sender,
+            writer,
             OutboundBrokerPayload::SessionSnapshot {
                 snapshot: compacted,
             },
@@ -1453,24 +1503,24 @@ async fn publish_snapshot(
             }),
         });
     }
-    publish_targeted_messages(sender, messages).await?;
+    publish_targeted_messages(writer, messages).await?;
 
     Ok(())
 }
 
 async fn publish_pending_broker_messages(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
 ) -> Result<(), String> {
-    let deltas = drain_pending_broker_messages_for_publish(sender, state).await?;
+    let deltas = drain_pending_broker_messages_for_publish(writer, state).await?;
     for delta in coalesce_transcript_deltas(deltas) {
-        publish_transcript_delta(sender, state, delta).await?;
+        publish_transcript_delta(writer, state, delta).await?;
     }
     Ok(())
 }
 
 async fn drain_pending_broker_messages_for_publish(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
 ) -> Result<Vec<PendingTranscriptDelta>, String> {
     let messages = state.drain_pending_broker_messages().await;
@@ -1492,7 +1542,7 @@ async fn drain_pending_broker_messages_for_publish(
     for message in messages {
         match message {
             BrokerPendingMessage::PairingResult(result) => {
-                publish_pairing_result(sender, result).await?;
+                publish_pairing_result(writer, result).await?;
             }
             BrokerPendingMessage::TranscriptDelta(delta) => transcript_deltas.push(delta),
         }
@@ -1501,7 +1551,7 @@ async fn drain_pending_broker_messages_for_publish(
 }
 
 async fn publish_transcript_delta_batch(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
     deltas: Vec<PendingTranscriptDelta>,
 ) -> Result<Vec<PendingTranscriptDelta>, String> {
@@ -1515,7 +1565,7 @@ async fn publish_transcript_delta_batch(
 
     let mut delta_count = 0;
     for delta in deltas {
-        publish_transcript_delta(sender, state, delta).await?;
+        publish_transcript_delta(writer, state, delta).await?;
         delta_count += 1;
     }
     if delta_count > 0 {
@@ -1525,13 +1575,13 @@ async fn publish_transcript_delta_batch(
 }
 
 async fn flush_pending_transcript_deltas(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
     pending_transcript_deltas: &mut Vec<PendingTranscriptDelta>,
 ) -> Result<(), String> {
     let mut deltas = std::mem::take(pending_transcript_deltas);
     while !deltas.is_empty() {
-        deltas = publish_transcript_delta_batch(sender, state, deltas).await?;
+        deltas = publish_transcript_delta_batch(writer, state, deltas).await?;
     }
     Ok(())
 }
@@ -1644,7 +1694,7 @@ fn build_transcript_delta_messages(
 }
 
 async fn publish_transcript_delta(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     state: &AppState,
     delta: PendingTranscriptDelta,
 ) -> Result<(), String> {
@@ -1688,15 +1738,23 @@ async fn publish_transcript_delta(
     );
 
     let messages = build_transcript_delta_messages(targets, broker_can_read_content, &delta)?;
-    publish_targeted_messages(sender, messages).await?;
+    publish_targeted_messages(writer, messages).await?;
 
     Ok(())
 }
 
-async fn publish_pairing_result(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+/// Seal a pairing result for exactly one broker peer.
+///
+/// The envelope carries the new device's `payload_secret` and refresh tokens
+/// sealed with nothing but the `pairing_secret` printed into the QR code, so any
+/// peer that can read the frame AND has seen the QR can open it. It therefore
+/// MUST leave here inside a `targeted_messages` wrapper: the broker routes on
+/// that wrapper alone, and a bare payload carrying an inner `target_peer_id` used
+/// to be fanned out to the whole room — handing the credentials to any bystander
+/// replaying the same pairing join ticket.
+fn pairing_result_targeted_message(
     result: crate::state::PendingPairingResult,
-) -> Result<(), String> {
+) -> Result<TargetedBrokerMessage, String> {
     let encrypted = encrypt_json(
         &result.pairing_secret,
         &PairingResultPlaintext {
@@ -1705,30 +1763,36 @@ async fn publish_pairing_result(
             payload_secret: result.payload_secret,
             relay_id: result.relay_id,
             relay_label: result.relay_label,
-            client_id: result.client_id,
-            client_refresh_token: result.client_refresh_token,
+            client_claim_id: result.client_claim_id,
+            client_claim_nonce: result.client_claim_nonce,
+            client_claim_expires_at: result.client_claim_expires_at,
             device_refresh_token: result.device_refresh_token,
             device_join_ticket: result.device_join_ticket,
             device_join_ticket_expires_at: result.device_join_ticket_expires_at,
             error: result.error,
         },
     )?;
-    publish_payload(
-        sender,
-        OutboundBrokerPayload::EncryptedPairingResult {
+    Ok(TargetedBrokerMessage {
+        target_peer_id: result.target_peer_id.clone(),
+        payload: Box::new(OutboundBrokerPayload::EncryptedPairingResult {
             pairing_id: result.pairing_id,
             target_peer_id: result.target_peer_id,
             envelope: encrypted,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())
+        }),
+    })
+}
+
+async fn publish_pairing_result(
+    writer: &BrokerWriter,
+    result: crate::state::PendingPairingResult,
+) -> Result<(), String> {
+    publish_targeted_messages(writer, vec![pairing_result_targeted_message(result)?]).await
 }
 
 async fn publish_payload(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     payload: OutboundBrokerPayload,
-) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+) -> Result<(), String> {
     let summary = summarize_outbound_payload(&payload);
     let frame_text = frame_text_for_payload(&payload);
     let frame_bytes = frame_text.len();
@@ -1750,11 +1814,17 @@ async fn publish_payload(
             "broker payload exceeds websocket text frame limit before send"
         );
     }
-    sender.send(Message::Text(frame_text)).await
+    writer.send_now(Message::Text(frame_text)).await
+}
+
+/// Serialize a payload into the frame the writer will send, without sending it.
+/// Used to build a chunk train up front so the writer can pace it.
+fn frame_message_for_payload(payload: &OutboundBrokerPayload) -> Message {
+    Message::Text(frame_text_for_payload(payload))
 }
 
 async fn publish_targeted_messages(
-    sender: &mut futures_util::stream::SplitSink<BrokerSocket, Message>,
+    writer: &BrokerWriter,
     messages: Vec<TargetedBrokerMessage>,
 ) -> Result<(), String> {
     if messages.is_empty() {
@@ -1772,7 +1842,7 @@ async fn publish_targeted_messages(
             && frame_bytes_for_payload(&candidate_payload) > MAX_BROKER_TEXT_FRAME_BYTES
         {
             let payload = OutboundBrokerPayload::TargetedMessages { messages: batch };
-            publish_payload(sender, payload)
+            publish_payload(writer, payload)
                 .await
                 .map_err(|error| error.to_string())?;
             batch = vec![message];
@@ -1783,7 +1853,7 @@ async fn publish_targeted_messages(
 
     if !batch.is_empty() {
         publish_payload(
-            sender,
+            writer,
             OutboundBrokerPayload::TargetedMessages { messages: batch },
         )
         .await

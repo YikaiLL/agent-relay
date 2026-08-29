@@ -16,16 +16,29 @@
  * or a pinned thread being read view-only. Declaring more than that would stream text
  * nothing is drawing.
  *
+ * `alsoWatch` is for a thread drawn BESIDE the conversation rather than instead
+ * of it — the Tasks screen's Orchestrator. Without it that pane is not in the
+ * watch set at all: `viewThreadId` still names whatever session you last looked
+ * at, so not even the active-thread fallback reaches the Orchestrator, and its
+ * text only ever arrives on the next full snapshot (chunked, and truncated by
+ * the snapshot's transcript cap) instead of streaming.
+ *
  * @param {object|null} session latest REAL session snapshot (never the view-only projection)
  * @param {string|null} viewThreadId thread the user is looking at, if not the active one
+ * @param {string[]} alsoWatch threads rendered alongside it
  * @returns {string[]} deduped, sorted thread ids
  */
-export function watchedThreadIds(session, viewThreadId) {
+export function watchedThreadIds(session, viewThreadId, alsoWatch = []) {
   const ids = new Set();
   if (viewThreadId) {
     ids.add(viewThreadId);
   } else if (session?.active_thread_id) {
     ids.add(session.active_thread_id);
+  }
+  for (const id of alsoWatch || []) {
+    if (id) {
+      ids.add(id);
+    }
   }
   // Sorted so an unchanged set always produces an identical key, whatever order the
   // ids were added in — otherwise every render could look like a change and re-POST.
@@ -72,12 +85,16 @@ export function createWatchedThreadsSync({
     }
   }
 
-  const syncWatchedThreads = async function syncWatchedThreads(session, viewThreadId) {
+  const syncWatchedThreads = async function syncWatchedThreads(
+    session,
+    viewThreadId,
+    alsoWatch = []
+  ) {
     const resolvedDeviceId = typeof deviceId === "function" ? deviceId() : deviceId;
     if (!resolvedDeviceId) {
       return false;
     }
-    const threadIds = watchedThreadIds(session, viewThreadId);
+    const threadIds = watchedThreadIds(session, viewThreadId, alsoWatch);
     const key = threadIds.join(" ");
     if (key === lastKey) {
       return false;

@@ -34,6 +34,10 @@ export const STALL_THRESHOLDS_BY_PHASE = {
   waiting_approval: null,
 };
 
+// How often the filler verb rotates while the agent works. One constant: the
+// Tasks pane used to carry its own copy, kept in step by a comment.
+export const VERB_CYCLE_MS = 2500;
+
 export function createVerbCycler(opts = {}) {
   const verbs = opts.verbs ?? PROGRESS_VERBS;
   const random = opts.random ?? Math.random;

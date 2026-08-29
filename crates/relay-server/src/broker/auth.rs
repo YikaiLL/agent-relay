@@ -41,9 +41,17 @@ pub(crate) struct DeviceBrokerCredential {
 }
 
 #[derive(Clone, Debug)]
+/// A relay's attestation that a client key may reach it.
+///
+/// Deliberately holds **no client credential**. The relay forwards this to the
+/// device inside the sealed pairing result; the device signs the nonce and
+/// redeems it against the broker itself, so the client token never transits a
+/// relay. Before this split, every relay a browser had ever paired with held a
+/// credential that authenticated that browser across all its other relays.
 pub(crate) struct ClientBrokerGrant {
-    pub(crate) client_id: String,
-    pub(crate) refresh_token: String,
+    pub(crate) claim_id: String,
+    pub(crate) claim_nonce: String,
+    pub(crate) claim_expires_at: u64,
     pub(crate) relay_id: String,
     pub(crate) relay_label: Option<String>,
 }
@@ -308,8 +316,9 @@ impl BrokerAuthConfig {
                 ensure_relay_binding(relay_id, &response.relay_id)?;
                 ensure_device_binding(device_id, &response.device_id)?;
                 Ok(Some(ClientBrokerGrant {
-                    client_id: response.client_id,
-                    refresh_token: response.client_refresh_token,
+                    claim_id: response.claim_id,
+                    claim_nonce: response.claim_nonce,
+                    claim_expires_at: response.claim_expires_at,
                     relay_id: response.relay_id,
                     relay_label: response.relay_label,
                 }))

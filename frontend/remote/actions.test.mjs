@@ -414,11 +414,14 @@ test("encrypted remote action result chunks reassemble before resolving", async 
             prev_cursor: 10,
           },
         };
-        const bytes = new TextEncoder().encode(JSON.stringify(result));
-        const midpoint = Math.ceil(bytes.length / 2);
+        // Text slices, not byte slices: chunks travel as JSON text now, so reassembly is
+        // string concatenation. Deliberately delivered out of order — the relay paces
+        // them, but nothing guarantees arrival order.
+        const serialized = JSON.stringify(result);
+        const midpoint = Math.ceil(serialized.length / 2);
         const chunks = [
-          { chunk_index: 1, data: bytes.slice(midpoint) },
-          { chunk_index: 0, data: bytes.slice(0, midpoint) },
+          { chunk_index: 1, data: serialized.slice(midpoint) },
+          { chunk_index: 0, data: serialized.slice(0, midpoint) },
         ];
         for (const chunk of chunks) {
           const envelope = await encryptJson("payload-secret-1", {
@@ -426,7 +429,7 @@ test("encrypted remote action result chunks reassemble before resolving", async 
             action: "fetch_thread_transcript",
             chunk_index: chunk.chunk_index,
             chunk_count: chunks.length,
-            data_base64: Buffer.from(chunk.data).toString("base64"),
+            data: chunk.data,
           });
           await handleRemoteBrokerPayload({
             kind: "encrypted_remote_action_result_chunk",
@@ -866,3 +869,507 @@ test("handleRemoteBrokerPayload does not apply snapshot for claim_challenge acti
 
   assert.equal(snapshotApplied, false);
 });
+
+// A surface receives every other surface's frames: the broker broadcasts remote
+// action results and filters nothing, by design (`must_not_be_broadcast` in
+// crates/relay-broker/src/state.rs lists only `encrypted_pairing_result`). That is
+// fine as long as discarding one is FREE. It was not: the discard path logged, and
+// `renderLog` is a `patchRemoteState`, which notifies the store that drives
+// `useSyncExternalStore` — i.e. a full re-render of RemoteApp per frame thrown away.
+//
+// A real boot trace showed 21 such frames arriving before the first frame addressed
+// to this surface, each one a chunk of another surface's `fetch_workspace_diff`.
+test("a frame addressed to another surface does not notify the remote store", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+
+  try {
+    // One chunked action result belonging to a DIFFERENT surface of the same device.
+    for (let index = 0; index < 12; index += 1) {
+      await handleRemoteBrokerPayload({
+        kind: "encrypted_remote_action_result_chunk",
+        action_id: "action-for-another-surface",
+        action: "fetch_workspace_diff",
+        chunk_index: index,
+        chunk_count: 12,
+        target_peer_id: "surface-other",
+        device_id: "device-1",
+        // Never reached: the payload is filtered before any decrypt.
+        envelope: "envelope-that-must-not-be-opened",
+      });
+    }
+    await handleRemoteBrokerPayload({
+      kind: "encrypted_remote_action_result",
+      action_id: "action-for-another-surface",
+      target_peer_id: "surface-other",
+      device_id: "device-1",
+      envelope: "envelope-that-must-not-be-opened",
+    });
+  } finally {
+    unsubscribe();
+  }
+
+  assert.equal(
+    notifications,
+    0,
+    "discarding another surface's frames must not notify the store: every "
+      + "notification is a full RemoteApp re-render for a frame we throw away"
+  );
+});
+
+// The suppression above is a gate, not a deletion. If the flag does not actually
+// restore the trace, the diagnostics are gone for good and nobody debugging broker
+// routing would find that out until they needed them.
+test("verbose broker logging restores the discarded-frame trace", async () => {
+  installBrowserStubs();
+  globalThis.window.__agentRelayVerboseBrokerLogs = true;
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+
+  try {
+    await handleRemoteBrokerPayload({
+      kind: "encrypted_remote_action_result_chunk",
+      action_id: "action-for-another-surface",
+      action: "fetch_workspace_diff",
+      chunk_index: 0,
+      chunk_count: 12,
+      target_peer_id: "surface-other",
+      device_id: "device-1",
+      envelope: "envelope-that-must-not-be-opened",
+    });
+  } finally {
+    unsubscribe();
+    delete globalThis.window.__agentRelayVerboseBrokerLogs;
+  }
+
+  assert.equal(
+    notifications,
+    1,
+    "with the flag on, the routing trace must come back — otherwise the gate is a delete"
+  );
+});
+
+// A chunked reply is paced by the relay, so its wall time scales with the payload. The
+// action deadline was armed once when the request went out and never moved, which makes
+// a large-but-legitimate reply *deterministically* undeliverable: chunks are ~32KiB and
+// paced 250ms apart, so 61 of them take the full 15s budget on their own. A ~2MB
+// workspace diff reaches that, and the relay will happily produce a 4MB one.
+//
+// A chunk arriving is proof the relay is alive and working. The deadline should catch a
+// STALLED transfer, not put a ceiling on a healthy one.
+test("each chunk of a reply extends the action deadline", async () => {
+  const browser = installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  // Stand in for a dispatched action awaiting its reply.
+  let rejected = null;
+  const timers = [];
+  const realSetTimeout = globalThis.window.setTimeout;
+  globalThis.window.setTimeout = (callback, delay) => {
+    timers.push({ callback, delay });
+    return timers.length;
+  };
+  state.pendingActions.set("action-big", {
+    actionType: "fetch_workspace_diff",
+    timeoutId: 0,
+    reject: (error) => {
+      rejected = error;
+    },
+    resolve: () => {},
+  });
+
+  const armedBefore = timers.length;
+  await handleRemoteBrokerPayload({
+    kind: "remote_action_result_chunk",
+    action_id: "action-big",
+    action: "fetch_workspace_diff",
+    chunk_index: 0,
+    chunk_count: 61,
+    data: "payload",
+  });
+  globalThis.window.setTimeout = realSetTimeout;
+
+  assert.equal(rejected, null, "a chunk must not settle the action");
+  assert.ok(
+    timers.length > armedBefore,
+    "a chunk must re-arm the action deadline: without that, a reply the relay paces "
+      + "over more than 15s can never be delivered no matter how healthy the link is"
+  );
+  void browser;
+});
+
+// The earlier fix only stopped OTHER surfaces' frames from re-rendering the app. A
+// reply addressed to this surface still logged on the accepted path, and
+// `encrypted_remote_action_result_chunk` was never in the high-volume mute list — so a
+// 21-chunk workspace diff meant for this very tab still cost 21 full RemoteApp
+// re-renders here, plus another 21 from the inbound log in broker-client.
+test("this surface's own chunks do not each re-render the app", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  const { encryptJson } = await import("./crypto.js");
+  const envelopes = [];
+  for (let index = 0; index < 12; index += 1) {
+    envelopes.push(
+      await encryptJson("payload-secret-1", {
+        action_id: "action-mine",
+        action: "fetch_workspace_diff",
+        chunk_index: index,
+        chunk_count: 21,
+        data: "payload",
+      })
+    );
+  }
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+
+  try {
+    for (let index = 0; index < 12; index += 1) {
+      await handleRemoteBrokerPayload({
+        kind: "encrypted_remote_action_result_chunk",
+        action_id: "action-mine",
+        action: "fetch_workspace_diff",
+        chunk_index: index,
+        chunk_count: 21,
+        target_peer_id: "surface-mine",
+        device_id: "device-1",
+        envelope: envelopes[index],
+      });
+    }
+  } finally {
+    unsubscribe();
+  }
+
+  assert.equal(
+    notifications,
+    0,
+    "streaming a reply to this surface must not re-render the whole app once per chunk"
+  );
+});
+
+// Extending the deadline on every chunk, rather than on every chunk that advances the
+// transfer, hands a stalled action an unlimited lease: a peer that re-sends chunk 0
+// forever keeps the action alive and its partial buffer retained, and it never fails.
+// Only progress should count as proof of life.
+test("a repeated chunk does not renew the action deadline", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  const timers = [];
+  const realSetTimeout = globalThis.window.setTimeout;
+  globalThis.window.setTimeout = (callback, delay) => {
+    timers.push({ callback, delay });
+    return timers.length;
+  };
+  state.pendingActions.set("action-stalled", {
+    actionType: "fetch_workspace_diff",
+    timeoutId: 0,
+    reject: () => {},
+    resolve: () => {},
+  });
+
+  const sendChunkZero = () =>
+    handleRemoteBrokerPayload({
+      kind: "remote_action_result_chunk",
+      action_id: "action-stalled",
+      action: "fetch_workspace_diff",
+      chunk_index: 0,
+      chunk_count: 61,
+      data: "payload",
+    });
+
+  await sendChunkZero();
+  const afterFirst = timers.length;
+  await sendChunkZero();
+  await sendChunkZero();
+  globalThis.window.setTimeout = realSetTimeout;
+
+  assert.equal(
+    timers.length,
+    afterFirst,
+    "re-sending a chunk already held must not buy the action another full deadline"
+  );
+});
+
+// Snapshots for this surface still logged on three separate paths — inbound, accepted,
+// and decrypted — each one a `patchRemoteState`, i.e. a full RemoteApp re-render. A
+// snapshot can arrive every 500ms, so an active session was paying several whole-app
+// renders a second purely for tracing. Applying the snapshot legitimately notifies the
+// store; the tracing around it should not.
+test("this surface's own snapshots do not re-render the app just to be traced", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth, subscribeRemoteState } = await import("./state.js");
+  const { configureRemoteActions, handleRemoteBrokerPayload } = await import("./actions.js");
+  const { encryptJson } = await import("./crypto.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketPeerId: "surface-mine" });
+
+  // The snapshot is swallowed, so anything the store hears is tracing, not rendering.
+  configureRemoteActions({ onApplySessionSnapshot() {} });
+  const envelope = await encryptJson("payload-secret-1", {
+    active_thread_id: "thread-a",
+    current_status: "idle",
+    transcript: [],
+  });
+
+  let notifications = 0;
+  const unsubscribe = subscribeRemoteState(() => {
+    notifications += 1;
+  });
+  try {
+    await handleRemoteBrokerPayload({
+      kind: "encrypted_session_snapshot",
+      target_peer_id: "surface-mine",
+      device_id: "device-1",
+      envelope,
+    });
+  } finally {
+    unsubscribe();
+  }
+
+  assert.equal(
+    notifications,
+    0,
+    "tracing a snapshot must not re-render the whole app; at one snapshot per 500ms "
+      + "that is several full renders a second spent on diagnostics"
+  );
+});
+
+// When a reply is lost, the client must be able to ask again WITHOUT the relay running
+// the action a second time. The relay already supports exactly that: it caches a
+// completed result under `(device_id, action_id)` and replays it instead of
+// re-executing. But it can only do so if the client asks with the SAME action id — and
+// the client minted a fresh one every time, so a retry of a write that had already
+// succeeded would have sent the message, or applied the file change, twice.
+test("resending an unanswered action reuses its original action id", async () => {
+  installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { dispatchOrRecover, resendPendingActions } = await import("./actions.js");
+
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-1",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "private",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  state.pendingActionChunks.clear();
+
+  const sentActionIds = [];
+  state.socket = {
+    readyState: 1,
+    send(frameText) {
+      const frame = JSON.parse(frameText);
+      // Never answered: this models the reply that got dropped.
+      sentActionIds.push(frame.payload?.action_id);
+    },
+  };
+
+  // Not awaited: the point is that it never settles.
+  const pending = dispatchOrRecover("fetch_workspace_diff", {}).catch(() => {});
+  await nextTick();
+  assert.equal(sentActionIds.length, 1, "the action should have been sent once");
+
+  await resendPendingActions();
+  await nextTick();
+
+  assert.equal(sentActionIds.length, 2, "an unanswered action should be resent");
+  assert.equal(
+    sentActionIds[1],
+    sentActionIds[0],
+    "the resend must carry the ORIGINAL action id, so the relay replays its cached "
+      + "result instead of executing the action a second time"
+  );
+  void pending;
+});
+
+// While the relay is away we know exactly why a reply has not come, so letting the
+// deadline fire is worse than useless: the action reports failure, the user redoes it,
+// and the redo mints a NEW action id that misses the relay's replay cache — which is
+// how a write gets executed twice. The pending action instead waits for the relay to
+// come back, and is resent under its own id then.
+test("a relay leaving suspends action deadlines rather than failing them", async () => {
+  installBrowserStubs();
+
+  const { state } = await import("./state.js");
+  const { suspendPendingActionDeadlines } = await import("./actions.js");
+
+  state.pendingActions.clear();
+  const cleared = [];
+  const realClearTimeout = globalThis.window.clearTimeout;
+  globalThis.window.clearTimeout = (id) => {
+    cleared.push(id);
+  };
+
+  let rejected = false;
+  state.pendingActions.set("action-writing", {
+    actionType: "send_message",
+    request: { text: "hello" },
+    timeoutId: 4242,
+    reject: () => {
+      rejected = true;
+    },
+    resolve: () => {},
+  });
+
+  suspendPendingActionDeadlines();
+  globalThis.window.clearTimeout = realClearTimeout;
+
+  assert.equal(rejected, false, "a relay leaving must not fail the action");
+  assert.ok(
+    cleared.includes(4242),
+    "its deadline must be stood down while we know the relay is gone"
+  );
+  assert.ok(
+    state.pendingActions.has("action-writing"),
+    "and the action must be kept so it can be resent under the same id"
+  );
+});
+

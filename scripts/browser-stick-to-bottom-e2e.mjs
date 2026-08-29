@@ -30,6 +30,7 @@ import { writeFailureArtifacts } from "./e2e/harness/artifacts.mjs";
 import { attachPageDebugLogging, launchBrowser } from "./e2e/harness/browser.mjs";
 import { createFakeProviderScenarioHarness } from "./e2e/harness/fake-provider.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
+import { startLocalSession } from "./e2e/harness/local-session.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import {
   dumpProcessLogs,
@@ -39,6 +40,25 @@ import {
 
 const TIMEOUT_MS = 45000;
 const STREAM_PROMPT = "stream-live";
+// A turn that parks on an approval request before it streams. Scoped to this one
+// prompt via the scenario (not FAKE_PROVIDER_ENFORCE_APPROVALS), so the other
+// legs keep running approval-free.
+const APPROVAL_PROMPT = "approval-live";
+// A turn that parks on a real AskUserQuestion, with an assistant message emitted
+// AFTER the question's tool call so the question is NOT the last transcript
+// entry — the case where the pin has to do actual work.
+const ASK_USER_PROMPT = "ask-user-live";
+const ASK_USER_TRAILING = "Meanwhile, here is some context.";
+// The turn parks this long before it writes ANYTHING to the transcript (the
+// fake provider sleeps first and publishes the question, its trailing message
+// and the pending request together under one write lock). That makes the window
+// after the send genuinely empty of agent activity — so anything that renders
+// in it came from the send itself, which is what the "own message lands"
+// assertion below depends on.
+const ASK_USER_DELAY_MS = 4000;
+// Comfortably inside the park, so the assertion can never be satisfied by the
+// question arriving instead of by the send.
+const OWN_MESSAGE_VISIBLE_MS = 2500;
 // "Following, no gap": distance-to-bottom must stay under this the whole stream.
 // It is far below 60vh (~408px @ 680, ~444 @ 740, ~840 @ 1400), so it cleanly
 // separates real follow (~0) from either the old 60vh reserve or a frozen
@@ -111,6 +131,71 @@ async function realWheelUp(page, deltaPx) {
   await page.mouse.wheel(0, -deltaPx);
 }
 
+// Wait until the scroller stops moving: `stableReads` consecutive equal samples.
+// Used after an escape, because a wheel scrolls on the compositor and its DOM
+// event can be delivered a beat later — returning while one is still in flight
+// lets it move the reader in the middle of the caller's assertions.
+async function waitForScrollQuiet(page, { everyMs = 150, stableReads = 3, timeoutMs = 5000 } = {}) {
+  const startedAt = Date.now();
+  let previous = null;
+  let stable = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    const { scrollTop } = await page.evaluate(readMetricsInPage);
+    stable = previous !== null && scrollTop === previous ? stable + 1 : 0;
+    if (stable >= stableReads) return scrollTop;
+    previous = scrollTop;
+    await delay(everyMs);
+  }
+  return previous;
+}
+
+// Escape the bottom-follow with a real wheel-up, and do not return until the
+// escape has actually LANDED and the scroller has gone quiet.
+//
+// A scrollTop DELTA cannot be the signal, which is what this suite used to do
+// ("moved up by more than 40px"). While the follower is STUCK it re-pins on every
+// resize, and the virtualized transcript's scrollHeight churns by a couple of
+// hundred px a beat as rows measure and the composer resizes — so a stuck
+// follower's scrollTop legitimately wanders well past any movement threshold.
+// Traced against the live follower, the old check passed while the follower was
+// still stuck at the bottom and the wheel had not been delivered at all; the
+// wheel then landed a beat later and un-stuck it in the middle of the assertions
+// the escape was supposed to set up. A leg built on that precondition is not
+// testing what it says it tests, however it happens to come out.
+//
+// Distance-to-bottom is the honest signal: while stuck, the follower re-pins to
+// the bottom on every one of those resizes, so distance stays ~0 for exactly as
+// long as we have NOT escaped. It cannot be faked by churn.
+async function escapeBottomFollow(page, label, { deltaPx = 900, minDistance = ESCAPE_MIN_DISTANCE_PX } = {}) {
+  const startedAt = Date.now();
+  let landed = false;
+  for (let attempt = 0; attempt < 3 && !landed; attempt += 1) {
+    await realWheelUp(page, deltaPx);
+    landed = await page
+      .waitForFunction(
+        (min) => {
+          const t = document.querySelector(".chat-thread");
+          if (!t) return false;
+          return Math.max(0, t.scrollHeight - t.clientHeight - t.scrollTop) > min;
+        },
+        minDistance,
+        { timeout: 3000 }
+      )
+      .then(() => true)
+      .catch(() => false);
+  }
+  await waitForScrollQuiet(page);
+  const metrics = await page.evaluate(readMetricsInPage);
+  console.log(`[${label}] escape landed in ${Date.now() - startedAt}ms, distance ${metrics.distance}`);
+  assert.ok(
+    landed && metrics.distance > minDistance,
+    `${label}: a real wheel-up must ESCAPE the bottom-follow — distance-to-bottom must `
+    + `exceed ${minDistance}px (landed ${landed}, distance ${metrics.distance}). A stuck `
+    + `follower re-pins to the bottom, so this cannot be satisfied by layout churn.`
+  );
+  return metrics;
+}
+
 // A REAL, SLOW upward touch drag over the transcript, via CDP trusted input.
 // The finger moves DOWN in many small steps (2-4px each) -> content scrolls UP.
 // This is the case a per-move-delta escape heuristic misses (each step is below
@@ -155,6 +240,38 @@ async function sample(page, count, everyMs) {
 const maxOf = (samples, key) => Math.max(...samples.map((s) => s[key]));
 const minOf = (samples, key) => Math.min(...samples.map((s) => s[key]));
 
+// "The viewport is following the bottom."
+//
+// Deliberately NOT `max(distance) <= threshold`. The follower re-pins from a
+// ResizeObserver, which fires AFTER layout — so between the virtualizer growing
+// a row (rows re-measure by ~225px on this transcript) and the pin landing there
+// is a one-frame window where the distance really is a couple of hundred px. The
+// sampler runs as its own task and can land inside it, so a lone spike is the
+// probe catching a frame mid-flight, not a follow failure.
+//
+// It is also not something a reader can see: ResizeObserver callbacks are
+// delivered in the rendering steps AFTER layout but BEFORE paint, so the pin is
+// applied in the same frame that grew the content. `page.evaluate` is privileged
+// here in a way the human eye is not — which is exactly why the assertion has to
+// be about SUSTAINED distance rather than any single observation.
+//
+// The regressions this leg exists to catch differ in KIND, not degree: the old
+// 60vh reserve and a frozen off-the-bottom viewport both hold the gap open for
+// every sample. So require the excursions to be isolated — never two in a row,
+// and never more than one across the run.
+function assertFollowsBottom(samples, message) {
+  const distances = samples.map((s) => s.distance);
+  const over = distances.filter((d) => d > FOLLOW_MAX_DISTANCE_PX).length;
+  const sustained = distances.some(
+    (d, index) => index > 0 && d > FOLLOW_MAX_DISTANCE_PX && distances[index - 1] > FOLLOW_MAX_DISTANCE_PX
+  );
+  assert.ok(
+    !sustained && over <= 1,
+    `${message} (distances: ${distances.join(", ")}; `
+    + `${over} over ${FOLLOW_MAX_DISTANCE_PX}px, consecutive: ${sustained})`
+  );
+}
+
 async function turnInFlight(page) {
   return page.evaluate(() => {
     const stop = document.querySelector(".stop-button");
@@ -167,6 +284,22 @@ async function waitTurnSettled(page) {
     () => {
       const stop = document.querySelector(".stop-button");
       return !stop || stop.hasAttribute("hidden") || stop.offsetParent === null;
+    },
+    null,
+    { timeout: TIMEOUT_MS }
+  );
+}
+
+// The stop button briefly hides during the approval -> streaming handover, so a
+// DOM-based settle can return while a turn is still in flight — and the next
+// send then QUEUES behind it, landing seconds later. Ask the relay instead.
+async function waitTurnFullySettled(page) {
+  await page.waitForFunction(
+    async () => {
+      const payload = await fetch("/api/session", { credentials: "same-origin" })
+        .then((response) => response.json())
+        .catch(() => null);
+      return Boolean(payload?.data) && !payload.data.active_turn_id;
     },
     null,
     { timeout: TIMEOUT_MS }
@@ -224,10 +357,9 @@ async function exercise(page, label) {
     phaseA.at(-1).streamTextLen - phaseA[0].streamTextLen > 80,
     `${label} A: stream should be growing (${phaseA[0].streamTextLen} -> ${phaseA.at(-1).streamTextLen})`
   );
-  assert.ok(
-    maxDistA <= FOLLOW_MAX_DISTANCE_PX,
-    `${label} A: after send the viewport must FOLLOW the bottom — no 60vh gap, no `
-    + `freeze (distances: ${phaseA.map((s) => s.distance).join(", ")})`
+  assertFollowsBottom(
+    phaseA,
+    `${label} A: after send the viewport must FOLLOW the bottom — no 60vh gap, no freeze`
   );
   assert.ok(
     phaseA.at(-1).scrollTop >= phaseA[0].scrollTop,
@@ -236,25 +368,7 @@ async function exercise(page, label) {
   );
 
   // ---- Phase B: a REAL upward wheel mid-stream escapes the follow at once.
-  // Retry the wheel: after a virtualized reload the first synthetic wheel can be
-  // dropped by Chromium before it registers a scroll (a Playwright input quirk,
-  // not the follower). We re-read the baseline each attempt so stream growth
-  // while following doesn't confuse the "moved up" check.
-  let beforeWheelTop = 0;
-  let afterWheelTop = 0;
-  let wheelEscaped = false;
-  for (let attempt = 0; attempt < 3 && !wheelEscaped; attempt += 1) {
-    beforeWheelTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    await realWheelUp(page, 800);
-    await delay(400); // let the async scroll settle before sampling
-    afterWheelTop = (await page.evaluate(readMetricsInPage)).scrollTop;
-    wheelEscaped = afterWheelTop < beforeWheelTop - 40;
-  }
-  assert.ok(
-    wheelEscaped,
-    `${label} B: a real wheel-up must move the viewport UP (before ${beforeWheelTop}, `
-    + `after ${afterWheelTop}); the stream must not snap it back to the bottom`
-  );
+  await escapeBottomFollow(page, `${label} B`, { deltaPx: 800 });
   // Confirm we escaped MID-stream (not at turn end). The text-growth probe can't
   // be used here: escaped far up a virtualized list, the streaming row is
   // rendered OUT of the DOM, so its growth is invisible from the reader's
@@ -277,10 +391,9 @@ async function exercise(page, label) {
   const phaseC = await sample(page, 8, 150);
   const maxDistC = maxOf(phaseC, "distance");
   console.log(`[${label}] C distances: ${phaseC.map((s) => s.distance).join(", ")}; maxDist ${maxDistC}`);
-  assert.ok(
-    maxDistC <= FOLLOW_MAX_DISTANCE_PX,
-    `${label} C: scroll-to-latest must re-lock and follow the bottom `
-    + `(distances: ${phaseC.map((s) => s.distance).join(", ")})`
+  assertFollowsBottom(
+    phaseC,
+    `${label} C: scroll-to-latest must re-lock and follow the bottom`
   );
 
   // ---- Phase D: let the turn end -> we are at the true bottom.
@@ -295,6 +408,254 @@ async function exercise(page, label) {
   return { final };
 }
 
+// When the agent blocks on the reader, the request must be ON SCREEN — and then
+// the reader must still be free to leave it.
+//
+// The approval card is pushed LAST in the transcript but is not a transcript
+// entry (no item_id, never in the hydration window), so before
+// `decideTranscriptScrollAction` learned about pending requests, nothing brought
+// it into view: the session looked hung with the approval below the fold. The
+// fix emits a fire-once `input-required` action.
+//
+// The leg drives the ordering that actually reproduces the bug: send, let the
+// send's own jump-bottom settle, scroll UP, and only THEN let the request arrive
+// (the scenario delays it). Without the trigger the reader stays parked in
+// history and never sees it.
+//
+// Then the converse, which matters just as much: firing on EVERY render rather
+// than once per request_id would make it impossible to scroll up and re-read the
+// command you are being asked to approve — the exact class of regression this
+// whole architecture exists to prevent.
+//
+// Runs against the virtualized thread on purpose: the card is the last virtual
+// row and `estimateTranscriptRowSize` guesses 140/180px for a card that is much
+// taller, so a bottom computed from `getTotalSize()` lands short until the row
+// is measured.
+async function exerciseApprovalVisibility(page, label) {
+  await waitTurnFullySettled(page);
+  await page.evaluate(scrollToBottomInPage);
+  await delay(200);
+
+  await page.fill("#message-input", APPROVAL_PROMPT);
+  await page.click("#send-button");
+  // Wait for the SEND to land and settle first: that fires jump-bottom and leaves
+  // the follower stuck at the bottom. Only then escape upward. The scenario holds
+  // the approval back (`approval_delay_ms`) so this ordering is deterministic —
+  // otherwise the request arrives in the same beat as the user message and the
+  // send's own jump-bottom would satisfy the assertion below on its own.
+  await page.waitForFunction(
+    (text) =>
+      [...document.querySelectorAll(".chat-thread .chat-message-user")].some((node) =>
+        (node.textContent || "").includes(text)
+      ),
+    APPROVAL_PROMPT,
+    { timeout: TIMEOUT_MS }
+  );
+  await delay(300);
+
+  // Precondition: genuinely OFF the bottom-follow before the request arrives.
+  // This has to be the real thing, not a scrollTop wobble — the whole point of
+  // the leg is that the request reaches a reader who had left the bottom.
+  await escapeBottomFollow(page, `${label} pre`);
+  assert.ok(
+    !(await page.$("[data-approval-id]")),
+    `${label}: precondition — the approval must not have arrived yet`
+  );
+
+  await page.waitForSelector("[data-approval-id]", { timeout: TIMEOUT_MS });
+  await delay(700); // let the card measure + the follow settle on its real height
+
+  const placement = await page.evaluate(() => {
+    const card = document.querySelector("[data-approval-id]");
+    const scroller = document.querySelector(".chat-thread");
+    if (!card || !scroller) return null;
+    const c = card.getBoundingClientRect();
+    const s = scroller.getBoundingClientRect();
+    return {
+      cardTop: Math.round(c.top),
+      cardBottom: Math.round(c.bottom),
+      viewTop: Math.round(s.top),
+      viewBottom: Math.round(s.bottom),
+      distance: Math.round(
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
+      ),
+    };
+  });
+  assert.ok(placement, `${label}: approval card and scroller must both exist`);
+  console.log(`[${label}] approval placement ${JSON.stringify(placement)}`);
+  // Geometry, never DOM child index: past the virtualization threshold rows are
+  // absolutely positioned, so DOM order and visual order are different things.
+  assert.ok(
+    placement.cardTop < placement.viewBottom && placement.cardBottom > placement.viewTop,
+    `${label}: the approval card must be within the transcript viewport `
+    + `(card ${placement.cardTop}-${placement.cardBottom}, view ${placement.viewTop}-${placement.viewBottom})`
+  );
+  assert.ok(
+    placement.distance <= FOLLOW_MAX_DISTANCE_PX,
+    `${label}: an arriving approval must bring the transcript to the bottom `
+    + `(distance ${placement.distance})`
+  );
+
+  // The reader escapes upward while the SAME approval stays pending. The relay
+  // keeps notifying throughout, so this samples many renders — every one of them
+  // a chance for a mis-scoped trigger to yank the reader back down.
+  await escapeBottomFollow(page, `${label} post`, { deltaPx: 800 });
+  const samples = await sample(page, 10, 200);
+  const minDist = minOf(samples, "distance");
+  console.log(`[${label}] escaped distances: ${samples.map((s) => s.distance).join(", ")}; min ${minDist}`);
+  assert.ok(
+    minDist > ESCAPE_MIN_DISTANCE_PX,
+    `${label}: input-required must fire ONCE per request — a pending approval must `
+    + `not re-yank a reader who scrolled up (distances: ${samples.map((s) => s.distance).join(", ")})`
+  );
+
+  // Release the turn so the leg leaves the thread idle for cleanup.
+  await page.evaluate(() => {
+    document.querySelector('[data-approval-decision="approve"]')?.click();
+  });
+  await waitTurnSettled(page);
+  return "pass";
+}
+
+// An UNANSWERED question must be the last thing in the transcript, exactly once,
+// and must drop back into place once answered.
+//
+// The scenario emits an assistant message AFTER the question's tool call, so the
+// question's natural position is NOT the bottom — a real shape, because a turn
+// can issue AskUserQuestion alongside other tool uses. Without the pin the
+// question renders buried above that message; with it, it is moved (not copied)
+// to the bottom while pending, and returns to its original position on answer.
+//
+// Scroll coverage here is deliberately the SECOND half only — the reader escapes
+// AFTER the question lands, and must then be left alone (fire-once). The first
+// half ("escaped reader, request arrives, gets brought into view") is covered by
+// the approval leg above, which exercises the very same `input-required` action;
+// duplicating it here would only re-test shared code.
+//
+// The parked window is also where this leg guards a fixed bug: with the turn
+// held back by `ask_user_delay_ms`, the browser used to render NOTHING between
+// the send and the next transcript change — including the user's own message.
+// The relay builds the `/api/session/message` response snapshot BEFORE it
+// appends the user message, so that response reliably resolved a few ms after
+// the SSE frame that carried the message and reverted the render. Fixed by
+// `transcriptIsPreWrite` in frontend/local/session/lifecycle.js (unit-covered in
+// frontend/local/session/send-snapshot-clobber.test.mjs); this is the end-to-end
+// half, and the only layer that would catch the relay ceasing to push the
+// post-append snapshot at all.
+async function exerciseAskUserPin(page, label) {
+  await waitTurnFullySettled(page);
+  await page.evaluate(scrollToBottomInPage);
+  await delay(200);
+
+  await page.fill("#message-input", ASK_USER_PROMPT);
+  await page.click("#send-button");
+
+  // Nothing agent-side can write to the transcript for ASK_USER_DELAY_MS, so
+  // this can only pass because the send itself rendered.
+  await page.waitForFunction(
+    (text) =>
+      [...document.querySelectorAll(".chat-thread .chat-message-user")].some((node) =>
+        (node.textContent || "").includes(text)
+      ),
+    ASK_USER_PROMPT,
+    { timeout: OWN_MESSAGE_VISIBLE_MS }
+  );
+  console.log(`[${label}] own message rendered while the turn was still parked`);
+  // The question and its trailing message become visible together (the relay
+  // publishes both under one write lock), so either selector implies both.
+  await page.waitForSelector(".chat-message-ask-user-interactive", { timeout: TIMEOUT_MS });
+  await page.waitForFunction(
+    (needle) => (document.querySelector(".chat-thread")?.textContent || "").includes(needle),
+    ASK_USER_TRAILING,
+    { timeout: TIMEOUT_MS }
+  );
+  await delay(700);
+
+  const pinned = await page.evaluate((needle) => {
+    const scroller = document.querySelector(".chat-thread");
+    const card = document.querySelector(".chat-message-ask-user");
+    const trailing = [...document.querySelectorAll(".chat-thread .chat-message")].find((node) =>
+      (node.textContent || "").includes(needle)
+    );
+    if (!scroller || !card || !trailing) return null;
+    const c = card.getBoundingClientRect();
+    const t = trailing.getBoundingClientRect();
+    const s = scroller.getBoundingClientRect();
+    return {
+      cards: document.querySelectorAll(".chat-message-ask-user").length,
+      cardTop: Math.round(c.top),
+      cardBottom: Math.round(c.bottom),
+      trailingTop: Math.round(t.top),
+      viewTop: Math.round(s.top),
+      viewBottom: Math.round(s.bottom),
+      distance: Math.round(
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
+      ),
+    };
+  }, ASK_USER_TRAILING);
+  assert.ok(pinned, `${label}: question card, trailing message and scroller must all exist`);
+  console.log(`[${label}] pinned ${JSON.stringify(pinned)}`);
+
+  // MOVED, not copied: two live question dialogs must never be on screen.
+  assert.equal(pinned.cards, 1, `${label}: the question must render exactly once`);
+  // Geometry, never DOM index — above the virtualization threshold rows are
+  // absolutely positioned, so DOM order and visual order are different things.
+  assert.ok(
+    pinned.cardTop > pinned.trailingTop,
+    `${label}: an unanswered question must be pinned BELOW the message that follows `
+    + `its tool call (card ${pinned.cardTop}, trailing ${pinned.trailingTop})`
+  );
+  assert.ok(
+    pinned.cardTop < pinned.viewBottom && pinned.cardBottom > pinned.viewTop,
+    `${label}: the pinned question must be within the viewport `
+    + `(card ${pinned.cardTop}-${pinned.cardBottom}, view ${pinned.viewTop}-${pinned.viewBottom})`
+  );
+
+  // The reader may still leave, and must be left alone while it stays pending.
+  await escapeBottomFollow(page, `${label} post`, { deltaPx: 800 });
+  const samples = await sample(page, 8, 200);
+  const minDist = minOf(samples, "distance");
+  console.log(`[${label}] escaped distances: ${samples.map((s) => s.distance).join(", ")}; min ${minDist}`);
+  assert.ok(
+    minDist > ESCAPE_MIN_DISTANCE_PX,
+    `${label}: a pending question must fire once, not re-yank the reader `
+    + `(distances: ${samples.map((s) => s.distance).join(", ")})`
+  );
+
+  // Answer it (single-select quick path: one option click submits).
+  await page.click(".chat-message-ask-user-interactive .ask-user-option-button");
+  await page.waitForFunction(
+    () => !document.querySelector(".chat-message-ask-user-interactive"),
+    null,
+    { timeout: TIMEOUT_MS }
+  );
+  await waitTurnSettled(page);
+  await page.evaluate(scrollToBottomInPage);
+  await delay(600);
+
+  const unpinned = await page.evaluate((needle) => {
+    const card = document.querySelector(".chat-message-ask-user");
+    const trailing = [...document.querySelectorAll(".chat-thread .chat-message")].find((node) =>
+      (node.textContent || "").includes(needle)
+    );
+    if (!card || !trailing) return null;
+    return {
+      cards: document.querySelectorAll(".chat-message-ask-user").length,
+      cardTop: Math.round(card.getBoundingClientRect().top),
+      trailingTop: Math.round(trailing.getBoundingClientRect().top),
+    };
+  }, ASK_USER_TRAILING);
+  assert.ok(unpinned, `${label}: the answered question must still be in the transcript`);
+  console.log(`[${label}] unpinned ${JSON.stringify(unpinned)}`);
+  assert.equal(unpinned.cards, 1, `${label}: still exactly one question card after answering`);
+  assert.ok(
+    unpinned.cardTop < unpinned.trailingTop,
+    `${label}: an answered question returns to its ORIGINAL position, above the `
+    + `message that followed it (card ${unpinned.cardTop}, trailing ${unpinned.trailingTop})`
+  );
+  return "pass";
+}
+
 // A SLOW touch drag (real trusted touch input, many 3px moves) must escape the
 // follow — the regression a per-move-delta heuristic missed. Runs on the phone
 // leg where touch is the primary input.
@@ -305,10 +666,7 @@ async function exerciseTouchEscape(page, label) {
     await delay(200);
     await sendStreamPrompt(page);
     const before = await sample(page, 4, 150);
-    assert.ok(
-      maxOf(before, "distance") <= FOLLOW_MAX_DISTANCE_PX,
-      `${label} touch: must be following before the drag (distances: ${before.map((s) => s.distance).join(", ")})`
-    );
+    assertFollowsBottom(before, `${label} touch: must be following before the drag`);
     assert.ok(await turnInFlight(page), `${label} touch: turn must still be streaming`);
 
     const x = Math.round(await page.evaluate(() => window.innerWidth / 2));
@@ -344,10 +702,7 @@ async function exerciseTouchEscape(page, label) {
 
     await clickScrollToLatest(page);
     const rejoined = await sample(page, 4, 150);
-    assert.ok(
-      maxOf(rejoined, "distance") <= FOLLOW_MAX_DISTANCE_PX,
-      `${label} touch: scroll-to-latest must re-lock (distances: ${rejoined.map((s) => s.distance).join(", ")})`
-    );
+    assertFollowsBottom(rejoined, `${label} touch: scroll-to-latest must re-lock`);
     await waitTurnSettled(page);
   } finally {
     await client.detach().catch(() => {});
@@ -359,16 +714,12 @@ async function exerciseTouchEscape(page, label) {
 // top. Regression shape: the empty render records no scroll snapshot, or the
 // follower's listener attaches too late to hear the jump-bottom broadcast.
 async function exerciseEmptyFirstSend(page, label, workspaceDir) {
-  await page.click("#open-start-session-dialog");
-  await page.waitForFunction(
-    () => document.querySelector("#launch-start-session-dialog")?.open,
-    null,
-    { timeout: TIMEOUT_MS }
-  );
-  await page.fill("#cwd-input", workspaceDir);
-  await page.selectOption("#provider-input", "fake");
-  await page.selectOption("#approval-policy-input", "never");
-  await page.click("#start-session-button");
+  await startLocalSession(page, {
+    cwd: workspaceDir,
+    provider: "fake",
+    approvalPolicy: "never",
+    timeoutMs: TIMEOUT_MS,
+  });
   await page.waitForFunction(
     () => (document.querySelector("#transcript")?.textContent || "").includes("Session ready"),
     null,
@@ -384,10 +735,9 @@ async function exerciseEmptyFirstSend(page, label, workspaceDir) {
     samples.at(-1).streamTextLen - samples[0].streamTextLen > 80,
     `${label}: stream should be growing`
   );
-  assert.ok(
-    maxDist <= FOLLOW_MAX_DISTANCE_PX,
-    `${label}: the FIRST send must land at the bottom and FOLLOW the stream `
-    + `(distances: ${samples.map((s) => s.distance).join(", ")})`
+  assertFollowsBottom(
+    samples,
+    `${label}: the FIRST send must land at the bottom and FOLLOW the stream`
   );
 
   await waitTurnSettled(page);
@@ -421,6 +771,24 @@ async function main() {
       [STREAM_PROMPT]: {
         chunks: STREAM_CHUNKS,
         chunk_delay_ms: 280,
+      },
+      [ASK_USER_PROMPT]: {
+        chunks: STREAM_CHUNKS,
+        chunk_delay_ms: 280,
+        ask_user: true,
+        ask_user_trailing_text: ASK_USER_TRAILING,
+        // Holds the whole turn back so the leg can assert the user's own
+        // message renders on the strength of the send alone. See
+        // ASK_USER_DELAY_MS.
+        ask_user_delay_ms: ASK_USER_DELAY_MS,
+      },
+      [APPROVAL_PROMPT]: {
+        chunks: STREAM_CHUNKS,
+        chunk_delay_ms: 280,
+        require_approval: true,
+        // Long enough for the leg to observe the send settle and then scroll up
+        // before the request appears — the ordering the assertion depends on.
+        approval_delay_ms: 3500,
       },
     },
   });
@@ -502,6 +870,11 @@ async function main() {
       { timeout: TIMEOUT_MS }
     );
     results.desktopVirtualized = await exercise(desktop, "desktop-virtualized");
+    results.approvalVisibility = await exerciseApprovalVisibility(
+      desktop,
+      "desktop-virtualized-approval"
+    );
+    results.askUserPin = await exerciseAskUserPin(desktop, "desktop-virtualized-ask-user");
     await desktop.close();
     desktop = null;
 

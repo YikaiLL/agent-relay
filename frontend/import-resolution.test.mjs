@@ -24,6 +24,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const REPO = path.dirname(ROOT);
+
+// `scripts/` too: the e2e harness imports frontend modules by relative path, and a
+// stale one there costs a browser suite twenty minutes in instead of a millisecond.
+const SCAN_ROOTS = [ROOT, path.join(REPO, "scripts")];
 
 function sourceFiles(dir) {
   const out = [];
@@ -32,7 +37,7 @@ function sourceFiles(dir) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...sourceFiles(full));
-    } else if (entry.name.endsWith(".js")) {
+    } else if (entry.name.endsWith(".js") || entry.name.endsWith(".mjs")) {
       out.push(full);
     }
   }
@@ -44,10 +49,16 @@ function sourceFiles(dir) {
 // string literal, so every real import looked like it had been stripped away and the
 // scan silently covered nothing. It reported a clean pass over a tree containing the
 // very defect it was written for.
+// The `[^:\\]` guard covers two lookalikes that are not comments: the `//` in a URL
+// (`https://`), and the one at the tail of a regex literal like `/^refs\/heads\//`.
+// The second is the nastier of the two — swallowing it takes the rest of the line,
+// including any unclosed backtick, and `stripped()` then eats everything up to the
+// next backtick in the file. That is silent blindness, not a visible failure: the
+// scan keeps passing while covering none of the exports it just deleted.
 function withoutComments(source) {
   return source
     .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+    .replace(/(^|[^:\\])\/\/[^\n]*/g, "$1");
 }
 
 // Comments AND strings, for reading exports — there no string literal carries meaning.
@@ -98,10 +109,34 @@ function exportedNames(source) {
   return { names, opaque };
 }
 
-const FILES = sourceFiles(ROOT);
+const FILES = SCAN_ROOTS.flatMap((dir) => sourceFiles(dir));
 
-test("the frontend has sources to scan at all", () => {
+test("the frontend and scripts trees have sources to scan at all", () => {
   assert.ok(FILES.length > 50, `expected a real tree, found ${FILES.length} files`);
+  // Per root, not just in total: a mistyped root would still clear the bar above
+  // on the strength of the other one, and cover nothing.
+  for (const dir of SCAN_ROOTS) {
+    assert.ok(
+      sourceFiles(dir).length > 10,
+      `expected sources under ${path.relative(REPO, dir)}, found ${sourceFiles(dir).length}`
+    );
+  }
+});
+
+// Guards the guard: a regex literal ending in `\//` used to be read as a comment,
+// which took the closing backtick with it and blanked the rest of the file.
+test("a regex literal is not mistaken for a comment", () => {
+  const source = [
+    'const label = `vs ${ref.replace(/^refs\\/heads\\//, "")}`;',
+    "export function StillVisible() {}",
+  ].join("\n");
+
+  const { names } = exportedNames(source);
+
+  assert.ok(names.has("StillVisible"), "the export after a regex literal must survive");
+  assert.match(withoutComments("const re = /a\\/\\//;"), /\/a\\\/\\\/\//);
+  // The URL case the guard was originally written for still strips.
+  assert.equal(withoutComments("const a = 1; // https://example.com").trim(), "const a = 1;");
 });
 
 test("every named import resolves to a real export", () => {
@@ -115,19 +150,19 @@ test("every named import resolves to a real export", () => {
 
       const target = path.resolve(path.dirname(file), spec.from);
       if (!fs.existsSync(target)) {
-        broken.push(`${path.relative(ROOT, file)} imports from "${spec.from}", which does not exist`);
+        broken.push(`${path.relative(REPO, file)} imports from "${spec.from}", which does not exist`);
         continue;
       }
 
       const { names, opaque } = exportedNames(fs.readFileSync(target, "utf8"));
       if (opaque) {
-        unverifiable.push(`${path.relative(ROOT, target)} uses \`export *\``);
+        unverifiable.push(`${path.relative(REPO, target)} uses \`export *\``);
         continue;
       }
       for (const name of spec.names) {
         if (!names.has(name)) {
           broken.push(
-            `${path.relative(ROOT, file)} imports { ${name} } from "${spec.from}", `
+            `${path.relative(REPO, file)} imports { ${name} } from "${spec.from}", `
               + "which does not export it"
           );
         }

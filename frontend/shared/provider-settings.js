@@ -1,9 +1,13 @@
 import { providerLabel } from "./provider-labels.js";
 
-const DEFAULT_PROVIDERS = ["codex", "claude_code"];
+const DEFAULT_PROVIDERS = ["codex", "claude_code", "cursor"];
 const DEFAULT_MODELS = {
   claude_code: "claude-sonnet-4-6",
   codex: "gpt-5.5",
+  // Cursor's own "Auto" entry. Its model ids are opaque and carry their
+  // settings inline (`gpt-5.5[context=272k,reasoning=medium]`), so there is no
+  // bare name to hardcode here.
+  cursor: "default[]",
 };
 
 // Permission mode options are kept symmetric across providers so the UI
@@ -53,6 +57,29 @@ const PROVIDER_SETTINGS = {
     modelLabel: "Codex model",
     sandboxLabel: "File access",
   },
+  // Cursor runs over ACP, which has session *modes* (agent / plan / ask) rather
+  // than a filesystem sandbox — so the copy promises containment at the tool
+  // level and never implies OS isolation.
+  cursor: {
+    approvalLabel: "Permission mode",
+    approvalOptions: [
+      { label: "Ask first", value: "untrusted", description: "Every tool call needs your OK.", tone: "safe" },
+      { label: "Ask when needed", value: "on-request", description: "Cursor only asks for actions outside its allowlist.", tone: "neutral" },
+      { label: "Auto-approve", value: "never", description: "Approvals are answered for you, one call at a time.", tone: "elevated" },
+      { label: "Full access (YOLO)", value: "bypass", description: "No prompts for anything. Use only on tasks you can throw away.", tone: "danger" },
+    ],
+    effortLabel: "Reasoning effort",
+    effortLabels: {
+      high: "High",
+      low: "Low",
+      max: "Max",
+      medium: "Medium",
+      minimal: "Minimal",
+      xhigh: "Extra high",
+    },
+    modelLabel: "Cursor model",
+    sandboxLabel: "File access",
+  },
 };
 
 const DEFAULT_SETTINGS = {
@@ -64,7 +91,16 @@ const DEFAULT_SETTINGS = {
     { label: "Full access (YOLO)", value: "bypass", description: "No prompts for anything. Use only on tasks you can throw away.", tone: "danger" },
   ],
   effortLabel: "Effort",
-  effortLabels: {},
+  // Not empty: an unmapped effort renders its raw wire value, so a new provider
+  // would show `xhigh` in the UI until someone noticed.
+  effortLabels: {
+    high: "High",
+    low: "Low",
+    max: "Max",
+    medium: "Medium",
+    minimal: "Minimal",
+    xhigh: "Extra high",
+  },
   modelLabel: "Model",
   sandboxLabel: "File access",
 };
@@ -86,8 +122,60 @@ export function normalizeProviderList(providers = []) {
   return unique.length ? unique : [...DEFAULT_PROVIDERS];
 }
 
+// The models to offer for `provider`: its own fetched catalog, else the session
+// snapshot's `available_models` — but ONLY when the snapshot is that provider's.
+//
+// `available_models` belongs to the ACTIVE session's provider, so using it as a
+// blanket fallback served one provider's catalog under another's name. With a
+// Claude session live, picking Cursor in the launch dialog listed Claude's
+// models ("Default (recommended, Opus 5)"), and the model actually submitted was
+// a Claude id the ACP bridge then had to refuse. It also defeated the fetch that
+// would have fixed it: the fork dialog's `ensureForkProviderModels` skips the
+// request when this returns anything, so a borrowed list meant the real catalog
+// was never loaded.
+//
+// Empty is the honest answer for "not harvested yet" — ACP publishes its models
+// only on `session/new`, so a first-ever Cursor launch genuinely has none, and
+// the dialog's own empty/loading copy says so.
+export function scopedProviderModels(
+  provider,
+  providerModels = {},
+  fallbackProvider = "",
+  fallbackModels = []
+) {
+  const normalized = normalizeProvider(provider);
+  const own = providerModels?.[normalized];
+  if (own?.length) {
+    return own;
+  }
+  // Compared normalized on both sides so `""`/undefined can't alias onto the
+  // provider being asked about.
+  if (!fallbackProvider || normalizeProvider(fallbackProvider) !== normalized) {
+    return [];
+  }
+  return fallbackModels || [];
+}
+
 export function defaultModelForProvider(provider) {
-  return DEFAULT_MODELS[normalizeProvider(provider)] || DEFAULT_MODELS.codex;
+  // No cross-provider fallback: handing an unknown provider Codex's `gpt-5.5`
+  // sends one provider's model id to another, and the relay then records it as
+  // the thread's model. Empty means "let the provider pick its own default",
+  // which every bridge already handles.
+  return DEFAULT_MODELS[normalizeProvider(provider)] || "";
+}
+
+// Only Codex enforces a filesystem boundary at the OS level. Claude has no
+// sandbox at all, and Cursor runs over ACP, which has session *modes*
+// (agent/plan/ask) rather than isolation — the bridge maps every non-read-only
+// sandbox onto the same `agent` mode, so showing "Workspace write" vs
+// "Full access" would promise a boundary nothing enforces.
+//
+// `fake` is included because it has no filesystem to escape, and the e2e
+// scenarios drive the control.
+const FILESYSTEM_SANDBOX_PROVIDERS = new Set(["codex", "fake"]);
+
+export function providerHasFilesystemSandbox(provider) {
+  return FILESYSTEM_SANDBOX_PROVIDERS.has(normalizeProvider(provider));
 }
 
 export function providerSettings(provider) {

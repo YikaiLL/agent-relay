@@ -103,10 +103,33 @@ export function applyDeltaToViewOnlyPin(pin, event) {
     index >= 0
       ? resolveViewOnlyDeltaAppend(pin.entries[index].text ?? "", deltaText, event.text_offset)
       : (startsAtZero ? deltaText : null);
-  if (delta == null || delta === "") {
-    // Gap, divergence, or pure duplicate: leave the pin alone so its next authoritative
-    // refresh repairs it.
+  if (delta === "") {
+    // Pure re-delivery of text we already hold. The stream replays routinely
+    // after a snapshot, so treating this as damage would refetch constantly.
     return pin;
+  }
+  if (delta == null) {
+    // A gap (earlier text missing) or a divergence (same range, different
+    // bytes). Splicing either would corrupt the body, so refusing is right --
+    // but refusing SILENTLY left the hole for whatever refreshed next, and the
+    // thing that used to refresh next was a 300ms poll. Say so instead, exactly
+    // as the conversation does (transcript-hydration-store.js:829-835):
+    // downgrade the body so it is not treated as authoritative, and raise a
+    // flag the refresh decision can act on in this frame rather than at the end
+    // of the turn.
+    if (index < 0) {
+      // We hold nothing for this item and the chunk does not start at 0, so its
+      // opening text never arrived. Nothing to downgrade; the pin still needs a
+      // page before it can render this entry at all.
+      return { ...pin, tailGap: true };
+    }
+    return {
+      ...pin,
+      tailGap: true,
+      entries: pin.entries.map((entry, position) =>
+        position === index ? { ...entry, content_state: "preview" } : entry
+      ),
+    };
   }
   const entries =
     index >= 0
@@ -157,6 +180,7 @@ export function buildViewOnlyPin({
   workflowLocked = false,
   reviewSig = null,
   cwd = null,
+  threadWorkspaceCwd = null,
   provider = null,
   settings = null,
   settingsWritable = false,
@@ -189,6 +213,7 @@ export function buildViewOnlyPin({
     // rather than the live thread's. The summary carries no model/effort/policy,
     // so the projection blanks those (blank/unknown beats impersonating live).
     cwd,
+    threadWorkspaceCwd,
     provider,
     settings,
     settingsWritable,
@@ -326,46 +351,86 @@ export function mergeRefreshedViewOnlyPage(pin, page) {
   }
 
   const freshEntries = Array.isArray(page?.entries) ? page.entries : [];
-  const fallback = {
-    entries: freshEntries,
-    historyExtended: false,
-    olderCursor: page?.prev_cursor ?? null,
-  };
-  if (
-    !pin?.historyExtended
-    || !page
-    || freshEntries.length === 0
-  ) {
-    return fallback;
+  const priorEntries = Array.isArray(pin?.entries) ? pin.entries : [];
+  const historyExtended = Boolean(pin?.historyExtended);
+
+  // Nothing authoritative arrived. Keeping the pin is the only safe move: this
+  // used to return the empty page and wipe the conversation.
+  if (!page || freshEntries.length === 0) {
+    return {
+      entries: priorEntries,
+      historyExtended,
+      olderCursor: pin?.olderCursor ?? page?.prev_cursor ?? null,
+    };
+  }
+  if (priorEntries.length === 0) {
+    // Nothing retained, so no history is being held open any more.
+    return { entries: freshEntries, historyExtended: false, olderCursor: page.prev_cursor ?? null };
   }
 
-  const priorEntries = Array.isArray(pin.entries) ? pin.entries : [];
-  const priorIndexById = new Map();
+  // Split what the pin holds around the window this page covers. The page is
+  // authoritative INSIDE its window and says nothing outside it, so entries the
+  // delta stream appended after the page was built are still ours to keep.
+  const freshIds = new Set(freshEntries.map((entry) => entry?.item_id).filter(Boolean));
+  let firstOverlap = -1;
+  let lastOverlap = -1;
   priorEntries.forEach((entry, index) => {
-    if (entry?.item_id) {
-      priorIndexById.set(entry.item_id, index);
+    if (entry?.item_id && freshIds.has(entry.item_id)) {
+      if (firstOverlap === -1) firstOverlap = index;
+      lastOverlap = index;
     }
   });
-  const firstOverlap = freshEntries.find((entry) =>
-    Boolean(entry?.item_id && priorIndexById.has(entry.item_id))
-  );
-  if (!firstOverlap) {
-    // The tail advanced beyond every retained entry (or the provider rewrote
-    // item ids). We cannot prove contiguity, so fall back to the authoritative
-    // tail and let the top loader rebuild history from its cursor.
-    return fallback;
+
+  let prefix;
+  let tail;
+  if (lastOverlap === -1) {
+    // No shared entry, so item ids cannot localize the page. `entry_seq` is
+    // monotonic per thread, so use it to say which side of the window the pin's
+    // entries fall on; without it, decline to guess and take the page alone.
+    const freshMaxSeq = maxEntrySeq(freshEntries);
+    const freshMinSeq = minEntrySeq(freshEntries);
+    if (freshMaxSeq == null) {
+      // Cannot prove where the pin's entries sit relative to this page, so take
+      // the authoritative tail alone and let the top loader rebuild history
+      // from its cursor. Nothing is retained, so history is no longer extended.
+      return { entries: freshEntries, historyExtended: false, olderCursor: page.prev_cursor ?? null };
+    }
+    prefix = priorEntries.filter((entry) => entrySeq(entry) != null && entrySeq(entry) < freshMinSeq);
+    tail = priorEntries.filter((entry) => entrySeq(entry) != null && entrySeq(entry) > freshMaxSeq);
+  } else {
+    prefix = priorEntries
+      .slice(0, firstOverlap)
+      .filter((entry) => !entry?.item_id || !freshIds.has(entry.item_id));
+    tail = priorEntries
+      .slice(lastOverlap + 1)
+      .filter((entry) => !entry?.item_id || !freshIds.has(entry.item_id));
   }
 
-  const overlapIndex = priorIndexById.get(firstOverlap.item_id);
-  const freshIds = new Set(freshEntries.map((entry) => entry?.item_id).filter(Boolean));
-  const retainedPrefix = priorEntries
-    .slice(0, overlapIndex)
-    .filter((entry) => !entry?.item_id || !freshIds.has(entry.item_id));
+  // The bound the `historyExtended` gate was always for: transport pages are
+  // byte-sized while dozens of adjacent tool calls collapse into one visual row,
+  // so retaining every older page forever would grow the window without limit
+  // for a reader who never scrolled. It is the OLD end that has to be trimmed.
+  // Trimming the new end instead is what dropped the reader's own message: the
+  // tail is exactly what the stream appended since this page was built.
   return {
-    entries: [...retainedPrefix, ...freshEntries],
-    historyExtended: true,
-    olderCursor: pin.olderCursor ?? null,
+    entries: [...(historyExtended ? prefix : []), ...freshEntries, ...tail],
+    historyExtended: historyExtended && prefix.length > 0,
+    olderCursor: historyExtended ? pin?.olderCursor ?? null : page.prev_cursor ?? null,
   };
+}
+
+function entrySeq(entry) {
+  return Number.isSafeInteger(entry?.entry_seq) ? entry.entry_seq : null;
+}
+
+function minEntrySeq(entries) {
+  const seqs = entries.map(entrySeq).filter((seq) => seq != null);
+  return seqs.length ? Math.min(...seqs) : null;
+}
+
+function maxEntrySeq(entries) {
+  const seqs = entries.map(entrySeq).filter((seq) => seq != null);
+  return seqs.length ? Math.max(...seqs) : null;
 }
 
 // Read-only projection of the real session for rendering. Mirrors the remote
@@ -438,6 +503,7 @@ export function projectViewOnlySession(realSession, { viewThreadId, viewOnlyThre
     // approval policy, sandbox). Blank/unknown over impersonation — and never
     // fall back to the live cwd.
     current_cwd: viewOnlyThread.cwd ?? "",
+    thread_workspace_cwd: viewOnlyThread.threadWorkspaceCwd ?? "",
     provider: viewOnlyThread.provider ?? "",
     model: settings.model || "",
     reasoning_effort: settings.reasoning_effort || "",

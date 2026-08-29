@@ -9,34 +9,53 @@ import {
 } from "../local/workspace-diff.js";
 import { RightPanelTabs } from "../shared/right-panel-tabs.js";
 import {
+  decideWorkspaceRefresh,
+  sessionViewedWorkspaceKey,
+} from "../shared/viewed-workspace-key.js";
+import {
+  fetchRemoteThreadWorkspace,
   fetchRemoteWorkspaceDiff,
   getRemoteViewedThreadId,
   getRemoteViewedWorkspaceKey,
+  setRemoteThreadWorkspace,
 } from "./session-ops.js";
 
 const h = React.createElement;
 
 let sharedStore = null;
 let lastRemoteTurnDiffId = null;
-let lastRemoteCwd = null;
-let lastRemoteViewThreadId = null;
+let lastRemoteWorkspaceKey = null;
 
 export function getRemoteWorkspaceDiffStore() {
   if (!sharedStore) {
     sharedStore = createWorkspaceDiffStore({
       apiFetch: null,
       surface: "remote",
-      // Keys the viewed-workspace identity (thread id + cwd) so a view switch OR a
-      // same-thread cwd change clears the previous diff; the actual fetch goes
-      // through fetchDiff below.
+      // Keys the viewed-workspace identity (thread + birth cwd + remembered tree)
+      // so a view switch, same-thread cwd change, or observation-only move clears
+      // the previous diff; the actual fetch goes through fetchDiff below.
       getWorkspaceKey: getRemoteViewedWorkspaceKey,
-      // Also needed so a pinned worktree root is remembered PER THREAD; without it
-      // every remote thread would share one pin.
+      // Session the workspace read/pin is for.
       getThreadId: getRemoteViewedThreadId,
-      fetchDiff: async (root, autoRoot) => {
-        const data = await fetchRemoteWorkspaceDiff(root, autoRoot);
+      fetchDiff: async ({ viewRoot } = {}) => {
+        const data = await fetchRemoteWorkspaceDiff({ viewRoot });
         if (!data) {
           throw new Error("workspace_diff missing in remote response");
+        }
+        return data;
+      },
+      // Session workspace is relay state. Diff preview is local via setViewRoot.
+      fetchWorkspace: async (threadId, options) => {
+        const data = await fetchRemoteThreadWorkspace(threadId, options);
+        if (!data) {
+          throw new Error("thread_workspace missing in remote response");
+        }
+        return data;
+      },
+      setWorkspace: async (threadId, cwd) => {
+        const data = await setRemoteThreadWorkspace(threadId, cwd);
+        if (!data) {
+          throw new Error("thread_workspace missing in remote response");
         }
         return data;
       },
@@ -45,37 +64,27 @@ export function getRemoteWorkspaceDiffStore() {
   return sharedStore;
 }
 
+// Counts are cached by PATH, which only identifies a directory while the relay is the
+// same machine — and this store is a singleton that survives the switch.
+export function resetRemoteWorkspaceCounts() {
+  sharedStore?.clearRootCounts();
+}
+
 export function notifyRemoteSessionUpdated(session) {
   if (!sharedStore) return;
   if (!session) return;
-  const cwd = session.current_cwd || "";
-  // Same-cwd thread switches must still refetch → key on the viewed thread too.
-  const viewThreadId = getRemoteViewedThreadId();
-  const cwdChanged = lastRemoteCwd !== null && cwd !== lastRemoteCwd;
-  const viewChanged =
-    lastRemoteViewThreadId !== null && viewThreadId !== lastRemoteViewThreadId;
-  if (cwdChanged || viewChanged) {
-    lastRemoteCwd = cwd;
-    lastRemoteViewThreadId = viewThreadId;
-    lastRemoteTurnDiffId = null;
+  // Observation does not move current_cwd; key includes the remembered tree.
+  const workspaceKey = sessionViewedWorkspaceKey(session, getRemoteViewedThreadId());
+  const decision = decideWorkspaceRefresh({
+    session,
+    workspaceKey,
+    lastWorkspaceKey: lastRemoteWorkspaceKey,
+    lastTurnDiffId: lastRemoteTurnDiffId,
+  });
+  lastRemoteWorkspaceKey = decision.workspaceKey;
+  lastRemoteTurnDiffId = decision.turnDiffId;
+  if (decision.refresh) {
     void sharedStore.refresh();
-    return;
-  }
-  lastRemoteCwd = cwd;
-  lastRemoteViewThreadId = viewThreadId;
-  const entries = session.transcript || [];
-  let latest = null;
-  for (let i = entries.length - 1; i >= 0; i -= 1) {
-    if (entries[i]?.tool?.item_type === "turnDiff") {
-      latest = entries[i].item_id || null;
-      break;
-    }
-  }
-  if (latest && latest !== lastRemoteTurnDiffId) {
-    lastRemoteTurnDiffId = latest;
-    void sharedStore.refresh();
-  } else if (!latest) {
-    lastRemoteTurnDiffId = null;
   }
 }
 

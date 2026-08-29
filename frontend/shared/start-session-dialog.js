@@ -1,171 +1,217 @@
 import React from "react";
-import { SessionSettingsFields } from "./session-settings-fields.js";
+
+import { ProjectPicker } from "./project-picker.js";
+import { SettingPill } from "./setting-pill.js";
+import { WorkspacePicker } from "./workspace-picker.js";
+import { abbreviateHomePath } from "./workspace-chip-model.js";
+import { buildModelPickerGroups, selectedModelChip } from "./model-picker-model.js";
+import {
+  PromptCard,
+  SessionContextBar,
+  SessionDialogShell,
+  SettingPillRow,
+  SubmitShortcutHint,
+} from "./session-dialog-chrome.js";
 
 const h = React.createElement;
 
+// Fully controlled: every value arrives in `fields` and leaves through
+// `onFieldChange`. `start-session-payload.test.mjs` pins the resulting request.
 export function StartSessionDialog({
+  approvalOptions = [],
+  effortOptions = [],
+  fields = {},
+  gitContext = null,
   id,
-  cwd,
-  labels = {},
-  onCwdChange,
-  fields,
-  onFieldChange,
-  onStart,
-  startPending,
-  workspaceSuggestions,
-  providerOptions,
-  models,
+  initialPromptAttachmentsId = null,
+  attachControl = null,
   modelsStatus = "ready",
-  approvalOptions,
-  effortOptions,
-  workspaceInputId,
-  suggestionsListId,
-  startButtonId,
-  settingsPrefix,
-  initialPromptAttachmentsId,
-  hideWorkspace,
-  directoryFormId,
-  loadButtonId,
-  onRequestClose,
+  onCreateProject = null,
+  onFieldChange = null,
+  // Its own callback, not two onFieldChange calls: provider, model and effort must
+  // move together, and the second of two sequential calls reads a stale render.
+  onSelectModel = null,
+  onRequestClose = null,
+  onStart = null,
+  projects = [],
+  providerModels = {},
+  providers = [],
+  // Claude consumes its first prompt at thread creation, so an empty prompt
+  // would start a session that cannot be talked to until it is re-prompted.
   requireInitialPrompt = true,
+  startPending = false,
+  threadActivity = null,
+  threadAttention = null,
+  threadProjectId = {},
+  threadReviewing = null,
+  threads = [],
+  workspaceSuggestions = [],
 }) {
-  const cwdId = workspaceInputId || `${id}-cwd`;
-  const suggestionsId = suggestionsListId || `${id}-suggestions`;
-  const btnId = startButtonId || `${id}-start`;
-  const isWorkspaceControlled = Boolean(onCwdChange);
-  const hasWorkspace = hideWorkspace || (isWorkspaceControlled ? Boolean(cwd?.trim()) : true);
-  const isClaudeCode = fields?.provider === "claude_code";
+  const cwd = fields.cwd || "";
+  const provider = fields.provider || "";
+  const isClaudeCode = provider === "claude_code";
   const requiresInitialPrompt = requireInitialPrompt && isClaudeCode;
-  const hasInitialPrompt = Boolean(fields?.initialPrompt?.trim());
-  const startDisabled = startPending || !hasWorkspace || (requiresInitialPrompt && !hasInitialPrompt);
-  const workspaceInputProps = {
-    autoComplete: "off",
-    id: cwdId,
-    list: suggestionsId,
-    placeholder: "/path/to/project or ~/project",
-    type: "text",
-  };
-  if (isWorkspaceControlled) {
-    workspaceInputProps.onChange = (e) => onCwdChange(e.target.value);
-    workspaceInputProps.value = cwd || "";
-  } else {
-    workspaceInputProps.defaultValue = cwd || "";
-  }
-  const closeDialog = () => {
-    onRequestClose?.();
-    document.getElementById(id)?.close();
+  const hasInitialPrompt = Boolean(fields.initialPrompt?.trim());
+  const startDisabled =
+    startPending || !cwd.trim() || (requiresInitialPrompt && !hasInitialPrompt);
+
+  const modelChip = selectedModelChip({
+    providerModels,
+    selectedModel: fields.model || "",
+    selectedProvider: provider,
+  });
+
+  const submit = () => {
+    if (startDisabled) {
+      return;
+    }
+    // Close optimistically so the user immediately sees the (possibly pending)
+    // session view, then let the host fire the actual start.
+    document.getElementById(id)?.close?.();
+    onStart?.();
   };
 
+  const selectedApproval = approvalOptions.find((option) => option.value === fields.approvalPolicy);
+  const selectedEffort = effortOptions.find((option) => option.value === fields.effort);
+
   return h(
-    "dialog",
+    SessionDialogShell,
     {
-      className: "panel-modal panel-modal-wide",
-      id,
-      onClose: () => onRequestClose?.(),
-      onClick: (event) => {
-        if (event.target === event.currentTarget) {
-          closeDialog();
-        }
-      },
-    },
-    h(
-      "div",
-      { className: "modal-header" },
-      h("h2", null, "New session"),
-      h("button", {
-        className: "header-button close-modal-btn",
-        onClick: closeDialog,
-        type: "button",
-      }, "×")
-    ),
-    h(
-      "section",
-      { className: "panel-modal-body" },
-      hideWorkspace ? null : h(
-        directoryFormId ? "form" : "div",
-        directoryFormId
-          ? { className: "workspace-form", id: directoryFormId }
-          : { className: "workspace-form" },
-        h("label", { className: "sidebar-label", htmlFor: cwdId }, "Workspace"),
+      actions: [
         h(
-          "div",
-          { className: "workspace-picker" },
-          h("input", workspaceInputProps),
-          h(
-            "datalist",
-            { id: suggestionsId },
-            ...(workspaceSuggestions || []).map((s) =>
-              h("option", { key: s.cwd, label: s.label, value: s.cwd })
-            )
-          ),
-          loadButtonId ? h("button", {
-            className: "load-button",
-            id: loadButtonId,
-            type: "submit",
-          }, "Load") : null
-        )
-      ),
-      h(SessionSettingsFields, {
-        fields: fields || {},
-        idPrefix: settingsPrefix ?? id,
-        labels,
-        model: {
-          approvalOptions: approvalOptions || [],
-          effortOptions: effortOptions || [],
-          models: models || [],
-          providerOptions: providerOptions || [],
-        },
-        onFieldChange,
-        initialPromptAccessory: initialPromptAttachmentsId
-          ? h("div", {
-              "aria-live": "polite",
-              className: "composer-attachments start-session-attachments",
-              hidden: true,
-              id: initialPromptAttachmentsId,
-            })
-          : null,
-      }),
-      modelsStatus === "loading" || modelsStatus === "error"
-        ? h(
-            "p",
-            {
-              className: "control-hint",
-              id: `${id}-models-hint`,
-              "data-models-status": modelsStatus,
+          "button",
+          {
+            className: "session-dialog-cancel",
+            key: "cancel",
+            onClick: () => {
+              onRequestClose?.();
+              document.getElementById(id)?.close?.();
             },
-            modelsStatus === "loading"
-              ? "Loading models…"
-              : "Couldn’t load the model list — switch provider or reconnect to retry."
-          )
-        : null,
-      requiresInitialPrompt
-        ? h(
-            "p",
-            { className: "control-hint", id: `${id}-prompt-hint` },
-            "Claude Code starts when you send the first prompt."
-          )
-        : null
-    ),
-    h(
-      "div",
-      { className: "modal-actions" },
-      h(
-        "button",
-        {
-          className: "start-session-button",
-          disabled: startDisabled,
-          id: btnId,
-          onClick: () => {
-            // Close the modal optimistically so the user immediately sees the
-            // (possibly pending) session view, then let the caller fire the
-            // actual session-start side effect.
-            document.getElementById(id)?.close?.();
-            onStart?.();
+            type: "button",
           },
-          type: "button",
+          "Cancel"
+        ),
+        h(
+          "button",
+          {
+            className: "session-dialog-submit",
+            disabled: startDisabled,
+            id: `${id}-start`,
+            key: "start",
+            onClick: submit,
+            type: "button",
+          },
+          startPending ? "Starting…" : "Start session",
+          h(SubmitShortcutHint)
+        ),
+      ],
+      // Sessions do NOT get a worktree — only Task-team runs provision one — so
+      // this must not promise isolation the session does not have.
+      footerHint: cwd ? `Runs in ${abbreviateHomePath(cwd)}` : "Choose a directory to run in",
+      id,
+      onRequestClose,
+      title: "New session",
+    },
+    h(SessionContextBar, {
+      key: "context",
+      project: h(ProjectPicker, {
+        activeProjectId: fields.projectId || null,
+        onCreateProject,
+        onSelectProject: (projectId) => onFieldChange?.("projectId", projectId),
+        projects,
+        threadActivity,
+        threadAttention,
+        threadProjectId,
+        threadReviewing,
+        threads,
+      }),
+      workspace: h(WorkspacePicker, {
+        gitContext,
+        inputId: `${id}-cwd`,
+        onChange: (next) => onFieldChange?.("cwd", next),
+        suggestions: workspaceSuggestions,
+        value: cwd,
+      }),
+    }),
+    h(PromptCard, {
+      // `hidden` is the host's to set: React owning it re-hid pasted attachments
+      // on the next keystroke.
+      accessory: initialPromptAttachmentsId
+        ? h("div", {
+            "aria-live": "polite",
+            className: "composer-attachments start-session-attachments",
+            id: initialPromptAttachmentsId,
+          })
+        : null,
+      attachControl,
+      hint: requiresInitialPrompt
+        ? "Claude Code starts when you send the first prompt"
+        : "Leave empty to start idle",
+      id: `${id}-start-prompt`,
+      key: "prompt",
+      onChange: (next) => onFieldChange?.("initialPrompt", next),
+      onSubmit: submit,
+      placeholder: initialPromptAttachmentsId
+        ? "What should it work on? Paste an image to attach it."
+        : "What should it work on?",
+      value: fields.initialPrompt ?? "",
+    }),
+    h(
+      SettingPillRow,
+      { key: "pills" },
+      h(SettingPill, {
+        groups: buildModelPickerGroups({
+          providerModels,
+          providers,
+          selectedModel: fields.model || "",
+          selectedProvider: provider,
+        }),
+        id: `${id}-model`,
+        key: "model",
+        label: "Model",
+        onSelect: (value, option) => {
+          onSelectModel?.({ model: value, provider: option.provider || provider });
         },
-        startPending ? "Starting..." : "Start Session"
-      )
-    )
+        tag: modelChip.tag,
+        value: modelChip.value,
+      }),
+      h(SettingPill, {
+        id: `${id}-effort`,
+        key: "effort",
+        label: "Effort",
+        onSelect: (value) => onFieldChange?.("effort", value),
+        options: effortOptions.map((option) => ({
+          ...option,
+          selected: option.value === fields.effort,
+        })),
+        value: selectedEffort?.label || fields.effort || "default",
+      }),
+      h(SettingPill, {
+        id: `${id}-approval`,
+        key: "approval",
+        label: "Permissions",
+        onSelect: (value) => onFieldChange?.("approvalPolicy", value),
+        options: approvalOptions.map((option) => ({
+          ...option,
+          selected: option.value === fields.approvalPolicy,
+        })),
+        tag: selectedApproval?.tag || null,
+        value: selectedApproval?.label || fields.approvalPolicy || "default",
+      })
+    ),
+    modelsStatus === "loading" || modelsStatus === "error"
+      ? h(
+          "p",
+          {
+            className: "session-dialog-note",
+            "data-models-status": modelsStatus,
+            id: `${id}-models-hint`,
+            key: "models-hint",
+          },
+          modelsStatus === "loading"
+            ? "Loading models…"
+            : "Couldn’t load the model list — switch provider or reconnect to retry."
+        )
+      : null
   );
 }

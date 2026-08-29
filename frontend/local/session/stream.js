@@ -210,19 +210,68 @@ export function createStreamController(ctx) {
     }
   }
 
+  /**
+   * The Tasks screen's Orchestrator transcript, which is a view-only pin in all
+   * but name: a thread id plus the entries drawn for it.
+   *
+   * Borrowing the pin reducer rather than writing a second one is deliberate.
+   * The hard parts of applying a delta are not the append — they are refusing a
+   * re-delivered chunk by `text_offset`, refusing a first delta that does not
+   * start at 0 (its opening text never arrived, so the body would render
+   * truncated as if whole), and refusing an unlabeled delta that might belong to
+   * another thread. A second copy of that would drift, and the failure mode of
+   * drift here is corrupted text with nothing to notice it by.
+   *
+   * @returns {boolean} whether the entries changed
+   */
+  function applyDeltaToOrchestratorEntries(event) {
+    const threadId = state.orchestratorEntriesThreadId;
+    if (!threadId || !Array.isArray(state.orchestratorEntries)) {
+      return false;
+    }
+    // The reducer returns the SAME object when the delta does not apply — which
+    // includes "this delta is for another thread", so no id check is needed here.
+    const pin = { threadId, entries: state.orchestratorEntries };
+    const next = applyDeltaToViewOnlyPin(pin, event);
+    if (next === pin) {
+      return false;
+    }
+    state.orchestratorEntries = next.entries;
+    // The reducer also reports that this thread is mid-turn, and that is the
+    // more reliable signal: `thread_activity` can omit the Orchestrator, or the
+    // Tasks screen can miss the frame that carried the phase. Dropping it left
+    // the working->idle refresh unable to fire, so the last entry stayed
+    // rendered as streaming forever.
+    state.orchestratorWasWorking = Boolean(next.wasWorking);
+    // Same signal, different slot: the Orchestrator's entries are scalars rather
+    // than a pin object, so the reducer's `tailGap` is carried here.
+    if (next.tailGap) {
+      state.orchestratorTailGap = true;
+    }
+    return true;
+  }
+
   function applyLocalTranscriptEntryDelta(event) {
     if (!event?.item_id || !Array.isArray(state.session?.transcript)) {
       return;
     }
     const currentThreadId = state.session.active_thread_id || null;
     if (event.thread_id && currentThreadId && event.thread_id !== currentThreadId) {
-      // Not the active thread — but it may be the thread this surface is watching
-      // read-only. Route it to the pin instead of dropping it: dropping is what made
-      // a background thread's transcript update only when a poll happened to land.
+      // Not the active thread — but this surface may be drawing it anyway, in one
+      // of two places. Route it instead of dropping it: dropping is what made a
+      // background thread's transcript update only when a poll happened to land.
+      // Both destinations run the SAME reducer; only the slot they live in differs.
+      let changed = false;
       const pin = state.viewOnlyThread;
       const nextPin = applyDeltaToViewOnlyPin(pin, event);
       if (nextPin !== pin) {
         state.viewOnlyThread = nextPin;
+        changed = true;
+      }
+      if (applyDeltaToOrchestratorEntries(event)) {
+        changed = true;
+      }
+      if (changed) {
         queueTranscriptRender(state.session);
       }
       return;

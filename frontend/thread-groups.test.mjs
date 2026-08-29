@@ -58,6 +58,31 @@ test("buildThreadGroups sorts groups by latest activity and threads by recency",
   assert.equal(groups[0].label, "nested");
 });
 
+// The sidebar is a PASSIVE surface: it renders because a session exists, not because
+// anyone asked about a workspace. Most workspaces are legitimately ungranted and nothing
+// about the session is blocked by it, so a tag here would sit on most rows forever — and
+// a badge everyone learns to ignore spends exactly the attention the in-context offer
+// (diff panel / review dialog) needs. The grouping therefore carries no trust state at
+// all: there is nothing here for a renderer to be tempted by.
+test("a workspace group carries no trust state — the sidebar has nothing to warn about", () => {
+  const [group] = buildThreadGroups([
+    {
+      id: "thread-1",
+      cwd: "/tmp/work/ungranted",
+      preview: "x",
+      updated_at: 1,
+      workspace_trusted: false,
+    },
+  ]);
+
+  assert.equal(group.cwd, "/tmp/work/ungranted");
+  assert.equal(
+    Object.keys(group).some((key) => /restrict|trust/i.test(key)),
+    false,
+    `a passive group must carry no trust flag; got ${Object.keys(group).join(", ")}`
+  );
+});
+
 test("buildThreadGroups project mode groups by project_id with a single Unassigned bucket", () => {
   const threads = [
     { id: "t1", cwd: "/a/repo", updated_at: 30 },

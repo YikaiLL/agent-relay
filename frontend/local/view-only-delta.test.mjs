@@ -115,12 +115,18 @@ test("a re-delivered delta does not double-append into the pin", () => {
   assert.equal(again.entries[0].text, "Hello world");
 });
 
-test("a gapped delta is refused so the pin's next refresh can repair it", () => {
+test("a gapped delta is refused, and now says so instead of waiting", () => {
   const start = applyDeltaToViewOnlyPin(pin(), delta({ delta: "Hello", text_offset: 0 }));
 
   const gapped = applyDeltaToViewOnlyPin(start, delta({ delta: "tail", text_offset: 99 }));
 
-  assert.equal(gapped, start, "a gapped delta must leave the pin untouched");
+  // This used to assert `gapped === start` -- identity standing in for "the pin
+  // was untouched". The refusal is unchanged and still the point; what changed
+  // is that it is no longer SILENT, so identity is expected to differ. The
+  // invariant that mattered is the text.
+  assert.equal(gapped.entries[0].text, "Hello", "refusing must never splice");
+  assert.equal(gapped.entries.length, start.entries.length);
+  assert.equal(gapped.tailGap, true, "and the hole is reported for repair now");
 });
 
 test("a partially-overlapping re-delivery appends only the missing tail", () => {
@@ -139,7 +145,15 @@ test("a first delta for an unknown item at a non-zero offset is refused", () => 
 
   const next = applyDeltaToViewOnlyPin(original, delta({ item_id: "late", text_offset: 42 }));
 
-  assert.equal(next, original, "a mid-stream body must not become a new entry");
+  // Same inversion as above: the entry must still not be created (its opening
+  // text never arrived, so it would render truncated as if whole), but the pin
+  // now reports that it needs a page before it can show this item at all.
+  assert.deepEqual(
+    next.entries.map((entry) => entry.item_id),
+    original.entries.map((entry) => entry.item_id),
+    "a mid-stream body must not become a new entry"
+  );
+  assert.equal(next.tailGap, true);
 });
 
 test("a first delta at offset 0 still creates the entry", () => {

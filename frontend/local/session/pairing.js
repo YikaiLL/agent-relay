@@ -221,16 +221,25 @@ export function createPairingController(ctx) {
     }
   }
 
-  async function submitDecision(decision, scope) {
-    if (!state.currentApprovalId) {
+  /**
+   * @param {string} decision
+   * @param {string} scope
+   * @param {string} [requestId] the approval to answer. Defaults to
+   *   `state.currentApprovalId`, which is whichever approval the CONVERSATION
+   *   rendered — correct there, wrong for any other pane, so a caller that
+   *   knows which approval it drew says so.
+   */
+  async function submitDecision(decision, scope, requestId = null) {
+    const approvalId = requestId || state.currentApprovalId;
+    if (!approvalId) {
       logLine("No pending approval to submit.");
       return;
     }
 
-    logLine(`Submitting ${decision} for ${state.currentApprovalId}`);
+    logLine(`Submitting ${decision} for ${approvalId}`);
 
     try {
-      const response = await apiFetch(`/api/approvals/${encodeURIComponent(state.currentApprovalId)}`, {
+      const response = await apiFetch(`/api/approvals/${encodeURIComponent(approvalId)}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

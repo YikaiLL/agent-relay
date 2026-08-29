@@ -14,6 +14,7 @@ import process from "node:process";
 
 import { launchBrowser } from "./e2e/harness/browser.mjs";
 import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
+import { startLocalSession } from "./e2e/harness/local-session.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
 
@@ -46,12 +47,12 @@ async function main() {
   try {
     await page.goto(`http://127.0.0.1:${relayPort}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#open-start-session-dialog");
-    await page.click("#open-start-session-dialog");
-    await page.waitForFunction(() => document.querySelector("#launch-start-session-dialog")?.open);
-    await page.fill("#cwd-input", toTildePath(ROOT));
-    await page.selectOption("#provider-input", "fake");
-    await page.selectOption("#approval-policy-input", "never");
-    await page.click("#start-session-button");
+    await startLocalSession(page, {
+      cwd: toTildePath(ROOT),
+      provider: "fake",
+      approvalPolicy: "never",
+      timeoutMs: TIMEOUT_MS,
+    });
     await page.waitForFunction(
       () => (document.querySelector("#transcript")?.textContent || "").includes("Session ready"),
       null,

@@ -15,6 +15,7 @@ import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
 import { startLocalSession } from "./e2e/harness/local-session.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
 import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
+import { projectSwitcherOption } from "./e2e/harness/project-switcher.mjs";
 
 const TIMEOUT_MS = Number(process.env.BROWSER_E2E_TIMEOUT_MS || 45000);
 // A second tab bucket now means a second real PROJECT. It used to mean "Projects mode
@@ -126,10 +127,7 @@ async function selectProjectInSwitcher(page, name) {
     await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
   }
   await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
-  await page
-    .locator(".project-switcher-option", { hasText: new RegExp(`^${name}$`) })
-    .first()
-    .click({ timeout: TIMEOUT_MS });
+  await projectSwitcherOption(page, name).click({ timeout: TIMEOUT_MS });
   await page.waitForFunction(
     (target) => window.history.state?.context?.projectId
       && [...document.querySelectorAll("#threads-list .thread-group-header-project .thread-group-name")]
@@ -148,10 +146,7 @@ async function selectDefaultWorkspaceInSwitcher(page) {
     await page.click(".project-switcher-trigger", { timeout: TIMEOUT_MS });
   }
   await page.waitForSelector(".project-switcher-menu", { timeout: TIMEOUT_MS });
-  await page
-    .locator(".project-switcher-option", { hasText: /^Default Workspace$/ })
-    .first()
-    .click({ timeout: TIMEOUT_MS });
+  await projectSwitcherOption(page, "Default Workspace").click({ timeout: TIMEOUT_MS });
   await page.waitForFunction(
     () => !window.history.state?.context?.projectId,
     { timeout: TIMEOUT_MS }

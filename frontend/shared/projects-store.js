@@ -98,8 +98,10 @@ export function createProjectsStore({ fetchProjects }) {
     },
     // Force a refetch (e.g. right after a local mutation, before the next snapshot
     // arrives) so the caller's own change is reflected immediately.
+    // Returns the fetch, so a caller that must not act on a stale list — creating a
+    // project and then selecting it — can await the store catching up.
     refresh() {
-      void fetchNow(appliedRevision ?? 0);
+      return fetchNow(appliedRevision ?? 0);
     },
     // Forget what's been fetched so the next syncToRevision refetches unconditionally.
     // Call this when the relay/channel identity changes: an equal revision advertised

@@ -7,23 +7,25 @@ import {
   shouldRefreshViewedThread,
 } from "./viewed-thread-refresh.js";
 
-test("working viewed threads refresh only after the throttle interval", () => {
-  assert.equal(
-    shouldRefreshViewedThread({
-      elapsedMs: VIEWED_THREAD_REFRESH_INTERVAL_MS - 1,
-      wasWorking: true,
-      working: true,
-    }),
-    false
-  );
-  assert.equal(
-    shouldRefreshViewedThread({
-      elapsedMs: VIEWED_THREAD_REFRESH_INTERVAL_MS,
-      wasWorking: true,
-      working: true,
-    }),
-    true
-  );
+// This used to assert the opposite: that a still-working thread refetches its
+// tail once every VIEWED_THREAD_REFRESH_INTERVAL_MS. That poll is gone, and the
+// inversion is the point of the change rather than a casualty of it.
+//
+// It was written when the relay streamed only the globally-active thread, so
+// polling WAS how a viewed thread's tail arrived. Per-thread streaming landed
+// two months later and made it redundant -- but not harmless: every refetch
+// replaced the live tail with a server page built moments earlier, so whatever
+// the stream had appended in between vanished. Users reported it as "sometimes
+// it loses my own message", which is exactly right: their message is the newest
+// entry in the pin and so the likeliest to be missing from that page.
+test("a still-working viewed thread is not re-polled; the stream owns its tail", () => {
+  for (const elapsedMs of [0, VIEWED_THREAD_REFRESH_INTERVAL_MS, 60_000]) {
+    assert.equal(
+      shouldRefreshViewedThread({ elapsedMs, wasWorking: true, working: true }),
+      false,
+      `no refetch at ${elapsedMs}ms while the thread is still working`
+    );
+  }
 });
 
 test("working to idle always gets a final refresh", () => {
@@ -97,4 +99,31 @@ test("an older-page fetch settling re-arms a deferred terminal tail refresh", ()
     "the completion re-check starts the authoritative terminal tail refresh"
   );
   assert.equal(latch.take(), null, "the deferred refresh is consumed exactly once");
+});
+
+// A refused delta leaves a hole. The conversation repairs one on the next
+// render (its entry is downgraded to `preview`, which re-arms hydration); a pin
+// had to wait for whatever refreshed next, and since the 300ms poll went away
+// that is the end of the turn. The pin's reducer now raises `tailGap`, and this
+// is what makes it mean something.
+test("a reported gap is repaired now, not at the end of the turn", () => {
+  assert.equal(
+    shouldRefreshViewedThread({ wasWorking: true, working: true, needsRepair: true }),
+    true,
+    "mid-turn is exactly when a hole is worth closing"
+  );
+});
+
+test("but not while a fetch for it is already in flight", () => {
+  assert.equal(
+    shouldRefreshViewedThread({ wasWorking: true, working: true, needsRepair: true, loading: true }),
+    false
+  );
+});
+
+test("no reported gap keeps the quiet default", () => {
+  assert.equal(
+    shouldRefreshViewedThread({ wasWorking: true, working: true, needsRepair: false }),
+    false
+  );
 });

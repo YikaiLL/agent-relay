@@ -58,9 +58,6 @@ export function imageFileToDataUrl(file) {
   });
 }
 
-export function formatAttachmentBytes(bytes) {
-  if (bytes < 1024 * 1024) {
-    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-  }
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+// Re-exported so this module stays the local surface's one attachment import,
+// while the shared composers can reach the same formatter.
+export { formatAttachmentBytes } from "../shared/attachment-size.js";

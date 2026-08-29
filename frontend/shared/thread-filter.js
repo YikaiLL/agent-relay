@@ -22,6 +22,23 @@ export const EMPTY_THREAD_FILTER = Object.freeze({
   retained: new Map(),
 });
 
+/**
+ * A FRESH bell at rest — the seed for a new thread-list store.
+ *
+ * Deliberately not `EMPTY_THREAD_FILTER`. `Object.freeze` seals the wrapper but not the
+ * `Map` inside it, so seeding every store from the constant would hand every store the
+ * same `retained` instance. On remote that is precisely the cross-relay leak
+ * `relay-scoped-state.js` exists to prevent — one relay's remembered states deciding
+ * which of another's sessions the bell keeps listed — and it would be silent, because
+ * the ids that collide are legitimate ids in both relays.
+ *
+ * `EMPTY_THREAD_FILTER` stays: it is the right value for a read fallback (frozen, shared,
+ * never written) and for tests that want a stable literal.
+ */
+export function createThreadFilter() {
+  return { on: false, retained: new Map() };
+}
+
 export function isThreadFilterActive(filter) {
   return Boolean(filter?.on);
 }

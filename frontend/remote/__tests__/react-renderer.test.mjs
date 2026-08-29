@@ -40,6 +40,7 @@ const {
   SessionPanel,
   WorkspaceHeading,
 } = await import("../react-renderer.js");
+const { ProjectSwitcher } = await import("../../shared/project-switcher.js");
 
 test("RelayHomeState renders the paired relay chooser", () => {
   const markup = renderToStaticMarkup(
@@ -90,37 +91,88 @@ test("MissingCredentialsState renders re-pair guidance", () => {
   assert.match(markup, /Work Mac/);
 });
 
-test("WorkspaceHeading compacts status labels for the chrome header", () => {
+test("WorkspaceHeading renders the shared project switcher without session badges", () => {
   const markup = renderToStaticMarkup(
     h(WorkspaceHeading, {
       header: {
-        subtitle: "/Users/luchi/git/agent-relay",
-        subtitleHidden: false,
-        subtitleTitle: "/Users/luchi/git/agent-relay",
+        modelLabel: "Claude · default",
+        subtitle: "",
+        subtitleHidden: true,
         title: "agent-relay",
-        titleTitle: "/Users/luchi/git/agent-relay",
       },
-      statusBadge: {
-        label: "approval required",
-        tone: "alert",
-      },
+      statusBadge: { label: "working", tone: "ready", headerVisible: false },
+      titleNode: h(ProjectSwitcher, {
+        activeProjectId: "project-1",
+        projects: [{ id: "project-1", name: "UI Redesign" }],
+        titleId: "remote-workspace-title",
+      }),
     })
   );
 
-  assert.match(markup, /agent-relay/);
-  assert.match(markup, />Approval</);
-  assert.match(markup, /\/Users\/luchi\/git\/agent-relay/);
+  assert.match(markup, /UI Redesign/);
+  assert.match(markup, /project-switcher-caret/);
+  assert.doesNotMatch(markup, /Claude · default/);
+  assert.doesNotMatch(markup, /working/i);
+  assert.doesNotMatch(markup, /remote-status-badge/);
+  assert.doesNotMatch(markup, /remote-model-badge/);
 });
 
-test("SessionPanel renders provider and model selects with correct field bindings", () => {
-  const fieldsCalled = [];
-  const onFieldChange = (field, value) => {
-    fieldsCalled.push({ field, value });
-  };
+test("WorkspaceHeading keeps alert status visible", () => {
+  const markup = renderToStaticMarkup(
+    h(WorkspaceHeading, {
+      header: {
+        subtitle: "",
+        subtitleHidden: true,
+        title: "agent-relay",
+      },
+      statusBadge: { label: "Re-pair required", tone: "alert", headerVisible: true },
+    })
+  );
 
+  assert.match(markup, /id="remote-status-badge"/);
+  assert.match(markup, /Re-pair/);
+});
+
+test("WorkspaceHeading keeps offline status visible", () => {
+  const markup = renderToStaticMarkup(
+    h(WorkspaceHeading, {
+      header: {
+        subtitle: "",
+        subtitleHidden: true,
+        title: "agent-relay",
+      },
+      statusBadge: { label: "Offline", tone: "offline", headerVisible: true },
+    })
+  );
+
+  assert.match(markup, /id="remote-status-badge"/);
+  assert.match(markup, /status-badge-offline/);
+  assert.match(markup, /Offline/);
+});
+
+test("WorkspaceHeading can show a ready-toned important status", () => {
+  const markup = renderToStaticMarkup(
+    h(WorkspaceHeading, {
+      header: {
+        subtitle: "",
+        subtitleHidden: true,
+        title: "Pair this browser",
+      },
+      statusBadge: { label: "Approval pending", tone: "ready", headerVisible: true },
+    })
+  );
+
+  assert.match(markup, /id="remote-status-badge"/);
+  assert.match(markup, /Approval/);
+});
+
+// What is worth pinning at this layer: remote hands the dialog the whole
+// per-provider catalogue map rather than one flattened list.
+test("SessionPanel wires remote's per-provider catalogs into the merged model pill", () => {
   const markup = renderToStaticMarkup(
     h(SessionPanel, {
       model: {
+        approvalOptions: [{ label: "Ask first", value: "untrusted" }],
         effortOptions: [
           { label: "Low", value: "low" },
           { label: "Medium", value: "medium" },
@@ -131,39 +183,54 @@ test("SessionPanel renders provider and model selects with correct field binding
           effort: "medium",
           initialPrompt: "",
           model: "gpt-5.5",
+          projectId: null,
           provider: "codex",
           sandbox: "workspace-write",
         },
         hasRemoteAuth: true,
         hasUsableRelay: true,
-        providerOptions: [
-          { label: "Codex", value: "codex" },
-          { label: "Claude Code", value: "claude_code" },
-        ],
+        providers: ["codex", "claude_code"],
+        providerModels: {
+          codex: [{ model: "gpt-5.5", display_name: "GPT-5.5", is_default: true }],
+          claude_code: [{ model: "claude-sonnet-4-6", display_name: "Sonnet" }],
+        },
+        projects: [],
         startPending: false,
-        models: [
-          { model: "gpt-5.5", display_name: "GPT-5.5", provider: "" },
-          { model: "claude-sonnet-4-6", display_name: "Sonnet", provider: "anthropic" },
-        ],
         workspaceSuggestions: [],
       },
-      onFieldChange,
+      onFieldChange: () => {},
     })
   );
 
-  // Renders both provider and model selects
-  assert.match(markup, /id="remote-launch-provider-input"/);
-  assert.match(markup, /id="remote-launch-model-input"/);
+  assert.match(markup, /id="remote-start-session-dialog"/);
+  // The closed pill names provider and model together — after the merge it is
+  // the only thing naming the provider at all.
+  assert.match(markup, /Codex · GPT-5\.5/);
+  assert.match(markup, /id="remote-start-session-dialog-model"/);
+  // And the project chip is present, which is the whole point of the parity work:
+  // a phone can file a session into a project at creation time.
+  assert.match(markup, /class="project-picker-trigger"/);
+});
 
-  // Provider select shows both options with correct values
-  assert.match(markup, /<option[^>]*value="codex"[^>]*>Codex<\/option>/);
-  assert.match(markup, /<option[^>]*value="claude_code"[^>]*>Claude Code<\/option>/);
+test("SessionPanel does not offer an attachment mount, which a paired device cannot use", () => {
+  const markup = renderToStaticMarkup(
+    h(SessionPanel, {
+      model: {
+        approvalOptions: [],
+        effortOptions: [],
+        fields: { cwd: "/tmp/project", initialPrompt: "", model: "gpt-5.5", provider: "codex" },
+        hasRemoteAuth: true,
+        hasUsableRelay: true,
+        providers: ["codex"],
+        providerModels: { codex: [] },
+        projects: [],
+        startPending: false,
+        workspaceSuggestions: [],
+      },
+      onFieldChange: () => {},
+    })
+  );
 
-  // Provider select has correct current value
-  assert.match(markup, /<select[^>]*id="remote-launch-provider-input"[^>]*>/);
-  assert.match(markup, /value="codex"/);
-
-  // Model select shows all models from the model list
-  assert.match(markup, /GPT-5\.5/);
-  assert.match(markup, /Sonnet/);
+  assert.doesNotMatch(markup, /composer-attachments/);
+  assert.doesNotMatch(markup, /Paste an image/);
 });

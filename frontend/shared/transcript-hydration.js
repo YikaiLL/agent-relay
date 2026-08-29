@@ -97,8 +97,16 @@ export async function hydrateTranscript(
         }
       }
 
+      // Two different questions, and folding them together is what made the
+      // settled-tail repair skip exactly the long transcripts it exists for.
+      //
+      // "Which revision are these bodies from" is answered by having merged the
+      // tail at all, so it is recorded unconditionally. "Have we reached the top
+      // of history" is what `prev_cursor == null` answers, and that is what
+      // decides whether the window is COMPLETE.
+      store.recordTranscriptHydrationRevision(state, snapshot.transcript_revision ?? null);
       if (page.prev_cursor == null) {
-        store.markTranscriptHydrationComplete(state);
+        store.markTranscriptHydrationComplete(state, snapshot.transcript_revision ?? null);
       }
 
       applyTranscriptHydrationProgress(state, store, onProgress);
@@ -164,6 +172,9 @@ export async function loadOlderTranscript(
       if (hasMore) {
         store.setTranscriptHydrationIdle(state);
       } else {
+        // No revision: reaching the TOP of history says nothing about whether
+        // the tail's cached bodies are current, and claiming otherwise would
+        // suppress the settled-turn re-check.
         store.markTranscriptHydrationComplete(state);
       }
       applyTranscriptHydrationProgress(state, store, onProgress);

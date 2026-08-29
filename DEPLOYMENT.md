@@ -182,6 +182,12 @@ Notes:
 - set `RELAY_API_TOKEN` to protect `/api` routes
 - when `BIND_HOST` is non-loopback, `RELAY_API_TOKEN` is now required by default
 - `RELAY_ALLOW_INSECURE_NO_AUTH=1` only exists as an explicit insecure development escape hatch for non-loopback binds
+- **`RELAY_ALLOWED_HOSTS` — read this if you run the relay behind a reverse proxy.** The relay now refuses any request whose `Host` header is not one it recognises, answering `421 Misdirected Request`. This is the DNS-rebinding defence: after a rebind the browser still sends the attacker's hostname, so an `Origin` check cannot catch it (the expected origin is *derived* from `Host`, and the two agree) — only pinning the hostname does.
+  - always accepted: `localhost`, anything in `127.0.0.0/8`, `::1`, and a non-loopback `BIND_HOST`'s own address
+  - enforced when `BIND_HOST` is loopback (the default) **or** when `RELAY_ALLOWED_HOSTS` is set
+  - not enforced when `BIND_HOST` is non-loopback and `RELAY_ALLOWED_HOSTS` is unset, since the external hostname cannot be guessed and those binds already require a token
+  - **migration:** if nginx/Caddy proxies to a loopback-bound relay while preserving the external `Host` (`proxy_set_header Host $host`, which is Caddy's default), every request starts returning 421 after upgrading. Set `RELAY_ALLOWED_HOSTS=relay.example.com` (comma-separated for several names, port optional). The alternative is to have the proxy send the relay's own name instead (`proxy_set_header Host $proxy_host`).
+  - a refused request is logged with the `Host` it carried, so a hosts-file alias that stops working is diagnosable rather than mysterious
 - the local web UI now exchanges `RELAY_API_TOKEN` for an `HttpOnly` same-site session cookie, so normal browser use no longer needs to keep sending the raw token on every request
 - direct `Authorization: Bearer ...` API access still works for scripts and manual clients
 - relay HTTP responses now send CSP, `Permissions-Policy`, `Referrer-Policy: no-referrer`, and `X-Content-Type-Options: nosniff`
@@ -326,9 +332,63 @@ Optional hardening env:
 
 - `RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE`
 - `RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE`
-- `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE`
+- `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE` — surface peers (default 240)
+- `RELAY_BROKER_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE` — relay peers (default 36000).
+  Relays are first-party and an order of magnitude busier than a surface: transcript
+  deltas alone batch into a 100ms window and publish one frame each. Going over makes
+  the broker **drop that frame**, which the relay treats as fatal: it ends the session
+  and reconnects to resync rather than carry on with a hole in what the surface
+  received. Setting this below real traffic therefore causes repeated reconnects, not
+  just slowdown — and the broker's window is keyed by peer, so it does not reset when
+  the relay reconnects. It bounds frames, not bytes — see the byte budgets below for that.
+  Leaving it unset while the generic limit above **is** set keeps the generic limit
+  governing relays, so an already-tightened deployment is not widened by upgrading.
+- `RELAY_BROKER_PUBLISH_BYTES_PER_MINUTE` — surface peers (default 8MiB)
+- `RELAY_BROKER_RELAY_PUBLISH_BYTES_PER_MINUTE` — relay peers (default 512MiB).
+  The bandwidth counterpart to the frame allowances: a frame count is a poor proxy for
+  size, and 36000 frames at the 64KiB cap is ~2.2GiB/min from one peer. The relay default
+  is ~6.8x the chunked-reply ceiling of **75MiB/min**, leaving room for transcript deltas
+  and snapshots running alongside it.
+  **Do not re-derive that ceiling from the 32KiB chunk target.** That is a *payload* size,
+  and the frame carrying it is bigger. The 75MiB/min figure is instead
+  `RELAY_BROKER_MAX_TEXT_FRAME_BYTES` x the 50ms publish cadence — an upper bound, because
+  the relay's chunk builders shrink a chunk until its frame fits that cap, and the writer
+  paces chunks that far apart *including across consecutive replies*.
+  **The same fatal-on-refusal caveat applies as for the frame limit, and matters more
+  here**: a refused relay publish ends the session, and the resync sends a full snapshot —
+  so a budget set near real traffic reconnects in a loop and spends more bandwidth than it
+  saves. Set to `0` to disable the byte budget entirely. Follows the same migration rule: an
+  explicitly set generic byte budget governs relays until the relay-specific one is set.
+- `RELAY_BROKER_PUBLISH_BURST_BYTES` / `RELAY_BROKER_RELAY_PUBLISH_BURST_BYTES` —
+  burst is a **separate quota** from the rate: how much a peer may publish back-to-back
+  after idling (defaults 2MiB / 16MiB). Without it the first large reply after a quiet
+  period is refused, which is exactly when one is most likely. A burst below
+  `RELAY_BROKER_MAX_TEXT_FRAME_BYTES` is raised to it, since a smaller one could never
+  afford a single frame the broker itself accepts.
+- Global egress (measured **after** fan-out, so a broadcast counts once per recipient) is
+  **observed, not enforced**. Refusing on a global condition would punish a peer for its
+  neighbours' traffic, and for a relay that means a teardown whose resync adds egress —
+  the control would amplify the overload it fired on. It is counted, and a minute above
+  2GiB logs a warning. Watch `publish_limits.peak_egress_bytes_per_minute` on
+  `/api/admin/stats` before deciding whether enforcement is ever warranted.
+  Its scope is **`ServerMessage` bytes written to client sockets** — welcomes, presence,
+  messages and errors, including the error sent to a rejected join. Within that scope it is
+  exact rather than modelled: counted where each frame is serialized on its way out, so
+  fan-out is included by construction and a frame that failed to send is not counted. It
+  deliberately excludes WebSocket **control** frames (ping/pong), which carry no
+  application payload, so this is what the broker was asked to deliver rather than raw
+  socket throughput.
+- Both allowances are keyed on the **authenticated ticket identity** (`device_id` /
+  `pairing_id`), not on the broker-assigned `peer_id`. A surface gets a fresh `peer_id`
+  on every join, so keying on that would let any surface reset its budget by reconnecting.
+  A consequence worth knowing: two tabs on the same device share one budget.
 - `RELAY_BROKER_MAX_CONNECTIONS_PER_IP`
-- `RELAY_BROKER_MAX_TEXT_FRAME_BYTES`
+- `RELAY_BROKER_MAX_TEXT_FRAME_BYTES` — **has a 64KiB floor**, and values below it are
+  raised with a warning rather than honoured. relay-server fits every chunk against a fixed
+  64KiB limit compiled into its binary and never learns this setting, so a smaller cap does
+  not make relay frames smaller — it rejects them, and the broker closes the socket on
+  `frame_too_large`, so the reconnect replays the same reply and fails identically. Raising
+  the value above 64KiB works normally.
 - `RELAY_BROKER_IDLE_TIMEOUT_SECS`
 - `RELAY_BROKER_CSP_CONNECT_SRC` when you want production `connect-src` tighter
   than the default dev/LAN-friendly policy

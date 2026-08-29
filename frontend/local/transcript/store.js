@@ -5,6 +5,7 @@ import {
   createMergedTranscriptHydrationPagePatch,
   prepareTranscriptHydrationState,
   createTranscriptHydrationCompletePatch,
+  createTranscriptHydrationRevisionPatch,
   createTranscriptHydrationPromisePatch,
   createTranscriptHydrationStatusPatch,
   restoreHydratedTranscriptSnapshot,
@@ -98,8 +99,12 @@ export function setTranscriptHydrationIdle(state) {
   applyLocalTranscriptPatch(state, createTranscriptHydrationStatusPatch("idle"));
 }
 
-export function markTranscriptHydrationComplete(state) {
-  applyLocalTranscriptPatch(state, createTranscriptHydrationCompletePatch());
+export function recordTranscriptHydrationRevision(state, fetchedRevision) {
+  applyLocalTranscriptPatch(state, createTranscriptHydrationRevisionPatch(fetchedRevision));
+}
+
+export function markTranscriptHydrationComplete(state, fetchedRevision) {
+  applyLocalTranscriptPatch(state, createTranscriptHydrationCompletePatch(fetchedRevision));
 }
 
 export function getTranscriptHydrationThreadId(state) {

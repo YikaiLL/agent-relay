@@ -82,6 +82,35 @@ test("createResetRemoteSurfaceStatePatch returns reset state and runs lifecycle 
   assertClearedSessionPatch(patch);
 });
 
+// Counts are cached by PATH and this store survives a relay switch — the same hazard as
+// the Projects revision cache this reset already clears.
+test("every surface reset forgets the previous relay's per-tree change counts", async () => {
+  const { getRemoteWorkspaceDiffStore } = await import("../workspace-diff-host.js");
+  // Initialise the singleton: the reset is a no-op until something has created it,
+  // which is exactly the state a real surface is in by the time it can switch relays.
+  const store = getRemoteWorkspaceDiffStore();
+
+  let cleared = 0;
+  const actual = store.clearRootCounts.bind(store);
+  store.clearRootCounts = () => {
+    cleared += 1;
+    actual();
+  };
+
+  try {
+    createResetRemoteSurfaceStatePatch({
+      cancelThreadSearch() {},
+      clearClaimLifecycle() {},
+      clearSessionRuntime() {},
+      rejectPendingActions() {},
+      reason: "relay switch",
+    });
+    assert.equal(cleared, 1, "the reset must reach the workspace store, not just Projects");
+  } finally {
+    store.clearRootCounts = actual;
+  }
+});
+
 // Tearing the surface down must ABANDON an open search, not merely blank its results:
 // a request already in flight has to be invalidated and a pending keystroke timer
 // cleared, or a re-pair lets the old relay's answer land in the new one's state.

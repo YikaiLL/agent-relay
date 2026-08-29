@@ -234,17 +234,22 @@ impl AppState {
             result.device_join_ticket_expires_at = credential.join_credential.expires_at;
         }
         if let Some(grant) = client_grant {
+            // Only the claim reference travels: the relay has no client token to
+            // pass on, by construction. The device signs the nonce and redeems it
+            // against the broker directly.
             relay.attach_pairing_client_grant(
                 pairing_id,
                 Some(grant.relay_id.clone()),
                 grant.relay_label.clone(),
-                Some(grant.client_id.clone()),
-                Some(grant.refresh_token.clone()),
+                Some(grant.claim_id.clone()),
+                Some(grant.claim_nonce.clone()),
+                Some(grant.claim_expires_at),
             )?;
             result.relay_id = Some(grant.relay_id);
             result.relay_label = grant.relay_label;
-            result.client_id = Some(grant.client_id);
-            result.client_refresh_token = Some(grant.refresh_token);
+            result.client_claim_id = Some(grant.claim_id);
+            result.client_claim_nonce = Some(grant.claim_nonce);
+            result.client_claim_expires_at = Some(grant.claim_expires_at);
         }
         let message = match input.decision {
             PairingDecision::Approve => {

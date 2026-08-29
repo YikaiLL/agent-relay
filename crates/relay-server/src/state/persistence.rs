@@ -9,11 +9,24 @@ use tokio::sync::{watch, RwLock};
 use tracing::warn;
 
 use super::{
-    DeviceRecord, PairedDevice, RelayState, ReviewJob, ReviewerThread, ThreadSessionSettings,
-    WorkflowRun, PERSISTED_STATE_VERSION,
+    DeviceRecord, PairedDevice, RelayState, ReviewJob, ReviewerThread, TeamRun,
+    ThreadSessionSettings, WorkflowRun, PERSISTED_STATE_VERSION,
 };
 
 const PERSISTENCE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Headroom added to the transcript clock when it is persisted, so the value on
+/// disk always sits AHEAD of every revision actually handed out.
+///
+/// Saving is debounced, and several paths advance the clock without scheduling a
+/// save at all (a cold transcript read materializing a runtime, for one). Without
+/// headroom a hard exit between a bump and the next save would restart the clock
+/// below revisions clients already hold, and re-issue them — the one thing the
+/// protocol cannot tolerate. Overshooting instead is free: the clock is a u64
+/// logical counter with no meaning beyond its ordering, so skipping ahead a few
+/// thousand costs nothing, while replaying a single number silently drops
+/// transcript content.
+const TRANSCRIPT_CLOCK_PERSIST_HEADROOM: u64 = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct PersistedRelayState {
@@ -47,6 +60,10 @@ pub(super) struct PersistedRelayState {
     /// `#[serde(default)]` keeps pre-promotion state files loadable.
     #[serde(default)]
     pub(super) thread_promoted_from: std::collections::HashMap<String, String>,
+    /// Pin/proven paths. Persist so a worktree move and an explicit pin survive restart.
+    #[serde(default)]
+    pub(super) thread_workspace:
+        std::collections::HashMap<String, crate::state::relay::ThreadWorkspace>,
     /// Honest per-thread last-activity timestamps (unix secs) used as the
     /// thread-list sort key instead of the resume-polluted provider mtime.
     /// `#[serde(default)]` keeps old state files loadable (empty map).
@@ -54,6 +71,35 @@ pub(super) struct PersistedRelayState {
     pub(super) thread_last_activity_at: std::collections::HashMap<String, u64>,
     #[serde(default)]
     pub(super) allowed_roots: Vec<String>,
+    /// Daily token budget, in tokens. `None` means no cap — which is not the
+    /// same statement as a cap of zero, so it stays an Option all the way down
+    /// rather than collapsing to 0 in the state file.
+    #[serde(default)]
+    pub(super) usage_daily_cap: Option<u64>,
+    /// What happens when the cap is reached, as a wire string. Stored as a
+    /// string rather than the enum so a state file written by a build that
+    /// knows more policies than this one still loads — `BudgetPolicy::parse`
+    /// falls back to the softer policy rather than refusing every turn.
+    #[serde(default)]
+    pub(super) usage_budget_policy: String,
+    /// Directories the LOCAL operator marked as theirs. Absent in old state files,
+    /// which is the correct default: trust is granted, never inferred.
+    #[serde(default)]
+    pub(super) trusted_workspaces: Vec<String>,
+    /// Whether the one-time carry-over of `allowed_roots` into `trusted_workspaces` has
+    /// already been applied (see `RelayState::migrate_allowed_roots_into_trust`).
+    ///
+    /// A MARKER rather than a condition on the data, and that distinction is the reason
+    /// the field exists: "migrate while `trusted_workspaces` is empty" would hand a root
+    /// back to a user who had deliberately withdrawn it, on the very next restart, and
+    /// trust that cannot be taken away is not trust. Only a record that the migration
+    /// RAN can tell "never migrated" apart from "migrated, then revoked".
+    ///
+    /// `#[serde(default)]` → false for every state file written before the split, which
+    /// is exactly the set that still needs the carry-over. A relay with no state file at
+    /// all starts `true` (`RelayState::new`): it has no legacy roots to carry.
+    #[serde(default)]
+    pub(super) allowed_roots_trust_migrated: bool,
     #[serde(default)]
     pub(super) device_records: std::collections::HashMap<String, DeviceRecord>,
     #[serde(default)]
@@ -82,6 +128,36 @@ pub(super) struct PersistedRelayState {
     /// orchestrator. `#[serde(default)]` keeps old state files loadable (empty map).
     #[serde(default)]
     pub(super) workflow_jobs: std::collections::HashMap<String, WorkflowRun>,
+    /// Task team runs (orchestration metadata only — the agents' transcripts are
+    /// rebuilt from the provider, and the TL's plan/design/report live as files in
+    /// the task worktree). Non-terminal runs persist, and a `Paused` run restores
+    /// verbatim so the user can resume it — see `RelayState::restored_team_runs`.
+    /// `#[serde(default)]` keeps old state files loadable (empty map), which is
+    /// why adding this map needs no `PERSISTED_STATE_VERSION` bump — a bump is a
+    /// hard load error, not a migration.
+    #[serde(default)]
+    pub(super) team_runs: std::collections::HashMap<String, TeamRun>,
+    /// Pin for the Tasks Orchestrator thread. `#[serde(default)]` keeps old
+    /// state files loadable (`None`). Pending Claude ids are dropped on write
+    /// the same way `active_thread_id` is.
+    #[serde(default)]
+    pub(super) orchestrator_thread_id: Option<String>,
+    /// Device the Orchestrator acts as. Re-attached on every Claude turn after a
+    /// restart — the bridge does not remember it in-process.
+    #[serde(default)]
+    pub(super) orchestrator_device_id: Option<String>,
+    /// Orchestrator persona text. Persisted beside the pin so relay/worker
+    /// restarts can re-send the secretary instructions on resume/send.
+    #[serde(default)]
+    pub(super) orchestrator_system_prompt: Option<String>,
+    /// Persona version metadata from the decision layer. `#[serde(default)]` → `None`
+    /// for old state files. Not used to retire the pinned thread.
+    #[serde(default)]
+    pub(super) orchestrator_system_prompt_version: Option<u32>,
+    /// Pending Orchestrator proposals. `#[serde(default)]` keeps old state files
+    /// loadable (empty list).
+    #[serde(default)]
+    pub(super) orchestrator_proposals: Vec<crate::protocol::OrchestratorProposalView>,
     /// Web Push subscriptions for remote devices, keyed by device_id. Persisted
     /// so a closed/locked phone keeps receiving pushes across a relay restart.
     /// `#[serde(default)]` keeps old state files loadable (empty map).
@@ -108,6 +184,23 @@ pub(super) struct PersistedRelayState {
     /// the next mutation. `#[serde(default)]` → 0 for pre-Projects state files.
     #[serde(default)]
     pub(super) projects_revision: u64,
+    /// High-water mark of the shared transcript revision clock. Persisted so a
+    /// restart resumes ABOVE every revision already handed out: a browser tab that
+    /// survives the restart still holds its old revision and drops anything at or
+    /// below it, so a clock that restarted at 0 would leave that tab silently deaf
+    /// until it climbed back.
+    ///
+    /// Stored with `TRANSCRIPT_CLOCK_PERSIST_HEADROOM` added, so a crash between a
+    /// bump and the next debounced save still resumes above what went out.
+    ///
+    /// `#[serde(default)]` → 0 for state files written before the clock existed.
+    /// Upgrading from one of those restarts the clock below whatever revision a
+    /// still-open page holds, so that page goes stale until the clock climbs past
+    /// it. Deliberately not worked around: the live tail is never served from the
+    /// client's page cache (`shared/caching-transcript-fetcher.js` RED LINE), so a
+    /// reload re-seeds the revision from the server and clears it outright.
+    #[serde(default)]
+    pub(super) transcript_clock: u64,
 }
 
 impl PersistedRelayState {
@@ -136,8 +229,19 @@ impl PersistedRelayState {
             thread_settings: relay.thread_settings.clone(),
             thread_forked_from: relay.thread_forked_from.clone(),
             thread_promoted_from: relay.thread_promoted_from.clone(),
+            // Drop pending ids: a pin on a synthetic id would persist a dead key.
+            thread_workspace: relay
+                .thread_workspace
+                .iter()
+                .filter(|(thread_id, _)| !thread_id.starts_with("claude-pending-"))
+                .map(|(thread_id, workspace)| (thread_id.clone(), workspace.clone()))
+                .collect(),
             thread_last_activity_at: relay.thread_last_activity_at.clone(),
             allowed_roots: relay.allowed_roots.clone(),
+            usage_daily_cap: relay.usage_budget.daily_cap,
+            usage_budget_policy: relay.usage_budget.policy.as_str().to_string(),
+            trusted_workspaces: relay.trusted_workspaces.clone(),
+            allowed_roots_trust_migrated: relay.allowed_roots_trust_migrated,
             device_records: relay.device_records.clone(),
             paired_devices: relay.paired_devices.clone(),
             // Drop synthetic Claude pending reviewer ids (same as active_thread_id
@@ -163,6 +267,38 @@ impl PersistedRelayState {
             // non-terminal run must survive so the restore side can reconcile it to
             // `Interrupted` and offer a re-run, rather than vanishing on restart.
             workflow_jobs: relay.workflow_jobs.clone(),
+            // Persist ALL team runs, terminal and not — a `Paused` run in
+            // particular exists precisely to be picked up after a restart.
+            //
+            // A run whose TL thread is still a synthetic `claude-pending-*` id
+            // (the SDK only mints a real session id on the first turn) cannot be
+            // resumed: that thread will not exist after a restart. But DROPPING
+            // the run would lose the spec, the card, and — worse — the record of a
+            // worktree and branch that are still sitting on disk with nothing
+            // pointing at them. So the id is cleared and the run is recorded
+            // terminal-Interrupted instead: the user still sees what was attempted
+            // and where its worktree is. Same treatment `active_thread_id` and
+            // `reviewer_threads` give their pending ids, minus the deletion.
+            team_runs: relay
+                .team_runs
+                .iter()
+                .map(|(id, run)| {
+                    let mut run = run.clone();
+                    if run.tl_thread_id.starts_with("claude-pending-") {
+                        run.detach_unresumable_tl();
+                    }
+                    (id.clone(), run)
+                })
+                .collect(),
+            // Drop pending Claude ids: the SDK session does not exist yet.
+            orchestrator_thread_id: relay
+                .orchestrator_thread_id
+                .clone()
+                .filter(|id| !id.starts_with("claude-pending-")),
+            orchestrator_device_id: relay.orchestrator_device_id.clone(),
+            orchestrator_system_prompt: relay.orchestrator_system_prompt.clone(),
+            orchestrator_system_prompt_version: relay.orchestrator_system_prompt_version,
+            orchestrator_proposals: relay.orchestrator_proposals.clone(),
             push_subscriptions: relay.push_subscriptions.clone(),
             projects: relay.projects.clone(),
             thread_project_id: relay.thread_project_id.clone(),
@@ -181,6 +317,9 @@ impl PersistedRelayState {
                 .map(|(thread_id, name)| (thread_id.clone(), name.clone()))
                 .collect(),
             projects_revision: relay.projects_revision,
+            transcript_clock: relay
+                .transcript_clock()
+                .saturating_add(TRANSCRIPT_CLOCK_PERSIST_HEADROOM),
         }
     }
 

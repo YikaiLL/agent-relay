@@ -9,13 +9,26 @@ impl AppState {
         let device_id = require_device_id(device_id)?;
         let request = {
             let relay = self.relay.read().await;
-            relay.ensure_device_can_approve(&device_id)?;
-            relay
+            let pending = relay
                 .pending_ask_user_questions
                 .get(request_id)
                 .cloned()
-                .ok_or_else(|| "there is no AskUserQuestion waiting for remote detail".to_string())?
-                .to_view()
+                .ok_or_else(|| {
+                    "there is no AskUserQuestion waiting for remote detail".to_string()
+                })?;
+            // Same authority as answering it, for the same reason. A remote
+            // snapshot externalizes any question body over 4 KB, so without this an
+            // unattended task's question renders as "Loading question detail"
+            // forever: visible, nominally answerable, and impossible to read.
+            match relay.team_run_cwd_for_thread(&pending.thread_id) {
+                Some(cwd) => ensure_path_within_device_scope(
+                    &cwd,
+                    &relay.device_path_scope(&device_id),
+                    &relay.allowed_roots,
+                )?,
+                None => relay.ensure_device_can_approve(&device_id)?,
+            }
+            pending.to_view()
         };
 
         Ok(AskUserQuestionDetailResponse { request })
@@ -50,6 +63,12 @@ impl AppState {
                     WORKFLOW_LOCKED_THREAD_MSG.to_string(),
                 ));
             }
+            // Same for a task team: its wait loop denies its own approvals and
+            // carries the turn on, so a user decision here would race that and
+            // could approve a write the run had already refused.
+            if relay.is_thread_or_cwd_team_locked(&pending.thread_id) {
+                return Err(ApprovalError::Bridge(TEAM_LOCKED_THREAD_MSG.to_string()));
+            }
             pending
         };
 
@@ -81,14 +100,18 @@ impl AppState {
         );
         relay.notify();
 
+        // Name the provider that actually received it. This used to say "Codex"
+        // for everyone, which made the receipt wrong for every non-Codex user on
+        // the one surface whose job is to confirm where a permission decision went.
+        let provider = crate::provider::provider_display_name(bridge.provider_name());
         Ok(ApprovalReceipt {
             request_id: request_id.to_string(),
             decision: input.decision,
             resulting_state: "approval_response_sent".to_string(),
             message: match input.decision {
-                ApprovalDecision::Approve => "Remote approval sent to Codex.".to_string(),
-                ApprovalDecision::Deny => "Remote denial sent to Codex.".to_string(),
-                ApprovalDecision::Cancel => "Remote cancel sent to Codex.".to_string(),
+                ApprovalDecision::Approve => format!("Remote approval sent to {provider}."),
+                ApprovalDecision::Deny => format!("Remote denial sent to {provider}."),
+                ApprovalDecision::Cancel => format!("Remote cancel sent to {provider}."),
             },
         })
     }
@@ -110,10 +133,32 @@ impl AppState {
         }
         let pending = {
             let relay = self.relay.read().await;
-            relay
-                .ensure_device_can_approve(&device_id)
-                .map_err(AskUserAnswerError::Bridge)?;
-            relay.pending_ask_user_questions.get(request_id).cloned()
+            let pending = relay.pending_ask_user_questions.get(request_id).cloned();
+            // A task team's question comes from a BACKGROUND thread, so there is no
+            // active session to "approve for" — and requiring one would close the
+            // run's only channel to a person exactly when a relay has no foreground
+            // session open, which is the normal state while a task runs unattended.
+            //
+            // It is authorized against the RUN's worktree instead, exactly as
+            // pause / stop / resume are. Merely SKIPPING the check would leave only
+            // "is this a paired device" — and an answer steers an agent that writes
+            // files, so any device holding a request id could direct work in a
+            // worktree outside its own path scope.
+            match pending
+                .as_ref()
+                .and_then(|pending| relay.team_run_cwd_for_thread(&pending.thread_id))
+            {
+                Some(cwd) => ensure_path_within_device_scope(
+                    &cwd,
+                    &relay.device_path_scope(&device_id),
+                    &relay.allowed_roots,
+                )
+                .map_err(AskUserAnswerError::Bridge)?,
+                None => relay
+                    .ensure_device_can_approve(&device_id)
+                    .map_err(AskUserAnswerError::Bridge)?,
+            }
+            pending
         };
         let pending = pending.ok_or(AskUserAnswerError::NoPendingRequest)?;
         // A reviewer thread's questions belong to the review — block answering them.
@@ -179,159 +224,121 @@ impl AppState {
         })
     }
 
+    /// Session tree from `resolve_thread_workspace`; `view_root` is a preview of another enumerated root, not a pin.
     pub async fn workspace_diff(
         &self,
         device_id: Option<String>,
         thread_id: Option<String>,
-        root: Option<String>,
-        auto_root: bool,
+        view_root: Option<String>,
     ) -> Result<WorkspaceDiffResponse, String> {
-        let (cwd, relay_cwd, device_scope, allowed_roots) = {
-            let relay = self.relay.read().await;
-            // Resolve which workspace to diff:
-            // - absent selector       → the global/active cwd (legacy back-compat)
-            // - present & resolvable   → the *viewed* session's own workspace
-            // - present & unresolvable → fail closed; NEVER fall back to the active
-            //   cwd, which would show (and, for a broad-scope remote device, leak)
-            //   another workspace's diff.
-            let resolved = match thread_id.as_deref() {
-                None => relay.current_cwd.clone(),
-                Some(thread_id) => match relay.thread_cwd(thread_id) {
-                    Some(cwd) => cwd,
-                    None => return Ok(WorkspaceDiffResponse::unavailable()),
-                },
+        // No thread: global cwd. view_root is unauthorized without a roots list.
+        let Some(thread_id) = non_empty(thread_id) else {
+            if non_empty(view_root).is_some() {
+                return Err(
+                    "view_root needs a thread_id so the relay can check it against that session's trees"
+                        .to_string(),
+                );
+            }
+            let (cwd, device_scope, allowed_roots, grants) = {
+                let relay = self.relay.read().await;
+                let device_scope = device_id
+                    .as_deref()
+                    .map(|id| relay.device_path_scope(id))
+                    .unwrap_or_default();
+                ensure_path_within_device_scope(
+                    &relay.current_cwd,
+                    &device_scope,
+                    &relay.allowed_roots,
+                )?;
+                (
+                    relay.current_cwd.clone(),
+                    device_scope,
+                    relay.allowed_roots.clone(),
+                    relay.trust_grants(),
+                )
             };
-            let device_scope = device_id
-                .as_deref()
-                .map(|id| relay.device_path_scope(id))
-                .unwrap_or_default();
-            ensure_path_within_device_scope(&resolved, &device_scope, &relay.allowed_roots)?;
+            let (mut response, retry_fallback) = super::collect_workspace_diff_resilient(
+                &cwd,
+                &cwd,
+                &device_scope,
+                &allowed_roots,
+                &grants,
+            )
+            .await?;
+            if response.unavailable {
+                return Ok(response);
+            }
+            response.roots = super::list_worktrees(&response.cwd, &grants)
+                .await
+                .into_iter()
+                .filter(|candidate| {
+                    path_within_device_scope(&candidate.path, &device_scope, &allowed_roots)
+                })
+                .collect();
+            response.fallback_from = retry_fallback;
+            return Ok(response);
+        };
+
+        // Unresolvable → empty panel. Do not fall back to active cwd (would leak another workspace).
+        let resolved = match self
+            .resolve_thread_workspace(&thread_id, device_id.as_deref())
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(ThreadWorkspaceError::Unresolvable(_)) => {
+                return Ok(WorkspaceDiffResponse::unavailable())
+            }
+            Err(ThreadWorkspaceError::OutOfScope(error)) => return Err(error),
+        };
+
+        let diff_cwd = match non_empty(view_root) {
+            Some(requested) => {
+                let matched = resolved
+                    .roots
+                    .iter()
+                    .find(|root| paths_equivalent(&root.path, &requested))
+                    .ok_or_else(|| {
+                        format!(
+                            "{requested} is not one of this session's working trees; pick one of \
+the trees the relay listed for it"
+                        )
+                    })?;
+                matched.path.clone()
+            }
+            None => resolved.cwd.clone(),
+        };
+
+        let (relay_cwd, device_scope, allowed_roots, grants) = {
+            let relay = self.relay.read().await;
             (
-                resolved,
                 relay.current_cwd.clone(),
-                device_scope,
+                device_id
+                    .as_deref()
+                    .map(|id| relay.device_path_scope(id))
+                    .unwrap_or_default(),
                 relay.allowed_roots.clone(),
+                relay.trust_grants(),
             )
         };
 
-        // That workspace may no longer EXIST — a thread born in an agent worktree keeps its
-        // path after the worktree is removed. Spawning git there fails with ENOENT, which
-        // used to reach the panel verbatim ("failed to run git rev-parse
-        // --is-inside-work-tree: No such file or directory (os error 2)") and took the root
-        // picker with it, leaving no way back. Degrade to a workspace that is provably
-        // related, in scope — or fail closed — and report WHICH one vanished.
-        let (workspace, fallback_from) =
-            match super::resolve_workspace_cwd(&cwd, &relay_cwd, &device_scope, &allowed_roots)
-                .await
-                .into_readable()
-            {
-                Some(usable) => usable,
-                None => return Ok(WorkspaceDiffResponse::unavailable()),
-            };
-        let cwd = workspace.as_str().to_string();
-
-        // Enumerate from the session's OWN cwd, which has just cleared the scope
-        // check. This is the only source of selectable roots, so the picker can
-        // never name a repo the viewed session has no access to.
-        //
-        // Then drop every root the caller may not see. A linked worktree routinely
-        // lives OUTSIDE the session cwd's subtree, so "is a worktree of this repo" is
-        // not on its own permission to know it exists: for a narrow-scoped device the
-        // path and branch name are themselves privileged topology. Filtering here (not
-        // just at selection time) also keeps the picker honest — every option it shows
-        // is one that will actually load.
-        let roots: Vec<WorkspaceRootView> = super::list_worktrees(&cwd)
-            .await
-            .into_iter()
-            .filter(|candidate| {
-                path_within_device_scope(&candidate.path, &device_scope, &allowed_roots)
-            })
-            .collect();
-
-        // Where this thread has actually been writing, derived (never stored) from its
-        // own transcript tail. Reported for the picker; only ACTED on when the client
-        // explicitly asks via `auto_root`, so a plain refresh can never move the panel
-        // out from under someone reading it.
-        // `known` distinguishes "looked, nothing to suggest" from "could not look yet"
-        // (a cold thread whose transcript has not loaded). Without that distinction a
-        // client burns its one-shot auto-resolve on a thread whose history has not
-        // arrived, and never re-resolves.
-        let (suggested, suggested_root_known) = match thread_id.as_deref() {
-            // No thread selected: nothing to attribute, and that IS the final answer.
-            None => (None, true),
-            Some(tid) => {
-                let relay = self.relay.read().await;
-                match relay.runtime_for_thread(tid) {
-                    None => (None, false),
-                    Some(runtime) => (
-                        super::suggested_root_from_tools(
-                            runtime
-                                .transcript
-                                .iter()
-                                .rev()
-                                .take(super::SUGGESTED_ROOT_SCAN_LIMIT)
-                                .filter_map(|record| {
-                                    // Status travels WITH the tool: whether a write landed
-                                    // is the deciding factor, and dropping it here is what
-                                    // let a failed edit count as evidence.
-                                    record
-                                        .tool
-                                        .as_ref()
-                                        .map(|tool| (tool, record.status.as_str()))
-                                }),
-                            &roots,
-                        ),
-                        true,
-                    ),
-                }
-            }
-        };
-        // Only a root DIFFERENT from the session's own cwd is worth suggesting; the
-        // panel already defaults there.
-        let suggested = suggested.filter(|candidate| !super::paths_equivalent(candidate, &cwd));
-
-        let target = match root {
-            // Adopt the suggestion only on an explicit opt-in from the client, which
-            // sends it once per thread switch (see the picker's auto-resolve).
-            None if auto_root => suggested.clone().unwrap_or(cwd),
-            None => cwd,
-            Some(requested) => {
-                // Gate 1 — membership: the request must name a worktree we just
-                // enumerated. Resolve to the ENUMERATED path and hand *that* to git;
-                // the caller's own string is never used as a filesystem path, so a
-                // crafted selector cannot reach a tree we did not enumerate.
-                let Some(matched) = roots
-                    .iter()
-                    .find(|candidate| super::paths_equivalent(&candidate.path, &requested))
-                else {
-                    return Ok(WorkspaceDiffResponse::unavailable());
-                };
-                // Gate 2 — device scope. Redundant by construction now that `roots` is
-                // pre-filtered, and deliberately kept: it is the check that actually
-                // enforces the boundary, so it must not depend on a caller elsewhere
-                // remembering to filter first.
-                ensure_path_within_device_scope(&matched.path, &device_scope, &allowed_roots)?;
-                matched.path.clone()
-            }
-        };
-
-        // Resilient because the resolve above and this collect are two steps: a cleanup task
-        // can remove the tree in between, and the panel must not go back to showing a raw
-        // git spawn error when it loses that race.
+        // Tree can vanish between resolve and collect.
         let (mut response, retry_fallback) = super::collect_workspace_diff_resilient(
-            &target,
+            &diff_cwd,
             &relay_cwd,
             &device_scope,
             &allowed_roots,
+            &grants,
         )
         .await?;
         if response.unavailable {
             return Ok(response);
         }
-        response.roots = roots;
-        response.suggested_root = suggested;
-        response.suggested_root_known = suggested_root_known;
-        response.fallback_from = fallback_from.or(retry_fallback);
+        response.roots = resolved.roots;
+        response.fallback_from = match resolved.origin {
+            WorkspaceOrigin::Substituted { gone } => Some(gone),
+            _ => None,
+        }
+        .or(retry_fallback);
         Ok(response)
     }
 
@@ -348,7 +355,7 @@ impl AppState {
         let _slot = self.acquire_session_slot()?;
         self.ensure_thread_runtime_loaded(&requested_thread, &device_id)
             .await?;
-        let (thread_id, cwd, diff) = {
+        let (thread_id, cwd, diff, grants) = {
             let relay = self.relay.read().await;
             let thread_id = requested_thread;
             if relay.is_thread_review_locked(&thread_id) {
@@ -356,6 +363,11 @@ impl AppState {
             }
             if relay.is_thread_or_cwd_workflow_locked(&thread_id) {
                 return Err(WORKFLOW_LOCKED_THREAD_MSG.to_string());
+            }
+            // Rolling a file change back rewrites the working tree, and a task
+            // team's worktree has three agents in it.
+            if relay.is_thread_or_cwd_team_locked(&thread_id) {
+                return Err(TEAM_LOCKED_THREAD_MSG.to_string());
             }
             let runtime = relay
                 .runtime_for_thread(&thread_id)
@@ -379,10 +391,15 @@ impl AppState {
             // two cannot disagree about what "this patch" means.
             let diff = crate::protocol::patch_for_apply(tool)
                 .ok_or_else(|| format!("file change `{item_id}` has no diff to apply"))?;
-            (thread_id, runtime.current_cwd.clone(), diff)
+            (
+                thread_id,
+                runtime.current_cwd.clone(),
+                diff,
+                relay.trust_grants(),
+            )
         };
 
-        apply_unified_diff(&cwd, &diff, input.direction).await?;
+        apply_unified_diff(&cwd, &diff, input.direction, &grants).await?;
 
         let mut relay = self.relay.write().await;
         relay.set_file_change_apply_state_for_thread(

@@ -298,6 +298,37 @@ const FAILED_TURN_REASONS = {
   error_max_budget_usd: "reached the maximum budget",
   error_max_structured_output_retries: "exceeded the structured-output retry limit",
 };
+/**
+ * The accounting fields of an SDK `result` message.
+ *
+ * The relay used to receive `usage` alone, which is enough for a headline
+ * number and not enough to attribute it. Two additions:
+ *
+ * - `model_usage` — the SDK's `modelUsage`, the same spend split by model. A
+ *   turn can span several (a subagent on a cheaper model, a fallback after a
+ *   refusal), and without this the relay has to guess from the thread's
+ *   configured model, which puts a Haiku subagent's tokens under Opus.
+ * - `total_cost_usd` — the provider's own price for the turn. The relay never
+ *   computes cost locally: per-model pricing changes, and on a subscription
+ *   plan there is no per-token bill at all.
+ *
+ * PRIVACY: every field here is a NUMBER or a model id. Nothing derived from
+ * conversation content crosses this boundary — `done` rides the relay's event
+ * stream to every paired device, so a field carrying user content would leak a
+ * background thread's work to devices with no path scope for it. Keep it that
+ * way when adding fields: `permission_denials`, for instance, carries tool
+ * inputs and must NOT be forwarded here.
+ */
+function turnAccounting(msg) {
+  const out = {};
+  if (msg.usage !== undefined) out.usage = msg.usage;
+  if (msg.modelUsage !== undefined) out.model_usage = msg.modelUsage;
+  if (typeof msg.total_cost_usd === "number") {
+    out.total_cost_usd = msg.total_cost_usd;
+  }
+  return out;
+}
+
 export function failedTurnReason(subtype) {
   if (typeof subtype === "string" && subtype in FAILED_TURN_REASONS) {
     return `Claude turn failed: ${FAILED_TURN_REASONS[subtype]}`;
@@ -515,10 +546,10 @@ export function mapSdkMessage(msg) {
         const reason = failedTurnReason(msg.subtype);
         return [
           { type: "error", message: reason },
-          { type: "done", usage: msg.usage, failed: true, reason },
+          { type: "done", ...turnAccounting(msg), failed: true, reason },
         ];
       }
-      return { type: "done", usage: msg.usage };
+      return { type: "done", ...turnAccounting(msg) };
     }
 
     default:

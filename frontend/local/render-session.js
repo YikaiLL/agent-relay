@@ -29,11 +29,25 @@ import {
   threadsCount,
   threadsList,
   projectOverviewMount,
+  taskTeamMount,
+  teamsLibraryMount,
+  reviewScreenMount,
+  usageReportMount,
+  sidebarTaskListMount,
+  sidebarTeamsListMount,
+  sidebarNavMount,
+  iconRailNavMount,
+  sidebarTopActionsMount,
+  sidebarSearchMount,
   transcript,
   workspaceSubtitle,
-  headerNewAgentButton,
   workspaceSuggestionsList,
 } from "./dom.js";
+import {
+  imageFileToDataUrl,
+  pastedImageFiles,
+  validateImageAttachments,
+} from "./image-attachments.js";
 import React from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
@@ -43,8 +57,9 @@ import {
   selectPinnedProjectId,
   summarizeThreadGroups,
 } from "../shared/thread-groups.js";
-import { selectOwningContext } from "./session-view-state.js";
-import { syncComposerError } from "./composer-error.js";
+import { selectOwningContext } from "../shared/session-view-state.js";
+import { shouldShowAuditEntry } from "../shared/audit-log.js";
+import { composerErrorFor, syncComposerError } from "./composer-error.js";
 import { selectWorkspaceSuggestionsModel } from "../shared/workspace-suggestions.js";
 import { isUnknownWorkspace } from "../shared/thread-groups.js";
 import {
@@ -62,6 +77,8 @@ import { selectThreadState } from "../shared/thread-dot.js";
 import { canForkInSession } from "../shared/fork-fields.js";
 import {
   readActiveProjectId,
+  readSearchUi,
+  readThreadFilter,
   readThreadListContextMenu,
   readThreadListUi,
 } from "../shared/thread-list-store.js";
@@ -107,6 +124,34 @@ import {
   reusableReviewersFromReviews,
 } from "../shared/reviews-cache.js";
 import { createWorkflowsCache } from "../shared/workflows-cache.js";
+import { createTeamsCache } from "../shared/teams-cache.js";
+import {
+  sortTeamRuns,
+  teamsNeedingYou,
+  teamsRevisionOf,
+} from "../shared/task-team-model.js";
+import { loadSeenTasks } from "./task-seen-prefs.js";
+import { tasksLocked, usageLocked } from "../shared/beta-gate.js";
+import { TaskSidebarList, TaskTeamScreen } from "../shared/task-team-react.js";
+import { createOrchestratorChatActions } from "../shared/orchestrator-chat.js";
+import { orchestratorCanWrite } from "../shared/orchestrator-write-gate.js";
+import { TaskDiffPane } from "../shared/task-diff-react.js";
+import { TaskReviewScreen } from "../shared/task-review-screen.js";
+import {
+  BUILTIN_TEAM_ID,
+  listLibraryTeams,
+  TeamsLibraryScreen,
+  TeamsSidebarList,
+} from "../shared/teams-library-react.js";
+import { teamsFromCatalog } from "../shared/teams-library-model.js";
+import { UsageReportScreen } from "../shared/usage-report-react.js";
+import { windowForBucket } from "../shared/usage-windows.js";
+import { SidebarNav, SidebarNavRail } from "../shared/sidebar-nav.js";
+import {
+  SidebarBellToggle,
+  SidebarSearchField,
+  SidebarSearchToggle,
+} from "../shared/sidebar-chrome.js";
 import {
   buildReviewingThreadSet,
   canRequestReview,
@@ -122,7 +167,13 @@ import {
   selectWorkflowLaunchModel,
   workflowRunsForThread,
 } from "../shared/workflow-state.js";
-import { projectViewOnlySession } from "./view-only-thread.js";
+import {
+  mergeOlderViewOnlyPage,
+  projectViewOnlySession,
+  VIEW_ONLY_LOAD_RETRY_BACKOFF_MS,
+} from "./view-only-thread.js";
+import { selectControlBannerModel } from "./control-banner.js";
+import { readWorkspaceRepair } from "./workspace-repair.js";
 import { canComposeThread, composerButtonState } from "../shared/thread-compose.js";
 import { saveLastEffort } from "../shared/last-used-settings.js";
 import {
@@ -133,12 +184,22 @@ import {
   TextContent,
 } from "./react-session-panels.js";
 import { ThreadGroupList } from "../shared/thread-list-react.js";
-import { buildThreadActivityMap } from "../shared/thread-activity.js";
+import { buildThreadActivityMap, threadActivityFor } from "../shared/thread-activity.js";
+import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
+import { copyTextToClipboard } from "../shared/clipboard.js";
+import { refreshedPinPage } from "./pin-page.js";
+import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
+import { createTranscriptInteractionHandler } from "../shared/transcript-interactions.js";
 import { describeStatusChips } from "../shared/session-status.js";
 import { selectStatusBadge } from "./status-badge.js";
-import { selectHeaderLabels } from "./header-labels.js";
+import { selectHeaderLabels } from "../shared/header-labels.js";
 import { selectStandbyEmptyModel, buildStandbyEmptyActions } from "./standby-empty-state.js";
-import { sessionIsWorking, threadAttention } from "../shared/thread-attention.js";
+import {
+  findPendingInputRequestIds,
+  pendingAskUserQuestionsForThread,
+  sessionIsWorking,
+  threadAttention,
+} from "../shared/thread-attention.js";
 import {
   configureThreadNotifications,
   ensureNotificationPermission,
@@ -244,6 +305,13 @@ export function createSessionRenderer({
   requestReview,
   startWorkflow,
   setReviewSlice,
+  // Same ResolvedWorkspace the Changes/Reviewer panels read, so all three stay aligned.
+  getThreadWorkspace = () => null,
+  pinThreadWorkspace = null,
+  // Grant this relay permission to run git in a tree, offered inside the review dialog
+  // when the tree it is about to review is one the relay may not read. Local surface
+  // only — the remote shell renders its own nudge and passes nothing here.
+  trustThreadWorkspace = null,
   reviewsCache = createReviewsCache(),
   workflowsCache = createWorkflowsCache(),
   fetchReviews,
@@ -256,6 +324,51 @@ export function createSessionRenderer({
   enterProjectOverview,
   startProjectAgent,
   openProjectContextMenu,
+  // ---- Task screen ----
+  // `getViewContext` rather than a derived boolean: the context is the canonical
+  // answer to "what is on screen", and the Task screen needs both halves of it
+  // (which screen, and which task).
+  teamsCache = createTeamsCache(),
+  fetchTeams,
+  fetchUsage,
+  fetchTeamCatalog,
+  ensureOrchestrator,
+  resetOrchestrator,
+  fetchTeamDiff,
+  fetchTaskLineComments,
+  createTaskLineComment,
+  resolveTaskLineComment,
+  handBackTaskLineComment,
+  fetchTaskReviewTicks,
+  tickTaskReviewFile,
+  proposeOrchestratorTask,
+  confirmOrchestratorProposal,
+  dismissOrchestratorProposal,
+  sendMessage,
+  fetchTranscriptPage,
+  setUsageBudget,
+  getViewContext = () => ({ kind: "sessions" }),
+  // The sidebar nav's two destinations. Injected, not imported: the shared component
+  // takes `current` in and emits these out, which is the entire seam that keeps it from
+  // learning about local's `session-view-state.js` — a real state machine with
+  // invariants that remote has no equivalent of.
+  onOpenSessionsScreen = () => {},
+  onOpenTasksScreen = () => {},
+  onOpenUsageScreen = () => {},
+  onOpenTeamsScreen = () => {},
+  // Reached from a task's changes summary rather than from the sidebar, so it
+  // carries the run id the other destinations do not need.
+  onOpenReviewScreen = null,
+  // The sidebar's narrowing controls. Injected because each carries a TRANSPORT: the
+  // search field's debounce plus its HTTP query, and the bell's re-render of the list.
+  // The components see neither — only these callbacks.
+  onSetSearchOpen = () => {},
+  onSearchInput = () => {},
+  onToggleActivityFilter = () => {},
+  onOpenTask,
+  onBackToTasks,
+  onTeamAction,
+  onStartTask,
 }) {
   // Look a thread up across everything the user can currently see — the authoritative
   // list plus any search result from beyond it. Lookups only; see `findVisibleThread`.
@@ -391,12 +504,6 @@ export function createSessionRenderer({
       labelTooltip: headerLabels.titleTooltip,
     });
     workspaceSubtitle.textContent = headerLabels.subtitle;
-    if (headerNewAgentButton) {
-      // The id rides on the element so the click handler in app.js doesn't have to
-      // re-derive which project the header is naming.
-      headerNewAgentButton.hidden = !headerLabels.newAgentProjectId;
-      headerNewAgentButton.dataset.projectId = headerLabels.newAgentProjectId || "";
-    }
 
     // Three-way main view: a live/read-only conversation always wins; otherwise, in
     // Projects mode with a selected project, the card overview replaces the console
@@ -409,17 +516,48 @@ export function createSessionRenderer({
     // `projectsViewMode` half of that condition went with the Sessions/Projects toggle.
     const showProjectOverview = false;
     void activeProjectId;
-    const mainView = viewingConversation
-      ? "conversation"
-      : showProjectOverview
-        ? "project-overview"
-        : "console";
+    // The Task screen is decided by the CONTEXT, not by what is or is not open.
+    // Its context routes no thread (SHOW_OVERVIEW sets threadId null), so
+    // `viewingConversation` is already false whenever it is showing — but reading
+    // the context first keeps the two from ever disagreeing about what is on
+    // screen, which is the whole reason `location` is canonical.
+    const viewKind = getViewContext()?.kind;
+    const onTaskScreen = viewKind === "tasks";
+    const onTeamsScreen = viewKind === "teams";
+    const onUsageScreen = viewKind === "usage";
+    const onReviewScreen = viewKind === "review";
+    const mainView = onUsageScreen
+      ? "usage"
+      : onTeamsScreen
+        ? "teams"
+        : onReviewScreen
+          ? "review"
+          : onTaskScreen
+            ? "tasks"
+            : viewingConversation
+              ? "conversation"
+              : showProjectOverview
+                ? "project-overview"
+                : "console";
     if (chatShell) {
       chatShell.dataset.view = mainView;
     }
     if (appShell) {
       appShell.dataset.view = mainView;
     }
+    // No `document.body.dataset.view` mirror any more, and no `aria-current` sweep over
+    // the nav rows. Both existed to solve the same problem in two places: the nav was
+    // static markup, so "which destination am I on" had to reach it from outside — as a
+    // CSS selector on an ancestor attribute (`body[data-view]` for the rail,
+    // `.app-shell[data-view]` for the rows) AND as an imperative accessibility write
+    // here, because CSS cannot set `aria-current`. Two writes, one fact, free to
+    // disagree.
+    //
+    // `renderSidebarNav()` below now passes the destination in as a prop, and the shared
+    // component sets the class and `aria-current` from the same comparison. `appShell`
+    // and `chatShell` keep their `data-view` because other rules genuinely switch on it
+    // (which sidebar BODY shows, whether the transcript is mounted) — that is a layout
+    // switch, not a duplicate of the nav's state.
     if (sessionHistoryDrawer) {
       // A pinned project keeps the drawer open: picking one is a request to see its
       // sessions, and the old rule (open only while viewing a conversation) left the
@@ -462,6 +600,68 @@ export function createSessionRenderer({
     renderAuditTimeline(session.logs || []);
     if (showProjectOverview) {
       renderProjectOverview();
+    }
+    // Sync the Teams channel on EVERY render, not only while the Task screen is
+    // open. It is revision-gated, so an unchanged run set costs nothing — and the
+    // sidebar badge has to be able to say "a task is waiting on you" from wherever
+    // the user happens to be, which is the whole point of walking away from one.
+    // …unless Tasks is locked: the server returns an empty list, so this would
+    // be one request per revision for a feature the user cannot open.
+    if (typeof fetchTeams === "function" && !tasksLocked(session)) {
+      void teamsCache.sync(
+        teamsRevisionOf(session),
+        () => fetchTeams(),
+        () => renderSession(state.session || session),
+        (error) => {
+          // Reported, not swallowed: a relay answering 500 forever otherwise looks
+          // exactly like a slow one. Re-render only on a CHANGE, or a failing
+          // endpoint would drive a render per frame.
+          const next = error ? error.message || String(error) : null;
+          if (state.teamsError !== next) {
+            state.teamsError = next;
+            renderSession(state.session || session);
+          }
+        }
+      );
+    }
+    renderSidebarNav();
+    renderSidebarChrome();
+    renderSidebarTaskList();
+    renderSidebarTeamsList();
+    if (!onTaskScreen) {
+      // Cleared HERE, not in renderTaskTeam, which only ever runs while the
+      // Tasks screen is up and so can never say "and now it isn't". Left set,
+      // it would keep claiming the Orchestrator is on screen and send the
+      // conversation's own detail fetches to the wrong thread.
+      state.orchestratorOnScreenThreadId = null;
+    }
+    if (onTaskScreen) {
+      renderTaskTeam(session);
+      if (!state.teamCatalog && !state.teamCatalogLoading && !tasksLocked(session)) {
+        state.teamCatalogLoading = true;
+        void loadTeamCatalog().finally(() => {
+          state.teamCatalogLoading = false;
+        });
+      }
+    }
+    if (onTeamsScreen) {
+      renderTeamsLibrary(session);
+      if (!state.teamCatalog && !state.teamCatalogLoading) {
+        state.teamCatalogLoading = true;
+        void loadTeamCatalog().finally(() => {
+          state.teamCatalogLoading = false;
+        });
+      }
+    }
+    if (onReviewScreen) {
+      renderReviewScreen();
+    }
+    if (onUsageScreen) {
+      if (!state.usageReport && !state.usageLoading && !state.usageError) {
+        void loadUsageReport(state.usageBucket || "day");
+      } else {
+        renderUsageReport();
+      }
     }
     if (!viewingConversation || viewingSessionDetails) {
       renderSessionMeta(session);
@@ -570,6 +770,12 @@ export function createSessionRenderer({
   }
 
   function renderSessionUnavailable(message) {
+    // The nav is chrome, not session content: an offline relay is still a moment where
+    // the user needs to be able to move between Sessions and Tasks. It used to be static
+    // markup in the shell and could not go missing; mounted, it has to be rendered by
+    // every top-level state or it silently is not there.
+    renderSidebarNav();
+    renderSidebarChrome();
     renderOverviewState(null, message);
     renderWorkspaceSuggestions(null);
     renderHeaderModelBadge(null);
@@ -596,6 +802,12 @@ export function createSessionRenderer({
     state.session = null;
     state.threads = [];
     state.threadGroups = [];
+    // This path runs at BOOT whenever there is no API token, so it is the first thing a
+    // signed-out user sees. Without this the sidebar rendered with no destinations in it
+    // at all — the nav was static markup before it was a mount, so nothing had to think
+    // about which states repaint it.
+    renderSidebarNav();
+    renderSidebarChrome();
     cancelControllerHeartbeat();
     cancelControllerLeaseRefresh();
     // Clear the independently-mounted Reviewer tab so it does not retain job
@@ -992,10 +1204,13 @@ export function createSessionRenderer({
       workflowRuns: threadWorkflowRuns,
       reviewModel: reviewLaunchModel(session),
       workflowModel: workflowLaunchModel(session),
-      // Existing reviewer threads of the VIEWED thread (same scope as the review job
-      // cards above), offered for reuse. Provider filtering happens in the panel (it
-      // reacts to the chosen provider).
-      reusableReviewers: reusableReviewersFromReviews(reviewsData, viewedThreadId, null),
+      // Filter reuse by working tree here: the relay refuses a reviewer bound to another tree.
+      reusableReviewers: reusableReviewersFromReviews(
+        reviewsData,
+        viewedThreadId,
+        null,
+        getThreadWorkspace()?.cwd || null
+      ),
       // Full reviewer-thread list so each card can show its reviewer thread's
       // (long, truncated-with-tooltip) name by joining on reviewer_thread_id.
       reviewerThreads: reviewsData.reviewer_threads || [],
@@ -1032,6 +1247,7 @@ export function createSessionRenderer({
       return;
     }
     const reviewModel = reviewLaunchModel(session);
+    const workspace = getThreadWorkspace();
     renderReactContent(
       reviewIdleNudge,
       h(
@@ -1049,9 +1265,13 @@ export function createSessionRenderer({
           reusableReviewers: reusableReviewersFromReviews(
             reviewsCache.current(),
             state.viewThreadId || session?.active_thread_id || null,
-            null
+            null,
+            workspace?.cwd || null
           ),
           parentThreadId: state.viewThreadId || session?.active_thread_id || null,
+          workspace,
+          onPinWorkspace: pinThreadWorkspace,
+          onTrustWorkspace: trustThreadWorkspace,
           disabled: false,
           onSubmit: (values) => requestReview(values),
         })
@@ -1059,47 +1279,57 @@ export function createSessionRenderer({
     );
   }
 
+  // What the banner shows is decided in local/control-banner.js — including that a
+  // missing workspace outranks take-over. This function only paints it.
+  //
+  // NOTE ON THE COMPOSER: it stays enabled while the workspace is missing, on
+  // purpose. A send is harmless now (the relay keeps the message and appends a
+  // visible error naming the directory instead of reaching the provider), and this
+  // banner's `workspace_missing` is only as fresh as the last tail fetch. Disabling
+  // the composer would make a STALE "missing" unfalsifiable: a user who re-created
+  // the directory by hand would be locked out of a workspace that is actually back,
+  // with no action left that could prove it. A send is exactly that proof — it
+  // re-fetches the tail, so it either goes through or re-states the problem in the
+  // transcript. The banner is the fast path; the composer is the one that self-heals.
   function renderControlBanner(session) {
     const activeUnderReview = isReviewInProgressForThread(session, session.active_thread_id);
     const activeUnderWorkflow = isWorkflowInProgressForThread(session, session.active_thread_id);
     const activeLockedByAgent = activeUnderReview || activeUnderWorkflow;
-    const sessionWorking = sessionIsWorking(session);
-    if (session.view_only && sessionWorking && !activeLockedByAgent) {
-      controlBanner.hidden = false;
-      renderReactContent(
-        controlBanner,
-        h(ControlBannerContent, {
-          hint: "This background session is still running. Stop it or take over to continue here.",
-          showTakeOver: true,
-          summary: "Background session is running",
-        })
-      );
-      return;
-    }
-    if (
-      !session.active_thread_id
-      || !isViewingConversation(session)
-      || !session.active_controller_device_id
-      || isCurrentDeviceActiveController(session)
-      || (!sessionWorking && !activeLockedByAgent)
-    ) {
+    const repair = readWorkspaceRepair(state, session.active_thread_id);
+    const model = selectControlBannerModel({
+      controllerName: session.active_controller_device_id
+        ? controllerLabel(session.active_controller_device_id)
+        : "",
+      hasActiveThread: Boolean(session.active_thread_id),
+      hasController: Boolean(session.active_controller_device_id),
+      isController: isCurrentDeviceActiveController(session),
+      // Review/workflow owns this turn sequence while non-terminal.
+      lockedByAgent: activeLockedByAgent,
+      lockedByWorkflow: activeUnderWorkflow,
+      repairError: repair.error,
+      repairPending: repair.pending,
+      sessionWorking: sessionIsWorking(session),
+      viewingConversation: isViewingConversation(session),
+      viewOnly: Boolean(session.view_only),
+      // Straight off the snapshot: the relay decides this on the paths that touch the
+      // workspace and caches it on the thread runtime, so every render already has it.
+      workspaceMissing: session.workspace_missing,
+    });
+
+    if (model.hidden) {
       controlBanner.hidden = true;
       return;
     }
 
     controlBanner.hidden = false;
-    // Only the thread actually owned by review/workflow is off-limits for take-over.
     renderReactContent(
       controlBanner,
       h(ControlBannerContent, {
-        hint: activeLockedByAgent
-          ? activeUnderWorkflow
-            ? "This session is locked by Code Flow; it unlocks when the workflow finishes."
-            : "This session is being reviewed; it unlocks when the review finishes."
-          : "You can still approve from this device. Take over when you want to type or continue the session.",
-        // Review/workflow owns this turn sequence while non-terminal.
-        showTakeOver: !activeLockedByAgent,
-        summary: `Another device has control (${controllerLabel(session.active_controller_device_id)})`,
+        hint: model.hint,
+        repair: model.repair,
+        showTakeOver: model.showTakeOver,
+        summary: model.summary,
+        summaryTitle: model.summaryTitle,
       })
     );
   }
@@ -1435,16 +1665,28 @@ export function createSessionRenderer({
       alreadyAnchoredUserIds: anchorsForThread,
       nextEntries: entries,
       nextThreadId: localThreadId,
+      // An approval / AskUser question is not a transcript entry, so it needs its
+      // own trigger to be brought into view when it arrives (it renders last, at
+      // the bottom). Fire-once, keyed on the request ids — plural because a
+      // second question can arrive while the first is still outstanding.
+      pendingInputRequestIds: findPendingInputRequestIds(session, localThreadId),
       previousSnapshot,
       restoredScrollPosition,
       scrollElement: transcript,
     });
-    // Record the latest user entry handled by this action. New-message actions
-    // use this to avoid re-jumping mid-stream; thread-transition actions use it
-    // to establish the loaded transcript as a baseline so the next snapshot
-    // cannot mistake retained history for a newly-sent message.
-    if (action?.userEntryId) {
-      anchorsForThread.add(action.userEntryId);
+    // Record what this action handled. New-message actions use this to avoid
+    // re-jumping mid-stream; thread-transition actions use it to establish the
+    // loaded transcript as a baseline so the next snapshot cannot mistake
+    // retained history for a newly-sent message. One Set serves both kinds —
+    // request ids are namespaced, so they cannot collide with item ids.
+    const handledScrollIds = [
+      action?.userEntryId,
+      ...(action?.inputRequestIds || []),
+    ].filter(Boolean);
+    if (handledScrollIds.length) {
+      for (const handledId of handledScrollIds) {
+        anchorsForThread.add(handledId);
+      }
       state.localTranscriptScrollAnchors.set(localThreadId, anchorsForThread);
     }
     state.localTranscriptScrollSnapshot = captureTranscriptScrollSnapshot({
@@ -1489,7 +1731,7 @@ export function createSessionRenderer({
     // the group structure with state buckets rather than narrowing within it, so a
     // pinned group cannot survive it. Standing the pin down beats rendering a control
     // that visibly does nothing.
-    const filtering = isThreadFilterActive(state.threadFilter);
+    const filtering = isThreadFilterActive(readThreadFilter(state.threadListStore));
     // Gated on the selection alone. It used to require `viewMode === "projects"` as
     // well, which was the toggle's last hold on the list: with the toggle gone that
     // condition is permanently false, so the pin would simply never apply.
@@ -1542,15 +1784,24 @@ export function createSessionRenderer({
       });
     // Monotonic accumulator, not derived state: it only ever grows while the filter is
     // on, so computing it here cannot cause a re-render loop.
-    state.threadFilter.retained = nextRetainedStates(
-      state.threadFilter.retained,
+    //
+    // Written through the store's setter rather than by mutating `retained` in place.
+    // Nothing on local SUBSCRIBES to this store — it is read with `getState()` from
+    // imperative code — so a write during a render pass notifies nobody and cannot loop.
+    // Remote, which does subscribe, keeps the same write in an effect for that reason.
+    const threadFilter = readThreadFilter(state.threadListStore);
+    const retainedNext = nextRetainedStates(
+      threadFilter.retained,
       listView.groups,
-      state.threadFilter,
+      threadFilter,
       stateOf
     );
+    if (retainedNext !== threadFilter.retained) {
+      state.threadListStore.getState().setThreadFilterRetained(retainedNext);
+    }
     const filterView = selectThreadFilterView({
       groups: listView.groups,
-      filter: state.threadFilter,
+      filter: { ...threadFilter, retained: retainedNext },
       stateOf,
     });
     // The pinned group's header carries the same activity roll-up ("2 working" /
@@ -1670,6 +1921,1159 @@ export function createSessionRenderer({
         state.threadHistoryScrollTop = threadsList.scrollTop;
       }
     });
+  }
+
+  // The sidebar's destination nav, in both of its forms.
+  //
+  // This is local's HOST for `shared/sidebar-nav.js`: it binds a surface-agnostic
+  // component to local's routing (`onOpenSessionsScreen` / `onOpenTasksScreen`, injected
+  // rather than imported, so the nav never learns what `session-view-state.js` is) and to
+  // local's notion of a waiting task. It replaced four id-addressed click listeners in
+  // app.js, an `aria-current` sweep, and two hand-written copies of the same two buttons.
+  //
+  // Both mounts get the SAME props. The rail is not a second nav — it is the same nav
+  // with the labels dropped, and it is the only one on screen while the sidebar is
+  // collapsed, so a count that lived only in the sidebar would go quiet in exactly the
+  // state where the user has the least on screen to notice it.
+  //
+  // The badge counts tasks WAITING ON A PERSON, not tasks that exist: a number meaning
+  // "runs in the list" would never go away — a terminal run stays forever — so the badge
+  // would stop meaning anything the first time one finished.
+  // The sidebar's top-bar controls and the search field.
+  //
+  // Local's host for `shared/sidebar-chrome.js`. Three things used to carry this between
+  // them: static markup in react-shell.js, five `getElementById` handles in app.js, and a
+  // `syncActivityFilterChrome()` whose whole job was keeping `is-active`/`aria-pressed` in
+  // step with the store. All of it collapses into "read the state, pass it as props".
+  //
+  // The field is ABSENT when closed rather than hidden — the change that let one component
+  // serve both surfaces. Everything inside it lost its id in the process, which is what
+  // makes it safe for remote to mount the same component without colliding.
+  function renderSidebarChrome() {
+    const searchUi = readSearchUi(state.threadListStore);
+    const filter = readThreadFilter(state.threadListStore);
+    renderReactContent(
+      sidebarTopActionsMount,
+      h(
+        React.Fragment,
+        null,
+        h(SidebarSearchToggle, {
+          open: searchUi.open,
+          onToggle: onSetSearchOpen,
+          // Local binds ⌘F (app.js); remote has no such key, so the hint is a prop rather
+          // than baked into the label.
+          shortcutHint: "⌘F",
+        }),
+        h(SidebarBellToggle, {
+          on: filter.on,
+          onToggle: (on) => onToggleActivityFilter({ on }),
+        })
+      )
+    );
+    renderReactContent(
+      sidebarSearchMount,
+      h(SidebarSearchField, {
+        open: searchUi.open,
+        query: searchUi.draft,
+        onInput: onSearchInput,
+        onClose: () => onSetSearchOpen(false),
+        // Local reveals the field from a keyboard shortcut (⌘F), so focusing it is the
+        // point. Remote leaves this off: on a phone, focusing pops the on-screen keyboard
+        // over the list the user just asked to see.
+        focusOnOpen: true,
+        // The counter, so ⌘F focuses an ALREADY-OPEN field too. `open` does not change in
+        // that case, so a mount-only `autoFocus` made the shortcut look dead.
+        focusSignal: searchUi.focusSignal,
+      })
+    );
+  }
+
+  function renderSidebarNav() {
+    const context = getViewContext() || {};
+    // `loadSeenTasks()` is a localStorage read per render. It is a single small JSON
+    // parse, and the alternative — caching it — needs an invalidation path for a value
+    // the user changes by clicking, which is the more expensive kind of wrong.
+    const locked = tasksLocked(state.session);
+    const props = {
+      // Full-area contexts own their destination key; everything else is Sessions.
+      // Teams is reached from the Tasks footer (13a), so the Tasks row stays current.
+      // Review is reached from inside a task, so the Tasks row stays current for
+      // the same reason Teams does — the nav names where you came from, and
+      // going one level deeper is not leaving.
+      current:
+        context.kind === "tasks" || context.kind === "teams" || context.kind === "review"
+          ? "tasks"
+          : context.kind === "usage"
+            ? "usage"
+            : "sessions",
+      // Locked means nothing can be waiting on you.
+      tasksWaitingCount: teamsNeedingYou(
+        locked ? [] : teamsCache.current().teams,
+        loadSeenTasks()
+      ),
+      tasksBeta: locked,
+      usageBeta: usageLocked(state.session),
+      onOpenSessions: onOpenSessionsScreen,
+      onOpenTasks: onOpenTasksScreen,
+      onOpenUsage: onOpenUsageScreen,
+    };
+    renderReactContent(sidebarNavMount, h(SidebarNav, props));
+    renderReactContent(iconRailNavMount, h(SidebarNavRail, props));
+  }
+
+  // The task list in the sidebar — the Tasks tab's body, opposite the session
+  // list. Rendered on every pass, not only while the Tasks view is showing: the
+  // sidebar is CSS-gated, so keeping it current costs nothing and means switching
+  // tabs never shows a stale or empty column for a frame.
+  function renderSidebarTaskList() {
+    if (!sidebarTaskListMount) {
+      return;
+    }
+    const context = getViewContext() || {};
+    const loaded = teamsCache.hasData();
+    renderReactContent(
+      sidebarTaskListMount,
+      h(TaskSidebarList, {
+        runs: loaded ? sortTeamRuns(teamsCache.current().teams) : null,
+        loading: !loaded,
+        // Without this the sidebar reads "Loading…" forever on a persistent
+        // failure while the main area correctly says the relay is unreachable —
+        // two surfaces disagreeing about the same fetch.
+        error: state.teamsError || null,
+        // The review screen is about one run, so its row stays selected in it —
+        // otherwise opening the changes reads as navigating away from the task.
+        selectedRunId:
+          context.kind === "tasks" || context.kind === "review"
+            ? context.teamRunId || null
+            : null,
+        locked: tasksLocked(state.session),
+        seenAt: loadSeenTasks(),
+        onOpenTask: (teamRunId) => onOpenTask?.(teamRunId),
+        onStartTask: () => onStartTask?.(),
+        onOpenTeams: () => onOpenTeamsScreen?.(),
+        teamsSummary: (() => {
+          const teams = teamsFromCatalog(state.teamCatalog);
+          const n = teams.length;
+          return `${n} team${n === 1 ? "" : "s"}`;
+        })(),
+      })
+    );
+  }
+
+  function renderSidebarTeamsList() {
+    if (!sidebarTeamsListMount) {
+      return;
+    }
+    const context = getViewContext() || {};
+    const teams = teamsFromCatalog(state.teamCatalog);
+    renderReactContent(
+      sidebarTeamsListMount,
+      h(TeamsSidebarList, {
+        teams,
+        selectedTeamId: context.kind === "teams" ? context.teamId || BUILTIN_TEAM_ID : BUILTIN_TEAM_ID,
+        locked: tasksLocked(state.session),
+        onSelectTeam: (teamId) => onOpenTeamsScreen?.(teamId),
+        onBackToTasks: () => onOpenTasksScreen?.(),
+      })
+    );
+  }
+
+  // Fill the Usage screen. Callers gate this on mainView === "usage".
+  function renderUsageReport() {
+    if (!usageReportMount) {
+      return;
+    }
+    const bucket = state.usageBucket || "day";
+    renderReactContent(
+      usageReportMount,
+      h(UsageReportScreen, {
+        locked: usageLocked(state.session),
+        budgetPending: state.usageBudgetPending === true,
+        onSetBudget: (patch) => void saveUsageBudget(patch),
+        report: state.usageReport ?? null,
+        loading: state.usageLoading === true,
+        error: state.usageError || null,
+        bucket,
+        onBucketChange: (next) => {
+          if (next === bucket) return;
+          state.usageBucket = next;
+          void loadUsageReport(next);
+        },
+        onRetry: () => void loadUsageReport(bucket),
+      })
+    );
+  }
+
+  // Save a budget change, then re-read the report rather than patching the
+  // local copy from the receipt. The screen shows a cap, a policy AND a
+  // projection derived from both; reconciling those by hand is how a screen
+  // starts disagreeing with the server it just wrote to.
+  async function saveUsageBudget(patch) {
+    if (typeof setUsageBudget !== "function" || usageLocked(state.session)) {
+      return;
+    }
+    state.usageBudgetPending = true;
+    renderUsageReport();
+    try {
+      await setUsageBudget(patch);
+      state.usageBudgetPending = false;
+      await loadUsageReport(state.usageBucket || "day");
+    } catch (error) {
+      state.usageBudgetPending = false;
+      state.usageError = error?.message || "Failed to save the budget";
+      renderUsageReport();
+    }
+  }
+
+  async function loadUsageReport(bucket = state.usageBucket || "day") {
+    // Ahead of every other check, including the transport one. The screen is
+    // loaded from the render pass, from a bucket switch and from Retry; putting
+    // the gate here rather than at those three call sites is what stops a fourth
+    // one from quietly reaching the network. Read from the live snapshot so a
+    // relay restarted without `--beta` re-locks a screen the user is standing on.
+    if (usageLocked(state.session)) {
+      state.usageLoading = false;
+      state.usageError = null;
+      renderUsageReport();
+      return;
+    }
+    if (typeof fetchUsage !== "function") {
+      state.usageError = "Usage API is not wired on this surface.";
+      state.usageLoading = false;
+      renderUsageReport();
+      return;
+    }
+    const requestId = (state.usageRequestId || 0) + 1;
+    state.usageRequestId = requestId;
+    state.usageBucket = bucket;
+    state.usageLoading = true;
+    state.usageError = null;
+    renderUsageReport();
+    try {
+      const window = windowForBucket(bucket);
+      const report = await fetchUsage({
+        ...window,
+        compare: "previous",
+      });
+      if (state.usageRequestId !== requestId) return;
+      state.usageReport = report;
+      state.usageLoading = false;
+      state.usageError = null;
+    } catch (error) {
+      if (state.usageRequestId !== requestId) return;
+      state.usageLoading = false;
+      state.usageError = error?.message || String(error);
+    }
+    renderUsageReport();
+  }
+
+  // Fill the Task screen. Callers gate this on mainView === "tasks".
+  //
+  // Reads the teams sidecar, which is keyed on the snapshot's `teams_revision` —
+  // a content hash, so an unchanged run set costs no request and a sub-task
+  // advancing costs exactly one.
+  let orchestratorHistoryLoader = null;
+  let orchestratorHistoryScroller = null;
+
+  function renderTaskTeam(session) {
+    if (!taskTeamMount) {
+      return;
+    }
+    const context = getViewContext() || {};
+    const loaded = teamsCache.hasData();
+    const teams = loaded ? sortTeamRuns(teamsCache.current().teams) : null;
+    const seenAt = loadSeenTasks();
+    const locked = tasksLocked(session);
+    if (!locked) {
+      void ensureOrchestratorReady(session);
+    }
+    const localUi = readLocalUiState(state.localUiStore);
+    const orchId = state.orchestratorThreadId || session?.orchestrator_thread_id || null;
+    // Declare, for the whole surface, that the thread on screen is this one.
+    // Detail expansion and file-diff loading resolve against it (see
+    // local/displayed-thread.js); without this they would silently query the
+    // session's active thread while you are looking at the Orchestrator.
+    state.orchestratorOnScreenThreadId = locked ? null : orchId;
+    // The approval belonging to THIS thread. `pending_approvals[0]` is the
+    // conversation's pick and can easily be another thread's.
+    const orchApproval =
+      (session?.pending_approvals || []).find(
+        (request) => (request?.thread_id || session?.active_thread_id) === orchId
+      ) || null;
+    const orchIsActive = Boolean(orchId && session?.active_thread_id === orchId);
+    const orchActivity = threadActivityFor(session, orchId);
+    // Streamed deltas leave their entry `status: "running"`, and the settling
+    // patch is only routed to the ACTIVE thread. The conversation's pin survives
+    // that because something refreshes it periodically; the Orchestrator has no
+    // such refresher, so its last message would read as forever-streaming.
+    // So it needs the same refresh policy the conversation's pin gets, and that
+    // policy is already a shared function — a tail repair every 300ms while the
+    // thread works, plus one final pass when it stops. Asking it rather than
+    // re-deriving "stopped working" here is the difference between the two panes
+    // agreeing forever and agreeing until one of them is edited.
+    //
+    // Fired here rather than left for `ensureOrchestratorReady` to notice on a
+    // later render: "another render will come along" is true right up until the
+    // frame that ends the turn is the last one. The previous entries stay on
+    // screen until the fetch lands, so there is no flash, and `wasWorking` is
+    // already updated by then, so this cannot re-arm itself.
+    // While the Orchestrator IS the active thread the pane draws
+    // `session.transcript`, and the cached page goes stale underneath it. When
+    // it stops being active, nothing refetched: the ensure guard sees the id it
+    // already has, and the settle refresh needs a working->idle edge that an
+    // already-idle thread will not produce. So the pane reverted to the
+    // pre-send conversation and stayed there. Three clicks to reproduce.
+    if (state.orchestratorWasActiveThread && !orchIsActive && orchId) {
+      state.orchestratorEntriesThreadId = null;
+    }
+    state.orchestratorWasActiveThread = orchIsActive;
+    const orchWorking = Boolean(orchActivity.phase);
+    const orchNeedsRefresh =
+      Boolean(orchId)
+      && !orchIsActive
+      && shouldRefreshViewedThread({
+        elapsedMs: Date.now() - (state.orchestratorLastRefreshAt || 0),
+        loading: Boolean(state.orchestratorEntriesLoading),
+        needsRepair: Boolean(state.orchestratorTailGap),
+        wasWorking: Boolean(state.orchestratorWasWorking),
+        working: orchWorking,
+      });
+    state.orchestratorWasWorking = orchWorking;
+    if (orchNeedsRefresh) {
+      state.orchestratorLastRefreshAt = Date.now();
+      void loadOrchestratorTranscript(orchId).then(() => {
+        if (state.session) {
+          renderTaskTeam(state.session);
+        }
+      });
+    }
+    const orchEntries = orchIsActive
+      ? session?.transcript || []
+      : state.orchestratorEntries || null;
+    renderReactContent(
+      taskTeamMount,
+      h(TaskTeamScreen, {
+        // `null` until the first successful load is what lets the screen tell
+        // "still loading" apart from "there are no tasks".
+        runs: teams,
+        selectedRunId: context.teamRunId || null,
+        changesPanel: taskDiffPanel(context.teamRunId || null),
+        // From the live snapshot, so a relay restarted without `--beta` re-blurs
+        // a screen the user is already standing on.
+        locked,
+        loading: !loaded,
+        syncing: teamsCache.isSyncing(),
+        error: state.teamsError || null,
+        waitingCount: teamsNeedingYou(teams || [], seenAt),
+        actionPending: state.teamActionPending || null,
+        actionError: state.teamActionError || null,
+        onOpenTask: (teamRunId) => onOpenTask?.(teamRunId),
+        onBack: () => onBackToTasks?.(),
+        onOpenThread: (threadId) => {
+          if (!threadId || typeof viewThread !== "function") {
+            return;
+          }
+          // Pass the thread's OWNING context. The reducer's floor stops a tasks
+          // context from swallowing the tab, but "not invisible" is not the same
+          // as "right": a seat thread that belongs to a project must land in that
+          // project's tab set, not in the sessions bucket.
+          viewThread(threadId, {
+            context: selectOwningContext({
+              threadId,
+              threadProjectId: state.threadProjectId || {},
+            }),
+          });
+        },
+        onAction: (action) => onTeamAction?.(action, context.teamRunId || null),
+        onStartTask: () => onStartTask?.(),
+        orchestrator: locked
+          ? null
+          : {
+              entries: orchEntries,
+              // Both: `orchestratorLoading` is the ensure (creating the thread),
+              // `orchestratorEntriesLoading` the transcript fetch. Only the
+              // first was surfaced, so a re-open's refetch showed as "no
+              // conversation" rather than as one arriving.
+              loading: Boolean(state.orchestratorLoading || state.orchestratorEntriesLoading),
+              composerDisabled: !orchId || Boolean(state.orchestratorLoading),
+              composerBusy: Boolean(state.orchestratorSending || state.orchestratorProposalBusy),
+              composerError: state.orchestratorSendError || null,
+              proposals: session?.orchestrator_proposals || [],
+              onSend: orchId ? (text) => sendOrchestratorMessage(text, orchId) : null,
+              onPropose: (text) => proposeFromOrchestratorDraft(text),
+              onConfirmProposal: (proposalId) => confirmOrchestratorProposalCard(proposalId),
+              onDismissProposal: (proposalId) => dismissOrchestratorProposalCard(proposalId),
+              onReset: typeof resetOrchestrator === "function" ? () => restartOrchestrator() : null,
+              resetBusy: Boolean(state.orchestratorResetting),
+              attachments: (state.orchestratorImageAttachments || []).map((attachment) => ({
+                id: attachment.id,
+                name: attachment.name,
+                size: attachment.size,
+              })),
+              onPasteImages: (clipboardData) => attachOrchestratorImages(clipboardData),
+              onRemoveAttachment: (id) => removeOrchestratorAttachment(id),
+              // The same bundle the conversation gets, minus what cannot work
+              // here. `canFork` and `enableFileChangeActions` are off: the
+              // Orchestrator does not edit files, and the apply endpoint
+              // resolves an item against the relay's ACTIVE thread, so acting
+              // from this pane could mutate a different one.
+              transcriptOptions: {
+                currentCwd: session?.current_cwd || state.selectedCwd || "",
+                expandedKeys: localUi.transcriptExpandedItemIds,
+                loadingItemIds: localUi.transcriptLoadingItemIds,
+                canFork: false,
+                enableFileChangeActions: false,
+                // Whoever is actually answering. The Orchestrator is built on
+                // Claude, but reading it off the thread keeps the mark honest if
+                // that ever changes.
+                provider: session?.provider || "",
+                // Filtered by thread: a question belongs to the thread that
+                // asked it (AskUserQuestionRequestView carries `thread_id`), and
+                // showing the session's question here would put an answer box on
+                // the wrong conversation. Unfiltered, this pane would also go
+                // interactive for a question it cannot answer.
+                pendingAskUserQuestions: pendingAskUserQuestionsForThread(session, orchId),
+                onSubmitAskUserAnswers: (requestId, answers) => {
+                  void state.controller?.submitAskUserQuestionAnswer?.(requestId, answers);
+                },
+                askUserSubmittingRequestId: localUi.askUserSubmittingRequestId || "",
+                askUserErrors:
+                  localUi.askUserErrors instanceof Map ? localUi.askUserErrors : new Map(),
+              },
+              // The transcript's own controls. Still a subset — this pane has
+              // no fork dialog and does not edit files — but the toggles are
+              // live now that `displayedThreadId()` resolves to this thread
+              // (see local/displayed-thread.js). Before that they would have
+              // fetched the session thread's details under the Orchestrator's
+              // messages.
+              onTranscriptInteract: createTranscriptInteractionHandler({
+                copyMessage: ({ text, element }) => void copyTextToClipboard(text, element),
+                toggleGroup: ({ expandKey }) =>
+                  state.controller?.toggleTranscriptExpandKey?.(expandKey),
+                toggleEntry: ({ itemId }) =>
+                  void state.controller?.toggleTranscriptEntry?.(itemId),
+                // Named explicitly rather than left to `state.currentApprovalId`,
+                // which is whichever approval the CONVERSATION rendered first.
+                approvalDecision: ({ decision, scope }) => {
+                  if (orchApproval?.request_id) {
+                    void state.controller?.submitDecision?.(decision, scope, orchApproval.request_id);
+                  }
+                },
+                openThread: ({ threadId }) => {
+                  if (threadId && typeof viewThread === "function") {
+                    viewThread(threadId, {
+                      context: selectOwningContext({
+                        threadId,
+                        threadProjectId: state.threadProjectId || {},
+                      }),
+                    });
+                  }
+                },
+              }),
+              // The DEVICE's write right, not "is the composer usable right
+              // now". Passing `!composerDisabled` made a pane that was merely
+              // still opening announce that another device had control.
+              //
+              // Asked of the ORCHESTRATOR's thread, not the conversation's.
+              // `canCurrentDeviceWrite` opens with `if (!active_thread_id)
+              // return false`, so on a relay with no session open it locked
+              // this composer and captioned it "Another device has control" —
+              // with no other device and no active thread. See
+              // shared/orchestrator-write-gate.js.
+              canWrite: orchestratorCanWrite({
+                session,
+                orchestratorThreadId: orchId,
+                deviceId: state.deviceId,
+              }),
+              // Stop, so a turn started here can be interrupted here. The pane
+              // is drawn beside the conversation, and the conversation's Stop
+              // button is hidden by CSS while Tasks is open.
+              onStop: () => void state.controller?.stopActiveTurn?.(orchId),
+              // An approval raised by the Orchestrator's own thread had NO
+              // surface at all: this prop was never passed, and the fallback
+              // `#pending-action-banner` is hidden by CSS while Tasks is open
+              // (styles.css: `.chat-shell[data-view="tasks"] > * { display:none }`).
+              // So the run just sat there.
+              approval: orchApproval,
+              // Liveness for the Orchestrator's OWN thread — top-level fields
+              // when it is the active one, `thread_activity` otherwise. Stall
+              // detection needs `last_progress_at`/`server_time`, which describe
+              // the active thread only, so it is claimed only then.
+              activity: {
+                ...orchActivity,
+                stalled: orchIsActive && isProgressStalled(session),
+              },
+            },
+      })
+    );
+    // AFTER the render, not before: the scroller is a React node, so on the
+    // first mount (and on every welcome/attention -> transcript swap) there was
+    // nothing to attach to yet and pagination stayed dead until some later
+    // render happened to run.
+    syncOrchestratorHistoryLoader();
+  }
+
+  /**
+   * Throw the current Orchestrator away and open a new one.
+   *
+   * `ensure` cannot do this: it is idempotent by design (every Tasks open calls
+   * it) and hands back a live pin. But a pin can point at a thread the relay
+   * still resolves while its provider session is gone — a restart drops cursor's
+   * — and then every turn fails identically with nothing on screen to press.
+   */
+  async function restartOrchestrator() {
+    if (typeof resetOrchestrator !== "function" || state.orchestratorResetting) {
+      return;
+    }
+    state.orchestratorResetting = true;
+    state.orchestratorSendError = null;
+    if (state.session) {
+      renderTaskTeam(state.session);
+    }
+    try {
+      const receipt = await resetOrchestrator();
+      const threadId = receipt?.thread_id || null;
+      if (!threadId) {
+        throw new Error("Orchestrator reset returned no thread id");
+      }
+      state.orchestratorThreadId = threadId;
+      // The old thread's entries are not this thread's — keep them and the new
+      // conversation would open showing someone else's history.
+      state.orchestratorEntries = null;
+      if (state.session) {
+        state.session = { ...state.session, orchestrator_thread_id: threadId };
+      }
+      await loadOrchestratorTranscript(threadId);
+    } catch (error) {
+      state.orchestratorSendError = error?.message || String(error);
+    } finally {
+      state.orchestratorResetting = false;
+      if (state.session) {
+        renderTaskTeam(state.session);
+      }
+    }
+  }
+
+  async function ensureOrchestratorReady(session) {
+    if (typeof ensureOrchestrator !== "function") {
+      return;
+    }
+    const known = state.orchestratorThreadId || session?.orchestrator_thread_id || null;
+    if (known) {
+      state.orchestratorThreadId = known;
+      // A failed load now leaves `orchestratorEntriesThreadId` null so this
+      // refetches instead of caching the failure forever — which means a
+      // persistently failing fetch would otherwise re-arm on every render. Same
+      // backoff the view-only pin uses for the same reason: long enough that a
+      // tight loop cannot form (a failed fetch re-renders synchronously), short
+      // enough that the next snapshot after the relay returns recovers.
+      const retryReady =
+        !state.orchestratorEntriesErrorAt
+        || Date.now() - state.orchestratorEntriesErrorAt >= VIEW_ONLY_LOAD_RETRY_BACKOFF_MS;
+      if (
+        session?.active_thread_id !== known &&
+        state.orchestratorEntriesThreadId !== known &&
+        !state.orchestratorEntriesLoading &&
+        retryReady
+      ) {
+        void loadOrchestratorTranscript(known).then(() => {
+          if (state.session) {
+            renderTaskTeam(state.session);
+          }
+        });
+      }
+      return;
+    }
+    if (state.orchestratorEnsurePromise) {
+      return state.orchestratorEnsurePromise;
+    }
+    state.orchestratorLoading = true;
+    state.orchestratorEnsurePromise = (async () => {
+      try {
+        const receipt = await ensureOrchestrator();
+        const threadId = receipt?.thread_id || null;
+        if (!threadId) {
+          throw new Error("Orchestrator ensure returned no thread id");
+        }
+        state.orchestratorThreadId = threadId;
+        state.orchestratorSendError = null;
+        if (state.session) {
+          state.session = {
+            ...state.session,
+            orchestrator_thread_id: threadId,
+          };
+        }
+        await loadOrchestratorTranscript(threadId);
+        if (state.session) {
+          renderTaskTeam(state.session);
+        }
+      } catch (error) {
+        state.orchestratorSendError = error?.message || String(error);
+        if (state.session) {
+          renderTaskTeam(state.session);
+        }
+      } finally {
+        state.orchestratorLoading = false;
+        state.orchestratorEnsurePromise = null;
+      }
+    })();
+    return state.orchestratorEnsurePromise;
+  }
+
+  async function loadOrchestratorTranscript(threadId) {
+    if (!threadId || typeof fetchTranscriptPage !== "function") {
+      state.orchestratorEntries = [];
+      state.orchestratorEntriesThreadId = threadId || null;
+      return;
+    }
+    if (state.session?.active_thread_id === threadId) {
+      state.orchestratorEntries = state.session.transcript || [];
+      state.orchestratorEntriesThreadId = threadId;
+      return;
+    }
+    state.orchestratorEntriesLoading = true;
+    // A counter, not just a thread-id compare: two loads for the SAME thread
+    // both pass an id check, and then the one that happens to resolve last wins
+    // even when it is the older request. `restartOrchestrator` plus the 300ms
+    // tail refresh make that overlap ordinary.
+    const generation = (state.orchestratorLoadGeneration =
+      (state.orchestratorLoadGeneration || 0) + 1);
+    const prior =
+      state.orchestratorEntriesThreadId === threadId
+        ? { threadId, entries: state.orchestratorEntries || [], olderCursor: state.orchestratorOlderCursor ?? null }
+        : null;
+    try {
+      const page = await fetchTranscriptPage(threadId, {});
+      if (generation !== state.orchestratorLoadGeneration) {
+        return;
+      }
+      // Normalize + validate the thread id + merge, the same three steps the
+      // view-only pin takes and for the same reasons (local/pin-page.js). This
+      // used to assign `page.entries` wholesale, discarding every delta that
+      // arrived while the fetch was in flight.
+      const refreshed = refreshedPinPage(prior, page, threadId);
+      state.orchestratorEntries = refreshed.entries;
+      state.orchestratorOlderCursor = refreshed.olderCursor;
+      state.orchestratorEntriesThreadId = threadId;
+      state.orchestratorEntriesError = null;
+      state.orchestratorEntriesErrorAt = 0;
+      // Answered: this page is authoritative for the window it covers.
+      state.orchestratorTailGap = false;
+    } catch (error) {
+      // A failed load must NOT claim the thread as loaded. It used to set
+      // `orchestratorEntriesThreadId = threadId` and `entries = []`, and the
+      // ensure path only refetches when that id differs from the pin — so one
+      // transient 500 left an empty Orchestrator with no way back, and `[]` is
+      // truthy enough to render the "no messages" welcome rather than a retry.
+      // A newer load may also have superseded this one, in which case its
+      // result is the one to keep.
+      if (generation !== state.orchestratorLoadGeneration) {
+        return;
+      }
+      state.orchestratorEntriesThreadId = null;
+      state.orchestratorEntriesError = error?.message || String(error);
+      state.orchestratorEntriesErrorAt = Date.now();
+      logLine(`Orchestrator transcript load failed: ${error?.message || error}`);
+    } finally {
+      state.orchestratorEntriesLoading = false;
+    }
+  }
+
+  /**
+   * Page in the Orchestrator's older history.
+   *
+   * The pane always rendered the history sentinel (TranscriptContent emits it
+   * unconditionally), but nothing watched it and `prev_cursor` was dropped on
+   * the floor — so scrolling up hit a hard wall at the newest transport page.
+   * Same merge the view-only pin uses: older entries are PREPENDED and
+   * de-duplicated by item id, never assigned over the live tail.
+   *
+   * @returns {Promise<boolean|null>} true if more history remains, false at the
+   *   oldest page, null when this attempt was not definitive (in flight, or
+   *   superseded) — the sentinel loader distinguishes all three.
+   */
+  /**
+   * Keep the history sentinel watched, across the pane mounting and unmounting.
+   *
+   * `attachTranscriptHistoryLoader` binds one scroll element for its lifetime,
+   * and this pane's scroller is a React node that comes and goes with the Tasks
+   * screen — so the loader is rebuilt whenever the element identity changes,
+   * and poked on every render so a cursor that only appeared after a refresh
+   * still resumes a loader that had backed off.
+   */
+  function syncOrchestratorHistoryLoader() {
+    const scroller = taskTeamMount?.querySelector?.(".task-orch-transcript") || null;
+    if (scroller !== orchestratorHistoryScroller) {
+      // `detach`, not `dispose`: the helper returns { detach, sync }, so the
+      // optional `dispose?.()` this used to call was a silent no-op and every
+      // scroller swap left the old IntersectionObserver alive on a detached
+      // node while a second one attached.
+      orchestratorHistoryLoader?.detach?.();
+      orchestratorHistoryLoader = null;
+      orchestratorHistoryScroller = scroller;
+      if (scroller) {
+        orchestratorHistoryLoader = attachTranscriptHistoryLoader({
+          onLoad: () => loadOlderOrchestratorTranscript(),
+          scrollElement: scroller,
+        });
+      }
+    }
+    orchestratorHistoryLoader?.sync?.();
+  }
+
+  async function loadOlderOrchestratorTranscript() {
+    const threadId = state.orchestratorEntriesThreadId;
+    if (!threadId || typeof fetchTranscriptPage !== "function") {
+      return null;
+    }
+    if (state.orchestratorOlderCursor == null) {
+      return false;
+    }
+    if (state.orchestratorEntriesLoading || state.orchestratorOlderLoading) {
+      return null;
+    }
+    const generation = state.orchestratorLoadGeneration || 0;
+    state.orchestratorOlderLoading = true;
+    try {
+      const page = await fetchTranscriptPage(threadId, {
+        before: state.orchestratorOlderCursor,
+      });
+      // A refresh or a restart landed while this was in flight; its entries are
+      // the current ones and prepending to them would splice in a stale prefix.
+      if (
+        (state.orchestratorLoadGeneration || 0) !== generation
+        || state.orchestratorEntriesThreadId !== threadId
+      ) {
+        return null;
+      }
+      const merged = mergeOlderViewOnlyPage(
+        {
+          threadId,
+          entries: state.orchestratorEntries || [],
+          olderCursor: state.orchestratorOlderCursor,
+        },
+        page
+      );
+      state.orchestratorEntries = merged.entries;
+      state.orchestratorOlderCursor = merged.olderCursor;
+      if (state.session) {
+        renderTaskTeam(state.session);
+      }
+      return state.orchestratorOlderCursor != null;
+    } catch (error) {
+      logLine(`Couldn't load older Orchestrator messages: ${error.message}`);
+      return null;
+    } finally {
+      state.orchestratorOlderLoading = false;
+    }
+  }
+
+  // Chat and task-start are separate channels on purpose; see orchestrator-chat.js.
+  const orchestratorChat = createOrchestratorChatActions({
+    state,
+    sendMessage,
+    proposeOrchestratorTask,
+    confirmOrchestratorProposal,
+    teamsCache,
+    onOpenTask,
+    // The Orchestrator has no composer node under it, so the failure `sendMessage`
+    // filed against its thread would otherwise never reach a screen.
+    readSendError: (threadId) => composerErrorFor(threadId),
+    renderTaskTeam: (session) => renderTaskTeam(session),
+    renderSession: (session) => renderSession(session),
+  });
+
+  /**
+   * Take images off a paste, if there are any.
+   *
+   * Returns whether it took them: the composer swallows the paste only then, so
+   * pasting ordinary text still behaves like ordinary text. Limits are the same
+   * ones every other composer uses — four images, 8 MB each, 16 MB together —
+   * because "why did this one refuse" is a worse question than any limit.
+   */
+  function attachOrchestratorImages(clipboardData) {
+    const files = pastedImageFiles(clipboardData);
+    if (files.length === 0) {
+      return false;
+    }
+    const existing = state.orchestratorImageAttachments || [];
+    const { accepted, errors } = validateImageAttachments(existing, files);
+    if (errors.length) {
+      state.orchestratorSendError = errors[0];
+    }
+    if (accepted.length) {
+      state.orchestratorImageAttachments = [
+        ...existing,
+        ...accepted.map((file) => ({
+          id: `orch-img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          name: file.name || "Pasted image",
+          size: file.size,
+          file,
+        })),
+      ];
+    }
+    if (state.session) {
+      renderTaskTeam(state.session);
+    }
+    return true;
+  }
+
+  function removeOrchestratorAttachment(id) {
+    state.orchestratorImageAttachments = (state.orchestratorImageAttachments || []).filter(
+      (attachment) => attachment.id !== id
+    );
+    if (state.session) {
+      renderTaskTeam(state.session);
+    }
+  }
+
+  /**
+   * Load one task's changes.
+   *
+   * Keyed by run AND base so switching either refetches, and guarded by the key
+   * that was in flight: a slow request for the previous run must not paint over
+   * a newer one. Read-only on the relay, so this is safe to call while the task
+   * is still running — the tree is simply a moving target, which the panel says.
+   */
+  async function loadTaskDiff(teamRunId, base) {
+    if (typeof fetchTeamDiff !== "function" || !teamRunId) {
+      return;
+    }
+    const key = `${teamRunId}::${base || ""}`;
+    if (state.taskDiffKey === key && (state.taskDiff || state.taskDiffLoading)) {
+      void loadTaskReviewData(teamRunId);
+      return;
+    }
+    state.taskDiffKey = key;
+    state.taskDiffLoading = true;
+    state.taskDiffError = null;
+    if (state.session) renderTaskTeam(state.session);
+    try {
+      const data = await fetchTeamDiff(teamRunId, base);
+      if (state.taskDiffKey !== key) return; // a newer request won
+      state.taskDiff = data;
+      // The relay decides which base actually answered; echo it back so the
+      // picker shows what is on screen rather than what was asked for.
+      state.taskDiffBase = data?.base || base || null;
+      void loadTaskReviewData(teamRunId);
+    } catch (error) {
+      if (state.taskDiffKey !== key) return;
+      state.taskDiff = null;
+      state.taskDiffError = error?.message || String(error);
+    } finally {
+      if (state.taskDiffKey === key) {
+        state.taskDiffLoading = false;
+        if (state.session) renderTaskTeam(state.session);
+      }
+    }
+  }
+
+  /**
+   * The line comments and review ticks for one task's diff.
+   *
+   * The key is the WHOLE guard, deliberately. This is reached from
+   * `taskDiffPanel()`, which runs during render, and everything here down to the
+   * first `await` is synchronous — including the `renderTaskTeam` below, which
+   * re-enters this function through that same panel. So the guard has to answer
+   * "has this key been started", not "has this key produced anything": on the
+   * re-entry no result can exist yet, by construction.
+   *
+   * It used to also require `state.taskComments || state.taskReviewTicks`.
+   * Those are results, so the guard never held on re-entry, and render recursed
+   * into itself until the renderer process died — selecting a task killed the
+   * tab outright, which reads as a freeze (no console, no way back). Note the
+   * sibling `loadTaskDiff` gets this right: its guard includes
+   * `state.taskDiffLoading`, the in-flight flag, not just the result.
+   *
+   * Nothing is lost by dropping the result clause, because every caller that
+   * wants a refetch already invalidates explicitly: `refreshTaskReviewData` and
+   * the base picker both null `state.taskReviewKey` first.
+   */
+  async function loadTaskReviewData(teamRunId) {
+    if (!teamRunId) return;
+    const key = `${teamRunId}::${state.taskDiffBase || ""}`;
+    if (state.taskReviewKey === key) {
+      return;
+    }
+    state.taskReviewKey = key;
+    state.taskCommentsLoading = true;
+    if (state.session) renderTaskTeam(state.session);
+    try {
+      const loaders = [];
+      if (typeof fetchTaskLineComments === "function") {
+        loaders.push(
+          fetchTaskLineComments(teamRunId).then((data) => {
+            if (state.taskReviewKey === key) state.taskComments = data;
+          })
+        );
+      }
+      if (typeof fetchTaskReviewTicks === "function") {
+        loaders.push(
+          fetchTaskReviewTicks(teamRunId).then((data) => {
+            if (state.taskReviewKey === key) state.taskReviewTicks = data;
+          })
+        );
+      }
+      await Promise.all(loaders);
+    } catch (error) {
+      if (state.taskReviewKey === key) {
+        state.taskCommentsError = error?.message || String(error);
+      }
+    } finally {
+      if (state.taskReviewKey === key) {
+        state.taskCommentsLoading = false;
+        if (state.session) renderTaskTeam(state.session);
+      }
+    }
+  }
+
+  async function refreshTaskReviewData(teamRunId) {
+    state.taskReviewKey = null;
+    await loadTaskReviewData(teamRunId);
+  }
+
+  /**
+   * The props both the summary panel and the review screen render from. One
+   * builder, so the two cannot disagree about the selected base or whether a
+   * comment landed — a divergence only visible after switching between them.
+   * `rerender` differs because they live in different mounts.
+   */
+  function taskReviewProps(teamRunId, rerender) {
+    void loadTaskDiff(teamRunId, state.taskDiffBase);
+    return {
+      data: state.taskDiff,
+      loading: Boolean(state.taskDiffLoading),
+      error: state.taskDiffError || null,
+      selectedPath: state.taskDiffPath || null,
+      comments: state.taskComments,
+      commentsLoading: Boolean(state.taskCommentsLoading),
+      commentScope: teamRunId ? `team_run:${teamRunId}` : "",
+      reviewTicks: state.taskReviewTicks,
+      onSelectPath: (path) => {
+        state.taskDiffPath = path;
+        rerender();
+      },
+      onSelectBase: (base) => {
+        state.taskDiffBase = base;
+        state.taskDiffPath = null;
+        state.taskReviewKey = null;
+        void loadTaskDiff(teamRunId, base);
+      },
+      onCreateComment:
+        typeof createTaskLineComment === "function"
+          ? async ({ path, side, line, body, base_commit: baseCommit }) => {
+              await createTaskLineComment(
+                teamRunId,
+                { path, side, line, base_commit: baseCommit },
+                body
+              );
+              await refreshTaskReviewData(teamRunId);
+            }
+          : null,
+      onResolveComment:
+        typeof resolveTaskLineComment === "function"
+          ? async (commentId, action) => {
+              await resolveTaskLineComment(commentId, action);
+              await refreshTaskReviewData(teamRunId);
+            }
+          : null,
+      onHandBackComment:
+        typeof handBackTaskLineComment === "function"
+          ? async (commentId) => {
+              await handBackTaskLineComment(commentId);
+              await refreshTaskReviewData(teamRunId);
+            }
+          : null,
+      onToggleReviewTick:
+        typeof tickTaskReviewFile === "function"
+          ? async (path) => {
+              await tickTaskReviewFile(teamRunId, path, "new", null);
+              await refreshTaskReviewData(teamRunId);
+            }
+          : null,
+    };
+  }
+
+  /** The node for `TaskDetail`'s existing "Changes on this branch" slot. */
+  function taskDiffPanel(teamRunId) {
+    if (!teamRunId || typeof fetchTeamDiff !== "function") {
+      return null;
+    }
+    return React.createElement(TaskDiffPane, {
+      ...taskReviewProps(teamRunId, () => {
+        if (state.session) renderTaskTeam(state.session);
+      }),
+      // One entry point to the full screen, so there is one to keep working.
+      onOpenReview: onOpenReviewScreen ? () => onOpenReviewScreen(teamRunId) : null,
+    });
+  }
+
+  /**
+   * The full-screen merge review (15a). Reads its run id from the CONTEXT, not a
+   * remembered selection, so a reload lands on the run the history entry names.
+   */
+  function renderReviewScreen() {
+    if (!reviewScreenMount) {
+      return;
+    }
+    const teamRunId = getViewContext()?.teamRunId || null;
+    if (!teamRunId || typeof fetchTeamDiff !== "function") {
+      renderReactContent(reviewScreenMount, null);
+      return;
+    }
+    renderReactContent(
+      reviewScreenMount,
+      h(TaskReviewScreen, {
+        ...taskReviewProps(teamRunId, () => renderReviewScreen()),
+        onBack: () => onOpenTask?.(teamRunId),
+      })
+    );
+  }
+
+  async function sendOrchestratorMessage(text, threadId) {
+    const attached = (state.orchestratorImageAttachments || []).slice();
+    let images = [];
+    if (attached.length) {
+      try {
+        images = await Promise.all(
+          attached.map(async (attachment) => ({
+            data_url: await imageFileToDataUrl(attachment.file),
+          }))
+        );
+      } catch (error) {
+        // Reading failed, so nothing was sent: keep the attachments where they
+        // are rather than dropping work the user can still retry.
+        state.orchestratorSendError = `Image attachment failed: ${error?.message || error}`;
+        if (state.session) {
+          renderTaskTeam(state.session);
+        }
+        return;
+      }
+    }
+    await orchestratorChat.send(text, threadId, images);
+    // Cleared only on a send that was accepted — `send` records its own failure
+    // in `orchestratorSendError`, and re-sending should still have the images.
+    if (!state.orchestratorSendError) {
+      const sent = new Set(attached.map((attachment) => attachment.id));
+      state.orchestratorImageAttachments = (state.orchestratorImageAttachments || []).filter(
+        (attachment) => !sent.has(attachment.id)
+      );
+      if (state.session) {
+        renderTaskTeam(state.session);
+      }
+    }
+  }
+
+  async function proposeFromOrchestratorDraft(text) {
+    await orchestratorChat.propose(text);
+  }
+
+  async function confirmOrchestratorProposalCard(proposalId) {
+    if (!proposalId || typeof confirmOrchestratorProposal !== "function") {
+      return;
+    }
+    state.orchestratorProposalBusy = true;
+    state.orchestratorSendError = null;
+    if (state.session) {
+      renderTaskTeam(state.session);
+    }
+    try {
+      await orchestratorChat.confirm(proposalId);
+    } catch (error) {
+      state.orchestratorSendError = error?.message || String(error);
+    } finally {
+      state.orchestratorProposalBusy = false;
+      if (state.session) {
+        renderTaskTeam(state.session);
+      }
+    }
+  }
+
+  async function dismissOrchestratorProposalCard(proposalId) {
+    if (!proposalId || typeof dismissOrchestratorProposal !== "function") {
+      return;
+    }
+    state.orchestratorProposalBusy = true;
+    state.orchestratorSendError = null;
+    if (state.session) {
+      renderTaskTeam(state.session);
+    }
+    try {
+      await dismissOrchestratorProposal(proposalId);
+      if (state.session) {
+        state.session = {
+          ...state.session,
+          orchestrator_proposals: (state.session.orchestrator_proposals || []).filter(
+            (entry) => entry?.id !== proposalId
+          ),
+        };
+      }
+    } catch (error) {
+      state.orchestratorSendError = error?.message || String(error);
+    } finally {
+      state.orchestratorProposalBusy = false;
+      if (state.session) {
+        renderTaskTeam(state.session);
+      }
+    }
+  }
+
+  function renderTeamsLibrary(session) {
+    if (!teamsLibraryMount) {
+      return;
+    }
+    const context = getViewContext() || {};
+    const teams = teamsFromCatalog(state.teamCatalog);
+    renderReactContent(
+      teamsLibraryMount,
+      h(TeamsLibraryScreen, {
+        teams,
+        selectedTeamId: context.teamId || BUILTIN_TEAM_ID,
+        locked: tasksLocked(session),
+        onSelectTeam: (teamId) => onOpenTeamsScreen?.(teamId),
+        onBackToTasks: () => onOpenTasksScreen?.(),
+      })
+    );
+  }
+
+  async function loadTeamCatalog() {
+    if (typeof fetchTeamCatalog !== "function" || tasksLocked(state.session)) {
+      state.teamCatalog = { enabled: false, teams: listLibraryTeams().map((team) => ({
+        id: team.id,
+        name: team.name,
+        persistent: team.persistent,
+        role_count: team.roleCount,
+        focus: team.focus,
+        current_version_id: team.currentVersionId,
+        roles: team.roles.map((role) => ({
+          id: role.id,
+          name: role.name,
+          seat: role.seat,
+          blurb: role.blurb,
+          estimate_label: role.estimateLabel,
+        })),
+        stats: {},
+      })) };
+      renderSidebarTeamsList();
+      if (getViewContext()?.kind === "teams") {
+        renderTeamsLibrary(state.session);
+      }
+      renderSidebarTaskList();
+      return;
+    }
+    try {
+      state.teamCatalog = await fetchTeamCatalog();
+    } catch (error) {
+      state.teamCatalogError = error?.message || String(error);
+      if (!state.teamCatalog) {
+        state.teamCatalog = { enabled: false, teams: [] };
+      }
+    }
+    renderSidebarTeamsList();
+    renderSidebarTaskList();
+    if (getViewContext()?.kind === "teams") {
+      renderTeamsLibrary(state.session);
+    }
   }
 
   // Fill the main-area card overview for the active project. Callers gate this on
@@ -1919,23 +3323,12 @@ export function createSessionRenderer({
     return "neutral";
   }
 
-  function shouldShowAuditEntry(entry) {
-    const kind = String(entry?.kind || "").toLowerCase();
-    const message = String(entry?.message || "");
-
-    if (kind !== "codex") {
-      return true;
-    }
-
-    return /approval|pair|revoke|connected|disconnected|take over|control|broker|session/i.test(
-      message
-    );
-  }
-
   return {
     renderAuthRequiredState,
     renderOverviewState,
     renderSession,
+    renderSidebarChrome,
+    renderSidebarNav,
     renderSessionMeta,
     renderSessionUnavailable,
     renderThreadListMessage,

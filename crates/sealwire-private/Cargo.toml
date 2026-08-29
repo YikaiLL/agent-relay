@@ -1,0 +1,21 @@
+[package]
+name = "sealwire-private"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# STUB. The real crate is proprietary and lives in a separate private repository.
+#
+# The name says only that it is private, not what is in it: today that is the
+# orchestration engines (`task_list`, `team`), and anything else that has to stay
+# closed arrives as another module here rather than as a second hidden crate. That
+# keeps the swap, the guard, the ignore rules and the feature flag at one each.
+#
+# This placeholder exists because Cargo must be able to READ the manifest of every
+# declared dependency — optional or not, enabled or not. Without it, `cargo build`
+# fails for anyone who does not have the private crate, which would make the relay
+# unauditable and unbuildable for everyone but us. Its source is never compiled in
+# a default build: the dependency is optional and off.
+#
+# `scripts/with-private.sh` swaps the real crate over this one for the duration of
+# a single command — see PRIVATE_CRATE.md.

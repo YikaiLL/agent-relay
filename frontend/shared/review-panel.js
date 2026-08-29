@@ -1,6 +1,8 @@
 import React from "react";
 
+import { providerMarkSlot } from "./provider-mark.js";
 import { selectReviewerCatalogState } from "./review-state.js";
+import { ThreadWorkspaceField } from "./workspace-picker.js";
 
 export {
   isReviewBlocked,
@@ -88,6 +90,19 @@ export function ReviewPanel({
   providerModelsStatus = {},
   activeProvider = "",
   onEnsureProviderModels,
+  // Parent thread's ResolvedWorkspace; reviews run against this tree.
+  workspace = null,
+  workspaceBusy = false,
+  workspaceError = null,
+  onPinWorkspace = null,
+  // Local surface only: `POST /api/workspace/trust` has no broker action, so a paired
+  // device gets the explanation and no control. See `trustPrompt` in workspace-picker.js.
+  onTrustWorkspace = null,
+  // Fired when the tree picker opens, so the per-tree change counts are measured only
+  // while they are on screen — they cost the relay a `git status` per worktree.
+  onOpenWorkspace = null,
+  // …and when it closes, so the relay stops measuring trees nobody is looking at.
+  onCloseWorkspace = null,
   submitting: submittingProp = false,
   onSubmit,
   onRequestClose,
@@ -144,7 +159,16 @@ export function ReviewPanel({
   const reusableForProvider = (reusableReviewers || []).filter(
     (entry) => entry?.provider == null || entry.provider === reviewerProvider
   );
-  const isReuse = reviewerThreadId !== "clean";
+
+  // Drop a reuse that the current tree/provider list no longer offers, so submit never sends a refused id.
+  const selectedReviewerThreadId =
+    reviewerThreadId !== "clean"
+    && !reusableForProvider.some((entry) => entry.reviewerThreadId === reviewerThreadId)
+      ? "clean"
+      : reviewerThreadId;
+  // Say so when a prefill was dropped; a silent clean start hid the mismatch.
+  const droppedReuse = selectedReviewerThreadId !== reviewerThreadId;
+  const isReuse = selectedReviewerThreadId !== "clean";
 
   // The selectable models for the chosen reviewer provider, plus whether the
   // catalog still needs fetching and its load status. The cross-agent provider's
@@ -178,7 +202,7 @@ export function ReviewPanel({
   // so fall back to a clean reviewer — and, when we were reusing, briefly highlight the
   // reviewer-session field so the user sees the system moved them off that session.
   const selectProvider = (value) => {
-    const wasReusing = providerSwitchClearsReuse(reviewerThreadId);
+    const wasReusing = providerSwitchClearsReuse(selectedReviewerThreadId);
     setReviewerProvider(value);
     setReviewerModel("");
     setReviewerEffort("");
@@ -228,7 +252,8 @@ export function ReviewPanel({
           reviewerModel,
           reviewerEffort,
           instructions,
-          reviewerThreadId,
+          // Effective selection: a dropped prefill must not reach the relay.
+          reviewerThreadId: selectedReviewerThreadId,
           parentThreadId,
           maxRounds,
           recapSource,
@@ -282,19 +307,46 @@ export function ReviewPanel({
         { className: "panel-modal-copy" },
         "Ask another agent to review the current changes. The reviewer runs in its own session and posts its findings back into this conversation."
       ),
+      // Which tree is reviewed; a mid-session worktree move is otherwise invisible.
+      workspace || onPinWorkspace
+        ? h(
+            React.Fragment,
+            null,
+            h(
+              "label",
+              { className: "sidebar-label", htmlFor: `${id}-workspace` },
+              "Working tree to review"
+            ),
+            h(ThreadWorkspaceField, {
+              busy: busy || workspaceBusy,
+              error: workspaceError,
+              id: `${id}-workspace`,
+              onClose: onCloseWorkspace,
+              onOpen: onOpenWorkspace,
+              onPin: onPinWorkspace,
+              onTrustWorkspace,
+              workspace,
+            })
+          )
+        : null,
       h("label", { className: "sidebar-label", htmlFor: `${id}-provider` }, "Reviewer provider"),
       h(
-        "select",
-        {
-          id: `${id}-provider`,
-          className: "control-input",
-          value: reviewerProvider,
-          // Always changeable: switching the provider off a reused session falls back to a
-          // clean reviewer of the new provider (highlighted on the reviewer-session field).
-          onChange: (event) => selectProvider(event.target.value),
-        },
-        h("option", { value: "" }, "Select a provider…"),
-        ...providerSelectOptions
+        "div",
+        { className: "select-with-mark" },
+        providerMarkSlot(reviewerProvider, { className: "select-mark" }),
+        h(
+          "select",
+          {
+            id: `${id}-provider`,
+            className: "control-input",
+            value: reviewerProvider,
+            // Always changeable: switching the provider off a reused session falls back to a
+            // clean reviewer of the new provider (highlighted on the reviewer-session field).
+            onChange: (event) => selectProvider(event.target.value),
+          },
+          h("option", { value: "" }, "Select a provider…"),
+          ...providerSelectOptions
+        )
       ),
       // Model + effort are selectable for clean AND reused reviewers. On reuse the
       // empty option keeps the reviewer thread's own model/effort; picking a value
@@ -382,7 +434,7 @@ export function ReviewPanel({
           className: sessionAutoSwitched
             ? "control-input reviewer-session-autoswitched"
             : "control-input",
-          value: reviewerThreadId,
+          value: selectedReviewerThreadId,
           onChange: (event) => selectReviewerSession(event.target.value),
         },
         h("option", { value: "clean" }, "New clean reviewer session"),
@@ -394,6 +446,13 @@ export function ReviewPanel({
           )
         )
       ),
+      droppedReuse
+        ? h(
+            "p",
+            { className: "panel-modal-copy" },
+            "That reviewer session can't review this working tree — a reviewer stays in the tree it was created in — so this review starts a clean one."
+          )
+        : null,
       isReuse
         ? h(
             "p",
@@ -498,6 +557,11 @@ export function ReviewLauncher({
   providerModelsStatus = {},
   activeProvider = "",
   onEnsureProviderModels,
+  workspace = null,
+  workspaceBusy = false,
+  workspaceError = null,
+  onPinWorkspace = null,
+  onTrustWorkspace = null,
   disabled = false,
   label = "Review",
   title = "Ask another agent to review the current changes",
@@ -529,6 +593,11 @@ export function ReviewLauncher({
       providerModelsStatus,
       activeProvider,
       onEnsureProviderModels,
+      workspace,
+      workspaceBusy,
+      workspaceError,
+      onPinWorkspace,
+      onTrustWorkspace,
       onSubmit,
     })
   );

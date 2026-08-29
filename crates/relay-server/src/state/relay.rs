@@ -22,8 +22,8 @@ use crate::{
 
 use super::{
     ensure_path_within_device_scope, persistence::PersistedRelayState, unix_now, ReviewJob,
-    RunStatus, SecurityProfile, TaskListRun, WorkflowRun, CONTROLLER_LEASE_SECS,
-    DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
+    RunStatus, SecurityProfile, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
+    CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
     STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
 
@@ -162,6 +162,26 @@ pub(crate) struct ReviewerThread {
     pub(crate) seq: u64,
 }
 
+/// Paths only. Pin and proven stay separate so a refresh cannot move an explicit choice.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ThreadWorkspace {
+    /// Explicit pin; only `set_thread_workspace` writes this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pinned: Option<String>,
+    /// Last proven tree. Observation and landed writes; recency is `proven_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proven: Option<String>,
+    /// Transcript clock when this tree was proven. Live writes with `seq > proven_at` are newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proven_at: Option<u64>,
+}
+
+impl ThreadWorkspace {
+    fn is_empty(&self) -> bool {
+        self.pinned.is_none() && self.proven.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CachedRemoteActionResult {
     pub(crate) action_kind: String,
@@ -176,6 +196,9 @@ pub(crate) struct CachedRemoteActionResult {
     pub(crate) thread_entry_detail: Option<ThreadEntryDetailResponse>,
     pub(crate) thread_transcript: Option<ThreadTranscriptResponse>,
     pub(crate) workspace_diff: Option<crate::protocol::WorkspaceDiffResponse>,
+    pub(crate) workspace_git_context: Option<crate::protocol::WorkspaceGitContextView>,
+    pub(crate) thread_workspace: Option<crate::protocol::ResolvedWorkspace>,
+    pub(crate) thread_settings: Option<crate::protocol::ThreadSettingsView>,
     pub(crate) reviews: Option<crate::protocol::ReviewsResponse>,
     pub(crate) workflows: Option<crate::protocol::WorkflowsResponse>,
     pub(crate) devices: Option<crate::protocol::DevicesResponse>,
@@ -238,6 +261,20 @@ pub struct RelayState {
     /// stalling the relay — the snapshot that follows repairs any gap.
     delta_tx: broadcast::Sender<TranscriptDeltaEvent>,
     revision: u64,
+    /// The one clock every transcript revision is drawn from, via
+    /// `next_transcript_revision`. Relay-global and persisted, so a revision is
+    /// unique across threads and never repeats across a restart.
+    ///
+    /// A client treats the revision as proof it has missed nothing: it accepts a
+    /// delta whose `base_revision` matches what it holds and discards one whose
+    /// `revision` is below it. Both halves of that break if a number can be
+    /// reused, so no other code may mint one — `transcript_revision` on
+    /// `RelayState` and on `ThreadRuntime` are *copies* of a value this handed
+    /// out, never counters in their own right.
+    transcript_clock: u64,
+    /// The selected thread's transcript revision, mirrored for `snapshot()` and
+    /// for the legacy no-active-thread transcript. A copy of a `transcript_clock`
+    /// value — never incremented on its own.
     transcript_revision: u64,
     security: SecurityProfile,
     pub provider_connected: bool,
@@ -276,10 +313,19 @@ pub struct RelayState {
     /// that never sent — can recognize the promotion authoritatively; the id
     /// sequence alone is indistinguishable from a normal thread switch.
     pub(super) thread_promoted_from: HashMap<String, String>,
+    /// Per-thread pin/proven paths. Absent = birth cwd.
+    pub(super) thread_workspace: HashMap<String, ThreadWorkspace>,
     /// Static per relay process, seeded from the spawned bridges. Rides the
     /// snapshot so both surfaces learn fork capability through the channel they
     /// already consume, instead of inferring it from provider names.
     pub(super) provider_fork_capabilities: Vec<crate::protocol::ProviderForkCapabilityView>,
+    /// Same shape and lifetime as `provider_fork_capabilities`, for archive:
+    /// most bridges have no archive at all, and a surface that guesses from the
+    /// provider name offers a control that silently changes nothing.
+    pub(super) provider_archive_capabilities: Vec<crate::protocol::ProviderArchiveCapabilityView>,
+    /// Whether this relay was launched with `sealwire --beta`. Static per
+    /// process; carried on every snapshot so both surfaces can gate on it.
+    pub(super) beta_features_enabled: bool,
     /// Static per-provider identity + spawn outcome, one entry per configured
     /// provider (in configured order). Combined with `provider_connections` at
     /// snapshot time to derive the live `provider_status` panel — including
@@ -322,12 +368,26 @@ pub struct RelayState {
     /// separately. In-memory only — a restart resets it to 0, so clients simply refetch
     /// once on the mismatch (harmless), same as `projects_revision`.
     pub(super) threads_revision: u64,
+    /// Bumped when any thread's pin or proven tree changes, so a surface viewing a
+    /// non-active thread can refetch that thread's workspace without reading the
+    /// active session's `thread_workspace_cwd`.
+    pub(super) thread_workspaces_revision: u64,
     /// Monotonic cache key for the dedicated Projects channel; bumped on every project
     /// mutation. Rides the snapshot (tiny); the full projects/membership payload is
     /// fetched on demand. In-memory only — a restart resets it to 0, so clients simply
     /// refetch once on the revision mismatch (harmless).
     pub(super) projects_revision: u64,
     pub allowed_roots: Vec<String>,
+    /// The relay-wide daily token budget and what to do when it is reached.
+    /// Consulted before a turn starts; see `crate::usage::budget`.
+    pub(crate) usage_budget: crate::usage::budget::BudgetSettings,
+    /// Granted by the local operator only, and never inferred from use. See
+    /// `TrustGrants::admit`.
+    pub trusted_workspaces: Vec<String>,
+    /// Whether the one-time carry-over of `allowed_roots` into `trusted_workspaces` has
+    /// run for this relay's state. Persisted; see the field's doc on
+    /// `PersistedRelayState` for why it is a marker and not an emptiness check.
+    pub(super) allowed_roots_trust_migrated: bool,
     pub available_models: Vec<ModelOptionView>,
     pub device_records: HashMap<String, DeviceRecord>,
     pub paired_devices: HashMap<String, PairedDevice>,
@@ -346,6 +406,16 @@ pub struct RelayState {
     /// it falls back to the active thread (see `device_watches_thread`), which is
     /// exactly the pre-subscription behavior for a client that never declares.
     watched_threads: HashMap<String, WatchedSurface>,
+    /// The token ledger. Ephemeral in the sense that matters here — it is never
+    /// part of `PersistedRelayState`, because it owns its own SQLite file and
+    /// must never be able to take `session.json` down with it (see
+    /// `crate::usage::store`). Defaults to disabled, so unit tests and any
+    /// construction path that does not install one simply record nothing.
+    pub(crate) usage_store: crate::usage::store::UsageStore,
+    /// Per-thread baselines that turn Codex's cumulative `tokenUsage.total`
+    /// into per-request deltas. Never persisted: a restart deliberately
+    /// re-baselines rather than billing a resumed thread's whole history.
+    pub(crate) codex_usage: crate::usage::CodexUsageTracker,
     /// Surface ids that are broker peer ids, so peer-presence pruning touches only
     /// those and never a local tab's subscription.
     broker_surface_ids: HashSet<String>,
@@ -409,12 +479,35 @@ pub struct RelayState {
     /// reconciles any non-terminal run to the terminal `Interrupted` state (no
     /// orchestrator survives a restart). `pub(super)` so the persistence writer reads it.
     pub(super) workflow_jobs: HashMap<String, WorkflowRun>,
-    /// Relay-owned task-list runs, keyed by run id. A `TaskListRun` drives a
-    /// sequence of child Code Flow `WorkflowRun`s (one per task). Like
-    /// `workflow_jobs`, NON-terminal runs persist so a restart can reconcile a
-    /// stranded list to `Interrupted` and offer re-run from the last completed task.
+    /// Relay-owned task team runs, keyed by run id. Like `workflow_jobs`,
+    /// NON-terminal runs persist. Unlike every other run map, one non-terminal
+    /// status — `Paused` — is restored VERBATIM instead of being reconciled to
+    /// `Interrupted`: a paused run has no driver on purpose, and its whole point
+    /// is that the user can come back and resume it. The exemption is enforced
+    /// inside `TeamRun::mark_interrupted_if_stranded`, not here.
     /// `pub(super)` so the persistence writer reads it.
-    pub(super) task_list_jobs: HashMap<String, TaskListRun>,
+    pub(super) team_runs: HashMap<String, TeamRun>,
+    /// Long-lived Tasks-screen secretary thread (`ensure_orchestrator`). Absent /
+    /// `None` until the first visit to Tasks creates one. Persisted so a restart
+    /// resumes the same conversation rather than minting a new empty one.
+    /// `#[serde(default)]` on the persisted form keeps old state files loadable.
+    pub(super) orchestrator_thread_id: Option<String>,
+    /// The device the Orchestrator acts as. Kept beside the pin because its tools
+    /// have to be re-attached on EVERY turn, not just at creation: the Claude
+    /// worker bakes options into the session at `query()` time, and a `send` that
+    /// omitted them would look like an options change and rebuild the session
+    /// without any tools at all.
+    pub(super) orchestrator_device_id: Option<String>,
+    /// Authoritative Orchestrator persona, re-sent on every options-bearing
+    /// command so a worker rebuild or process restart cannot drop the secretary
+    /// instructions while MCP tools remain attached.
+    pub(super) orchestrator_system_prompt: Option<String>,
+    /// Persona version from the decision layer. Persisted metadata only — prompt
+    /// text drives worker rebuilds; this is not used to retire the pinned thread.
+    pub(super) orchestrator_system_prompt_version: Option<u32>,
+    /// Pending Orchestrator proposals (M4 propose/confirm). Persisted so a
+    /// restart does not wipe a card the user was about to confirm.
+    pub(super) orchestrator_proposals: Vec<crate::protocol::OrchestratorProposalView>,
     /// Web Push subscriptions for remote devices, keyed by `device_id` (a device
     /// can have several browser subscriptions; deduped by endpoint). Persisted so
     /// a closed/locked phone keeps receiving pushes across a relay restart.
@@ -446,6 +539,7 @@ impl RelayState {
             change_tx,
             delta_tx,
             revision: 0,
+            transcript_clock: 0,
             transcript_revision: 0,
             security,
             provider_connected: false,
@@ -472,21 +566,35 @@ impl RelayState {
             thread_settings: HashMap::new(),
             thread_forked_from: HashMap::new(),
             thread_promoted_from: HashMap::new(),
+            thread_workspace: HashMap::new(),
             provider_fork_capabilities: Vec::new(),
+            provider_archive_capabilities: Vec::new(),
+            beta_features_enabled: false,
             provider_status_base: Vec::new(),
             thread_last_activity_at: HashMap::new(),
             projects: HashMap::new(),
             thread_project_id: HashMap::new(),
             thread_custom_name: HashMap::new(),
             threads_revision: 0,
+            thread_workspaces_revision: 0,
             projects_revision: 0,
             allowed_roots: Vec::new(),
+            usage_budget: crate::usage::budget::BudgetSettings::default(),
+            trusted_workspaces: Vec::new(),
+            // A relay with no state file has no legacy roots to carry over, so it starts
+            // already migrated — otherwise a brand-new install would turn the roots it
+            // configures today into execution grants at its next restart, which is the
+            // exact conflation the split removed. A restore overwrites this with what the
+            // state file says.
+            allowed_roots_trust_migrated: true,
             available_models: Vec::new(),
             device_records: HashMap::new(),
             paired_devices: HashMap::new(),
             online_surface_peer_ids: HashSet::new(),
             online_surface_peer_devices: HashMap::new(),
             watched_threads: HashMap::new(),
+            usage_store: crate::usage::store::UsageStore::disabled(),
+            codex_usage: crate::usage::CodexUsageTracker::new(),
             broker_surface_ids: HashSet::new(),
             surface_generations: HashMap::new(),
             pending_pairings: HashMap::new(),
@@ -509,13 +617,20 @@ impl RelayState {
             reviewer_threads: HashMap::new(),
             reviewer_thread_seq: 0,
             workflow_jobs: HashMap::new(),
-            task_list_jobs: HashMap::new(),
+            team_runs: HashMap::new(),
+            orchestrator_thread_id: None,
+            orchestrator_device_id: None,
+            orchestrator_system_prompt: None,
+            orchestrator_system_prompt_version: None,
+            orchestrator_proposals: Vec::new(),
             push_subscriptions: HashMap::new(),
             push_tx: None,
             push_vapid_public_key: None,
             push_attention: PushAttentionTracker::new(),
         };
-        state.push_log("info", "Relay booted. Waiting for Codex app-server.");
+        // Provider-neutral: which bridges are configured is decided later (and a
+        // relay running only Cursor is not waiting for Codex at all).
+        state.push_log("info", "Relay booted. Waiting for an agent provider.");
         state
     }
 
@@ -717,10 +832,28 @@ impl RelayState {
         self.enqueue_push(job);
     }
 
+    pub(crate) fn transcript_clock(&self) -> u64 {
+        self.transcript_clock
+    }
+
+    /// Hand out the next transcript revision. This is the ONLY place a transcript
+    /// revision is minted; everything else copies what this returns.
+    ///
+    /// Saturating rather than wrapping on purpose: wrapping would let the clock
+    /// walk back under a client's cursor, and a client that sees the number rewind
+    /// discards content. Saturating instead parks at the ceiling, which costs gap
+    /// detection but never data. A real relay reaches neither.
+    pub(super) fn next_transcript_revision(&mut self) -> u64 {
+        self.transcript_clock = self.transcript_clock.saturating_add(1);
+        self.transcript_clock
+    }
+
     pub(super) fn bump_transcript_revision(&mut self) -> (u64, u64) {
         let Some(thread_id) = self.active_thread_id.clone() else {
+            // Legacy no-active-thread transcript. It draws from the same clock as
+            // every thread, so it can never mint a number a thread also uses.
             let base_revision = self.transcript_revision;
-            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            self.transcript_revision = self.next_transcript_revision();
             return (base_revision, self.transcript_revision);
         };
 
@@ -735,10 +868,23 @@ impl RelayState {
         // the runtime via `ThreadRuntime::from_sync_data`/`merge_fresh_history`
         // and never calls this, so a mere session selection won't reorder.
         self.touch_thread_last_activity(thread_id);
-        let runtime = self.ensure_runtime_for_thread(thread_id);
+        // Materialize BEFORE drawing the revision. Creating a runtime draws one of
+        // its own to seed it, so allocating first would leave the seed above the
+        // revision being issued and emit a delta whose base is ahead of it.
+        //
+        // Guarded because this is the streaming-delta hot path and
+        // `ensure_runtime_for_thread` scans and clones from `self.threads` even when
+        // the runtime already exists.
+        if !self.runtimes.contains_key(thread_id) {
+            self.ensure_runtime_for_thread(thread_id);
+        }
+        let revision = self.next_transcript_revision();
+        let runtime = self
+            .runtimes
+            .get_mut(thread_id)
+            .expect("runtime materialized above");
         let base_revision = runtime.transcript_revision;
-        runtime.transcript_revision = runtime.transcript_revision.wrapping_add(1);
-        let revision = runtime.transcript_revision;
+        runtime.transcript_revision = revision;
         if self.active_thread_id.as_deref() == Some(thread_id) {
             self.transcript_revision = revision;
         }
@@ -794,6 +940,97 @@ impl RelayState {
                     .map(|thread| thread.cwd.clone())
                     .filter(|cwd| !cwd.is_empty())
             })
+    }
+
+    /// What is remembered about this thread's working tree. Empty → birth cwd.
+    pub(crate) fn thread_workspace(&self, thread_id: &str) -> ThreadWorkspace {
+        self.thread_workspace
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Pin (`Some`) or drop the pin (`None`). Caller validates roots + device scope.
+    pub(super) fn set_thread_workspace(&mut self, thread_id: &str, cwd: Option<&str>) -> bool {
+        let entry = self
+            .thread_workspace
+            .entry(thread_id.to_string())
+            .or_default();
+        let pinned = cwd.map(str::to_string);
+        if entry.pinned == pinned {
+            // Still prune: an empty pin is a persisted row no other cleanup would reach.
+            if entry.is_empty() {
+                self.thread_workspace.remove(thread_id);
+            }
+            return false;
+        }
+        entry.pinned = pinned;
+        if entry.is_empty() {
+            self.thread_workspace.remove(thread_id);
+        }
+        self.thread_workspaces_revision = self.thread_workspaces_revision.wrapping_add(1);
+        true
+    }
+
+    /// Agent-reported cwd (hooks / command cwd). Does not pin and does not rewrite birth cwd.
+    /// Same path still advances recency: a later "still here" observation outranks intervening writes.
+    pub(crate) fn observe_thread_cwd(&mut self, thread_id: &str, cwd: &str) {
+        if thread_id.is_empty() || cwd.is_empty() {
+            return;
+        }
+        let at = self.next_transcript_revision();
+        self.record_proven_thread_workspace_at(thread_id, cwd, at);
+    }
+
+    /// Internal side effect of `resolve_thread_workspace` (roots + scope already checked). Notifies on a real change so persistence can save even when the caller returns without touching job state.
+    pub(crate) fn record_proven_thread_workspace(&mut self, thread_id: &str, tree: &str) {
+        if self.thread_workspace(thread_id).proven.as_deref() == Some(tree) {
+            return;
+        }
+        let at = self.next_transcript_revision();
+        self.record_proven_thread_workspace_at(thread_id, tree, at);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_thread_workspace_from_json(&mut self, thread_id: &str, json: &str) {
+        let workspace: ThreadWorkspace = serde_json::from_str(json).expect("thread workspace json");
+        self.thread_workspace
+            .insert(thread_id.to_string(), workspace);
+    }
+
+    pub(crate) fn record_inferred_thread_workspace(
+        &mut self,
+        thread_id: &str,
+        tree: &str,
+        at: Option<u64>,
+    ) {
+        // Unsequenced evidence is older than any observation; never mint a clock at write-back.
+        self.record_proven_thread_workspace_at(thread_id, tree, at.unwrap_or(0));
+    }
+
+    pub(crate) fn record_proven_thread_workspace_at(
+        &mut self,
+        thread_id: &str,
+        tree: &str,
+        at: u64,
+    ) {
+        let entry = self
+            .thread_workspace
+            .entry(thread_id.to_string())
+            .or_default();
+        if entry.proven_at.is_some_and(|current| current > at) {
+            return;
+        }
+        if entry.proven.as_deref() == Some(tree) && entry.proven_at == Some(at) {
+            return;
+        }
+        let path_changed = entry.proven.as_deref() != Some(tree);
+        entry.proven = Some(tree.to_string());
+        entry.proven_at = Some(at);
+        if path_changed {
+            self.thread_workspaces_revision = self.thread_workspaces_revision.wrapping_add(1);
+        }
+        self.notify();
     }
 
     /// The project a thread belongs to, if any (`None` = "Unassigned").
@@ -1318,6 +1555,9 @@ impl RelayState {
                     reviewer_provider: self.reviewer_thread_provider(reviewer),
                     name: summary.and_then(|s| s.name.clone()),
                     updated_at: summary.map(|s| s.updated_at),
+                    // The reviewer's OWN tree, not its parent's: the parent may have
+                    // moved since, and the reuse gate compares against the reviewer.
+                    cwd: self.thread_cwd(reviewer),
                 }
             })
             .collect();
@@ -1328,6 +1568,95 @@ impl RelayState {
     /// Promote a Claude thread from its synthetic `claude-pending-…` id to the
     /// real SDK session id. This moves the runtime, pending prompts, and any review
     /// job reference without assuming the thread is the current live projection.
+    /// The device the Orchestrator acts as, when `thread_id` IS the Orchestrator.
+    ///
+    /// Asked per turn rather than remembered by the bridge, so it survives a relay
+    /// restart and a promotion without a second copy to keep in sync.
+    pub(crate) fn orchestrator_tools_device(&self, thread_id: &str) -> Option<String> {
+        if self.orchestrator_thread_id.as_deref() == Some(thread_id) {
+            self.orchestrator_device_id.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Device id + persona for an Orchestrator turn/resume. `None` when the thread
+    /// is not the pin, the device id was lost, or the acting device is explicitly
+    /// revoked in device records. Unpaired ids are allowed — the local browser
+    /// surface uses a localStorage UUID that never enters `paired_devices`.
+    pub(crate) fn orchestrator_session_options(
+        &self,
+        thread_id: &str,
+    ) -> Option<(String, Option<String>)> {
+        if self.orchestrator_thread_id.as_deref() != Some(thread_id) {
+            return None;
+        }
+        let device_id = self.orchestrator_device_id.clone()?;
+        if self.orchestrator_acting_device_is_revoked(&device_id) {
+            return None;
+        }
+        Some((device_id, self.orchestrator_system_prompt.clone()))
+    }
+
+    /// True when device records explicitly mark the id revoked. Unknown ids —
+    /// including local browser operators — are not blocked.
+    pub(crate) fn orchestrator_acting_device_is_revoked(&self, device_id: &str) -> bool {
+        matches!(
+            self.device_records
+                .get(device_id)
+                .map(|record| record.lifecycle_state),
+            Some(crate::protocol::DeviceLifecycleState::Revoked)
+        )
+    }
+
+    /// Restore acting-device identity on a live pin when persistence predates
+    /// `orchestrator_device_id`, or replace a stored id that was revoked without
+    /// clearing the pin. Keeps the pinned thread; only the acting identity moves.
+    pub(crate) fn backfill_orchestrator_acting_device(&mut self, device_id: &str) {
+        if self.orchestrator_thread_id.is_none() {
+            return;
+        }
+        let replace = match self.orchestrator_device_id.as_deref() {
+            None => true,
+            Some(stored) if self.orchestrator_acting_device_is_revoked(stored) => true,
+            Some(_) => false,
+        };
+        if replace {
+            self.orchestrator_device_id = Some(device_id.to_string());
+        }
+    }
+
+    /// Drop the Orchestrator pin when its acting device is revoked. The old thread
+    /// is left in place; only the pin and persisted acting identity are cleared.
+    pub(crate) fn clear_orchestrator_pin_if_device(&mut self, device_id: &str) {
+        if self.orchestrator_device_id.as_deref() != Some(device_id) {
+            return;
+        }
+        if let Some(previous) = self.orchestrator_thread_id.take() {
+            self.push_log(
+                "info",
+                format!(
+                    "Retired the Orchestrator thread ({previous}): its acting device ({device_id}) was revoked."
+                ),
+            );
+        }
+        self.orchestrator_device_id = None;
+        self.orchestrator_system_prompt = None;
+        self.orchestrator_system_prompt_version = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_orchestrator_pin(
+        &mut self,
+        thread_id: &str,
+        device_id: &str,
+        persona: &str,
+    ) {
+        self.orchestrator_thread_id = Some(thread_id.to_string());
+        self.orchestrator_device_id = Some(device_id.to_string());
+        self.orchestrator_system_prompt = Some(persona.to_string());
+    }
+
     pub(crate) fn promote_background_thread(&mut self, pending_id: &str, real_id: &str) {
         if pending_id == real_id || pending_id.is_empty() || real_id.is_empty() {
             return;
@@ -1338,6 +1667,14 @@ impl RelayState {
         // switch (the active-id sequence alone cannot).
         self.thread_promoted_from
             .insert(real_id.to_string(), pending_id.to_string());
+        // The Orchestrator pin is the one pointer that OUTLIVES a promotion and
+        // is load-bearing: `live_orchestrator_thread_id` clears a pin whose thread
+        // cannot be found, which is correct for a deleted thread and catastrophic
+        // for a promoted one — the next ensure would build a fresh Orchestrator
+        // and the conversation would reset on every first message.
+        if self.orchestrator_thread_id.as_deref() == Some(pending_id) {
+            self.orchestrator_thread_id = Some(real_id.to_string());
+        }
         if let Some(mut runtime) = self.runtimes.remove(pending_id) {
             if let Some(summary) = runtime.summary.as_mut() {
                 summary.id = real_id.to_string();
@@ -1355,6 +1692,12 @@ impl RelayState {
                 }
                 Some(existing) => {
                     runtime.turn_revision = runtime.turn_revision.max(existing.turn_revision);
+                    // Same reason turn_revision is folded: a client may already track
+                    // real_id, and the pending runtime can be behind it on the shared
+                    // clock. Adopting pending's revision verbatim would rewind it.
+                    runtime.transcript_revision = runtime
+                        .transcript_revision
+                        .max(existing.transcript_revision);
                     self.runtimes.insert(real_id.to_string(), runtime);
                 }
                 None => {
@@ -1412,6 +1755,12 @@ impl RelayState {
                 .entry(real_id.to_string())
                 .or_insert(pending_source);
         }
+        // Promote pending workspace too: it is keyed by thread id in a persisted map.
+        if let Some(pending_workspace) = self.thread_workspace.remove(pending_id) {
+            self.thread_workspace
+                .entry(real_id.to_string())
+                .or_insert(pending_workspace);
+        }
         // Drop the stale pending row; the real row is upserted by the caller.
         self.threads.retain(|thread| thread.id != pending_id);
         for approval in self.pending_approvals.values_mut() {
@@ -1428,6 +1777,13 @@ impl RelayState {
             if job.reviewer_thread_id.as_deref() == Some(pending_id) {
                 job.reviewer_thread_id = Some(real_id.to_string());
             }
+            // The REVIEWED thread is promoted too when the review is what first
+            // messages it (its recap turn creates the SDK session). This id is what
+            // `is_thread_review_locked` matches on, so leaving it behind silently
+            // unfreezes a thread the orchestrator is still driving.
+            if job.parent_thread_id == pending_id {
+                job.parent_thread_id = real_id.to_string();
+            }
         }
         // A workflow step thread (a clean Claude reviewer) is promoted from its
         // synthetic pending id to the real session id once its first turn starts;
@@ -1439,6 +1795,19 @@ impl RelayState {
                     *thread_id = real_id.to_string();
                 }
             }
+            // Same for the author thread a workflow runs its execute/revise steps on
+            // — the workflow lock keys off it exactly as the review lock does.
+            if run.parent_thread_id == pending_id {
+                run.parent_thread_id = real_id.to_string();
+            }
+        }
+        // Same for every team seat. This is not optional plumbing: EVERY team
+        // thread is background-started, so a TL, a dev, or any reviewer can be
+        // promoted mid-turn, and a driver left holding the pending id would find
+        // no runtime, read that as "not working", and treat a running turn as
+        // finished — silently losing that agent's output.
+        for run in self.team_runs.values_mut() {
+            run.rekey_thread(pending_id, real_id);
         }
         // Move the durable nav-hiding entry from the pending id to the real id
         // (carrying its parent + created_at, so FIFO order is preserved).
@@ -1505,6 +1874,24 @@ impl RelayState {
         })
     }
 
+    /// Whether an approval parked on `thread_id` could ever reach a person.
+    ///
+    /// A reviewer, workflow or team thread is driven by the relay, not by a
+    /// user: `decide_approval` refuses a decision on one, and the review waiter
+    /// treats a pending approval on its thread as an outright failure. So a card
+    /// parked there is not "waiting" — it is a run already broken.
+    ///
+    /// A bridge with a *mandatory* question (a shell command needs a yes or a
+    /// no) should still park, and let the owning run's policy resolve it. This
+    /// exists for the other case: an approval the bridge could reasonably answer
+    /// itself, where parking would turn a normal event into a failure. See the
+    /// ACP bridge's `cursor/create_plan` handling.
+    pub(crate) fn approval_can_reach_a_user(&self, thread_id: &str) -> bool {
+        !self.is_thread_review_locked(thread_id)
+            && !self.is_thread_or_cwd_workflow_locked(thread_id)
+            && !self.is_thread_or_cwd_team_locked(thread_id)
+    }
+
     /// Whether `thread_id` is owned by a non-terminal workflow run (its parent OR
     /// any workflow-owned step thread). A `Blocked` workflow is intentionally
     /// non-terminal, so this lock remains until recovery/restart reconciliation.
@@ -1533,6 +1920,228 @@ impl RelayState {
             || self
                 .thread_cwd(thread_id)
                 .is_some_and(|cwd| self.is_cwd_workflow_locked(&cwd))
+    }
+
+    /// Whether a non-terminal team run owns `thread_id` — any seat, including
+    /// retired TL generations and run-level threads.
+    ///
+    /// A team thread is not a thread the user talks to. The run drives it, and a
+    /// message typed into one would interleave with the driver's own turn. The one
+    /// deliberate exception is the AskUserQuestion channel, which is the run's only
+    /// way to ask a person something — see `team_thread_gate`.
+    pub(crate) fn is_thread_team_locked(&self, thread_id: &str) -> bool {
+        self.team_runs.values().any(|run| {
+            !run.status.is_terminal()
+                && run
+                    .owned_thread_ids()
+                    .iter()
+                    .any(|owned| owned == thread_id)
+        })
+    }
+
+    /// Which team run and seat a thread belongs to, if any.
+    ///
+    /// Attribution has to happen at WRITE time. A ledger row records what was
+    /// true when the tokens were spent; a run can finish, be pruned, or have its
+    /// worktree removed long before anyone opens the usage report, so there is
+    /// no join to fall back on later.
+    ///
+    /// Terminal runs are included here, unlike `is_thread_team_locked` — that
+    /// asks "may the user type here", which stops mattering once a run ends,
+    /// whereas "who spent this" never stops being true.
+    fn team_attribution(&self, thread_id: &str) -> TeamAttribution {
+        for run in self.team_runs.values() {
+            if !run
+                .owned_thread_ids()
+                .iter()
+                .any(|owned| owned == thread_id)
+            {
+                continue;
+            }
+            // Which sub-task, so repeated spend can be traced to one step
+            // rather than only to a role — every dev turn in a run shares the
+            // role, so `role` alone cannot answer "the same migration step".
+            let sub_task_id = run
+                .sub_tasks
+                .iter()
+                .find(|task| {
+                    task.dev_thread_id.as_deref() == Some(thread_id)
+                        || task.reviewer_thread_id.as_deref() == Some(thread_id)
+                        || task.owned_thread_ids.iter().any(|owned| owned == thread_id)
+                })
+                .map(|task| task.id.clone());
+            let role = if run.tl_thread_id == thread_id
+                || run
+                    .tl_succession
+                    .iter()
+                    .any(|generation| generation.thread_id == thread_id)
+            {
+                Some("tl")
+            } else if run
+                .sub_tasks
+                .iter()
+                .any(|task| task.dev_thread_id.as_deref() == Some(thread_id))
+            {
+                Some("dev")
+            } else if run
+                .sub_tasks
+                .iter()
+                .any(|task| task.reviewer_thread_id.as_deref() == Some(thread_id))
+            {
+                Some("reviewer")
+            } else {
+                // A run-owned thread: the design reviewer, an MR-gate reviewer,
+                // or the dev that addresses MR findings. The run is known, the
+                // seat is genuinely ambiguous, and guessing one would put real
+                // spend under the wrong role in the report.
+                None
+            };
+            return TeamAttribution {
+                team_run_id: Some(run.id.clone()),
+                role: role.map(str::to_string),
+                sub_task_id,
+                // Copied from the run's pin. Configurable teams (M3) will offer
+                // more than the builtin Default; the join still has to happen
+                // here because a pruned run leaves no row to look up later.
+                team_id: run.team_id.clone(),
+            };
+        }
+        TeamAttribution::default()
+    }
+
+    /// Record one turn's token usage against a thread.
+    ///
+    /// Best-effort by construction: the ledger swallows its own failures, and an
+    /// empty observation is dropped rather than written as a zero-token row.
+    pub(crate) fn record_token_usage(
+        &mut self,
+        thread_id: &str,
+        turn_id: Option<String>,
+        provider: &str,
+        usage: crate::usage::TokenUsage,
+        cost_usd: Option<f64>,
+        context_window: Option<u64>,
+        model_hint: Option<String>,
+        failed: bool,
+    ) {
+        if usage.is_empty() {
+            return;
+        }
+        // Prefer what the provider said this turn ran on, then what the thread
+        // is configured for, then the active session's model — and stop rather
+        // than substituting a default. An unknown model is its own bucket in the
+        // report; inventing one would put spend under a model that never ran.
+        let non_empty = |value: String| (!value.is_empty()).then_some(value);
+        let model = model_hint
+            .and_then(non_empty)
+            .or_else(|| {
+                self.runtime_for_thread(thread_id)
+                    .map(|runtime| runtime.model.clone())
+                    .and_then(non_empty)
+            })
+            .or_else(|| {
+                self.thread_settings
+                    .get(thread_id)
+                    .map(|settings| settings.model.clone())
+                    .and_then(non_empty)
+            })
+            .or_else(|| {
+                (self.active_thread_id.as_deref() == Some(thread_id))
+                    .then(|| self.model.clone())
+                    .and_then(non_empty)
+            });
+
+        let attribution = self.team_attribution(thread_id);
+        self.usage_store.record(&crate::usage::store::TokenEvent {
+            at: unix_now(),
+            provider: provider.to_string(),
+            model,
+            thread_id: thread_id.to_string(),
+            turn_id,
+            team_run_id: attribution.team_run_id,
+            role: attribution.role,
+            sub_task_id: attribution.sub_task_id,
+            team_id: attribution.team_id,
+            usage,
+            cost_usd,
+            context_window,
+            failed,
+        });
+    }
+
+    /// Whether a non-terminal team run owns the workspace at `cwd`.
+    ///
+    /// The reciprocal of the run's own isolation: a review or workflow started
+    /// against the task worktree would walk into a tree three agents are already
+    /// editing under an orchestrator that knows nothing about it.
+    ///
+    /// Containment, NOT string equality. `has_working_thread_in_cwd` compares
+    /// exact strings and can afford to — it asks "is this same session busy". This
+    /// asks "would this touch the task's files", and a thread started in
+    /// `<worktree>/src` is in the very same git worktree. Exact matching let
+    /// precisely the writer this lock exists to exclude in through a subdirectory.
+    pub(crate) fn is_cwd_team_locked(&self, cwd: &str) -> bool {
+        let candidate = super::normalize_cwd(cwd);
+        self.team_runs.values().any(|run| {
+            !run.status.is_terminal()
+                && !run.cwd.is_empty()
+                && super::path_within_allowed_roots(&candidate, std::slice::from_ref(&run.cwd))
+        })
+    }
+
+    /// The worktree of the non-terminal team run that owns `thread_id`.
+    ///
+    /// The authority a user action on a team thread is authorized against: the
+    /// run's own cwd path-scope, exactly as pause / stop / resume use. A team
+    /// thread has no other workspace of its own to check.
+    pub(crate) fn team_run_cwd_for_thread(&self, thread_id: &str) -> Option<String> {
+        self.team_runs
+            .values()
+            .find(|run| {
+                !run.status.is_terminal() && run.owned_thread_ids().iter().any(|id| id == thread_id)
+            })
+            .map(|run| run.cwd.clone())
+    }
+
+    pub(crate) fn is_thread_or_cwd_team_locked(&self, thread_id: &str) -> bool {
+        self.is_thread_team_locked(thread_id)
+            || self
+                .thread_cwd(thread_id)
+                .is_some_and(|cwd| self.is_cwd_team_locked(&cwd))
+    }
+
+    /// What the user may do with a thread a team run owns.
+    ///
+    /// One function so every lock call site gets ONE consistent answer, rather
+    /// than each guard inventing its own notion of "is this thread busy".
+    pub(crate) fn team_thread_gate(&self, thread_id: &str) -> TeamThreadGate {
+        for run in self.team_runs.values() {
+            if run.status.is_terminal() {
+                continue;
+            }
+            if !run.owned_thread_ids().iter().any(|id| id == thread_id) {
+                continue;
+            }
+            // The team lead is conversable while the run is parked — that is where
+            // a user redirects the task. Only while `Paused`, though: at any other
+            // moment the driver owns the next turn on that thread. This runs BEFORE
+            // the workspace rule below, which would otherwise swallow it: the team
+            // lead lives in the very worktree that rule locks.
+            if run.tl_thread_id == thread_id && matches!(run.status, TeamRunStatus::Paused) {
+                return TeamThreadGate::TlWhilePaused;
+            }
+            return TeamThreadGate::Locked;
+        }
+        // A thread the run does not own but which sits in its worktree is locked
+        // all the same. The isolation a task run buys is a property of the
+        // WORKSPACE — three agents are editing those files — not of a thread list.
+        if self
+            .thread_cwd(thread_id)
+            .is_some_and(|cwd| self.is_cwd_team_locked(&cwd))
+        {
+            return TeamThreadGate::Locked;
+        }
+        TeamThreadGate::Free
     }
 
     /// Hard-cap the total retained review jobs (evicting the oldest terminal jobs
@@ -1675,59 +2284,6 @@ impl RelayState {
             .any(|run| !run.status.is_terminal())
     }
 
-    pub(crate) fn insert_task_list_run(&mut self, run: TaskListRun) {
-        self.prune_task_list_runs();
-        self.task_list_jobs.insert(run.id.clone(), run);
-    }
-
-    pub(crate) fn task_list_run(&self, id: &str) -> Option<&TaskListRun> {
-        self.task_list_jobs.get(id)
-    }
-
-    pub(crate) fn update_task_list_run<F: FnOnce(&mut TaskListRun)>(
-        &mut self,
-        id: &str,
-        update: F,
-    ) -> bool {
-        match self.task_list_jobs.get_mut(id) {
-            Some(run) => {
-                update(run);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Whether any task-list run is still non-terminal. One list at a time (mirrors
-    /// `has_active_workflow`); checked under the session slot so check + insert is
-    /// atomic against a concurrent start.
-    pub(crate) fn has_active_task_list(&self) -> bool {
-        self.task_list_jobs
-            .values()
-            .any(|run| !run.status.is_terminal())
-    }
-
-    /// Hard-cap retained task-list runs, evicting the oldest TERMINAL runs first
-    /// (mirrors `prune_workflow_runs`). Non-terminal runs are never auto-evicted.
-    fn prune_task_list_runs(&mut self) {
-        if self.task_list_jobs.len() < MAX_WORKFLOW_RUNS {
-            return;
-        }
-        let mut terminal: Vec<(String, u64)> = self
-            .task_list_jobs
-            .iter()
-            .filter(|(_, run)| run.status.is_terminal())
-            .map(|(id, run)| (id.clone(), run.updated_at))
-            .collect();
-        terminal.sort_by_key(|(_, updated_at)| *updated_at);
-        for (id, _) in terminal {
-            if self.task_list_jobs.len() < MAX_WORKFLOW_RUNS {
-                break;
-            }
-            self.task_list_jobs.remove(&id);
-        }
-    }
-
     /// Hard-cap retained workflow runs, evicting the oldest TERMINAL runs first
     /// (mirrors `prune_review_jobs`). Non-terminal runs are never auto-evicted —
     /// they have a live or restart-recoverable orchestrator.
@@ -1748,6 +2304,148 @@ impl RelayState {
             }
             self.workflow_jobs.remove(&id);
         }
+    }
+
+    pub(crate) fn insert_team_run(&mut self, run: TeamRun) {
+        self.prune_team_runs();
+        self.team_runs.insert(run.id.clone(), run);
+    }
+
+    pub(crate) fn team_run(&self, id: &str) -> Option<&TeamRun> {
+        self.team_runs.get(id)
+    }
+
+    /// Every recorded team run, in no particular order.
+    pub(crate) fn team_runs_snapshot(&self) -> impl Iterator<Item = &TeamRun> {
+        self.team_runs.values()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update_team_run<F: FnOnce(&mut TeamRun)>(&mut self, id: &str, update: F) -> bool {
+        match self.team_runs.get_mut(id) {
+            Some(run) => {
+                update(run);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn remove_team_run(&mut self, id: &str) -> Option<TeamRun> {
+        self.team_runs.remove(id)
+    }
+
+    /// Whether any team run is still live. M1 allows one at a time globally, so
+    /// this gates starting another. A `Paused` run counts: it still owns its
+    /// worktree and threads and expects to be resumed.
+    #[allow(dead_code)]
+    pub(crate) fn has_active_team_run(&self) -> bool {
+        self.team_runs.values().any(|run| !run.status.is_terminal())
+    }
+
+    /// Resolve the run a whole-run action targets.
+    ///
+    /// An omitted id is allowed only while it is unambiguous. M1 runs one task at
+    /// a time, so that is the normal case — but the ambiguity is checked rather
+    /// than assumed, because the cap is a policy in `start_team_run` and this has
+    /// to keep telling the truth when that policy relaxes.
+    pub(crate) fn active_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
+        if let Some(run_id) = run_id {
+            return match self.team_runs.get(run_id) {
+                Some(run) => Ok(run.id.clone()),
+                None => Err("there is no task with that id".to_string()),
+            };
+        }
+        let live: Vec<&TeamRun> = self
+            .team_runs
+            .values()
+            .filter(|run| !run.status.is_terminal())
+            .collect();
+        match live.as_slice() {
+            [] => Err("there is no active task".to_string()),
+            [run] => Ok(run.id.clone()),
+            _ => Err("team_run_id is required when more than one task is active".to_string()),
+        }
+    }
+
+    /// Resolve the run a `Blocked` recovery targets, refusing anything that is not
+    /// actually blocked so a recovery cannot drain a healthy run's threads.
+    pub(crate) fn blocked_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
+        if let Some(run_id) = run_id {
+            return match self.team_runs.get(run_id) {
+                Some(run) if matches!(run.status, TeamRunStatus::Blocked) => Ok(run.id.clone()),
+                Some(run) if matches!(run.status, TeamRunStatus::Resolving) => {
+                    Err("this task is already being resolved".to_string())
+                }
+                Some(_) => Err("this task is not blocked".to_string()),
+                None => Err("there is no task with that id".to_string()),
+            };
+        }
+        let blocked: Vec<&TeamRun> = self
+            .team_runs
+            .values()
+            .filter(|run| matches!(run.status, TeamRunStatus::Blocked))
+            .collect();
+        match blocked.as_slice() {
+            [] => Err("there is no blocked task to resolve".to_string()),
+            [run] => Ok(run.id.clone()),
+            _ => Err("team_run_id is required when more than one task is blocked".to_string()),
+        }
+    }
+
+    fn prune_team_runs(&mut self) {
+        if self.team_runs.len() < MAX_WORKFLOW_RUNS {
+            return;
+        }
+        let mut terminal: Vec<(String, u64)> = self
+            .team_runs
+            .iter()
+            .filter(|(_, run)| run.status.is_terminal())
+            .map(|(id, run)| (id.clone(), run.updated_at))
+            .collect();
+        terminal.sort_by_key(|(_, updated_at)| *updated_at);
+        for (id, _) in terminal {
+            if self.team_runs.len() < MAX_WORKFLOW_RUNS {
+                break;
+            }
+            self.team_runs.remove(&id);
+        }
+    }
+
+    /// Clone persisted team runs for restore.
+    ///
+    /// Three cases, and only the first is unlike every other run map here:
+    /// - `Paused` restores VERBATIM. It has no driver on purpose; resuming it is
+    ///   the whole feature. `mark_interrupted_if_stranded` enforces the exemption.
+    /// - `PausePending` / `AwaitingUser` settle to `Paused`. Both had a live
+    ///   driver that is now gone, but both are a boundary away from a legitimate
+    ///   pause, so degrading beats discarding. `AwaitingUser` additionally rolls
+    ///   its round back, because the pending question lived only in memory (and
+    ///   the Claude worker died with the relay), so nobody can answer it now.
+    /// - everything else non-terminal reconciles to `Interrupted`, as usual.
+    fn restored_team_runs(persisted: &HashMap<String, TeamRun>) -> HashMap<String, TeamRun> {
+        persisted
+            .iter()
+            .map(|(id, run)| {
+                let mut run = run.clone();
+                match run.status {
+                    TeamRunStatus::PausePending => {
+                        run.settle_paused("the relay restarted while the team was pausing");
+                    }
+                    TeamRunStatus::AwaitingUser => {
+                        run.rollback_current_round();
+                        run.settle_paused(
+                            "the relay restarted while the team was waiting on your answer; that step will be re-run",
+                        );
+                    }
+                    _ => {
+                        run.mark_interrupted_if_stranded();
+                    }
+                }
+                (id.clone(), run)
+            })
+            .collect()
     }
 
     /// Clone persisted workflow runs for restore, reconciling any NON-terminal run
@@ -1997,6 +2695,28 @@ impl RelayState {
         acc
     }
 
+    /// Cache key for the Teams channel.
+    ///
+    /// Hashes the VIEW, so the key moves for exactly what a client can see — a
+    /// sub-task advancing included, which a hash over the run's own fields would
+    /// miss. XOR-accumulated per run because `team_runs_snapshot` yields
+    /// `HashMap::values()`: a single hasher fed in iteration order would produce a
+    /// different key each snapshot and refetch forever.
+    ///
+    /// A content hash rather than a bumped counter, for the reason
+    /// `workflows_revision` is one: team runs mutate from a dozen places in the
+    /// driver, and a hash has no bump site to forget.
+    pub(crate) fn teams_revision(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut acc: u64 = 0;
+        for run in self.team_runs_snapshot() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            crate::state::app::team::team_run_view(run).hash(&mut h);
+            acc ^= h.finish();
+        }
+        acc
+    }
+
     /// Minimal, non-terminal workflow state retained in SessionSnapshot.
     pub(crate) fn workflow_activity_view(&self) -> Vec<crate::protocol::WorkflowActivityView> {
         let mut runs = self
@@ -2122,10 +2842,17 @@ impl RelayState {
             .iter()
             .find(|thread| thread.id == thread_id)
             .cloned();
+        // Draw the revision only when we are actually about to build a runtime, and
+        // before the closure borrows `self`.
+        let seed_revision = if self.runtimes.contains_key(thread_id) {
+            0
+        } else {
+            self.next_transcript_revision()
+        };
         self.runtimes
             .entry(thread_id.to_string())
             .or_insert_with(|| {
-                let mut runtime = ThreadRuntime::placeholder(thread_id, now);
+                let mut runtime = ThreadRuntime::placeholder(thread_id, now, seed_revision);
                 if let Some(summary) = summary {
                     runtime.current_status = summary.status.clone();
                     runtime.current_cwd = summary.cwd.clone();
@@ -2151,7 +2878,12 @@ impl RelayState {
 
     pub(crate) fn sync_selected_runtime_to_fields(&mut self) {
         let Some(runtime) = self.selected_runtime().cloned() else {
-            self.transcript_revision = 0;
+            // Park at the clock, not 0. A snapshot reporting 0 for a thread a client
+            // tracks at N is rejected as stale — and a rejected snapshot is also the
+            // repair the client needed. Every issued revision is <= the clock, so
+            // this is the lowest value that is still safe, and it is stable until
+            // the next transition.
+            self.transcript_revision = self.transcript_clock;
             self.active_turn_id = None;
             self.current_status = "idle".to_string();
             self.current_phase = None;
@@ -2186,7 +2918,13 @@ impl RelayState {
             return;
         }
         let now = unix_now();
-        let mut runtime = ThreadRuntime::placeholder(&thread_id, now);
+        // Draw from the clock rather than adopting the mirror. The mirror is 0 on a
+        // freshly restored relay (and can even hold the OUTGOING thread's value when
+        // a provider reassigns `active_thread_id` directly), so adopting it would
+        // seed this thread below a revision its client already holds — and a client
+        // that far ahead rejects the repairing snapshot too, not just the deltas.
+        let seed_revision = self.next_transcript_revision();
+        let mut runtime = ThreadRuntime::placeholder(&thread_id, now, seed_revision);
         if let Some(summary) = self
             .threads
             .iter()
@@ -2212,7 +2950,6 @@ impl RelayState {
         runtime.approval_policy = self.approval_policy.clone();
         runtime.sandbox = self.sandbox.clone();
         runtime.reasoning_effort = self.reasoning_effort.clone();
-        runtime.transcript_revision = self.transcript_revision;
         runtime.transcript = self.transcript.clone();
         runtime.apply_states = self.apply_states.clone();
         runtime.pending_approvals = self
@@ -2354,6 +3091,12 @@ impl RelayState {
         };
         let (review_activity_total, review_blocked) = self.review_activity_summary();
         let selected = self.selected_runtime();
+        // The mirror, NOT the live clock. This value is a client-side cache key, so
+        // it may only move when the transcript it describes moves; reading the clock
+        // here would churn it on every poll as unrelated background threads stream.
+        // The mirror is kept at or above the high-water mark by the transitions that
+        // would otherwise leave it at 0 (see `sync_selected_runtime_to_fields`,
+        // `clear_active_session`, `apply_persisted`).
         let transcript_revision = selected
             .map(|runtime| runtime.transcript_revision)
             .unwrap_or(self.transcript_revision);
@@ -2390,6 +3133,10 @@ impl RelayState {
         let current_cwd = selected
             .map(|runtime| runtime.current_cwd.clone())
             .unwrap_or_else(|| self.current_cwd.clone());
+        // A field read, never a `stat`: see `ThreadRuntime::workspace_missing`. This
+        // function runs under the relay lock on every notify, and a blocking filesystem
+        // call here would stall every session rather than one banner.
+        let workspace_missing = selected.and_then(|runtime| runtime.workspace_missing.clone());
         let model = selected
             .map(|runtime| runtime.model.clone())
             .unwrap_or_else(|| self.model.clone());
@@ -2427,6 +3174,7 @@ impl RelayState {
 
         SessionSnapshot {
             provider_fork_capabilities: self.provider_fork_capabilities.clone(),
+            provider_archive_capabilities: self.provider_archive_capabilities.clone(),
             provider_status: self.provider_status_view(),
             revision: self.revision,
             transcript_revision,
@@ -2441,6 +3189,7 @@ impl RelayState {
             e2ee_enabled: self.security.e2ee_enabled(),
             broker_can_read_content: self.security.broker_can_read_content(),
             audit_enabled: self.security.audit_enabled(),
+            beta_features_enabled: self.beta_features_enabled,
             active_thread_id: self.active_thread_id.clone(),
             active_thread_promoted_from: self
                 .active_thread_id
@@ -2458,6 +3207,11 @@ impl RelayState {
             active_flags,
             thread_activity: self.thread_activity_view(),
             current_cwd,
+            thread_workspace_cwd: self.active_thread_id.as_deref().and_then(|id| {
+                let remembered = self.thread_workspace(id);
+                remembered.pinned.or(remembered.proven)
+            }),
+            workspace_missing,
             model,
             available_models: self.available_models.clone(),
             approval_policy,
@@ -2505,6 +3259,10 @@ impl RelayState {
             push_vapid_public_key: self.push_vapid_public_key.clone(),
             projects_revision: self.projects_revision,
             threads_revision: self.threads_revision,
+            thread_workspaces_revision: self.thread_workspaces_revision,
+            teams_revision: self.teams_revision(),
+            orchestrator_thread_id: self.orchestrator_thread_id.clone(),
+            orchestrator_proposals: self.orchestrator_proposals.clone(),
         }
     }
 
@@ -2524,6 +3282,7 @@ impl RelayState {
         self.materialize_selected_runtime_from_fields();
         self.assign_active_controller(device_id, now);
         self.active_thread_id = Some(thread_id.clone());
+        let transcript_revision = self.next_transcript_revision();
         self.runtimes.insert(
             thread_id.clone(),
             ThreadRuntime::new(
@@ -2534,6 +3293,7 @@ impl RelayState {
                 sandbox,
                 effort,
                 now,
+                transcript_revision,
             ),
         );
         self.remember_thread_settings(&thread_id, approval_policy, sandbox, effort, model);
@@ -2569,6 +3329,7 @@ impl RelayState {
             runtime.reasoning_effort = effort.to_string();
             runtime.touch(now);
         } else {
+            let transcript_revision = self.next_transcript_revision();
             self.runtimes.insert(
                 thread_id.clone(),
                 ThreadRuntime::new(
@@ -2579,6 +3340,7 @@ impl RelayState {
                     sandbox,
                     effort,
                     now,
+                    transcript_revision,
                 ),
             );
         }
@@ -2604,6 +3366,7 @@ impl RelayState {
     ) {
         let now = unix_now();
         let thread_id = thread.id.clone();
+        let transcript_revision = self.next_transcript_revision();
         self.runtimes.insert(
             thread_id.clone(),
             ThreadRuntime::new(
@@ -2614,6 +3377,7 @@ impl RelayState {
                 sandbox,
                 effort,
                 now,
+                transcript_revision,
             ),
         );
         self.remember_thread_settings(&thread_id, approval_policy, sandbox, effort, model);
@@ -2663,6 +3427,7 @@ impl RelayState {
             return;
         }
         let now = unix_now();
+        let transcript_revision = self.next_transcript_revision();
         let runtime = ThreadRuntime::from_sync_data(
             data.clone(),
             approval_policy,
@@ -2670,6 +3435,7 @@ impl RelayState {
             effort,
             model,
             now,
+            transcript_revision,
         );
         self.runtimes.insert(thread_id.clone(), runtime);
         if remember_settings {
@@ -2765,6 +3531,7 @@ impl RelayState {
         self.materialize_selected_runtime_from_fields();
         self.assign_active_controller(device_id, now);
         self.active_thread_id = Some(thread_id.clone());
+        let transcript_revision = self.next_transcript_revision();
         let runtime = ThreadRuntime::from_sync_data(
             data.clone(),
             approval_policy,
@@ -2772,11 +3539,23 @@ impl RelayState {
             effort,
             &model_for_runtime,
             now,
+            transcript_revision,
         );
-        if let Some(existing) = self.runtimes.get_mut(&thread_id) {
-            existing.merge_fresh_history(runtime);
-        } else {
-            self.runtimes.insert(thread_id.clone(), runtime);
+        // A re-read rebuilds this thread's transcript. Whether it merges into a live
+        // runtime or replaces a dropped one, the revision must move FORWARD: a client
+        // that sees it advance repairs the gap, whereas one that sees it rewind
+        // silently discards every delta until the counter climbs back.
+        let changed = match self.runtimes.get_mut(&thread_id) {
+            Some(existing) => existing.merge_fresh_history(runtime),
+            None => {
+                self.runtimes.insert(thread_id.clone(), runtime);
+                false
+            }
+        };
+        if changed {
+            if let Some(existing) = self.runtimes.get_mut(&thread_id) {
+                existing.transcript_revision = transcript_revision;
+            }
         }
         self.remember_thread_settings(
             &thread_id,
@@ -2805,6 +3584,11 @@ impl RelayState {
         } else {
             settings.model.clone()
         };
+        // Resume the clock before drawing from it — this function restores the clock
+        // itself further down, and allocating first would seed the restored thread
+        // from a clock that has not yet caught up to its high-water mark.
+        self.transcript_clock = self.transcript_clock.max(persisted.transcript_clock);
+        let transcript_revision = self.next_transcript_revision();
         let runtime = ThreadRuntime::from_sync_data(
             data.clone(),
             &settings.approval_policy,
@@ -2812,6 +3596,7 @@ impl RelayState {
             &settings.reasoning_effort,
             &model,
             now,
+            transcript_revision,
         );
         self.runtimes.insert(thread_id.clone(), runtime);
         self.thread_settings = persisted.thread_settings.clone();
@@ -2824,6 +3609,7 @@ impl RelayState {
             .or_insert(materialized);
         self.thread_forked_from = persisted.thread_forked_from.clone();
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
+        self.thread_workspace = persisted.thread_workspace.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
         self.thread_custom_name = persisted.thread_custom_name.clone();
@@ -2836,7 +3622,24 @@ impl RelayState {
         {
             self.projects_revision = 1;
         }
+        // Resume the shared transcript clock at its high-water mark. `max` rather than
+        // assignment so a restore can only ever move it forward — restoring twice, or
+        // restoring an older state file over a clock that has already issued
+        // revisions, must not hand the same number out again.
+        self.transcript_clock = self.transcript_clock.max(persisted.transcript_clock);
+        // The restored active thread has no runtime yet, so the snapshot falls back
+        // to the mirror. Start it at the high-water mark rather than 0, or the first
+        // snapshot after a restart is below what a surviving client holds.
+        self.transcript_revision = self.transcript_clock;
         self.allowed_roots = persisted.allowed_roots.clone();
+        self.usage_budget = crate::usage::budget::BudgetSettings {
+            daily_cap: persisted.usage_daily_cap,
+            policy: crate::usage::budget::BudgetPolicy::parse(&persisted.usage_budget_policy),
+        };
+        self.trusted_workspaces = persisted.trusted_workspaces.clone();
+        self.allowed_roots_trust_migrated = persisted.allowed_roots_trust_migrated;
+        // Ordered after the two assignments above: it reads one and writes the other.
+        self.migrate_allowed_roots_into_trust();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
         self.push_subscriptions = persisted.push_subscriptions.clone();
@@ -2857,6 +3660,17 @@ impl RelayState {
         // terminal `Interrupted` here — no orchestrator survives a restart (see
         // workflow.rs / `restored_workflow_jobs`).
         self.workflow_jobs = Self::restored_workflow_jobs(&persisted.workflow_jobs);
+        // Team runs persist non-terminal too, and `Paused` survives verbatim —
+        // see `restored_team_runs` for why that one is not reconciled.
+        self.team_runs = Self::restored_team_runs(&persisted.team_runs);
+        self.orchestrator_thread_id = persisted
+            .orchestrator_thread_id
+            .clone()
+            .filter(|id| !id.starts_with("claude-pending-"));
+        self.orchestrator_device_id = persisted.orchestrator_device_id.clone();
+        self.orchestrator_system_prompt = persisted.orchestrator_system_prompt.clone();
+        self.orchestrator_system_prompt_version = persisted.orchestrator_system_prompt_version;
+        self.orchestrator_proposals = persisted.orchestrator_proposals.clone();
         self.recompute_reviewer_thread_seq();
         self.online_surface_peer_ids.clear();
         self.online_surface_peer_devices.clear();
@@ -3023,8 +3837,23 @@ impl RelayState {
         self.provider_fork_capabilities = capabilities;
     }
 
+    pub fn set_provider_archive_capabilities(
+        &mut self,
+        capabilities: Vec<crate::protocol::ProviderArchiveCapabilityView>,
+    ) {
+        self.provider_archive_capabilities = capabilities;
+    }
+
     pub fn set_provider_status_base(&mut self, base: Vec<crate::provider::ProviderStatusBase>) {
         self.provider_status_base = base;
+    }
+
+    pub fn set_beta_features_enabled(&mut self, enabled: bool) {
+        self.beta_features_enabled = enabled;
+    }
+
+    pub fn beta_features_enabled(&self) -> bool {
+        self.beta_features_enabled
     }
 
     /// Derive the live per-provider status panel: static spawn outcome folded
@@ -3131,8 +3960,12 @@ impl RelayState {
             .is_some_and(ThreadRuntime::has_live_turn)
             || (is_active && self.active_thread_has_live_turn());
         if running {
+            // No provider name: this is reached by every provider, and naming
+            // one tells most users their session is held by an agent they are
+            // not running. (The `cannot archive` prefix is load-bearing — the
+            // HTTP handler keys the 400-vs-502 split on it.)
             return Err(
-                "cannot archive the active session while Codex is still running".to_string(),
+                "cannot archive the active session while the agent is still running".to_string(),
             );
         }
 
@@ -3147,8 +3980,10 @@ impl RelayState {
             .is_some_and(ThreadRuntime::has_live_turn)
             || (is_active && self.active_thread_has_live_turn());
         if running {
+            // Same reasoning as `can_archive_thread` above, and the
+            // `cannot permanently delete` prefix is load-bearing the same way.
             return Err(
-                "cannot permanently delete the active session while Codex is still running"
+                "cannot permanently delete the active session while the agent is still running"
                     .to_string(),
             );
         }
@@ -3167,6 +4002,11 @@ impl RelayState {
         // forever and wait to be inherited by a reused id. It joins the two persisted
         // per-thread maps this function already clears, rather than being a special case.
         self.thread_custom_name.remove(thread_id);
+        // Same reasoning again for the thread's working tree: another persisted
+        // per-thread map, whose entry could otherwise never be reached again and would
+        // wait to be inherited by a reused id — pointing a future review at a tree that
+        // thread was never in.
+        self.thread_workspace.remove(thread_id);
         // Same reasoning: a hint left behind would keep an archived/deleted session
         // routable from a stale search result the client still has on screen.
         self.forget_search_routing_hint(thread_id);
@@ -3350,6 +4190,15 @@ impl RelayState {
 
     pub fn mark_surface_peer_online(&mut self, peer_id: &str) -> bool {
         self.online_surface_peer_ids.insert(peer_id.to_string())
+    }
+
+    /// Whether this surface is still in the room, as of the last presence frame.
+    ///
+    /// Read by the broker writer to abandon a chunked reply whose surface has left.
+    /// Only meaningful because the read loop no longer blocks while the writer paces
+    /// (see `broker/writer.rs`): before that, presence could not change mid-train.
+    pub fn surface_peer_is_online(&self, peer_id: &str) -> bool {
+        self.online_surface_peer_ids.contains(peer_id)
     }
 
     pub fn mark_surface_peer_offline(&mut self, peer_id: &str) -> bool {
@@ -3874,6 +4723,7 @@ impl RelayState {
         }
         self.thread_forked_from = persisted.thread_forked_from.clone();
         self.thread_promoted_from = persisted.thread_promoted_from.clone();
+        self.thread_workspace = persisted.thread_workspace.clone();
         self.projects = persisted.projects.clone();
         self.thread_project_id = persisted.thread_project_id.clone();
         self.thread_custom_name = persisted.thread_custom_name.clone();
@@ -3886,7 +4736,24 @@ impl RelayState {
         {
             self.projects_revision = 1;
         }
+        // Resume the shared transcript clock at its high-water mark. `max` rather than
+        // assignment so a restore can only ever move it forward — restoring twice, or
+        // restoring an older state file over a clock that has already issued
+        // revisions, must not hand the same number out again.
+        self.transcript_clock = self.transcript_clock.max(persisted.transcript_clock);
+        // The restored active thread has no runtime yet, so the snapshot falls back
+        // to the mirror. Start it at the high-water mark rather than 0, or the first
+        // snapshot after a restart is below what a surviving client holds.
+        self.transcript_revision = self.transcript_clock;
         self.allowed_roots = persisted.allowed_roots.clone();
+        self.usage_budget = crate::usage::budget::BudgetSettings {
+            daily_cap: persisted.usage_daily_cap,
+            policy: crate::usage::budget::BudgetPolicy::parse(&persisted.usage_budget_policy),
+        };
+        self.trusted_workspaces = persisted.trusted_workspaces.clone();
+        self.allowed_roots_trust_migrated = persisted.allowed_roots_trust_migrated;
+        // Ordered after the two assignments above: it reads one and writes the other.
+        self.migrate_allowed_roots_into_trust();
         self.device_records = persisted.device_records.clone();
         self.paired_devices = persisted.paired_devices.clone();
         self.push_subscriptions = persisted.push_subscriptions.clone();
@@ -3907,6 +4774,17 @@ impl RelayState {
         // terminal `Interrupted` here — no orchestrator survives a restart (see
         // workflow.rs / `restored_workflow_jobs`).
         self.workflow_jobs = Self::restored_workflow_jobs(&persisted.workflow_jobs);
+        // Team runs persist non-terminal too, and `Paused` survives verbatim —
+        // see `restored_team_runs` for why that one is not reconciled.
+        self.team_runs = Self::restored_team_runs(&persisted.team_runs);
+        self.orchestrator_thread_id = persisted
+            .orchestrator_thread_id
+            .clone()
+            .filter(|id| !id.starts_with("claude-pending-"));
+        self.orchestrator_device_id = persisted.orchestrator_device_id.clone();
+        self.orchestrator_system_prompt = persisted.orchestrator_system_prompt.clone();
+        self.orchestrator_system_prompt_version = persisted.orchestrator_system_prompt_version;
+        self.orchestrator_proposals = persisted.orchestrator_proposals.clone();
         self.recompute_reviewer_thread_seq();
         self.online_surface_peer_ids.clear();
         self.online_surface_peer_devices.clear();
@@ -3935,7 +4813,7 @@ impl RelayState {
         self.current_tool = None;
         self.last_progress_at = None;
         self.active_flags.clear();
-        self.transcript_revision = 0;
+        self.transcript_revision = self.transcript_clock;
         self.transcript.clear();
         self.apply_states.clear();
         self.pending_approvals.clear();
@@ -4069,6 +4947,31 @@ impl RelayState {
         true
     }
 
+    /// One-time carry-over: grant the `allowed_roots` this relay already had.
+    ///
+    /// Until the trust split, an `allowed_root` matched exactly WAS permission to run git
+    /// in that directory. Landing the split with no migration would silently restrict
+    /// every existing user's roots — git stops being read in the directories that worked
+    /// yesterday, with nothing on screen to explain it — so today's behaviour is
+    /// preserved verbatim, once.
+    ///
+    /// Once, and the marker is what makes it once. An emptiness check would re-grant a
+    /// root the operator went out of their way to withdraw, on the very next restart; a
+    /// withdrawal that does not stick is not a withdrawal. Both load paths call this,
+    /// because both re-read the same on-disk snapshot and the second would otherwise
+    /// undo the first within the same boot.
+    fn migrate_allowed_roots_into_trust(&mut self) {
+        if self.allowed_roots_trust_migrated {
+            return;
+        }
+        self.allowed_roots_trust_migrated = true;
+        for root in &self.allowed_roots {
+            if !self.trusted_workspaces.contains(root) {
+                self.trusted_workspaces.push(root.clone());
+            }
+        }
+    }
+
     pub fn reserve_remote_action(
         &mut self,
         device_id: &str,
@@ -4185,8 +5088,8 @@ fn remote_action_cache_key(device_id: &str, action_id: &str) -> String {
 mod tests {
     use super::{
         BrokerPendingMessage, PendingPairingResult, PendingTranscriptDelta, PersistedRelayState,
-        RelayState, ReviewJob, SecurityProfile, TranscriptDeltaKind, WorkflowRun,
-        MAX_WORKFLOW_RUNS,
+        RelayState, ReviewJob, SecurityProfile, TeamRun, TeamRunStatus, TranscriptDeltaKind,
+        WorkflowRun, MAX_WORKFLOW_RUNS,
     };
     use crate::protocol::ThreadSummaryView;
     use crate::state::{ReviewMode, RunStatus};
@@ -4222,8 +5125,9 @@ mod tests {
             payload_secret: None,
             relay_id: None,
             relay_label: None,
-            client_id: None,
-            client_refresh_token: None,
+            client_claim_id: None,
+            client_claim_nonce: None,
+            client_claim_expires_at: None,
             device_refresh_token: None,
             device_join_ticket: None,
             device_join_ticket_expires_at: None,
@@ -4367,6 +5271,7 @@ mod tests {
 
     fn test_thread(id: &str, cwd: &str) -> ThreadSummaryView {
         ThreadSummaryView {
+            workspace_trusted: false,
             id: id.to_string(),
             name: None,
             preview: id.to_string(),
@@ -4564,6 +5469,303 @@ mod tests {
         );
         assert!(restored.workflow_run("r1").unwrap().error.is_some());
         assert_eq!(restored.workflow_run("r2").unwrap().status, RunStatus::Done);
+    }
+
+    #[test]
+    fn orchestrator_pin_persists_device_and_persona() {
+        let mut relay = test_relay();
+        relay.orchestrator_thread_id = Some("orch-thread".to_string());
+        relay.orchestrator_device_id = Some("device-1".to_string());
+        relay.orchestrator_system_prompt = Some("You are the Orchestrator.".to_string());
+        relay.orchestrator_system_prompt_version = Some(2);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        assert_eq!(
+            persisted.orchestrator_device_id.as_deref(),
+            Some("device-1")
+        );
+        assert_eq!(
+            persisted.orchestrator_system_prompt.as_deref(),
+            Some("You are the Orchestrator.")
+        );
+        assert_eq!(persisted.orchestrator_system_prompt_version, Some(2));
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        assert_eq!(
+            restored.orchestrator_thread_id.as_deref(),
+            Some("orch-thread")
+        );
+        assert_eq!(restored.orchestrator_device_id.as_deref(), Some("device-1"));
+        assert_eq!(
+            restored.orchestrator_system_prompt.as_deref(),
+            Some("You are the Orchestrator.")
+        );
+        assert_eq!(restored.orchestrator_system_prompt_version, Some(2));
+        assert_eq!(
+            restored.orchestrator_tools_device("orch-thread").as_deref(),
+            Some("device-1")
+        );
+    }
+
+    fn team_run_with_status(id: &str, status: TeamRunStatus) -> TeamRun {
+        let mut run = TeamRun::new(
+            id.to_string(),
+            crate::state::TaskSpec::default(),
+            "/tmp/wt".to_string(),
+            "device".to_string(),
+        );
+        run.tl_thread_id = "tl-1".to_string();
+        run.status = status;
+        run
+    }
+
+    #[test]
+    fn teams_revision_moves_for_any_change_a_client_can_see() {
+        // The cache key for the Teams channel. A content hash rather than a bumped
+        // counter for the same reason `workflows_revision` is one: team runs mutate
+        // from a dozen places in the driver, and a hash cannot be forgotten.
+        let mut relay = test_relay();
+        assert_eq!(relay.teams_revision(), 0, "no runs, nothing to key on");
+
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        let running = relay.teams_revision();
+        assert_ne!(running, 0);
+        assert_eq!(
+            running,
+            relay.teams_revision(),
+            "an unchanged run set must not force a refetch"
+        );
+
+        relay.update_team_run("t1", |run| run.status = TeamRunStatus::Paused);
+        let paused = relay.teams_revision();
+        assert_ne!(running, paused, "a status change is the whole point");
+
+        // The discriminating case: sub-task progress with the run's own fields
+        // untouched. A hash over only the top-level fields passes every assertion
+        // above and still leaves the sub-task list stale on screen.
+        relay.update_team_run("t1", |run| {
+            run.sub_tasks = vec![crate::state::SubTask {
+                id: "s1".to_string(),
+                title: "Write the parser".to_string(),
+                ..Default::default()
+            }];
+        });
+        let with_sub_task = relay.teams_revision();
+        assert_ne!(
+            paused, with_sub_task,
+            "a sub-task appearing must move the key, or the list never refreshes"
+        );
+
+        relay.update_team_run("t1", |run| {
+            run.sub_tasks[0].status = crate::state::SubTaskStatus::Done;
+        });
+        assert_ne!(
+            with_sub_task,
+            relay.teams_revision(),
+            "nor may a sub-task's own status change go unnoticed"
+        );
+    }
+
+    #[test]
+    fn teams_revision_does_not_depend_on_map_iteration_order() {
+        // `team_runs_snapshot` yields `HashMap::values()`, whose order is arbitrary
+        // and varies per process. Accumulating with XOR is what makes the key
+        // stable; a single hasher fed in iteration order would flap between
+        // snapshots and refetch forever.
+        let mut forwards = test_relay();
+        forwards.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        forwards.insert_team_run(team_run_with_status("t2", TeamRunStatus::Paused));
+
+        let mut backwards = test_relay();
+        backwards.insert_team_run(team_run_with_status("t2", TeamRunStatus::Paused));
+        backwards.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+
+        assert_eq!(forwards.teams_revision(), backwards.teams_revision());
+    }
+
+    #[test]
+    fn a_paused_team_run_survives_a_restore_without_being_interrupted() {
+        // The one non-terminal status in this codebase that must NOT be reconciled.
+        // A paused run has no driver on purpose; interrupting it would turn "come
+        // back to this later" into "your work is gone, re-run it".
+        let mut relay = test_relay();
+        let mut paused = team_run_with_status("t1", TeamRunStatus::Paused);
+        paused.phase = crate::state::TeamPhase::SubTasks;
+        paused.pause_reason = Some("you paused it".to_string());
+        relay.insert_team_run(paused);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+
+        let run = restored
+            .team_run("t1")
+            .expect("the paused run must survive");
+        assert_eq!(run.status, TeamRunStatus::Paused);
+        assert_eq!(run.phase, crate::state::TeamPhase::SubTasks);
+        assert_eq!(run.pause_reason.as_deref(), Some("you paused it"));
+        assert!(run.status.is_resumable());
+    }
+
+    #[test]
+    fn a_stranded_running_team_run_is_reconciled_to_interrupted() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        relay.insert_team_run(team_run_with_status("t2", TeamRunStatus::Done));
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        assert_eq!(
+            persisted.team_runs.len(),
+            2,
+            "non-terminal runs persist too"
+        );
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+        assert_eq!(
+            restored.team_run("t1").unwrap().status,
+            TeamRunStatus::Interrupted,
+            "a run whose driver died must not come back Running",
+        );
+        assert!(restored.team_run("t1").unwrap().error.is_some());
+        assert_eq!(restored.team_run("t2").unwrap().status, TeamRunStatus::Done);
+    }
+
+    #[test]
+    fn a_pausing_or_parked_team_run_degrades_to_paused_on_restore() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::PausePending));
+
+        // A run parked on a question: the question itself lived only in memory, so
+        // after a restart nobody can answer it and its round must be re-run.
+        let mut parked = team_run_with_status("t2", TeamRunStatus::AwaitingUser);
+        parked.phase = crate::state::TeamPhase::SubTasks;
+        parked.sub_tasks = vec![crate::state::SubTask {
+            id: "s1".to_string(),
+            status: crate::state::SubTaskStatus::Implementing,
+            rounds_used: 1,
+            ..crate::state::SubTask::default()
+        }];
+        parked.awaiting = Some(crate::state::AwaitingUser {
+            thread_id: "dev-1".to_string(),
+            request_id: "ask:1".to_string(),
+            role: "dev".to_string(),
+            asked_at: 0,
+        });
+        relay.insert_team_run(parked);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+
+        assert_eq!(
+            restored.team_run("t1").unwrap().status,
+            TeamRunStatus::Paused,
+            "a pause that was already in flight lands as a pause, not an interrupt",
+        );
+
+        let parked = restored.team_run("t2").unwrap();
+        assert_eq!(parked.status, TeamRunStatus::Paused);
+        assert!(
+            parked.awaiting.is_none(),
+            "the unanswerable question is dropped"
+        );
+        assert_eq!(
+            parked.sub_tasks[0].status,
+            crate::state::SubTaskStatus::Pending,
+            "the round rolls back so resuming re-runs it",
+        );
+        assert_eq!(
+            parked.sub_tasks[0].rounds_used, 1,
+            "an incomplete round must not be charged against the budget",
+        );
+    }
+
+    #[test]
+    fn a_team_run_whose_tl_thread_never_materialized_restores_interrupted_not_missing() {
+        // Claude mints a synthetic `claude-pending-*` id until the first turn
+        // promotes it. Such a run cannot be resumed — that thread will not exist
+        // after a restart — but dropping it would also erase the record of a
+        // worktree and branch still sitting on disk with nothing pointing at them.
+        let mut relay = test_relay();
+        let mut pending = team_run_with_status("t1", TeamRunStatus::Paused);
+        pending.tl_thread_id = "claude-pending-7".to_string();
+        pending.branch = "task/orphan".to_string();
+        pending.cwd = "/repo/.sealwire/worktrees/orphan".to_string();
+        relay.insert_team_run(pending);
+
+        let persisted = PersistedRelayState::from_relay(&relay);
+        let mut restored = test_relay();
+        restored.apply_persisted(&persisted);
+
+        let run = restored
+            .team_run("t1")
+            .expect("the run must survive so its worktree is still accounted for");
+        assert_eq!(run.status, TeamRunStatus::Interrupted);
+        assert!(
+            !run.status.is_resumable(),
+            "Resume would drive a dead thread"
+        );
+        assert!(run.tl_thread_id.is_empty());
+        assert_eq!(run.branch, "task/orphan");
+        assert_eq!(run.cwd, "/repo/.sealwire/worktrees/orphan");
+
+        // The live run is untouched: it is still mid-promotion in memory.
+        assert_eq!(
+            relay.team_run("t1").unwrap().tl_thread_id,
+            "claude-pending-7"
+        );
+    }
+
+    #[test]
+    fn an_unknown_team_phase_does_not_destroy_the_state_file() {
+        // `TeamRunStatus` was not the only strict enum in this record; a phase or
+        // sub-task status from a newer build has the same blast radius.
+        let mut relay = test_relay();
+        let mut run = team_run_with_status("t1", TeamRunStatus::Paused);
+        run.sub_tasks = vec![crate::state::SubTask {
+            id: "s1".to_string(),
+            ..crate::state::SubTask::default()
+        }];
+        relay.insert_team_run(run);
+        let persisted = PersistedRelayState::from_relay(&relay);
+
+        let mut encoded: serde_json::Value =
+            serde_json::to_value(&persisted).expect("serialize state");
+        encoded["team_runs"]["t1"]["phase"] = serde_json::Value::String("warp_drive".to_string());
+        encoded["team_runs"]["t1"]["sub_tasks"][0]["status"] =
+            serde_json::Value::String("quantum".to_string());
+
+        let decoded: PersistedRelayState = serde_json::from_value(encoded)
+            .expect("an unknown phase must not fail the whole state file");
+        assert_eq!(
+            decoded.team_runs["t1"].phase,
+            crate::state::TeamPhase::Finished
+        );
+        assert_eq!(
+            decoded.team_runs["t1"].sub_tasks[0].status,
+            crate::state::SubTaskStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_team_run_with_an_unknown_persisted_status_does_not_destroy_the_state_file() {
+        // The whole reason `TeamRunStatus` is its own enum: `PersistenceStore::load`
+        // turns any decode error into `Err`, and `AppState::new` answers that by
+        // throwing away the ENTIRE session file — devices, projects, allowed roots.
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("t1", TeamRunStatus::Running));
+        let persisted = PersistedRelayState::from_relay(&relay);
+
+        let mut encoded: serde_json::Value =
+            serde_json::to_value(&persisted).expect("serialize state");
+        encoded["team_runs"]["t1"]["status"] =
+            serde_json::Value::String("invented_by_a_newer_build".to_string());
+
+        let decoded: PersistedRelayState = serde_json::from_value(encoded)
+            .expect("an unknown status must not fail the whole file");
+        assert_eq!(decoded.team_runs["t1"].status, TeamRunStatus::Failed);
     }
 
     #[test]
@@ -4784,6 +5986,7 @@ mod tests {
     fn renaming_updates_the_cached_row_and_clearing_does_not_leave_it_stale() {
         let mut relay = test_relay();
         relay.upsert_thread(ThreadSummaryView {
+            workspace_trusted: false,
             id: "t1".to_string(),
             name: Some("Agent Title".to_string()),
             preview: "hello".to_string(),
@@ -5019,6 +6222,106 @@ mod tests {
         );
     }
 
+    /// A state file written before the trust split: identical content, minus the
+    /// migration marker — which is what `#[serde(default)]` is there to supply.
+    fn legacy_state_file(relay: &RelayState) -> PersistedRelayState {
+        let mut value = serde_json::to_value(PersistedRelayState::from_relay(relay))
+            .expect("persisted state serializes");
+        value
+            .as_object_mut()
+            .expect("persisted state is a JSON object")
+            .remove("allowed_roots_trust_migrated");
+        serde_json::from_value(value).expect("a pre-migration state file must still decode")
+    }
+
+    // `allowed_roots` used to double as permission to RUN git in a directory (by exact
+    // match). It is now only a fence, so the split would silently restrict every root a
+    // user already had: the relay stops reading git in directories that worked the day
+    // before, with nothing on screen to explain it. So the old roots are granted — once,
+    // on the first load that finds no marker.
+    #[test]
+    fn upgrading_grants_the_roots_that_used_to_be_executable() {
+        let mut relay = test_relay();
+        relay.allowed_roots = vec!["/work/alpha".to_string(), "/work/beta".to_string()];
+        let legacy = legacy_state_file(&relay);
+        assert!(
+            legacy.trusted_workspaces.is_empty(),
+            "a pre-migration state file carries no grants at all — that is the whole point",
+        );
+
+        let mut restored = test_relay();
+        restored.apply_persisted(&legacy);
+
+        assert_eq!(
+            restored.trusted_workspaces,
+            vec!["/work/alpha".to_string(), "/work/beta".to_string()],
+            "a root that was executable before the split must stay executable across it",
+        );
+    }
+
+    // Why the marker is persisted rather than inferred from an empty grant list: a user
+    // who deliberately withdraws trust from a migrated root would have it handed back on
+    // the next restart, and trust you cannot take away is not trust.
+    #[test]
+    fn withdrawing_trust_from_a_migrated_root_survives_the_next_load() {
+        let mut relay = test_relay();
+        relay.allowed_roots = vec!["/work/alpha".to_string()];
+
+        let mut first_boot = test_relay();
+        first_boot.apply_persisted(&legacy_state_file(&relay));
+        assert_eq!(
+            first_boot.trusted_workspaces,
+            vec!["/work/alpha".to_string()],
+            "precondition: the upgrade grants the legacy root, which is then withdrawn",
+        );
+
+        // Exactly what `set_workspace_trust` does with `trusted: false`.
+        first_boot
+            .trusted_workspaces
+            .retain(|granted| granted != "/work/alpha");
+
+        // Saved, then loaded again — the restart the withdrawal has to survive.
+        let after_withdrawal = PersistedRelayState::from_relay(&first_boot);
+        let mut second_boot = test_relay();
+        second_boot.apply_persisted(&after_withdrawal);
+
+        assert!(
+            second_boot.trusted_workspaces.is_empty(),
+            "the migration must be RECORDED, not inferred from an empty grant list: a \
+             withdrawn root came back on restart",
+        );
+    }
+
+    // The second load path. It re-reads the same persisted snapshot to restore the
+    // active thread, so a migration applied only in `apply_persisted` would be undone
+    // moments later, in the same boot.
+    #[test]
+    fn restoring_the_active_thread_does_not_undo_the_migration() {
+        let mut relay = test_relay();
+        relay.allowed_roots = vec!["/work/alpha".to_string()];
+        let legacy = legacy_state_file(&relay);
+
+        let mut booted = test_relay();
+        booted.apply_persisted(&legacy);
+        // `restore_persisted_session` hands `apply_persisted`'s own snapshot back to
+        // `restore_thread_data` — still pre-migration, because it was read from disk.
+        booted.restore_thread_data(
+            crate::provider::ThreadSyncData {
+                thread: test_thread("thread-1", "/work/alpha"),
+                status: "idle".to_string(),
+                active_flags: Vec::new(),
+                transcript: Vec::new(),
+            },
+            &legacy,
+        );
+
+        assert_eq!(
+            booted.trusted_workspaces,
+            vec!["/work/alpha".to_string()],
+            "restoring the active thread must not strip the grants the boot just migrated",
+        );
+    }
+
     #[test]
     fn prune_caps_terminal_runs_but_never_evicts_non_terminal() {
         // Terminal runs are capped at MAX_WORKFLOW_RUNS (oldest evicted first).
@@ -5044,4 +6347,16 @@ mod tests {
             "non-terminal runs are never auto-evicted",
         );
     }
+}
+
+/// Where a ledger row's spend belongs, resolved at write time.
+///
+/// Every field is only knowable while the run exists, which is why they are
+/// captured on the row rather than joined at report time.
+#[derive(Debug, Default)]
+struct TeamAttribution {
+    team_run_id: Option<String>,
+    role: Option<String>,
+    sub_task_id: Option<String>,
+    team_id: Option<String>,
 }

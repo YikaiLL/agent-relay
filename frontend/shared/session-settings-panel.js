@@ -1,5 +1,9 @@
 import React from "react";
-import { providerSettings, sandboxOptions } from "./provider-settings.js";
+import {
+  providerHasFilesystemSandbox,
+  providerSettings,
+  sandboxOptions,
+} from "./provider-settings.js";
 import { buildReasoningEffortOptionsWithSelection } from "./reasoning-efforts.js";
 import { isAgentStatusWorking } from "./review-state.js";
 
@@ -82,7 +86,9 @@ export function SessionSettingsButton({
   const idle = isSessionIdle(session);
   const disabled = !idle || busy;
   const hint = busy ? "Applying…" : sessionBusyReason(session);
-  const showSandbox = provider !== "claude_code";
+  // Providers without a real filesystem boundary must not render a control
+  // implying one — see `providerHasFilesystemSandbox`.
+  const showSandbox = providerHasFilesystemSandbox(provider);
   const currentApproval = session.approval_policy || "";
   const tone = approvalTone(settings.approvalOptions, currentApproval);
   const currentEffort = composerEffort || session.reasoning_effort || "";

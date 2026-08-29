@@ -17,7 +17,10 @@ use crate::protocol::{
 
 use super::RelayState;
 
-const DEFAULT_PAIRING_TTL_SECS: u64 = 30;
+// The pairing TTL is the *whole* approval budget, not just QR-scan time: the
+// ticket has to stay valid while the human scans on the phone and then walks
+// over to the laptop to hit Approve. 3 minutes covers that comfortably.
+const DEFAULT_PAIRING_TTL_SECS: u64 = 180;
 const MAX_PAIRING_TTL_SECS: u64 = 600;
 const CLAIM_CHALLENGE_TTL_SECS: u64 = 60;
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -169,8 +172,9 @@ pub(crate) struct CompletedPairing {
     pub(crate) payload_secret: Option<String>,
     pub(crate) relay_id: Option<String>,
     pub(crate) relay_label: Option<String>,
-    pub(crate) client_id: Option<String>,
-    pub(crate) client_refresh_token: Option<String>,
+    pub(crate) client_claim_id: Option<String>,
+    pub(crate) client_claim_nonce: Option<String>,
+    pub(crate) client_claim_expires_at: Option<u64>,
     pub(crate) device_refresh_token: Option<String>,
     pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
@@ -218,8 +222,9 @@ pub(crate) struct PendingPairingResult {
     pub(crate) payload_secret: Option<String>,
     pub(crate) relay_id: Option<String>,
     pub(crate) relay_label: Option<String>,
-    pub(crate) client_id: Option<String>,
-    pub(crate) client_refresh_token: Option<String>,
+    pub(crate) client_claim_id: Option<String>,
+    pub(crate) client_claim_nonce: Option<String>,
+    pub(crate) client_claim_expires_at: Option<u64>,
     pub(crate) device_refresh_token: Option<String>,
     pub(crate) device_join_ticket: Option<String>,
     pub(crate) device_join_ticket_expires_at: Option<u64>,
@@ -387,6 +392,20 @@ impl RelayState {
             .map(|pairing| (pairing.expires_at, pairing.path_scope.clone()))
             .ok_or_else(|| "pairing request is missing or expired".to_string())?;
         if let Some(existing) = self.pending_pairing_requests.get_mut(pairing_id) {
+            // Rebinding exists so ONE device can retry over a fresh broker peer (a
+            // network blip mid-approval). It must stay keyed to that device: the
+            // Ed25519 verify key is the only stable identity here, since device_id
+            // and label are both attacker-chosen. Without this check anyone else
+            // holding the QR could register last and silently inherit the approval
+            // the operator is about to grant — along with the payload_secret and
+            // refresh tokens that ride the pairing result.
+            if existing.device_verify_key != device_verify_key {
+                return Err(
+                    "another device is already waiting for approval on this pairing ticket; \
+                     generate a fresh pairing ticket for this device"
+                        .to_string(),
+                );
+            }
             let label_fallback = requested_device_id
                 .as_deref()
                 .or(Some(peer_id))
@@ -398,7 +417,6 @@ impl RelayState {
             }
             existing.label = normalize_device_label(device_label, label_fallback);
             existing.broker_peer_id = peer_id.to_string();
-            existing.device_verify_key = device_verify_key;
             existing.path_scope = ticket_path_scope;
             return Ok(existing.to_view());
         }
@@ -494,8 +512,9 @@ impl RelayState {
                     payload_secret: Some(token.clone()),
                     relay_id: None,
                     relay_label: None,
-                    client_id: None,
-                    client_refresh_token: None,
+                    client_claim_id: None,
+                    client_claim_nonce: None,
+                    client_claim_expires_at: None,
                     device_refresh_token: None,
                     device_join_ticket: None,
                     device_join_ticket_expires_at,
@@ -511,8 +530,9 @@ impl RelayState {
                 payload_secret: Some(token),
                 relay_id: None,
                 relay_label: None,
-                client_id: None,
-                client_refresh_token: None,
+                client_claim_id: None,
+                client_claim_nonce: None,
+                client_claim_expires_at: None,
                 device_refresh_token: None,
                 device_join_ticket: None,
                 device_join_ticket_expires_at,
@@ -540,8 +560,9 @@ impl RelayState {
                 payload_secret: None,
                 relay_id: None,
                 relay_label: None,
-                client_id: None,
-                client_refresh_token: None,
+                client_claim_id: None,
+                client_claim_nonce: None,
+                client_claim_expires_at: None,
                 device_refresh_token: None,
                 device_join_ticket: None,
                 device_join_ticket_expires_at: None,
@@ -557,8 +578,9 @@ impl RelayState {
             payload_secret: None,
             relay_id: None,
             relay_label: None,
-            client_id: None,
-            client_refresh_token: None,
+            client_claim_id: None,
+            client_claim_nonce: None,
+            client_claim_expires_at: None,
             device_refresh_token: None,
             device_join_ticket: None,
             device_join_ticket_expires_at: None,
@@ -590,8 +612,9 @@ impl RelayState {
             payload_secret: completed.payload_secret,
             relay_id: completed.relay_id,
             relay_label: completed.relay_label,
-            client_id: completed.client_id,
-            client_refresh_token: completed.client_refresh_token,
+            client_claim_id: completed.client_claim_id,
+            client_claim_nonce: completed.client_claim_nonce,
+            client_claim_expires_at: completed.client_claim_expires_at,
             device_refresh_token: completed.device_refresh_token,
             device_join_ticket: completed.device_join_ticket,
             device_join_ticket_expires_at: completed.device_join_ticket_expires_at,
@@ -614,6 +637,7 @@ impl RelayState {
             self.active_controller_device_id = None;
             self.active_controller_last_seen_at = None;
         }
+        self.clear_orchestrator_pin_if_device(device_id);
         true
     }
 
@@ -756,6 +780,19 @@ impl RelayState {
             .unwrap_or_default()
     }
 
+    /// The execution grants, copied out so admission can run WITHOUT the relay lock.
+    ///
+    /// Deciding trust reads `.git` from disk, and `workspace_resolve_lock_lint` exists
+    /// because awaiting on filesystem work while holding this lock stalls every other
+    /// session. Copying a handful of strings is the cheaper half of that trade.
+    ///
+    /// `allowed_roots` is deliberately NOT here. It bounds which paths a caller may
+    /// REACH; it has never meant "run whatever code is in them", and folding the two
+    /// together is what made a configured directory silently executable.
+    pub fn trust_grants(&self) -> crate::state::app::TrustGrants {
+        crate::state::app::TrustGrants::new(self.trusted_workspaces.clone())
+    }
+
     pub fn paired_device_verify_key(&self, device_id: &str) -> Result<String, String> {
         let verify_key = self
             .paired_devices
@@ -826,8 +863,9 @@ impl RelayState {
         pairing_id: &str,
         relay_id: Option<String>,
         relay_label: Option<String>,
-        client_id: Option<String>,
-        client_refresh_token: Option<String>,
+        client_claim_id: Option<String>,
+        client_claim_nonce: Option<String>,
+        client_claim_expires_at: Option<u64>,
     ) -> Result<(), String> {
         let completed = self
             .completed_pairings
@@ -835,8 +873,9 @@ impl RelayState {
             .ok_or_else(|| "completed pairing result is missing".to_string())?;
         completed.relay_id = relay_id;
         completed.relay_label = relay_label;
-        completed.client_id = client_id;
-        completed.client_refresh_token = client_refresh_token;
+        completed.client_claim_id = client_claim_id;
+        completed.client_claim_nonce = client_claim_nonce;
+        completed.client_claim_expires_at = client_claim_expires_at;
         Ok(())
     }
 
@@ -1027,11 +1066,19 @@ fn pairing_payload(
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("pairing payload should serialize"))
 }
 
+/// The scannable pairing link.
+///
+/// The payload rides in the URL **fragment**, never the query string. It contains
+/// the `pairing_secret`, which is the only key sealing the pairing handshake — the
+/// envelope carrying the device's `payload_secret` and refresh tokens. The broker
+/// itself serves this page, so a query string would put that secret in the
+/// broker's request line and in every proxy/CDN access log in front of it, letting
+/// the broker decrypt a handshake `private` mode promises it cannot read.
+/// Fragments are never transmitted to the server.
 fn pairing_url(broker_url: &str, pairing_payload: &str) -> String {
     let mut url = browser_url(broker_url);
-    url.query_pairs_mut()
-        .clear()
-        .append_pair("pairing", pairing_payload);
+    url.set_query(None);
+    url.set_fragment(Some(&format!("pairing={pairing_payload}")));
     url.to_string()
 }
 

@@ -7,6 +7,36 @@ const MAX_PROJECTS: usize = 256;
 const MAX_PROJECT_NAME_CHARS: usize = 200;
 const MAX_PROJECT_MEMBERSHIPS: usize = 10_000;
 
+/// Best-effort by design: the user asked for a SESSION, and a project deleted
+/// mid-dialog must not cost them one. Returns whether membership changed.
+pub(super) fn attach_new_thread_to_project(
+    relay: &mut RelayState,
+    thread_id: &str,
+    project_id: &str,
+) -> bool {
+    if !relay.thread_project_id.contains_key(thread_id)
+        && relay.thread_project_id.len() >= MAX_PROJECT_MEMBERSHIPS
+    {
+        relay.push_log(
+            "warn",
+            format!(
+                "Session {thread_id} started outside project {project_id}: membership limit reached ({MAX_PROJECT_MEMBERSHIPS})"
+            ),
+        );
+        return false;
+    }
+    match relay.assign_thread_to_project(thread_id, project_id) {
+        Ok(()) => true,
+        Err(error) => {
+            relay.push_log(
+                "warn",
+                format!("Session {thread_id} started outside project {project_id}: {error}"),
+            );
+            false
+        }
+    }
+}
+
 impl AppState {
     /// Manual Projects write path: create / rename / delete a Project, or assign /
     /// unassign a session. Returns the full post-action project list + membership so

@@ -42,10 +42,10 @@ use protocol::{
     BROKER_PROTOCOL_VERSION,
 };
 use public_control::{
-    ClientGrantRequest, ClientGrantResponse, ClientIdentityRevokeResponse,
-    ClientIdentityRotateResponse, ClientRelaysResponse, ClientSessionResponse,
-    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
+    ClientClaimRequest, ClientClaimResponse, ClientGrantRequest, ClientGrantResponse,
+    ClientIdentityRevokeResponse, ClientIdentityRotateResponse, ClientRelaysResponse,
+    ClientSessionResponse, DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse,
+    DeviceGrantRequest, DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
     DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
     PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
     RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayRegistrationSnapshot,
@@ -67,9 +67,127 @@ use tracing::{debug, warn};
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const DEFAULT_PUBLIC_API_RATE_LIMIT_PER_MINUTE: usize = 120;
 const DEFAULT_JOIN_RATE_LIMIT_PER_MINUTE: usize = 40;
+/// Publish allowance for a surface peer: a browser tab sending user-driven actions.
 const DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 240;
+/// Publish allowance for a relay peer, which is first-party and not traffic-shaped by
+/// this limiter.
+///
+/// Derived from what a relay can legitimately emit rather than guessed. Transcript
+/// deltas drain on a 100ms timer and publish one frame each, up to
+/// `MAX_DELTAS_PER_DRAIN = 50` per drain — 500 a second — and every watched thread
+/// streams at once, so a busy relay is nowhere near a surface's 4-a-second budget.
+///
+/// Going over is silent: the broker drops the frame and keeps the socket open. A
+/// dropped transcript delta the client can repair (it notices the gap and refetches);
+/// a dropped chunk it cannot, and costs a full action timeout. So for a relay this
+/// limit is a runaway backstop, not a shaper — it must sit above the SUM of what real
+/// traffic produces, not merely above its largest component: deltas at 500/s, a chunked
+/// reply at 20/s, and snapshots at 2/s together already exceed the delta bound alone.
+/// Surfaces, which are the actual abuse surface, keep the tight budget above.
+///
+/// Crossing it is no longer silent: the relay treats a dropped publish as fatal and
+/// reconnects. So this number decides how often that costs a reconnect — set it below
+/// real traffic and the relay will flap, because the broker's window is keyed by peer
+/// and does not reset when the relay reconnects into it.
+///
+/// What it does NOT bound is bytes — see [`DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE`] for
+/// the budget that does. The two are complementary: this one stops a peer spinning on
+/// tiny frames, that one stops a peer moving gigabytes in a handful of large ones.
+const DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE: usize = 36_000;
+
+/// Byte allowance for a surface peer, per minute.
+///
+/// A surface's frame budget already caps it at 240 frames of at most 64KiB, i.e. ~15MiB
+/// a minute. This sits below that so the byte dimension is a real constraint rather than
+/// arithmetic that can never bind, and far above what a surface actually sends: user
+/// actions and pairing envelopes are single-digit KiB.
+const DEFAULT_PUBLISH_BYTES_PER_MINUTE: usize = 8 * 1024 * 1024;
+/// Burst allowance for a surface peer — see [`DEFAULT_RELAY_PUBLISH_BURST_BYTES`].
+const DEFAULT_PUBLISH_BURST_BYTES: usize = 2 * 1024 * 1024;
+
+/// Byte allowance for a relay peer, per minute. The bandwidth counterpart to
+/// [`DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE`], and like it a runaway backstop
+/// rather than a shaper.
+///
+/// Derived from what a relay legitimately emits, not guessed — and bounded at the **wire**,
+/// because that is what this budget charges.
+///
+/// The dominant stream is a chunked action reply. Do **not** size it from
+/// `REMOTE_ACTION_RESULT_CHUNK_TARGET_CHARS` (32KiB): that is a *payload* target, and the
+/// frame carrying it is bigger — an encrypted chunk still costs one base64 expansion over
+/// its ciphertext. Two revisions of this constant were sized off the payload target and
+/// understated real traffic.
+///
+/// The robust bound ignores the encoding entirely: the relay's chunk builders shrink the
+/// chunk until `frame_bytes_for_payload(..) <= MAX_BROKER_TEXT_FRAME_BYTES`, so a chunk
+/// frame **cannot exceed the frame cap**, whatever encoding layers sit inside it. That
+/// makes the ceiling `max_text_frame_bytes` x the publish cadence:
+///
+/// - chunked reply: 64KiB every `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS`
+///   (50ms) → 20/s → **75MiB/min**, an upper bound rather than an estimate
+/// - transcript deltas drain on a 100ms timer, `MAX_DELTAS_PER_DRAIN = 50` a drain
+/// - session snapshots at ~2/s
+///
+/// **The 20/s rests on the relay pacing across train *boundaries*, not just within a
+/// train.** It did not, once: a finished train left the next one's first chunk due
+/// immediately, so back-to-back replies went out at 40/s and this ceiling was half the
+/// truth. `relay-server`'s `pacing_holds_across_train_boundaries` is what keeps it honest.
+///
+/// So a busy relay tops out near 75MiB a minute on the chunk train alone. This is ~6.8x
+/// that. Two tests pin it: `the_default_relay_byte_budget_sits_well_above_real_traffic`
+/// here, computed from this broker's own frame cap, and — authoritatively —
+/// `this_relays_publish_cadence_stays_inside_the_brokers_byte_budget` in `relay-server`,
+/// which reads the *real* cadence constant so speeding the relay up fails the build rather
+/// than silently eating the margin.
+///
+/// The headroom is the point: being refused is **not** backpressure for a relay —
+/// `relay-server`'s `rate_limited` arm ends the session and resyncs — so a budget set near
+/// real traffic is a reconnect loop, and each reconnect resyncs a full snapshot and spends
+/// *more* bandwidth than it saved. Set this above what real traffic can reach; it exists to
+/// bound a runaway, and 512MiB/min is still ~4.4x tighter than the 2.2GiB/min the frame
+/// allowance alone permits.
+///
+/// `0` disables the byte budget entirely — an escape hatch if it ever misfires in
+/// production, since the failure mode is a flapping relay rather than a slow one.
+///
+/// `pub` so relay-server can assert its own publish cadence against it — the two crates
+/// have to agree, and the authoritative check lives where the real cadence constants are.
+pub const DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE: usize = 512 * 1024 * 1024;
+/// Burst allowance for a relay peer: how much it may publish back-to-back after being
+/// idle, independent of the per-minute rate.
+///
+/// A rate alone would refuse the first large reply after a quiet period, which is exactly
+/// when one is most likely (a surface opens a tab and asks for a workspace diff). 16MiB
+/// swallows a ~4MiB diff whole with room to spare.
+const DEFAULT_RELAY_PUBLISH_BURST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Egress in a single minute, measured **after** fan-out, above which the broker warns.
+///
+/// Observation only — crossing it never refuses a frame. Refusing on a *global* condition
+/// would punish a peer for its neighbours' traffic, and for a relay that means a session
+/// teardown whose resync adds egress: the control would amplify the overload it fired on.
+/// So this counts and warns, and the number it produces is what a future enforcement
+/// decision should be based on.
+const GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Bucket count past which [`ByteRateLimiter::charge`] prunes settled entries, so the map
+/// does not grow without bound across churning peers. Amortised: pruning is O(n) but only
+/// runs once the map is already large.
+const BYTE_BUCKET_PRUNE_THRESHOLD: usize = 1_024;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 24;
 const DEFAULT_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
+/// Floor under [`BrokerHardeningConfig::max_text_frame_bytes`].
+///
+/// relay-server fits every chunk against a **fixed** `MAX_BROKER_TEXT_FRAME_BYTES` compiled
+/// into its binary; it never learns what this broker was configured with. A cap below that
+/// therefore does not shrink relay frames, it rejects them — and the broker closes the
+/// socket on `frame_too_large`, so the relay reconnects, replays the same cached result and
+/// fails identically. One hardening knob would make large replies permanently
+/// undeliverable.
+///
+/// `pub` so relay-server can assert its own fixed size still fits (see
+/// `this_relays_frame_size_fits_the_brokers_guaranteed_minimum`).
+pub const MIN_MAX_TEXT_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 const DEVICE_SESSION_COOKIE_NAME: &str = "agent_relay_device_session";
 const DEVICE_SCOPED_SESSION_COOKIE_PATH: &str = "/api/public/device";
@@ -79,6 +197,11 @@ const DEVICE_SESSION_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 400;
 const PUBLIC_API_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLIC_API_RATE_LIMIT_PER_MINUTE";
 const JOIN_RATE_LIMIT_ENV: &str = "RELAY_BROKER_JOIN_RATE_LIMIT_PER_MINUTE";
 const PUBLISH_RATE_LIMIT_ENV: &str = "RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE";
+const RELAY_PUBLISH_RATE_LIMIT_ENV: &str = "RELAY_BROKER_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE";
+const PUBLISH_BYTES_ENV: &str = "RELAY_BROKER_PUBLISH_BYTES_PER_MINUTE";
+const RELAY_PUBLISH_BYTES_ENV: &str = "RELAY_BROKER_RELAY_PUBLISH_BYTES_PER_MINUTE";
+const PUBLISH_BURST_BYTES_ENV: &str = "RELAY_BROKER_PUBLISH_BURST_BYTES";
+const RELAY_PUBLISH_BURST_BYTES_ENV: &str = "RELAY_BROKER_RELAY_PUBLISH_BURST_BYTES";
 const MAX_CONNECTIONS_PER_IP_ENV: &str = "RELAY_BROKER_MAX_CONNECTIONS_PER_IP";
 const MAX_TEXT_FRAME_BYTES_ENV: &str = "RELAY_BROKER_MAX_TEXT_FRAME_BYTES";
 const IDLE_TIMEOUT_SECS_ENV: &str = "RELAY_BROKER_IDLE_TIMEOUT_SECS";
@@ -406,12 +529,15 @@ enum BrokerJoinVerifier {
 struct VerifiedBrokerJoin {
     peer_id: Option<String>,
     device_id: Option<String>,
+    pairing_id: Option<String>,
 }
 
 #[derive(Clone)]
 struct BrokerHardeningState {
     config: BrokerHardeningConfig,
     rate_limiter: SlidingWindowRateLimiter,
+    byte_limiter: ByteRateLimiter,
+    publish_metrics: PublishMetrics,
     connection_tracker: ActiveConnectionTracker,
 }
 
@@ -420,14 +546,103 @@ struct BrokerHardeningConfig {
     public_api_rate_limit_per_minute: usize,
     join_rate_limit_per_minute: usize,
     publish_rate_limit_per_minute: usize,
+    relay_publish_rate_limit_per_minute: usize,
+    publish_bytes_per_minute: usize,
+    relay_publish_bytes_per_minute: usize,
+    publish_burst_bytes: usize,
+    relay_publish_burst_bytes: usize,
     max_connections_per_ip: usize,
     max_text_frame_bytes: usize,
     idle_timeout: Duration,
 }
 
+/// A peer's byte allowance: a sustained rate plus an independent burst.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ByteBudget {
+    bytes_per_minute: usize,
+    burst_bytes: usize,
+}
+
+impl ByteBudget {
+    /// `0` bytes/minute switches the budget off (see
+    /// [`DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE`]).
+    fn is_disabled(self) -> bool {
+        self.bytes_per_minute == 0
+    }
+
+    fn bytes_per_second(self) -> f64 {
+        self.bytes_per_minute as f64 / RATE_LIMIT_WINDOW_SECS as f64
+    }
+}
+
 #[derive(Clone, Default)]
 struct SlidingWindowRateLimiter {
     buckets: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+}
+
+/// Per-peer token bucket over published **bytes**.
+///
+/// Keyed the same way as [`SlidingWindowRateLimiter`] — `(channel, peer)` on shared broker
+/// state rather than on the connection — so a reconnect resumes the same bucket. That is
+/// load-bearing, not incidental: a relay that gets refused reconnects automatically, so a
+/// per-connection bucket would reset itself precisely when it is doing its job.
+#[derive(Clone, Default)]
+struct ByteRateLimiter {
+    buckets: Arc<Mutex<HashMap<String, ByteBucket>>>,
+}
+
+struct ByteBucket {
+    /// Bytes currently available to spend.
+    tokens: f64,
+    last_refill: Instant,
+    /// When this bucket will have refilled to its burst ceiling. A bucket at or past
+    /// this instant is indistinguishable from a brand new one, so it is safe to prune.
+    /// Stored per bucket rather than recomputed, because one map holds peers of
+    /// different roles and therefore different budgets.
+    full_at: Instant,
+}
+
+/// Counters behind the publish allowances, so an operator can see the limits working
+/// (or misfiring) instead of inferring it from logs.
+///
+/// Deliberately a **blocking** mutex, not the async one: egress is recorded on every
+/// outbound frame, and the critical section is a handful of integer adds. An async lock
+/// there would put an await point — and so a possible yield — on the socket write path,
+/// which on this broker is the path a heartbeat ping shares. Anything that can delay a
+/// ping is a session-killer. The lock is never held across an await.
+#[derive(Clone, Default)]
+struct PublishMetrics {
+    inner: Arc<StdMutex<PublishMetricsInner>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+struct PublishMetricsSnapshot {
+    /// Frames refused by the frame-count allowance.
+    frame_limit_exceeded: u64,
+    /// Frames refused by the byte allowance.
+    byte_limit_exceeded: u64,
+    /// Inbound bytes accepted for publishing.
+    published_bytes: u64,
+    /// `ServerMessage` bytes written to client sockets — welcomes, presence, messages and
+    /// errors, including the error sent to a rejected join.
+    ///
+    /// Exact within that scope, and inherently after fan-out: each recipient's own write is
+    /// counted where its real serialized length is known. The scope deliberately excludes
+    /// WebSocket **control** frames (ping/pong), which carry no application payload and are
+    /// a fixed few bytes; this counts what the broker was asked to deliver, not raw socket
+    /// throughput.
+    egress_bytes: u64,
+    /// Highest egress observed in any single completed minute.
+    peak_egress_bytes_per_minute: u64,
+    /// Minutes whose egress crossed [`GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE`].
+    global_egress_warnings: u64,
+}
+
+#[derive(Default)]
+struct PublishMetricsInner {
+    snapshot: PublishMetricsSnapshot,
+    egress_window_bytes: u64,
+    egress_window_started: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -477,6 +692,11 @@ impl Default for BrokerHardeningConfig {
             public_api_rate_limit_per_minute: DEFAULT_PUBLIC_API_RATE_LIMIT_PER_MINUTE,
             join_rate_limit_per_minute: DEFAULT_JOIN_RATE_LIMIT_PER_MINUTE,
             publish_rate_limit_per_minute: DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE,
+            relay_publish_rate_limit_per_minute: DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE,
+            publish_bytes_per_minute: DEFAULT_PUBLISH_BYTES_PER_MINUTE,
+            relay_publish_bytes_per_minute: DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE,
+            publish_burst_bytes: DEFAULT_PUBLISH_BURST_BYTES,
+            relay_publish_burst_bytes: DEFAULT_RELAY_PUBLISH_BURST_BYTES,
             max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
             max_text_frame_bytes: DEFAULT_MAX_TEXT_FRAME_BYTES,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
@@ -499,19 +719,211 @@ impl BrokerHardeningConfig {
                 PUBLISH_RATE_LIMIT_ENV,
                 DEFAULT_PUBLISH_RATE_LIMIT_PER_MINUTE,
             )?,
+            relay_publish_rate_limit_per_minute: relay_publish_rate_limit_from_env()?,
+            publish_bytes_per_minute: parse_usize_env(
+                PUBLISH_BYTES_ENV,
+                DEFAULT_PUBLISH_BYTES_PER_MINUTE,
+            )?,
+            relay_publish_bytes_per_minute: relay_publish_bytes_from_env()?,
+            publish_burst_bytes: parse_usize_env(
+                PUBLISH_BURST_BYTES_ENV,
+                DEFAULT_PUBLISH_BURST_BYTES,
+            )?,
+            relay_publish_burst_bytes: relay_publish_burst_bytes_from_env()?,
             max_connections_per_ip: parse_usize_env(
                 MAX_CONNECTIONS_PER_IP_ENV,
                 DEFAULT_MAX_CONNECTIONS_PER_IP,
             )?,
-            max_text_frame_bytes: parse_usize_env(
-                MAX_TEXT_FRAME_BYTES_ENV,
-                DEFAULT_MAX_TEXT_FRAME_BYTES,
-            )?,
+            max_text_frame_bytes: {
+                let configured =
+                    parse_usize_env(MAX_TEXT_FRAME_BYTES_ENV, DEFAULT_MAX_TEXT_FRAME_BYTES)?;
+                if configured < MIN_MAX_TEXT_FRAME_BYTES {
+                    warn!(
+                        configured,
+                        effective = MIN_MAX_TEXT_FRAME_BYTES,
+                        "{MAX_TEXT_FRAME_BYTES_ENV} is below the size a relay is compiled to \
+                         emit; raising it. A smaller cap does not shrink relay frames, it \
+                         rejects them, and the reconnect replays the same reply."
+                    );
+                }
+                configured
+            },
             idle_timeout: Duration::from_secs(parse_u64_env(
                 IDLE_TIMEOUT_SECS_ENV,
                 DEFAULT_IDLE_TIMEOUT_SECS,
             )?),
         })
+    }
+}
+
+impl BrokerHardeningConfig {
+    /// The frame allowance for `role`.
+    fn frame_limit(&self, role: protocol::PeerRole) -> usize {
+        match role {
+            protocol::PeerRole::Relay => self.relay_publish_rate_limit_per_minute,
+            protocol::PeerRole::Surface => self.publish_rate_limit_per_minute,
+        }
+    }
+
+    /// The largest client frame the broker will accept.
+    ///
+    /// Never below [`MIN_MAX_TEXT_FRAME_BYTES`]: a relay cannot negotiate this value, so a
+    /// smaller one rejects frames it is compiled to produce rather than making it produce
+    /// smaller ones. Raised rather than refused at startup, matching the publish burst
+    /// floor — a misconfigured limit should throttle, never brick.
+    fn max_text_frame_bytes(&self) -> usize {
+        self.max_text_frame_bytes.max(MIN_MAX_TEXT_FRAME_BYTES)
+    }
+
+    /// The byte allowance for `role`.
+    ///
+    /// The burst floor is not cosmetic: a burst below `max_text_frame_bytes` would refuse
+    /// frames the broker's own frame cap accepts, and refuse them *forever*, since the
+    /// bucket can never hold enough to pay for one. A misconfigured burst would brick
+    /// publishing rather than throttle it, so it is raised to the frame cap instead.
+    fn byte_budget(&self, role: protocol::PeerRole) -> ByteBudget {
+        let (bytes_per_minute, burst_bytes) = match role {
+            protocol::PeerRole::Relay => (
+                self.relay_publish_bytes_per_minute,
+                self.relay_publish_burst_bytes,
+            ),
+            protocol::PeerRole::Surface => {
+                (self.publish_bytes_per_minute, self.publish_burst_bytes)
+            }
+        };
+        ByteBudget {
+            bytes_per_minute,
+            burst_bytes: burst_bytes.max(self.max_text_frame_bytes()),
+        }
+    }
+}
+
+impl ByteRateLimiter {
+    /// Spend `cost` bytes from `key`'s bucket, returning whether the peer could afford it.
+    ///
+    /// A refused charge deducts nothing, so a peer that is over budget is not pushed
+    /// further under by retrying.
+    async fn charge(&self, key: String, cost: usize, budget: ByteBudget) -> bool {
+        if budget.is_disabled() {
+            return true;
+        }
+        let now = Instant::now();
+        let burst = budget.burst_bytes as f64;
+        let per_second = budget.bytes_per_second();
+
+        let mut buckets = self.buckets.lock().await;
+        // Prune settled buckets before inserting, so a churn of one-frame peers cannot
+        // grow the map without bound. Only buckets that have refilled to full are
+        // dropped: those carry no state a fresh bucket would not also have.
+        if buckets.len() > BYTE_BUCKET_PRUNE_THRESHOLD {
+            buckets.retain(|_, bucket| bucket.full_at > now);
+        }
+
+        let bucket = buckets.entry(key).or_insert(ByteBucket {
+            tokens: burst,
+            last_refill: now,
+            full_at: now,
+        });
+
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * per_second).min(burst);
+        bucket.last_refill = now;
+
+        let affordable = bucket.tokens >= cost as f64;
+        if affordable {
+            bucket.tokens -= cost as f64;
+        }
+
+        // Refresh the prune deadline from the (possibly reduced) balance either way, so a
+        // bucket that keeps being refused stays resident rather than being pruned into a
+        // free reset.
+        let deficit = (burst - bucket.tokens).max(0.0);
+        let seconds_to_full = if per_second > 0.0 {
+            deficit / per_second
+        } else {
+            0.0
+        };
+        bucket.full_at = now + Duration::from_secs_f64(seconds_to_full.min(u32::MAX as f64));
+
+        affordable
+    }
+}
+
+impl PublishMetrics {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PublishMetricsInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record_frame_limited(&self) {
+        self.lock().snapshot.frame_limit_exceeded += 1;
+    }
+
+    fn record_byte_limited(&self) {
+        self.lock().snapshot.byte_limit_exceeded += 1;
+    }
+
+    fn record_published(&self, bytes: usize) {
+        self.lock().snapshot.published_bytes += bytes as u64;
+    }
+
+    /// Record bytes actually written to a peer socket, into the one-minute observation
+    /// window.
+    ///
+    /// Called once per outbound frame, from the one place that knows the real serialized
+    /// length. That is what makes this figure exact rather than modelled: fan-out is
+    /// counted because each recipient's own write is counted, and a frame that was never
+    /// sent is never counted.
+    ///
+    /// Never refuses anything — see [`GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE`] for why the
+    /// global view is deliberately observation-only.
+    fn record_egress(&self, bytes: u64) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.snapshot.egress_bytes += bytes;
+        inner.close_elapsed_window(now);
+        inner.egress_window_bytes += bytes;
+    }
+
+    /// Read the counters, closing an elapsed window first.
+    ///
+    /// Closing on read is what makes a burst-then-silence minute observable at all: if the
+    /// window only rolled when the next frame arrived, the loudest minute an operator
+    /// could have — a spike followed by nothing — would never reach the peak or the
+    /// warning counter.
+    fn snapshot(&self) -> PublishMetricsSnapshot {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.close_elapsed_window(now);
+        inner.snapshot
+    }
+}
+
+impl PublishMetricsInner {
+    /// Fold the current window into the peak and warning counters once a full minute has
+    /// passed, then start a fresh one. A no-op while the minute is still running.
+    fn close_elapsed_window(&mut self, now: Instant) {
+        let started = *self.egress_window_started.get_or_insert(now);
+        if now.saturating_duration_since(started).as_secs() < RATE_LIMIT_WINDOW_SECS {
+            return;
+        }
+        let completed = self.egress_window_bytes;
+        self.snapshot.peak_egress_bytes_per_minute =
+            self.snapshot.peak_egress_bytes_per_minute.max(completed);
+        if completed > GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE {
+            self.snapshot.global_egress_warnings += 1;
+            warn!(
+                egress_bytes = completed,
+                warn_threshold = GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE,
+                "broker egress crossed the warning threshold in the last minute; \
+                 this is observed, not enforced"
+            );
+        }
+        self.egress_window_bytes = 0;
+        self.egress_window_started = Some(now);
     }
 }
 
@@ -703,6 +1115,7 @@ impl BrokerJoinVerifier {
             .map(|claims| VerifiedBrokerJoin {
                 peer_id: claims.peer_id,
                 device_id: claims.device_id,
+                pairing_id: claims.pairing_id,
             }),
             Self::PublicControlPlane(control_plane) => verify_join_ticket_for_connection(
                 control_plane.issuer_key(),
@@ -713,6 +1126,7 @@ impl BrokerJoinVerifier {
             .map(|claims| VerifiedBrokerJoin {
                 peer_id: claims.peer_id,
                 device_id: claims.device_id,
+                pairing_id: claims.pairing_id,
             }),
             Self::Misconfigured(error) => Err(error.clone()),
         }
@@ -849,6 +1263,10 @@ fn app_with_web_root_and_verifier_and_hardening_and_licenses(
             "/api/public/clients/grants",
             post(public_issue_client_grant),
         )
+        .route(
+            "/api/public/client/claim",
+            post(public_claim_client_identity),
+        )
         .route("/api/public/relays", get(public_list_client_relays))
         .route(
             "/api/public/client/session",
@@ -896,7 +1314,6 @@ fn app_with_web_root_and_verifier_and_hardening_and_licenses(
             ServeFile::new(web_root.join("remote-manifest.webmanifest")),
         )
         .route_service("/sw.js", ServeFile::new(web_root.join("remote-sw.js")))
-        .route_service("/icon.svg", ServeFile::new(web_root.join("icon.svg")))
         .route_service(
             "/apple-touch-icon.png",
             ServeFile::new(web_root.join("apple-touch-icon.png")),
@@ -930,6 +1347,8 @@ fn app_with_web_root_and_verifier_and_hardening_and_licenses(
             hardening: BrokerHardeningState {
                 config: hardening_config,
                 rate_limiter: SlidingWindowRateLimiter::default(),
+                byte_limiter: ByteRateLimiter::default(),
+                publish_metrics: PublishMetrics::default(),
                 connection_tracker: ActiveConnectionTracker::default(),
             },
             public_monitoring: PublicMonitoringState::default(),
@@ -1061,6 +1480,10 @@ struct AdminStatsResponse {
     generated_at: u64,
     totals: public_control::AdminTotals,
     relays: Vec<AdminRelayRow>,
+    /// Publish-allowance counters: how often each limit fired, and how much traffic
+    /// actually moved. `peak_egress_bytes_per_minute` is the number to watch before
+    /// deciding whether the global egress view should ever become enforcing.
+    publish_limits: PublishMetricsSnapshot,
 }
 
 /// Outcome of checking an operator admin request's bearer token.
@@ -1180,6 +1603,7 @@ async fn admin_stats(
         generated_at: unix_now_secs(),
         totals: stats.totals,
         relays,
+        publish_limits: state.hardening.publish_metrics.snapshot(),
     }))
 }
 
@@ -1481,6 +1905,26 @@ async fn public_issue_client_grant(
     let bearer = bearer_token(&headers)?;
     control_plane
         .issue_client_grant(bearer, input)
+        .await
+        .map(Json)
+        .map_err(public_api_error)
+}
+
+/// Redeem a relay's attestation for a client credential.
+///
+/// Intentionally takes no bearer: the Ed25519 signature in the body *is* the
+/// authentication, and it belongs to the client, not to the relay that
+/// attested it. Rate-limited like the rest of the public control plane so the
+/// unauthenticated shape cannot be used to grind at claim ids.
+async fn public_claim_client_identity(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<BrokerAppState>,
+    Json(input): Json<ClientClaimRequest>,
+) -> Result<Json<ClientClaimResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    enforce_public_api_rate_limit(&state, remote_addr, "client_claim").await?;
+    let control_plane = require_public_control_plane(&state)?;
+    control_plane
+        .claim_client_identity(input)
         .await
         .map(Json)
         .map_err(public_api_error)
@@ -1892,7 +2336,13 @@ async fn handle_socket(
     query: ConnectQuery,
 ) {
     if channel_id.trim().is_empty() {
-        reject_socket(socket, "invalid_connection", "channel_id is required").await;
+        reject_socket(
+            &state.hardening.publish_metrics,
+            socket,
+            "invalid_connection",
+            "channel_id is required",
+        )
+        .await;
         return;
     }
     let Some(_connection_permit) = state.hardening.connection_tracker.try_acquire(
@@ -1900,6 +2350,7 @@ async fn handle_socket(
         state.hardening.config.max_connections_per_ip,
     ) else {
         reject_socket(
+            &state.hardening.publish_metrics,
             socket,
             "rate_limited",
             "too many broker connections from this client",
@@ -1917,6 +2368,7 @@ async fn handle_socket(
         .await
     {
         reject_socket(
+            &state.hardening.publish_metrics,
             socket,
             "rate_limited",
             "broker join rate limit exceeded for this client",
@@ -1940,6 +2392,7 @@ async fn handle_socket(
                 "broker join rejected"
             );
             reject_socket(
+                &state.hardening.publish_metrics,
                 socket,
                 "join_rejected",
                 state.join_verifier.client_join_error_message(),
@@ -1949,8 +2402,19 @@ async fn handle_socket(
         }
     };
 
-    let mut peer_id =
-        trimmed_option_string(query.peer_id).or_else(|| verified_join.peer_id.clone());
+    // Only a ticket that PINS a peer_id (a relay join) may have it echoed back in
+    // the query — the equality check below then validates the match. A surface
+    // ticket pins nothing, so honoring the query parameter let a surface name
+    // itself after the relay and take that slot; and because the relay's own
+    // ticket pins its id, the regenerate-on-collision retry below never fires for
+    // it, so the relay was locked out of its own room until the squatter dropped
+    // the socket. Surfaces get a broker-assigned id instead, which is what the
+    // remote client already reads back out of `Welcome`.
+    let mut peer_id = if verified_join.peer_id.is_some() {
+        trimmed_option_string(query.peer_id).or_else(|| verified_join.peer_id.clone())
+    } else {
+        None
+    };
     let join = loop {
         let candidate = peer_id
             .clone()
@@ -1964,6 +2428,7 @@ async fn handle_socket(
                     "broker join rejected because the requested peer_id did not match the verified ticket"
                 );
                 reject_socket(
+                    &state.hardening.publish_metrics,
                     socket,
                     "join_rejected",
                     state.join_verifier.client_join_error_message(),
@@ -1979,6 +2444,7 @@ async fn handle_socket(
                 &candidate,
                 query.role,
                 verified_join.device_id.clone(),
+                verified_join.pairing_id.clone(),
             )
             .await
         {
@@ -1998,6 +2464,7 @@ async fn handle_socket(
                     "broker join failed"
                 );
                 reject_socket(
+                    &state.hardening.publish_metrics,
                     socket,
                     "join_rejected",
                     state.join_verifier.client_join_error_message(),
@@ -2008,6 +2475,9 @@ async fn handle_socket(
         }
     };
     let peer_id = peer_id.expect("broker should assign a peer id");
+    // Resolved once, from the verified ticket rather than the assigned peer_id, so
+    // reconnecting cannot hand this connection a fresh allowance.
+    let publish_identity = publish_limit_identity(&verified_join, &peer_id);
     let connection_id = join.connection_id;
 
     let (mut sender, mut receiver) = socket.split();
@@ -2018,7 +2488,10 @@ async fn handle_socket(
         peers: join.existing_peers,
     };
 
-    if send_message(&mut sender, &welcome).await.is_err() {
+    if send_message(&state.hardening.publish_metrics, &mut sender, &welcome)
+        .await
+        .is_err()
+    {
         state
             .broker
             .leave_connection(&channel_id, &peer_id, connection_id)
@@ -2038,13 +2511,14 @@ async fn handle_socket(
                 let Some(message) = outbound_message else {
                     break;
                 };
-                if send_message(&mut sender, &message).await.is_err() {
+                if send_message(&state.hardening.publish_metrics, &mut sender, &message).await.is_err() {
                     break;
                 }
                 idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
             }
             _ = &mut idle_sleep => {
                 let _ = send_message(
+                    &state.hardening.publish_metrics,
                     &mut sender,
                     &ServerMessage::Error {
                         code: "idle_timeout".to_string(),
@@ -2061,14 +2535,15 @@ async fn handle_socket(
                 idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                 match frame {
                     Ok(Message::Text(text)) => {
-                        if text.len() > state.hardening.config.max_text_frame_bytes {
+                        if text.len() > state.hardening.config.max_text_frame_bytes() {
                             let _ = send_message(
+                                &state.hardening.publish_metrics,
                                 &mut sender,
                                 &ServerMessage::Error {
                                     code: "frame_too_large".to_string(),
                                     message: format!(
                                         "client text frames must be {} bytes or smaller",
-                                        state.hardening.config.max_text_frame_bytes
+                                        state.hardening.config.max_text_frame_bytes()
                                     ),
                                 },
                             )
@@ -2081,6 +2556,7 @@ async fn handle_socket(
                             Ok(ClientMessage::Publish { protocol_version, payload }) => {
                                 if protocol_version != BROKER_PROTOCOL_VERSION {
                                     let _ = send_message(
+                                        &state.hardening.publish_metrics,
                                         &mut sender,
                                         &ServerMessage::Error {
                                             code: "unsupported_protocol_version".to_string(),
@@ -2093,23 +2569,26 @@ async fn handle_socket(
                                     break;
                                 }
                                 let payload_summary = summarize_published_payload(&payload);
+                                let frame_bytes = text.len();
                                 if !state
                                     .hardening
                                     .rate_limiter
                                     .allow(
-                                        format!("publish:{channel_id}:{peer_id}"),
-                                        state.hardening.config.publish_rate_limit_per_minute,
+                                        format!("publish:{channel_id}:{publish_identity}"),
+                                        state.hardening.config.frame_limit(query.role),
                                     )
                                     .await
                                 {
+                                    state.hardening.publish_metrics.record_frame_limited();
                                     warn!(
                                         channel_id,
                                         peer_id,
-                                        frame_bytes = text.len(),
+                                        frame_bytes,
                                         payload = %payload_summary,
                                         "broker publish rate limit exceeded"
                                     );
                                     let _ = send_message(
+                                        &state.hardening.publish_metrics,
                                         &mut sender,
                                         &ServerMessage::Error {
                                             code: "rate_limited".to_string(),
@@ -2119,7 +2598,42 @@ async fn handle_socket(
                                     .await;
                                     continue;
                                 }
-                                if let Err(error) = state
+                                // Charged on the raw frame, so a peer pays for what it
+                                // actually puts on the wire rather than for a count that
+                                // says nothing about size.
+                                let byte_budget = state.hardening.config.byte_budget(query.role);
+                                if !state
+                                    .hardening
+                                    .byte_limiter
+                                    .charge(
+                                        format!("publish-bytes:{channel_id}:{publish_identity}"),
+                                        frame_bytes,
+                                        byte_budget,
+                                    )
+                                    .await
+                                {
+                                    state.hardening.publish_metrics.record_byte_limited();
+                                    warn!(
+                                        channel_id,
+                                        peer_id,
+                                        frame_bytes,
+                                        bytes_per_minute = byte_budget.bytes_per_minute,
+                                        burst_bytes = byte_budget.burst_bytes,
+                                        payload = %payload_summary,
+                                        "broker publish byte limit exceeded"
+                                    );
+                                    let _ = send_message(
+                                        &state.hardening.publish_metrics,
+                                        &mut sender,
+                                        &ServerMessage::Error {
+                                            code: "rate_limited".to_string(),
+                                            message: "broker publish byte limit exceeded for this peer".to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                match state
                                     .broker
                                     .publish_connection(
                                         &channel_id,
@@ -2129,21 +2643,33 @@ async fn handle_socket(
                                     )
                                     .await
                                 {
-                                    warn!(
-                                        channel_id,
-                                        peer_id,
-                                        %error,
-                                        payload = %payload_summary,
-                                        "failed to publish message"
-                                    );
-                                    if error.contains("connection has been replaced") {
-                                        break;
+                                    Ok(()) => {
+                                        // Inbound only. The egress this fans out to is
+                                        // counted per recipient in `send_message`, where
+                                        // the real serialized length is known.
+                                        state
+                                            .hardening
+                                            .publish_metrics
+                                            .record_published(frame_bytes);
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            channel_id,
+                                            peer_id,
+                                            %error,
+                                            payload = %payload_summary,
+                                            "failed to publish message"
+                                        );
+                                        if error.contains("connection has been replaced") {
+                                            break;
+                                        }
                                     }
                                 }
                             }
                             Err(error) => {
                                 debug!(channel_id, peer_id, %error, "rejecting invalid client frame");
                                 let _ = send_message(
+                                    &state.hardening.publish_metrics,
                                     &mut sender,
                                     &ServerMessage::Error {
                                         code: "invalid_client_frame".to_string(),
@@ -2163,14 +2689,15 @@ async fn handle_socket(
                     }
                     Ok(Message::Pong(_)) => {}
                     Ok(Message::Binary(bytes)) => {
-                        if bytes.len() > state.hardening.config.max_text_frame_bytes {
+                        if bytes.len() > state.hardening.config.max_text_frame_bytes() {
                             let _ = send_message(
+                                &state.hardening.publish_metrics,
                                 &mut sender,
                                 &ServerMessage::Error {
                                     code: "frame_too_large".to_string(),
                                     message: format!(
                                         "client binary frames must be {} bytes or smaller",
-                                        state.hardening.config.max_text_frame_bytes
+                                        state.hardening.config.max_text_frame_bytes()
                                     ),
                                 },
                             )
@@ -2193,22 +2720,44 @@ async fn handle_socket(
         .await;
 }
 
+/// Write one frame to a peer socket, accounting its exact serialized length as egress.
+///
+/// This is the only place a `ServerMessage` becomes bytes, which makes it the only place
+/// egress can be known rather than modelled. Counting here is also free: the
+/// serialization already had to happen. An earlier revision estimated egress at publish
+/// time from a fan-out count and the inbound frame size, which silently assumed every
+/// target of a `targeted_messages` wrapper got a similar-sized payload — one large
+/// delivered payload beside one tiny undelivered one reported half the true figure.
+///
+/// Only a successful write counts: a frame the socket rejected never left.
 async fn send_message(
+    metrics: &PublishMetrics,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: &ServerMessage,
 ) -> Result<(), axum::Error> {
     let payload = serde_json::to_string(message).expect("server messages should serialize");
-    sender.send(Message::Text(payload)).await
+    let bytes = payload.len() as u64;
+    let result = sender.send(Message::Text(payload)).await;
+    if result.is_ok() {
+        metrics.record_egress(bytes);
+    }
+    result
 }
 
-async fn reject_socket(socket: WebSocket, code: &str, message: &str) {
+async fn reject_socket(metrics: &PublishMetrics, socket: WebSocket, code: &str, message: &str) {
     let (mut sender, _) = socket.split();
     let payload = serde_json::to_string(&ServerMessage::Error {
         code: code.to_string(),
         message: message.to_string(),
     })
     .expect("error message should serialize");
-    let _ = sender.send(Message::Text(payload)).await;
+    let bytes = payload.len() as u64;
+    // Counted like any other `ServerMessage`. A rejection frame is small, but leaving it
+    // out would make `egress_bytes` mean "egress except the one path an abusive client
+    // can drive hardest" — a rejected join is exactly what a flood produces.
+    if sender.send(Message::Text(payload)).await.is_ok() {
+        metrics.record_egress(bytes);
+    }
     let _ = sender.close().await;
 }
 
@@ -2236,6 +2785,34 @@ fn workspace_root() -> Option<PathBuf> {
         .join("..")
         .canonicalize()
         .ok()
+}
+
+/// The identity a publish allowance is keyed on — deliberately **not** the `peer_id`.
+///
+/// A surface's `peer_id` is minted fresh by the broker on every join (see
+/// [`generated_peer_id`]; a surface ticket pins nothing), so a budget keyed on it resets
+/// every time the peer reconnects. That makes the limit advisory for exactly the peers it
+/// is aimed at: at the default 40 joins/minute one credential could draw ~10 fresh bursts
+/// a minute, and concurrent sockets multiply it again.
+///
+/// The join ticket's `device_id`/`pairing_id` are authenticated and survive a reconnect,
+/// which is what a budget needs. Ticket validation guarantees a surface carries exactly
+/// one of them, so the `peer_id` fallback is unreachable for a validated surface join; it
+/// exists so an unauthenticated path can never silently become unkeyed.
+///
+/// A relay's ticket pins its `peer_id` and forbids both other ids, so relays fall through
+/// to that and keep the identity they already had.
+///
+/// Consequence worth knowing: two tabs on the same device now share one budget. That is
+/// the intended reading of "per peer" — the credential is the peer, not the socket.
+fn publish_limit_identity(verified: &VerifiedBrokerJoin, peer_id: &str) -> String {
+    if let Some(device_id) = verified.device_id.as_deref() {
+        return format!("device:{device_id}");
+    }
+    if let Some(pairing_id) = verified.pairing_id.as_deref() {
+        return format!("pairing:{pairing_id}");
+    }
+    format!("peer:{peer_id}")
 }
 
 fn generated_peer_id(role: protocol::PeerRole) -> String {
@@ -2624,6 +3201,88 @@ fn parse_u64_env(name: &str, default: u64) -> Result<u64, String> {
             .map_err(|error| format!("{name} must be a positive integer: {error}")),
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid utf-8")),
+    }
+}
+
+/// The relay's publish allowance, with a migration path.
+///
+/// Before relays and surfaces had separate budgets, `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE`
+/// governed every peer. An operator who deliberately tightened it would otherwise find
+/// relays silently promoted to the far larger relay default on upgrade — a hardening
+/// setting quietly weakening itself is the wrong way round. So an explicitly configured
+/// generic limit keeps governing relays too, until the operator opts into the split by
+/// setting the relay-specific variable.
+fn relay_publish_rate_limit_from_env() -> Result<usize, String> {
+    resolve_relay_publish_rate_limit(
+        std::env::var(RELAY_PUBLISH_RATE_LIMIT_ENV).ok().as_deref(),
+        std::env::var(PUBLISH_RATE_LIMIT_ENV).ok().as_deref(),
+    )
+}
+
+/// Split out from the environment so the migration rule can be tested without mutating
+/// process-wide state that the concurrent server tests also read.
+fn resolve_relay_publish_rate_limit(
+    relay_setting: Option<&str>,
+    generic_setting: Option<&str>,
+) -> Result<usize, String> {
+    let parse = |name: &str, value: &str| {
+        value
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| format!("{name} must be a positive integer: {error}"))
+    };
+    match (relay_setting, generic_setting) {
+        (Some(relay), _) => parse(RELAY_PUBLISH_RATE_LIMIT_ENV, relay),
+        (None, Some(generic)) => parse(PUBLISH_RATE_LIMIT_ENV, generic),
+        (None, None) => Ok(DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE),
+    }
+}
+
+/// The relay's byte allowance, following the same migration rule as its frame allowance.
+///
+/// The byte variables are new, so no deployment can already have set them — but an
+/// operator who tightens the generic byte budget means it, and leaving relays at a default
+/// 32x larger would read as the setting being ignored. Same shape as the frame rule, so
+/// there is one thing to learn rather than two.
+fn relay_publish_bytes_from_env() -> Result<usize, String> {
+    resolve_relay_byte_setting(
+        std::env::var(RELAY_PUBLISH_BYTES_ENV).ok().as_deref(),
+        std::env::var(PUBLISH_BYTES_ENV).ok().as_deref(),
+        RELAY_PUBLISH_BYTES_ENV,
+        PUBLISH_BYTES_ENV,
+        DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE,
+    )
+}
+
+fn relay_publish_burst_bytes_from_env() -> Result<usize, String> {
+    resolve_relay_byte_setting(
+        std::env::var(RELAY_PUBLISH_BURST_BYTES_ENV).ok().as_deref(),
+        std::env::var(PUBLISH_BURST_BYTES_ENV).ok().as_deref(),
+        RELAY_PUBLISH_BURST_BYTES_ENV,
+        PUBLISH_BURST_BYTES_ENV,
+        DEFAULT_RELAY_PUBLISH_BURST_BYTES,
+    )
+}
+
+/// Split out from the environment so the migration rule can be tested without mutating
+/// process-wide state that the concurrent server tests also read.
+fn resolve_relay_byte_setting(
+    relay_setting: Option<&str>,
+    generic_setting: Option<&str>,
+    relay_name: &str,
+    generic_name: &str,
+    default: usize,
+) -> Result<usize, String> {
+    let parse = |name: &str, value: &str| {
+        value
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| format!("{name} must be a non-negative integer: {error}"))
+    };
+    match (relay_setting, generic_setting) {
+        (Some(relay), _) => parse(relay_name, relay),
+        (None, Some(generic)) => parse(generic_name, generic),
+        (None, None) => Ok(default),
     }
 }
 

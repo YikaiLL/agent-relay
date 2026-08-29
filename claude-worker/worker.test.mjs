@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
+import { createCwdReporter } from "./session-options.mjs";
 import {
   buildSdkMsgProbe,
   closeSessionEntry,
   createSessionEntry,
   createWorkerSession,
+  cwdChangedEvent,
   ensureLiveSession,
   evictSessionsIfNeeded,
   findSessionEntry,
@@ -55,11 +58,39 @@ async function* streamMessages(messages) {
   }
 }
 
+// Capture the WORKER's stdout without eating the test runner's.
+//
+// Both go through `process.stdout.write`, and these tests are async, so a naive
+// swap swallows whatever node:test reports while the swap is in place. That is
+// not a cosmetic loss: under `node --test` it silently dropped 12 of this file's
+// 14 results, so a failure in any of them could not fail the gate. (Running the
+// file directly showed them, which is what made it invisible.)
+//
+// The two streams are distinguishable by construction: the worker's protocol is
+// NDJSON — `protocol.mjs:emit` writes exactly `JSON.stringify(event) + "\n"` —
+// and the runner's output is never a bare JSON value. So capture what parses and
+// forward what does not.
 function captureStdout(fn) {
   const lines = [];
   const originalWrite = process.stdout.write.bind(process.stdout);
-  process.stdout.write = (chunk) => {
-    lines.push(...String(chunk).split("\n").filter(Boolean));
+  // Classify the chunk as a whole and forward it BYTE-FOR-BYTE if it is not
+  // ours. Rebuilding a passthrough chunk from split lines corrupts the runner's
+  // output (it writes partial lines and ANSI escapes, and may hand us a Buffer).
+  const isWorkerOutput = (text) => {
+    const candidates = text.split("\n").filter(Boolean);
+    if (candidates.length === 0) return false;
+    return candidates.every((line) => {
+      try {
+        return JSON.parse(line) !== null && typeof JSON.parse(line) === "object";
+      } catch {
+        return false;
+      }
+    });
+  };
+  process.stdout.write = (chunk, ...rest) => {
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    if (!isWorkerOutput(text)) return originalWrite(chunk, ...rest);
+    lines.push(...text.split("\n").filter(Boolean));
     return true;
   };
   return Promise.resolve()
@@ -272,6 +303,99 @@ test("flushEvents emits no MCP log when init has no servers", async () => {
   );
 });
 
+test("flushEvents emits a queued PostToolUse cwd after the tool result", async () => {
+  const order = [];
+  const reporter = createCwdReporter((cwd) => order.push(`cwd:${cwd}`));
+  reporter.observeCwd("/repo/a", { source: "PostToolUse" });
+  assert.deepEqual(order, [], "PostToolUse must not race the tool result");
+
+  await captureStdout(async () => {
+    await flushEvents(
+      streamMessages([
+        {
+          type: "user",
+          uuid: "user-1",
+          message: {
+            content: [{ type: "tool_result", tool_use_id: "tool-1", content: "ok" }],
+          },
+        },
+      ]),
+      { current: false },
+      (event) => order.push(event.type),
+      null,
+      null,
+      null,
+      null,
+      makeTracker(),
+      (event) => {
+        if (event?.type === "tool_call_result") reporter.flushPostToolCwd(event.id);
+        else if (event?.type === "mapped_batch_end") reporter.flushPostToolCwd();
+      },
+    );
+  });
+
+  assert.deepEqual(order, ["tool_call_result", "cwd:/repo/a"]);
+});
+
+test("flushEvents emits PostToolUse cwd after a parallel batch of write results", async () => {
+  const order = [];
+  const reporter = createCwdReporter((cwd) => order.push(`cwd:${cwd}`));
+  reporter.observeCwd("/repo/a", { source: "PostToolUse", tool_use_id: "tool-1" });
+  reporter.observeCwd("/repo/a", { source: "PostToolUse", tool_use_id: "tool-2" });
+
+  await captureStdout(async () => {
+    await flushEvents(
+      streamMessages([
+        {
+          type: "user",
+          uuid: "user-1",
+          message: {
+            content: [
+              { type: "tool_result", tool_use_id: "tool-1", content: "ok" },
+              { type: "tool_result", tool_use_id: "tool-2", content: "ok" },
+            ],
+          },
+        },
+      ]),
+      { current: false },
+      (event) => order.push(event.type),
+      null,
+      null,
+      null,
+      null,
+      makeTracker(),
+      (event) => {
+        if (event?.type === "tool_call_result") reporter.flushPostToolCwd(event.id);
+        else if (event?.type === "mapped_batch_end") reporter.flushPostToolCwd();
+      },
+    );
+  });
+
+  assert.deepEqual(order, [
+    "tool_call_result",
+    "cwd:/repo/a",
+    "tool_call_result",
+    "cwd:/repo/a",
+  ]);
+  const lastCwd = order.lastIndexOf("cwd:/repo/a");
+  const lastResult = order.lastIndexOf("tool_call_result");
+  assert.ok(lastCwd > lastResult, "the last cwd must outrank the last write result");
+});
+
+test("the live stream flushes PostToolUse cwd after publishing tool_call_result", () => {
+  const src = readFileSync(new URL("./worker.mjs", import.meta.url), "utf8");
+  const flushAfterResult =
+    src.includes('event?.type === "tool_call_result"') &&
+    src.includes("entry.flushPostToolCwd?.(event.id)");
+  const flushAfterBatch =
+    src.includes('event?.type === "mapped_batch_end"') && src.includes("entry.flushPostToolCwd?.()");
+  assert.equal(
+    flushAfterResult && flushAfterBatch,
+    true,
+    "PostToolUse cwd has to leave the worker after each result and after the mapped batch",
+  );
+});
+
 // A fake SDK whose query() records the options it was booted with and blocks
 // (like a live session awaiting input) until interrupt(), so we can observe
 // whether ensureLiveSession reuses or rebuilds the underlying query.
@@ -302,6 +426,54 @@ function makeFakeSdk() {
 function rebuildContext() {
   return { pendingApprovals: new Map(), pendingAskUserQuestions: new Map() };
 }
+
+test("sessionOptionsChanged notices a persona swap", () => {
+  // systemPrompt is baked into query() like permissionMode and model. Left out
+  // of this comparison, a live session silently keeps the OLD persona while the
+  // relay believes it sent a new one — the failure is invisible, which is what
+  // makes it worth pinning.
+  assert.equal(
+    sessionOptionsChanged(
+      { permissionMode: "default", systemPrompt: "You are the Orchestrator." },
+      { permissionMode: "default", systemPrompt: "You are something else." }
+    ),
+    true
+  );
+  assert.equal(
+    sessionOptionsChanged(
+      { permissionMode: "default", systemPrompt: "same" },
+      { permissionMode: "default", systemPrompt: "same" }
+    ),
+    false
+  );
+  // Absent on both sides is not a change.
+  assert.equal(
+    sessionOptionsChanged({ permissionMode: "default" }, { permissionMode: "default" }),
+    false
+  );
+  // Omitted systemPrompt on a live command clears the baked persona (rebuild).
+  assert.equal(
+    sessionOptionsChanged(
+      { permissionMode: "default", systemPrompt: "You are the Orchestrator." },
+      { permissionMode: "default" },
+    ),
+    true,
+  );
+});
+
+test("sessionOptionsChanged notices a toolset swap", () => {
+  const withTools = {
+    permissionMode: "acceptEdits",
+    mcpServers: { sealwire: { type: "stdio", command: "node", args: ["/x.mjs"] } },
+    allowedTools: ["mcp__sealwire__propose_task"],
+  };
+  assert.equal(sessionOptionsChanged({ permissionMode: "acceptEdits" }, withTools), true);
+  assert.equal(sessionOptionsChanged(withTools, withTools), false);
+  assert.equal(
+    sessionOptionsChanged(withTools, { ...withTools, allowedTools: ["mcp__sealwire__list_teams"] }),
+    true
+  );
+});
 
 test("sessionOptionsChanged flags permissionMode/model but ignores an omitted model", () => {
   assert.equal(
@@ -429,4 +601,16 @@ test("ensureLiveSession rebuilds on a model switch and preserves model when omit
   assert.equal(sdk.queries[2].options.model, "claude-sonnet-4-6");
 
   closeSessionEntry(entry);
+});
+
+test("cwd_changed carries the pending thread id before Claude has a real session id", () => {
+  const pendingId = "claude-pending-1";
+  const event = cwdChangedEvent("/repo/wt", pendingId);
+  assert.equal(event.type, "cwd_changed");
+  assert.equal(event.cwd, "/repo/wt");
+  assert.equal(
+    event.provider_session_id,
+    pendingId,
+    "the first cwd hook must not wait for the SDK session id"
+  );
 });

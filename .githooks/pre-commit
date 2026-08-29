@@ -1,0 +1,53 @@
+#!/bin/sh
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+guard="$repo_root/scripts/check-no-private.sh"
+if [ -x "$guard" ]; then
+  "$guard"
+fi
+
+staged_rs_list=$(mktemp)
+trap 'rm -f "$staged_rs_list"' EXIT INT TERM
+
+git diff --cached --name-only --diff-filter=ACMR -- '*.rs' > "$staged_rs_list"
+
+if [ ! -s "$staged_rs_list" ]; then
+  exit 0
+fi
+
+resolve_rustfmt() {
+  if command -v rustfmt >/dev/null 2>&1; then
+    command -v rustfmt
+    return 0
+  fi
+
+  if [ -x "$HOME/.cargo/bin/rustfmt" ]; then
+    printf '%s\n' "$HOME/.cargo/bin/rustfmt"
+    return 0
+  fi
+
+  if command -v rustup >/dev/null 2>&1; then
+    rustup which rustfmt 2>/dev/null
+    return 0
+  fi
+
+  return 1
+}
+
+rustfmt_bin=$(resolve_rustfmt || true)
+
+if [ -z "${rustfmt_bin:-}" ] || [ ! -x "$rustfmt_bin" ]; then
+  echo "pre-commit: rustfmt is required to format staged Rust files" >&2
+  exit 1
+fi
+
+echo "pre-commit: formatting staged Rust files"
+tr '\n' '\0' < "$staged_rs_list" | xargs -0 "$rustfmt_bin" --edition 2021
+
+while IFS= read -r file; do
+  if [ -n "$file" ] && [ -f "$file" ]; then
+    git add -- "$file"
+  fi
+done < "$staged_rs_list"

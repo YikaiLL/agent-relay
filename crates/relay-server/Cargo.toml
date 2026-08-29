@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Build with the private crate linked in.
+private = ["dep:sealwire-private"]
+
 [dependencies]
 aes-gcm.workspace = true
 async-trait = "0.1"
@@ -18,7 +23,12 @@ p256.workspace = true
 qrcode.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+relay-api = { path = "../relay-api" }
 relay-broker = { path = "../relay-broker" }
+# PRIVATE and optional. Without it the relay builds, runs, and is fully
+# auditable — it simply has no orchestration engines registered. Switch the
+# `path` for a `git` source once the private repo has a remote.
+sealwire-private = { path = "../sealwire-private", optional = true }
 relay-http = { path = "../relay-http" }
 relay-util = { path = "../relay-util" }
 rusqlite.workspace = true
@@ -36,5 +46,8 @@ fs4 = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` gives tests a paused clock, so the broker writer's pacing/priority rules
+# are asserted deterministically instead of by sleeping in real time.
+tokio = { workspace = true, features = ["test-util"] }
 # `oneshot` for router-level tests (already in the lock via axum/tower-http).
 tower = { version = "0.5", features = ["util"] }

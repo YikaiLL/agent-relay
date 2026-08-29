@@ -44,6 +44,13 @@ import { readThreadListUi } from "../../shared/thread-list-store.js";
 import { shouldRenderThreadListLoadingPlaceholder } from "../../shared/thread-list-state.js";
 import { syncLiveTranscriptEntryDetailsFromSnapshot } from "../transcript/details.js";
 import {
+  readWorkspaceRepair,
+  repairThreadWorkspace,
+  setWorkspaceRepairError,
+  setWorkspaceRepairPending,
+  workspaceRepairResolved,
+} from "../workspace-repair.js";
+import {
   clearTranscriptHydration,
   restoreHydratedTranscript,
   switchTranscriptHydrationThread,
@@ -73,6 +80,12 @@ export function createLifecycleController(ctx) {
     liveElement,
     isViewingConversation,
   } = ctx;
+  // A ctx seam, not a store import, so the controller stays testable.
+  const readSessionDraft = () => ctx.readSessionDraft?.() || {};
+  // The dialog owns its markup, so the controller asks rather than naming an id.
+  const focusWorkspaceField = () =>
+    ctx.focusWorkspaceField?.()
+    ?? document.getElementById("launch-start-session-dialog-cwd")?.focus();
   // What the user is looking at right now: the routed/pinned thread, else the
   // active one. Same expression as app.js and render-session.js, so a failure's
   // visibility follows one notion of "current thread" across the surface.
@@ -199,29 +212,20 @@ export function createLifecycleController(ctx) {
   }
 
   async function startSession(imageAttachments = []) {
-    const liveCwdInput = liveElement("cwd-input", cwdInput);
-    const liveStartPromptInput = liveElement("start-prompt", startPromptInput);
-    const liveProviderInput = liveElement("provider-input", providerInput);
-    const liveModelInput = liveElement("model-input", modelInput);
-    const liveApprovalPolicyInput = liveElement("approval-policy-input", approvalPolicyInput);
-    // sandbox-input was removed from the UI when the file-access dropdown
-    // was collapsed into the permission level. Fall back to workspace-write
-    // so the session-start protocol stays unchanged.
-    const liveSandboxInput = liveElement("sandbox-input", sandboxInput);
-    const sandboxValue = liveSandboxInput?.value || "workspace-write";
-    const liveStartEffortInput = liveElement("start-effort", startEffortInput);
-    const cwd = liveCwdInput.value.trim();
+    // Read the DRAFT, not the DOM. `start-session-payload.test.mjs` pins the
+    // resulting request across that change.
+    const draft = readSessionDraft();
+    const cwd = String(draft.cwd || "").trim();
 
     if (!cwd) {
       logLine("Choose a directory before starting a session.");
-      liveCwdInput.focus();
+      focusWorkspaceField();
       return null;
     }
-
     setSelectedCwd(cwd);
     setStartControlsBusy(true);
     // Name the provider being started — not a hardcoded "Codex".
-    const agentName = providerLabel(liveProviderInput?.value) || "agent";
+    const agentName = providerLabel(draft.provider) || "agent";
     logLine(`Starting a new ${agentName} session in ${cwd}`);
 
     try {
@@ -237,13 +241,18 @@ export function createLifecycleController(ctx) {
         },
         body: JSON.stringify({
           cwd,
-          initial_prompt: liveStartPromptInput.value.trim() || null,
-          model: liveModelInput.value.trim() || null,
-          approval_policy: liveApprovalPolicyInput.value,
-          sandbox: sandboxValue,
-          effort: liveStartEffortInput.value,
+          initial_prompt: String(draft.initialPrompt || "").trim() || null,
+          model: String(draft.model || "").trim() || null,
+          approval_policy: draft.approvalPolicy,
+          // The file-access dropdown was collapsed into the permission level; the
+          // draft still carries the value so the start protocol is unchanged.
+          sandbox: draft.sandbox || "workspace-write",
+          effort: draft.effort,
           device_id: state.deviceId,
-          provider: liveProviderInput?.value || null,
+          provider: draft.provider || null,
+          // Filed server-side as part of the start, so local and remote reach the
+          // same place. Explicit null means the Default Workspace.
+          project_id: draft.projectId || null,
           images,
         }),
       });
@@ -453,7 +462,16 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  async function sendMessage(textOverride, threadId, images = []) {
+  /**
+   * @param {{ inheritComposerSettings?: boolean }} [options]
+   *   `inheritComposerSettings: false` sends no model and no effort, leaving the
+   *   thread's own remembered settings in charge. For a composer that shows no
+   *   picker (the Orchestrator), attaching the session picker's value is a lie
+   *   the user cannot see or correct — and across providers it is fatal, since
+   *   the relay forwards an explicitly named model without validating it.
+   */
+  async function sendMessage(textOverride, threadId, images = [], options = {}) {
+    const { inheritComposerSettings = true } = options || {};
     // Accept an explicit, already-captured message (the composer captures the draft
     // at submit time so a later edit can't change what is sent). Fall back to the
     // live input value for the normal path.
@@ -483,18 +501,23 @@ export function createLifecycleController(ctx) {
         },
         body: JSON.stringify({
           text,
-          model: messageModel?.value,
-          // The live session effort wins over the per-provider last-used memory,
-          // and the result is clamped to the target model's supported set — so a
-          // stale/foreign value (e.g. a "max" mis-bucketed under codex) can never
-          // be forwarded and rejected with a 400.
-          effort: resolveOutgoingEffort({
-            override: messageEffort?.value || "",
-            sessionEffort: state.session?.reasoning_effort || "",
-            lastUsedEffort: loadLastEffort(state.session?.provider || ""),
-            models: state.session?.available_models || [],
-            model: messageModel?.value || state.session?.model || "",
-          }),
+          ...(inheritComposerSettings
+            ? {
+                model: messageModel?.value,
+                // The live session effort wins over the per-provider last-used
+                // memory, and the result is clamped to the target model's
+                // supported set — so a stale/foreign value (e.g. a "max"
+                // mis-bucketed under codex) can never be forwarded and rejected
+                // with a 400.
+                effort: resolveOutgoingEffort({
+                  override: messageEffort?.value || "",
+                  sessionEffort: state.session?.reasoning_effort || "",
+                  lastUsedEffort: loadLastEffort(state.session?.provider || ""),
+                  models: state.session?.available_models || [],
+                  model: messageModel?.value || state.session?.model || "",
+                }),
+              }
+            : {}),
           device_id: state.deviceId,
           // Target the thread captured at submit time. The relay starts the turn
           // directly there, so a concurrent navigation cannot redirect the message.
@@ -509,7 +532,11 @@ export function createLifecycleController(ctx) {
       }
 
       messageInput.value = "";
-      applySessionSnapshot(payload.data);
+      // Depending on the provider, this response's transcript may have been
+      // built before the message we just sent was appended — see
+      // `transcriptMayPredateWrite`. It is still applied in full; it just
+      // cannot remove transcript entries the surface already has.
+      applySessionSnapshot(payload.data, { transcriptMayPredateWrite: true });
       logLine("Prompt accepted by relay");
       return true;
     } catch (error) {
@@ -668,10 +695,21 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  async function stopActiveTurn() {
+  /**
+   * @param {string} [threadId] the thread to interrupt. Defaults to the viewed
+   *   or active thread, which is right for the conversation's own Stop button
+   *   and wrong for every other pane: a caller drawn BESIDE the conversation
+   *   (the Tasks screen's Orchestrator) is routinely not the active thread, so
+   *   an untargeted stop there could interrupt an unrelated turn — or refuse,
+   *   reporting nothing to stop while its own thread worked on.
+   */
+  async function stopActiveTurn(threadId = null) {
     // Name the active thread's own provider — never a hardcoded "Codex".
     const agentName = providerLabel(state.session?.provider) || "agent";
-    if (!state.session?.active_thread_id || !state.session.active_turn_id) {
+    // An explicitly named thread is the caller's assertion that it has a turn
+    // running; the session-level `active_turn_id` describes a different thread
+    // and cannot answer for it.
+    if (!threadId && (!state.session?.active_thread_id || !state.session.active_turn_id)) {
       logLine(`There is no running ${agentName} turn to stop.`);
       return;
     }
@@ -686,7 +724,8 @@ export function createLifecycleController(ctx) {
         },
         body: JSON.stringify({
           device_id: state.deviceId,
-          thread_id: state.viewOnlyThread?.threadId || state.session.active_thread_id,
+          thread_id:
+            threadId || state.viewOnlyThread?.threadId || state.session.active_thread_id,
         }),
       });
       const payload = await response.json();
@@ -702,8 +741,104 @@ export function createLifecycleController(ctx) {
     }
   }
 
-  function applySessionSnapshot(snapshot) {
+  /// Make the VIEWED thread's recorded workspace exist again (mkdir, or `git worktree
+  /// add` back onto the branch it was born on), then take the fresh snapshot the
+  /// relay hands back.
+  ///
+  /// The thread is not moved anywhere: a Claude session is archived under the project
+  /// directory derived from its cwd and `resume` resolves through that same
+  /// derivation, so the recorded path is the only address that can work. The relay
+  /// decides what to run — this only asks.
+  async function repairWorkspace() {
+    const threadId = viewedThreadId();
+    if (!threadId) {
+      logLine("There is no session whose workspace could be re-created.");
+      return;
+    }
+    // The verdict rides the snapshot; the store holds only this button's own state.
+    const missing = state.session?.workspace_missing;
+    if (!missing || readWorkspaceRepair(state, threadId).pending) {
+      return;
+    }
+
+    const recorded = missing.recorded_cwd || "";
+    setWorkspaceRepairPending(state, threadId, true);
+    if (state.session) {
+      renderSession(state.session);
+    }
+    logLine(`Re-creating this session's workspace ${recorded}`);
+
+    try {
+      const snapshot = await repairThreadWorkspace(apiFetch, threadId, state.deviceId);
+      // Clear BEFORE rendering the snapshot: the snapshot carries no workspace
+      // verdict of its own (`workspace_missing` rides a thread's transcript tail),
+      // so the banner would otherwise sit there until the next tail fetch.
+      workspaceRepairResolved(state, threadId);
+      applySessionSnapshot(snapshot);
+      logLine(`Workspace ${recorded} is back; this session can run again.`);
+    } catch (error) {
+      // The relay's own words, on the banner and in the log. It is the only thing
+      // that can tell the user whether to retry or go fix the repository by hand.
+      setWorkspaceRepairError(state, threadId, error.message);
+      if (state.session) {
+        renderSession(state.session);
+      }
+      logLine(`Workspace repair failed: ${error.message}`);
+    }
+  }
+
+  /// Render a session snapshot.
+  ///
+  /// `transcriptMayPredateWrite` marks a response whose transcript may have been
+  /// built BEFORE the write that produced it — currently only
+  /// `/api/session/message`, whose snapshot the relay builds without waiting for
+  /// the user message to be appended. Whether it actually predates it is
+  /// PROVIDER-DEPENDENT, so this is never assumed either way:
+  ///
+  ///   * `codex` appends asynchronously on the app-server's `item/completed` +
+  ///     `userMessage`, and `fake` in a task spawned after `start_turn` returns —
+  ///     so their responses omit the message and resolve a few ms AFTER the SSE
+  ///     frame that carried it. Applying such a response un-rendered what the
+  ///     user had just sent, leaving it invisible until the next transcript
+  ///     change — seconds, when the turn parks on an approval or an
+  ///     AskUserQuestion.
+  ///   * `claude` awaits `record_local_user_message` before `start_turn` returns
+  ///     (claude.rs:777), so its response already CONTAINS the message. If the
+  ///     stream has not delivered it yet — not connected, lagging, or down —
+  ///     that response is the only copy there is.
+  ///
+  /// So the rule is additive rather than a pin: the response may ADD entries to
+  /// the transcript, it may never REMOVE them. Both providers come out right
+  /// without the client having to know which one it is talking to, and without
+  /// ordering snapshots across transports. The guard rests on the response being
+  /// stale BY CONSTRUCTION — a fact about the endpoint — not on comparing
+  /// revisions.
+  ///
+  /// (`transcript_revision` USED to be a per-process counter that
+  /// `ThreadRuntime::from_sync_data` re-seeded at 0, which made ordering by it
+  /// actively unsafe across a relay restart. It is now one relay-global,
+  /// persisted, monotonic clock, so the comparison would be sound. The guard
+  /// still does not need it, and nothing here depends on that ordering.)
+  ///
+  /// Scoped to the thread the surface is already showing: for any OTHER thread —
+  /// notably a deferred-start Claude thread the send itself just promoted — the
+  /// surface holds nothing to preserve and the response is authoritative.
+  ///
+  /// NOTE: this covers the transcript only. The rest of the snapshot is still
+  /// applied wholesale, so a response that lost a race can still roll back
+  /// newer pending-approval / pending-question / turn state. That is unchanged
+  /// from before this guard existed and is not specific to the send — it is the
+  /// generic cross-transport race, and closing it needs the snapshot ordering
+  /// this deliberately avoids.
+  function applySessionSnapshot(snapshot, { transcriptMayPredateWrite = false } = {}) {
     const previousThreadId = state.session?.active_thread_id || null;
+    if (
+      transcriptMayPredateWrite
+      && !!previousThreadId
+      && snapshot?.active_thread_id === previousThreadId
+    ) {
+      snapshot = withRenderedTranscriptEntriesKept(snapshot);
+    }
     if (snapshot?.active_thread_id !== state.transcriptHydrationThreadId) {
       // Thread switch: retain the leaving thread's loaded window and restore the
       // target thread's retained window (if any) instead of clearing — so
@@ -757,9 +892,49 @@ export function createLifecycleController(ctx) {
       logLine(`Session attention update failed: ${error.message}`);
     }
 
+    // Additive: entries present in the snapshot are merged in, none are dropped,
+    // so a snapshot that lost a race cannot un-cache a detail either.
     syncLiveTranscriptEntryDetailsFromSnapshot(state, snapshot);
     const merged = restoreHydratedTranscript(state, snapshot);
     renderSession(merged);
+  }
+
+  /// `snapshot` with the rendered tail it does not carry appended back onto it.
+  ///
+  /// Scoped to the SUFFIX of the rendered transcript that follows the last entry
+  /// the snapshot does carry — i.e. what the surface learned from another
+  /// transport after this response was built, in practice the message just sent.
+  /// Rescuing arbitrary omitted entries instead would have to re-derive where
+  /// each one belongs; a suffix appends in order by construction. Anything the
+  /// snapshot drops from further back it also drops today (a truncated tail is
+  /// shorter on purpose), so this adds no new omission.
+  ///
+  /// Entries the hydration window holds are skipped: the window is the base
+  /// `restoreHydratedTranscript` merges onto, so they survive on their own, and
+  /// re-placing them through the tail could reorder them.
+  function withRenderedTranscriptEntriesKept(snapshot) {
+    const rendered = state.session?.transcript;
+    if (!Array.isArray(rendered) || !rendered.length) {
+      return snapshot;
+    }
+    const carried = new Set(
+      (snapshot.transcript || []).map((candidate) => candidate?.item_id).filter(Boolean)
+    );
+    let suffixStart = rendered.length;
+    while (suffixStart > 0 && !carried.has(rendered[suffixStart - 1]?.item_id)) {
+      suffixStart -= 1;
+    }
+    const windowed =
+      state.transcriptHydrationThreadId === snapshot?.active_thread_id
+        ? state.transcriptHydrationEntries
+        : null;
+    const rescued = rendered
+      .slice(suffixStart)
+      .filter((candidate) => candidate?.item_id && !windowed?.has?.(candidate.item_id));
+    if (!rescued.length) {
+      return snapshot;
+    }
+    return { ...snapshot, transcript: [...(snapshot.transcript || []), ...rescued] };
   }
 
   /**
@@ -872,6 +1047,7 @@ export function createLifecycleController(ctx) {
     resolveWorkflow,
     deleteReview,
     stopActiveTurn,
+    repairWorkspace,
     applySessionSnapshot,
     fetchThreadList,
   };

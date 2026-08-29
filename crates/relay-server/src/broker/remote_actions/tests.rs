@@ -8,6 +8,7 @@ use crate::protocol::{
 fn make_snapshot() -> SessionSnapshot {
     SessionSnapshot {
         provider_fork_capabilities: Vec::new(),
+        provider_archive_capabilities: Vec::new(),
         provider_status: Vec::new(),
         revision: 7,
         transcript_revision: 3,
@@ -22,6 +23,7 @@ fn make_snapshot() -> SessionSnapshot {
         e2ee_enabled: true,
         broker_can_read_content: false,
         audit_enabled: false,
+        beta_features_enabled: false,
         active_thread_id: Some("thread-1".to_string()),
         active_thread_promoted_from: None,
         active_controller_device_id: Some("device-1".to_string()),
@@ -36,6 +38,8 @@ fn make_snapshot() -> SessionSnapshot {
         active_flags: vec![],
         thread_activity: vec![],
         current_cwd: "/tmp/project".to_string(),
+        thread_workspace_cwd: None,
+        workspace_missing: None,
         model: "gpt-5.4".to_string(),
         available_models: vec![],
         approval_policy: "untrusted".to_string(),
@@ -73,6 +77,10 @@ fn make_snapshot() -> SessionSnapshot {
         push_vapid_public_key: None,
         projects_revision: 0,
         threads_revision: 0,
+        thread_workspaces_revision: 0,
+        teams_revision: 0,
+        orchestrator_thread_id: None,
+        orchestrator_proposals: Vec::new(),
     }
 }
 
@@ -80,6 +88,7 @@ fn make_threads() -> ThreadsResponse {
     ThreadsResponse {
         threads: (0..16)
             .map(|index| ThreadSummaryView {
+                workspace_trusted: false,
                 id: format!("thread-{index}"),
                 name: Some(format!("Thread {index}")),
                 preview: "x".repeat(2_000),
@@ -192,10 +201,46 @@ fn fork_session_action_round_trips_and_issues_session_claim() {
 }
 
 #[test]
+fn fetch_workspace_git_context_round_trips_and_binds_the_requesting_device() {
+    // The stamp is load-bearing, not bookkeeping: the path scope is resolved from
+    // the device id, and the cwd here is caller-supplied.
+    let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "fetch_workspace_git_context",
+        "cwd": "/repo/checkout"
+    }))
+    .expect("fetch_workspace_git_context should parse");
+    assert_eq!(request.kind(), RemoteActionKind::FetchWorkspaceGitContext);
+    assert_eq!(
+        RemoteActionKind::FetchWorkspaceGitContext.as_str(),
+        "fetch_workspace_git_context"
+    );
+
+    match request.bind_device("device-9".to_string()) {
+        RemoteActionRequest::FetchWorkspaceGitContext { device_id, cwd } => {
+            assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert_eq!(
+                cwd.as_deref(),
+                Some("/repo/checkout"),
+                "bind_device must preserve the path being asked about"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+}
+
+#[test]
+fn fetch_workspace_git_context_is_read_only_and_needs_no_session_claim() {
+    // A paired device must see what it is about to launch into without taking
+    // control of whatever session happens to be running.
+    assert!(
+        !super::requires_session_claim(RemoteActionKind::FetchWorkspaceGitContext),
+        "reading a workspace's git standing must not require taking over a session"
+    );
+}
+
+#[test]
 fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
-    // The client sends the viewed session's thread_id; bind_device must stamp the
-    // requesting device WITHOUT dropping the selector (regression guard for the
-    // "rebuild loses the field" bug the reviewer flagged).
+    // bind_device must keep thread_id. Extra `root`/`auto_root` fields parse and are ignored.
     let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
         "type": "fetch_workspace_diff",
         "thread_id": "thread-viewed",
@@ -213,24 +258,15 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
-            root,
-            auto_root,
+            view_root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-9"));
-            assert!(
-                auto_root,
-                "bind_device must preserve the auto-resolve opt-in too"
-            );
             assert_eq!(
                 thread_id.as_deref(),
                 Some("thread-viewed"),
                 "bind_device must preserve the viewed thread_id, not drop it"
             );
-            assert_eq!(
-                root.as_deref(),
-                Some("/repo/linked"),
-                "bind_device must preserve the worktree root selector too"
-            );
+            assert_eq!(view_root, None);
         }
         other => panic!("unexpected bound request: {other:?}"),
     }
@@ -244,15 +280,108 @@ fn fetch_workspace_diff_round_trips_and_bind_device_preserves_thread_id() {
         RemoteActionRequest::FetchWorkspaceDiff {
             device_id,
             thread_id,
-            root,
-            auto_root,
+            view_root,
         } => {
             assert_eq!(device_id.as_deref(), Some("device-1"));
             assert_eq!(thread_id, None);
-            assert_eq!(root, None, "an omitted root must default to None");
-            assert!(!auto_root, "an omitted auto_root must default to false");
+            assert_eq!(view_root, None);
         }
         other => panic!("unexpected variant: {other:?}"),
+    }
+}
+
+// Not claim-gated: seeing/pinning a tree must not steal the session lease.
+#[test]
+fn thread_workspace_actions_round_trip_and_need_no_session_claim() {
+    let fetch: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "fetch_thread_workspace",
+        "thread_id": "thread-viewed"
+    }))
+    .expect("fetch_thread_workspace should parse");
+    assert_eq!(fetch.kind(), RemoteActionKind::FetchThreadWorkspace);
+    assert_eq!(
+        RemoteActionKind::FetchThreadWorkspace.as_str(),
+        "fetch_thread_workspace"
+    );
+    match fetch.bind_device("device-9".to_string()) {
+        RemoteActionRequest::FetchThreadWorkspace {
+            device_id,
+            thread_id,
+            roots_status,
+        } => {
+            assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert_eq!(thread_id, "thread-viewed");
+            assert!(
+                !roots_status,
+                "a client that does not ask must not be charged a git status per worktree"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // `bind_device` rebuilds the variant field by field, so a forgotten one is dropped
+    // silently — here, downgrading the open picker's request to an unmeasured one.
+    let measured: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "fetch_thread_workspace",
+        "thread_id": "thread-viewed",
+        "roots_status": true
+    }))
+    .expect("fetch_thread_workspace should parse with roots_status");
+    match measured.bind_device("device-9".to_string()) {
+        RemoteActionRequest::FetchThreadWorkspace { roots_status, .. } => {
+            assert!(
+                roots_status,
+                "the picker's request must survive device binding"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // The pin's payload is flattened, so `thread_id`/`cwd` sit next to `type`.
+    let pin: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "set_thread_workspace",
+        "thread_id": "thread-viewed",
+        "cwd": "/repo/linked",
+        // Client-supplied device_id must not win over bind_device.
+        "device_id": "device-someone-else"
+    }))
+    .expect("set_thread_workspace should parse");
+    assert_eq!(pin.kind(), RemoteActionKind::SetThreadWorkspace);
+    match pin.bind_device("device-9".to_string()) {
+        RemoteActionRequest::SetThreadWorkspace { device_id, input } => {
+            assert_eq!(device_id.as_deref(), Some("device-9"));
+            assert_eq!(input.thread_id, "thread-viewed");
+            assert_eq!(input.cwd.as_deref(), Some("/repo/linked"));
+            assert_eq!(
+                input.device_id.as_deref(),
+                Some("device-9"),
+                "the INNER device_id is what pin_thread_workspace scopes on, so \
+bind_device must overwrite the client's"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    // An absent `cwd` is the un-pin, not a malformed request.
+    let unpin: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "set_thread_workspace",
+        "thread_id": "thread-viewed"
+    }))
+    .expect("an un-pin carries no cwd");
+    match unpin {
+        RemoteActionRequest::SetThreadWorkspace { input, .. } => assert_eq!(input.cwd, None),
+        other => panic!("unexpected request: {other:?}"),
+    }
+
+    for action in [
+        RemoteActionKind::FetchThreadWorkspace,
+        RemoteActionKind::SetThreadWorkspace,
+    ] {
+        assert!(
+            !requires_session_claim(action),
+            "{} must not require a session claim",
+            action.as_str()
+        );
     }
 }
 
@@ -349,6 +478,9 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -385,6 +517,9 @@ fn plain_remote_action_result_payload_splits_control_results_from_session_result
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -484,6 +619,13 @@ fn remote_action_result_size_breakdown_reports_large_thread_transcript_payloads(
         Some(&thread_entries),
         None,
         Some(&thread_transcript),
+        // workspace_diff
+        None,
+        // workspace_git_context
+        None,
+        // thread_workspace
+        None,
+        // thread_settings
         None,
         // reviews
         None,
@@ -541,6 +683,9 @@ fn make_large_thread_transcript_plaintext() -> RemoteActionResultPlaintext {
             thread_state: None,
         }),
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -570,6 +715,9 @@ fn make_large_ask_user_detail_plaintext() -> RemoteActionResultPlaintext {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -923,6 +1071,7 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
             reviewer_provider: Some("codex".to_string()),
             name: Some("reviewer one".to_string()),
             updated_at: Some(5),
+            cwd: None,
         }],
     };
     let result = RemoteActionResultPlaintext {
@@ -939,6 +1088,9 @@ fn plain_fetch_reviews_result_carries_the_reviews_payload_to_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: Some(reviews),
         workflows: None,
         devices: None,
@@ -985,6 +1137,9 @@ fn plain_dedicated_workflows_and_devices_payloads_reach_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: None,
         workflows: Some(crate::protocol::WorkflowsResponse {
             workflows_revision: 4,
@@ -1044,6 +1199,9 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
         thread_entry_detail: None,
         thread_transcript: None,
         workspace_diff: None,
+        workspace_git_context: None,
+        thread_workspace: None,
+        thread_settings: None,
         reviews: None,
         workflows: None,
         devices: None,
@@ -1073,6 +1231,109 @@ fn plain_fetch_projects_result_carries_the_projects_payload_to_the_device() {
     assert_eq!(
         carried["thread_project_id"]["thread-1"], "proj-1",
         "the device needs membership to group sessions by project"
+    );
+}
+
+#[test]
+fn plain_fetch_workspace_git_context_result_reaches_the_device() {
+    // Missing from the plaintext envelope builder fails only on unsealed transport.
+    // Request binding is covered elsewhere; this locks the RESULT path.
+    let result = RemoteActionResultPlaintext {
+        kind: remote_action_result_kind(RemoteActionKind::FetchWorkspaceGitContext),
+        action: RemoteActionKind::FetchWorkspaceGitContext,
+        ok: true,
+        snapshot: None,
+        receipt: None,
+        ask_user_answer_receipt: None,
+        providers: None,
+        models: None,
+        threads: None,
+        thread_entries: None,
+        thread_entry_detail: None,
+        thread_transcript: None,
+        workspace_diff: None,
+        thread_workspace: None,
+        thread_settings: None,
+        workspace_git_context: Some(crate::protocol::WorkspaceGitContextView {
+            cwd: "/repo/checkout".to_string(),
+            is_repo: true,
+            branch: Some("main".to_string()),
+            detached: false,
+            dirty: true,
+            dirty_known: true,
+            restricted: false,
+        }),
+        reviews: None,
+        workflows: None,
+        devices: None,
+        projects: None,
+        ask_user_question_detail: None,
+        session_claim: None,
+        session_claim_expires_at: None,
+        claim_challenge_id: None,
+        claim_challenge: None,
+        claim_challenge_expires_at: None,
+        error: None,
+    };
+
+    let payload = build_plain_remote_action_result_payload("action-git", "surface-1", &result)
+        .expect("git context payload");
+    let json = serde_json::to_value(&payload).expect("serialize git context payload");
+    let carried = json
+        .get("workspace_git_context")
+        .unwrap_or(&serde_json::Value::Null)
+        .clone();
+    assert!(
+        !carried.is_null(),
+        "the plaintext envelope must carry `workspace_git_context`; got: {json}"
+    );
+    assert_eq!(carried["branch"], "main");
+    assert_eq!(carried["dirty"], true);
+    assert_eq!(
+        carried["cwd"], "/repo/checkout",
+        "the echoed cwd is what lets a client drop an answer about a directory it has moved off"
+    );
+}
+
+/// Locks the `repair_workspace` wire contract, including the two properties that are
+/// easy to lose in a refactor and only fail on a device: `bind_device` must stamp the
+/// actor without dropping the thread selector, and the action must NOT require the
+/// session claim. A phone looking at a session whose workspace vanished has to be able
+/// to un-brick it without first stealing the active-controller lease from the desktop.
+#[test]
+fn repair_workspace_round_trips_and_needs_no_session_claim() {
+    let request: RemoteActionRequest = serde_json::from_value(serde_json::json!({
+        "type": "repair_workspace",
+        "thread_id": "thread-1",
+        "input": {}
+    }))
+    .expect("repair_workspace should parse with an empty input");
+    assert_eq!(request.kind(), RemoteActionKind::RepairWorkspace);
+    assert_eq!(
+        RemoteActionKind::RepairWorkspace.as_str(),
+        "repair_workspace"
+    );
+
+    match request.bind_device("device-9".to_string()) {
+        RemoteActionRequest::RepairWorkspace { thread_id, input } => {
+            assert_eq!(thread_id, "thread-1");
+            assert_eq!(
+                input.device_id.as_deref(),
+                Some("device-9"),
+                "the server stamps the actor; a device cannot claim to be another"
+            );
+        }
+        other => panic!("unexpected bound request: {other:?}"),
+    }
+
+    assert!(matches!(
+        remote_action_result_kind(RemoteActionKind::RepairWorkspace),
+        RemoteActionResultKind::RemoteActionAck
+    ));
+    assert!(
+        !requires_session_claim(RemoteActionKind::RepairWorkspace),
+        "re-creating a directory runs no turn; demanding the lease would make the \
+         repair unreachable from the device most likely to notice the problem"
     );
 }
 
@@ -1187,6 +1448,7 @@ async fn list_threads_action_carries_the_search_query() {
             sandbox: None,
             provider: Some("fake".to_string()),
             initial_prompt: None,
+            project_id: None,
         })
         .await
         .expect("start_session");
@@ -1208,6 +1470,7 @@ async fn list_threads_action_carries_the_search_query() {
                         limit: Some(50),
                         device_id: None,
                         q,
+                        ids: None,
                     },
                 },
             )
@@ -1231,4 +1494,232 @@ async fn list_threads_action_carries_the_search_query() {
         1,
         "no query still returns the ordinary page"
     );
+}
+
+/// Publishing a chunked reply must not cost the caller the reply's pacing.
+///
+/// `broker.rs` awaits `handle_server_message` INLINE in the `select!` arm that reads the
+/// broker socket, and a chunked action reply is published from inside that handler. So
+/// for as long as this function takes, the relay reads NOTHING: not another surface's
+/// `fetch_thread_transcript`, not a `claim_challenge`, not even the presence frame
+/// saying the surface it is answering has gone away.
+///
+/// It used to sleep `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS` between every
+/// chunk, so a 21-chunk reply — a real trace had exactly that, one
+/// `fetch_workspace_diff` — blinded the relay for ~5 seconds. Users experienced it as
+/// "I clicked and nothing happened, then a while later everything arrived at once".
+///
+/// Runs on a paused clock, so the assertion is about the pacing this call performs, not
+/// about how fast the machine is: a paused runtime auto-advances time whenever the task
+/// sleeps, which means a version that still paces inline reports the full ~5s here.
+#[tokio::test(start_paused = true)]
+async fn queueing_a_chunk_train_does_not_block_the_read_loop() {
+    use crate::state::{RelayState, SecurityProfile};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    let (change_tx, _rx) = watch::channel(0_u64);
+    let relay = Arc::new(RwLock::new(RelayState::new(
+        "/tmp/chunk-train-test".to_string(),
+        change_tx.clone(),
+        SecurityProfile::private(),
+    )));
+    relay.write().await.mark_surface_peer_online("surface-1");
+    let state = AppState::from_parts(relay, HashMap::new(), change_tx);
+
+    let (writer, _now_queue, mut queued) = super::super::writer::test_writer();
+    let chunks = workspace_diff_chunks("surface-1", 21);
+
+    let started_at = tokio::time::Instant::now();
+    publish_remote_action_result_chunks(&state, &writer, chunks, "test chunk train", "surface-1")
+        .await
+        .expect("queueing a train succeeds");
+    let blocked_for = started_at.elapsed();
+
+    assert!(
+        blocked_for < Duration::from_millis(50),
+        "handing off a 21-chunk reply must be a queue push, not {}ms of blocked read \
+         loop — the pacing belongs to the writer task",
+        blocked_for.as_millis()
+    );
+
+    let frame = queued
+        .try_recv()
+        .expect("the train must actually be queued");
+    assert_eq!(frame.chunks.len(), 21, "every chunk is handed over");
+    assert_eq!(
+        frame.interval,
+        Duration::from_millis(REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS),
+        "and the writer is told the pacing to apply"
+    );
+    assert_eq!(
+        frame.watch_target.as_deref(),
+        Some("surface-1"),
+        "a surface observed online at queue time is watched, so its train can be \
+         abandoned if it leaves"
+    );
+}
+
+fn workspace_diff_chunks(target_peer_id: &str, chunk_count: usize) -> Vec<OutboundBrokerPayload> {
+    (0..chunk_count)
+        .map(
+            |chunk_index| OutboundBrokerPayload::RemoteActionResultChunk {
+                action_id: "action-1".to_string(),
+                target_peer_id: target_peer_id.to_string(),
+                action: RemoteActionKind::FetchWorkspaceDiff,
+                chunk_index,
+                chunk_count,
+                data: "payload".to_string(),
+            },
+        )
+        .collect()
+}
+
+/// A chunked reply must not pay for base64 twice.
+///
+/// The encrypted chunk path used to base64 the chunk into `data_base64`, wrap that in
+/// JSON, encrypt it, and base64 the ciphertext **again** — two 4/3 expansions, so the wire
+/// cost was ~1.78x the payload. The inner encoding was never needed: the thing being
+/// chunked is already JSON *text*, so it can travel as a JSON string provided the split
+/// respects character boundaries.
+///
+/// This is a real cost, not a theoretical one — the broker's egress is billed per GB, and
+/// chunked replies are the largest thing the relay sends.
+#[test]
+fn a_chunked_reply_does_not_pay_for_base64_twice() {
+    let plaintext = make_large_thread_transcript_plaintext();
+    let payload_bytes = serde_json::to_vec(&plaintext)
+        .expect("plaintext serializes")
+        .len();
+
+    let encrypted = build_encrypted_remote_action_result_chunk_payloads(
+        "action-1",
+        "surface-1",
+        "device-1",
+        "payload-secret",
+        &plaintext,
+    )
+    .expect("encrypted chunk payloads");
+    let encrypted_wire: usize = encrypted.iter().map(frame_bytes_for_payload).sum();
+    let encrypted_ratio = encrypted_wire as f64 / payload_bytes as f64;
+
+    assert!(
+        encrypted_ratio < 1.45,
+        "an encrypted chunked reply cost {encrypted_ratio:.3}x its payload ({encrypted_wire} \
+         bytes on the wire for {payload_bytes} bytes of result). One base64 layer is \
+         unavoidable for ciphertext; a second one is pure waste, and at ~1.78x it is a \
+         quarter of the bandwidth bill for the largest thing the relay sends."
+    );
+
+    let plain =
+        build_plain_remote_action_result_chunk_payloads("action-1", "surface-1", &plaintext)
+            .expect("plain chunk payloads");
+    let plain_wire: usize = plain.iter().map(frame_bytes_for_payload).sum();
+    let plain_ratio = plain_wire as f64 / payload_bytes as f64;
+
+    assert!(
+        plain_ratio < 1.15,
+        "a plaintext chunked reply cost {plain_ratio:.3}x its payload ({plain_wire} bytes \
+         for {payload_bytes}). Nothing is encrypted here, so there is no ciphertext to \
+         encode — the chunks are JSON text and should travel as text."
+    );
+}
+
+/// Build the same large transcript, but out of text that makes chunking hard: multi-byte
+/// characters, and the characters JSON has to escape.
+fn make_unicode_heavy_transcript_plaintext() -> RemoteActionResultPlaintext {
+    // Every ingredient that can make a chunk serialize larger than its neighbours:
+    // 3-byte CJK, 4-byte emoji (a surrogate pair in the browser), combining marks, and
+    // quotes/backslashes/newlines/tabs that JSON expands to two characters each.
+    let nasty = "日本語のテキスト🙂🇯🇵é\"quoted\"\\back\\slash\n\ttab—dash";
+    // Deliberately FRONT-LOADED WITH ASCII. A uniformly nasty fixture is not a test of
+    // anything: every piece serializes alike, so sampling one and assuming the rest match
+    // gives the right answer by accident. The cheap prefix makes the first piece
+    // unrepresentative, so only a fit loop that measures every piece keeps the later,
+    // far heavier ones inside the frame limit.
+    let mut body = "plain ascii filler. ".repeat(4_000);
+    body.push_str(&nasty.repeat(4_000));
+    let mut plaintext = make_large_thread_transcript_plaintext();
+    if let Some(transcript) = plaintext.thread_transcript.as_mut() {
+        for entry in transcript.entries.iter_mut() {
+            entry.text = Some(body.clone());
+        }
+    }
+    plaintext
+}
+
+/// Chunking on character boundaries must survive text that is not one byte per character.
+///
+/// The old encoding sliced raw bytes and base64'd them, so every chunk was the same size
+/// and could not split a character. Sending text instead buys ~25% of the bandwidth back
+/// and costs exactly this: a slice can land mid-character (producing bytes no client can
+/// decode), and pieces vary in serialized size because multi-byte characters and
+/// JSON-escaped ones cost more. Fitting the frame by sampling one chunk and assuming the
+/// rest match is how an oversized frame reaches the broker — which discards it and, since
+/// this relay treats that as fatal, tears the session down.
+#[test]
+fn unicode_and_escape_heavy_chunks_stay_within_the_frame_limit_and_round_trip() {
+    let plaintext = make_unicode_heavy_transcript_plaintext();
+    let expected = serde_json::to_value(&plaintext).expect("plaintext serializes");
+
+    let plain =
+        build_plain_remote_action_result_chunk_payloads("action-1", "surface-1", &plaintext)
+            .expect("plain chunk payloads");
+    assert!(plain.len() > 1, "the fixture must actually chunk");
+
+    let mut reassembled = String::new();
+    for payload in &plain {
+        assert!(
+            frame_bytes_for_payload(payload) <= MAX_BROKER_TEXT_FRAME_BYTES,
+            "a chunk of multi-byte / escape-heavy text produced an oversized frame. The \
+             fit loop has to measure EVERY piece: character-boundary pieces are not \
+             uniform, and the broker drops an over-limit frame, which this relay treats \
+             as fatal."
+        );
+        match payload {
+            OutboundBrokerPayload::RemoteActionResultChunk { data, .. } => {
+                reassembled.push_str(data)
+            }
+            other => panic!("expected a plain chunk, got {other:?}"),
+        }
+    }
+    // Exactly what the browser does: concatenate the pieces and parse the result.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&reassembled).expect("reassembled chunks must be valid JSON");
+    assert_eq!(
+        parsed, expected,
+        "reassembling the chunks must reproduce the result byte for byte; a split that \
+         landed mid-character would corrupt it here"
+    );
+
+    // The encrypted path fits against ciphertext length, so it needs its own coverage.
+    let encrypted = build_encrypted_remote_action_result_chunk_payloads(
+        "action-1",
+        "surface-1",
+        "device-1",
+        "payload-secret",
+        &plaintext,
+    )
+    .expect("encrypted chunk payloads");
+    assert!(encrypted.len() > 1);
+    let mut decrypted = String::new();
+    for payload in &encrypted {
+        assert!(
+            frame_bytes_for_payload(payload) <= MAX_BROKER_TEXT_FRAME_BYTES,
+            "an encrypted chunk of multi-byte / escape-heavy text produced an oversized frame"
+        );
+        match payload {
+            OutboundBrokerPayload::EncryptedRemoteActionResultChunk { envelope, .. } => {
+                let chunk: RemoteActionResultChunkPlaintext =
+                    crate::broker::crypto::decrypt_json("payload-secret", envelope)
+                        .expect("chunk decrypts");
+                decrypted.push_str(&chunk.data);
+            }
+            other => panic!("expected an encrypted chunk, got {other:?}"),
+        }
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&decrypted).expect("decrypted chunks must reassemble into JSON");
+    assert_eq!(parsed, expected);
 }

@@ -21,12 +21,13 @@ use super::*;
 use crate::auth::BrokerAuthMode;
 use crate::join_ticket::{JoinTicketClaims, JoinTicketKey};
 use crate::public_control::{
-    ClientGrantRequest, ClientGrantResponse, ClientIdentityRevokeResponse,
-    ClientIdentityRotateResponse, ClientRelaysResponse, ClientSessionResponse,
-    DeviceGrantBulkRevokeRequest, DeviceGrantBulkRevokeResponse, DeviceGrantRequest,
-    DeviceGrantResponse, DeviceGrantRevokeRequest, DeviceGrantRevokeResponse,
-    DeviceSessionResponse, DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse,
-    PublicControlPlane, RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
+    client_claim_message, ClientClaimRequest, ClientClaimResponse, ClientGrantRequest,
+    ClientGrantResponse, ClientIdentityRevokeResponse, ClientIdentityRotateResponse,
+    ClientRelaysResponse, ClientSessionResponse, DeviceGrantBulkRevokeRequest,
+    DeviceGrantBulkRevokeResponse, DeviceGrantRequest, DeviceGrantResponse,
+    DeviceGrantRevokeRequest, DeviceGrantRevokeResponse, DeviceSessionResponse,
+    DeviceWsTokenResponse, PairingWsTokenRequest, PairingWsTokenResponse, PublicControlPlane,
+    RelayEnrollmentChallengeRequest, RelayEnrollmentChallengeResponse,
     RelayEnrollmentCompleteRequest, RelayEnrollmentResponse, RelayWsTokenRequest,
     RelayWsTokenResponse,
 };
@@ -177,6 +178,38 @@ where
         .json::<TResp>()
         .await
         .expect("response should decode")
+}
+
+/// Drive a full client pairing over HTTP: the relay attests the key, then the
+/// key holder redeems the attestation on its own (no bearer — the signature is
+/// the authentication). Returns the credential the *client* receives; the relay
+/// never sees one.
+async fn public_client_pair(
+    address: SocketAddr,
+    relay_bearer: &str,
+    signing_key: &SigningKey,
+    request: &ClientGrantRequest,
+) -> ClientClaimResponse {
+    let relay_id = request.relay_id.clone();
+    let attestation: ClientGrantResponse =
+        public_post(address, "/api/public/clients/grants", relay_bearer, request).await;
+    let message = client_claim_message(&attestation.claim_id, &attestation.claim_nonce, &relay_id);
+    let claim_signature = STANDARD.encode(signing_key.sign(message.as_bytes()).to_bytes());
+
+    reqwest::Client::new()
+        .post(format!("http://{address}/api/public/client/claim"))
+        .json(&ClientClaimRequest {
+            claim_id: attestation.claim_id,
+            claim_signature,
+        })
+        .send()
+        .await
+        .expect("claim request should succeed")
+        .error_for_status()
+        .expect("claim response should be successful")
+        .json::<ClientClaimResponse>()
+        .await
+        .expect("claim response should decode")
 }
 
 async fn public_post_response<TReq>(
@@ -359,11 +392,6 @@ fn test_web_root() -> PathBuf {
         r#"self.addEventListener("install", () => {}); const CACHE = "agent-relay-remote-v1";"#,
     )
     .expect("service worker should write");
-    fs::write(
-        root.join("icon.svg"),
-        r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
-    )
-    .expect("icon should write");
     fs::write(assets.join("remote-test.js"), "console.log('remote');").expect("asset should write");
     // A non-hashed static file served from the web root (not /static/assets/):
     // the frontend fetches this at runtime to detect new builds, so it must
@@ -554,11 +582,13 @@ async fn websocket_relays_messages_between_peers() {
         Some("relay-1"),
         JoinTicketClaims::relay_join("room-a", "relay-1"),
     );
+    // Surfaces do not name themselves — the broker assigns the id (see
+    // `a_surface_cannot_squat_the_relays_peer_id`), so read it back out of Welcome.
     let surface_url = websocket_url(
         address,
         "room-a",
         protocol::PeerRole::Surface,
-        Some("phone-1"),
+        None,
         JoinTicketClaims::pairing_surface_join("room-a", "pair-1", u64::MAX),
     );
 
@@ -575,20 +605,25 @@ async fn websocket_relays_messages_between_peers() {
         .await
         .expect("surface should connect");
     let welcome = next_server_message(&mut surface).await;
-    match welcome {
-        ServerMessage::Welcome { peers, .. } => {
+    let surface_peer_id = match welcome {
+        ServerMessage::Welcome {
+            peers,
+            peer_id: assigned_peer_id,
+            ..
+        } => {
             assert_eq!(peers.len(), 1);
             assert_eq!(peers[0].peer_id, "relay-1");
             assert_eq!(peers[0].device_id, None);
+            assigned_peer_id
         }
         other => panic!("unexpected welcome frame: {other:?}"),
-    }
+    };
 
     let presence = next_server_message(&mut relay).await;
     match presence {
         ServerMessage::Presence { kind, peer, .. } => {
             assert_eq!(kind, protocol::PresenceKind::Joined);
-            assert_eq!(peer.peer_id, "phone-1");
+            assert_eq!(peer.peer_id, surface_peer_id);
             assert_eq!(peer.device_id, None);
         }
         other => panic!("unexpected presence frame: {other:?}"),
@@ -618,6 +653,227 @@ async fn websocket_relays_messages_between_peers() {
             assert_eq!(payload, json!({"ciphertext":"abc"}));
         }
         other => panic!("unexpected relayed frame: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_surface_cannot_squat_the_relays_peer_id() {
+    // SECURITY: surface tickets carry no peer_id, so `lib.rs` falls back to the
+    // client-supplied query parameter unchecked. A surface can therefore claim the
+    // relay's own peer_id, and because a relay's ticket PINS its peer_id the
+    // no-peer_id retry loop never fires for it — the relay is locked out of its own
+    // room until the squatter drops the socket.
+    let address = spawn_app().await;
+    let squatter_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("relay-1"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-squat", u64::MAX),
+    );
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let squatter = connect_async(&squatter_url).await;
+    let Ok((mut squatter, _)) = squatter else {
+        // Already hardened: a surface may not name itself after a relay.
+        return;
+    };
+    let seated = next_server_message(&mut squatter).await;
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("the real relay should still be able to connect");
+    let relay_welcome = next_server_message(&mut relay).await;
+
+    assert!(
+        matches!(relay_welcome, ServerMessage::Welcome { .. }),
+        "a surface holding a pairing ticket must not be able to lock the relay out \
+         of its own room; squatter got {seated:?}, relay got {relay_welcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bare_pairing_result_is_refused_while_other_directed_payloads_still_flow() {
+    // SECURITY: `encrypted_pairing_result` carries the new device's payload_secret
+    // and refresh tokens, sealed with the pairing_secret from the QR. It shipped
+    // for a while with a `target_peer_id` field but WITHOUT the
+    // `targeted_messages` wrapper, and the broker's fanout routes on the wrapper
+    // alone — so it went to the whole room, handing the sealed credentials to any
+    // bystander replaying the same QR join ticket. The wrapper must be the only
+    // way to address one peer: a bare payload that names a recipient is refused
+    // outright, so the next one that forgets it fails loudly instead of leaking.
+    let address = spawn_app().await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let intended_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("phone-intended"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-target", u64::MAX),
+    );
+    // A distinct pairing id, so the two surfaces stay seated together — one ticket
+    // holds only one seat (see `a_second_join_on_one_pairing_ticket_supersedes_the_first`),
+    // and this test is about the fanout, not the seat.
+    let bystander_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        Some("phone-bystander"),
+        JoinTicketClaims::pairing_surface_join("room-a", "pair-bystander", u64::MAX),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay should connect");
+    let _ = next_server_message(&mut relay).await;
+    let (mut intended, _) = connect_async(&intended_url)
+        .await
+        .expect("intended surface should connect");
+    let _ = next_server_message(&mut intended).await;
+    let (mut bystander, _) = connect_async(&bystander_url)
+        .await
+        .expect("bystander surface should connect");
+    let _ = next_server_message(&mut bystander).await;
+    // The bystander's arrival notifies everyone already seated; drain it so the
+    // only frame that could still show up is the publish under test.
+    let _ = next_server_message(&mut intended).await;
+
+    relay
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage::Publish {
+                protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+                payload: json!({
+                    "kind": "encrypted_pairing_result",
+                    "pairing_id": "pair-target",
+                    "target_peer_id": "phone-intended",
+                    "envelope": {"nonce": "n", "ciphertext": "c"},
+                }),
+            })
+            .expect("client frame should serialize"),
+        ))
+        .await
+        .expect("publish should send");
+
+    // Every OTHER directed payload keeps its existing broadcast + client-side
+    // filter behaviour. Treating `target_peer_id` itself as a routing directive
+    // would silently drop every remote action response, so pin that here: this
+    // frame must still be delivered.
+    relay
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage::Publish {
+                protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+                payload: json!({
+                    "kind": "encrypted_remote_action_result",
+                    "action_id": "action-1",
+                    "target_peer_id": "phone-intended",
+                    "device_id": "device-1",
+                    "envelope": {"nonce": "n", "ciphertext": "c"},
+                }),
+            })
+            .expect("client frame should serialize"),
+        ))
+        .await
+        .expect("publish should send");
+
+    match next_server_message(&mut intended).await {
+        ServerMessage::Message { payload, .. } => assert_eq!(
+            payload["kind"], "encrypted_remote_action_result",
+            "a remote action result must still reach the room; the pairing-result \
+             guard must not generalise to every payload naming a peer"
+        ),
+        other => panic!("remote action result should be delivered: {other:?}"),
+    }
+    let _ = next_server_message(&mut bystander).await;
+
+    for (label, socket) in [
+        ("the named target", &mut intended),
+        ("a bystander", &mut bystander),
+    ] {
+        let received = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            next_server_message(socket),
+        )
+        .await;
+        assert!(
+            received.is_err(),
+            "a payload naming one peer but published without the \
+             `targeted_messages` wrapper must reach nobody; {label} got {received:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_join_on_one_pairing_ticket_supersedes_the_first() {
+    // SECURITY: the pairing join_ticket is what the QR code hands out, and
+    // verification is stateless HMAC + expiry — nothing stops the same ticket from
+    // being replayed. Every replay used to become an independent room member, so a
+    // bystander who photographed the QR could sit in the room alongside the device
+    // being paired and read what the relay published. One ticket must hold exactly
+    // one seat: a later join supersedes the earlier holder rather than joining it.
+    //
+    // Supersede (not reject) is deliberate — the remote client re-presents the
+    // pairing ticket automatically after a network blip, and that reconnect has to
+    // be able to reclaim its own seat.
+    let address = spawn_app().await;
+    let ticket = test_join_ticket_key()
+        .mint(&JoinTicketClaims::pairing_surface_join(
+            "room-a",
+            "pair-shared",
+            u64::MAX,
+        ))
+        .expect("pairing join ticket should mint");
+
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay should connect");
+    let _ = next_server_message(&mut relay).await;
+
+    let surface_url = format!("ws://{address}/ws/room-a?role=surface&join_ticket={ticket}");
+
+    let (mut first, _) = connect_async(&surface_url)
+        .await
+        .expect("the first surface should connect");
+    let first_peer_id = match next_server_message(&mut first).await {
+        ServerMessage::Welcome { peer_id, .. } => peer_id,
+        other => panic!("unexpected welcome frame: {other:?}"),
+    };
+
+    let (mut second, _) = connect_async(&surface_url)
+        .await
+        .expect("a reconnect on the same ticket should be admitted");
+    match next_server_message(&mut second).await {
+        ServerMessage::Welcome { peers, peer_id, .. } => {
+            assert_ne!(peer_id, first_peer_id, "the seat should be a fresh peer");
+            assert!(
+                !peers.iter().any(|peer| peer.peer_id == first_peer_id),
+                "the superseded holder must already be gone from the room; saw {peers:?}"
+            );
+        }
+        other => panic!("unexpected welcome frame: {other:?}"),
+    }
+
+    match next_server_message(&mut first).await {
+        ServerMessage::Error { code, .. } => assert_eq!(code, "pairing_ticket_superseded"),
+        other => panic!("the first holder should be told it lost its seat: {other:?}"),
     }
 }
 
@@ -738,25 +994,55 @@ async fn surface_connections_can_use_broker_assigned_peer_ids() {
 }
 
 #[tokio::test]
-async fn duplicate_peers_get_error_frame() {
+async fn surfaces_asking_for_the_same_peer_id_get_distinct_assigned_ids() {
+    // This used to assert the second surface was rejected for reusing `dup-1`.
+    // Surfaces no longer name themselves at all — honoring the query parameter let
+    // one squat the relay's id and lock it out of its own room — so a requested id
+    // is ignored and the broker hands out a fresh one instead. Two surfaces asking
+    // for the same id must therefore both be seated, under different ids.
     let address = spawn_app().await;
-    let url = websocket_url(
-        address,
-        "room-a",
-        protocol::PeerRole::Surface,
-        Some("dup-1"),
-        JoinTicketClaims::pairing_surface_join("room-a", "pair-3", u64::MAX),
-    );
+    // Distinct pairing ids on purpose: one ticket seats only one peer, so sharing a
+    // ticket here would evict the first connection and the test would prove nothing
+    // about two surfaces coexisting.
+    let url = |pairing_id: &str| {
+        websocket_url(
+            address,
+            "room-a",
+            protocol::PeerRole::Surface,
+            Some("dup-1"),
+            JoinTicketClaims::pairing_surface_join("room-a", pairing_id, u64::MAX),
+        )
+    };
 
-    let (_first, _) = connect_async(&url)
+    let (mut first, _) = connect_async(url("pair-3a"))
         .await
         .expect("first peer should connect");
-    let (mut duplicate, _) = connect_async(&url).await.expect("duplicate should connect");
+    let (mut second, _) = connect_async(url("pair-3b"))
+        .await
+        .expect("second should connect");
 
-    let error = next_server_message(&mut duplicate).await;
-    match error {
-        ServerMessage::Error { code, .. } => assert_eq!(code, "join_rejected"),
-        other => panic!("unexpected error frame: {other:?}"),
+    let assigned = |message: ServerMessage| match message {
+        ServerMessage::Welcome { peer_id, peers, .. } => (peer_id, peers),
+        other => panic!("unexpected welcome frame: {other:?}"),
+    };
+    let (first_peer_id, _) = assigned(next_server_message(&mut first).await);
+    let (second_peer_id, second_sees) = assigned(next_server_message(&mut second).await);
+
+    assert_ne!(
+        first_peer_id, second_peer_id,
+        "each surface must get its own broker-assigned peer id"
+    );
+    // Both are genuinely seated at once — the second peer's Welcome lists the first,
+    // which is what makes this a statement about coexistence and not about eviction.
+    assert!(
+        second_sees.iter().any(|peer| peer.peer_id == first_peer_id),
+        "the second surface should see the first still seated; saw {second_sees:?}"
+    );
+    for peer_id in [&first_peer_id, &second_peer_id] {
+        assert_ne!(
+            peer_id, "dup-1",
+            "a client-requested surface peer id must be ignored"
+        );
     }
 }
 
@@ -1688,10 +1974,10 @@ async fn public_client_grants_list_relays_and_track_revoke() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -1734,10 +2020,10 @@ async fn public_client_session_cookie_can_list_relays() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[8_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -1792,10 +2078,10 @@ async fn cookie_authenticated_relay_directory_is_no_store() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[24_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -1844,10 +2130,10 @@ async fn public_client_refresh_token_can_rotate() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -1902,10 +2188,10 @@ async fn public_client_session_cookie_can_rotate() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -1981,10 +2267,10 @@ async fn public_client_session_cookie_fails_after_revoke() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[10_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -2631,10 +2917,10 @@ async fn client_environment_mutations_are_tracked() {
     let address = spawn_public_mode_app().await;
     let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
 
-    let grant: ClientGrantResponse = public_post(
+    let grant = public_client_pair(
         address,
-        "/api/public/clients/grants",
         "relay-refresh-1",
+        &signing_key,
         &ClientGrantRequest {
             relay_id: "relay-1".to_string(),
             broker_room_id: "room-a".to_string(),
@@ -2847,7 +3133,11 @@ async fn websocket_publish_rate_limit_rejects_messages_without_closing_socket() 
     let address = spawn_app_with(
         BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
         BrokerHardeningConfig {
+            // This peer joins as a relay, so it is the relay budget that has to be
+            // squeezed to provoke the limit — surfaces and relays have separate
+            // allowances (see `DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE`).
             publish_rate_limit_per_minute: 1,
+            relay_publish_rate_limit_per_minute: 1,
             ..BrokerHardeningConfig::default()
         },
         SecurityHeadersConfig::default(),
@@ -2904,11 +3194,19 @@ async fn websocket_publish_rate_limit_rejects_messages_without_closing_socket() 
     }
 }
 
+/// Oversized frames are still refused — at the floor, which is now the smallest cap a
+/// deployment can actually have.
+///
+/// This used to configure a 64-BYTE cap. `MIN_MAX_TEXT_FRAME_BYTES` makes that
+/// unreachable: a cap below what relay-server is compiled to emit rejects frames it cannot
+/// shrink, so the floor raises it. The rejection itself is unchanged — it just takes a
+/// genuinely oversized frame to trigger.
 #[tokio::test]
 async fn oversized_client_frames_are_rejected() {
     let address = spawn_app_with(
         BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
         BrokerHardeningConfig {
+            // Below the floor on purpose: the effective cap is MIN_MAX_TEXT_FRAME_BYTES.
             max_text_frame_bytes: 64,
             ..BrokerHardeningConfig::default()
         },
@@ -2926,7 +3224,7 @@ async fn oversized_client_frames_are_rejected() {
     let (mut socket, _) = connect_async(&url).await.expect("socket should connect");
     let _welcome = next_server_message(&mut socket).await;
     socket
-        .send(Message::Text("x".repeat(65)))
+        .send(Message::Text("x".repeat(MIN_MAX_TEXT_FRAME_BYTES + 1)))
         .await
         .expect("oversized frame should send");
 
@@ -2934,7 +3232,11 @@ async fn oversized_client_frames_are_rejected() {
     match error {
         ServerMessage::Error { code, message } => {
             assert_eq!(code, "frame_too_large");
-            assert!(message.contains("64"));
+            assert!(
+                message.contains(&MIN_MAX_TEXT_FRAME_BYTES.to_string()),
+                "the message must quote the EFFECTIVE cap, not the configured one, or an \
+                 operator debugging this chases a number the broker is not using: {message}"
+            );
         }
         other => panic!("unexpected oversized frame response: {other:?}"),
     }
@@ -3979,5 +4281,1157 @@ async fn admin_stats_requires_valid_token_and_returns_stats() {
             .iter()
             .any(|r| r["relay_id"] == serde_json::json!(enrolled.relay_id)),
         "the enrolled relay must appear in the stats rows"
+    );
+
+    // Every publish-allowance counter must actually reach the wire. A metric that exists
+    // only in the struct is not a metric an operator has — and these are the numbers the
+    // observe-only global egress policy asks them to watch before deciding on enforcement.
+    let publish_limits = &body["publish_limits"];
+    for field in [
+        "frame_limit_exceeded",
+        "byte_limit_exceeded",
+        "published_bytes",
+        "egress_bytes",
+        "peak_egress_bytes_per_minute",
+        "global_egress_warnings",
+    ] {
+        assert!(
+            publish_limits[field].is_u64(),
+            "publish_limits.{field} must be present and numeric in the admin stats \
+             payload, got {publish_limits}"
+        );
+    }
+}
+
+/// A relay publishing at the cadence it is *designed* for must not be throttled.
+///
+/// The relay's own constants put it well past the shared 240/minute allowance:
+/// `TRANSCRIPT_DELTA_PUBLISH_WINDOW_MILLIS = 100` is up to 10 publishes a second during
+/// streaming, plus up to 2 snapshots a second, plus a chunked action reply's 4 a second.
+/// The allowance is 4 a second in total.
+///
+/// Exceeding it is not a soft failure: the broker drops the frame and keeps the socket
+/// open, and the relay only slows its *snapshots* in response — transcript deltas keep
+/// being sent and keep being discarded. A client then waits on content that was thrown
+/// away. Chunked action replies are worse, because a client resolves one only after
+/// every chunk lands, so a single dropped chunk costs it the full 15-second timeout.
+///
+/// The allowance exists to stop an abusive peer, and a relay is a first-party peer whose
+/// legitimate traffic is an order of magnitude above a surface's. So the two get
+/// separate budgets rather than the relay being squeezed into the surface's.
+#[tokio::test]
+async fn a_relays_designed_publish_cadence_is_not_rate_limited() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay socket should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    let publish_frame = serde_json::to_string(&ClientMessage::Publish {
+        protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+        payload: json!({"ciphertext":"abc"}),
+    })
+    .expect("client frame should serialize");
+
+    // Comfortably past the surface allowance, and still under a minute of the relay's
+    // real streaming rate.
+    for _ in 0..300 {
+        relay
+            .send(Message::Text(publish_frame.clone()))
+            .await
+            .expect("publish should send");
+    }
+
+    // Nobody else is in the room, so the only thing that can come back is an error.
+    let unexpected = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        next_server_message(&mut relay),
+    )
+    .await;
+    assert!(
+        unexpected.is_err(),
+        "the relay was rate limited at its own designed cadence: {unexpected:?}. The \
+         broker drops those frames silently, so this is lost transcript content and \
+         chunked replies the client can only time out on."
+    );
+}
+
+/// …and a surface is still held to the tighter budget, so the split above is a
+/// separation of concerns rather than a way to switch the protection off.
+#[tokio::test]
+async fn a_surface_is_still_held_to_the_tighter_publish_budget() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            publish_rate_limit_per_minute: 2,
+            ..BrokerHardeningConfig::default()
+        },
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let surface_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Surface,
+        None,
+        JoinTicketClaims::device_surface_join("room-a", "device-1", None),
+    );
+
+    let (mut surface, _) = connect_async(&surface_url)
+        .await
+        .expect("surface socket should connect");
+    let _welcome = next_server_message(&mut surface).await;
+
+    let publish_frame = serde_json::to_string(&ClientMessage::Publish {
+        protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+        payload: json!({"ciphertext":"abc"}),
+    })
+    .expect("client frame should serialize");
+    for _ in 0..4 {
+        surface
+            .send(Message::Text(publish_frame.clone()))
+            .await
+            .expect("publish should send");
+    }
+
+    match next_server_message(&mut surface).await {
+        ServerMessage::Error { code, .. } => assert_eq!(code, "rate_limited"),
+        other => panic!("a surface over its budget must still be limited, got {other:?}"),
+    }
+}
+
+/// Splitting the publish allowance must not quietly widen a deployment that had
+/// deliberately tightened it.
+///
+/// `RELAY_BROKER_PUBLISH_RATE_LIMIT_PER_MINUTE` used to govern every peer. An operator
+/// who set it low did so on purpose, and an upgrade that promotes relays to the much
+/// larger relay default would be a hardening setting weakening itself on their behalf.
+/// So the generic limit keeps governing relays until they opt into the split.
+#[test]
+fn an_explicit_generic_publish_limit_still_governs_relays() {
+    assert_eq!(
+        resolve_relay_publish_rate_limit(None, Some("60")).expect("limit parses"),
+        60,
+        "an operator who tightened the generic limit must keep it for relays too"
+    );
+    assert_eq!(
+        resolve_relay_publish_rate_limit(Some("900"), Some("60")).expect("limit parses"),
+        900,
+        "setting the relay limit is how they opt into the split"
+    );
+    assert_eq!(
+        resolve_relay_publish_rate_limit(None, None).expect("limit parses"),
+        DEFAULT_RELAY_PUBLISH_RATE_LIMIT_PER_MINUTE,
+        "an untouched deployment gets the relay default"
+    );
+    assert!(
+        resolve_relay_publish_rate_limit(None, Some("nonsense")).is_err(),
+        "a malformed limit must fail loudly rather than fall back to a wider default"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Byte-rate limiting
+//
+// The frame allowance above bounds how MANY frames a peer may publish, and says
+// nothing about how BIG they are. A relay's 36000 frames/minute at the 64KiB
+// frame cap is ~2.2GiB a minute from one peer, and a non-targeted payload fans
+// out to every peer in the room on top of that. These tests pin the byte
+// dimension, and — just as importantly — pin that it stays far enough above real
+// traffic to never fire on it. A `rate_limited` is fatal for a relay: it ends the
+// session and resyncs (see `relay-server/src/broker.rs`, the `rate_limited` arm),
+// so a byte budget set too tight is not a throttle, it is a reconnect loop.
+// ---------------------------------------------------------------------------
+
+/// Publish frames just under the 64KiB frame cap, so a peer inside its *frame*
+/// budget is still moving a lot of bytes.
+fn large_publish_frame(payload_bytes: usize) -> String {
+    serde_json::to_string(&ClientMessage::Publish {
+        protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+        payload: json!({ "ciphertext": "x".repeat(payload_bytes) }),
+    })
+    .expect("client frame should serialize")
+}
+
+/// Pump `frame` into `socket` `count` times while watching for a server error,
+/// so a `rate_limited` reply is observed as soon as it lands instead of after the
+/// whole run. Returns the first error code the broker sent, if any.
+///
+/// Reading concurrently matters: without it a broker that starts replying mid-run
+/// can fill the socket buffer and stall the sender.
+async fn publish_until_error(
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    frame: String,
+    count: usize,
+) -> Option<String> {
+    let (mut writer, mut reader) = socket.split();
+    let sender = tokio::spawn(async move {
+        for _ in 0..count {
+            if writer.send(Message::Text(frame.clone())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+        while let Some(Ok(frame)) = reader.next().await {
+            let Ok(text) = frame.into_text() else {
+                continue;
+            };
+            if let Ok(ServerMessage::Error { code, .. }) = serde_json::from_str(&text) {
+                return Some(code);
+            }
+        }
+        None
+    })
+    .await
+    .unwrap_or(None);
+
+    sender.abort();
+    observed
+}
+
+/// The hole this exists to close: a relay inside its frame budget can still push
+/// bytes without bound.
+///
+/// 600 frames is a rounding error against the 36000/minute frame allowance, so the
+/// frame limiter cannot be what stops this. At ~56KiB each they are ~33MiB, which
+/// is far past any defensible per-minute byte budget — and today nothing counts
+/// them at all.
+#[tokio::test]
+async fn a_relay_cannot_publish_unbounded_bytes_inside_its_frame_budget() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay socket should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    let observed = publish_until_error(relay, large_publish_frame(56 * 1024), 600).await;
+
+    assert_eq!(
+        observed.as_deref(),
+        Some("rate_limited"),
+        "a relay pushed ~33MiB in 600 frames and the broker never objected. The frame \
+         allowance cannot catch this — 600 frames is far inside 36000/minute — so \
+         without a byte budget one peer can move gigabytes a minute."
+    );
+}
+
+/// …and the budget must still sit above the traffic the relay is *designed* to
+/// send, because being refused is not a throttle for a relay — it ends the session
+/// and resyncs.
+///
+/// The largest legitimate burst is a chunked action reply: a workspace diff can be ~4MiB,
+/// sent as `REMOTE_ACTION_RESULT_CHUNK_TARGET_BYTES` (32KiB) chunks.
+///
+/// The frames here are ~56KiB, not 32KiB, deliberately. A chunk's *payload* target is
+/// 32KiB, but what the budget charges is the frame on the wire, and encryption plus
+/// base64 plus the JSON envelope expand that by roughly a third. Sizing the test off the
+/// plaintext target would quietly test a lighter load than production sends. These frames
+/// sit just under `max_text_frame_bytes`, so they are at least as heavy as any real chunk
+/// can be.
+///
+/// It is harsher than production in two further ways: the whole reply goes out as fast as
+/// the socket allows, where real pacing is 50ms apart and lets the bucket refill
+/// throughout, and 128 such frames is ~7MiB against a ~4MiB diff.
+#[tokio::test]
+async fn a_relays_largest_designed_reply_is_not_byte_limited() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay socket should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    // 128 wire-sized chunks = ~7MiB, unpaced.
+    let observed = publish_until_error(relay, large_publish_frame(56 * 1024), 128).await;
+
+    assert_eq!(
+        observed, None,
+        "the relay was byte limited while sending one large-but-ordinary chunked reply. \
+         A refused publish is fatal for a relay (it reconnects and resyncs), so this \
+         budget would turn every big workspace diff into a session teardown."
+    );
+}
+
+/// Reconnecting must not hand a peer a fresh budget.
+///
+/// The bucket is keyed by `(channel, peer)` and lives on broker state, not on the
+/// connection, so dropping the socket and coming back does not clear it. If it
+/// did, the budget would be advisory: any peer could reset it at will, and a relay
+/// that gets refused reconnects *by design*.
+#[tokio::test]
+async fn reconnecting_does_not_reset_the_byte_budget() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig::default(),
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    // First connection: spend the budget until the broker refuses.
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay socket should connect");
+    let _welcome = next_server_message(&mut relay).await;
+    let first = publish_until_error(relay, large_publish_frame(56 * 1024), 600).await;
+    assert_eq!(
+        first.as_deref(),
+        Some("rate_limited"),
+        "precondition: the first connection should have exhausted the byte budget"
+    );
+
+    // Reconnect as the same peer and send a modest amount. The budget is still
+    // spent, so this must be refused too.
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay socket should reconnect");
+    let _welcome = next_server_message(&mut relay).await;
+    let second = publish_until_error(relay, large_publish_frame(56 * 1024), 64).await;
+
+    assert_eq!(
+        second.as_deref(),
+        Some("rate_limited"),
+        "a reconnect handed the peer a fresh byte budget. The bucket must outlive the \
+         connection, or a refused peer can reset it simply by doing what a refused \
+         relay already does automatically: reconnect."
+    );
+}
+
+/// Burst is a separate quota, not a slice of the rate.
+///
+/// A rate alone would refuse the first large reply after an idle period — exactly when one
+/// is most likely, because a surface that just opened a tab is what asks for a workspace
+/// diff. So an idle peer may spend up to `burst_bytes` back-to-back, and then is held to
+/// the sustained rate.
+#[tokio::test]
+async fn an_idle_peer_may_spend_its_burst_then_drops_to_the_sustained_rate() {
+    let limiter = ByteRateLimiter::default();
+    // 60 bytes/minute = 1 byte/second sustained, with a 1000-byte burst. The two are
+    // deliberately far apart so the test cannot pass by confusing one for the other.
+    let budget = ByteBudget {
+        bytes_per_minute: 60,
+        burst_bytes: 1_000,
+    };
+
+    assert!(
+        limiter.charge("peer".to_string(), 1_000, budget).await,
+        "an idle peer must be able to spend its whole burst at once"
+    );
+    assert!(
+        !limiter.charge("peer".to_string(), 1_000, budget).await,
+        "a second full burst back-to-back must be refused: the burst is a one-off \
+         allowance that refills at the sustained rate, not a per-call ceiling"
+    );
+}
+
+/// A refused charge must not deduct anything.
+///
+/// A relay that gets refused reconnects and retries. If a refusal still spent the tokens
+/// it could not afford, every retry would push the peer further under and the bucket would
+/// never recover — a limiter that latches instead of throttling.
+#[tokio::test]
+async fn a_refused_charge_does_not_spend_the_budget() {
+    let limiter = ByteRateLimiter::default();
+    let budget = ByteBudget {
+        bytes_per_minute: 60,
+        burst_bytes: 1_000,
+    };
+
+    for _ in 0..5 {
+        assert!(
+            !limiter.charge("peer".to_string(), 5_000, budget).await,
+            "a charge above the burst ceiling can never be afforded"
+        );
+    }
+    assert!(
+        limiter.charge("peer".to_string(), 1_000, budget).await,
+        "after five refusals the bucket must still hold its full burst; a refusal that \
+         deducted would leave the peer permanently short"
+    );
+}
+
+/// Setting the byte budget to zero switches it off.
+///
+/// The escape hatch matters because the failure mode of a too-tight relay budget is a
+/// flapping session, not a slow one. An operator who hits that needs a way to turn the
+/// control off without redeploying a build.
+#[tokio::test]
+async fn a_zero_byte_budget_disables_the_limit() {
+    let limiter = ByteRateLimiter::default();
+    let budget = ByteBudget {
+        bytes_per_minute: 0,
+        burst_bytes: 0,
+    };
+
+    for _ in 0..100 {
+        assert!(
+            limiter.charge("peer".to_string(), usize::MAX, budget).await,
+            "a zero budget must admit everything, including a charge no bucket could hold"
+        );
+    }
+}
+
+/// A burst smaller than the frame cap would refuse frames the broker itself accepts —
+/// and refuse them forever, since the bucket could never hold enough to pay for one.
+/// A misconfigured burst must throttle, not brick, so it is raised to the frame cap.
+#[test]
+fn a_burst_below_the_frame_cap_is_raised_to_it() {
+    let config = BrokerHardeningConfig {
+        relay_publish_burst_bytes: 1_024,
+        publish_burst_bytes: 1_024,
+        max_text_frame_bytes: 64 * 1024,
+        ..BrokerHardeningConfig::default()
+    };
+
+    for role in [protocol::PeerRole::Relay, protocol::PeerRole::Surface] {
+        assert_eq!(
+            config.byte_budget(role).burst_bytes,
+            64 * 1024,
+            "a burst under the frame cap must be raised to it, or {role:?} frames that \
+             pass the frame cap would be permanently unaffordable"
+        );
+    }
+}
+
+/// The shipped defaults must leave the relay's real traffic comfortably affordable.
+///
+/// This is the arithmetic behind `DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE`, pinned so a
+/// future edit to the constant has to confront it.
+///
+/// Bounded by the **frame cap**, not by the chunk payload target.
+///
+/// Two earlier revisions of this constant were sized from the relay's chunk *payload*
+/// target (32KiB) and were both wrong, because this budget charges the frame and the frame
+/// is bigger — how much bigger depends on encoding layers that have already changed once
+/// (chunks used to be base64'd a second time inside the encrypted envelope). Modelling that
+/// chain here would be a third guess that drifts the next time the encoding moves.
+///
+/// So this derives the ceiling from something the broker owns and the relay must obey: the
+/// relay's chunk builders halve the chunk until the frame fits `MAX_BROKER_TEXT_FRAME_BYTES`,
+/// which is this broker's `max_text_frame_bytes`. A chunk frame therefore cannot exceed the
+/// cap regardless of how many encodings are layered inside it, and cap x cadence is a true
+/// upper bound that no relay-server encoding change can invalidate.
+#[test]
+fn the_default_relay_byte_budget_sits_well_above_real_traffic() {
+    let config = BrokerHardeningConfig::default();
+    let budget = config.byte_budget(protocol::PeerRole::Relay);
+
+    // `REMOTE_ACTION_RESULT_CHUNK_PUBLISH_INTERVAL_MILLIS` is 50ms → 20 frames a second,
+    // each at most one full frame.
+    let chunks_per_minute = (1_000 / 50) * 60;
+    let chunk_train_ceiling_per_minute = config.max_text_frame_bytes * chunks_per_minute;
+
+    assert_eq!(
+        chunk_train_ceiling_per_minute,
+        75 * 1024 * 1024,
+        "sanity: the chunk train ceiling should be 75MiB/min. Every doc comment quoting \
+         that figure is now wrong if this changed."
+    );
+    assert!(
+        budget.bytes_per_minute >= chunk_train_ceiling_per_minute * 6,
+        "the relay byte budget ({} B/min) must stay well above the chunked reply ceiling \
+         alone ({chunk_train_ceiling_per_minute} B/min), with room left for transcript \
+         deltas and snapshots running at the same time. Being refused ends a relay session \
+         and resyncs, so a budget near real traffic is a reconnect loop that spends more \
+         bandwidth than it saves.",
+        budget.bytes_per_minute
+    );
+    assert!(
+        budget.burst_bytes >= 2 * config.max_text_frame_bytes * 100,
+        "the burst must swallow a whole large workspace diff in one go. A ~4MiB diff \
+         becomes ~7MiB on the wire once both base64 layers are applied, so sizing the \
+         burst off the plaintext figure would refuse the first big reply after an idle \
+         period — exactly when one is most likely."
+    );
+}
+
+/// The byte budget follows the same migration rule as the frame budget: an operator who
+/// tightens the generic setting keeps it for relays until they opt into the split.
+#[test]
+fn an_explicit_generic_byte_budget_still_governs_relays() {
+    let resolve = |relay, generic| {
+        resolve_relay_byte_setting(
+            relay,
+            generic,
+            RELAY_PUBLISH_BYTES_ENV,
+            PUBLISH_BYTES_ENV,
+            DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE,
+        )
+    };
+
+    assert_eq!(
+        resolve(None, Some("1024")).expect("budget parses"),
+        1024,
+        "an operator who tightened the generic byte budget must keep it for relays too"
+    );
+    assert_eq!(
+        resolve(Some("2048"), Some("1024")).expect("budget parses"),
+        2048,
+        "setting the relay byte budget is how they opt into the split"
+    );
+    assert_eq!(
+        resolve(None, None).expect("budget parses"),
+        DEFAULT_RELAY_PUBLISH_BYTES_PER_MINUTE,
+        "an untouched deployment gets the relay default"
+    );
+    assert!(
+        resolve(None, Some("nonsense")).is_err(),
+        "a malformed budget must fail loudly rather than fall back to a wider default"
+    );
+}
+
+/// The global egress view observes; it never refuses.
+///
+/// Refusing on a global condition would punish a peer for its neighbours' traffic, and for
+/// a relay that means a session teardown whose resync sends a full snapshot — the control
+/// would amplify the overload it fired on. So this records, warns, and admits.
+#[tokio::test]
+async fn global_egress_is_metered_without_ever_refusing() {
+    let metrics = PublishMetrics::default();
+
+    metrics.record_egress(GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE * 4);
+    metrics.record_published(4_096);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.egress_bytes,
+        GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE * 4,
+        "egress must be accumulated even far past the warning threshold"
+    );
+    assert_eq!(
+        snapshot.byte_limit_exceeded, 0,
+        "crossing the global egress threshold must not be recorded as a peer refusal: \
+         nothing was refused, and a future enforcement decision needs these separable"
+    );
+    assert_eq!(snapshot.published_bytes, 4_096);
+}
+
+/// A surface must not get a fresh budget by reconnecting.
+///
+/// This is the abuse-facing case, and it is the one the relay reconnect test above does
+/// **not** cover: a relay's ticket pins its `peer_id`, so its bucket key is stable by
+/// accident of that. A surface ticket pins nothing — the broker assigns a random
+/// `peer_id` on every join (see `generated_peer_id`) — so keying the bucket on `peer_id`
+/// hands the same credential a brand new burst every time it reconnects. At the default
+/// 40 joins/minute that converts an 8MiB/minute budget into ~80MiB/minute, and concurrent
+/// sockets multiply it further.
+///
+/// The budget must therefore key on the authenticated identity from the join ticket
+/// (`device_id` / `pairing_id`), which the peer cannot roll by reconnecting.
+#[tokio::test]
+async fn a_surface_cannot_reset_its_byte_budget_by_reconnecting() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            // Effectively no refill, so the test measures the burst and nothing else.
+            // The burst floor raises this to `max_text_frame_bytes` (64KiB).
+            publish_bytes_per_minute: 1,
+            publish_burst_bytes: 1,
+            ..BrokerHardeningConfig::default()
+        },
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+
+    // Same device credential every time; only the broker-assigned peer_id changes.
+    let surface_url = || {
+        websocket_url(
+            address,
+            "room-a",
+            protocol::PeerRole::Surface,
+            None,
+            JoinTicketClaims::device_surface_join("room-a", "device-1", None),
+        )
+    };
+    let frame = large_publish_frame(56 * 1024);
+
+    let (mut surface, _) = connect_async(&surface_url())
+        .await
+        .expect("surface socket should connect");
+    let first_peer_id = match next_server_message(&mut surface).await {
+        ServerMessage::Welcome { peer_id, .. } => peer_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    let first = publish_until_error(surface, frame.clone(), 4).await;
+    assert_eq!(
+        first.as_deref(),
+        Some("rate_limited"),
+        "precondition: the first connection should have exhausted the 64KiB burst"
+    );
+
+    // Reconnect on the same credential. The broker hands out a different peer_id.
+    let (mut surface, _) = connect_async(&surface_url())
+        .await
+        .expect("surface socket should reconnect");
+    let second_peer_id = match next_server_message(&mut surface).await {
+        ServerMessage::Welcome { peer_id, .. } => peer_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    assert_ne!(
+        first_peer_id, second_peer_id,
+        "precondition: surfaces are meant to get a fresh broker-assigned peer_id per join; \
+         if that ever changes this test is no longer testing what it thinks it is"
+    );
+
+    // Exactly ONE frame, which is smaller than a fresh 64KiB burst. That is what makes
+    // this test able to tell the two outcomes apart: a reset budget affords it, a carried
+    // -over budget does not. Sending more would be refused either way and the test would
+    // pass without proving anything.
+    let second = publish_until_error(surface, frame, 1).await;
+    assert_eq!(
+        second.as_deref(),
+        Some("rate_limited"),
+        "a surface reset its byte budget by reconnecting. The bucket must key on the \
+         authenticated ticket identity, not on the peer_id the broker freshly assigns on \
+         every join — otherwise the limit is advisory for exactly the peers it targets."
+    );
+}
+
+/// The same bypass applies to the frame allowance, which is keyed the same way.
+///
+/// Pre-existing rather than introduced by the byte budget, but it is the same key and the
+/// same credential, so fixing one and leaving the other would just move the hole.
+#[tokio::test]
+async fn a_surface_cannot_reset_its_frame_budget_by_reconnecting() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            publish_rate_limit_per_minute: 2,
+            ..BrokerHardeningConfig::default()
+        },
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let surface_url = || {
+        websocket_url(
+            address,
+            "room-a",
+            protocol::PeerRole::Surface,
+            None,
+            JoinTicketClaims::device_surface_join("room-a", "device-1", None),
+        )
+    };
+    let frame = large_publish_frame(16);
+
+    let (mut surface, _) = connect_async(&surface_url())
+        .await
+        .expect("surface socket should connect");
+    let _welcome = next_server_message(&mut surface).await;
+    assert_eq!(
+        publish_until_error(surface, frame.clone(), 4)
+            .await
+            .as_deref(),
+        Some("rate_limited"),
+        "precondition: the first connection should have exhausted the 2-frame allowance"
+    );
+
+    let (mut surface, _) = connect_async(&surface_url())
+        .await
+        .expect("surface socket should reconnect");
+    let _welcome = next_server_message(&mut surface).await;
+
+    // One frame, for the same reason as the byte test above: a fresh 2-frame allowance
+    // would afford it, an already-spent one would not.
+    assert_eq!(
+        publish_until_error(surface, frame, 1).await.as_deref(),
+        Some("rate_limited"),
+        "a surface reset its frame allowance by reconnecting, for the same reason as the \
+         byte budget: a broker-assigned peer_id is not an identity a limit can rest on."
+    );
+}
+
+/// Two live connections on one credential share a budget.
+///
+/// The reconnect test proves a *sequential* bypass is closed; this proves the concurrent
+/// one is too. Opening a second socket must not double the allowance, or the fix would
+/// only have made the bypass slightly less convenient.
+#[tokio::test]
+async fn concurrent_connections_on_one_credential_share_a_byte_budget() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            publish_bytes_per_minute: 1,
+            publish_burst_bytes: 1,
+            ..BrokerHardeningConfig::default()
+        },
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let surface_url = || {
+        websocket_url(
+            address,
+            "room-a",
+            protocol::PeerRole::Surface,
+            None,
+            JoinTicketClaims::device_surface_join("room-a", "device-1", None),
+        )
+    };
+    let frame = large_publish_frame(56 * 1024);
+
+    // Both sockets open at once, same credential.
+    let (mut first, _) = connect_async(&surface_url())
+        .await
+        .expect("first surface should connect");
+    let _welcome = next_server_message(&mut first).await;
+    let (mut second, _) = connect_async(&surface_url())
+        .await
+        .expect("second surface should connect");
+    let _welcome = next_server_message(&mut second).await;
+
+    // The first spends the shared 64KiB burst.
+    assert_eq!(
+        publish_until_error(first, frame.clone(), 4)
+            .await
+            .as_deref(),
+        Some("rate_limited"),
+        "precondition: the first socket should have exhausted the shared burst"
+    );
+
+    assert_eq!(
+        publish_until_error(second, frame, 1).await.as_deref(),
+        Some("rate_limited"),
+        "a second concurrent socket on the same credential got its own budget. The \
+         credential is the peer, not the socket."
+    );
+}
+
+/// A completed minute must show up even if traffic stops.
+///
+/// Rolling the window only when the *next* frame arrives means a burst followed by silence
+/// is never folded into the peak and never warns — the two things an operator would act
+/// on. Reading the metric has to close an elapsed window too.
+#[tokio::test(start_paused = true)]
+async fn an_idle_completed_minute_still_reports_its_peak_and_warning() {
+    let metrics = PublishMetrics::default();
+    let burst = GLOBAL_EGRESS_WARN_BYTES_PER_MINUTE + 1;
+
+    metrics.record_egress(burst);
+    // Traffic stops. The minute completes with nothing to trigger a rollover.
+    tokio::time::advance(Duration::from_secs(RATE_LIMIT_WINDOW_SECS + 1)).await;
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.peak_egress_bytes_per_minute, burst,
+        "a completed minute must appear in the peak even though no further frame arrived \
+         to roll the window"
+    );
+    assert_eq!(
+        snapshot.global_egress_warnings, 1,
+        "and it must warn: a burst followed by silence is exactly the shape an operator \
+         needs told about"
+    );
+}
+
+/// Egress must equal the bytes that actually went out — including for a targeted batch
+/// whose payloads are wildly different sizes.
+///
+/// This is the case that killed the previous approach. Egress used to be estimated at
+/// publish time by scaling the inbound frame by `delivered / targets`, which assumes every
+/// target's payload is about the same size. One large delivered payload beside one tiny
+/// undelivered one reported **half** the real figure, and more tiny missing targets made
+/// it arbitrarily worse. Counting at the socket removes the assumption rather than
+/// tightening it, so this asserts exact equality, not a tolerance.
+///
+/// It also covers fan-out and the small-message case in the same measurement: the numbers
+/// compared are whatever the clients genuinely received.
+#[tokio::test]
+async fn reported_egress_equals_the_bytes_clients_actually_received() {
+    let token: std::sync::Arc<str> = std::sync::Arc::from("s3cret-operator-token");
+    let address = spawn_public_mode_app_full(Some(token.clone()), None, false).await;
+    let http = reqwest::Client::new();
+
+    let egress_now = |http: reqwest::Client, token: std::sync::Arc<str>| async move {
+        let body: serde_json::Value = http
+            .get(format!("http://{address}/api/admin/stats"))
+            .bearer_auth(token.as_ref())
+            .send()
+            .await
+            .expect("stats request")
+            .json()
+            .await
+            .expect("stats json");
+        body["publish_limits"]["egress_bytes"]
+            .as_u64()
+            .expect("egress_bytes must be reported")
+    };
+
+    // Two peers in one room. Both join as relays purely because a relay ws token is the
+    // cheapest credential to mint here; egress accounting does not depend on role.
+    let mut sockets = Vec::new();
+    for peer in ["sender", "receiver-1"] {
+        let ws_token: RelayWsTokenResponse = public_post(
+            address,
+            "/api/public/relay/ws-token",
+            "relay-refresh-1",
+            &RelayWsTokenRequest {
+                relay_id: "relay-1".to_string(),
+                broker_room_id: "room-a".to_string(),
+                relay_peer_id: peer.to_string(),
+            },
+        )
+        .await;
+        let url = format!(
+            "ws://{address}/ws/room-a?role=relay&peer_id={peer}&join_ticket={}",
+            ws_token.relay_ws_token
+        );
+        let (socket, _) = connect_async(&url).await.expect("peer should connect");
+        sockets.push(socket);
+    }
+    let mut receiver = sockets.pop().expect("receiver socket");
+    let mut sender = sockets.pop().expect("sender socket");
+
+    // Drain the welcome and the join presence so the baseline below is quiet.
+    let _ = next_server_message(&mut sender).await;
+    let _ = next_server_message(&mut sender).await;
+    let _ = next_server_message(&mut receiver).await;
+
+    let baseline = egress_now(http.clone(), token.clone()).await;
+
+    // One large payload to a peer that IS connected, one empty payload to a peer that is
+    // not. The estimator reported ~half of this; the truth is one large frame.
+    let publish = serde_json::to_string(&ClientMessage::Publish {
+        protocol_version: protocol::BROKER_PROTOCOL_VERSION,
+        payload: json!({
+            "kind": "targeted_messages",
+            "messages": [
+                {"target_peer_id": "receiver-1", "payload": {"ciphertext": "x".repeat(32 * 1024)}},
+                {"target_peer_id": "absent-peer", "payload": {"ciphertext": ""}},
+            ],
+        }),
+    })
+    .expect("publish frame serializes");
+    sender
+        .send(Message::Text(publish))
+        .await
+        .expect("publish should send");
+
+    // Exactly what arrived on the wire.
+    let delivered = receiver
+        .next()
+        .await
+        .expect("receiver should get the targeted message")
+        .expect("frame decodes")
+        .into_text()
+        .expect("frame is text")
+        .len() as u64;
+
+    let after = egress_now(http.clone(), token.clone()).await;
+
+    assert_eq!(
+        after - baseline,
+        delivered,
+        "reported egress ({}) must equal the bytes the client actually received \
+         ({delivered}). A targeted batch with unequal payloads is precisely where a \
+         scaled estimate goes wrong.",
+        after - baseline
+    );
+    assert!(
+        delivered > 32 * 1024,
+        "sanity: the delivered frame should be the large payload, got {delivered} bytes"
+    );
+}
+
+/// The pairing branch of the identity must hold too.
+///
+/// A pairing surface carries `pairing_id` and no `device_id`, so it exercises a different
+/// arm of `publish_limit_identity` than the device reconnect test. It is also the branch
+/// that matters most for abuse: a pairing ticket is the credential encoded in a QR code,
+/// which is the one an attacker is most likely to have a copy of.
+#[tokio::test]
+async fn a_pairing_surface_cannot_reset_its_byte_budget_by_reconnecting() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            publish_bytes_per_minute: 1,
+            publish_burst_bytes: 1,
+            ..BrokerHardeningConfig::default()
+        },
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let expires_at = unix_now_secs() + 300;
+    let surface_url = || {
+        websocket_url(
+            address,
+            "room-a",
+            protocol::PeerRole::Surface,
+            None,
+            JoinTicketClaims::pairing_surface_join("room-a", "pairing-1", expires_at),
+        )
+    };
+    let frame = large_publish_frame(56 * 1024);
+
+    let (mut surface, _) = connect_async(&surface_url())
+        .await
+        .expect("pairing surface should connect");
+    let _welcome = next_server_message(&mut surface).await;
+    assert_eq!(
+        publish_until_error(surface, frame.clone(), 4)
+            .await
+            .as_deref(),
+        Some("rate_limited"),
+        "precondition: the first connection should have exhausted the burst"
+    );
+
+    let (mut surface, _) = connect_async(&surface_url())
+        .await
+        .expect("pairing surface should reconnect");
+    let _welcome = next_server_message(&mut surface).await;
+
+    // One frame: affordable from a fresh burst, not from a spent one.
+    assert_eq!(
+        publish_until_error(surface, frame, 1).await.as_deref(),
+        Some("rate_limited"),
+        "a pairing surface reset its byte budget by reconnecting. `pairing_id` is the \
+         stable identity for this branch, and it is the credential most likely to be \
+         copied — a QR code."
+    );
+}
+
+/// The bucket refills at the sustained rate, not in a lump.
+///
+/// Everything else about the budget is tested at its ceiling; this pins the slope between
+/// ceilings. Paused time rather than sleeping, so the assertion is exact instead of racy.
+#[tokio::test(start_paused = true)]
+async fn a_depleted_bucket_refills_at_the_sustained_rate() {
+    let limiter = ByteRateLimiter::default();
+    // 600 bytes/minute = 10 bytes/second, burst 100.
+    let budget = ByteBudget {
+        bytes_per_minute: 600,
+        burst_bytes: 100,
+    };
+
+    assert!(limiter.charge("peer".to_string(), 100, budget).await);
+    assert!(
+        !limiter.charge("peer".to_string(), 10, budget).await,
+        "precondition: the burst is spent"
+    );
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(
+        limiter.charge("peer".to_string(), 50, budget).await,
+        "five seconds at 10 B/s must have refilled 50 bytes"
+    );
+    assert!(
+        !limiter.charge("peer".to_string(), 10, budget).await,
+        "...and not a byte more: refill is a rate, not a reset"
+    );
+
+    // Refill must also stop at the burst ceiling rather than accruing without bound.
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert!(
+        limiter.charge("peer".to_string(), 100, budget).await,
+        "a long idle must refill to the full burst"
+    );
+    assert!(
+        !limiter.charge("peer".to_string(), 1, budget).await,
+        "but must not accrue beyond it — ten minutes idle at 10 B/s would be 6000 bytes \
+         if the ceiling were not applied, which would hand an idle peer a free flood"
+    );
+}
+
+/// Pruning must never hand a peer that is still in debt a fresh budget.
+///
+/// The map is pruned once it grows past `BYTE_BUCKET_PRUNE_THRESHOLD`, and pruning the
+/// wrong entry is indistinguishable from resetting that peer's allowance — the exact bypass
+/// the identity fix closed. Only fully-refilled buckets may be dropped.
+#[tokio::test(start_paused = true)]
+async fn pruning_keeps_buckets_that_are_still_in_debt() {
+    let limiter = ByteRateLimiter::default();
+    // Slow refill so the victim stays in debt for the whole test.
+    let budget = ByteBudget {
+        bytes_per_minute: 60,
+        burst_bytes: 1_000,
+    };
+
+    // A peer that spends its whole burst: 1000 bytes of debt at 1 B/s is ~1000s to refill.
+    assert!(limiter.charge("victim".to_string(), 1_000, budget).await);
+
+    // Push the map past the prune threshold with peers that spend almost nothing, so they
+    // refill to full quickly and become legitimately prunable.
+    for index in 0..(BYTE_BUCKET_PRUNE_THRESHOLD * 2) {
+        assert!(limiter.charge(format!("filler-{index}"), 1, budget).await);
+    }
+    let before = limiter.buckets.lock().await.len();
+
+    // Ten seconds: enough for a 1-byte deficit to refill, nowhere near enough for 1000.
+    tokio::time::advance(Duration::from_secs(10)).await;
+    // One more charge to run the prune pass.
+    assert!(limiter.charge("trigger".to_string(), 1, budget).await);
+    let after = limiter.buckets.lock().await.len();
+
+    assert!(
+        after < before,
+        "precondition: the prune pass must actually have dropped the settled buckets \
+         ({before} -> {after}), otherwise this test proves nothing about selectivity"
+    );
+    assert!(
+        !limiter.charge("victim".to_string(), 1_000, budget).await,
+        "pruning dropped a bucket that was still in debt, handing that peer a fresh burst. \
+         A limit that a peer can clear by waiting for unrelated churn is not a limit."
+    );
+}
+
+/// A rejected join's error frame counts as egress too.
+///
+/// `reject_socket` writes its `ServerMessage` on a path of its own, so it was invisible to
+/// the metric while the documentation claimed to count client-socket egress. That is the
+/// one path an abusive client drives hardest — a flood of bad joins is all rejections — so
+/// exempting it would blind the metric to exactly the traffic it exists to show.
+///
+/// This drives a REAL rejected join and reads the REAL metric over HTTP. An earlier version
+/// re-implemented `reject_socket`'s body in the test and called `record_egress` itself,
+/// which proved only that addition works: deleting the accounting from the actual function
+/// left it green.
+#[tokio::test]
+async fn a_rejected_join_counts_its_error_frame_as_egress() {
+    let token: std::sync::Arc<str> = std::sync::Arc::from("s3cret-operator-token");
+    let address = spawn_public_mode_app_full(Some(token.clone()), None, false).await;
+    let http = reqwest::Client::new();
+
+    let egress_now = |http: reqwest::Client, token: std::sync::Arc<str>| async move {
+        let body: serde_json::Value = http
+            .get(format!("http://{address}/api/admin/stats"))
+            .bearer_auth(token.as_ref())
+            .send()
+            .await
+            .expect("stats request")
+            .json()
+            .await
+            .expect("stats json");
+        body["publish_limits"]["egress_bytes"]
+            .as_u64()
+            .expect("egress_bytes must be reported")
+    };
+
+    let baseline = egress_now(http.clone(), token.clone()).await;
+
+    // A real join the broker refuses: well-formed URL, unusable ticket.
+    let (mut socket, _) = connect_async(&format!(
+        "ws://{address}/ws/room-a?role=relay&peer_id=relay-1&join_ticket=not-a-valid-ticket"
+    ))
+    .await
+    .expect("the socket connects before the join is judged");
+
+    let rejection = socket
+        .next()
+        .await
+        .expect("the broker should send a rejection")
+        .expect("frame decodes")
+        .into_text()
+        .expect("frame is text");
+    let received = rejection.len() as u64;
+    assert!(
+        rejection.contains("join_rejected"),
+        "expected a join rejection, got {rejection}"
+    );
+
+    let after = egress_now(http, token).await;
+    assert_eq!(
+        after - baseline,
+        received,
+        "the rejection frame must be counted, and counted exactly: the client read \
+         {received} bytes"
+    );
+}
+
+/// A frame cap configured below what a relay can emit must not brick large replies.
+///
+/// The relay fits its chunks against a **fixed** 64KiB limit compiled into relay-server; it
+/// does not learn this broker's configured cap. So a cap set below that turns ordinary
+/// encrypted chunks into `frame_too_large`, and the broker CLOSES the socket on that — the
+/// relay reconnects, replays the same cached result, and fails identically. A workspace
+/// diff becomes permanently undeliverable from a single hardening knob.
+///
+/// The floor is raised rather than the deploy refused, matching how a too-small publish
+/// burst is handled: a misconfigured limit should throttle, never brick.
+#[tokio::test]
+async fn a_frame_cap_below_the_relays_fixed_size_is_raised_to_it() {
+    let address = spawn_app_with(
+        BrokerJoinVerifier::SelfHosted(test_join_ticket_key()),
+        BrokerHardeningConfig {
+            max_text_frame_bytes: 16 * 1024,
+            ..BrokerHardeningConfig::default()
+        },
+        SecurityHeadersConfig::default(),
+    )
+    .await;
+    let relay_url = websocket_url(
+        address,
+        "room-a",
+        protocol::PeerRole::Relay,
+        Some("relay-1"),
+        JoinTicketClaims::relay_join("room-a", "relay-1"),
+    );
+
+    let (mut relay, _) = connect_async(&relay_url)
+        .await
+        .expect("relay socket should connect");
+    let _welcome = next_server_message(&mut relay).await;
+
+    // A chunk the size the relay actually produces, just under its fixed 64KiB ceiling.
+    relay
+        .send(Message::Text(large_publish_frame(60 * 1024)))
+        .await
+        .expect("publish should send");
+
+    let unexpected = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        next_server_message(&mut relay),
+    )
+    .await;
+    assert!(
+        unexpected.is_err(),
+        "a relay-sized frame was refused by a broker configured below the relay's fixed \
+         64KiB fitting limit: {unexpected:?}. The relay cannot negotiate this cap, so the \
+         reply is undeliverable and the reconnect replays the same failure."
     );
 }

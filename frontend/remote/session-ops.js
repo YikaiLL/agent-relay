@@ -5,6 +5,7 @@ import {
 } from "./actions.js";
 import {
   isCurrentDeviceActiveController,
+  isVerboseBrokerLoggingEnabled,
   renderLog,
   renderSession,
 } from "./session-surface.js";
@@ -26,6 +27,13 @@ import {
   createTranscriptPageFetcher,
 } from "./transcript/api.js";
 import { transcriptPageCache } from "./transcript/page-cache-instance.js";
+import {
+  dispatchWorkspaceRepair,
+  readWorkspaceRepair,
+  setWorkspaceRepairError,
+  setWorkspaceRepairPending,
+  workspaceRepairResolved,
+} from "./workspace-repair.js";
 import { withThreadError } from "../shared/composer-errors.js";
 import { createCachingTranscriptPageFetcher } from "../shared/caching-transcript-fetcher.js";
 import { providerLabel } from "../shared/provider-labels.js";
@@ -59,10 +67,12 @@ import { threadAttention } from "../shared/thread-attention.js";
 import { forkFieldsToPayload } from "../shared/fork-fields.js";
 import { isDocumentForeground, notifyThreadEvents } from "../shared/thread-notify.js";
 import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
+import { sessionViewedWorkspaceKey } from "../shared/viewed-workspace-key.js";
 import { isWorkingThreadStatus } from "../shared/thread-status.js";
 import { createFrameRenderQueue } from "./frame-render-queue.js";
 
-const fetchRawTranscriptPage = createTranscriptPageFetcher(dispatchOrRecover);
+const fetchTranscriptPageOverBroker = createTranscriptPageFetcher(dispatchOrRecover);
+const fetchRawTranscriptPage = fetchTranscriptPageOverBroker;
 const fetchTranscriptEntryDetailRequest =
   createTranscriptEntryDetailFetcher(dispatchOrRecover);
 
@@ -115,15 +125,69 @@ function remoteQueryScope() {
 }
 
 function fetchTranscriptPage({ threadId, before }) {
-  return remoteQueryClient.fetchQuery(
-    createThreadTranscriptPageQueryOptions({
-      before,
-      fetchPage: fetchCachedTranscriptPage,
-      scope: remoteQueryScope(),
-      surface: "remote",
-      threadId,
-    })
-  );
+  return remoteQueryClient
+    .fetchQuery(
+      createThreadTranscriptPageQueryOptions({
+        before,
+        fetchPage: fetchCachedTranscriptPage,
+        scope: remoteQueryScope(),
+        surface: "remote",
+        threadId,
+      })
+    );
+}
+
+// The repair records live on a Map hanging off `state`, so mutating them is invisible to
+// `useSyncExternalStore`. Re-publish the same Map through the store to bump the snapshot
+// identity and repaint the banner.
+function publishWorkspaceRepair() {
+  patchRemoteState({ workspaceRepairByThread: state.workspaceRepairByThread || new Map() });
+}
+
+/**
+ * Ask the relay to make this thread's recorded workspace exist again.
+ *
+ * Ack-only over the broker and claim-free by design: a phone must be able to un-brick a
+ * session it is merely viewing, without stealing the active-controller lease.
+ */
+export async function repairRemoteWorkspace(threadId) {
+  const targetThreadId = threadId || state.session?.active_thread_id || null;
+  if (!targetThreadId) {
+    renderLog("There is no session whose workspace could be re-created.");
+    return false;
+  }
+
+  setWorkspaceRepairPending(state, targetThreadId, true);
+  publishWorkspaceRepair();
+
+  try {
+    await dispatchWorkspaceRepair(dispatchOrRecover, targetThreadId);
+    // Clear now rather than waiting for the next tail fetch: the relay has just confirmed
+    // the directory exists, and a banner still claiming otherwise would be a lie with a
+    // button on it. The refresh below replaces this with the relay's own verdict.
+    workspaceRepairResolved(state, targetThreadId);
+    publishWorkspaceRepair();
+    renderLog(`Re-created the workspace for session ${targetThreadId}.`);
+    // No client-side probe cache to invalidate here: the verdict rides
+    // `snapshot.workspace_missing` (see shared/workspace-repair.js), so the refresh
+    // below is the whole of it. An assignment to a stray `lastWorkspaceVerdictProbeKey`
+    // outlived the design that had one, and being inside this try meant the
+    // ReferenceError it threw in strict mode was caught below and reported as a failed
+    // repair — of a workspace the relay had just rebuilt.
+    void fetchRawTranscriptPage({ threadId: targetThreadId, before: null }).catch(() => {});
+    return true;
+  } catch (error) {
+    // The relay's own message, kept whole — "the repository … no longer exists either" is
+    // the difference between a user who knows what to do and one who does not.
+    setWorkspaceRepairError(
+      state,
+      targetThreadId,
+      error.message || "Failed to re-create the workspace"
+    );
+    publishWorkspaceRepair();
+    renderLog(`Workspace repair failed: ${error.message}`);
+    return false;
+  }
 }
 
 function transcriptDeltaKindToEntryKind(deltaKind) {
@@ -657,6 +721,14 @@ export function applySessionSnapshot(snapshot) {
   } catch (error) {
     renderLog(`[thread-attention] ingest failed: ${error?.message || error}`);
   }
+  // Everything below is diagnostics, and it is not cheap: reading `scrollHeight`
+  // forces a synchronous layout of the whole transcript subtree, and `renderLog` is a
+  // `patchRemoteState` — a full RemoteApp re-render. Both were paid on EVERY snapshot,
+  // including the identical idle snapshots a relay repeats for a thread this surface
+  // is not even displaying. Behind the flag, a snapshot costs neither.
+  if (!isVerboseBrokerLoggingEnabled()) {
+    return;
+  }
   const scrollTop = remoteUiRefs.remoteTranscript?.scrollTop || 0;
   const scrollHeight = remoteUiRefs.remoteTranscript?.scrollHeight || 0;
   const clientHeight = remoteUiRefs.remoteTranscript?.clientHeight || 0;
@@ -824,6 +896,10 @@ export function projectRemoteViewedSession(realSession, threadId, currentView) {
     active_turn_id: explicitTurnId || (isWorking ? `view:${threadId}` : null),
     controller_lease_expires_at: null,
     current_cwd: threadState.current_cwd || thread?.cwd || "",
+    thread_workspace_cwd:
+      threadState.thread_workspace_cwd
+      ?? currentView?.thread_workspace_cwd
+      ?? "",
     current_phase: currentPhase,
     current_status: threadState.current_status
       || (isWorking ? "active" : settledThreadStatus(thread?.status)),
@@ -1185,6 +1261,9 @@ export async function startRemoteSession(sessionDraftOverride = null) {
         sandbox: sessionDraft.sandbox,
         effort: sessionDraft.effort,
         provider: sessionDraft.provider,
+        // Explicit null when unfiled: remote has no second step, its start_session
+        // returns no thread id to follow up on.
+        project_id: sessionDraft.projectId || null,
       },
     });
     return true;
@@ -1348,7 +1427,7 @@ function runRemoteThreadsPoll() {
  * caller reads this. It only matters for search — where an empty answer reads as "that
  * session does not exist" — but it rides both paths so there is one shape.
  */
-export async function fetchRemoteThreadPage({ limit = 80, q = "" } = {}) {
+export async function fetchRemoteThreadPage({ limit = 80, q = "", ids = null } = {}) {
   if (!state.remoteAuth) {
     return { threads: [], unavailableProviders: [] };
   }
@@ -1356,6 +1435,13 @@ export async function fetchRemoteThreadPage({ limit = 80, q = "" } = {}) {
   const query = { limit };
   if (q) {
     query.q = q;
+  }
+  // Ask about specific sessions instead of for a page. The relay scans as deeply as a
+  // search for these and does not truncate to `limit`, so absence from the answer means
+  // it genuinely could not resolve the id — the one thing a page cannot tell you, because
+  // its bound applies to the provider scan too. See `ThreadsQuery.ids`.
+  if (Array.isArray(ids) && ids.length) {
+    query.ids = ids;
   }
   const result = await dispatchOrRecover("list_threads", { query });
   return {
@@ -1366,6 +1452,21 @@ export async function fetchRemoteThreadPage({ limit = 80, q = "" } = {}) {
 
 export async function fetchRemoteThreads(options = {}) {
   return (await fetchRemoteThreadPage(options)).threads;
+}
+
+/**
+ * Ask the relay which of these sessions it can still resolve.
+ *
+ * Deliberately NOT routed through the thread-list query cache. That cache is keyed by the
+ * resting list, and a probe is a different question with a different answer shape —
+ * seeding it would let a narrow probe answer a later request for the whole page.
+ */
+export async function probeRemoteThreadsExist(threadIds) {
+  const ids = [...new Set((threadIds || []).filter(Boolean))];
+  if (!ids.length) {
+    return { threads: [], unavailableProviders: [] };
+  }
+  return fetchRemoteThreadPage({ limit: ids.length, ids });
 }
 
 let remoteThreadSearchGeneration = 0;
@@ -1860,23 +1961,41 @@ export function getRemoteViewedThreadId() {
   return viewOnlyThreadId || state.session?.active_thread_id || null;
 }
 
-// Identity of the viewed workspace (thread id + cwd): used to drop stale diff data
-// on a view switch OR a same-thread cwd change during the load window.
+// Identity of the viewed workspace (thread + birth cwd + remembered tree).
 export function getRemoteViewedWorkspaceKey() {
-  return JSON.stringify([getRemoteViewedThreadId() || "", state.session?.current_cwd || ""]);
+  return sessionViewedWorkspaceKey(state.session, getRemoteViewedThreadId());
 }
 
-export async function fetchRemoteWorkspaceDiff(root = null, autoRoot = false) {
+export async function fetchRemoteWorkspaceDiff({ viewRoot = null } = {}) {
   const threadId = getRemoteViewedThreadId();
   const payload = {};
   if (threadId) payload.thread_id = threadId;
-  // The relay validates this against the worktrees it enumerated for that session,
-  // so a stale pin fails closed rather than reading a foreign tree.
-  if (root) payload.root = root;
-  // One-shot opt-in: land on where this thread has actually been writing.
-  if (autoRoot) payload.auto_root = true;
+  // Diff preview only — never a session pin.
+  if (viewRoot) payload.view_root = viewRoot;
   const result = await dispatchOrRecover("fetch_workspace_diff", payload);
   return result.workspace_diff;
+}
+
+// Not claim-gated: a paired device must see where a session is without taking control.
+// `rootsStatus` costs the relay a `git status` per worktree, so only the open picker —
+// the one thing that displays those counts — asks for it.
+export async function fetchRemoteThreadWorkspace(threadId, options = null) {
+  if (!threadId) return null;
+  const result = await dispatchOrRecover("fetch_thread_workspace", {
+    thread_id: threadId,
+    roots_status: Boolean(options?.rootsStatus),
+  });
+  return result.thread_workspace || null;
+}
+
+// Pin (`cwd`) or unpin (`null`). No session claim: relay-owned, like rename_thread.
+export async function setRemoteThreadWorkspace(threadId, cwd) {
+  if (!threadId) return null;
+  const result = await dispatchOrRecover("set_thread_workspace", {
+    thread_id: threadId,
+    cwd: cwd || null,
+  });
+  return result.thread_workspace || null;
 }
 
 // Cross-agent review actions over the broker. Each ack carries no snapshot, so
@@ -2040,6 +2159,13 @@ export function clearSessionRuntime() {
   invalidateViewOnlyNavigation();
   state.realSession = null;
   clearTranscriptHydration(state);
+  // Thread ids are only unique within one relay, so a repair marked in flight (or failed)
+  // against thread X here would attach itself to a different relay's thread X after a
+  // switch or a re-pair — a button stuck spinning, or someone else's error under it.
+  // The verdict itself needs no clearing: it rides the snapshot, so the new relay's first
+  // one replaces it.
+  state.workspaceRepairByThread = new Map();
+  publishWorkspaceRepair();
 }
 
 async function sendHeartbeat() {

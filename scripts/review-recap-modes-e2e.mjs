@@ -141,6 +141,13 @@ async function main() {
 // with the given recap mode, wait for it to finish, and return the terminal job +
 // the parent's transcript entries.
 async function runReview(relayPort, { cwd, recapSource, seedMessage }) {
+  // Reviews collect git context in an unattended background task. Starting an
+  // agent in a directory is a deliberate local action, but it is not permission
+  // for ambient git probes; mirror the local UI's explicit trust step so this
+  // fixture exercises the review modes instead of the trust refusal path.
+  const trusted = await postEnvelope(relayPort, "/api/workspace/trust", { cwd });
+  assert.ok(trusted.ok, `workspace trust failed: ${JSON.stringify(trusted.error)}`);
+
   const started = await postEnvelope(relayPort, "/api/session/start", {
     device_id: DEVICE,
     cwd,

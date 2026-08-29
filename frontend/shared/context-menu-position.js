@@ -8,6 +8,9 @@
 /** Gap kept between the menu and the viewport edges. */
 export const CONTEXT_MENU_MARGIN_PX = 12;
 
+/** Gap kept between a dropdown menu and the trigger it hangs off. */
+export const ANCHORED_MENU_GAP_PX = 6;
+
 // Only used when the menu can't be measured (never rendered / zero-size layout).
 const FALLBACK_MENU_WIDTH_PX = 220;
 const FALLBACK_MENU_HEIGHT_PX = 96;
@@ -16,6 +19,15 @@ function clamp(value, min, max) {
   // `min` wins when the menu is larger than the space it has to live in, so we
   // stay pinned to the top/left margin instead of drifting off screen.
   return Math.max(min, Math.min(value, max));
+}
+
+/**
+ * The one flip rule, shared by both menu kinds: stay on the preferred side when
+ * the menu fits there, flip when it doesn't, and when it fits on neither side
+ * take the roomier one so the clamp loses as little as possible.
+ */
+function shouldFlip(size, spacePreferred, spaceOther) {
+  return size > spacePreferred && (size <= spaceOther || spaceOther > spacePreferred);
 }
 
 /**
@@ -36,15 +48,12 @@ export function placeContextMenu({
   const spaceBelow = viewportHeight - margin - anchorY;
   const spaceAbove = anchorY - margin;
   // Prefer downward (the familiar direction); flip up only when the menu
-  // genuinely doesn't fit below. If it fits neither way, take the roomier side
-  // so the clamp below loses as little of the menu as possible.
-  const openAbove =
-    menuHeight > spaceBelow && (menuHeight <= spaceAbove || spaceAbove > spaceBelow);
+  // genuinely doesn't fit below.
+  const openAbove = shouldFlip(menuHeight, spaceBelow, spaceAbove);
 
   const spaceRight = viewportWidth - margin - anchorX;
   const spaceLeft = anchorX - margin;
-  const alignRight =
-    menuWidth > spaceRight && (menuWidth <= spaceLeft || spaceLeft > spaceRight);
+  const alignRight = shouldFlip(menuWidth, spaceRight, spaceLeft);
 
   const rawTop = openAbove ? anchorY - menuHeight : anchorY;
   const rawLeft = alignRight ? anchorX - menuWidth : anchorX;
@@ -54,6 +63,58 @@ export function placeContextMenu({
     top: clamp(rawTop, margin, viewportHeight - margin - menuHeight),
     placement: openAbove ? "above" : "below",
     alignment: alignRight ? "right" : "left",
+  };
+}
+
+/**
+ * Placement for a menu hanging off a TRIGGER BOX rather than a click point. Same
+ * flip rule as the context menus, plus `maxHeight` — the room actually available
+ * on the chosen side, which is what CSS could not express and why the Model list
+ * was capped at a flat 340px and still ran off the edge.
+ *
+ * @returns {{ left: number, top: number, maxHeight: number,
+ *             placement: "above"|"below", alignment: "left"|"right" }}
+ */
+export function placeAnchoredMenu({
+  gap = ANCHORED_MENU_GAP_PX,
+  margin = CONTEXT_MENU_MARGIN_PX,
+  menuHeight = 0,
+  menuWidth = 0,
+  triggerBottom = 0,
+  triggerLeft = 0,
+  triggerRight = 0,
+  triggerTop = 0,
+  viewportHeight = 0,
+  viewportWidth = 0,
+} = {}) {
+  // Space between the trigger's near edge and the viewport margin, on each side.
+  const spaceBelow = viewportHeight - margin - (triggerBottom + gap);
+  const spaceAbove = triggerTop - gap - margin;
+  const openAbove = shouldFlip(menuHeight, spaceBelow, spaceAbove);
+
+  // Negative space means the trigger itself is off-screen (mid-scroll, or a
+  // keyboard has shrunk the visual viewport). Zero keeps the menu degenerate but
+  // on-screen rather than inverted.
+  const available = Math.max(openAbove ? spaceAbove : spaceBelow, 0);
+  const height = Math.min(menuHeight, available);
+
+  // Left-align to the trigger, flip to right-aligned when that overflows.
+  const spaceRight = viewportWidth - margin - triggerLeft;
+  const spaceLeft = triggerRight - margin;
+  const alignRight = shouldFlip(menuWidth, spaceRight, spaceLeft);
+
+  const rawTop = openAbove ? triggerTop - gap - height : triggerBottom + gap;
+  const rawLeft = alignRight ? triggerRight - menuWidth : triggerLeft;
+
+  return {
+    alignment: alignRight ? "right" : "left",
+    // `Math.max(margin, …)` guards the case where the menu is wider/taller than
+    // the viewport itself: without it the clamp range inverts and `min` wins,
+    // putting the menu off the top-left corner.
+    left: clamp(rawLeft, margin, Math.max(margin, viewportWidth - margin - menuWidth)),
+    maxHeight: available,
+    placement: openAbove ? "above" : "below",
+    top: clamp(rawTop, margin, Math.max(margin, viewportHeight - margin - height)),
   };
 }
 
