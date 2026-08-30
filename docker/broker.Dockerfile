@@ -2,7 +2,15 @@ FROM node:25-bookworm AS frontend-build
 WORKDIR /app
 
 COPY package.json package-lock.json vite.config.js ./
+# `npm ci` runs the root package's `prepare` script, so the file it executes has
+# to exist here too. It no-ops outside a Git checkout. Copied file-scoped rather
+# than as the whole scripts/ dir to keep this layer's cache from busting on every
+# unrelated script change.
+COPY scripts/install-git-hooks.mjs ./scripts/
 COPY frontend ./frontend
+# frontend/shared/* re-exports from the private crate's frontend, so `frontend`
+# alone is not a self-contained build tree.
+COPY crates/sealwire-private/frontend ./crates/sealwire-private/frontend
 
 RUN npm ci && npm run build
 
