@@ -7,11 +7,10 @@ import React, {
 import { canApplyPatch } from "./file-change-actions.js";
 import {
   Virtualizer,
-  elementScroll,
   measureElement,
-  observeElementOffset,
   observeElementRect,
 } from "@tanstack/virtual-core";
+import { createTranscriptScrollAdjuster } from "./transcript-scroll-adjust.js";
 import { CHECK_SVG, COPY_SVG, FORK_SVG, SPARKLES_SVG } from "../svg.js";
 import { approvalKindLabel } from "./approval-labels.js";
 import { providerIconSvg } from "./provider-icons.js";
@@ -2494,6 +2493,14 @@ function useTranscriptVirtualizer(rows, enabled) {
   const scrollTargetRef = useRef(null);
   const [, forceUpdate] = useReducer((value) => value + 1, 0);
   const virtualizerRef = useRef(null);
+  // One adjuster per virtualizer: it carries the running `scrollAdjustments` total,
+  // and both the constructor and `setOptions` below must hand over the SAME pair or
+  // that total desynchronises from `virtual-core`'s.
+  const scrollAdjusterRef = useRef(null);
+  if (!scrollAdjusterRef.current) {
+    scrollAdjusterRef.current = createTranscriptScrollAdjuster();
+  }
+  const { scrollToFn, observeElementOffset } = scrollAdjusterRef.current;
   const scrollElement = findTranscriptScrollElement(scrollTargetRef.current);
   const scrollMargin = measureTranscriptScrollMargin(scrollTargetRef.current, scrollElement);
 
@@ -2507,7 +2514,7 @@ function useTranscriptVirtualizer(rows, enabled) {
       observeElementRect,
       overscan: TRANSCRIPT_VIRTUAL_OVERSCAN,
       scrollMargin,
-      scrollToFn: elementScroll,
+      scrollToFn,
       onChange: () => forceUpdate(),
     });
   }
@@ -2527,7 +2534,7 @@ function useTranscriptVirtualizer(rows, enabled) {
     observeElementRect,
     overscan: TRANSCRIPT_VIRTUAL_OVERSCAN,
     scrollMargin,
-    scrollToFn: elementScroll,
+    scrollToFn,
     onChange: () => forceUpdate(),
   });
 

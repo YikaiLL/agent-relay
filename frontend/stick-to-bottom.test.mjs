@@ -80,14 +80,59 @@ test("NOT interacting + stuck: an unattributed scroll is layout churn -> re-glue
   );
 });
 
-test("NOT interacting + not stuck: only re-stick once settled AT the bottom", () => {
+// `readerDriven` is what makes "settled AT the bottom" mean the READER settled there.
+// It is stamped by the follower on wheel/keydown, since neither raises `interacting`.
+test("NOT interacting + not stuck: only re-stick once the READER settles AT the bottom", () => {
   assert.equal(
-    classifyScrollIntent({ scrolledUp: false, distance: RESTICK_AT_BOTTOM_PX, interacting: false, stuck: false }),
+    classifyScrollIntent({
+      scrolledUp: false,
+      distance: RESTICK_AT_BOTTOM_PX,
+      interacting: false,
+      stuck: false,
+      readerDriven: true,
+    }),
     "stick"
   );
   assert.equal(
-    classifyScrollIntent({ scrolledUp: false, distance: 200, interacting: false, stuck: false }),
+    classifyScrollIntent({
+      scrolledUp: false,
+      distance: 200,
+      interacting: false,
+      stuck: false,
+      readerDriven: true,
+    }),
     "none"
+  );
+});
+
+// A scroll that merely LANDS at the bottom is not evidence the reader put it
+// there. The transcript has untagged programmatic writers — the TanStack
+// virtualizer corrects `scrollTop` when a measured row differs from the estimate,
+// and only the follower's OWN pins carry `selfScrollTop` — so "distance <= restick"
+// alone re-armed bottom-follow behind a reader who had just escaped. Require a
+// fresh reader gesture (wheel / keydown, stamped by the follower) as well.
+test("NOT interacting + not stuck: an untagged scroll landing at the bottom must not re-arm the follow", () => {
+  assert.equal(
+    classifyScrollIntent({
+      scrolledUp: false,
+      distance: 0,
+      interacting: false,
+      stuck: false,
+      readerDriven: false,
+    }),
+    "none"
+  );
+  // The reader wheeling back down to the bottom still re-sticks — wheel has no
+  // pointer-down, so `interacting` is false and this is the only path that re-locks.
+  assert.equal(
+    classifyScrollIntent({
+      scrolledUp: false,
+      distance: 0,
+      interacting: false,
+      stuck: false,
+      readerDriven: true,
+    }),
+    "stick"
   );
 });
 

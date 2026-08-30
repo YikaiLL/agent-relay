@@ -15,6 +15,13 @@ const h = React.createElement;
 // explicit "scroll to latest" button.
 export const RESTICK_AT_BOTTOM_PX = TRANSCRIPT_BOTTOM_FOLLOW_THRESHOLD_PX;
 
+// How long after a wheel/key gesture an untagged scroll still counts as the reader's.
+// This only has to outlive the gap between a gesture and the scroll event it causes —
+// momentum scrolling keeps emitting `wheel` while it coasts, so a long flick stays
+// attributed throughout.
+const READER_INTENT_MS = 300;
+const now = () => Date.now();
+
 // Programmatic transcript actions carry semantic intent. In particular,
 // `restore-thread` means the cached state explicitly recorded a reader who was
 // NOT following the bottom, so the follower must not reinterpret a nearby
@@ -45,14 +52,26 @@ export function classifyTranscriptScrollAction({ kind } = {}) {
 //     or layout churn (snapshot re-render / virtualizer re-measure). While stuck
 //     we re-glue to the bottom (churn must never un-stick us); otherwise we only
 //     re-stick once the reader has settled back AT the bottom.
-export function classifyScrollIntent({ scrolledUp, distance, interacting, stuck, restickPx = RESTICK_AT_BOTTOM_PX }) {
+//   readerDriven = a wheel or key gesture landed on the scroller just now, so an
+//     untagged scroll can be attributed to the reader. Without it, "landed at the
+//     bottom" is NOT evidence the reader put it there: the virtualizer corrects
+//     scrollTop on every row re-measure and those writes carry no tag, so they used
+//     to re-arm the follow behind a reader who had just escaped.
+export function classifyScrollIntent({
+  scrolledUp,
+  distance,
+  interacting,
+  stuck,
+  readerDriven = false,
+  restickPx = RESTICK_AT_BOTTOM_PX,
+}) {
   if (interacting) {
     if (scrolledUp) return "unstick";
     if (distance <= restickPx) return "stick";
     return "none";
   }
   if (stuck) return "pin";
-  if (distance <= restickPx) return "stick";
+  if (readerDriven && distance <= restickPx) return "stick";
   return "none";
 }
 
@@ -115,6 +134,10 @@ export function StickToBottomFollower() {
     let touchActive = false;
     let mouseActive = false;
     const interacting = () => touchActive || mouseActive;
+    // When the reader last wheeled/keyed on the scroller. Untagged scrolls outside this
+    // window are someone else's writes (virtualizer size corrections, snapshot churn)
+    // and must not re-arm the follow.
+    let readerScrollAt = -Infinity;
 
     const distance = () =>
       Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
@@ -151,11 +174,23 @@ export function StickToBottomFollower() {
       observedContentRef.current = content;
     }
 
+    // Wheel and keys are reader gestures that never raise `interacting` (no pointer is
+    // down), so they are stamped instead. Momentum scrolling keeps emitting `wheel`
+    // while it coasts, so a flick down to the bottom stays attributed to the reader
+    // for as long as it is still moving.
+    const stampReader = () => {
+      readerScrollAt = now();
+    };
+    const readerDriven = () => now() - readerScrollAt <= READER_INTENT_MS;
     const onWheel = (event) => {
+      stampReader();
       // Wheel does not go through the pointer-down path, so escape here directly.
       if (!event.ctrlKey && (event.deltaY || 0) < 0) {
         unstick();
       }
+    };
+    const onKeyDown = () => {
+      stampReader();
     };
     const onScroll = () => {
       const sp = scroller.scrollTop;
@@ -172,6 +207,7 @@ export function StickToBottomFollower() {
         distance: distance(),
         interacting: interacting(),
         stuck,
+        readerDriven: readerDriven(),
       });
       if (action === "unstick") unstick();
       else if (action === "stick") stick();
@@ -209,6 +245,7 @@ export function StickToBottomFollower() {
     };
 
     scroller.addEventListener("wheel", onWheel, { passive: true });
+    scroller.addEventListener("keydown", onKeyDown, { passive: true });
     scroller.addEventListener("scroll", onScroll, { passive: true });
     scroller.addEventListener("touchstart", onTouchActive, { passive: true });
     scroller.addEventListener("touchmove", onTouchActive, { passive: true });
@@ -224,6 +261,7 @@ export function StickToBottomFollower() {
       resizeObserverRef.current = null;
       observedContentRef.current = null;
       scroller.removeEventListener("wheel", onWheel);
+      scroller.removeEventListener("keydown", onKeyDown);
       scroller.removeEventListener("scroll", onScroll);
       scroller.removeEventListener("touchstart", onTouchActive);
       scroller.removeEventListener("touchmove", onTouchActive);
