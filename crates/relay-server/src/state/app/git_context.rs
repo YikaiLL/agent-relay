@@ -751,16 +751,32 @@ mod tests {
 
     // The read cap bounds READING, not WALKING: on 18,000 untracked files it saved 19%
     // (42ms of 52ms), not a bound. Only a clock is. Timing out reports NO count.
+    //
+    // The fixture has to be big for this to mean anything, which the budget parameter
+    // alone cannot buy. `tokio::time::timeout` returns `Ok` whenever the inner future
+    // is ready first — however small the budget — and tokio's timer resolution is
+    // milliseconds, so `from_nanos(1)` really means "the first tick". A one-file tree
+    // finishes `git status` inside that tick on a fast filesystem, and then the
+    // give-up path is never taken: this test asserted `None` and got `Some((1,false))`
+    // on CI while passing locally, which is just the two sides of a race swapping
+    // places. Enough untracked files makes the walk unambiguously the slower one.
     #[tokio::test]
     async fn a_scan_that_outruns_its_budget_reports_no_count() {
         let dir = TempDir::new().expect("tmp");
         let cwd = init_repo(dir.path()).await;
-        std::fs::write(std::path::Path::new(&cwd).join("dirty.txt"), "x\n").expect("write");
+        let root = std::path::Path::new(&cwd);
+        for index in 0..2_000 {
+            std::fs::write(root.join(format!("dirty-{index}.txt")), "x\n").expect("write");
+        }
         let workspace = TrustedWorkspace::granted_for_test(&cwd).expect("live workspace");
 
         // Sanity: this tree IS measurable given a normal budget, so a `None` below is
-        // the budget talking and not a broken fixture.
-        assert_eq!(count_changed_files(&workspace).await, Some((1, false)));
+        // the budget talking and not a broken fixture. The count itself is not the
+        // point here (the read cap may report it as a floor), only that one exists.
+        assert!(
+            count_changed_files(&workspace).await.is_some(),
+            "the fixture must be measurable within the normal budget"
+        );
 
         assert_eq!(
             count_changed_files_within(&workspace, std::time::Duration::from_nanos(1)).await,
