@@ -392,6 +392,12 @@ async function main() {
   const codexHomeDir = await prepareSeededCodexHome("agent-relay-mobile-menus-codex-", {
     requireAuth: false,
   });
+  // Claude is the other half of the same problem, and it has no CODEX_HOME of its
+  // own: it reads `~/.claude/projects` off HOME. Pin HOME at an empty directory so
+  // the picker sees the same (empty) history everywhere. A clean CI runner has
+  // neither provider installed, so this is what CI already looks like — it is the
+  // developer machine that was the outlier.
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-relay-mobile-menus-home-"));
 
   const relay = startLocalRelay({
     codexHomeDir,
@@ -401,6 +407,7 @@ async function main() {
     extraEnv: {
       AGENT_PROVIDERS: "fake,codex,claude",
       FAKE_PROVIDER_MODEL_COUNT: "12",
+      HOME: homeDir,
     },
     relayPort,
     relayStatePath: path.join(stateDir, "session.json"),
@@ -571,6 +578,7 @@ async function main() {
     await fs.rm(stateDir, { force: true, recursive: true }).catch(() => {});
     await fs.rm(workspaceDir, { force: true, recursive: true }).catch(() => {});
     await fs.rm(codexHomeDir, { force: true, recursive: true }).catch(() => {});
+    await fs.rm(homeDir, { force: true, recursive: true }).catch(() => {});
   }
 }
 
