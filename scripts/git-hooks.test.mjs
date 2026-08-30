@@ -27,6 +27,37 @@ test("npm prepare installs the tracked hook directory", async () => {
   }
 });
 
+// npm runs `prepare` during `npm pack`, and `npm pack --json` promises its stdout is
+// JSON the caller can parse. Anything a lifecycle script prints there lands in the
+// middle of that JSON. npm 10 interleaves the two streams, npm 11 does not — so
+// printing to stdout broke `npm test` on CI (Node 22) while passing locally on a
+// newer Node, which is a bad way to find this out. Diagnostics go to stderr.
+test("the hook installer keeps stdout clean for `npm pack --json`", async () => {
+  const workdir = await mkdtemp(path.join(os.tmpdir(), "sealwire-hook-stdout-"));
+  tempDirs.push(workdir);
+  await mkdir(path.join(workdir, "scripts"), { recursive: true });
+  await copyFile(
+    path.join(repoRoot, "scripts/install-git-hooks.mjs"),
+    path.join(workdir, "scripts/install-git-hooks.mjs")
+  );
+  // A real checkout, so the installer runs its full path instead of the
+  // "no git here, nothing to do" early exit.
+  assert.equal(git(workdir, "init", "-q").status, 0);
+
+  const run = spawnSync(
+    process.execPath,
+    [path.join(workdir, "scripts/install-git-hooks.mjs")],
+    { cwd: workdir, encoding: "utf8" }
+  );
+
+  assert.equal(run.status, 0, `installer failed:\n${run.stderr}`);
+  assert.equal(
+    run.stdout,
+    "",
+    `the installer must report on stderr; stdout would corrupt \`npm pack --json\`. Got: ${run.stdout}`
+  );
+});
+
 test("a normal git commit is refused while the private crate is swapped in", async () => {
   const workdir = await mkdtemp(path.join(os.tmpdir(), "sealwire-hook-"));
   tempDirs.push(workdir);

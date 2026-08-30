@@ -24,4 +24,7 @@ if (configured.status !== 0) {
   throw new Error(configured.stderr || "failed to configure the repository's Git hooks");
 }
 
-console.log(`git hooks: ${hooksPath}`);
+// stderr, not stdout: npm runs this as `prepare` during `npm pack`, and
+// `npm pack --json` writes JSON to stdout that callers parse. A line printed there
+// lands inside that JSON. Still visible to a human either way.
+console.error(`git hooks: ${hooksPath}`);
