@@ -83,6 +83,32 @@ fn a_ledger_from_a_newer_build_is_refused_rather_than_downgraded() {
     assert_eq!(version, 99, "the newer schema stamp must not be rewritten");
 }
 
+/// The constant and the migration chain must agree.
+///
+/// `migrate` refuses any file whose `user_version` is above
+/// `LEDGER_SCHEMA_VERSION`. So if a numbered migration stamps HIGHER than the
+/// constant, the first open migrates the file and every open after it refuses
+/// the very file this build just wrote — the ledger silently disables itself on
+/// the second launch, and the only symptom a user sees is token usage quietly
+/// staying at zero.
+#[test]
+fn the_schema_version_constant_matches_what_the_migrations_stamp() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("sealwire.db");
+    assert!(UsageStore::open(&path).is_enabled(), "a fresh ledger opens");
+
+    let conn = Connection::open(&path).expect("reopen");
+    let stamped: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read version");
+    assert_eq!(
+        stamped, LEDGER_SCHEMA_VERSION,
+        "a fresh ledger stamped user_version {stamped}, but this build refuses \
+         anything above {LEDGER_SCHEMA_VERSION}. Bump LEDGER_SCHEMA_VERSION to \
+         match the highest numbered migration."
+    );
+}
+
 /// Opening the same path twice must be a no-op the second time, not a reset.
 #[test]
 fn reopening_an_existing_ledger_preserves_its_rows() {

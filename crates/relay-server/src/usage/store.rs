@@ -14,7 +14,7 @@ use super::TokenUsage;
 
 /// Bumped only by adding a numbered migration below. `user_version` is a plain
 /// integer SQLite keeps in the file header, so this needs no table of its own.
-const LEDGER_SCHEMA_VERSION: i64 = 5;
+const LEDGER_SCHEMA_VERSION: i64 = 6;
 
 /// A single billable observation, ready to be written.
 #[derive(Debug, Clone, Default)]
