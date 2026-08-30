@@ -187,6 +187,15 @@ export function useAnchoredMenu({ menuRef, open, triggerRef }) {
     // to its content.
     menu.style.right = "auto";
     menu.style.bottom = "auto";
+    // The cap the menu sets for ITSELF, read with the inline value cleared so the
+    // stylesheet's own rule shows through. A panel that caps its height and scrolls
+    // inside (the workspace picker is 420px over a scrolling row list) means it, so
+    // placement may only shrink it to fit — never grant it more than it asked for.
+    // Without this the measurement below, which must run uncapped, is also the last
+    // word: the cap is cleared and never restored.
+    menu.style.maxHeight = "";
+    const declaredMaxHeight = Number.parseFloat(view.getComputedStyle(menu).maxHeight);
+    const selfCap = Number.isFinite(declaredMaxHeight) ? declaredMaxHeight : Infinity;
     menu.style.maxHeight = "none";
     menu.style.maxWidth = "none";
     // Park at the containing block's origin. The rect this produces does double
@@ -209,7 +218,10 @@ export function useAnchoredMenu({ menuRef, open, triggerRef }) {
     const bounds = placementBounds(view, menu);
 
     const placement = placeAnchoredMenu({
-      menuHeight: originBox.height,
+      // Capped, so placement decides where a menu of the size it will ACTUALLY be
+      // fits. Feeding it the uncapped height makes it believe a self-capping menu
+      // is far too tall for the space below its trigger, and move it away.
+      menuHeight: Math.min(originBox.height, selfCap),
       menuWidth: originBox.width,
       triggerBottom: triggerBox.bottom - bounds.top,
       triggerLeft: triggerBox.left - bounds.left,
@@ -222,7 +234,7 @@ export function useAnchoredMenu({ menuRef, open, triggerRef }) {
     // Bounds coordinates → layout viewport → containing block.
     menu.style.left = `${Math.round(placement.left + bounds.left - originBox.left)}px`;
     menu.style.top = `${Math.round(placement.top + bounds.top - originBox.top)}px`;
-    menu.style.maxHeight = `${Math.round(placement.maxHeight)}px`;
+    menu.style.maxHeight = `${Math.round(Math.min(placement.maxHeight, selfCap))}px`;
     // A narrow screen is where the menu's own min-width would push it past the
     // edge; cap it here rather than duplicating the margin in CSS.
     menu.style.maxWidth = `${Math.round(bounds.width - CONTEXT_MENU_MARGIN_PX * 2)}px`;
