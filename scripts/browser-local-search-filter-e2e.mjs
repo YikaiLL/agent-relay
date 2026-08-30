@@ -291,6 +291,14 @@ async function main() {
   });
   await waitForHealth(`http://127.0.0.1:${relayPort}/api/health`);
 
+  // Step 9 asks for a real review, and a review collects a workspace diff. Starting an
+  // agent in a directory is a deliberate local action but not permission for ambient
+  // git probes, so without an explicit grant the job dies on "is not a granted
+  // workspace" — a TERMINAL status, which means the parent never enters the Reviewing
+  // bucket and the assertion reads as "the dot never appeared". Mirror the local UI's
+  // trust step, exactly as `review-recap-modes-e2e.mjs` and `cwd-drift-e2e.mjs` do.
+  await api(relayPort, "POST", "/api/workspace/trust", { cwd: workspace });
+
   let browser;
   let context;
   let page;
