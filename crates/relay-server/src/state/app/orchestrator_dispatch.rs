@@ -100,18 +100,20 @@ impl AppState {
         }
     }
 
-    /// The tools worth offering right now, ready to hand to a model.
+    /// Every tool, ready to hand to a model.
     ///
-    /// Gated exactly as `call_orchestrator_tool` is. The two MUST agree: a list
-    /// that advertises what every call refuses is worse than an empty one,
-    /// because the model has no way to learn the difference except by trying —
-    /// which is the retry loop the availability filter exists to prevent.
+    /// Deliberately not gated on workspace state. The model fetches this once
+    /// per session and is never told it changed, so anything left out here is
+    /// out for the whole session — which used to hide `revise_proposal` from
+    /// every session that began before a task was staged, i.e. all of them.
+    /// `call_orchestrator_tool` still refuses what the workspace cannot serve,
+    /// and says why, which is a thing the model can act on. An absent tool is
+    /// not.
     pub async fn list_orchestrator_tools(&self) -> Vec<OrchestratorToolView> {
         if !self.beta_features_enabled().await {
             return Vec::new();
         }
-        let facts = self.orchestrator_tool_facts().await;
-        orchestrator_tools::available_tools(&facts)
+        orchestrator_tools::available_tools()
             .into_iter()
             .map(|spec| OrchestratorToolView {
                 name: spec.name.to_string(),
@@ -131,16 +133,14 @@ impl AppState {
         if !self.beta_features_enabled().await {
             return Err(super::team::TASKS_LOCKED_MESSAGE.to_string());
         }
-        // Re-check availability: the model's list may be a turn old.
+        if orchestrator_tools::spec_for(name).is_none() {
+            return Err(format!("no such tool: {name}"));
+        }
+        // Every tool is advertised, so this is where a workspace that cannot
+        // serve the call says so — naming what is missing, not just refusing.
         let facts = self.orchestrator_tool_facts().await;
-        if !orchestrator_tools::available_tools(&facts)
-            .iter()
-            .any(|spec| spec.name == name)
-        {
-            return Err(match orchestrator_tools::spec_for(name) {
-                Some(_) => format!("{name} is not available right now"),
-                None => format!("no such tool: {name}"),
-            });
+        if let Some(reason) = orchestrator_tools::blocked_reason(name, &facts) {
+            return Err(format!("{name}: {reason}"));
         }
 
         match orchestrator_tools::parse_call(name, args)? {
@@ -427,15 +427,16 @@ mod tests {
         assert_eq!(snap.orchestrator_proposals[0].title, "Add a parser");
     }
 
-    /// Availability is re-checked at CALL time, not only at list time: the list a
-    /// model holds was assembled at least a turn ago.
+    /// Every tool is on offer, so CALL time is the only gate left — and a
+    /// refusal has to name what is missing. "Not available" reads as a blip the
+    /// model should retry; "no run is going" tells it to go look at the
+    /// workspace instead.
     #[tokio::test]
-    async fn a_tool_that_is_no_longer_available_is_refused_by_name() {
+    async fn a_tool_the_workspace_cannot_serve_is_refused_with_the_reason() {
         let project = TempDir::new().expect("tempdir");
         let cwd = project.path().to_string_lossy().to_string();
         let app = ready_app(&cwd).await;
 
-        // Nothing is running, so control_run is not on offer.
         let err = app
             .call_orchestrator_tool(
                 "control_run",
@@ -444,7 +445,8 @@ mod tests {
             )
             .await
             .expect_err("no runs, no control");
-        assert!(err.contains("not available"), "{err}");
+        assert!(err.contains("control_run"), "{err}");
+        assert!(err.contains("no run is going"), "{err}");
     }
 
     #[tokio::test]
@@ -460,24 +462,35 @@ mod tests {
         assert!(err.contains("no such tool"), "{err}");
     }
 
-    /// A staged card makes `revise_proposal` appear; an empty workspace does not
-    /// offer it, because there would be no id to name.
+    /// The reported bug, end to end. `revise_proposal` used to appear only once
+    /// a task was already staged — but the model reads the tool list when the
+    /// session opens, before it has staged anything, and is never told the list
+    /// grew. So the one tool it needs the moment after proposing was the one it
+    /// never had, and it told the user so, correctly.
+    ///
+    /// It must be on offer BEFORE the first task exists. Calling it that early
+    /// is still refused — with a reason, which the model can act on.
     #[tokio::test]
-    async fn the_offered_tools_track_what_the_workspace_can_answer() {
+    async fn revise_proposal_is_offered_before_there_is_anything_to_revise() {
         let project = TempDir::new().expect("tempdir");
         let cwd = project.path().to_string_lossy().to_string();
         let app = ready_app(&cwd).await;
 
-        let before: Vec<String> = app
-            .list_orchestrator_tools()
-            .await
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
+        let before = offered(&app).await;
         assert!(
-            !before.contains(&"revise_proposal".to_string()),
-            "{before:?}"
+            before.contains(&"revise_proposal".to_string()),
+            "a session that opens with nothing staged is every session: {before:?}"
         );
+
+        let err = app
+            .call_orchestrator_tool(
+                "revise_proposal",
+                &json!({ "proposal_id": "nope", "title": "t" }),
+                Some("device-1".to_string()),
+            )
+            .await
+            .expect_err("nothing staged yet");
+        assert!(err.contains("nothing to change"), "{err}");
 
         app.call_orchestrator_tool(
             "propose_task",
@@ -487,13 +500,12 @@ mod tests {
         .await
         .expect("propose");
 
-        let after: Vec<String> = app
-            .list_orchestrator_tools()
-            .await
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
-        assert!(after.contains(&"revise_proposal".to_string()), "{after:?}");
+        let after = offered(&app).await;
+        assert_eq!(
+            before, after,
+            "the list must not move when the workspace does — the model cached \
+it a turn ago"
+        );
     }
 
     /// A refusal must reach the model as a readable result, not as a transport
@@ -715,11 +727,9 @@ mod tests {
         let app = ready_app(&cwd).await;
         park_a_seat(&app, &cwd, "run-1", "req-1").await;
 
-        let names = offered(&app).await;
-        assert!(
-            names.contains(&"pending_questions".to_string()),
-            "{names:?}"
-        );
+        app.call_orchestrator_tool("pending_questions", &json!({}), Some("d".to_string()))
+            .await
+            .expect("a live question can be read");
 
         {
             let mut relay = app.relay.write().await;
@@ -728,15 +738,23 @@ mod tests {
             });
         }
 
-        let names = offered(&app).await;
-        assert!(
-            !names.contains(&"pending_questions".to_string()),
-            "the run is gone; there is nothing to read: {names:?}"
-        );
-        assert!(
-            !names.contains(&"respond_to_agent".to_string()),
-            "answering would steer a drained thread: {names:?}"
-        );
+        // Both tools stay on offer — the list is fixed — so the JOIN now has to
+        // hold at call time, which is the only place it still can.
+        let err = app
+            .call_orchestrator_tool("pending_questions", &json!({}), Some("d".to_string()))
+            .await
+            .expect_err("the run is gone; there is nothing to read");
+        assert!(err.contains("nothing is waiting"), "{err}");
+
+        let err = app
+            .call_orchestrator_tool(
+                "respond_to_agent",
+                &json!({ "request_id": "req-1", "answers": { "Which?": "yes" } }),
+                Some("d".to_string()),
+            )
+            .await
+            .expect_err("answering would steer a drained thread");
+        assert!(err.contains("nothing is waiting"), "{err}");
     }
 
     /// The status line and the question list must not be able to disagree: one

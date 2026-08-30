@@ -7,13 +7,20 @@
 //!
 //! 1. **No tool starts work.** Propose → card → user confirms. No `start_task`.
 //!    [`Effect::Acts`] is only for release/unblock (`ACTING_TOOLS`).
-//! 2. **Don't offer useless tools.** `available_tools` filters by live workspace
-//!    facts so schemas aren't burned on empty answers.
+//! 2. **Offer every tool, always.** The model reads the list once per session
+//!    and is never told it changed, so a list derived from live facts freezes
+//!    at connect time — stranding it without `revise_proposal`, `control_run`
+//!    and the question tools, none of which are relevant until after the
+//!    session has started. [`blocked_reason`] carries the gating instead: the
+//!    tool is visible, and a call the workspace cannot serve is refused with
+//!    the reason. A fixed list is also the cheap one — tools render at the
+//!    front of every request, so a list that changes re-prices the whole
+//!    conversation, while a list that never changes is paid for once.
 
 use serde_json::{json, Map, Value};
 
-/// Same cap the proposals module enforces — imported so the filter and the
-/// backend cannot drift (past the cap, `propose_task` is not offered).
+/// Same cap the proposals module enforces — imported so the refusal and the
+/// backend cannot drift (past the cap, `propose_task` is refused).
 pub(crate) use crate::state::app::orchestrator_proposals::MAX_PENDING_PROPOSALS;
 
 /// What calling a tool does to the world.
@@ -237,20 +244,35 @@ pub(crate) struct WorkspaceFacts {
     pub(crate) parked_questions: usize,
 }
 
-/// The tools worth offering right now.
-pub(crate) fn available_tools(facts: &WorkspaceFacts) -> Vec<&'static ToolSpec> {
-    TOOLS
-        .iter()
-        .filter(|tool| match tool.name {
-            "propose_task" => facts.pending_proposals < MAX_PENDING_PROPOSALS,
-            "list_teams" => facts.known_teams > 0,
-            "task_status" => facts.known_runs > 0,
-            "control_run" => facts.active_runs > 0,
-            "pending_questions" | "respond_to_agent" => facts.parked_questions > 0,
-            "revise_proposal" => facts.pending_proposals > 0,
-            _ => true,
-        })
-        .collect()
+/// Every tool, whatever the workspace looks like. Deliberately takes no facts:
+/// the list is what the model caches for the session, so it must not be able
+/// to depend on state that has moved on by the time it calls.
+pub(crate) fn available_tools() -> Vec<&'static ToolSpec> {
+    TOOLS.iter().collect()
+}
+
+/// Why this tool cannot run right now, or `None` if it can.
+///
+/// The model is told this verbatim when it calls, so each reason must say what
+/// is missing — a bare "not available" teaches it to retry rather than to pick
+/// a different tool or ask the user.
+pub(crate) fn blocked_reason(name: &str, facts: &WorkspaceFacts) -> Option<&'static str> {
+    match name {
+        "propose_task" if facts.pending_proposals >= MAX_PENDING_PROPOSALS => Some(
+            "too many tasks are already waiting for the user; they have to confirm or \
+dismiss one before you can stage another",
+        ),
+        "revise_proposal" if facts.pending_proposals == 0 => {
+            Some("no task is waiting for the user, so there is nothing to change")
+        }
+        "list_teams" if facts.known_teams == 0 => Some("no teams are defined"),
+        "task_status" if facts.known_runs == 0 => Some("nothing has run yet"),
+        "control_run" if facts.active_runs == 0 => Some("no run is going"),
+        "pending_questions" | "respond_to_agent" if facts.parked_questions == 0 => {
+            Some("nothing is waiting on an answer")
+        }
+        _ => None,
+    }
 }
 
 /// Validated tool call (parsed args; callers can be total).
@@ -546,23 +568,46 @@ that it is acting on a CARD, not on the task",
         assert!(err.contains("no such tool"), "{err}");
     }
 
-    /// Don't offer tools the workspace cannot answer.
+    /// The Orchestrator's tool list is fetched once per session, and nothing
+    /// tells the model when it changes. Deriving the list from live facts
+    /// therefore froze it at whatever the workspace looked like at connect
+    /// time: `revise_proposal` is gated on a pending proposal, so a session
+    /// that started with none never saw it — and the Orchestrator correctly
+    /// told the user it had no way to change a staged card. Same for
+    /// `control_run` and the question tools, which only become relevant after
+    /// work is running. Advertising is now unconditional; [`blocked_reason`] is
+    /// what refuses a call the workspace cannot serve.
     #[test]
-    fn a_workspace_that_has_never_run_a_task_is_not_offered_task_status() {
+    fn every_tool_is_offered_whatever_the_workspace_looks_like() {
+        let names: Vec<_> = available_tools().iter().map(|tool| tool.name).collect();
+        assert_eq!(names.len(), TOOLS.len(), "{names:?}");
+        // Named rather than counted: these four are the ones a state-derived
+        // list drops, because none of them is reachable in the workspace the
+        // session opens in.
+        for late in [
+            "revise_proposal",
+            "control_run",
+            "pending_questions",
+            "respond_to_agent",
+        ] {
+            assert!(
+                names.contains(&late),
+                "{late} only becomes useful after the session has started, so a \
+list built at connect time is exactly when it goes missing: {names:?}"
+            );
+        }
+    }
+
+    /// Visible but refused: the workspace cannot answer it yet.
+    #[test]
+    fn a_workspace_that_has_never_run_a_task_cannot_be_asked_for_status() {
         let facts = WorkspaceFacts {
             known_teams: 3,
-            active_runs: 0,
-            known_runs: 0,
-            pending_proposals: 0,
-            parked_questions: 0,
+            ..Default::default()
         };
-        let names: Vec<_> = available_tools(&facts)
-            .iter()
-            .map(|tool| tool.name)
-            .collect();
-        assert!(names.contains(&"propose_task"));
-        assert!(names.contains(&"list_teams"));
-        assert!(!names.contains(&"task_status"), "{names:?}");
+        assert!(blocked_reason("propose_task", &facts).is_none());
+        assert!(blocked_reason("list_teams", &facts).is_none());
+        assert!(blocked_reason("task_status", &facts).is_some());
     }
 
     #[test]
@@ -570,17 +615,11 @@ that it is acting on a CARD, not on the task",
         // task_status follows known_runs; control_run needs active_runs.
         let facts = WorkspaceFacts {
             known_teams: 1,
-            active_runs: 0,
             known_runs: 2,
-            pending_proposals: 0,
-            parked_questions: 0,
+            ..Default::default()
         };
-        let names: Vec<_> = available_tools(&facts)
-            .iter()
-            .map(|tool| tool.name)
-            .collect();
-        assert!(names.contains(&"task_status"), "{names:?}");
-        assert!(!names.contains(&"control_run"), "{names:?}");
+        assert!(blocked_reason("task_status", &facts).is_none());
+        assert!(blocked_reason("control_run", &facts).is_some());
     }
 
     #[test]
@@ -590,66 +629,91 @@ that it is acting on a CARD, not on the task",
             known_teams: 1,
             active_runs: 1,
             known_runs: 1,
-            pending_proposals: 0,
             parked_questions: 1,
+            ..Default::default()
         };
-        let names: Vec<_> = available_tools(&facts)
-            .iter()
-            .map(|tool| tool.name)
-            .collect();
-        assert!(names.contains(&"respond_to_agent"), "{names:?}");
+        assert!(blocked_reason("respond_to_agent", &facts).is_none());
         assert!(
-            names.contains(&"pending_questions"),
-            "the tool that answers is useless without the one that reads: {names:?}"
+            blocked_reason("pending_questions", &facts).is_none(),
+            "the tool that answers is useless without the one that reads"
         );
     }
 
     #[test]
-    fn nothing_parked_offers_neither_question_tool() {
+    fn nothing_parked_refuses_both_question_tools() {
         let facts = WorkspaceFacts {
             known_teams: 1,
             active_runs: 1,
             known_runs: 1,
-            pending_proposals: 0,
-            parked_questions: 0,
+            ..Default::default()
         };
-        let names: Vec<_> = available_tools(&facts)
-            .iter()
-            .map(|tool| tool.name)
-            .collect();
-        assert!(!names.contains(&"pending_questions"), "{names:?}");
-        assert!(!names.contains(&"respond_to_agent"), "{names:?}");
+        assert!(blocked_reason("pending_questions", &facts).is_some());
+        assert!(blocked_reason("respond_to_agent", &facts).is_some());
     }
 
     #[test]
-    fn a_full_proposal_queue_stops_offering_to_propose() {
+    fn a_full_proposal_queue_refuses_another_task() {
         let facts = WorkspaceFacts {
             known_teams: 1,
             active_runs: 1,
             known_runs: 1,
             pending_proposals: MAX_PENDING_PROPOSALS,
-            parked_questions: 0,
+            ..Default::default()
         };
-        let names: Vec<_> = available_tools(&facts)
-            .iter()
-            .map(|tool| tool.name)
-            .collect();
+        assert!(blocked_reason("propose_task", &facts).is_some());
+        assert!(blocked_reason("task_status", &facts).is_none());
         assert!(
-            !names.contains(&"propose_task"),
-            "a tool that can only fail teaches the model to retry: {names:?}"
+            blocked_reason("revise_proposal", &facts).is_none(),
+            "a queue at the cap is exactly when the model needs to change a \
+staged task rather than stage a new one"
         );
-        assert!(names.contains(&"task_status"));
     }
 
     #[test]
     fn a_bare_workspace_still_offers_a_way_in() {
         // Nothing running, no teams loaded yet: the Orchestrator must still be able
         // to stage a task, or its first useful act is unreachable.
-        let names: Vec<_> = available_tools(&WorkspaceFacts::default())
-            .iter()
-            .map(|tool| tool.name)
-            .collect();
-        assert_eq!(names, vec!["propose_task"]);
+        assert!(blocked_reason("propose_task", &WorkspaceFacts::default()).is_none());
+    }
+
+    /// A refusal has to name what is missing, or the model reads it as a
+    /// transient failure and calls again.
+    #[test]
+    fn a_refusal_says_what_the_workspace_is_missing() {
+        let bare = WorkspaceFacts::default();
+        for tool in TOOLS {
+            let Some(reason) = blocked_reason(tool.name, &bare) else {
+                continue;
+            };
+            assert!(
+                !reason.is_empty() && !reason.contains("not available"),
+                "{} is refused with '{reason}' — say what is missing, not that \
+it failed",
+                tool.name
+            );
+        }
+    }
+
+    /// Reasons are only paid for on a refusal, but they are still read by a
+    /// model mid-turn; a paragraph buries the one fact that matters.
+    #[test]
+    fn a_refusal_stays_short_enough_to_read() {
+        let busy = WorkspaceFacts {
+            pending_proposals: MAX_PENDING_PROPOSALS,
+            ..Default::default()
+        };
+        for facts in [WorkspaceFacts::default(), busy] {
+            for tool in TOOLS {
+                if let Some(reason) = blocked_reason(tool.name, &facts) {
+                    assert!(
+                        reason.len() <= 160,
+                        "{}'s refusal is {} chars",
+                        tool.name,
+                        reason.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
