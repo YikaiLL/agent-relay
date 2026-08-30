@@ -216,12 +216,21 @@ jobs:
       # through /api/session/review — `recap` (drives a recap turn) and
       # `last_message` (skips it, briefs with the author's last message) — asserting
       # the recap turn's presence/absence and the reviewer's briefing source.
+      # `continue-on-error` + a gate at the end of the job, so one failing e2e does
+      # not hide the others. These three drive separate surfaces and share nothing
+      # but the relay binary; stopping at the first meant each red CI round named
+      # exactly one of them. The job still fails — see "Fail if any e2e failed".
       - name: Review recap-modes e2e
+        id: e2e_recap
+        continue-on-error: true
         run: npm run test:review-recap-modes
 
       # Session workspace identity over HTTP: birth in a linked worktree must keep
       # Changes + review on that tree, and pin/unpin must move Diff without a browser.
       - name: Cwd-drift worktree e2e
+        id: e2e_cwd_drift
+        if: always()
+        continue-on-error: true
         run: CWD_DRIFT_E2E_SKIP_BUILD=1 npm run test:cwd-drift
 
       # Same shape for the Task team: the real relay binary, the fake provider, a
@@ -264,6 +273,9 @@ jobs:
         run: echo "::warning::Could not read the private crate, so the task-team e2e ran against the public stub and skipped itself. Read the failed step above — the mint step's inputs, the RELAY_PRIVATE_APP_* secrets, or the app's installation on sealwire-private."
 
       - name: Task team e2e
+        id: e2e_task_team
+        if: always()
+        continue-on-error: true
         env:
           RELAY_PRIVATE_PATH: ${{ github.workspace }}/.private
         run: |
@@ -273,6 +285,21 @@ jobs:
           else
             npm run test:task-team
           fi
+
+      # The job's verdict. Without this every e2e above is advisory, since
+      # `continue-on-error` makes a failed step stop counting.
+      - name: Fail if any e2e failed
+        if: always()
+        run: |
+          failed=""
+          [ "${{ steps.e2e_recap.outcome }}" = "failure" ] && failed="$failed review-recap-modes"
+          [ "${{ steps.e2e_cwd_drift.outcome }}" = "failure" ] && failed="$failed cwd-drift"
+          [ "${{ steps.e2e_task_team.outcome }}" = "failure" ] && failed="$failed task-team"
+          if [ -n "$failed" ]; then
+            echo "::error::relay-http-e2e failures:$failed"
+            exit 1
+          fi
+          echo "all relay-http e2e scenarios passed"
 
   browser-smoke:
     name: browser-page-smoke
