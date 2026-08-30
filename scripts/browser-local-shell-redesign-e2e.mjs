@@ -222,17 +222,30 @@ async function run() {
         // ids that would collide the moment remote mounts it too.
         hasSessions: !!r?.querySelector('[data-destination="sessions"]'),
         hasTasks: !!r?.querySelector('[data-destination="tasks"]'),
+        hasUsage: !!r?.querySelector('[data-destination="usage"]'),
         hasGear: !!r?.querySelector("#icon-rail-settings"),
         buttons: r ? r.querySelectorAll("button").length : 0,
       };
     });
     assert.ok(rail.present && rail.hasLogo && rail.hasGear, `icon rail: ${JSON.stringify(rail)}`);
     assert.equal(rail.hasHome, false, `the rail's Projects folder is retired: ${JSON.stringify(rail)}`);
+    // Collapsed, the rail IS the whole nav, so it has to offer every destination —
+    // a subset strands the ones it leaves out, which is the bug the Sessions button
+    // was added to fix. `usage` joined `sessions` and `tasks` as a third destination
+    // (see SIDEBAR_NAV_DESTINATIONS) and this had not caught up: it checked two and
+    // then pinned the count at three, so the new one was both unasserted and, via the
+    // count, actively refused.
     assert.ok(
-      rail.hasSessions && rail.hasTasks,
-      `collapsed, the rail is the whole nav — it needs both destinations: ${JSON.stringify(rail)}`
+      rail.hasSessions && rail.hasTasks && rail.hasUsage,
+      `collapsed, the rail is the whole nav — it needs every destination: ${JSON.stringify(rail)}`
     );
-    assert.equal(rail.buttons, 3, `icon rail is Sessions + Tasks + gear: ${JSON.stringify(rail)}`);
+    // One button per destination, plus the gear (which is not a destination — it
+    // opens a modal). Adding a destination should move this number.
+    assert.equal(
+      rail.buttons,
+      4,
+      `icon rail is Sessions + Tasks + Usage + gear: ${JSON.stringify(rail)}`
+    );
     assert.equal(rail.visible, false, `an expanded sidebar hides the rail: ${JSON.stringify(rail)}`);
 
     // The brand and Settings the rail used to carry are on the open sidebar.
