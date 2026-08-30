@@ -92,3 +92,173 @@ test("a normal git commit is refused while the private crate is swapped in", asy
   const accepted = git(workdir, "commit", "-m", "public stub restored");
   assert.equal(accepted.status, 0, accepted.stderr);
 });
+
+// pre-push must guard the HISTORY being published, not the working tree. A
+// with-private.sh session leaves the real sources (and a dirty Cargo.lock) on
+// disk for the whole time the relay is up — that is the normal day-to-day
+// state, and stopping the relay just to push an unrelated public commit is
+// the wrong cost. The commit being pushed still has to be the public stub.
+const CLEAN_LOCK =
+  '[[package]]\nname = "sealwire-private"\nversion = "0.1.0"\n';
+const POISONED_LOCK =
+  '[[package]]\nname = "sealwire-private"\nversion = "0.1.0"\ndependencies = [\n "serde",\n]\n';
+const PRIVATE_SOURCE = "// private\n";
+const PUBLIC_PLACEHOLDER = "// public placeholder, not the private source\n";
+
+async function setupPushRepo() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "sealwire-push-root-"));
+  const workdir = path.join(root, "repo");
+  const privateDir = path.join(root, "sealwire-private");
+  const bare = await mkdtemp(path.join(os.tmpdir(), "sealwire-push-bare-"));
+  tempDirs.push(root, bare);
+
+  await mkdir(path.join(workdir, ".githooks"), { recursive: true });
+  await mkdir(path.join(workdir, "scripts"), { recursive: true });
+  await mkdir(path.join(workdir, "crates/sealwire-private"), { recursive: true });
+  await mkdir(path.join(privateDir, "src"), { recursive: true });
+  await copyFile(
+    path.join(repoRoot, ".githooks/pre-push"),
+    path.join(workdir, ".githooks/pre-push")
+  );
+  await copyFile(
+    path.join(repoRoot, "scripts/check-no-private.sh"),
+    path.join(workdir, "scripts/check-no-private.sh")
+  );
+  await chmod(path.join(workdir, ".githooks/pre-push"), 0o755);
+  await chmod(path.join(workdir, "scripts/check-no-private.sh"), 0o755);
+  await writeFile(path.join(privateDir, "src/team.rs"), PRIVATE_SOURCE);
+
+  assert.equal(git(workdir, "init", "-q").status, 0);
+  assert.equal(git(workdir, "config", "user.email", "test@example.com").status, 0);
+  assert.equal(git(workdir, "config", "user.name", "Test").status, 0);
+  assert.equal(git(workdir, "config", "core.hooksPath", path.join(workdir, ".githooks")).status, 0);
+
+  await writeFile(path.join(workdir, "crates/sealwire-private/STUB"), "public stub\n");
+  await writeFile(path.join(workdir, "Cargo.lock"), CLEAN_LOCK);
+  await writeFile(path.join(workdir, "readme.txt"), "public\n");
+  assert.equal(git(workdir, "add", "-A").status, 0);
+  assert.equal(git(workdir, "commit", "-m", "base").status, 0);
+
+  assert.equal(git(bare, "init", "--bare", "-q").status, 0);
+  assert.equal(git(workdir, "remote", "add", "origin", bare).status, 0);
+  const firstPush = git(workdir, "push", "-u", "origin", "HEAD");
+  assert.equal(firstPush.status, 0, firstPush.stderr);
+
+  return { workdir, privateDir };
+}
+
+function commitNoHook(workdir, message) {
+  return git(workdir, "-c", "core.hooksPath=/dev/null", "commit", "-m", message);
+}
+
+test("git push is allowed while the private crate is swapped in", async () => {
+  const { workdir } = await setupPushRepo();
+
+  await writeFile(path.join(workdir, "readme.txt"), "public, still\n");
+  assert.equal(git(workdir, "add", "readme.txt").status, 0);
+  assert.equal(git(workdir, "commit", "-m", "public tip").status, 0);
+
+  // Mimic a live with-private.sh session: private sources on disk, lock dirty.
+  await rm(path.join(workdir, "crates/sealwire-private/STUB"), { force: true });
+  await mkdir(path.join(workdir, "crates/sealwire-private/src"), { recursive: true });
+  await writeFile(path.join(workdir, "crates/sealwire-private/src/team.rs"), PRIVATE_SOURCE);
+  await writeFile(path.join(workdir, "Cargo.lock"), POISONED_LOCK);
+
+  const pushed = git(workdir, "push", "origin", "HEAD");
+  assert.equal(
+    pushed.status,
+    0,
+    `push of a public commit must not require stopping with-private.sh:\n${pushed.stdout}${pushed.stderr}`
+  );
+});
+
+test("git push refuses a commit whose tree is not the public stub", async () => {
+  const { workdir } = await setupPushRepo();
+
+  // Build a private commit behind the push hook's back (no pre-commit here).
+  await rm(path.join(workdir, "crates/sealwire-private/STUB"), { force: true });
+  await mkdir(path.join(workdir, "crates/sealwire-private/src"), { recursive: true });
+  await writeFile(path.join(workdir, "crates/sealwire-private/src/team.rs"), PRIVATE_SOURCE);
+  assert.equal(git(workdir, "add", "-A").status, 0);
+  assert.equal(commitNoHook(workdir, "leaked private").status, 0);
+
+  // Working tree looks like the stub again — that must not launder the history.
+  await writeFile(path.join(workdir, "crates/sealwire-private/STUB"), "public stub\n");
+  await rm(path.join(workdir, "crates/sealwire-private/src/team.rs"), { force: true });
+
+  const refused = git(workdir, "push", "origin", "HEAD");
+  assert.notEqual(refused.status, 0);
+  assert.match(`${refused.stdout}${refused.stderr}`, /REFUSING TO PUSH/);
+});
+
+test("git push refuses a commit that carries STUB and a private source together", async () => {
+  const { workdir } = await setupPushRepo();
+
+  await writeFile(path.join(workdir, "crates/sealwire-private/STUB"), "public stub\n");
+  await mkdir(path.join(workdir, "crates/sealwire-private/src"), { recursive: true });
+  await writeFile(path.join(workdir, "crates/sealwire-private/src/team.rs"), PRIVATE_SOURCE);
+  assert.equal(git(workdir, "add", "-A").status, 0);
+  assert.equal(commitNoHook(workdir, "mixed stub and private").status, 0);
+
+  const refused = git(workdir, "push", "origin", "HEAD");
+  assert.notEqual(refused.status, 0);
+  assert.match(`${refused.stdout}${refused.stderr}`, /REFUSING TO PUSH/);
+  assert.match(`${refused.stdout}${refused.stderr}`, /private source/i);
+});
+
+test("git push refuses a commit whose Cargo.lock carries private dependencies", async () => {
+  const { workdir } = await setupPushRepo();
+
+  await writeFile(path.join(workdir, "crates/sealwire-private/STUB"), "public stub\n");
+  await writeFile(path.join(workdir, "Cargo.lock"), POISONED_LOCK);
+  assert.equal(git(workdir, "add", "Cargo.lock").status, 0);
+  assert.equal(commitNoHook(workdir, "poisoned lock").status, 0);
+
+  const refused = git(workdir, "push", "origin", "HEAD");
+  assert.notEqual(refused.status, 0);
+  assert.match(`${refused.stdout}${refused.stderr}`, /REFUSING TO PUSH/);
+  assert.match(`${refused.stdout}${refused.stderr}`, /Cargo\.lock carries the private crate/);
+  assert.match(`${refused.stdout}${refused.stderr}`, /rewrite/i);
+  assert.doesNotMatch(`${refused.stdout}${refused.stderr}`, /in a new commit/i);
+});
+
+test("git push refuses when a bad commit sits between origin and a clean tip", async () => {
+  const { workdir } = await setupPushRepo();
+
+  await writeFile(path.join(workdir, "readme.txt"), "public, still\n");
+  assert.equal(git(workdir, "add", "readme.txt").status, 0);
+  assert.equal(git(workdir, "commit", "-m", "public tip").status, 0);
+
+  // Insert a leaked-private commit between origin and the clean tip.
+  assert.equal(git(workdir, "reset", "--soft", "HEAD~1").status, 0);
+  await rm(path.join(workdir, "crates/sealwire-private/STUB"), { force: true });
+  await mkdir(path.join(workdir, "crates/sealwire-private/src"), { recursive: true });
+  await writeFile(path.join(workdir, "crates/sealwire-private/src/team.rs"), PRIVATE_SOURCE);
+  assert.equal(git(workdir, "add", "-A").status, 0);
+  assert.equal(commitNoHook(workdir, "leaked private in the middle").status, 0);
+
+  await writeFile(path.join(workdir, "crates/sealwire-private/STUB"), "public stub\n");
+  await rm(path.join(workdir, "crates/sealwire-private/src/team.rs"), { force: true });
+  await writeFile(path.join(workdir, "readme.txt"), "public, still\n");
+  assert.equal(git(workdir, "add", "-A").status, 0);
+  assert.equal(commitNoHook(workdir, "clean tip after bad ancestor").status, 0);
+
+  const refused = git(workdir, "push", "origin", "HEAD");
+  assert.notEqual(refused.status, 0);
+  assert.match(`${refused.stdout}${refused.stderr}`, /REFUSING TO PUSH/);
+});
+
+test("git push still allows a public placeholder that is not byte-identical to private", async () => {
+  const { workdir, privateDir } = await setupPushRepo();
+
+  await mkdir(path.join(privateDir, "frontend"), { recursive: true });
+  await writeFile(path.join(privateDir, "frontend/thing.js"), PRIVATE_SOURCE);
+  await writeFile(path.join(workdir, "crates/sealwire-private/STUB"), "public stub\n");
+  await mkdir(path.join(workdir, "crates/sealwire-private/frontend"), { recursive: true });
+  await writeFile(path.join(workdir, "crates/sealwire-private/frontend/thing.js"), PUBLIC_PLACEHOLDER);
+  assert.equal(git(workdir, "add", "-A").status, 0);
+  assert.equal(commitNoHook(workdir, "public seam placeholder").status, 0);
+
+  const pushed = git(workdir, "push", "origin", "HEAD");
+  assert.equal(pushed.status, 0, `${pushed.stdout}${pushed.stderr}`);
+});

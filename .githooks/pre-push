@@ -1,9 +1,55 @@
 #!/bin/sh
+# Guard what is about to leave the machine — the commit trees being pushed —
+# not the working tree. A live with-private.sh session leaves the real sources
+# on disk; that must not block pushing an already-public tip. See
+# scripts/check-no-private.sh (--commits).
 
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
 guard="$repo_root/scripts/check-no-private.sh"
-if [ -x "$guard" ]; then
-  "$guard"
+if [ ! -x "$guard" ]; then
+  exit 0
 fi
+
+remote_name="${1:-}"
+zero=0000000000000000000000000000000000000000
+# Collect SHAs first so a refused range still drains stdin cleanly if a later
+# caller ever pipes this hook.
+commits=""
+
+while read -r local_ref local_sha remote_ref remote_sha
+do
+  # Deleting a remote ref cannot publish private content.
+  if [ "$local_sha" = "$zero" ]; then
+    continue
+  fi
+
+  if [ "$remote_sha" = "$zero" ]; then
+    # New branch / tag: only the commits that are not already on that remote.
+    if [ -n "$remote_name" ]; then
+      list=$(git rev-list "$local_sha" --not --remotes="$remote_name" 2>/dev/null || true)
+    else
+      list=$(git rev-list "$local_sha" --not --remotes 2>/dev/null || true)
+    fi
+    # Brand-new repo with no remotes yet: fall back to the tip alone rather
+    # than walking the entire ancestry of every local branch.
+    if [ -z "$list" ]; then
+      list=$local_sha
+    fi
+  else
+    list=$(git rev-list "$remote_sha..$local_sha")
+  fi
+
+  for sha in $list; do
+    commits="$commits $sha"
+  done
+done
+
+# Nothing new to publish (e.g. push of an up-to-date ref).
+if [ -z "${commits## }" ]; then
+  exit 0
+fi
+
+# shellcheck disable=SC2086
+exec "$guard" --commits $commits
