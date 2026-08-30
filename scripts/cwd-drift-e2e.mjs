@@ -59,6 +59,21 @@ async function main() {
     // Dirty ONLY the linked worktree so Changes can prove which tree was used.
     await fs.writeFile(path.join(linkedCwd, "seed.txt"), `line1\n${MARKER}\n`, "utf8");
 
+    // Starting an agent in a directory is a deliberate local action, but it is not
+    // permission for ambient git probes, so Changes/review degrade to `unavailable`
+    // until the repository is granted. Mirror the local UI's explicit trust step, the
+    // same way `review-recap-modes-e2e.mjs` does, so this fixture exercises worktree
+    // drift instead of the trust refusal path.
+    //
+    // Granted through the LINKED tree on purpose: trust is a property of the
+    // repository, so this one grant must also cover the main worktree the pin step
+    // below switches to. `a_repository_and_all_its_worktrees_are_trusted_as_one`
+    // pins that same rule in Rust.
+    const trusted = await postEnvelope(relayPort, "/api/workspace/trust", {
+      cwd: linkedCwd,
+    });
+    assert.ok(trusted.ok, `workspace trust failed: ${JSON.stringify(trusted.error)}`);
+
     const started = await postEnvelope(relayPort, "/api/session/start", {
       device_id: DEVICE,
       cwd: linkedCwd,
