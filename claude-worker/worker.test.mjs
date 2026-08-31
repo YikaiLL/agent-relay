@@ -475,6 +475,27 @@ test("sessionOptionsChanged notices a toolset swap", () => {
   );
 });
 
+test("sessionOptionsChanged flags an effort switch, and ignores an omitted one", () => {
+  // effort is baked into query() like model, so a live session cannot be
+  // re-pointed at a new one — without a rebuild, switching a thread to "max"
+  // keeps running at whatever it started on, silently.
+  assert.equal(
+    sessionOptionsChanged(
+      { permissionMode: "default", effort: "medium" },
+      { permissionMode: "default", effort: "max" },
+    ),
+    true,
+  );
+  // Same reasoning as model: a resume omits it, and "unspecified" is not a change.
+  assert.equal(
+    sessionOptionsChanged(
+      { permissionMode: "default", effort: "medium" },
+      { permissionMode: "default" },
+    ),
+    false,
+  );
+});
+
 test("sessionOptionsChanged flags permissionMode/model but ignores an omitted model", () => {
   assert.equal(
     sessionOptionsChanged({ permissionMode: "default" }, { permissionMode: "bypassPermissions" }),

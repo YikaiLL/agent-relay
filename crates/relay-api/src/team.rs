@@ -185,10 +185,8 @@ pub enum TeamThreadGate {
 
 /// The user's Task, verbatim.
 ///
-/// IMMUTABLE by construction: only `TeamRun::new` sets it and there is no `&mut`
-/// accessor. The TL owns the plan file and may rewrite it freely, but it must not
-/// be able to edit the thing it is being measured against — `agreed_scope` and
-/// `quality_rules` are the MR gate's yardstick.
+/// The team must never edit this: `agreed_scope` and `quality_rules` are the MR
+/// gate's yardstick. Only the user and the Orchestrator may widen it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaskSpec {
@@ -197,6 +195,56 @@ pub struct TaskSpec {
     pub acceptance_criteria: String,
     pub agreed_scope: String,
     pub quality_rules: String,
+}
+
+impl TaskSpec {
+    /// Append to the scope the MR gate measures against. Appends rather than
+    /// replaces so the original ask stays readable next to what was added.
+    pub fn widen_scope(&mut self, addition: &str) -> bool {
+        let addition = addition.trim();
+        if addition.is_empty() {
+            return false;
+        }
+        if self.agreed_scope.trim().is_empty() {
+            self.agreed_scope = addition.to_string();
+        } else {
+            self.agreed_scope = format!("{}\n\nAlso in scope: {addition}", self.agreed_scope);
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod task_spec_tests {
+    use super::TaskSpec;
+
+    #[test]
+    fn widening_keeps_the_original_ask_readable() {
+        let mut spec = TaskSpec {
+            agreed_scope: "Parser only.".to_string(),
+            ..Default::default()
+        };
+        assert!(spec.widen_scope("Also the loader."));
+        assert!(spec.agreed_scope.contains("Parser only."));
+        assert!(spec.agreed_scope.contains("Also the loader."));
+    }
+
+    #[test]
+    fn widening_with_nothing_changes_nothing() {
+        let mut spec = TaskSpec {
+            agreed_scope: "Parser only.".to_string(),
+            ..Default::default()
+        };
+        assert!(!spec.widen_scope("   "));
+        assert_eq!(spec.agreed_scope, "Parser only.");
+    }
+
+    #[test]
+    fn widening_an_empty_scope_does_not_prefix_it() {
+        let mut spec = TaskSpec::default();
+        assert!(spec.widen_scope("The loader."));
+        assert_eq!(spec.agreed_scope, "The loader.");
+    }
 }
 
 /// Where the run is in the fixed pipeline.
@@ -482,6 +530,11 @@ pub struct TeamRun {
     pub tl_thread_id: String,
     pub tl_provider: String,
     pub tl_model: String,
+    /// Reasoning effort for this seat. Empty means "the model's own default",
+    /// which is not a level we could name on its behalf. `#[serde(default)]`
+    /// keeps runs written before per-seat effort existed loadable.
+    #[serde(default)]
+    pub tl_effort: String,
     pub tl_succession: Vec<TlGeneration>,
     pub tl_turns_this_generation: u32,
     /// Why the team lead should be replaced before the next action, if it should.
@@ -504,10 +557,19 @@ pub struct TeamRun {
     /// run's locks are released. Persisted, appended, never pruned while live.
     pub run_owned_thread_ids: Vec<String>,
 
+    /// Instructions left for the team to pick up on its next turn. The driver
+    /// drains these; they are notes TO the team, never from it.
+    #[serde(default)]
+    pub pending_user_notes: Vec<String>,
+
     pub dev_provider: String,
     pub dev_model: String,
+    #[serde(default)]
+    pub dev_effort: String,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    #[serde(default)]
+    pub reviewer_effort: String,
 
     pub max_review_rounds: u32,
     pub max_mr_rounds: u32,

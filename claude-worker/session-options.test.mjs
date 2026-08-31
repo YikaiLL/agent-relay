@@ -27,6 +27,32 @@ test("bypassPermissions sets allowDangerouslySkipPermissions=true", () => {
   assert.equal(opts.allowDangerouslySkipPermissions, true);
 });
 
+test("effort reaches the SDK, not just the model catalogue", () => {
+  // The worker published every model's supported effort levels and let the
+  // relay pick one, then never applied it: only `model` was copied onto the
+  // options, so the SDK ran at its own default no matter what was chosen.
+  const opts = buildSessionOptionsBase(
+    { cwd: "/tmp", model: "claude-opus-5", effort: "medium" },
+    defaults,
+  );
+  assert.equal(opts.effort, "medium");
+});
+
+test("an unknown effort is dropped rather than handed to the SDK", () => {
+  // The SDK takes a closed set; forwarding junk fails the whole query() rather
+  // than degrading to the default, which would take the thread down.
+  const opts = buildSessionOptionsBase(
+    { cwd: "/tmp", model: "claude-opus-5", effort: "turbo" },
+    defaults,
+  );
+  assert.ok(!("effort" in opts));
+});
+
+test("no effort asked for means no effort forced", () => {
+  const opts = buildSessionOptionsBase({ cwd: "/tmp", model: "claude-opus-5" }, defaults);
+  assert.ok(!("effort" in opts));
+});
+
 test("missing permissionMode falls back to default and stays safe", () => {
   const opts = buildSessionOptionsBase({ cwd: "/tmp" }, defaults);
   assert.equal(opts.permissionMode, "default");

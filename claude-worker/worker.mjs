@@ -998,6 +998,10 @@ function sessionOptionsChanged(prev, next) {
   // `model` is only present when the command specified one; a resume omits it,
   // so treat "unspecified" as "unchanged" rather than forcing a needless rebuild.
   if (next.model && prev.model !== next.model) return true;
+  // effort is baked in at query() time exactly like model, so switching a
+  // thread to a new level cannot be applied to the live session — without this,
+  // the change is accepted everywhere and takes effect nowhere.
+  if (next.effort && prev.effort !== next.effort) return true;
   // A persona is baked in at query() time like permissionMode and model. Omitted
   // on a live command means cleared — the relay must re-send an authoritative
   // persona when it wants one kept (Orchestrator send/resume). Sticky inheritance

@@ -243,6 +243,14 @@ pub(crate) struct TeamStartRequest {
     pub(crate) tl_provider: String,
     pub(crate) dev_provider: String,
     pub(crate) reviewer_provider: String,
+    /// Empty means "leave this seat on the provider's own default" — the run
+    /// records the ask, not a snapshot of today's default.
+    pub(crate) tl_model: String,
+    pub(crate) dev_model: String,
+    pub(crate) reviewer_model: String,
+    pub(crate) tl_effort: String,
+    pub(crate) dev_effort: String,
+    pub(crate) reviewer_effort: String,
 }
 
 impl AppState {
@@ -319,6 +327,12 @@ locally and trust it before starting a task team there"
         run.tl_provider = input.tl_provider;
         run.dev_provider = input.dev_provider;
         run.reviewer_provider = input.reviewer_provider;
+        run.tl_model = input.tl_model;
+        run.dev_model = input.dev_model;
+        run.reviewer_model = input.reviewer_model;
+        run.tl_effort = input.tl_effort;
+        run.dev_effort = input.dev_effort;
+        run.reviewer_effort = input.reviewer_effort;
         // Pin the builtin Default team until configurable teams land. The
         // ledger's `team_id` is only knowable while the run exists, so this
         // has to be set at start — not joined at report time.
@@ -616,6 +630,11 @@ over on resume"
         let tl_provider = resolve_provider(input.tl_provider, "team lead")?;
         let dev_provider = resolve_provider(input.dev_provider, "developer")?;
         let reviewer_provider = resolve_provider(input.reviewer_provider, "reviewer")?;
+        // Model and effort are NOT validated here. The provider's catalogue is
+        // loaded per seat when its thread starts, and a name checked now could
+        // be gone by then; `start_team_thread` resolves and clamps against the
+        // live catalogue, which is the only place the answer is true.
+        let asked = |value: Option<String>| non_empty(value).unwrap_or_default();
 
         let run_id = self
             .start_team_run(TeamStartRequest {
@@ -629,6 +648,12 @@ over on resume"
                 origin_cwd,
                 target_branch: non_empty(input.target_branch),
                 device_id,
+                tl_model: asked(input.tl_model),
+                dev_model: asked(input.dev_model),
+                reviewer_model: asked(input.reviewer_model),
+                tl_effort: asked(input.tl_effort),
+                dev_effort: asked(input.dev_effort),
+                reviewer_effort: asked(input.reviewer_effort),
                 tl_provider,
                 dev_provider,
                 reviewer_provider,
@@ -1234,15 +1259,27 @@ over on resume"
         role: TeamRole,
         workspace: &LiveDir,
     ) -> Result<String, ThreadDriveError> {
-        let (provider, model_override) = {
+        let (provider, model_override, effort_override) = {
             let relay = self.relay.read().await;
             let run = relay
                 .team_run(run_id)
                 .ok_or_else(|| ThreadDriveError::Provider("task run is gone".to_string()))?;
             match role {
-                TeamRole::Tl => (run.tl_provider.clone(), run.tl_model.clone()),
-                TeamRole::Dev => (run.dev_provider.clone(), run.dev_model.clone()),
-                TeamRole::Reviewer => (run.reviewer_provider.clone(), run.reviewer_model.clone()),
+                TeamRole::Tl => (
+                    run.tl_provider.clone(),
+                    run.tl_model.clone(),
+                    run.tl_effort.clone(),
+                ),
+                TeamRole::Dev => (
+                    run.dev_provider.clone(),
+                    run.dev_model.clone(),
+                    run.dev_effort.clone(),
+                ),
+                TeamRole::Reviewer => (
+                    run.reviewer_provider.clone(),
+                    run.reviewer_model.clone(),
+                    run.reviewer_effort.clone(),
+                ),
             }
         };
 
@@ -1260,8 +1297,16 @@ over on resume"
             non_empty(Some(model_override)),
             defaults.model.clone(),
         );
-        let effort = default_effort_for_model(&provider_models, &model)
-            .unwrap_or_else(|| defaults.reasoning_effort.clone());
+        // A seat that asked for an effort gets it, clamped to what the model
+        // actually offers — an unsupported level would otherwise reach the
+        // provider and fail the turn rather than degrade. A seat that asked for
+        // nothing keeps the old behaviour: the model's default, else the
+        // relay's.
+        let effort = match non_empty(Some(effort_override)) {
+            Some(asked) => clamp_effort_to_model(asked, &model, &provider_models),
+            None => default_effort_for_model(&provider_models, &model)
+                .unwrap_or_else(|| defaults.reasoning_effort.clone()),
+        };
         let (approval_policy, sandbox) = team_thread_settings(
             &provider_name,
             role,
@@ -1272,12 +1317,10 @@ over on resume"
         let start = classify_workspace_result(
             workspace,
             bridge
-                .start_thread(StartThreadRequest::new(
-                    workspace.as_str(),
-                    &model,
-                    &approval_policy,
-                    &sandbox,
-                ))
+                .start_thread(
+                    StartThreadRequest::new(workspace.as_str(), &model, &approval_policy, &sandbox)
+                        .with_effort(&effort),
+                )
                 .await,
         )?;
         let mut thread = start.thread;
@@ -1371,15 +1414,19 @@ over on resume"
                 drop(self.team_gated_barrier.lock().await);
             }
 
-            let model = self
-                .relay
-                .read()
-                .await
-                .runtime_for_thread(&thread_id)
-                .map(|runtime| runtime.model.clone());
+            let (model, effort) = {
+                let relay = self.relay.read().await;
+                match relay.runtime_for_thread(&thread_id) {
+                    Some(runtime) => (
+                        Some(runtime.model.clone()),
+                        Some(runtime.reasoning_effort.clone()),
+                    ),
+                    None => (None, None),
+                }
+            };
 
             let outcome = self
-                .send_message_to_thread(&thread_id, prompt, model.as_deref(), None)
+                .send_message_to_thread(&thread_id, prompt, model.as_deref(), effort.as_deref())
                 .await;
             match &outcome {
                 Ok(dispatched) if dispatched.turn_id.is_some() => {

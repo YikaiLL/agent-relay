@@ -2668,6 +2668,63 @@ pub struct EnsureOrchestratorReceipt {
     pub thread_id: String,
 }
 
+/// Which agent one seat runs on. `None` is "whatever the relay would pick",
+/// which is NOT the same as a named default — the relay's own default can move,
+/// and a task that never asked should move with it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeatAgentView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl SeatAgentView {
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.effort.is_none()
+    }
+
+    /// Apply the fields `next` names, keeping the rest. Revising one seat's
+    /// effort must not silently drop the model that seat was staged with.
+    pub fn merge(&mut self, next: &SeatAgentView) {
+        if next.provider.is_some() {
+            self.provider = next.provider.clone();
+        }
+        if next.model.is_some() {
+            self.model = next.model.clone();
+        }
+        if next.effort.is_some() {
+            self.effort = next.effort.clone();
+        }
+    }
+}
+
+/// A task's three seats, each already merged from the task-wide ask and any
+/// per-seat override. What the card shows is what the run will use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSeatAgentsView {
+    #[serde(default)]
+    pub tl: SeatAgentView,
+    #[serde(default)]
+    pub dev: SeatAgentView,
+    #[serde(default)]
+    pub reviewer: SeatAgentView,
+}
+
+impl TaskSeatAgentsView {
+    pub fn is_empty(&self) -> bool {
+        self.tl.is_empty() && self.dev.is_empty() && self.reviewer.is_empty()
+    }
+
+    pub fn merge(&mut self, next: &TaskSeatAgentsView) {
+        self.tl.merge(&next.tl);
+        self.dev.merge(&next.dev);
+        self.reviewer.merge(&next.reviewer);
+    }
+}
+
 /// A held Orchestrator proposal waiting for the user to confirm or dismiss.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrchestratorProposalView {
@@ -2688,6 +2745,10 @@ pub struct OrchestratorProposalView {
     pub team_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// Per-seat agent choice, already merged. Empty means every seat takes the
+    /// relay default.
+    #[serde(default, skip_serializing_if = "TaskSeatAgentsView::is_empty")]
+    pub agents: TaskSeatAgentsView,
     pub created_at: u64,
 }
 
@@ -2706,6 +2767,8 @@ pub struct ProposeOrchestratorTaskInput {
     pub team_id: Option<String>,
     #[serde(default)]
     pub why: Option<String>,
+    #[serde(default)]
+    pub agents: TaskSeatAgentsView,
     #[serde(default)]
     pub device_id: Option<String>,
 }
@@ -2730,6 +2793,8 @@ pub struct ReviseOrchestratorProposalInput {
     pub acceptance_criteria: Option<String>,
     pub team_id: Option<String>,
     pub why: Option<String>,
+    /// Only the named fields are applied; the rest of the staged choice stands.
+    pub agents: TaskSeatAgentsView,
     pub device_id: Option<String>,
 }
 
@@ -3033,6 +3098,21 @@ pub struct StartTeamInput {
     pub dev_provider: Option<String>,
     #[serde(default)]
     pub reviewer_provider: Option<String>,
+    /// Per-seat model and reasoning effort. `None` leaves the seat on whatever
+    /// the provider's catalogue defaults to, which is what every caller that
+    /// does not care should send.
+    #[serde(default)]
+    pub tl_model: Option<String>,
+    #[serde(default)]
+    pub dev_model: Option<String>,
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
+    #[serde(default)]
+    pub tl_effort: Option<String>,
+    #[serde(default)]
+    pub dev_effort: Option<String>,
+    #[serde(default)]
+    pub reviewer_effort: Option<String>,
     #[serde(default)]
     pub device_id: Option<String>,
 }

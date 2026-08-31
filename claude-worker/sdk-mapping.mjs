@@ -46,7 +46,9 @@ function previewJson(value, max = 1000) {
 // the transcript renders as an interactive card. Truncating mid-JSON breaks
 // parsing, so allow a much larger budget for this tool specifically.
 const ASK_USER_QUESTION_PREVIEW_MAX = 8000;
-const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+/// The SDK's closed set. Exported so the catalogue we publish and the value we
+/// actually apply cannot drift apart — one list, two readers.
+export const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 function previewToolInput(name, value) {
   if (name === "AskUserQuestion") {

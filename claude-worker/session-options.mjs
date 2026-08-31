@@ -2,6 +2,8 @@
 // `unstable_v2_createSession` / `unstable_v2_resumeSession`. Extracted from
 // worker.mjs so it can be unit-tested without booting the worker's main loop.
 
+import { EFFORT_LEVELS } from "./sdk-mapping.mjs";
+
 // A read-only reviewer thread must inspect freely without ever prompting (the review
 // loop is non-interactive and treats any pending approval/question as a hard failure),
 // but it must not edit. Claude has no filesystem sandbox, so we run it bypassPermissions
@@ -43,6 +45,15 @@ export function buildSessionOptionsBase(cmd, { canUseTool, defaultSettingSources
 
   if (cmd.model) {
     options.model = cmd.model;
+  }
+
+  // The SDK takes a closed set here. The relay clamps effort to what the model
+  // advertises before sending, but this is the boundary a bad value would take
+  // the whole query() down at — so drop anything unrecognised rather than
+  // forward it. Absent means "the SDK's own default", which is not the same as
+  // any level we could pick on its behalf.
+  if (EFFORT_LEVELS.has(cmd.effort)) {
+    options.effort = cmd.effort;
   }
 
   // Persona as systemPrompt (replaces coding preset; not a user turn).

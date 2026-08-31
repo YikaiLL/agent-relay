@@ -440,6 +440,45 @@ function OrchestratorWorkingIndicator({ activity }) {
   });
 }
 
+// The seats, in pipeline order, with the label the card shows for each.
+const PROPOSAL_SEATS = [
+  ["tl", "Planner"],
+  ["dev", "Implementer"],
+  ["reviewer", "Reviewer"],
+];
+
+// "codex \u00b7 gpt-5.6-codex \u00b7 max", skipping whatever was not chosen.
+// An empty seat renders nothing at all rather than the word "default": the
+// relay's default can move, and naming it here would claim a guarantee the
+// proposal does not carry.
+function seatAgentLabel(agent) {
+  if (!agent) return "";
+  return [agent.provider, agent.model, agent.effort].filter(Boolean).join(" \u00b7 ");
+}
+
+// Confirming a proposal authorises whatever agent it names — a different
+// provider, a pricier model, `max` effort on every seat. Showing only the title
+// asked the user to approve spend they could not see, so any seat that names
+// something is listed here before the Start button.
+function ProposalAgentSummary({ agents }) {
+  const rows = PROPOSAL_SEATS.map(([seat, label]) => [label, seatAgentLabel(agents?.[seat])]).filter(
+    ([, value]) => value,
+  );
+  if (rows.length === 0) return null;
+  return h(
+    "ul",
+    { className: "task-orch-proposal-agents" },
+    rows.map(([label, value]) =>
+      h(
+        "li",
+        { key: label, className: "task-orch-proposal-agent" },
+        h("span", { className: "task-orch-proposal-agent-seat" }, label),
+        h("span", { className: "task-orch-proposal-agent-value" }, value),
+      ),
+    ),
+  );
+}
+
 function OrchestratorProposalCard({ proposal, busy = false, onConfirm = null, onDismiss = null }) {
   return h(
     "div",
@@ -456,6 +495,7 @@ function OrchestratorProposalCard({ proposal, busy = false, onConfirm = null, on
       : proposal.context
         ? h("p", { className: "task-orch-card-body" }, proposal.context)
         : null,
+    h(ProposalAgentSummary, { agents: proposal.agents }),
     h(
       "div",
       { className: "task-orch-proposal-actions" },

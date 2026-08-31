@@ -112,6 +112,11 @@ pub struct StartThreadRequest {
     pub model: String,
     pub approval_policy: String,
     pub sandbox: String,
+    /// Reasoning effort for the session this creates. Empty means "the
+    /// provider's own default". Session-scoped rather than per-turn because the
+    /// Claude SDK bakes it in at creation; a bridge that takes it per turn may
+    /// ignore this.
+    pub effort: String,
     /// A first USER turn. Visible in the transcript, and it runs a turn: the
     /// model answers it. `StartThreadResult::consumed_initial_prompt` tells the
     /// relay whether the bridge already delivered it or it still needs replay.
@@ -131,10 +136,16 @@ impl StartThreadRequest {
             model: model.to_string(),
             approval_policy: approval_policy.to_string(),
             sandbox: sandbox.to_string(),
+            effort: String::new(),
             initial_prompt: None,
             system_prompt: None,
             orchestrator_tools: None,
         }
+    }
+
+    pub fn with_effort(mut self, effort: &str) -> Self {
+        self.effort = effort.to_string();
+        self
     }
 
     pub fn with_initial_prompt(mut self, prompt: Option<&str>) -> Self {

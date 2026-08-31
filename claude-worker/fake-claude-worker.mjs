@@ -111,7 +111,7 @@ for await (const line of rl) {
   // explicit null would be indistinguishable from absent by value alone.
   recv(
     `WORKER RECV type=${cmd.type} permissionMode=${cmd.permissionMode ?? "-"} ` +
-      `model=${cmd.model ?? "-"} session=${sessionId} ` +
+      `model=${cmd.model ?? "-"} effort=${cmd.effort ?? "-"} session=${sessionId} ` +
       `prompt=${cmd.prompt ? "yes" : "no"} cwd=${cmd.cwd ?? "-"} ` +
       `upTo=${cmd.up_to_message_id ?? "-"} ` +
       `upToKey=${Object.prototype.hasOwnProperty.call(cmd, "up_to_message_id") ? "yes" : "no"} ` +
