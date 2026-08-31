@@ -58,11 +58,28 @@ const CLAUDE_PROVIDER_KEY: &str = "claude_code";
 struct PendingClaudeConfig {
     cwd: String,
     model: String,
+    /// Effort the thread was opened with; the first turn's own effort wins over
+    /// it, since a settings change between open and first turn is legitimate.
+    effort: String,
     permission_mode: String,
     /// Carried across deferred start (no initial prompt until first turn).
     system_prompt: Option<String>,
     /// Same: Orchestrator opens with no prompt but needs tools on first send.
     orchestrator_tools: Option<String>,
+}
+
+/// Attach a reasoning effort to a worker command, when there is one to attach.
+///
+/// Empty is not a level — it means "no opinion, let the SDK decide" — so the key
+/// is omitted rather than sent blank, which the worker would have to special-case.
+fn insert_effort(cmd: &mut Value, effort: &str) {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return;
+    }
+    if let Some(object) = cmd.as_object_mut() {
+        object.insert("effort".to_string(), Value::String(effort.to_string()));
+    }
 }
 
 /// Bridges the relay to Claude Code via a Node.js worker process that wraps the
@@ -420,6 +437,7 @@ impl ProviderBridge for ClaudeCodeBridge {
                 PendingClaudeConfig {
                     cwd: cwd.to_string(),
                     model: model.to_string(),
+                    effort: request.effort.clone(),
                     permission_mode: permission_mode.to_string(),
                     system_prompt: system_prompt.clone(),
                     orchestrator_tools: request.orchestrator_tools.clone(),
@@ -453,6 +471,7 @@ impl ProviderBridge for ClaudeCodeBridge {
             "model": model,
             "permissionMode": permission_mode,
         });
+        insert_effort(&mut cmd, &request.effort);
         if let Some(prompt) = initial_prompt {
             cmd["prompt"] = Value::String(prompt.to_string());
         }
@@ -744,8 +763,8 @@ impl ProviderBridge for ClaudeCodeBridge {
         &self,
         thread_id: &str,
         text: &str,
-        _model: &str,
-        _effort: &str,
+        model: &str,
+        effort: &str,
         images: &[ProviderImage],
     ) -> Result<Option<String>, String> {
         let transcript_text = user_message_transcript_text(text, images.len()).unwrap_or_default();
@@ -795,6 +814,17 @@ impl ProviderBridge for ClaudeCodeBridge {
                 "user_item_id": user_item_id,
                 "user_message_uuid": user_message_uuid,
             });
+            // The turn's own effort wins: it is what the relay resolved for the
+            // work about to run, while the config's was captured when the empty
+            // thread was opened and may be a settings change out of date.
+            insert_effort(
+                &mut cmd,
+                if effort.trim().is_empty() {
+                    config.effort.as_str()
+                } else {
+                    effort
+                },
+            );
             // The persona was set when the thread was created; this deferred
             // `start` is the first time a worker session actually exists to
             // receive it.
@@ -881,9 +911,15 @@ impl ProviderBridge for ClaudeCodeBridge {
             "turn_id": turn_id,
             "user_item_id": user_item_id,
             "user_message_uuid": user_message_uuid,
-            "model": _model,
+            "model": model,
             "permissionMode": permission_mode,
         });
+        // The relay has already resolved and clamped this to something the model
+        // supports; an empty string means "no opinion", not "default effort", so
+        // send the key only when there is one. The worker treats a change here
+        // like a model change and rebuilds the session, since the SDK bakes it
+        // in at query() time.
+        insert_effort(&mut cmd, effort);
         attach_orchestrator_session(&self.state, &self.worker_path, thread_id, &mut cmd).await;
         if let Some(cwd) = cwd {
             if let Some(object) = cmd.as_object_mut() {
@@ -2304,6 +2340,99 @@ mod tests {
         }
     }
 
+    /// A thread created with no opening prompt does not exist worker-side yet;
+    /// the session is built on the FIRST turn, by a `start` command — not the
+    /// `send` the already-materialised path uses. Team seats are all created
+    /// this way, so putting effort only on `send` left the first turn (and for a
+    /// reviewer, often the only turn) running at the SDK default.
+    ///
+    /// Found by review: the first version of this guard used an arbitrary
+    /// session id, which took the `send` path and passed while the real one
+    /// stayed broken.
+    #[tokio::test]
+    async fn the_first_turn_of_a_deferred_thread_carries_its_effort() {
+        let Some((bridge, state)) = spawn_fake_bridge().await else {
+            return;
+        };
+
+        let started = bridge
+            .start_thread(
+                StartThreadRequest::new("/tmp/deferred", "claude-opus-5", "default", "read-only")
+                    .with_effort("medium"),
+            )
+            .await
+            .expect("deferred start");
+        assert!(
+            started.started_turn_id.is_none(),
+            "no prompt means no turn yet — this is the deferred path"
+        );
+
+        bridge
+            .start_turn(&started.thread.id, "hello", "claude-opus-5", "medium", &[])
+            .await
+            .expect("first turn materialises the session");
+
+        assert!(
+            wait_for_log(
+                &state,
+                "type=start permissionMode=default model=claude-opus-5 effort=medium",
+                5,
+            )
+            .await,
+            "the session the first turn builds must carry the effort it was given",
+        );
+    }
+
+    /// The other creation path: a thread that opens with a prompt is built
+    /// immediately, and that `start` has to carry effort too.
+    #[tokio::test]
+    async fn a_thread_that_opens_with_a_prompt_carries_its_effort() {
+        let Some((bridge, state)) = spawn_fake_bridge().await else {
+            return;
+        };
+
+        bridge
+            .start_thread(
+                StartThreadRequest::new("/tmp/immediate", "claude-opus-5", "default", "read-only")
+                    .with_initial_prompt(Some("go"))
+                    .with_effort("xhigh"),
+            )
+            .await
+            .expect("immediate start");
+
+        assert!(
+            wait_for_log(
+                &state,
+                "type=start permissionMode=default model=claude-opus-5 effort=xhigh",
+                5,
+            )
+            .await,
+            "a thread created with an opening turn runs that turn at the SDK default",
+        );
+    }
+
+    /// The relay resolves a reasoning effort for every Claude turn — it stores
+    /// it per thread, clamps it to what the model supports, and shows it in the
+    /// UI — and then `start_turn` bound it to `_effort` and never put it on the
+    /// wire. Every effort control upstream was honest; the last hop was not, so
+    /// picking "medium" on a Claude thread did nothing at all.
+    #[tokio::test]
+    async fn a_claude_turn_carries_the_effort_the_relay_resolved() {
+        let Some((bridge, state)) = spawn_fake_bridge().await else {
+            return;
+        };
+
+        bridge
+            .start_turn("sess-effort", "hello", "claude-opus-5", "medium", &[])
+            .await
+            .expect("start_turn should send");
+
+        assert!(
+            wait_for_log(&state, "model=claude-opus-5 effort=medium", 5).await,
+            "the turn dropped the effort the relay had already resolved",
+        );
+    }
+
     #[tokio::test]
     async fn start_turn_sends_the_threads_current_permission_mode() {
         // This is the Rust-side guard for the YOLO-still-prompts bug: a turn must
@@ -2450,7 +2579,7 @@ mod tests {
         assert!(
             wait_for_log(
                 &state,
-                "type=resume permissionMode=bypassPermissions model=- session=sess-7",
+                "type=resume permissionMode=bypassPermissions model=- effort=- session=sess-7",
                 5,
             )
             .await,
@@ -2496,7 +2625,7 @@ mod tests {
         assert!(
             wait_for_log(
                 &state,
-                "type=send permissionMode=default model=claude-sonnet-4-6 session=orch-sess",
+                "type=send permissionMode=default model=claude-sonnet-4-6 effort=high session=orch-sess",
                 5,
             )
             .await
@@ -2557,7 +2686,7 @@ mod tests {
         assert!(
             wait_for_log(
                 &state,
-                "type=resume permissionMode=acceptEdits model=- session=orch-resume",
+                "type=resume permissionMode=acceptEdits model=- effort=- session=orch-resume",
                 5,
             )
             .await
@@ -3058,7 +3187,7 @@ mod tests {
         assert!(
             wait_for_log(
                 &state,
-                "WORKER RECV type=fork_session permissionMode=- model=- session=sess-src \
+                "WORKER RECV type=fork_session permissionMode=- model=- effort=- session=sess-src \
                  prompt=no cwd=/tmp/fork \
                  upTo=11111111-2222-4333-8444-555555555555 upToKey=yes",
                 5,
