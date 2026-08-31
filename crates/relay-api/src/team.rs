@@ -28,6 +28,9 @@
 //! The driver advances `phase` in the SAME write that records a step's result, so
 //! a crash re-runs at most the last turn. See `markdown/task-team-design.md` §5.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{unix_now, WorkflowVerdict};
@@ -438,6 +441,36 @@ impl<'de> Deserialize<'de> for SubTaskStatus {
         // UNKNOWN value is the untrustworthy case that must settle terminal.
         Ok(raw.as_deref().map_or(Self::Pending, Self::from_wire))
     }
+}
+
+/// A sub-task id nothing else can repeat: `st-<hex>` over a nanosecond clock,
+/// forced upward so two mints inside one nanosecond still differ.
+///
+/// Uniqueness only stops one id from naming two different pieces of work. A replan
+/// still replaces the whole list, so a pre-replan sub-task remains unrerunnable.
+pub fn mint_sub_task_id() -> String {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let number = mint_number(&LAST, now).expect("sub-task id counter exhausted");
+    format!("st-{number:x}")
+}
+
+/// `max(now, previous + 1)`, claimed atomically; `None` once the counter cannot
+/// rise, because saturating there would hand the same number out forever.
+fn mint_number(last: &AtomicU64, now: u64) -> Option<u64> {
+    let step = |prev: u64| {
+        if now > prev {
+            Some(now)
+        } else {
+            prev.checked_add(1)
+        }
+    };
+    last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, step)
+        .ok()
+        .and_then(step)
 }
 
 /// One TL-authored unit of work.
@@ -1612,6 +1645,72 @@ mod tests {
             "the worktree is still on disk, so the record of it must survive"
         );
         assert_eq!(run.branch, "task/x");
+    }
+
+    #[test]
+    fn minted_sub_task_ids_never_repeat_or_go_backwards() {
+        // The bug being removed: positional ids meant `st-1` before a replan and
+        // `st-1` after it named two different pieces of work. A mint that can
+        // collide inside one planning burst would leave exactly that.
+        use std::collections::HashSet;
+
+        let ids: Vec<String> = (0..4000).map(|_| mint_sub_task_id()).collect();
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "every minted id must be distinct");
+
+        let mut previous = 0u64;
+        for id in &ids {
+            let hex = id
+                .strip_prefix("st-")
+                .unwrap_or_else(|| panic!("id must be `st-<hex>`, got {id}"));
+            let value = u64::from_str_radix(hex, 16)
+                .unwrap_or_else(|_| panic!("id must carry a hex number, got {id}"));
+            assert!(
+                value > previous,
+                "the sequence must strictly increase: {value} came after {previous}"
+            );
+            previous = value;
+        }
+    }
+
+    #[test]
+    fn a_frozen_clock_still_mints_distinct_rising_numbers() {
+        // The atomic is the whole mechanism, and a real clock hides whether it is
+        // there — reads usually tick on their own. Freeze the timestamp so only
+        // the bump can make these differ.
+        use std::collections::HashSet;
+
+        let last = AtomicU64::new(0);
+        let frozen = 1_700_000_000_000_000_000_u64;
+        let numbers: Vec<u64> = (0..1000)
+            .map(|_| mint_number(&last, frozen).expect("the counter is nowhere near its ceiling"))
+            .collect();
+
+        let unique: HashSet<&u64> = numbers.iter().collect();
+        assert_eq!(unique.len(), numbers.len(), "same nanosecond, same id");
+        assert!(
+            numbers.windows(2).all(|pair| pair[1] > pair[0]),
+            "the sequence must rise even while the clock stands still"
+        );
+        assert_eq!(numbers[0], frozen, "the first mint is the clock reading");
+    }
+
+    #[test]
+    fn a_counter_at_its_ceiling_refuses_instead_of_repeating() {
+        // Saturating at `u64::MAX` would hand the same number out forever, which
+        // is the duplicate-id bug this function exists to remove.
+        let last = AtomicU64::new(u64::MAX - 1);
+        let first = mint_number(&last, 5);
+        let second = mint_number(&last, 5);
+
+        assert_eq!(first, Some(u64::MAX), "the last number is still mintable");
+        assert_ne!(first, second, "the ceiling must not repeat a number");
+        assert_eq!(second, None, "an exhausted counter mints nothing");
+        assert_eq!(
+            last.load(Ordering::Relaxed),
+            u64::MAX,
+            "a refused mint must not move the counter"
+        );
     }
 
     #[test]
