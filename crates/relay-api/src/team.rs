@@ -197,7 +197,68 @@ pub struct TaskSpec {
     pub quality_rules: String,
 }
 
+/// A field-by-field rewrite of the task definition. `None` keeps what is there.
+///
+/// Separate from `TaskSpec` so "keep it" and "make it empty" stay different
+/// answers — a reopen that named one field must not blank the four it did not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaskSpecUpdates {
+    pub title: Option<String>,
+    pub context: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub agreed_scope: Option<String>,
+    pub quality_rules: Option<String>,
+}
+
+impl TaskSpecUpdates {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.context.is_none()
+            && self.acceptance_criteria.is_none()
+            && self.agreed_scope.is_none()
+            && self.quality_rules.is_none()
+    }
+
+    /// Which fields this would rewrite, for the card to show before the user
+    /// confirms. Approving a definition change you cannot see is not approval.
+    pub fn changed_fields(&self) -> Vec<&'static str> {
+        [
+            ("title", self.title.is_some()),
+            ("context", self.context.is_some()),
+            ("acceptance criteria", self.acceptance_criteria.is_some()),
+            ("agreed scope", self.agreed_scope.is_some()),
+            ("quality rules", self.quality_rules.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| present.then_some(name))
+        .collect()
+    }
+}
+
 impl TaskSpec {
+    /// Rewrite the named fields for a new cycle.
+    ///
+    /// REPLACES, where `widen_scope` appends — and the difference is the point.
+    /// An investigation's "change no code" has to be able to BECOME "change the
+    /// code"; appending would leave both on the page and the reviewer picking.
+    pub fn apply_updates(&mut self, updates: &TaskSpecUpdates) -> bool {
+        let mut changed = false;
+        for (field, value) in [
+            (&mut self.title, &updates.title),
+            (&mut self.context, &updates.context),
+            (&mut self.acceptance_criteria, &updates.acceptance_criteria),
+            (&mut self.agreed_scope, &updates.agreed_scope),
+            (&mut self.quality_rules, &updates.quality_rules),
+        ] {
+            if let Some(replacement) = value {
+                *field = replacement.clone();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Append to the scope the MR gate measures against. Appends rather than
     /// replaces so the original ask stays readable next to what was added.
     pub fn widen_scope(&mut self, addition: &str) -> bool {
@@ -562,6 +623,11 @@ pub struct TeamRun {
     #[serde(default)]
     pub pending_user_notes: Vec<String>,
 
+    /// How many times a finished run was reopened. Kept so "Done" stays
+    /// readable as a fact about a moment rather than about the run forever.
+    #[serde(default)]
+    pub reopened_count: u32,
+
     pub dev_provider: String,
     pub dev_model: String,
     #[serde(default)]
@@ -907,6 +973,43 @@ impl TeamRun {
                 task.status = SubTaskStatus::Pending;
             }
         }
+    }
+
+    /// Put escalated sub-tasks back to work, because a user note is the user
+    /// asking for another go. Returns whether anything was revived.
+    ///
+    /// Two things have to move together or the note still has nowhere to land.
+    /// The per-cycle closure state goes with the revival — `finalize` refuses a
+    /// run with `unresolved` entries, so leaving the old findings behind means a
+    /// run that has since been fixed can never reach `Done`. And the phase has
+    /// to come back to `SubTasks`: `next_team_action` only looks at sub-tasks
+    /// there, so a run already at the gate walks straight past the revived one.
+    ///
+    /// A sub-task mid-round keeps its spent rounds — refunding work in flight
+    /// would hand out budget nobody asked for.
+    pub fn revive_escalated_sub_tasks(&mut self) -> bool {
+        let mut revived = false;
+        for task in &mut self.sub_tasks {
+            if task.status == SubTaskStatus::Escalated {
+                task.status = SubTaskStatus::Pending;
+                task.rounds_used = 0;
+                task.digested = false;
+                revived = true;
+            }
+        }
+        if !revived {
+            return false;
+        }
+        self.design_review_rounds = 0;
+        self.mr_rounds_used = 0;
+        self.unresolved.clear();
+        self.mr_verdict = None;
+        self.design_verdict = None;
+        if matches!(self.phase, TeamPhase::MrGate | TeamPhase::Wrapping) {
+            self.phase = TeamPhase::SubTasks;
+        }
+        self.updated_at = unix_now();
+        true
     }
 
     /// The sub-task the run is currently working, for display. Derived, so it can

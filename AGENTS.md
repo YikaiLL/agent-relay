@@ -32,6 +32,75 @@ fake) to web/mobile frontends. Rust workspace + Node worker + Vite frontend.
 - Browser e2e (`npm run test:browser:*`) is slow and needs playwright — **don't
   run by default, only when needed**.
 
+## Driving the relay from a script
+
+The relay is a plain JSON HTTP API on `127.0.0.1:8787` (`npm run dev:full`), so
+an agent can drive it without a browser. On loopback with no `RELAY_API_TOKEN`
+set, send `X-Agent-Relay-CSRF: 1` and nothing else; with a token, send
+`Authorization: Bearer $RELAY_API_TOKEN` instead. Every mutating call needs a
+non-empty `device_id` — any string; pairing is for remote clients.
+
+- `GET /api/health`, `GET /api/session` — the snapshot everything else reads back
+  from (`beta_features_enabled`, `orchestrator_thread_id`, `orchestrator_proposals`).
+- `POST /api/session/message` `{text, thread_id, device_id}` — send a turn.
+- `POST /api/session/start`, `GET /api/threads`, `GET /api/providers/:p/models`.
+
+`scripts/verify-orchestrator-mcp.mjs` is the worked example: it boots a relay on
+a free port with its own `RELAY_STATE_PATH` and drives it end to end. Copy that
+rather than re-deriving it, and give your relay its own port and state path so it
+cannot disturb one already running.
+
+## Turning Tasks and Task Teams on
+
+Both are **beta-gated and need two things at once**: a build with
+`--features private` AND `SEALWIRE_BETA=1`. Either alone leaves
+`beta_features_enabled: false` and every task route refuses with a message that
+reads like a product limit rather than a missing build.
+
+```sh
+scripts/with-private.sh cargo build -p relay-server --features private
+SEALWIRE_BETA=1 target/debug/relay-server
+```
+
+`npm run dev:full` already does both when the private crate is present. The
+workspace must also be trusted before a team run may start — `POST
+/api/workspace/trust {cwd, trusted: true}`, plus `POST /api/allowed-roots`.
+
+Then, driving it:
+
+- `POST /api/orchestrator/ensure {device_id}` → the Orchestrator thread id.
+  Message that thread and it decides what to do; it only ever stages a **card**.
+- `GET /api/orchestrator/tools`, `POST /api/orchestrator/tools/:name/call`
+  `{arguments, device_id}` — the same tools, callable directly. Refusals come
+  back as `200` with `isError: true` and a readable reason.
+- `POST /api/orchestrator/proposals/:id/confirm {device_id}` — **the only thing
+  that starts work.** No tool starts a run; confirming is the user's.
+- `GET /api/session/teams` — every run, with phase and per-sub-task status.
+
+The task-team engine itself — the driver loop and the role prompts — lives in the
+`sealwire-private` crate, swapped into `crates/sealwire-private/` by
+`scripts/with-private.sh`. Its public seams are `orchestrator_tools.rs` (the tool
+registry), `state/app/orchestrator_dispatch.rs` (handlers) and `state/app/team.rs`
+(run lifecycle); a public checkout has the stub and everything above degrades to
+a clear refusal. See `PRIVATE_CRATE.md`.
+
+## Verifying in a real browser
+
+For anything about layout, width, or what is actually on screen, drive a real
+browser — do not reason from the cascade, and do not add a source-level CSS
+guard, which stays green through real bugs.
+
+- `scripts/live-browser.mjs` — opens the **real system Chrome** and screenshots.
+- `scripts/e2e/harness/browser.mjs` — headless Chromium for CI-shaped tests;
+  `scripts/e2e/harness/project-switcher.mjs` and
+  `scripts/browser-remote-mobile-header-e2e.mjs` are the header/phone references.
+- `npm run test:browser:android` — the Android-web viewport suite.
+
+**`innerText` is not evidence.** Chromium returns the full string even when CSS
+has clipped it to an ellipsis, so a DOM assertion can pass on text nobody can
+read. Prove it with a screenshot, or with `scrollWidth` vs `clientWidth` /
+`getBoundingClientRect`.
+
 ## Committing
 
 **Use `scripts/commit.sh` instead of `git commit`.** It takes the same

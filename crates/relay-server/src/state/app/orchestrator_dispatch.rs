@@ -258,6 +258,46 @@ impl AppState {
         }
     }
 
+    /// What the seat MCP path offers. Shapes what a seat is handed; it does not
+    /// stop one that calls the API directly — see `SEAT_TOOLS`.
+    pub async fn list_team_seat_tools(&self) -> Vec<OrchestratorToolView> {
+        orchestrator_tools::seat_tools()
+            .into_iter()
+            .map(|spec| OrchestratorToolView {
+                name: spec.name.to_string(),
+                description: spec.summary.to_string(),
+                input_schema: spec.input_schema(),
+            })
+            .collect()
+    }
+
+    /// The seat entry point: reads only, and only its own run. Reached when the
+    /// caller says it is a seat — that claim is not verified.
+    pub async fn call_team_seat_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        seat_run_id: &str,
+    ) -> Result<String, String> {
+        if !orchestrator_tools::SEAT_TOOLS.contains(&name) {
+            return Err(format!(
+                "{name} is not something the team may call — only {}",
+                orchestrator_tools::SEAT_TOOLS.join(", ")
+            ));
+        }
+        match orchestrator_tools::parse_call(name, args)? {
+            ToolCall::TaskDefinition { .. } => {
+                let relay = self.relay.read().await;
+                let run = relay
+                    .team_runs_snapshot()
+                    .find(|run| run.id == seat_run_id)
+                    .ok_or_else(|| "this task is gone".to_string())?;
+                Ok(task_definition_block(&run.id, &run.spec))
+            }
+            _ => Err(format!("{name} is not something the team may call")),
+        }
+    }
+
     /// Run a tool; `Err` is a refused call for the model to read (not HTTP 500).
     pub async fn call_orchestrator_tool(
         &self,
@@ -429,17 +469,48 @@ answers keyed by the question text above)",
                 }
                 Ok(blocks.join("\n\n"))
             }
+            ToolCall::ProposeReopen {
+                text,
+                run_id,
+                updates,
+            } => {
+                let receipt = self
+                    .propose_orchestrator_reopen(run_id, &text, &updates, device_id)
+                    .await
+                    .map_err(|error| format!("propose_reopen: {error}"))?;
+                let rewritten = receipt.proposal.spec_updates.changed_fields();
+                Ok(format!(
+                    "Staged {} to reopen \"{}\". It has NOT started — the user confirms the card.{}",
+                    receipt.proposal.id,
+                    receipt.proposal.title,
+                    if rewritten.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" It rewrites the {} for this cycle.", rewritten.join(", "))
+                    }
+                ))
+            }
             ToolCall::MessageTeam { text, run_id } => {
                 let target = self.one_live_run(run_id.as_deref()).await?;
+                let mut revived = false;
                 {
                     let mut relay = self.relay.write().await;
                     relay.update_team_run(&target, |run| {
                         run.pending_user_notes.push(text.clone());
+                        // A note is a request for another go, so it buys one.
+                        // Otherwise it lands in a run whose sub-task already
+                        // spent its rounds and nothing can act on it.
+                        revived = run.revive_escalated_sub_tasks();
                     });
                     relay.notify();
                 }
                 Ok(format!(
-                    "Left for {target}: {text}. The team reads it on its next turn."
+                    "Left for {target}: {text}. The team reads it on its next turn.{}",
+                    if revived {
+                        " A sub-task that had run out of review rounds is back at work with a fresh budget."
+                    } else {
+                        ""
+                    }
                 ))
             }
             ToolCall::WidenScope { addition, run_id } => {
@@ -1051,6 +1122,281 @@ mod tests {
         );
     }
 
+    /// A reopened task is a NEW cycle, and the definition it finished under is
+    /// often the wrong one to grade it by. An investigation whose criteria say
+    /// "no code was changed" cannot be reopened as "now change the code": the
+    /// reviewer keeps marking every edit against the old bar, and the team lead
+    /// stalls asking which of the two to believe. So the card has to be able to
+    /// carry a rewritten definition, and show it before anyone confirms.
+    #[tokio::test]
+    async fn a_reopen_can_rewrite_the_task_definition_for_the_new_cycle() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.status = relay_api::team::TeamRunStatus::Escalated;
+                run.spec.acceptance_criteria = "No code was changed.".to_string();
+                run.spec.agreed_scope = "Investigation only.".to_string();
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "propose_reopen",
+            &json!({
+                "text": "Now actually fix it.",
+                "title": "Fix the truncated project name",
+                "context": "The investigation landed; this cycle implements it.",
+                "acceptance_criteria": "A failing test pins a 4-character name, then passes.",
+                "agreed_scope": "Product code under frontend/ may change.",
+            }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("propose_reopen with a rewritten definition");
+
+        let card = app
+            .snapshot()
+            .await
+            .orchestrator_proposals
+            .first()
+            .cloned()
+            .expect("a card is staged");
+        assert_eq!(card.kind, "reopen_task");
+        assert_eq!(
+            card.title, "Fix the truncated project name",
+            "the card headline has to read as the work now being asked for"
+        );
+        assert_eq!(
+            card.spec_updates.acceptance_criteria.as_deref(),
+            Some("A failing test pins a 4-character name, then passes."),
+            "the bar the reviewer grades against is the whole point"
+        );
+        assert_eq!(
+            card.spec_updates.agreed_scope.as_deref(),
+            Some("Product code under frontend/ may change.")
+        );
+        assert_eq!(
+            card.spec_updates.quality_rules, None,
+            "a field nobody named must stay untouched, not be blanked"
+        );
+        assert_eq!(
+            card.context, "Now actually fix it.",
+            "the instruction stays the card body — it is what the user is approving"
+        );
+    }
+
+    /// Omitting every override has to keep working exactly as before, or the
+    /// plain "carry on" reopen starts blanking the task it is carrying on.
+    #[tokio::test]
+    async fn a_reopen_without_overrides_keeps_the_definition_it_had() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.status = relay_api::team::TeamRunStatus::Done;
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "propose_reopen",
+            &json!({ "text": "Keep going on that one." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("propose_reopen");
+
+        let card = app
+            .snapshot()
+            .await
+            .orchestrator_proposals
+            .first()
+            .cloned()
+            .expect("a card is staged");
+        assert_eq!(card.title, "Investigate the loader");
+        assert!(
+            card.spec_updates.is_empty(),
+            "nothing was asked for, so nothing may be rewritten"
+        );
+    }
+
+    /// A note is the user asking for another go, so it has to buy one. Without
+    /// this the note lands in a run whose sub-task already spent its two review
+    /// rounds, and there is nothing left that can act on it — which is exactly
+    /// how a "go and take the screenshots" instruction was read and then
+    /// dropped.
+    #[tokio::test]
+    async fn a_note_buys_an_escalated_sub_task_another_review_round() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(relay_api::team::SubTask {
+                    id: "st-1".to_string(),
+                    title: "Diagnose it".to_string(),
+                    status: relay_api::team::SubTaskStatus::Escalated,
+                    rounds_used: relay_api::team::MAX_SUBTASK_REVIEW_ROUNDS,
+                    digested: true,
+                    ..Default::default()
+                });
+                run.unresolved
+                    .push("sub-task \"Diagnose it\" was not approved".to_string());
+                run.mr_rounds_used = relay_api::team::MAX_MR_ROUNDS;
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "message_team",
+            &json!({ "text": "You never took the screenshots — go and take them." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("message_team");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        let sub = &run.sub_tasks[0];
+        assert_eq!(
+            sub.status,
+            relay_api::team::SubTaskStatus::Pending,
+            "an escalated sub-task has to become workable again, or the note has nowhere to land"
+        );
+        assert_eq!(sub.rounds_used, 0, "the review budget has to come back too");
+        assert!(
+            !sub.digested,
+            "its outcome is no longer final, so the TL must hear the new one"
+        );
+        assert!(
+            run.unresolved.is_empty(),
+            "stale findings would keep the run from ever finishing: {:?}",
+            run.unresolved
+        );
+        assert_eq!(
+            run.mr_rounds_used, 0,
+            "the gate budget is per cycle as well"
+        );
+    }
+
+    /// Reviving the sub-task is not enough on its own. `next_team_action` only
+    /// looks at sub-tasks while the run is in `SubTasks`; a run that already
+    /// reached the gate would walk straight past the revived one and finish.
+    #[tokio::test]
+    async fn a_note_rewinds_a_run_that_already_reached_the_gate() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.phase = relay_api::team::TeamPhase::MrGate;
+                run.sub_tasks.push(relay_api::team::SubTask {
+                    id: "st-1".to_string(),
+                    title: "Diagnose it".to_string(),
+                    status: relay_api::team::SubTaskStatus::Escalated,
+                    rounds_used: relay_api::team::MAX_SUBTASK_REVIEW_ROUNDS,
+                    digested: true,
+                    ..Default::default()
+                });
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "message_team",
+            &json!({ "text": "Go back and take the screenshots." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("message_team");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.phase,
+            relay_api::team::TeamPhase::SubTasks,
+            "the revived sub-task is unreachable from the gate"
+        );
+    }
+
+    /// A note that revives nothing must not drag a run backwards. Rewinding a
+    /// healthy gate would re-run the whole review for a passing remark.
+    #[tokio::test]
+    async fn a_note_that_revives_nothing_leaves_the_phase_where_it_was() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.phase = relay_api::team::TeamPhase::MrGate;
+                run.sub_tasks.push(relay_api::team::SubTask {
+                    id: "st-1".to_string(),
+                    title: "Landed fine".to_string(),
+                    status: relay_api::team::SubTaskStatus::Done,
+                    rounds_used: 1,
+                    digested: true,
+                    ..Default::default()
+                });
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "message_team",
+            &json!({ "text": "Nice work — mention the caret in the report." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("message_team");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(run.phase, relay_api::team::TeamPhase::MrGate);
+        assert_eq!(
+            run.sub_tasks[0].status,
+            relay_api::team::SubTaskStatus::Done,
+            "an approved sub-task is not reopened by a passing remark"
+        );
+    }
+
+    /// The budget is per NOTE, not per run: two notes must not compound into
+    /// four rounds, and a note left while nothing is escalated must not quietly
+    /// hand a healthy sub-task a fresh budget mid-round.
+    #[tokio::test]
+    async fn a_note_leaves_a_sub_task_that_is_still_working_alone() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(relay_api::team::SubTask {
+                    id: "st-1".to_string(),
+                    title: "Still going".to_string(),
+                    status: relay_api::team::SubTaskStatus::Implementing,
+                    rounds_used: 1,
+                    ..Default::default()
+                });
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "message_team",
+            &json!({ "text": "Also check the drawer." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("message_team");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        let sub = &run.sub_tasks[0];
+        assert_eq!(sub.status, relay_api::team::SubTaskStatus::Implementing);
+        assert_eq!(
+            sub.rounds_used, 1,
+            "a round already spent on work in flight is not refunded"
+        );
+    }
+
     #[tokio::test]
     async fn widening_scope_appends_and_the_team_can_read_it_back() {
         let project = TempDir::new().expect("tempdir");
@@ -1077,6 +1423,91 @@ mod tests {
             .await
             .expect("task_definition");
         assert!(reply.contains("The loader too."), "{reply}");
+    }
+
+    /// The seat path serves reads and refuses the rest.
+    #[tokio::test]
+    async fn the_seat_path_serves_reads_and_refuses_writes() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+
+        let reply = app
+            .call_team_seat_tool("task_definition", &json!({}), &run_id)
+            .await
+            .expect("a seat may read its task");
+        assert!(reply.contains("Investigation only."), "{reply}");
+
+        for forbidden in ["widen_scope", "propose_task", "message_team", "control_run"] {
+            let err = app
+                .call_team_seat_tool(forbidden, &json!({ "addition": "x", "text": "x" }), &run_id)
+                .await
+                .expect_err("the seat path must refuse this");
+            assert!(err.contains("not something the team may call"), "{err}");
+        }
+    }
+
+    /// Naming another run on the seat path still answers with its own.
+    #[tokio::test]
+    async fn the_seat_path_answers_with_its_own_task_whatever_is_named() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+
+        let mut other = relay_api::team::TeamRun::new(
+            "run-other".to_string(),
+            crate::state::TaskSpec {
+                title: "Someone else's task".to_string(),
+                agreed_scope: "Not yours.".to_string(),
+                ..Default::default()
+            },
+            cwd.to_string(),
+            "device-1".to_string(),
+        );
+        other.status = relay_api::team::TeamRunStatus::Running;
+        {
+            let mut relay = app.relay.write().await;
+            relay.insert_team_run(other);
+        }
+
+        let reply = app
+            .call_team_seat_tool(
+                "task_definition",
+                &json!({ "run_id": "run-other" }),
+                &run_id,
+            )
+            .await
+            .expect("still answers");
+        assert!(
+            reply.contains("Investigation only."),
+            "its own task: {reply}"
+        );
+        assert!(
+            !reply.contains("Not yours."),
+            "leaked another task: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_seat_toolset_is_a_subset_of_what_exists() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+
+        let seat: Vec<String> = app
+            .list_team_seat_tools()
+            .await
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(!seat.is_empty());
+        for name in &seat {
+            assert!(
+                orchestrator_tools::spec_for(name).is_some(),
+                "{name} is offered to seats but is not a real tool"
+            );
+        }
+        assert!(!seat.contains(&"widen_scope".to_string()));
     }
 
     #[tokio::test]

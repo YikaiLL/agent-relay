@@ -535,8 +535,10 @@ async fn a_session_already_living_in_the_worktree_cannot_be_resumed_into_it() {
     assert!(error.contains("belongs to a running task"), "{error}");
 }
 
+/// Tasks run concurrently. Each still gets its own worktree and branch, which
+/// is what kept them apart when only one could run.
 #[tokio::test]
-async fn a_second_task_is_refused_while_one_is_live() {
+async fn a_second_task_starts_alongside_a_live_one_on_its_own_worktree() {
     let (_repo, root) = init_team_repo().await;
     let (app, providers) = build_review_app(&root, &["codex"]).await;
     providers
@@ -545,17 +547,24 @@ async fn a_second_task_is_refused_while_one_is_live() {
         .complete_turns
         .store(false, Ordering::Relaxed);
 
-    app.start_team_run(team_input(&root))
-        .await
-        .expect("the first task should start");
-    let error = app
+    let first = app
         .start_team_run(team_input(&root))
         .await
-        .expect_err("M1 runs one task at a time");
-    assert!(
-        error.contains("already running"),
-        "error should say why: {error}"
+        .expect("the first task should start");
+    let second = app
+        .start_team_run(team_input(&root))
+        .await
+        .expect("a second task runs alongside the first");
+    assert_ne!(first, second);
+
+    let relay = app.relay.read().await;
+    let first_run = relay.team_run(&first).expect("first").clone();
+    let second_run = relay.team_run(&second).expect("second").clone();
+    assert_ne!(
+        first_run.cwd, second_run.cwd,
+        "two live tasks sharing a worktree would write over each other"
     );
+    assert_ne!(first_run.branch, second_run.branch);
 }
 
 #[tokio::test]

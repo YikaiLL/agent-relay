@@ -460,6 +460,24 @@ function seatAgentLabel(agent) {
 // provider, a pricier model, `max` effort on every seat. Showing only the title
 // asked the user to approve spend they could not see, so any seat that names
 // something is listed here before the Start button.
+/// Which parts of the task definition this card rewrites, in the order the
+/// brief reads. Names match the labels the team sees, not the wire keys.
+const SPEC_FIELD_LABELS = [
+  ["title", "title"],
+  ["context", "context"],
+  ["acceptance_criteria", "acceptance criteria"],
+  ["agreed_scope", "agreed scope"],
+  ["quality_rules", "quality rules"],
+];
+
+function rewrittenFields(proposal) {
+  const updates = proposal?.spec_updates;
+  if (!updates) return [];
+  return SPEC_FIELD_LABELS.filter(([key]) => typeof updates[key] === "string").map(
+    ([, label]) => label
+  );
+}
+
 function ProposalAgentSummary({ agents }) {
   const rows = PROPOSAL_SEATS.map(([seat, label]) => [label, seatAgentLabel(agents?.[seat])]).filter(
     ([, value]) => value,
@@ -486,8 +504,20 @@ function OrchestratorProposalCard({ proposal, busy = false, onConfirm = null, on
     h(
       "div",
       { className: "task-orch-card-head" },
-      h("span", { className: "task-orch-card-tag" }, "Propose task"),
-      h("span", { className: "task-orch-card-state" }, proposal.team_name || "Default")
+      h(
+        "span",
+        { className: "task-orch-card-tag" },
+        proposal.kind === "reopen_task" ? "Reopen task" : "Propose task"
+      ),
+      // A reopen names no team: it puts the task back on the one it already ran
+      // with. Falling back to "Default" would claim a choice nobody made.
+      h(
+        "span",
+        { className: "task-orch-card-state" },
+        proposal.kind === "reopen_task"
+          ? "continues on its own branch"
+          : proposal.team_name || "Default"
+      )
     ),
     h("h3", { className: "task-orch-card-title" }, proposal.title || "Untitled task"),
     proposal.why
@@ -495,6 +525,15 @@ function OrchestratorProposalCard({ proposal, busy = false, onConfirm = null, on
       : proposal.context
         ? h("p", { className: "task-orch-card-body" }, proposal.context)
         : null,
+    // A reopen may rewrite the brief the reviewer grades against. Confirm is
+    // the only gate on that, so say which fields move before it is pressed.
+    rewrittenFields(proposal).length
+      ? h(
+          "p",
+          { className: "task-orch-card-note" },
+          `Rewrites the ${rewrittenFields(proposal).join(", ")} for this run.`
+        )
+      : null,
     h(ProposalAgentSummary, { agents: proposal.agents }),
     h(
       "div",

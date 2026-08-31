@@ -1584,6 +1584,19 @@ impl RelayState {
     /// is not the pin, the device id was lost, or the acting device is explicitly
     /// revoked in device records. Unpaired ids are allowed — the local browser
     /// surface uses a localStorage UUID that never enters `paired_devices`.
+    /// The live run this thread is a seat of, if any. Terminal runs are skipped:
+    /// a finished task has nothing left to steer.
+    pub(crate) fn seat_run_id_for_thread(&self, thread_id: &str) -> Option<String> {
+        self.team_runs_snapshot()
+            .filter(|run| !run.status.is_terminal())
+            .find(|run| {
+                run.owned_thread_ids()
+                    .iter()
+                    .any(|owned| owned == thread_id)
+            })
+            .map(|run| run.id.clone())
+    }
+
     pub(crate) fn orchestrator_session_options(
         &self,
         thread_id: &str,
@@ -2340,15 +2353,11 @@ impl RelayState {
     /// this gates starting another. A `Paused` run counts: it still owns its
     /// worktree and threads and expects to be resumed.
     #[allow(dead_code)]
-    pub(crate) fn has_active_team_run(&self) -> bool {
-        self.team_runs.values().any(|run| !run.status.is_terminal())
-    }
-
     /// Resolve the run a whole-run action targets.
     ///
-    /// An omitted id is allowed only while it is unambiguous. M1 runs one task at
-    /// a time, so that is the normal case — but the ambiguity is checked rather
-    /// than assumed, because the cap is a policy in `start_team_run` and this has
+    /// An omitted id is allowed only while it is unambiguous. Tasks run
+    /// concurrently, so the ambiguity is real and checked rather than assumed,
+    /// because the resolution belongs here and not in any one caller. This has
     /// to keep telling the truth when that policy relaxes.
     pub(crate) fn active_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
         if let Some(run_id) = run_id {
@@ -2391,6 +2400,33 @@ impl RelayState {
             [] => Err("there is no blocked task to resolve".to_string()),
             [run] => Ok(run.id.clone()),
             _ => Err("team_run_id is required when more than one task is blocked".to_string()),
+        }
+    }
+
+    /// Resolve the run a reopen targets. Only a run that FINISHED qualifies: a
+    /// cancelled or failed one is something to look at, not to carry on.
+    pub(crate) fn reopenable_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
+        let finished =
+            |run: &TeamRun| matches!(run.status, TeamRunStatus::Done | TeamRunStatus::Escalated);
+        if let Some(run_id) = run_id {
+            return match self.team_runs.get(run_id) {
+                Some(run) if finished(run) => Ok(run.id.clone()),
+                Some(run) => Err(format!(
+                    "only a finished task can be reopened; this one is {}",
+                    run.status.as_str()
+                )),
+                None => Err("there is no task with that id".to_string()),
+            };
+        }
+        let done: Vec<&TeamRun> = self
+            .team_runs
+            .values()
+            .filter(|run| finished(run))
+            .collect();
+        match done.as_slice() {
+            [] => Err("no task has finished, so there is nothing to reopen".to_string()),
+            [run] => Ok(run.id.clone()),
+            _ => Err("team_run_id is required when more than one task has finished".to_string()),
         }
     }
 

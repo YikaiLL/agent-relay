@@ -2729,8 +2729,11 @@ impl TaskSeatAgentsView {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrchestratorProposalView {
     pub id: String,
-    /// Wire discriminator — today only `start_task`.
+    /// Wire discriminator: `start_task` or `reopen_task`.
     pub kind: String,
+    /// The finished run a `reopen_task` card puts back to work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopen_run_id: Option<String>,
     pub title: String,
     #[serde(default)]
     pub context: String,
@@ -2745,6 +2748,13 @@ pub struct OrchestratorProposalView {
     pub team_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// How a `reopen_task` card rewrites the task definition for the new cycle.
+    /// Empty means it carries on under the one it finished with.
+    #[serde(
+        default,
+        skip_serializing_if = "relay_api::team::TaskSpecUpdates::is_empty"
+    )]
+    pub spec_updates: relay_api::team::TaskSpecUpdates,
     /// Per-seat agent choice, already merged. Empty means every seat takes the
     /// relay default.
     #[serde(default, skip_serializing_if = "TaskSeatAgentsView::is_empty")]
@@ -3185,6 +3195,10 @@ pub struct TeamRunView {
     pub tl_thread_id: String,
     /// How many team leads this run has had. Anything above 1 means a re-seed.
     pub tl_generations: usize,
+    /// Times this run finished and was put back to work. Above 0, "Done" is a
+    /// fact about a past moment rather than about the run now.
+    #[serde(default)]
+    pub reopened_count: u32,
     pub sub_tasks: Vec<TeamSubTaskView>,
     pub awaiting: Option<TeamAwaitingView>,
     pub unresolved: Vec<String>,

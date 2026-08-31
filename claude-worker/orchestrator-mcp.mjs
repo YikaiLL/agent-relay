@@ -12,6 +12,9 @@ import {
 
 const RELAY_URL = process.env.SEALWIRE_RELAY_URL || "http://127.0.0.1:8787";
 const DEVICE_ID = process.env.SEALWIRE_DEVICE_ID || null;
+// Set for a team seat instead of a device. Picks the read-only toolset and
+// scopes every answer to that run.
+const SEAT_RUN_ID = process.env.SEALWIRE_SEAT_RUN_ID || null;
 const API_TOKEN = process.env.RELAY_API_TOKEN || null;
 
 function headers() {
@@ -36,7 +39,10 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const body = await relayJson("/api/orchestrator/tools", { method: "GET" });
+  const path = SEAT_RUN_ID
+    ? `/api/orchestrator/tools?seat_run_id=${encodeURIComponent(SEAT_RUN_ID)}`
+    : "/api/orchestrator/tools";
+  const body = await relayJson(path, { method: "GET" });
   const tools = body?.data?.tools ?? body?.tools ?? [];
   return {
     tools: tools.map((tool) => ({
@@ -54,7 +60,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Refused calls are 200 + isError (model can correct); don't throw those.
     return await relayJson(`/api/orchestrator/tools/${encodeURIComponent(name)}/call`, {
       method: "POST",
-      body: JSON.stringify({ arguments: args, device_id: DEVICE_ID }),
+      body: JSON.stringify({
+        arguments: args,
+        device_id: DEVICE_ID,
+        seat_run_id: SEAT_RUN_ID,
+      }),
     });
   } catch (error) {
     // Transport failure → tool result, not a session fault.

@@ -54,6 +54,7 @@ impl AppState {
         let proposal = OrchestratorProposalView {
             id: format!("orch_prop_{}", crate::state::app::review::random_suffix()),
             kind: "start_task".to_string(),
+            reopen_run_id: None,
             title,
             context,
             acceptance_criteria,
@@ -63,6 +64,8 @@ impl AppState {
             team_version_id,
             team_name,
             why,
+            // A fresh task IS its definition; only a reopen rewrites one.
+            spec_updates: Default::default(),
             agents: input.agents,
             created_at: unix_now(),
         };
@@ -145,6 +148,74 @@ impl AppState {
         })
     }
 
+    /// Stage a card that puts a finished run back to work.
+    ///
+    /// Eligibility is checked now so the user is not offered a card that will
+    /// fail on confirm; it is checked AGAIN on confirm, because the run can
+    /// settle differently in between.
+    pub async fn propose_orchestrator_reopen(
+        &self,
+        run_id: Option<String>,
+        instruction: &str,
+        updates: &relay_api::team::TaskSpecUpdates,
+        device_id: Option<String>,
+    ) -> Result<ProposeOrchestratorTaskReceipt, String> {
+        if !self.beta_features_enabled().await {
+            return Err(super::team::TASKS_LOCKED_MESSAGE.to_string());
+        }
+        let _device_id = require_device_id(device_id.clone())?;
+        let instruction = non_empty(Some(instruction.to_string()))
+            .ok_or_else(|| "say what the team should do now".to_string())?;
+
+        let (target, title) = {
+            let relay = self.relay.read().await;
+            let target = relay.reopenable_team_run_id(run_id.as_deref())?;
+            // The headline reads as the work being asked for NOW, so an
+            // overridden title shows on the card the user is approving.
+            let title = updates.title.clone().unwrap_or_else(|| {
+                relay
+                    .team_run(&target)
+                    .map(|run| run.spec.title.clone())
+                    .unwrap_or_default()
+            });
+            (target, title)
+        };
+
+        let proposal = OrchestratorProposalView {
+            id: format!("orch_prop_{}", crate::state::app::review::random_suffix()),
+            kind: "reopen_task".to_string(),
+            reopen_run_id: Some(target),
+            title,
+            context: truncate_chars(instruction, MAX_PROPOSAL_FIELD_CHARS),
+            acceptance_criteria: String::new(),
+            agreed_scope: String::new(),
+            quality_rules: String::new(),
+            team_id: String::new(),
+            team_version_id: String::new(),
+            team_name: String::new(),
+            why: None,
+            spec_updates: updates.clone(),
+            agents: Default::default(),
+            created_at: unix_now(),
+        };
+
+        {
+            let mut relay = self.relay.write().await;
+            if relay.orchestrator_proposals.len() >= MAX_PENDING_PROPOSALS {
+                return Err(format!(
+                    "too many pending Orchestrator proposals (max {MAX_PENDING_PROPOSALS}); confirm or dismiss one first"
+                ));
+            }
+            relay.orchestrator_proposals.push(proposal.clone());
+            relay.notify();
+        }
+
+        Ok(ProposeOrchestratorTaskReceipt {
+            proposal,
+            message: "Reopen ready — confirm to put the team back on it.".to_string(),
+        })
+    }
+
     /// Apply a pending proposal via the ordinary `start_team` path.
     pub async fn confirm_orchestrator_proposal(
         &self,
@@ -165,6 +236,26 @@ impl AppState {
             // Drop before start so a double-click cannot start twice.
             relay.orchestrator_proposals.remove(index)
         };
+
+        if proposal.kind == "reopen_task" {
+            let target = proposal.reopen_run_id.clone();
+            let status = self
+                .reopen_team_run(
+                    target.clone(),
+                    &proposal.context,
+                    &proposal.spec_updates,
+                    Some(device_id),
+                )
+                .await?;
+            let run = self.team_run_snapshot(&target.unwrap_or_default()).await;
+            return Ok(StartTeamReceipt {
+                team_run_id: run.as_ref().map(|run| run.id.clone()).unwrap_or_default(),
+                cwd: run.as_ref().map(|run| run.cwd.clone()).unwrap_or_default(),
+                branch: run.map(|run| run.branch).unwrap_or_default(),
+                status: status.as_str().to_string(),
+                message: "Reopened — the team lead re-reads the task first.".to_string(),
+            });
+        }
 
         let receipt = self
             .start_team(StartTeamInput {

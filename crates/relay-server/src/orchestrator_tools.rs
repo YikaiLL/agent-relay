@@ -23,6 +23,18 @@ use serde_json::{json, Map, Value};
 /// backend cannot drift (past the cap, `propose_task` is refused).
 pub(crate) use crate::state::app::orchestrator_proposals::MAX_PENDING_PROPOSALS;
 
+/// What the seat MCP path serves. NOT an enforcement boundary: a seat has a
+/// shell, and the loopback API trusts any caller that omits `seat_run_id`.
+pub(crate) const SEAT_TOOLS: &[&str] = &["task_definition"];
+
+/// The specs a team seat is offered.
+pub(crate) fn seat_tools() -> Vec<&'static ToolSpec> {
+    TOOLS
+        .iter()
+        .filter(|tool| SEAT_TOOLS.contains(&tool.name))
+        .collect()
+}
+
 /// The seats a task runs on. Order is the pipeline's own.
 pub(crate) const SEATS: &[&str] = &["tl", "dev", "reviewer"];
 
@@ -361,6 +373,58 @@ while it runs or while it is paused; does not resume it.",
         ],
     },
     ToolSpec {
+        name: "propose_reopen",
+        summary: "Put a FINISHED task back to work on its own branch, rewriting \
+any definition field that no longer fits. Stages a card; the user confirms.",
+        effect: Effect::Proposes,
+        params: &[
+            ToolParam {
+                name: "text",
+                kind: ParamKind::Text,
+                required: true,
+                summary: "What the team should do now, in the user's terms.",
+            },
+            ToolParam {
+                name: "run_id",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Which task. Omit when only one has finished.",
+            },
+            ToolParam {
+                name: "title",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement title for this cycle. Omit to keep it.",
+            },
+            ToolParam {
+                name: "context",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement context for this cycle. Omit to keep it.",
+            },
+            ToolParam {
+                name: "acceptance_criteria",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement bar the reviewer grades against — reopening \
+an investigation to implement needs this. Omit to keep it.",
+            },
+            ToolParam {
+                name: "agreed_scope",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement scope. REPLACES, unlike widen_scope, so \
+\"change no code\" can become \"change the code\". Omit to keep it.",
+            },
+            ToolParam {
+                name: "quality_rules",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement quality rules. Omit to keep them.",
+            },
+        ],
+    },
+    ToolSpec {
         name: "control_run",
         summary: "Pause, resume, stop, cancel or unblock a run that is already going.",
         effect: Effect::Acts,
@@ -454,6 +518,7 @@ dismiss one before you can stage another",
         "task_status" if facts.known_runs == 0 => Some("nothing has run yet"),
         "task_definition" if facts.known_runs == 0 => Some("nothing has run yet"),
         "message_team" if facts.known_runs == 0 => Some("nothing has run yet"),
+        "propose_reopen" if facts.known_runs == 0 => Some("nothing has run yet"),
         "widen_scope" if facts.active_runs == 0 => {
             Some("no task is going; scope can only be widened while one is running")
         }
@@ -496,6 +561,11 @@ pub(crate) enum ToolCall {
     MessageTeam {
         text: String,
         run_id: Option<String>,
+    },
+    ProposeReopen {
+        text: String,
+        run_id: Option<String>,
+        updates: relay_api::team::TaskSpecUpdates,
     },
     PendingQuestions,
     TaskStatus {
@@ -683,6 +753,17 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
         "list_agents" => Ok(ToolCall::ListAgents),
         "task_definition" => Ok(ToolCall::TaskDefinition {
             run_id: get("run_id")?,
+        }),
+        "propose_reopen" => Ok(ToolCall::ProposeReopen {
+            text: get("text")?.expect("required param yields Some"),
+            run_id: get("run_id")?,
+            updates: relay_api::team::TaskSpecUpdates {
+                title: get("title")?,
+                context: get("context")?,
+                acceptance_criteria: get("acceptance_criteria")?,
+                agreed_scope: get("agreed_scope")?,
+                quality_rules: get("quality_rules")?,
+            },
         }),
         "message_team" => Ok(ToolCall::MessageTeam {
             text: get("text")?.expect("required param yields Some"),

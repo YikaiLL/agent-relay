@@ -256,15 +256,10 @@ pub(crate) struct TeamStartRequest {
 impl AppState {
     /// Provision a worktree, record the run, and start driving it.
     pub(crate) async fn start_team_run(&self, input: TeamStartRequest) -> Result<String, String> {
-        // One at a time in M1, and the check has to be atomic with the insert or
-        // two requests can both pass it. `acquire_session_slot` is the existing
-        // check-then-act mutex; it is released as soon as the run is recorded, NOT
-        // held for the run's lifetime — holding it would block every unrelated
-        // user operation.
+        // Tasks run concurrently. The slot still serialises the check-then-insert
+        // so two requests cannot both claim the same worktree; it is released as
+        // soon as the run is recorded.
         let _slot = self.acquire_session_slot()?;
-        if self.relay.read().await.has_active_team_run() {
-            return Err("another task is already running; pause or finish it first".to_string());
-        }
 
         let origin_cwd = normalize_cwd(&input.origin_cwd);
         let (allowed_roots, device_scope) = {
@@ -362,6 +357,101 @@ locally and trust it before starting a task team there"
     /// pure function of the record, so there is no second path that could disagree
     /// about where the run left off. All this has to do is prove the run may be
     /// driven, prove nothing else is driving it, and hand the driver its ticket.
+    /// Put a finished run back to work with a new instruction.
+    ///
+    /// Only a run that FINISHED reopens — a cancelled or failed one is not a
+    /// task to continue, it is one to look at. The phase goes back to intake so
+    /// the team lead re-reads the task (now wider) before doing anything.
+    pub(crate) async fn reopen_team_run(
+        &self,
+        run_id: Option<String>,
+        instruction: &str,
+        updates: &relay_api::team::TaskSpecUpdates,
+        device_id: Option<String>,
+    ) -> Result<TeamRunStatus, String> {
+        let instruction = instruction.trim();
+        if instruction.is_empty() {
+            return Err("say what the team should do now".to_string());
+        }
+        // Held across the whole reopen. Reopening makes a terminal run LIVE, so
+        // it needs the same one-at-a-time gate a fresh task takes; holding it
+        // also serialises two reopens of the same run.
+        let _slot = self.acquire_session_slot()?;
+
+        // Resolved before authorizing: the shared resolver only ever finds a LIVE
+        // run, and a reopen targets one that has finished.
+        let requested = {
+            let relay = self.relay.read().await;
+            relay.reopenable_team_run_id(run_id.as_deref())?
+        };
+        let (target, _device_id) = self
+            .authorize_team_action(Some(&requested), device_id.clone())
+            .await?;
+        // Checked before the record moves: a reopen into a tree that is gone
+        // would leave the run un-finished with nowhere to work.
+        if let Err(error) = self.require_team_workspace(&target).await {
+            return Err(match error {
+                TeamPortError::Blocked(message) | TeamPortError::Failed(message) => message,
+                TeamPortError::Settled => "the task settled while reopening".to_string(),
+            });
+        }
+
+        let instruction = instruction.to_string();
+        let restore = {
+            let mut relay = self.relay.write().await;
+            let Some(before) = relay.team_run(&target).cloned() else {
+                return Err("there is no task with that id".to_string());
+            };
+            if !matches!(
+                before.status,
+                TeamRunStatus::Done | TeamRunStatus::Escalated
+            ) {
+                return Err(format!(
+                    "only a finished task can be reopened; this one is {}",
+                    before.status.as_str()
+                ));
+            }
+            relay.update_team_run(&target, |run| {
+                run.status = TeamRunStatus::Paused;
+                run.phase = relay_api::team::TeamPhase::Intake;
+                run.pending_user_notes.push(instruction.clone());
+                // The definition it finished under is often the wrong one to
+                // grade the new cycle by — an investigation's "no code was
+                // changed" cannot survive being reopened to write code. Applied
+                // here so the rollback below restores the old wording too.
+                run.spec.apply_updates(updates);
+                run.reopened_count = run.reopened_count.saturating_add(1);
+                run.error = None;
+                // Per-CYCLE state, not history: the review budgets and the
+                // findings that closed the last cycle. Carried forward, one
+                // rejection would exhaust the budget the previous run spent, and
+                // an escalated run's old findings would keep it from ever
+                // reaching Done.
+                run.design_review_rounds = 0;
+                run.mr_rounds_used = 0;
+                run.unresolved.clear();
+                run.mr_verdict = None;
+                run.design_verdict = None;
+            });
+            relay.notify();
+            before
+        };
+
+        // Resume owns the claim-then-flip dance; duplicating it here would be a
+        // second place for a driver to be spawned twice.
+        match self.resume_team_run(Some(target.clone()), device_id).await {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                // Put the finished record back: a refused reopen must not leave
+                // a Done task looking paused with an instruction nobody will read.
+                let mut relay = self.relay.write().await;
+                relay.update_team_run(&target, |run| *run = restore);
+                relay.notify();
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) async fn resume_team_run(
         &self,
         run_id: Option<String>,
@@ -2325,6 +2415,7 @@ pub(crate) fn team_run_view(run: &TeamRun) -> TeamRunView {
         branch: run.branch.clone(),
         target_ref: run.target_ref.clone(),
         tl_thread_id: run.tl_thread_id.clone(),
+        reopened_count: run.reopened_count,
         tl_generations: run.tl_generation_count(),
         sub_tasks: run
             .sub_tasks

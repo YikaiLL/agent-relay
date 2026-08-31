@@ -2117,6 +2117,14 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-2);
   line-height: var(--leading-relaxed);
 }
+/* What a reopen rewrites in the brief. Set apart from the body because it is a
+   consequence of confirming, not part of the ask. */
+.task-orch-card-note {
+  margin: 0 0 12px;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  line-height: var(--leading-relaxed);
+}
 .task-orch-card-action {
   display: inline-flex;
   margin-bottom: 10px;

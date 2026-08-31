@@ -121,11 +121,20 @@ async fn attach_orchestrator_session(
     thread_id: &str,
     cmd: &mut Value,
 ) {
-    let options = {
+    let (options, seat_run_id) = {
         let relay = state.read().await;
-        relay.orchestrator_session_options(thread_id)
+        (
+            relay.orchestrator_session_options(thread_id),
+            relay.seat_run_id_for_thread(thread_id),
+        )
     };
     let Some((device_id, system_prompt)) = options else {
+        // A seat gets the read-only MCP server and nothing else. `tools` and
+        // `allowedTools` stay untouched: `tools: []` strips Bash/Edit, which is
+        // right for the Orchestrator and would leave a dev seat unable to work.
+        if let Some(run_id) = seat_run_id {
+            cmd["mcpServers"] = seat_mcp_config(worker_path, &run_id);
+        }
         return;
     };
     cmd["mcpServers"] = orchestrator_mcp_config(worker_path, &device_id);
@@ -151,6 +160,20 @@ fn orchestrator_allowed_tools() -> Value {
 }
 
 /// Stdio MCP config beside `worker.mjs` (follows `CLAUDE_WORKER_PATH`).
+/// MCP config for a team seat: same bridge, run id instead of a device id, so
+/// the seat's own tool calls land on the read-only path.
+fn seat_mcp_config(worker_path: &str, run_id: &str) -> Value {
+    let mut config = orchestrator_mcp_config(worker_path, "");
+    if let Some(env) = config["sealwire"]["env"].as_object_mut() {
+        env.remove("SEALWIRE_DEVICE_ID");
+        env.insert(
+            "SEALWIRE_SEAT_RUN_ID".to_string(),
+            Value::String(run_id.to_string()),
+        );
+    }
+    config
+}
+
 fn orchestrator_mcp_config(worker_path: &str, device_id: &str) -> Value {
     let bridge = std::path::Path::new(worker_path)
         .parent()
@@ -2409,6 +2432,61 @@ mod tests {
             .await,
             "a thread created with an opening turn runs that turn at the SDK default",
         );
+    }
+
+    /// A seat's MCP config must not carry a device identity: that is the
+    /// Orchestrator's key, and it unlocks the write tools.
+    #[test]
+    fn a_seats_mcp_config_carries_the_run_and_no_device() {
+        let config = seat_mcp_config("/tmp/claude-worker/worker.mjs", "run-7");
+        let env = config["sealwire"]["env"].as_object().expect("env object");
+        assert_eq!(
+            env.get("SEALWIRE_SEAT_RUN_ID").and_then(|v| v.as_str()),
+            Some("run-7")
+        );
+        assert!(env.get("SEALWIRE_DEVICE_ID").is_none(), "{env:?}");
+    }
+
+    /// `tools: []` is how the Orchestrator is stripped down to a chat surface.
+    /// A dev seat that inherited it could not edit the worktree it exists to
+    /// edit, and a reviewer could not read it.
+    #[tokio::test]
+    async fn attaching_a_seat_leaves_its_coding_tools_alone() {
+        let (_bridge, state) = match spawn_fake_bridge().await {
+            Some(pair) => pair,
+            None => return,
+        };
+        // The thread id has to be set explicitly: `TeamRun::new` leaves it empty,
+        // and an empty id matches no seat, so the assertions below would pass
+        // against the very regression they exist to catch.
+        let thread_id = "seat-thread-1".to_string();
+        let mut run = relay_api::team::TeamRun::new(
+            "run-seat".to_string(),
+            Default::default(),
+            "/tmp/seat".to_string(),
+            "device-1".to_string(),
+        );
+        run.tl_thread_id = thread_id.clone();
+        run.status = relay_api::team::TeamRunStatus::Running;
+        {
+            let mut relay = state.write().await;
+            relay.insert_team_run(run);
+        }
+
+        let mut cmd = json!({ "type": "send" });
+        attach_orchestrator_session(
+            &state,
+            "/tmp/claude-worker/worker.mjs",
+            &thread_id,
+            &mut cmd,
+        )
+        .await;
+        assert!(
+            cmd.get("mcpServers").is_some(),
+            "the seat never got its read-only server: {cmd}"
+        );
+        assert!(cmd.get("tools").is_none(), "{cmd}");
+        assert!(cmd.get("allowedTools").is_none(), "{cmd}");
     }
 
     /// The relay resolves a reasoning effort for every Claude turn — it stores

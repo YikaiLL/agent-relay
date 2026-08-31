@@ -4,6 +4,7 @@
 // `device_id` bug survived them: the bridge forwarded an id the relay was never
 // told to send. So this runs the real bridge process, driven by a real MCP
 // client, against a real relay, and asserts the card actually lands in state.
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,33 +13,58 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-import { startLocalRelay } from "./e2e/harness/local-relay.mjs";
 import { getFreePort } from "./e2e/harness/ports.mjs";
-import { stopManagedProcess, waitForHealth } from "./e2e/harness/process.mjs";
+import {
+  spawnManagedProcess,
+  stopManagedProcess,
+  waitForHealth,
+} from "./e2e/harness/process.mjs";
 
 const ROOT = path.dirname(fileURLToPath(new URL("..", import.meta.url)));
 const REPO = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 let relay;
 let transport;
+/// Thrown when there is nothing to verify against, so the run stops instead of
+/// reporting a missing build as a dozen product failures.
+class SkipRun extends Error {}
+
 const results = [];
 function check(label, ok, detail = "") {
   results.push({ label, ok, detail });
   console.log(`${ok ? "PASS" : "FAIL"}  ${label}${detail ? `  — ${detail}` : ""}`);
 }
 
+// The private sources are swapped in by scripts/with-private.sh; the stub
+// marker means they are not here, and `--features private` would fail to build
+// long before any check could run.
+const STUB_MARKER = path.join(REPO, "crates", "sealwire-private", "STUB");
+
 try {
+  if (existsSync(STUB_MARKER)) {
+    console.log(
+      "SKIP  nothing to verify against — run it as:\n" +
+        "      scripts/with-private.sh node scripts/verify-orchestrator-mcp.mjs"
+    );
+    process.exit(0);
+  }
   const port = await getFreePort();
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "orch-mcp-"));
-  relay = startLocalRelay({
-    relayPort: port,
-    relayStatePath: path.join(stateDir, "session.json"),
-    // Beta needs BOTH the flag and a build that can run the feature
-    // (`SEALWIRE_BETA && cfg!(feature = "private")`), so this script requires a
-    // binary built under scripts/with-private.sh. A stub build refuses
-    // everything, which is correct and makes for a useless verification.
-    extraEnv: { AGENT_PROVIDERS: "fake", SEALWIRE_BETA: "1" },
-  });
+  // Beta needs BOTH the flag and a build that can run the feature
+  // (`SEALWIRE_BETA && cfg!(feature = "private")`). The shared harness resolves
+  // a plain `cargo run`, which would drop the feature and refuse every call, so
+  // this spawns the build it needs itself.
+  relay = spawnManagedProcess(
+    "relay",
+    "cargo",
+    ["run", "-p", "relay-server", "--features", "private"],
+    {
+      PORT: String(port),
+      RELAY_STATE_PATH: path.join(stateDir, "session.json"),
+      AGENT_PROVIDERS: "fake",
+      SEALWIRE_BETA: "1",
+    }
+  );
   const base = `http://127.0.0.1:${port}`;
   await waitForHealth(`${base}/api/health`);
 
@@ -57,6 +83,12 @@ try {
     beta === true,
     beta === true ? "" : "rebuild: scripts/with-private.sh cargo build -p relay-server --features private"
   );
+  // Everything below asserts on tool behaviour. Without beta the relay refuses
+  // every call, and reporting a dozen refusals as failures reads as a broken
+  // toolset rather than a missing build.
+  if (beta !== true) {
+    throw new SkipRun("the relay came up without beta");
+  }
   // No pairing flow here: a local controller identifies itself by whatever id it
   // sends, and the relay scopes an unknown device to the roots it already allows.
   const deviceId = "verify-device";
@@ -111,12 +143,18 @@ try {
 
   orchId = resetId ?? orchId;
 
-  // 2. The tools route answers, and filters by live state.
+  // 2. The tools route answers with the WHOLE list, whatever the workspace
+  // looks like. The model reads it once per session and is never told it
+  // changed, so anything withheld here is withheld for the session — which is
+  // how `revise_proposal` used to be invisible in every session that began
+  // before a task was staged.
   const tools0 = await api("/api/orchestrator/tools");
   const names0 = (tools0.body?.data?.tools ?? []).map((t) => t.name);
   check(
-    "an empty workspace is offered propose_task and nothing that would fail",
-    names0.includes("propose_task") && !names0.includes("control_run") && !names0.includes("revise_proposal"),
+    "an empty workspace is still offered every tool, including the later ones",
+    ["propose_task", "revise_proposal", "control_run", "respond_to_agent"].every((name) =>
+      names0.includes(name)
+    ),
     names0.join(", ")
   );
   const proposeSpec = (tools0.body?.data?.tools ?? []).find((t) => t.name === "propose_task");
@@ -182,7 +220,7 @@ try {
   // 5. The tool list is a function of live state, re-read per call.
   const listed2 = await client.listTools();
   check(
-    "with a card staged, revise_proposal becomes available",
+    "the list does not move when a card is staged",
     listed2.tools.some((t) => t.name === "revise_proposal"),
     listed2.tools.map((t) => t.name).join(", ")
   );
@@ -217,7 +255,9 @@ try {
     `title=${card?.title} context=${card?.context} why=${card?.why}`
   );
 } catch (error) {
-  check("harness ran to completion", false, error?.stack || String(error));
+  if (!(error instanceof SkipRun)) {
+    check("harness ran to completion", false, error?.stack || String(error));
+  }
 } finally {
   if (transport) await transport.close().catch(() => {});
   if (relay) await stopManagedProcess(relay).catch(() => {});

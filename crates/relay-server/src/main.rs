@@ -747,15 +747,29 @@ struct OrchestratorToolCallInput {
     arguments: serde_json::Value,
     #[serde(default)]
     device_id: Option<String>,
+    /// Routes to the seat toolset and scopes answers to that run. Caller-
+    /// supplied, so it narrows what a seat gets — it does not authenticate one.
+    #[serde(default)]
+    seat_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct OrchestratorToolListQuery {
+    #[serde(default)]
+    seat_run_id: Option<String>,
 }
 
 async fn list_orchestrator_tools(
     State(context): State<AppContext>,
     headers: HeaderMap,
     uri: Uri,
+    Query(query): Query<OrchestratorToolListQuery>,
 ) -> Result<Json<ApiEnvelope<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
-    let tools = context.app.list_orchestrator_tools().await;
+    let tools = match query.seat_run_id {
+        Some(_) => context.app.list_team_seat_tools().await,
+        None => context.app.list_orchestrator_tools().await,
+    };
     Ok(Json(ApiEnvelope::ok(serde_json::json!({ "tools": tools }))))
 }
 
@@ -772,10 +786,20 @@ async fn call_orchestrator_tool(
     Json(input): Json<OrchestratorToolCallInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     authorize_api(&context, &headers, &uri)?;
-    let outcome = context
-        .app
-        .call_orchestrator_tool(&tool_name, &input.arguments, input.device_id)
-        .await;
+    let outcome = match input.seat_run_id.as_deref() {
+        Some(run_id) => {
+            context
+                .app
+                .call_team_seat_tool(&tool_name, &input.arguments, run_id)
+                .await
+        }
+        None => {
+            context
+                .app
+                .call_orchestrator_tool(&tool_name, &input.arguments, input.device_id)
+                .await
+        }
+    };
     Ok(Json(
         crate::state::app::orchestrator_dispatch::tool_result_envelope(outcome),
     ))
