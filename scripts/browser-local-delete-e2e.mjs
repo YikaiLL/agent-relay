@@ -244,37 +244,94 @@ async function waitForThreadIdle(relayPort, threadId, timeoutMs = LOCAL_TIMEOUT_
   throw new Error(`timed out waiting for thread ${threadId} to become idle before deletion`);
 }
 
-async function openThreadContextMenu(page, threadId, actionSelector) {
-  const target = page.locator(`#threads-list [data-thread-id="${threadId}"]`);
-  await target.waitFor({ state: "visible", timeout: LOCAL_TIMEOUT_MS });
-  await target.scrollIntoViewIfNeeded({ timeout: LOCAL_TIMEOUT_MS });
-  const box = await target.boundingBox({ timeout: LOCAL_TIMEOUT_MS });
-  assert.ok(box, `thread row ${threadId} should have a bounding box before opening menu`);
-  await target.click({
-    button: "right",
-    position: {
-      x: Math.min(box.width / 2, 160),
-      y: Math.min(box.height / 2, 24),
-    },
-    timeout: LOCAL_TIMEOUT_MS,
-  });
-  await page.waitForFunction(
-    ({ actionSelector, threadId }) => {
+// The action buttons' `disabled` flags are computed ONCE, when the menu opens, from
+// the frontend's copy of the session — and that copy arrives over SSE. Callers reach
+// here after confirming the thread is idle through the RELAY's API, which the browser
+// can still be a beat behind on a slow machine.
+//
+// So re-open the menu rather than wait inside it: the flags are never recomputed
+// while it stays open, which means waiting on them can only ever time out. That is
+// exactly how this failed — 45s spent watching a `disabled` that nothing would
+// change, with the menu open and the row correctly highlighted the whole time.
+//
+// A genuinely busy thread still fails, just after a few attempts instead of one.
+const CONTEXT_MENU_ATTEMPTS = 4;
+
+async function readContextMenuState(page, actionSelector, threadId) {
+  return page.evaluate(
+    ({ actionSelector: sel, threadId: id }) => {
       const menu = document.querySelector("#thread-context-menu");
-      const button = document.querySelector(actionSelector);
-      const row = [...document.querySelectorAll("#threads-list [data-thread-id]")].find(
-        (element) => element.dataset.threadId === threadId
-      );
-      return Boolean(
-        menu &&
-          !menu.hidden &&
-          button &&
-          !button.disabled &&
-          row?.classList.contains("is-context-target")
-      );
+      const button = document.querySelector(sel);
+      const rows = [...document.querySelectorAll("#threads-list [data-thread-id]")];
+      const row = rows.find((element) => element.dataset.threadId === id);
+      return {
+        menuOpen: Boolean(menu) && !menu.hidden,
+        buttonPresent: Boolean(button),
+        buttonDisabled: button ? button.disabled : null,
+        rowHighlighted: Boolean(row?.classList.contains("is-context-target")),
+        rowPresent: Boolean(row),
+        rowIds: rows.map((element) => element.dataset.threadId),
+      };
     },
-    { actionSelector, threadId },
-    { timeout: LOCAL_TIMEOUT_MS }
+    { actionSelector, threadId }
+  );
+}
+
+async function openThreadContextMenu(page, threadId, actionSelector) {
+  const perAttemptMs = Math.max(2000, Math.floor(LOCAL_TIMEOUT_MS / CONTEXT_MENU_ATTEMPTS));
+  let last = null;
+
+  for (let attempt = 1; attempt <= CONTEXT_MENU_ATTEMPTS; attempt += 1) {
+    const target = page.locator(`#threads-list [data-thread-id="${threadId}"]`);
+    await target.waitFor({ state: "visible", timeout: LOCAL_TIMEOUT_MS });
+    await target.scrollIntoViewIfNeeded({ timeout: LOCAL_TIMEOUT_MS });
+    const box = await target.boundingBox({ timeout: LOCAL_TIMEOUT_MS });
+    assert.ok(box, `thread row ${threadId} should have a bounding box before opening menu`);
+    await target.click({
+      button: "right",
+      position: {
+        x: Math.min(box.width / 2, 160),
+        y: Math.min(box.height / 2, 24),
+      },
+      timeout: LOCAL_TIMEOUT_MS,
+    });
+
+    const opened = await page
+      .waitForFunction(
+        ({ actionSelector: sel, threadId: id }) => {
+          const menu = document.querySelector("#thread-context-menu");
+          const button = document.querySelector(sel);
+          const row = [...document.querySelectorAll("#threads-list [data-thread-id]")].find(
+            (element) => element.dataset.threadId === id
+          );
+          return Boolean(
+            menu &&
+              !menu.hidden &&
+              button &&
+              !button.disabled &&
+              row?.classList.contains("is-context-target")
+          );
+        },
+        { actionSelector, threadId },
+        { timeout: perAttemptMs }
+      )
+      .then(() => true)
+      .catch(() => false);
+
+    if (opened) {
+      return;
+    }
+
+    last = await readContextMenuState(page, actionSelector, threadId);
+    // Close before retrying, so the next right-click is a fresh open and the flags
+    // are recomputed against whatever the browser knows by then.
+    await page.keyboard.press("Escape").catch(() => {});
+    await delay(500);
+  }
+
+  throw new Error(
+    `${actionSelector} never became usable for thread ${threadId} after `
+      + `${CONTEXT_MENU_ATTEMPTS} attempts; last state: ${JSON.stringify(last)}`
   );
 }
 

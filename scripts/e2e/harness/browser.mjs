@@ -1,9 +1,29 @@
 import { createHash } from "node:crypto";
 import { chromium } from "playwright";
 
+/// Slow every page in the context down by this factor, when set.
+///
+/// CI runners are several times slower than a development machine, and that gap is
+/// where the timing-dependent failures in this suite live — they reproduce there and
+/// nowhere else, which leaves guesswork as the only tool. `E2E_CPU_THROTTLE=4` closes
+/// the gap locally: the delete-thread spec failed 4-of-4 under it and passed 4-of-4
+/// after the fix, having been 3-of-3 green at full speed both times.
+const CPU_THROTTLE_RATE = Number(process.env.E2E_CPU_THROTTLE) || 0;
+
 export async function launchBrowser({ contextOptions = {} } = {}) {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext(contextOptions);
+  if (CPU_THROTTLE_RATE > 1) {
+    context.on("page", (page) => {
+      context
+        .newCDPSession(page)
+        .then((session) =>
+          session.send("Emulation.setCPUThrottlingRate", { rate: CPU_THROTTLE_RATE })
+        )
+        // Best effort: a spec that cannot be throttled should still run.
+        .catch(() => {});
+    });
+  }
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
   await context.addInitScript(() => {
     window.__agentRelayProtocolFrames = [];
