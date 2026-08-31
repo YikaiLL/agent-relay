@@ -63,6 +63,7 @@ impl AppState {
             team_version_id,
             team_name,
             why,
+            agents: input.agents,
             created_at: unix_now(),
         };
 
@@ -126,6 +127,9 @@ impl AppState {
             proposal.why =
                 non_empty(Some(why)).map(|value| truncate_chars(value, MAX_PROPOSAL_FIELD_CHARS));
         }
+        // Field-by-field: revising one seat's effort must leave the model that
+        // seat was already staged with alone.
+        proposal.agents.merge(&input.agents);
         if let Some((team_id, team_version_id, team_name)) = team {
             proposal.team_id = team_id;
             proposal.team_version_id = team_version_id;
@@ -171,9 +175,18 @@ impl AppState {
                 quality_rules: proposal.quality_rules.clone(),
                 cwd: None,
                 target_branch: None,
-                tl_provider: None,
-                dev_provider: None,
-                reviewer_provider: None,
+                // The card's whole point is that what the user confirmed is
+                // what runs. Dropping these here would start every task on the
+                // relay default while the card said otherwise.
+                tl_provider: proposal.agents.tl.provider.clone(),
+                dev_provider: proposal.agents.dev.provider.clone(),
+                reviewer_provider: proposal.agents.reviewer.provider.clone(),
+                tl_model: proposal.agents.tl.model.clone(),
+                dev_model: proposal.agents.dev.model.clone(),
+                reviewer_model: proposal.agents.reviewer.model.clone(),
+                tl_effort: proposal.agents.tl.effort.clone(),
+                dev_effort: proposal.agents.dev.effort.clone(),
+                reviewer_effort: proposal.agents.reviewer.effort.clone(),
                 device_id: Some(device_id),
             })
             .await;
@@ -273,6 +286,7 @@ mod tests {
                 quality_rules: None,
                 team_id: None,
                 why: Some("Touches the CLI surface.".to_string()),
+                agents: Default::default(),
                 device_id: Some("device-1".to_string()),
             })
             .await
@@ -315,6 +329,7 @@ mod tests {
                 quality_rules: None,
                 team_id: None,
                 why: None,
+                agents: Default::default(),
                 device_id: Some("device-1".to_string()),
             })
             .await
@@ -459,6 +474,7 @@ mod tests {
                 quality_rules: None,
                 team_id: None,
                 why: None,
+                agents: Default::default(),
                 device_id: Some("device-1".to_string()),
             })
             .await

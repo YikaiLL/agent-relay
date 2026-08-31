@@ -8,14 +8,20 @@ use super::team::TeamAction2;
 use super::*;
 use crate::orchestrator_tools::{self, ToolCall, WorkspaceFacts};
 use crate::protocol::{
-    ProposeOrchestratorTaskInput, ReviseOrchestratorProposalInput, SubmitAskUserAnswerInput,
-    TeamActionInput,
+    ProposeOrchestratorTaskInput, ReviseOrchestratorProposalInput, SeatAgentView,
+    SubmitAskUserAnswerInput, TaskSeatAgentsView, TeamActionInput,
 };
 use serde_json::{json, Value};
 
 /// Caps on one `pending_questions` reply (tool results sit in model context).
 const MAX_QUESTIONS_PER_REQUEST: usize = 8;
 const MAX_OPTIONS_PER_QUESTION: usize = 12;
+/// Cap on one agent's models in a `list_agents` reply. Same reasoning as the
+/// role cap: a silently short list reads as the whole catalogue.
+const MAX_MODELS_PER_AGENT: usize = 24;
+/// Cap on one team's roles in a `list_teams` reply. Over it, the count of what
+/// was dropped is printed — a silently short list reads as the whole team.
+const MAX_ROLES_PER_TEAM: usize = 12;
 /// Max chars of a sub-task summary in a status line.
 const SUMMARY_LINE_MAX_CHARS: usize = 160;
 
@@ -30,6 +36,119 @@ fn first_line_bounded(summary: &str) -> &str {
         Some((index, _)) => &line[..index],
         None => line,
     }
+}
+
+/// The model's ask, flattened to the three seats that will actually run.
+///
+/// The fan-out happens HERE, once, so the staged task shows each seat's real
+/// choice rather than a rule the user would have to apply in their head — and
+/// so nothing downstream has to remember that a task-wide value existed.
+fn seat_agents_view(agents: &orchestrator_tools::TeamAgents) -> TaskSeatAgentsView {
+    let seat = |agent: orchestrator_tools::SeatAgent| SeatAgentView {
+        provider: agent.provider,
+        model: agent.model,
+        effort: agent.effort,
+    };
+    let (tl, dev, reviewer) = agents.per_seat();
+    TaskSeatAgentsView {
+        tl: seat(tl),
+        dev: seat(dev),
+        reviewer: seat(reviewer),
+    }
+}
+
+/// A team's last seven days as one clause, or `None` when nothing is known.
+///
+/// An absent stat means the ledger has not seen this team, NOT that it ran
+/// nothing — so the field is dropped rather than printed as `0`. A zero the
+/// model reads as fact is worse than a gap it can ask about, and
+/// `propose_task.why` asks it to cite exactly these numbers.
+fn seven_day_history(stats: &crate::teams::TeamCatalogStats) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(tasks) = stats.tasks_7d {
+        parts.push(format!("{tasks} tasks"));
+    }
+    if let Some(avg) = stats.avg_tokens {
+        parts.push(format!("{avg} tokens avg"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// One team, as much as the model needs to pick between teams and say why.
+fn team_block(team: &crate::teams::TeamCatalogTeam) -> String {
+    // role_count comes from the pinned version and is authoritative; the roles
+    // printed below may be capped, so the two can legitimately disagree.
+    let mut block = format!("{} ({}) — {} roles", team.name, team.id, team.role_count);
+    if let Some(history) = seven_day_history(&team.stats) {
+        block.push_str(&format!("; last 7d: {history}"));
+    }
+    if let Some(focus) = team.focus.as_deref() {
+        let focus = first_line_bounded(focus);
+        if !focus.is_empty() {
+            block.push_str(&format!("\n  focus: {focus}"));
+        }
+    }
+    for role in team.roles.iter().take(MAX_ROLES_PER_TEAM) {
+        block.push_str(&format!("\n  - {}", role.name));
+        if let Some(seat) = role.seat.as_deref() {
+            block.push_str(&format!(" [{seat}]"));
+        }
+        let blurb = first_line_bounded(&role.blurb);
+        if !blurb.is_empty() {
+            block.push_str(&format!(": {blurb}"));
+        }
+    }
+    let dropped = team.roles.len().saturating_sub(MAX_ROLES_PER_TEAM);
+    if dropped > 0 {
+        block.push_str(&format!("\n  (+{dropped} more roles not shown)"));
+    }
+    block
+}
+
+/// One provider and the models a task may name on it.
+///
+/// Hidden models are left out: they are not offerable, and a model that names
+/// one gets an id the resolver will keep verbatim and the seat will fail on.
+fn agent_block(provider: &str, models: &[ModelOptionView]) -> String {
+    let offerable: Vec<&ModelOptionView> = models.iter().filter(|model| !model.hidden).collect();
+    if offerable.is_empty() {
+        return format!("{provider} — no selectable models; omit model to use its default");
+    }
+    let mut block = format!("{provider} — {} models", offerable.len());
+    for model in offerable.iter().take(MAX_MODELS_PER_AGENT) {
+        block.push_str(&format!("\n  - {}", model.model));
+        if model.is_default {
+            block.push_str(" (default)");
+        }
+        if !model.supported_reasoning_efforts.is_empty() {
+            block.push_str(&format!(
+                ": effort {}",
+                model.supported_reasoning_efforts.join(", ")
+            ));
+        }
+    }
+    let dropped = offerable.len().saturating_sub(MAX_MODELS_PER_AGENT);
+    if dropped > 0 {
+        block.push_str(&format!("\n  (+{dropped} more models not shown)"));
+    }
+    block
+}
+
+/// The task as it stands, including any scope added since it started.
+fn task_definition_block(run_id: &str, spec: &relay_api::team::TaskSpec) -> String {
+    let mut block = format!("{run_id} — {}", spec.title);
+    for (label, value) in [
+        ("context", &spec.context),
+        ("acceptance criteria", &spec.acceptance_criteria),
+        ("in scope", &spec.agreed_scope),
+        ("quality rules", &spec.quality_rules),
+    ] {
+        let value = value.trim();
+        if !value.is_empty() {
+            block.push_str(&format!("\n  {label}: {value}"));
+        }
+    }
+    block
 }
 
 /// One seat's question, joined to the run still waiting on it.
@@ -123,6 +242,22 @@ impl AppState {
             .collect()
     }
 
+    /// The one non-terminal run, or the named one. Refuses rather than guessing
+    /// when several are going.
+    async fn one_live_run(&self, run_id: Option<&str>) -> Result<String, String> {
+        let relay = self.relay.read().await;
+        let mut live = relay
+            .team_runs_snapshot()
+            .filter(|run| !run.status.is_terminal())
+            .filter(|run| run_id.is_none_or(|wanted| run.id == wanted))
+            .map(|run| run.id.clone());
+        match (live.next(), live.next()) {
+            (None, _) => Err("there is no task with that id".to_string()),
+            (Some(_), Some(_)) => Err("more than one task is going; name the run_id".to_string()),
+            (Some(id), None) => Ok(id),
+        }
+    }
+
     /// Run a tool; `Err` is a refused call for the model to read (not HTTP 500).
     pub async fn call_orchestrator_tool(
         &self,
@@ -150,6 +285,7 @@ impl AppState {
                 acceptance_criteria,
                 team_id,
                 why,
+                agents,
             } => {
                 let receipt = self
                     .propose_orchestrator_task(ProposeOrchestratorTaskInput {
@@ -158,6 +294,7 @@ impl AppState {
                         acceptance_criteria,
                         team_id,
                         why,
+                        agents: seat_agents_view(&agents),
                         device_id,
                         ..Default::default()
                     })
@@ -173,6 +310,7 @@ impl AppState {
                 context,
                 team_id,
                 why,
+                agents,
             } => {
                 let receipt = self
                     .revise_orchestrator_proposal(
@@ -182,6 +320,7 @@ impl AppState {
                             context,
                             team_id,
                             why,
+                            agents: seat_agents_view(&agents),
                             device_id,
                             ..Default::default()
                         },
@@ -192,17 +331,43 @@ impl AppState {
                     receipt.proposal.id, receipt.proposal.team_name
                 ))
             }
+            ToolCall::ListAgents => {
+                // Read from the warm catalogue only. Asking each provider here
+                // would make a lookup the model does before every task as slow
+                // as the slowest bridge, and a provider that is briefly quiet
+                // would read as "this agent has no models".
+                let mut blocks = Vec::new();
+                for provider in self.available_providers() {
+                    let Some(models) = self.cached_provider_model_catalog(&provider).await else {
+                        blocks.push(format!(
+                            "{provider} — models not loaded yet; omit model and effort to use its default"
+                        ));
+                        continue;
+                    };
+                    blocks.push(agent_block(&provider, &models));
+                }
+                if blocks.is_empty() {
+                    return Ok("No agent providers are available.".to_string());
+                }
+                Ok(blocks.join("\n\n"))
+            }
             ToolCall::ListTeams => {
                 let catalog = self.team_catalog().await;
                 if catalog.teams.is_empty() {
                     return Ok("No teams are defined.".to_string());
                 }
-                let lines: Vec<String> = catalog
-                    .teams
-                    .iter()
-                    .map(|team| format!("{} ({})", team.name, team.id))
-                    .collect();
-                Ok(lines.join("\n"))
+                let mut blocks: Vec<String> = catalog.teams.iter().map(team_block).collect();
+                if !catalog.enabled {
+                    // Distinguish "no history" from "never ran": with the store
+                    // down, every team looks unused, and the model would cite
+                    // that as a fact about the team.
+                    blocks.push(
+                        "(No history is available for any team right now — the usage \
+store could not be read. That is unknown, not unused.)"
+                            .to_string(),
+                    );
+                }
+                Ok(blocks.join("\n\n"))
             }
             ToolCall::PendingQuestions => {
                 let relay = self.relay.read().await;
@@ -251,6 +416,48 @@ answers keyed by the question text above)",
                     return Ok("Nobody is waiting on you.".to_string());
                 }
                 Ok(blocks.join("\n\n"))
+            }
+            ToolCall::TaskDefinition { run_id } => {
+                let relay = self.relay.read().await;
+                let blocks: Vec<String> = relay
+                    .team_runs_snapshot()
+                    .filter(|run| run_id.as_deref().is_none_or(|wanted| run.id == wanted))
+                    .map(|run| task_definition_block(&run.id, &run.spec))
+                    .collect();
+                if blocks.is_empty() {
+                    return Err("there is no task with that id".to_string());
+                }
+                Ok(blocks.join("\n\n"))
+            }
+            ToolCall::MessageTeam { text, run_id } => {
+                let target = self.one_live_run(run_id.as_deref()).await?;
+                {
+                    let mut relay = self.relay.write().await;
+                    relay.update_team_run(&target, |run| {
+                        run.pending_user_notes.push(text.clone());
+                    });
+                    relay.notify();
+                }
+                Ok(format!(
+                    "Left for {target}: {text}. The team reads it on its next turn."
+                ))
+            }
+            ToolCall::WidenScope { addition, run_id } => {
+                let target = self.one_live_run(run_id.as_deref()).await?;
+                let mut widened = false;
+                {
+                    let mut relay = self.relay.write().await;
+                    relay.update_team_run(&target, |run| {
+                        widened = run.spec.widen_scope(&addition);
+                    });
+                    relay.notify();
+                }
+                if !widened {
+                    return Err("the addition was blank".to_string());
+                }
+                Ok(format!(
+                    "{target} may now also cover: {addition}. The team sees this on its next turn."
+                ))
             }
             ToolCall::TaskStatus { run_id } => {
                 let relay = self.relay.read().await;
@@ -371,6 +578,169 @@ mod tests {
         app
     }
 
+    fn role(name: &str, seat: Option<&str>, blurb: &str) -> crate::teams::TeamCatalogRole {
+        crate::teams::TeamCatalogRole {
+            id: name.to_lowercase(),
+            name: name.to_string(),
+            seat: seat.map(str::to_string),
+            blurb: blurb.to_string(),
+            estimate_label: None,
+        }
+    }
+
+    fn team_of(
+        roles: Vec<crate::teams::TeamCatalogRole>,
+        stats: crate::teams::TeamCatalogStats,
+    ) -> crate::teams::TeamCatalogTeam {
+        crate::teams::TeamCatalogTeam {
+            id: "team_x".to_string(),
+            name: "Backend".to_string(),
+            persistent: true,
+            role_count: roles.len(),
+            focus: Some("Payments and billing".to_string()),
+            current_version_id: "ver_1".to_string(),
+            roles,
+            stats,
+        }
+    }
+
+    fn no_stats() -> crate::teams::TeamCatalogStats {
+        crate::teams::TeamCatalogStats {
+            tasks_7d: None,
+            avg_tokens: None,
+            passed: None,
+            total: None,
+        }
+    }
+
+    /// `list_teams` used to print `"{name} ({id})"` and throw the rest away,
+    /// though the catalog it already held carried every role. Asked what a team
+    /// was made of, the Orchestrator had nothing to answer with.
+    #[test]
+    fn a_team_block_names_every_role_and_the_seat_it_fills() {
+        let block = team_block(&team_of(
+            vec![
+                role("Planner", Some("tl"), "Sizes the work and splits it."),
+                role(
+                    "Implementer",
+                    Some("dev"),
+                    "Builds one sub-task per session.",
+                ),
+                role("Scribe", None, "Keeps the changelog."),
+            ],
+            no_stats(),
+        ));
+
+        assert!(block.contains("Backend"), "{block}");
+        assert!(
+            block.contains("team_x"),
+            "the id is what propose_task needs"
+        );
+        assert!(block.contains("Payments and billing"), "{block}");
+        for (name, blurb) in [
+            ("Planner", "Sizes the work and splits it."),
+            ("Implementer", "Builds one sub-task per session."),
+            ("Scribe", "Keeps the changelog."),
+        ] {
+            assert!(block.contains(name), "{name} missing: {block}");
+            assert!(block.contains(blurb), "{name}'s job missing: {block}");
+        }
+        assert!(block.contains("[tl]"), "{block}");
+        assert!(block.contains("[dev]"), "{block}");
+    }
+
+    /// A role with no pipeline seat is still part of the team; it just has no
+    /// bracket. Printing an empty one would read as a seat named "".
+    #[test]
+    fn a_role_without_a_seat_prints_no_empty_bracket() {
+        let block = team_block(&team_of(
+            vec![role("Scribe", None, "Keeps the changelog.")],
+            no_stats(),
+        ));
+        assert!(block.contains("Scribe"), "{block}");
+        assert!(!block.contains("[]"), "{block}");
+    }
+
+    /// `propose_task.why` tells the model to cite facts. These are the facts.
+    #[test]
+    fn a_known_history_is_quoted_so_why_has_something_to_stand_on() {
+        let block = team_block(&team_of(
+            vec![role("Planner", Some("tl"), "Plans.")],
+            crate::teams::TeamCatalogStats {
+                tasks_7d: Some(12),
+                avg_tokens: Some(45_000),
+                passed: None,
+                total: None,
+            },
+        ));
+        assert!(block.contains("12 tasks"), "{block}");
+        assert!(block.contains("45000 tokens avg"), "{block}");
+    }
+
+    /// The catalog is explicit that a missing stat means unknown, not zero. A
+    /// printed `0` is a fact the model will cite; a gap is one it can ask about.
+    #[test]
+    fn an_unknown_history_is_left_out_rather_than_printed_as_zero() {
+        let block = team_block(&team_of(
+            vec![role("Planner", Some("tl"), "Plans.")],
+            no_stats(),
+        ));
+        assert!(!block.contains("last 7d"), "{block}");
+        assert!(
+            !block.contains('0'),
+            "an unknown count must not read as 0: {block}"
+        );
+        assert!(seven_day_history(&no_stats()).is_none());
+    }
+
+    /// Half-known is still worth saying — drop only the field that is missing.
+    #[test]
+    fn a_partly_known_history_keeps_the_half_it_has() {
+        let history = seven_day_history(&crate::teams::TeamCatalogStats {
+            tasks_7d: Some(4),
+            avg_tokens: None,
+            passed: None,
+            total: None,
+        })
+        .expect("one known stat is still history");
+        assert!(history.contains("4 tasks"), "{history}");
+        assert!(!history.contains("tokens"), "{history}");
+    }
+
+    /// A capped list that does not say it was capped reads as the whole team.
+    #[test]
+    fn too_many_roles_says_how_many_it_dropped() {
+        let roles: Vec<_> = (0..MAX_ROLES_PER_TEAM + 3)
+            .map(|n| role(&format!("Role{n}"), None, "Does a thing."))
+            .collect();
+        let block = team_block(&team_of(roles, no_stats()));
+        assert!(block.contains("(+3 more roles not shown)"), "{block}");
+        assert!(
+            block.contains(&format!("{} roles", MAX_ROLES_PER_TEAM + 3)),
+            "the true count comes from the pinned version, not the printed list: {block}"
+        );
+    }
+
+    /// The question that started this: "what is the Default team made of?"
+    #[tokio::test]
+    async fn list_teams_says_what_the_default_team_is_made_of() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+
+        let reply = app
+            .call_orchestrator_tool("list_teams", &json!({}), Some("device-1".to_string()))
+            .await
+            .expect("list_teams");
+
+        for role in ["Planner", "Implementer", "Reviewer"] {
+            assert!(
+                reply.contains(role),
+                "a team is its roles; naming it alone answers nothing: {reply}"
+            );
+        }
+    }
+
     /// Found by running it: the list route had no beta gate while every call
     /// had one, so a locked build advertised six tools and refused all six. That
     /// is the precise failure the registry's own doc warns about — "a tool that
@@ -447,6 +817,266 @@ mod tests {
             .expect_err("no runs, no control");
         assert!(err.contains("control_run"), "{err}");
         assert!(err.contains("no run is going"), "{err}");
+    }
+
+    /// End to end through the real tool call: what the model asked for has to
+    /// reach the staged task, per seat, or the user confirms one thing and
+    /// something else runs.
+    #[tokio::test]
+    async fn a_proposed_task_stages_the_agent_each_seat_will_run_on() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+
+        app.call_orchestrator_tool(
+            "propose_task",
+            &json!({
+                "title": "Add a parser",
+                "provider": "codex",
+                "effort": "medium",
+                "seat_overrides": { "reviewer": { "effort": "max" } },
+            }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("propose");
+
+        let snap = app.snapshot().await;
+        let staged = snap
+            .orchestrator_proposals
+            .first()
+            .expect("one staged task");
+        assert_eq!(staged.agents.tl.provider.as_deref(), Some("codex"));
+        assert_eq!(staged.agents.dev.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            staged.agents.reviewer.effort.as_deref(),
+            Some("max"),
+            "the seat override has to survive the whole path"
+        );
+        assert_eq!(
+            staged.agents.reviewer.provider.as_deref(),
+            Some("codex"),
+            "and must not drop what the task chose for it"
+        );
+    }
+
+    /// Revising one field must not blank the rest of a seat's staged choice —
+    /// the same rule the text fields already follow.
+    #[tokio::test]
+    async fn revising_an_effort_keeps_the_model_the_seat_was_staged_with() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+
+        app.call_orchestrator_tool(
+            "propose_task",
+            &json!({ "title": "Add a parser", "model": "claude-opus-5", "effort": "medium" }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("propose");
+        let staged_id = app
+            .snapshot()
+            .await
+            .orchestrator_proposals
+            .first()
+            .expect("staged")
+            .id
+            .clone();
+
+        app.call_orchestrator_tool(
+            "revise_proposal",
+            &json!({ "proposal_id": staged_id, "effort": "max" }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("revise");
+
+        let snap = app.snapshot().await;
+        let staged = snap.orchestrator_proposals.first().expect("still staged");
+        assert_eq!(staged.agents.dev.effort.as_deref(), Some("max"));
+        assert_eq!(
+            staged.agents.dev.model.as_deref(),
+            Some("claude-opus-5"),
+            "revising the effort blanked the model",
+        );
+    }
+
+    fn model_option(model: &str, efforts: &[&str], is_default: bool) -> ModelOptionView {
+        ModelOptionView {
+            model: model.to_string(),
+            display_name: model.to_string(),
+            provider: "codex".to_string(),
+            supported_reasoning_efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            default_reasoning_effort: efforts.first().unwrap_or(&"").to_string(),
+            hidden: false,
+            is_default,
+        }
+    }
+
+    /// Without this the Orchestrator could name a provider/model/effort but had
+    /// no way to learn which ones exist, so it guessed — and a guessed model id
+    /// is kept verbatim by the resolver, so the task provisions a worktree and
+    /// only fails when that seat finally starts.
+    #[test]
+    fn an_agent_block_names_each_model_and_the_efforts_it_takes() {
+        let block = agent_block(
+            "codex",
+            &[
+                model_option("gpt-5.6-codex", &["low", "medium", "high"], true),
+                model_option("gpt-5.6", &["low", "medium"], false),
+            ],
+        );
+        assert!(block.contains("codex"), "{block}");
+        assert!(block.contains("gpt-5.6-codex"), "{block}");
+        assert!(
+            block.contains("(default)"),
+            "the model has to know which it gets for free"
+        );
+        assert!(block.contains("effort low, medium, high"), "{block}");
+    }
+
+    /// A hidden model is not offerable. Listing it invites exactly the guess
+    /// this tool exists to remove.
+    #[test]
+    fn a_hidden_model_is_not_offered() {
+        let mut hidden = model_option("internal-only", &["low"], false);
+        hidden.hidden = true;
+        let block = agent_block("codex", &[model_option("gpt-5.6", &["low"], true), hidden]);
+        assert!(!block.contains("internal-only"), "{block}");
+        assert!(block.contains("1 models"), "{block}");
+    }
+
+    #[test]
+    fn an_agent_with_nothing_selectable_says_so_rather_than_listing_nothing() {
+        let block = agent_block("codex", &[]);
+        assert!(block.contains("omit model"), "{block}");
+    }
+
+    #[test]
+    fn too_many_models_says_how_many_it_dropped() {
+        let models: Vec<_> = (0..MAX_MODELS_PER_AGENT + 2)
+            .map(|n| model_option(&format!("m{n}"), &["low"], false))
+            .collect();
+        let block = agent_block("codex", &models);
+        assert!(block.contains("(+2 more models not shown)"), "{block}");
+    }
+
+    /// The tool has to be reachable through the real call path, not just exist
+    /// in the registry.
+    #[tokio::test]
+    async fn list_agents_answers_without_asking_any_provider() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+
+        let reply = app
+            .call_orchestrator_tool("list_agents", &json!({}), Some("device-1".to_string()))
+            .await
+            .expect("list_agents");
+        assert!(
+            !reply.is_empty(),
+            "an empty answer teaches it to guess again"
+        );
+    }
+
+    async fn app_with_a_live_run(cwd: &str) -> (AppState, String) {
+        let app = ready_app(cwd).await;
+        let mut run = relay_api::team::TeamRun::new(
+            "run-note".to_string(),
+            crate::state::TaskSpec {
+                title: "Investigate the loader".to_string(),
+                agreed_scope: "Investigation only.".to_string(),
+                ..Default::default()
+            },
+            cwd.to_string(),
+            "device-1".to_string(),
+        );
+        run.status = relay_api::team::TeamRunStatus::Running;
+        {
+            let mut relay = app.relay.write().await;
+            relay.insert_team_run(run);
+        }
+        (app, "run-note".to_string())
+    }
+
+    /// The point of pausing is to look at what came out and then say what next.
+    /// Without somewhere to put that, the only way to redirect a team was to
+    /// start a whole new task.
+    #[tokio::test]
+    async fn a_note_left_for_the_team_is_kept_for_its_next_turn() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+
+        app.call_orchestrator_tool(
+            "message_team",
+            &json!({ "text": "Analysis looks right — now build it." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("message_team");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.pending_user_notes,
+            vec!["Analysis looks right — now build it."]
+        );
+    }
+
+    /// Two notes before the team next runs must both survive; the second is not
+    /// a correction of the first unless the user says so.
+    #[tokio::test]
+    async fn notes_queue_rather_than_overwrite() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+
+        for text in ["First thing.", "Second thing."] {
+            app.call_orchestrator_tool(
+                "message_team",
+                &json!({ "text": text }),
+                Some("device-1".to_string()),
+            )
+            .await
+            .expect("message_team");
+        }
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.pending_user_notes.len(),
+            2,
+            "{:?}",
+            run.pending_user_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn widening_scope_appends_and_the_team_can_read_it_back() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+
+        app.call_orchestrator_tool(
+            "widen_scope",
+            &json!({ "addition": "The loader too." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("widen_scope");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert!(
+            run.spec.agreed_scope.contains("Investigation only."),
+            "original ask kept"
+        );
+        assert!(run.spec.agreed_scope.contains("The loader too."));
+
+        let reply = app
+            .call_orchestrator_tool("task_definition", &json!({}), Some("device-1".to_string()))
+            .await
+            .expect("task_definition");
+        assert!(reply.contains("The loader too."), "{reply}");
     }
 
     #[tokio::test]

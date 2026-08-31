@@ -23,6 +23,77 @@ use serde_json::{json, Map, Value};
 /// backend cannot drift (past the cap, `propose_task` is refused).
 pub(crate) use crate::state::app::orchestrator_proposals::MAX_PENDING_PROPOSALS;
 
+/// The seats a task runs on. Order is the pipeline's own.
+pub(crate) const SEATS: &[&str] = &["tl", "dev", "reviewer"];
+
+/// Which agent one seat should run on, as asked for — not yet resolved against
+/// what the relay actually has. `None` means "no opinion, use the default".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SeatAgent {
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+}
+
+impl SeatAgent {
+    /// This seat's override laid over a task-wide default, FIELD BY FIELD.
+    ///
+    /// Whole-value precedence would be a trap: asking for the reviewer to think
+    /// harder (`effort` only) would silently drop the model the task chose, and
+    /// the seat would run somewhere nobody asked for.
+    fn over(&self, base: &SeatAgent) -> SeatAgent {
+        // A model id belongs to the provider that published it. When this seat
+        // names a provider the task did not, inheriting the task's model would
+        // stage an id the seat's own catalogue has never seen — and the resolver
+        // deliberately keeps an explicitly-named model rather than healing it,
+        // so the mistake outlives provisioning and only bites when the seat
+        // starts. Effort still inherits: the levels are shared, and are clamped
+        // to whatever model is finally chosen.
+        let moved_provider = self.provider.is_some() && self.provider != base.provider;
+        SeatAgent {
+            provider: self.provider.clone().or_else(|| base.provider.clone()),
+            model: self.model.clone().or_else(|| {
+                if moved_provider {
+                    None
+                } else {
+                    base.model.clone()
+                }
+            }),
+            effort: self.effort.clone().or_else(|| base.effort.clone()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.effort.is_none()
+    }
+}
+
+/// What agent each seat should run on. The task-wide ask plus per-seat
+/// overrides; [`TeamAgents::per_seat`] is what anything downstream should read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TeamAgents {
+    /// Applies to every seat that does not override it.
+    pub(crate) all: SeatAgent,
+    pub(crate) tl: SeatAgent,
+    pub(crate) dev: SeatAgent,
+    pub(crate) reviewer: SeatAgent,
+}
+
+impl TeamAgents {
+    /// `(tl, dev, reviewer)`, each already merged over the task-wide ask.
+    pub(crate) fn per_seat(&self) -> (SeatAgent, SeatAgent, SeatAgent) {
+        (
+            self.tl.over(&self.all),
+            self.dev.over(&self.all),
+            self.reviewer.over(&self.all),
+        )
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.tl.is_empty() && self.dev.is_empty() && self.reviewer.is_empty()
+    }
+}
+
 /// What calling a tool does to the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Effect {
@@ -35,7 +106,12 @@ pub(crate) enum Effect {
 
 /// Tools allowed to mutate without a card. Allowlist so new Acts tools are a
 /// deliberate edit. Members must release or unblock, never commit work.
-const ACTING_TOOLS: &[&str] = &["control_run", "respond_to_agent"];
+const ACTING_TOOLS: &[&str] = &[
+    "control_run",
+    "respond_to_agent",
+    "widen_scope",
+    "message_team",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParamKind {
@@ -128,6 +204,31 @@ starts work by confirming the card this creates.",
                 summary: "Why this team — cite facts, and name the argument against \
 your own choice.",
             },
+            ToolParam {
+                name: "provider",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Agent to run every seat on, e.g. codex. Omit for the default.",
+            },
+            ToolParam {
+                name: "model",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Model for every seat. Omit for the provider's default.",
+            },
+            ToolParam {
+                name: "effort",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Reasoning effort for every seat. Omit for the model's default.",
+            },
+            ToolParam {
+                name: "seat_overrides",
+                kind: ParamKind::Object,
+                required: false,
+                summary: "Per-seat exceptions, keyed tl/dev/reviewer, each any of \
+provider/model/effort. Overrides only the fields it names.",
+            },
         ],
     },
     ToolSpec {
@@ -167,13 +268,97 @@ another team, or sharpen the scope. Starts nothing.",
                 summary: "Why this team — cite facts, and name the argument against \
 your own choice.",
             },
+            ToolParam {
+                name: "provider",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement agent for every seat. Omit to keep it.",
+            },
+            ToolParam {
+                name: "model",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement model for every seat. Omit to keep it.",
+            },
+            ToolParam {
+                name: "effort",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Replacement reasoning effort for every seat. Omit to keep it.",
+            },
+            ToolParam {
+                name: "seat_overrides",
+                kind: ParamKind::Object,
+                required: false,
+                summary: "Per-seat exceptions, keyed tl/dev/reviewer, each any of \
+provider/model/effort. Replaces the staged overrides.",
+            },
         ],
+    },
+    ToolSpec {
+        name: "list_agents",
+        summary: "The agents a task can run on: each one's models, and the \
+reasoning-effort levels each model takes.",
+        effect: Effect::Read,
+        params: &[],
     },
     ToolSpec {
         name: "list_teams",
         summary: "The teams available to run a task, with their ids.",
         effect: Effect::Read,
         params: &[],
+    },
+    ToolSpec {
+        name: "task_definition",
+        summary: "The task a run is working to: its scope, acceptance criteria \
+and quality rules, as they stand now.",
+        effect: Effect::Read,
+        params: &[ToolParam {
+            name: "run_id",
+            kind: ParamKind::Text,
+            required: false,
+            summary: "Which run. Omit when only one is active.",
+        }],
+    },
+    ToolSpec {
+        name: "widen_scope",
+        summary: "Add to what a running task is allowed to cover. Cannot narrow \
+it, and the team itself may never call this.",
+        effect: Effect::Acts,
+        params: &[
+            ToolParam {
+                name: "addition",
+                kind: ParamKind::Text,
+                required: true,
+                summary: "What is now also in scope, in the user's terms.",
+            },
+            ToolParam {
+                name: "run_id",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Which run. Omit when only one is active.",
+            },
+        ],
+    },
+    ToolSpec {
+        name: "message_team",
+        summary: "Leave an instruction the team picks up on its next turn. Works \
+while it runs or while it is paused; does not resume it.",
+        effect: Effect::Acts,
+        params: &[
+            ToolParam {
+                name: "text",
+                kind: ParamKind::Text,
+                required: true,
+                summary: "What the team should do next, in the user's terms.",
+            },
+            ToolParam {
+                name: "run_id",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Which run. Omit when only one is active.",
+            },
+        ],
     },
     ToolSpec {
         name: "control_run",
@@ -267,6 +452,11 @@ dismiss one before you can stage another",
         }
         "list_teams" if facts.known_teams == 0 => Some("no teams are defined"),
         "task_status" if facts.known_runs == 0 => Some("nothing has run yet"),
+        "task_definition" if facts.known_runs == 0 => Some("nothing has run yet"),
+        "message_team" if facts.known_runs == 0 => Some("nothing has run yet"),
+        "widen_scope" if facts.active_runs == 0 => {
+            Some("no task is going; scope can only be widened while one is running")
+        }
         "control_run" if facts.active_runs == 0 => Some("no run is going"),
         "pending_questions" | "respond_to_agent" if facts.parked_questions == 0 => {
             Some("nothing is waiting on an answer")
@@ -284,6 +474,7 @@ pub(crate) enum ToolCall {
         acceptance_criteria: Option<String>,
         team_id: Option<String>,
         why: Option<String>,
+        agents: TeamAgents,
     },
     ReviseProposal {
         proposal_id: String,
@@ -291,8 +482,21 @@ pub(crate) enum ToolCall {
         context: Option<String>,
         team_id: Option<String>,
         why: Option<String>,
+        agents: TeamAgents,
     },
+    ListAgents,
     ListTeams,
+    TaskDefinition {
+        run_id: Option<String>,
+    },
+    WidenScope {
+        addition: String,
+        run_id: Option<String>,
+    },
+    MessageTeam {
+        text: String,
+        run_id: Option<String>,
+    },
     PendingQuestions,
     TaskStatus {
         run_id: Option<String>,
@@ -309,6 +513,83 @@ pub(crate) enum ToolCall {
 
 pub(crate) fn spec_for(name: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|tool| tool.name == name)
+}
+
+/// One seat's override object. Refuses anything it does not understand rather
+/// than ignoring it — a typo'd key silently dropped would run the seat on the
+/// default while the model believes it asked for something else.
+fn parse_seat_agent(tool: &str, seat: &str, value: &Value) -> Result<SeatAgent, String> {
+    let Value::Object(fields) = value else {
+        return Err(format!(
+            "{tool}: seat_overrides.{seat} must be an object of provider/model/effort"
+        ));
+    };
+    let mut agent = SeatAgent::default();
+    for (key, raw) in fields {
+        let Value::String(text) = raw else {
+            return Err(format!(
+                "{tool}: seat_overrides.{seat}.{key} must be a string"
+            ));
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(format!(
+                "{tool}: seat_overrides.{seat}.{key} must not be blank"
+            ));
+        }
+        let slot = match key.as_str() {
+            "provider" => &mut agent.provider,
+            "model" => &mut agent.model,
+            "effort" => &mut agent.effort,
+            other => {
+                return Err(format!(
+                    "{tool}: seat_overrides.{seat} has no '{other}' — only \
+provider, model, effort"
+                ))
+            }
+        };
+        *slot = Some(text.to_string());
+    }
+    Ok(agent)
+}
+
+/// The task-wide ask plus per-seat overrides, from already-validated args.
+fn parse_team_agents(
+    tool: &str,
+    object: &Map<String, Value>,
+    all: SeatAgent,
+) -> Result<TeamAgents, String> {
+    let mut agents = TeamAgents {
+        all,
+        ..Default::default()
+    };
+    let Some(raw) = object.get("seat_overrides") else {
+        return Ok(agents);
+    };
+    if raw.is_null() {
+        return Ok(agents);
+    }
+    let Value::Object(seats) = raw else {
+        return Err(format!(
+            "{tool}: 'seat_overrides' must be an object keyed by seat ({})",
+            SEATS.join(", ")
+        ));
+    };
+    for (seat, value) in seats {
+        let parsed = parse_seat_agent(tool, seat, value)?;
+        match seat.as_str() {
+            "tl" => agents.tl = parsed,
+            "dev" => agents.dev = parsed,
+            "reviewer" => agents.reviewer = parsed,
+            other => {
+                return Err(format!(
+                    "{tool}: '{other}' is not a seat — only {}",
+                    SEATS.join(", ")
+                ))
+            }
+        }
+    }
+    Ok(agents)
 }
 
 /// Validate a raw tool call. Errors name the bad argument for the model.
@@ -373,6 +654,15 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
         text(param)
     };
 
+    // Task-wide ask; per-seat overrides are layered over it by `per_seat`.
+    let task_wide = || -> Result<SeatAgent, String> {
+        Ok(SeatAgent {
+            provider: get("provider")?,
+            model: get("model")?,
+            effort: get("effort")?,
+        })
+    };
+
     match spec.name {
         "propose_task" => Ok(ToolCall::ProposeTask {
             title: get("title")?.expect("required param yields Some"),
@@ -380,6 +670,7 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
             acceptance_criteria: get("acceptance_criteria")?,
             team_id: get("team_id")?,
             why: get("why")?,
+            agents: parse_team_agents(spec.name, object, task_wide()?)?,
         }),
         "revise_proposal" => Ok(ToolCall::ReviseProposal {
             proposal_id: get("proposal_id")?.expect("required param yields Some"),
@@ -387,6 +678,19 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
             context: get("context")?,
             team_id: get("team_id")?,
             why: get("why")?,
+            agents: parse_team_agents(spec.name, object, task_wide()?)?,
+        }),
+        "list_agents" => Ok(ToolCall::ListAgents),
+        "task_definition" => Ok(ToolCall::TaskDefinition {
+            run_id: get("run_id")?,
+        }),
+        "message_team" => Ok(ToolCall::MessageTeam {
+            text: get("text")?.expect("required param yields Some"),
+            run_id: get("run_id")?,
+        }),
+        "widen_scope" => Ok(ToolCall::WidenScope {
+            addition: get("addition")?.expect("required param yields Some"),
+            run_id: get("run_id")?,
         }),
         "list_teams" => Ok(ToolCall::ListTeams),
         "pending_questions" => Ok(ToolCall::PendingQuestions),
@@ -546,6 +850,7 @@ that it is acting on a CARD, not on the task",
                 acceptance_criteria: None,
                 team_id: None,
                 why: None,
+                agents: TeamAgents::default(),
             }
         );
     }
@@ -559,6 +864,249 @@ that it is acting on a CARD, not on the task",
         assert_eq!(
             parse_call("list_teams", &json!({})),
             Ok(ToolCall::ListTeams)
+        );
+    }
+
+    /// A task-wide ask reaches every seat; that is what makes it task-wide.
+    #[test]
+    fn a_task_wide_model_lands_on_all_three_seats() {
+        let ToolCall::ProposeTask { agents, .. } = parse_call(
+            "propose_task",
+            &json!({ "title": "t", "model": "claude-opus-5", "effort": "medium" }),
+        )
+        .expect("parse") else {
+            panic!("wrong variant");
+        };
+        let (tl, dev, reviewer) = agents.per_seat();
+        for seat in [&tl, &dev, &reviewer] {
+            assert_eq!(seat.model.as_deref(), Some("claude-opus-5"));
+            assert_eq!(seat.effort.as_deref(), Some("medium"));
+        }
+    }
+
+    /// The trap this design exists to avoid: overriding ONE field of a seat must
+    /// not drop the rest of the task's choice for that seat. Asking the reviewer
+    /// to think harder should not silently move it to a different model.
+    #[test]
+    fn a_seat_override_replaces_only_the_fields_it_names() {
+        let ToolCall::ProposeTask { agents, .. } = parse_call(
+            "propose_task",
+            &json!({
+                "title": "t",
+                "model": "claude-opus-5",
+                "effort": "medium",
+                "seat_overrides": { "reviewer": { "effort": "max" } },
+            }),
+        )
+        .expect("parse") else {
+            panic!("wrong variant");
+        };
+        let (tl, _dev, reviewer) = agents.per_seat();
+        assert_eq!(
+            reviewer.effort.as_deref(),
+            Some("max"),
+            "the override applies"
+        );
+        assert_eq!(
+            reviewer.model.as_deref(),
+            Some("claude-opus-5"),
+            "overriding effort must not drop the model the task chose",
+        );
+        assert_eq!(
+            tl.effort.as_deref(),
+            Some("medium"),
+            "other seats untouched"
+        );
+    }
+
+    /// A seat may name a provider different from the task's, and that has to
+    /// carry its own model — otherwise the seat runs a model its provider does
+    /// not have.
+    #[test]
+    fn a_seat_can_move_to_another_provider_with_its_own_model() {
+        let ToolCall::ProposeTask { agents, .. } = parse_call(
+            "propose_task",
+            &json!({
+                "title": "t",
+                "provider": "codex",
+                "seat_overrides": {
+                    "reviewer": { "provider": "claude_code", "model": "claude-opus-5" }
+                },
+            }),
+        )
+        .expect("parse") else {
+            panic!("wrong variant");
+        };
+        let (tl, _dev, reviewer) = agents.per_seat();
+        assert_eq!(reviewer.provider.as_deref(), Some("claude_code"));
+        assert_eq!(reviewer.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(tl.provider.as_deref(), Some("codex"));
+        assert_eq!(
+            tl.model, None,
+            "the task named no model, so the seat has none"
+        );
+    }
+
+    /// Silently ignoring a misspelled seat would run the task on the defaults
+    /// while the model believed it had asked for something else.
+    /// A model id only means anything to the provider that published it. A seat
+    /// that moves to another provider must NOT inherit the task's model, or it
+    /// is staged with an id its own catalogue has never seen — and the resolver
+    /// deliberately preserves an explicitly-named model, so the mistake survives
+    /// provisioning and only surfaces when that seat finally starts.
+    #[test]
+    fn a_seat_that_changes_provider_does_not_inherit_the_other_ones_model() {
+        let ToolCall::ProposeTask { agents, .. } = parse_call(
+            "propose_task",
+            &json!({
+                "title": "t",
+                "provider": "codex",
+                "model": "gpt-5.6-codex",
+                "effort": "medium",
+                "seat_overrides": { "reviewer": { "provider": "claude_code" } },
+            }),
+        )
+        .expect("parse") else {
+            panic!("wrong variant");
+        };
+        let (tl, _dev, reviewer) = agents.per_seat();
+        assert_eq!(reviewer.provider.as_deref(), Some("claude_code"));
+        assert_eq!(
+            reviewer.model, None,
+            "a codex model id must not follow the seat onto claude_code",
+        );
+        assert_eq!(
+            reviewer.effort.as_deref(),
+            Some("medium"),
+            "effort levels are shared across providers and get clamped, so they \
+still inherit",
+        );
+        assert_eq!(
+            tl.model.as_deref(),
+            Some("gpt-5.6-codex"),
+            "the seat that stayed put keeps the task's model",
+        );
+    }
+
+    /// Naming a provider where the task named none is still a move: the task's
+    /// model belongs to whatever the relay would have picked, not to this seat.
+    #[test]
+    fn a_seat_naming_a_provider_the_task_did_not_drops_the_inherited_model() {
+        let ToolCall::ProposeTask { agents, .. } = parse_call(
+            "propose_task",
+            &json!({
+                "title": "t",
+                "model": "gpt-5.6-codex",
+                "seat_overrides": { "dev": { "provider": "claude_code" } },
+            }),
+        )
+        .expect("parse") else {
+            panic!("wrong variant");
+        };
+        let (_tl, dev, _reviewer) = agents.per_seat();
+        assert_eq!(dev.model, None, "{dev:?}");
+    }
+
+    #[test]
+    fn a_seat_that_does_not_exist_is_refused_by_name() {
+        let err = parse_call(
+            "propose_task",
+            &json!({ "title": "t", "seat_overrides": { "reveiwer": { "effort": "max" } } }),
+        )
+        .unwrap_err();
+        assert!(err.contains("reveiwer"), "{err}");
+        assert!(
+            err.contains("reviewer"),
+            "the error must name the real seats: {err}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_field_inside_a_seat_is_refused_by_name() {
+        let err = parse_call(
+            "propose_task",
+            &json!({ "title": "t", "seat_overrides": { "dev": { "modle": "x" } } }),
+        )
+        .unwrap_err();
+        assert!(err.contains("modle"), "{err}");
+        assert!(err.contains("provider, model, effort"), "{err}");
+    }
+
+    #[test]
+    fn a_seat_override_must_be_an_object_of_strings() {
+        let err = parse_call(
+            "propose_task",
+            &json!({ "title": "t", "seat_overrides": { "dev": "claude-opus-5" } }),
+        )
+        .unwrap_err();
+        assert!(err.contains("must be an object"), "{err}");
+
+        let err = parse_call(
+            "propose_task",
+            &json!({ "title": "t", "seat_overrides": { "dev": { "effort": 5 } } }),
+        )
+        .unwrap_err();
+        assert!(err.contains("must be a string"), "{err}");
+    }
+
+    /// Asking for nothing must stay indistinguishable from not asking, or every
+    /// task would pin itself to today's default and stop following it.
+    #[test]
+    fn a_task_that_names_no_agent_pins_nothing() {
+        let ToolCall::ProposeTask { agents, .. } =
+            parse_call("propose_task", &json!({ "title": "t" })).expect("parse")
+        else {
+            panic!("wrong variant");
+        };
+        assert!(agents.is_empty());
+        let (tl, dev, reviewer) = agents.per_seat();
+        for seat in [&tl, &dev, &reviewer] {
+            assert!(seat.provider.is_none() && seat.model.is_none() && seat.effort.is_none());
+        }
+    }
+
+    #[test]
+    fn revise_carries_the_same_agent_surface_as_propose() {
+        // Whatever propose can express, revise must be able to correct — else the
+        // only way to fix a model is to dismiss and re-stage.
+        let propose = spec_for("propose_task").expect("propose_task");
+        let revise = spec_for("revise_proposal").expect("revise_proposal");
+        for name in ["provider", "model", "effort", "seat_overrides"] {
+            assert!(
+                propose.params.iter().any(|param| param.name == name),
+                "propose_task lost {name}"
+            );
+            assert!(
+                revise.params.iter().any(|param| param.name == name),
+                "revise_proposal cannot correct {name}"
+            );
+        }
+    }
+
+    /// The gate measures against `agreed_scope`; a team that could widen it
+    /// would always pass its own gate.
+    #[test]
+    fn the_team_can_never_widen_its_own_scope() {
+        let spec = spec_for("widen_scope").expect("widen_scope");
+        assert!(
+            spec.summary.contains("never"),
+            "the tool must say who may not call it: {}",
+            spec.summary
+        );
+        assert!(ACTING_TOOLS.contains(&"widen_scope"));
+    }
+
+    #[test]
+    fn widening_needs_something_to_add() {
+        let err = parse_call("widen_scope", &json!({ "addition": "  " })).unwrap_err();
+        assert!(err.contains("addition"), "{err}");
+    }
+
+    #[test]
+    fn reading_the_task_definition_takes_no_arguments() {
+        assert_eq!(
+            parse_call("task_definition", &json!({})),
+            Ok(ToolCall::TaskDefinition { run_id: None })
         );
     }
 
