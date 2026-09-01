@@ -233,6 +233,39 @@ test("the specific reason survives the collapse", () => {
   );
 });
 
+test("attention hides terminal reports once their latest update was read", () => {
+  const seenAt = {
+    "escalated-1": 100,
+    "failed-1": 100,
+    "interrupted-1": 100,
+  };
+  for (const status of ["escalated", "failed", "interrupted"]) {
+    assert.equal(
+      teamAttention(run({ team_run_id: `${status}-1`, status, updated_at: 100 }), seenAt),
+      null,
+      status
+    );
+  }
+});
+
+test("attention shows a terminal report again after a newer update", () => {
+  const report = run({ team_run_id: "failed-1", status: "failed", updated_at: 200 });
+  assert.equal(teamAttention(report, { "failed-1": 100 }).reason, "failed");
+});
+
+test("attention never dismisses a question or blocked request as read", () => {
+  const seenAt = { "asking-1": 100, "blocked-1": 100 };
+  const question = run({
+    team_run_id: "asking-1",
+    status: "awaiting_user",
+    updated_at: 100,
+    awaiting: { role: "dev", request_id: "ask:1" },
+  });
+  const blocked = run({ team_run_id: "blocked-1", status: "blocked", updated_at: 100 });
+  assert.equal(teamAttention(question, seenAt).reason, "question");
+  assert.equal(teamAttention(blocked, seenAt).reason, "blocked");
+});
+
 test("a blocked task explains itself even with no error recorded", () => {
   const attention = teamAttention(run({ status: "blocked", error: null }));
   assert.equal(attention.kind, "needs_input");
