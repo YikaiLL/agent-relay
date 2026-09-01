@@ -191,7 +191,13 @@ export function currentSubTask(run) {
   return subTasks.find((task) => !isTerminalSubTaskStatus(task?.status)) || null;
 }
 
-const TERMINAL_SUB_TASK_STATUSES = new Set(["done", "escalated", "failed", "skipped"]);
+const TERMINAL_SUB_TASK_STATUSES = new Set([
+  "done",
+  "escalated",
+  "failed",
+  "skipped",
+  "superseded",
+]);
 
 export function isTerminalSubTaskStatus(status) {
   return TERMINAL_SUB_TASK_STATUSES.has(status);

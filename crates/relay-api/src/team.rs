@@ -28,9 +28,7 @@
 //! The driver advances `phase` in the SAME write that records a step's result, so
 //! a crash re-runs at most the last turn. See `markdown/task-team-design.md` §5.
 
-use std::collections::hash_map::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -379,7 +377,8 @@ impl<'de> Deserialize<'de> for TeamPhase {
     }
 }
 
-/// Per-sub-task lifecycle. Terminal: `Done`, `Escalated`, `Failed`, `Skipped`.
+/// Per-sub-task lifecycle. Terminal: `Done`, `Escalated`, `Failed`, `Skipped`,
+/// `Superseded`.
 ///
 /// Decodes leniently, same rationale as `TeamPhase`. Unknown maps to the terminal
 /// `Failed`: a sub-task we cannot interpret is never re-run, and still gets
@@ -400,6 +399,8 @@ pub enum SubTaskStatus {
     Failed,
     /// Never run because the run settled first. TERMINAL.
     Skipped,
+    /// Replaced by a later plan, and still rerunnable by its id. TERMINAL.
+    Superseded,
 }
 
 impl SubTaskStatus {
@@ -411,6 +412,7 @@ impl SubTaskStatus {
             Self::Escalated => "escalated",
             Self::Failed => "failed",
             Self::Skipped => "skipped",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -421,6 +423,7 @@ impl SubTaskStatus {
             "done" => Self::Done,
             "escalated" => Self::Escalated,
             "skipped" => Self::Skipped,
+            "superseded" => Self::Superseded,
             _ => Self::Failed,
         }
     }
@@ -428,7 +431,7 @@ impl SubTaskStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Done | Self::Escalated | Self::Failed | Self::Skipped
+            Self::Done | Self::Escalated | Self::Failed | Self::Skipped | Self::Superseded
         )
     }
 }
@@ -445,52 +448,28 @@ impl<'de> Deserialize<'de> for SubTaskStatus {
     }
 }
 
-/// A sub-task id nothing else can repeat: `st-<counter>-<salt>`, the counter a
-/// nanosecond clock forced upward so two mints in one nanosecond still differ.
-///
-/// The salt is what a restart cannot repeat: the counter starts from zero in a new
-/// process, so an equal or stepped-back clock would otherwise reissue a persisted id.
+/// A sub-task id `st-<hex>`, distinct for as long as this relay process runs.
+/// A restart could in principle reissue one, and we accept that.
 pub fn mint_sub_task_id() -> String {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
-    mint_id(&LAST, process_salt(), now)
+    format!("st-{:x}", mint_number(&LAST, now))
 }
 
-fn mint_id(last: &AtomicU64, salt: u32, now: u64) -> String {
-    let number = mint_number(last, now).expect("sub-task id counter exhausted");
-    format!("st-{number:x}-{salt:08x}")
-}
-
-/// Drawn once, so every id this process mints carries the same salt and the
-/// counter alone orders them.
-fn process_salt() -> u32 {
-    static SALT: OnceLock<u32> = OnceLock::new();
-    *SALT.get_or_init(draw_salt)
-}
-
-/// `RandomState` keys come from the OS per process — the one input here that does
-/// not come back the same after a restart.
-fn draw_salt() -> u32 {
-    use std::hash::{BuildHasher, Hasher};
-    RandomState::new().build_hasher().finish() as u32
-}
-
-/// `max(now, previous + 1)`, claimed atomically; `None` once the counter cannot
-/// rise, because saturating there would hand the same number out forever.
-fn mint_number(last: &AtomicU64, now: u64) -> Option<u64> {
-    let step = |prev: u64| {
-        if now > prev {
-            Some(now)
-        } else {
-            prev.checked_add(1)
-        }
-    };
-    last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, step)
-        .ok()
-        .and_then(step)
+/// `max(now, previous + 1)`, claimed atomically, because two reads of the clock
+/// can land on the same nanosecond.
+fn mint_number(last: &AtomicU64, now: u64) -> u64 {
+    let mut minted = now;
+    // Contention re-runs the closure, so the value it wrote last is the one this
+    // call actually stored.
+    let _ = last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        minted = now.max(prev + 1);
+        Some(minted)
+    });
+    minted
 }
 
 /// One TL-authored unit of work.
@@ -1078,6 +1057,26 @@ impl TeamRun {
         true
     }
 
+    /// Append the TL's new plan, retiring rather than dropping what it replaces,
+    /// so an earlier sub-task's id still names its record and can be rerun.
+    pub fn replan_sub_tasks(&mut self, planned: Vec<SubTask>) {
+        for task in &mut self.sub_tasks {
+            task.status = SubTaskStatus::Superseded;
+            // `current_sub_task` selects an undigested entry however terminal, and
+            // the TL wrote the replan, so it is owed no report about it.
+            task.digested = true;
+        }
+        for mut task in planned {
+            // A restart resets the mint, so a new id can land on a retained one and
+            // leave that record unreachable by name. One re-mint is the defence.
+            if self.sub_tasks.iter().any(|kept| kept.id == task.id) {
+                task.id = mint_sub_task_id();
+            }
+            self.sub_tasks.push(task);
+        }
+        self.updated_at = unix_now();
+    }
+
     /// Pull the phase back to `SubTasks` while one is waiting, dropping the verdict
     /// and findings that judged the diff before it. Returns whether it moved.
     ///
@@ -1640,6 +1639,7 @@ mod tests {
             SubTaskStatus::Escalated,
             SubTaskStatus::Failed,
             SubTaskStatus::Skipped,
+            SubTaskStatus::Superseded,
         ] {
             let encoded = serde_json::to_string(&status).expect("serialize");
             assert_eq!(encoded, format!("\"{}\"", status.as_str()));
@@ -1714,12 +1714,10 @@ mod tests {
         assert_eq!(unique.len(), ids.len(), "every minted id must be distinct");
 
         let mut previous = 0u64;
-        let mut salts: HashSet<&str> = HashSet::new();
         for id in &ids {
-            let (counter, salt) = id
+            let counter = id
                 .strip_prefix("st-")
-                .and_then(|rest| rest.split_once('-'))
-                .unwrap_or_else(|| panic!("id must be `st-<hex>-<hex>`, got {id}"));
+                .unwrap_or_else(|| panic!("id must be `st-<hex>`, got {id}"));
             let value = u64::from_str_radix(counter, 16)
                 .unwrap_or_else(|_| panic!("id must carry a hex number, got {id}"));
             assert!(
@@ -1727,13 +1725,7 @@ mod tests {
                 "the sequence must strictly increase: {value} came after {previous}"
             );
             previous = value;
-            salts.insert(salt);
         }
-        assert_eq!(
-            salts.len(),
-            1,
-            "one process, one salt — the counter is what orders these: {salts:?}"
-        );
     }
 
     #[test]
@@ -1745,9 +1737,7 @@ mod tests {
 
         let last = AtomicU64::new(0);
         let frozen = 1_700_000_000_000_000_000_u64;
-        let numbers: Vec<u64> = (0..1000)
-            .map(|_| mint_number(&last, frozen).expect("the counter is nowhere near its ceiling"))
-            .collect();
+        let numbers: Vec<u64> = (0..1000).map(|_| mint_number(&last, frozen)).collect();
 
         let unique: HashSet<&u64> = numbers.iter().collect();
         assert_eq!(unique.len(), numbers.len(), "same nanosecond, same id");
@@ -1756,52 +1746,6 @@ mod tests {
             "the sequence must rise even while the clock stands still"
         );
         assert_eq!(numbers[0], frozen, "the first mint is the clock reading");
-    }
-
-    #[test]
-    fn a_restart_cannot_reissue_an_id_the_old_process_already_persisted() {
-        // The counter starts at zero in every process, so on a restart only the
-        // clock separates the ids — and a clock that was stepped back, or read at
-        // the same nanosecond, hands the persisted id straight back out.
-        let frozen = 1_700_000_000_000_000_000_u64;
-        let before = mint_id(&AtomicU64::new(0), 0x1111_2222, frozen);
-        let after = mint_id(&AtomicU64::new(0), 0x3333_4444, frozen);
-
-        assert_ne!(
-            before, after,
-            "the same clock reading in a new process must not repeat an id"
-        );
-    }
-
-    #[test]
-    fn the_per_process_salt_is_drawn_and_not_a_constant() {
-        // What the restart case above rests on. A constant here would make the id
-        // a pure function of the clock again, which is the bug.
-        use std::collections::HashSet;
-
-        let draws: HashSet<u32> = (0..64).map(|_| draw_salt()).collect();
-        assert!(
-            draws.len() > 1,
-            "a salt that never varies is not a salt: {draws:?}"
-        );
-    }
-
-    #[test]
-    fn a_counter_at_its_ceiling_refuses_instead_of_repeating() {
-        // Saturating at `u64::MAX` would hand the same number out forever, which
-        // is the duplicate-id bug this function exists to remove.
-        let last = AtomicU64::new(u64::MAX - 1);
-        let first = mint_number(&last, 5);
-        let second = mint_number(&last, 5);
-
-        assert_eq!(first, Some(u64::MAX), "the last number is still mintable");
-        assert_ne!(first, second, "the ceiling must not repeat a number");
-        assert_eq!(second, None, "an exhausted counter mints nothing");
-        assert_eq!(
-            last.load(Ordering::Relaxed),
-            u64::MAX,
-            "a refused mint must not move the counter"
-        );
     }
 
     #[test]
@@ -1850,6 +1794,69 @@ mod tests {
         );
         assert_eq!(run.sub_tasks[1].rounds_used, 3);
         assert!(run.sub_tasks[1].digested);
+    }
+
+    fn planned_sub_task(id: &str) -> SubTask {
+        SubTask {
+            id: id.to_string(),
+            ..sub_task(SubTaskStatus::Pending, false)
+        }
+    }
+
+    #[test]
+    fn a_replan_retires_what_it_replaces_instead_of_dropping_it() {
+        // A replan is authored from `Planning`, before any of it has been worked,
+        // so everything it replaces is still pending.
+        let mut run = run_with(
+            TeamPhase::Planning,
+            vec![planned_sub_task("st-1"), planned_sub_task("st-2")],
+        );
+
+        run.replan_sub_tasks(vec![planned_sub_task("st-3")]);
+
+        let ids: Vec<&str> = run.sub_tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["st-1", "st-2", "st-3"],
+            "an id from before the replan must still name its record"
+        );
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Superseded);
+        assert_eq!(run.sub_tasks[1].status, SubTaskStatus::Superseded);
+        assert_eq!(
+            run.current_sub_task(),
+            Some(2),
+            "a retired one must not be picked up again"
+        );
+    }
+
+    #[test]
+    fn a_replanned_id_landing_on_a_retained_one_is_minted_again() {
+        // A restart resets the mint, so the plan after it can carry an id an
+        // earlier plan already handed out. Two records answering to one id makes
+        // a rerun reach only the first, which is the record nobody asked for.
+        let mut run = run_with(TeamPhase::Planning, vec![planned_sub_task("st-1")]);
+
+        run.replan_sub_tasks(vec![planned_sub_task("st-1")]);
+
+        assert_eq!(run.sub_tasks.len(), 2, "neither record may be dropped");
+        assert_eq!(
+            run.sub_tasks[0].id, "st-1",
+            "the retired one keeps the id the user is holding"
+        );
+        assert_ne!(
+            run.sub_tasks[1].id, "st-1",
+            "the newcomer must not answer to it as well"
+        );
+        assert!(
+            run.sub_tasks[1].id.starts_with("st-"),
+            "the replacement is a real minted id, got {}",
+            run.sub_tasks[1].id
+        );
+        assert_eq!(
+            run.current_sub_task(),
+            Some(1),
+            "and the new plan is what the team goes on to work"
+        );
     }
 
     #[test]
