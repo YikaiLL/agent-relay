@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
     ensure_path_within_device_scope, persistence::PersistedRelayState, unix_now, ReviewJob,
-    RunStatus, SecurityProfile, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
+    RunStatus, SecurityProfile, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadGate, WorkflowRun,
     CONTROLLER_LEASE_SECS, DEFAULT_APPROVAL_POLICY, DEFAULT_EFFORT, DEFAULT_MODEL, DEFAULT_SANDBOX,
     STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
@@ -2542,12 +2542,16 @@ impl RelayState {
                 let mut run = run.clone();
                 match run.status {
                     TeamRunStatus::PausePending => {
-                        run.settle_paused("the relay restarted while the team was pausing");
+                        run.settle_paused(
+                            "the relay restarted while the team was pausing",
+                            TeamPauseKind::Boundary,
+                        );
                     }
                     TeamRunStatus::AwaitingUser => {
                         run.rollback_current_round();
                         run.settle_paused(
                             "the relay restarted while the team was waiting on your answer; that step will be re-run",
+                            TeamPauseKind::Boundary,
                         );
                     }
                     _ => {

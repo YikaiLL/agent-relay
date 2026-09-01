@@ -48,9 +48,9 @@ pub(crate) use self::review::Verdict;
 pub(crate) use self::security::SecurityProfile;
 #[allow(unused_imports)]
 pub(crate) use self::team::{
-    AwaitingUser, SubTask, SubTaskStatus, TaskSpec, TeamPhase, TeamRun, TeamRunStatus,
-    TeamThreadGate, TeamThreadSlot, TlGeneration, MAX_MR_ROUNDS, MAX_SUBTASK_REVIEW_ROUNDS,
-    MAX_TL_GENERATIONS,
+    AwaitingUser, SubTask, SubTaskStatus, TaskSpec, TeamPauseKind, TeamPhase, TeamRun,
+    TeamRunStatus, TeamThreadGate, TeamThreadSlot, TlGeneration, MAX_MR_ROUNDS,
+    MAX_SUBTASK_REVIEW_ROUNDS, MAX_TL_GENERATIONS,
 };
 #[allow(unused_imports)]
 pub(crate) use self::workflow::{
