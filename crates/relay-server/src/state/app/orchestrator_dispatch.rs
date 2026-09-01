@@ -623,8 +623,67 @@ pending_questions to read it",
                     })?;
                 Ok(receipt.message)
             }
+            ToolCall::RerunSubTasks {
+                sub_task_ids,
+                run_id,
+            } => {
+                let target = self.one_live_run(run_id.as_deref()).await?;
+                let mut outcome = Err("this task is gone".to_string());
+                {
+                    let mut relay = self.relay.write().await;
+                    relay.update_team_run(&target, |run| {
+                        outcome = match rerun_targets(run, &sub_task_ids) {
+                            Ok(titles) => {
+                                run.revive_sub_tasks(Some(&sub_task_ids));
+                                Ok(titles)
+                            }
+                            Err(refusal) => Err(refusal),
+                        };
+                    });
+                    if outcome.is_ok() {
+                        relay.notify();
+                    }
+                }
+                let titles = outcome?;
+                Ok(format!(
+                    "{target} will run {} again, each with a fresh review budget. \
+The team resumes at the earliest of them on its next turn.",
+                    titles.join(", ")
+                ))
+            }
         }
     }
+}
+
+/// The titles a rerun would touch, or why it may not run at all.
+///
+/// Every id is checked before anything moves: applying the half of a call that
+/// made sense leaves the model believing the rest ran too.
+fn rerun_targets(run: &relay_api::team::TeamRun, ids: &[String]) -> Result<Vec<String>, String> {
+    let mut unknown = Vec::new();
+    let mut in_flight = Vec::new();
+    let mut titles = Vec::new();
+    for id in ids {
+        match run.sub_tasks.iter().find(|task| &task.id == id) {
+            None => unknown.push(id.as_str()),
+            Some(task) if !task.status.is_terminal() => in_flight.push(id.as_str()),
+            Some(task) => titles.push(task.title.clone()),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{} has no sub-task {} — task_status lists the ids",
+            run.id,
+            unknown.join(", ")
+        ));
+    }
+    if !in_flight.is_empty() {
+        return Err(format!(
+            "{} is still working — resetting it now would throw away the turn in flight",
+            in_flight.join(", ")
+        ));
+    }
+    Ok(titles)
 }
 
 /// MCP `tools/call` envelope shared by HTTP and any in-process caller.
@@ -1960,6 +2019,265 @@ it a turn ago"
                 .contains("question text"),
             "the tool that takes the map must describe the same key: {}",
             answers_param.summary
+        );
+    }
+
+    /// A settled sub-task, with a checkpoint commit a rerun must not lose.
+    fn settled_sub_task(id: &str, title: &str) -> relay_api::team::SubTask {
+        relay_api::team::SubTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: relay_api::team::SubTaskStatus::Done,
+            rounds_used: relay_api::team::MAX_SUBTASK_REVIEW_ROUNDS,
+            digested: true,
+            base_commit: "c0ffee".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of the tool. Record fields alone do not prove it can run
+    /// again: the run has to be back in a phase that looks at sub-tasks, and the
+    /// derived cursor has to select it.
+    #[tokio::test]
+    async fn a_rerun_puts_a_finished_sub_task_back_to_work() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.phase = relay_api::team::TeamPhase::MrGate;
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+                run.unresolved
+                    .push("sub-task \"Diagnose it\" was not approved".to_string());
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": ["st-1"] }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("rerun_sub_tasks");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        let sub = &run.sub_tasks[0];
+        assert_eq!(sub.status, relay_api::team::SubTaskStatus::Pending);
+        assert_eq!(sub.rounds_used, 0, "it gets a fresh review budget");
+        assert!(!sub.digested, "the TL has to hear the new outcome");
+        assert!(
+            run.unresolved.is_empty(),
+            "stale findings would keep the run from ever finishing: {:?}",
+            run.unresolved
+        );
+        assert_eq!(
+            run.phase,
+            relay_api::team::TeamPhase::SubTasks,
+            "from the gate, nothing ever looks at the revived sub-task"
+        );
+        assert_eq!(
+            run.current_sub_task(),
+            Some(0),
+            "the team has to actually resume there"
+        );
+    }
+
+    /// One id the run does not have has to refuse the whole call, by name.
+    /// Running the ids it did recognise would leave the model believing the
+    /// typo'd one ran too, and nothing would ever say otherwise.
+    #[tokio::test]
+    async fn an_unknown_id_refuses_the_whole_rerun_by_name() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+            });
+        }
+
+        let error = app
+            .call_orchestrator_tool(
+                "rerun_sub_tasks",
+                &json!({ "sub_task_ids": ["st-1", "st-9"] }),
+                Some("device-1".to_string()),
+            )
+            .await
+            .expect_err("an unknown id is refused");
+        assert!(error.contains("st-9"), "say which one: {error}");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.sub_tasks[0].status,
+            relay_api::team::SubTaskStatus::Done,
+            "a refused call must not have applied the half it understood"
+        );
+    }
+
+    /// Naming a sub-task whose turn is still running is refused rather than
+    /// quietly skipped: "these will run again" has to be true of all of them,
+    /// and resetting one mid-turn would throw away the work in flight.
+    #[tokio::test]
+    async fn a_rerun_of_a_sub_task_still_in_flight_is_refused_by_name() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+                run.sub_tasks.push(relay_api::team::SubTask {
+                    id: "st-2".to_string(),
+                    title: "Fix it".to_string(),
+                    status: relay_api::team::SubTaskStatus::Implementing,
+                    rounds_used: 1,
+                    ..Default::default()
+                });
+            });
+        }
+
+        let error = app
+            .call_orchestrator_tool(
+                "rerun_sub_tasks",
+                &json!({ "sub_task_ids": ["st-1", "st-2"] }),
+                Some("device-1".to_string()),
+            )
+            .await
+            .expect_err("a sub-task in flight is refused");
+        assert!(error.contains("st-2"), "say which one: {error}");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.sub_tasks[0].status,
+            relay_api::team::SubTaskStatus::Done,
+            "the settled one must not have run anyway"
+        );
+        assert_eq!(
+            run.sub_tasks[1].rounds_used, 1,
+            "the turn in flight keeps what it has spent"
+        );
+    }
+
+    /// One call takes a set, not a single id — and touches only the set it was
+    /// given. A sub-task nobody named stays settled.
+    #[tokio::test]
+    async fn a_rerun_takes_several_ids_and_leaves_the_rest_settled() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+                run.sub_tasks.push(settled_sub_task("st-2", "Fix it"));
+                run.sub_tasks.push(settled_sub_task("st-3", "Write it up"));
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": ["st-1", "st-3"] }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("rerun_sub_tasks");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        let status_of = |id: &str| {
+            run.sub_tasks
+                .iter()
+                .find(|task| task.id == id)
+                .expect("sub-task")
+                .status
+        };
+        assert_eq!(
+            status_of("st-1"),
+            relay_api::team::SubTaskStatus::Pending,
+            "a named sub-task runs again"
+        );
+        assert_eq!(
+            status_of("st-3"),
+            relay_api::team::SubTaskStatus::Pending,
+            "every named sub-task runs again, not just the first"
+        );
+        assert_eq!(
+            status_of("st-2"),
+            relay_api::team::SubTaskStatus::Done,
+            "one nobody named is left where it was"
+        );
+    }
+
+    /// A sub-task mid-turn that the call did not name must come through
+    /// untouched — reviving its neighbours may not reach into work in flight.
+    #[tokio::test]
+    async fn a_rerun_leaves_an_unnamed_sub_task_in_flight_alone() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+                run.sub_tasks.push(relay_api::team::SubTask {
+                    id: "st-2".to_string(),
+                    title: "Fix it".to_string(),
+                    status: relay_api::team::SubTaskStatus::Implementing,
+                    rounds_used: 1,
+                    ..Default::default()
+                });
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": ["st-1"] }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("rerun_sub_tasks");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.sub_tasks[1].status,
+            relay_api::team::SubTaskStatus::Implementing,
+            "an unnamed sub-task mid-turn is not part of this call"
+        );
+        assert_eq!(
+            run.sub_tasks[1].rounds_used, 1,
+            "and it keeps the rounds it has spent"
+        );
+    }
+
+    /// A revived sub-task keeps its checkpoint commit. Rebuilding the record
+    /// instead of editing it would blank `base_commit`, and the reviewer would
+    /// then grade the rerun against everything since the run began.
+    #[tokio::test]
+    async fn a_rerun_sub_task_keeps_the_commit_its_review_diffs_against() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": ["st-1"] }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("rerun_sub_tasks");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(run.sub_tasks[0].base_commit, "c0ffee");
+        assert_eq!(
+            run.sub_tasks[0].title, "Diagnose it",
+            "the record is edited, never rebuilt"
         );
     }
 }
