@@ -1021,9 +1021,22 @@ impl TeamRun {
     /// A sub-task mid-round keeps its spent rounds — refunding work in flight
     /// would hand out budget nobody asked for.
     pub fn revive_escalated_sub_tasks(&mut self) -> bool {
+        self.revive_sub_tasks(None)
+    }
+
+    /// [`revive_escalated_sub_tasks`] with a filter: `None` takes every
+    /// `Escalated` sub-task, `Some(ids)` takes those ids where already terminal.
+    ///
+    /// The terminal guard lives here, not in the caller, so no future caller can
+    /// reset a sub-task whose turn is still running and lose the work in flight.
+    pub fn revive_sub_tasks(&mut self, only: Option<&[String]>) -> bool {
         let mut revived = false;
         for task in &mut self.sub_tasks {
-            if task.status == SubTaskStatus::Escalated {
+            let selected = match only {
+                None => task.status == SubTaskStatus::Escalated,
+                Some(ids) => task.status.is_terminal() && ids.iter().any(|id| id == &task.id),
+            };
+            if selected {
                 task.status = SubTaskStatus::Pending;
                 task.rounds_used = 0;
                 task.digested = false;
@@ -1727,5 +1740,130 @@ mod tests {
         assert!(owned.contains(&"dev-1".to_string()));
         assert!(owned.contains(&"rev-1".to_string()));
         assert_eq!(owned.len(), 3, "no duplicates: {owned:?}");
+    }
+
+    fn spent_sub_task(id: &str, status: SubTaskStatus) -> SubTask {
+        SubTask {
+            id: id.to_string(),
+            rounds_used: 3,
+            ..sub_task(status, true)
+        }
+    }
+
+    #[test]
+    fn a_filtered_revive_takes_the_named_sub_task_and_nothing_else() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Done),
+                spent_sub_task("st-2", SubTaskStatus::Escalated),
+            ],
+        );
+
+        assert!(run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Pending);
+        assert_eq!(run.sub_tasks[0].rounds_used, 0, "a fresh review budget");
+        assert!(!run.sub_tasks[0].digested, "its outcome is owed again");
+        assert_eq!(
+            run.sub_tasks[1].status,
+            SubTaskStatus::Escalated,
+            "an unnamed sub-task stays settled even when it is escalated"
+        );
+        assert_eq!(run.sub_tasks[1].rounds_used, 3);
+        assert!(run.sub_tasks[1].digested);
+    }
+
+    #[test]
+    fn a_named_sub_task_in_flight_is_left_alone() {
+        // Resetting a turn that is still running would throw away work nobody
+        // asked to discard, so the guard lives here rather than in the caller.
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![spent_sub_task("st-1", SubTaskStatus::Implementing)],
+        );
+
+        assert!(!run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Implementing);
+        assert_eq!(run.sub_tasks[0].rounds_used, 3);
+        assert!(run.sub_tasks[0].digested);
+    }
+
+    #[test]
+    fn a_filtered_revive_reopens_the_run_the_same_way_the_unfiltered_one_does() {
+        let mut run = run_with(
+            TeamPhase::MrGate,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Done),
+                spent_sub_task("st-2", SubTaskStatus::Done),
+            ],
+        );
+        run.unresolved = vec!["the retry path is untested".to_string()];
+        run.mr_rounds_used = 2;
+        run.design_review_rounds = 1;
+        run.mr_verdict = Some(WorkflowVerdict::needs_changes(vec!["fix it".to_string()]));
+
+        assert!(run.revive_sub_tasks(Some(&["st-2".to_string()])));
+
+        assert!(run.unresolved.is_empty(), "`finalize` refuses leftovers");
+        assert_eq!(run.mr_rounds_used, 0);
+        assert_eq!(run.design_review_rounds, 0);
+        assert_eq!(run.mr_verdict, None);
+        assert_eq!(
+            run.phase,
+            TeamPhase::SubTasks,
+            "the gate never looks at sub-tasks"
+        );
+        assert_eq!(
+            run.current_sub_task(),
+            Some(1),
+            "the revived sub-task is the one the run picks up"
+        );
+    }
+
+    #[test]
+    fn the_unfiltered_revive_still_takes_every_escalated_sub_task() {
+        let mut run = run_with(
+            TeamPhase::Wrapping,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Done),
+                spent_sub_task("st-2", SubTaskStatus::Escalated),
+                spent_sub_task("st-3", SubTaskStatus::Escalated),
+            ],
+        );
+        run.unresolved = vec!["a finding".to_string()];
+        run.mr_rounds_used = 2;
+
+        assert!(run.revive_escalated_sub_tasks());
+
+        assert_eq!(
+            run.sub_tasks[0].status,
+            SubTaskStatus::Done,
+            "not escalated"
+        );
+        for index in [1, 2] {
+            assert_eq!(run.sub_tasks[index].status, SubTaskStatus::Pending);
+            assert_eq!(run.sub_tasks[index].rounds_used, 0);
+            assert!(!run.sub_tasks[index].digested);
+        }
+        assert!(run.unresolved.is_empty());
+        assert_eq!(run.mr_rounds_used, 0);
+        assert_eq!(run.phase, TeamPhase::SubTasks);
+    }
+
+    #[test]
+    fn an_unfiltered_revive_with_nothing_escalated_changes_nothing() {
+        let mut run = run_with(
+            TeamPhase::MrGate,
+            vec![spent_sub_task("st-1", SubTaskStatus::Done)],
+        );
+        run.unresolved = vec!["a finding".to_string()];
+
+        assert!(!run.revive_escalated_sub_tasks());
+
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Done);
+        assert_eq!(run.unresolved.len(), 1, "no rewind without a revival");
+        assert_eq!(run.phase, TeamPhase::MrGate);
     }
 }
