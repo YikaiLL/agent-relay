@@ -320,6 +320,8 @@ test("progress counts every settled sub-task, including skipped and escalated on
 test("currentSubTask is null once everything settled", () => {
   assert.equal(currentSubTask(run({ sub_tasks: [subTask({ status: "done" })] })), null);
   assert.equal(currentSubTask(run({ sub_tasks: [] })), null);
+  // One a replan retired is settled too, not the step the team is on.
+  assert.equal(currentSubTask(run({ sub_tasks: [subTask({ status: "superseded" })] })), null);
 });
 
 test("the team lead is conversable only while the task is paused", () => {

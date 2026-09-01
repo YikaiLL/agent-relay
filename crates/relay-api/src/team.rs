@@ -377,7 +377,8 @@ impl<'de> Deserialize<'de> for TeamPhase {
     }
 }
 
-/// Per-sub-task lifecycle. Terminal: `Done`, `Escalated`, `Failed`, `Skipped`.
+/// Per-sub-task lifecycle. Terminal: `Done`, `Escalated`, `Failed`, `Skipped`,
+/// `Superseded`.
 ///
 /// Decodes leniently, same rationale as `TeamPhase`. Unknown maps to the terminal
 /// `Failed`: a sub-task we cannot interpret is never re-run, and still gets
@@ -398,6 +399,8 @@ pub enum SubTaskStatus {
     Failed,
     /// Never run because the run settled first. TERMINAL.
     Skipped,
+    /// Replaced by a later plan, and still rerunnable by its id. TERMINAL.
+    Superseded,
 }
 
 impl SubTaskStatus {
@@ -409,6 +412,7 @@ impl SubTaskStatus {
             Self::Escalated => "escalated",
             Self::Failed => "failed",
             Self::Skipped => "skipped",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -419,6 +423,7 @@ impl SubTaskStatus {
             "done" => Self::Done,
             "escalated" => Self::Escalated,
             "skipped" => Self::Skipped,
+            "superseded" => Self::Superseded,
             _ => Self::Failed,
         }
     }
@@ -426,7 +431,7 @@ impl SubTaskStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Done | Self::Escalated | Self::Failed | Self::Skipped
+            Self::Done | Self::Escalated | Self::Failed | Self::Skipped | Self::Superseded
         )
     }
 }
@@ -1050,6 +1055,21 @@ impl TeamRun {
         true
     }
 
+    /// Append the TL's new plan, retiring rather than dropping what it replaces,
+    /// so an earlier sub-task's id still names its record and can be rerun.
+    pub fn replan_sub_tasks(&mut self, planned: Vec<SubTask>) {
+        for task in &mut self.sub_tasks {
+            if !task.status.is_terminal() {
+                task.status = SubTaskStatus::Superseded;
+                // `current_sub_task` selects an undigested entry however terminal,
+                // and the TL wrote the replan, so it is owed no report about it.
+                task.digested = true;
+            }
+        }
+        self.sub_tasks.extend(planned);
+        self.updated_at = unix_now();
+    }
+
     /// Pull the phase back to `SubTasks` while one is waiting, dropping the verdict
     /// and findings that judged the diff before it. Returns whether it moved.
     ///
@@ -1612,6 +1632,7 @@ mod tests {
             SubTaskStatus::Escalated,
             SubTaskStatus::Failed,
             SubTaskStatus::Skipped,
+            SubTaskStatus::Superseded,
         ] {
             let encoded = serde_json::to_string(&status).expect("serialize");
             assert_eq!(encoded, format!("\"{}\"", status.as_str()));
@@ -1766,6 +1787,43 @@ mod tests {
         );
         assert_eq!(run.sub_tasks[1].rounds_used, 3);
         assert!(run.sub_tasks[1].digested);
+    }
+
+    #[test]
+    fn a_replan_retires_what_it_replaces_instead_of_dropping_it() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Done),
+                SubTask {
+                    id: "st-2".to_string(),
+                    ..sub_task(SubTaskStatus::Implementing, false)
+                },
+            ],
+        );
+
+        run.replan_sub_tasks(vec![SubTask {
+            id: "st-3".to_string(),
+            ..sub_task(SubTaskStatus::Pending, false)
+        }]);
+
+        let ids: Vec<&str> = run.sub_tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["st-1", "st-2", "st-3"],
+            "an id from before the replan must still name its record"
+        );
+        assert_eq!(
+            run.sub_tasks[0].status,
+            SubTaskStatus::Done,
+            "one that already settled keeps the outcome it earned"
+        );
+        assert_eq!(run.sub_tasks[1].status, SubTaskStatus::Superseded);
+        assert_eq!(
+            run.current_sub_task(),
+            Some(2),
+            "the retired one must not be picked up again"
+        );
     }
 
     #[test]

@@ -2083,6 +2083,49 @@ it a turn ago"
         );
     }
 
+    /// The case the tool exists for. A replan used to overwrite the list, so the
+    /// id the user is holding named nothing and the rerun was refused.
+    #[tokio::test]
+    async fn a_sub_task_a_replan_replaced_is_still_rerunnable_by_its_id() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+                run.replan_sub_tasks(vec![relay_api::team::SubTask {
+                    id: "st-2".to_string(),
+                    title: "Rewrite the loader instead".to_string(),
+                    ..Default::default()
+                }]);
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": ["st-1"] }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("rerun_sub_tasks");
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        let sub = &run.sub_tasks[0];
+        assert_eq!(sub.id, "st-1");
+        assert_eq!(sub.status, relay_api::team::SubTaskStatus::Pending);
+        assert_eq!(sub.rounds_used, 0, "it gets a fresh review budget");
+        assert_eq!(
+            sub.base_commit, "c0ffee",
+            "the reviewer has to see both attempts"
+        );
+        assert_eq!(
+            run.current_sub_task(),
+            Some(0),
+            "and the team has to actually resume there"
+        );
+    }
+
     /// One id the run does not have has to refuse the whole call, by name.
     /// Running the ids it did recognise would leave the model believing the
     /// typo'd one ran too, and nothing would ever say otherwise.
