@@ -130,6 +130,119 @@ test("an error result terminates the turn AND surfaces a SANITIZED failure (no c
   );
 });
 
+// A session/usage limit surfaces from the SDK as a `rate_limit_event` — not as
+// part of the failed `result` itself — so nothing downstream can tell a limit
+// apart from any other generic failure unless mapSdkMessage remembers it and
+// folds it into the turn's terminal `done`. See the NOTE above EXTRA_MODEL_INFOS.
+test("a rate_limit_event followed by a failed result folds the limit into `done`", () => {
+  const turnState = {};
+  const rateLimitMapped = mapSdkMessage(
+    {
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        rateLimitType: "five_hour",
+        errorCode: "credits_required",
+        canUserPurchaseCredits: true,
+        hasChargeableSavedPaymentMethod: false,
+      },
+      uuid: "rle-1",
+      session_id: "sess-1",
+    },
+    turnState,
+  );
+  // Log-only, per the NOTE: a rate_limit_event is never its own event.
+  assert.equal(rateLimitMapped, null);
+
+  const [errorEvent, done] = mapSdkMessage(
+    {
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      errors: ["RAW_PROVIDER_ERROR_SENTINEL"],
+      usage: { output_tokens: 1 },
+    },
+    turnState,
+  );
+
+  assert.equal(errorEvent.type, "error");
+  assert.equal(done.type, "done");
+  assert.equal(done.failed, true);
+  // Typed, closed label — not free text derived from the SDK's own fields.
+  assert.equal(done.failure_kind, "usage_limit");
+  assert.match(done.reason, /limit/i);
+  assert.notEqual(done.reason, failedTurnReason("error_during_execution"));
+
+  // PRIVACY: never the SDK's own field values, never `errors[]`/`result` content.
+  const serialized = JSON.stringify([errorEvent, done]);
+  assert.doesNotMatch(serialized, /RAW_PROVIDER_ERROR_SENTINEL/);
+  assert.doesNotMatch(serialized, /credits_required/);
+  assert.doesNotMatch(serialized, /five_hour/);
+});
+
+test("a failed result with no preceding rate_limit_event keeps today's reason and no failure_kind", () => {
+  const turnState = {};
+  const [errorEvent, done] = mapSdkMessage(
+    {
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      usage: { output_tokens: 1 },
+    },
+    turnState,
+  );
+
+  assert.equal(errorEvent.message, failedTurnReason("error_during_execution"));
+  assert.equal(done.reason, failedTurnReason("error_during_execution"));
+  assert.equal("failure_kind" in done, false);
+});
+
+test("a successful result is untouched even after a preceding rate_limit_event", () => {
+  const turnState = {};
+  mapSdkMessage(
+    {
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected" },
+      uuid: "rle-2",
+      session_id: "sess-1",
+    },
+    turnState,
+  );
+
+  const done = mapSdkMessage(
+    { type: "result", subtype: "success", usage: { output_tokens: 3 } },
+    turnState,
+  );
+
+  assert.deepEqual(done, { type: "done", usage: { output_tokens: 3 } });
+});
+
+test("failure_kind clears once its turn settles and never leaks into the next turn", () => {
+  const turnState = {};
+  mapSdkMessage(
+    {
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected" },
+      uuid: "rle-3",
+      session_id: "sess-1",
+    },
+    turnState,
+  );
+  mapSdkMessage(
+    { type: "result", subtype: "error_during_execution", is_error: true, usage: {} },
+    turnState,
+  );
+
+  // A later turn fails for an unrelated reason with no new rate_limit_event.
+  const [, done] = mapSdkMessage(
+    { type: "result", subtype: "error_max_turns", is_error: true, usage: {} },
+    turnState,
+  );
+
+  assert.equal("failure_kind" in done, false);
+  assert.equal(done.reason, failedTurnReason("error_max_turns"));
+});
+
 test("lastMessageActivitySeconds returns the newest message time in unix seconds", () => {
   assert.equal(
     lastMessageActivitySeconds([

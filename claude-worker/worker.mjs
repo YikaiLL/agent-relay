@@ -179,6 +179,9 @@ async function flushEvents(
   afterEmit = null,
 ) {
   let streamProviderSessionId = initialProviderSessionId;
+  // mapSdkMessage's turnState: one object per stream (never shared across
+  // sessions), self-clearing at each `result`.
+  const turnState = {};
   try {
     for await (const msg of stream) {
       // Suppress late provider events during cancellation. Returning closes the
@@ -201,7 +204,7 @@ async function flushEvents(
         for (const line of mcpStatusLogLines(msg.mcp_servers)) log(line);
       }
 
-      const mapped = mapSdkMessage(msg);
+      const mapped = mapSdkMessage(msg, turnState);
       if (!mapped) continue;
 
       const events = Array.isArray(mapped) ? mapped : [mapped];
