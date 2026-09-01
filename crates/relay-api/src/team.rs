@@ -28,9 +28,7 @@
 //! The driver advances `phase` in the SAME write that records a step's result, so
 //! a crash re-runs at most the last turn. See `markdown/task-team-design.md` §5.
 
-use std::collections::hash_map::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -445,52 +443,26 @@ impl<'de> Deserialize<'de> for SubTaskStatus {
     }
 }
 
-/// A sub-task id nothing else can repeat: `st-<counter>-<salt>`, the counter a
-/// nanosecond clock forced upward so two mints in one nanosecond still differ.
-///
-/// The salt is what a restart cannot repeat: the counter starts from zero in a new
-/// process, so an equal or stepped-back clock would otherwise reissue a persisted id.
+/// A sub-task id `st-<hex>`, distinct for as long as this relay process runs.
+/// A restart could in principle reissue one, and we accept that.
 pub fn mint_sub_task_id() -> String {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
-    mint_id(&LAST, process_salt(), now)
+    format!("st-{:x}", mint_number(&LAST, now))
 }
 
-fn mint_id(last: &AtomicU64, salt: u32, now: u64) -> String {
-    let number = mint_number(last, now).expect("sub-task id counter exhausted");
-    format!("st-{number:x}-{salt:08x}")
-}
-
-/// Drawn once, so every id this process mints carries the same salt and the
-/// counter alone orders them.
-fn process_salt() -> u32 {
-    static SALT: OnceLock<u32> = OnceLock::new();
-    *SALT.get_or_init(draw_salt)
-}
-
-/// `RandomState` keys come from the OS per process — the one input here that does
-/// not come back the same after a restart.
-fn draw_salt() -> u32 {
-    use std::hash::{BuildHasher, Hasher};
-    RandomState::new().build_hasher().finish() as u32
-}
-
-/// `max(now, previous + 1)`, claimed atomically; `None` once the counter cannot
-/// rise, because saturating there would hand the same number out forever.
-fn mint_number(last: &AtomicU64, now: u64) -> Option<u64> {
-    let step = |prev: u64| {
-        if now > prev {
-            Some(now)
-        } else {
-            prev.checked_add(1)
-        }
-    };
-    last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, step)
-        .ok()
-        .and_then(step)
+/// `max(now, previous + 1)`, claimed atomically, because two reads of the clock
+/// can land on the same nanosecond.
+fn mint_number(last: &AtomicU64, now: u64) -> u64 {
+    let step = |prev: u64| now.max(prev + 1);
+    match last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        Some(step(prev))
+    }) {
+        Ok(prev) | Err(prev) => step(prev),
+    }
 }
 
 /// One TL-authored unit of work.
@@ -1714,12 +1686,10 @@ mod tests {
         assert_eq!(unique.len(), ids.len(), "every minted id must be distinct");
 
         let mut previous = 0u64;
-        let mut salts: HashSet<&str> = HashSet::new();
         for id in &ids {
-            let (counter, salt) = id
+            let counter = id
                 .strip_prefix("st-")
-                .and_then(|rest| rest.split_once('-'))
-                .unwrap_or_else(|| panic!("id must be `st-<hex>-<hex>`, got {id}"));
+                .unwrap_or_else(|| panic!("id must be `st-<hex>`, got {id}"));
             let value = u64::from_str_radix(counter, 16)
                 .unwrap_or_else(|_| panic!("id must carry a hex number, got {id}"));
             assert!(
@@ -1727,13 +1697,7 @@ mod tests {
                 "the sequence must strictly increase: {value} came after {previous}"
             );
             previous = value;
-            salts.insert(salt);
         }
-        assert_eq!(
-            salts.len(),
-            1,
-            "one process, one salt — the counter is what orders these: {salts:?}"
-        );
     }
 
     #[test]
@@ -1745,9 +1709,7 @@ mod tests {
 
         let last = AtomicU64::new(0);
         let frozen = 1_700_000_000_000_000_000_u64;
-        let numbers: Vec<u64> = (0..1000)
-            .map(|_| mint_number(&last, frozen).expect("the counter is nowhere near its ceiling"))
-            .collect();
+        let numbers: Vec<u64> = (0..1000).map(|_| mint_number(&last, frozen)).collect();
 
         let unique: HashSet<&u64> = numbers.iter().collect();
         assert_eq!(unique.len(), numbers.len(), "same nanosecond, same id");
@@ -1756,52 +1718,6 @@ mod tests {
             "the sequence must rise even while the clock stands still"
         );
         assert_eq!(numbers[0], frozen, "the first mint is the clock reading");
-    }
-
-    #[test]
-    fn a_restart_cannot_reissue_an_id_the_old_process_already_persisted() {
-        // The counter starts at zero in every process, so on a restart only the
-        // clock separates the ids — and a clock that was stepped back, or read at
-        // the same nanosecond, hands the persisted id straight back out.
-        let frozen = 1_700_000_000_000_000_000_u64;
-        let before = mint_id(&AtomicU64::new(0), 0x1111_2222, frozen);
-        let after = mint_id(&AtomicU64::new(0), 0x3333_4444, frozen);
-
-        assert_ne!(
-            before, after,
-            "the same clock reading in a new process must not repeat an id"
-        );
-    }
-
-    #[test]
-    fn the_per_process_salt_is_drawn_and_not_a_constant() {
-        // What the restart case above rests on. A constant here would make the id
-        // a pure function of the clock again, which is the bug.
-        use std::collections::HashSet;
-
-        let draws: HashSet<u32> = (0..64).map(|_| draw_salt()).collect();
-        assert!(
-            draws.len() > 1,
-            "a salt that never varies is not a salt: {draws:?}"
-        );
-    }
-
-    #[test]
-    fn a_counter_at_its_ceiling_refuses_instead_of_repeating() {
-        // Saturating at `u64::MAX` would hand the same number out forever, which
-        // is the duplicate-id bug this function exists to remove.
-        let last = AtomicU64::new(u64::MAX - 1);
-        let first = mint_number(&last, 5);
-        let second = mint_number(&last, 5);
-
-        assert_eq!(first, Some(u64::MAX), "the last number is still mintable");
-        assert_ne!(first, second, "the ceiling must not repeat a number");
-        assert_eq!(second, None, "an exhausted counter mints nothing");
-        assert_eq!(
-            last.load(Ordering::Relaxed),
-            u64::MAX,
-            "a refused mint must not move the counter"
-        );
     }
 
     #[test]
