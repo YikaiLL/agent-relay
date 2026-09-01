@@ -28,6 +28,11 @@
 //! The driver advances `phase` in the SAME write that records a step's result, so
 //! a crash re-runs at most the last turn. See `markdown/task-team-design.md` §5.
 
+use std::collections::hash_map::RandomState;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{unix_now, WorkflowVerdict};
@@ -438,6 +443,54 @@ impl<'de> Deserialize<'de> for SubTaskStatus {
         // UNKNOWN value is the untrustworthy case that must settle terminal.
         Ok(raw.as_deref().map_or(Self::Pending, Self::from_wire))
     }
+}
+
+/// A sub-task id nothing else can repeat: `st-<counter>-<salt>`, the counter a
+/// nanosecond clock forced upward so two mints in one nanosecond still differ.
+///
+/// The salt is what a restart cannot repeat: the counter starts from zero in a new
+/// process, so an equal or stepped-back clock would otherwise reissue a persisted id.
+pub fn mint_sub_task_id() -> String {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    mint_id(&LAST, process_salt(), now)
+}
+
+fn mint_id(last: &AtomicU64, salt: u32, now: u64) -> String {
+    let number = mint_number(last, now).expect("sub-task id counter exhausted");
+    format!("st-{number:x}-{salt:08x}")
+}
+
+/// Drawn once, so every id this process mints carries the same salt and the
+/// counter alone orders them.
+fn process_salt() -> u32 {
+    static SALT: OnceLock<u32> = OnceLock::new();
+    *SALT.get_or_init(draw_salt)
+}
+
+/// `RandomState` keys come from the OS per process — the one input here that does
+/// not come back the same after a restart.
+fn draw_salt() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish() as u32
+}
+
+/// `max(now, previous + 1)`, claimed atomically; `None` once the counter cannot
+/// rise, because saturating there would hand the same number out forever.
+fn mint_number(last: &AtomicU64, now: u64) -> Option<u64> {
+    let step = |prev: u64| {
+        if now > prev {
+            Some(now)
+        } else {
+            prev.checked_add(1)
+        }
+    };
+    last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, step)
+        .ok()
+        .and_then(step)
 }
 
 /// One TL-authored unit of work.
@@ -988,9 +1041,22 @@ impl TeamRun {
     /// A sub-task mid-round keeps its spent rounds — refunding work in flight
     /// would hand out budget nobody asked for.
     pub fn revive_escalated_sub_tasks(&mut self) -> bool {
+        self.revive_sub_tasks(None)
+    }
+
+    /// [`revive_escalated_sub_tasks`] with a filter: `None` takes every
+    /// `Escalated` sub-task, `Some(ids)` takes those ids where already terminal.
+    ///
+    /// The terminal guard lives here, not in the caller, so no future caller can
+    /// reset a sub-task whose turn is still running and lose the work in flight.
+    pub fn revive_sub_tasks(&mut self, only: Option<&[String]>) -> bool {
         let mut revived = false;
         for task in &mut self.sub_tasks {
-            if task.status == SubTaskStatus::Escalated {
+            let selected = match only {
+                None => task.status == SubTaskStatus::Escalated,
+                Some(ids) => task.status.is_terminal() && ids.iter().any(|id| id == &task.id),
+            };
+            if selected {
                 task.status = SubTaskStatus::Pending;
                 task.rounds_used = 0;
                 task.digested = false;
@@ -1008,6 +1074,28 @@ impl TeamRun {
         if matches!(self.phase, TeamPhase::MrGate | TeamPhase::Wrapping) {
             self.phase = TeamPhase::SubTasks;
         }
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// Pull the phase back to `SubTasks` while one is waiting, dropping the verdict
+    /// and findings that judged the diff before it. Returns whether it moved.
+    ///
+    /// A driver picks its next phase before a turn and writes it when the turn ends,
+    /// so a revival landing in between is invisible to that decision and buried by it.
+    pub fn hold_phase_for_waiting_sub_tasks(&mut self) -> bool {
+        let closing = matches!(
+            self.phase,
+            TeamPhase::MrGate | TeamPhase::Wrapping | TeamPhase::Finished
+        );
+        if !closing || self.current_sub_task().is_none() {
+            return false;
+        }
+        self.phase = TeamPhase::SubTasks;
+        self.mr_verdict = None;
+        // Leftovers from that same turn would outlive the work that answers them,
+        // and `finalize` refuses to call a run with leftovers Done.
+        self.unresolved.clear();
         self.updated_at = unix_now();
         true
     }
@@ -1615,6 +1703,108 @@ mod tests {
     }
 
     #[test]
+    fn minted_sub_task_ids_never_repeat_or_go_backwards() {
+        // The bug being removed: positional ids meant `st-1` before a replan and
+        // `st-1` after it named two different pieces of work. A mint that can
+        // collide inside one planning burst would leave exactly that.
+        use std::collections::HashSet;
+
+        let ids: Vec<String> = (0..4000).map(|_| mint_sub_task_id()).collect();
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "every minted id must be distinct");
+
+        let mut previous = 0u64;
+        let mut salts: HashSet<&str> = HashSet::new();
+        for id in &ids {
+            let (counter, salt) = id
+                .strip_prefix("st-")
+                .and_then(|rest| rest.split_once('-'))
+                .unwrap_or_else(|| panic!("id must be `st-<hex>-<hex>`, got {id}"));
+            let value = u64::from_str_radix(counter, 16)
+                .unwrap_or_else(|_| panic!("id must carry a hex number, got {id}"));
+            assert!(
+                value > previous,
+                "the sequence must strictly increase: {value} came after {previous}"
+            );
+            previous = value;
+            salts.insert(salt);
+        }
+        assert_eq!(
+            salts.len(),
+            1,
+            "one process, one salt — the counter is what orders these: {salts:?}"
+        );
+    }
+
+    #[test]
+    fn a_frozen_clock_still_mints_distinct_rising_numbers() {
+        // The atomic is the whole mechanism, and a real clock hides whether it is
+        // there — reads usually tick on their own. Freeze the timestamp so only
+        // the bump can make these differ.
+        use std::collections::HashSet;
+
+        let last = AtomicU64::new(0);
+        let frozen = 1_700_000_000_000_000_000_u64;
+        let numbers: Vec<u64> = (0..1000)
+            .map(|_| mint_number(&last, frozen).expect("the counter is nowhere near its ceiling"))
+            .collect();
+
+        let unique: HashSet<&u64> = numbers.iter().collect();
+        assert_eq!(unique.len(), numbers.len(), "same nanosecond, same id");
+        assert!(
+            numbers.windows(2).all(|pair| pair[1] > pair[0]),
+            "the sequence must rise even while the clock stands still"
+        );
+        assert_eq!(numbers[0], frozen, "the first mint is the clock reading");
+    }
+
+    #[test]
+    fn a_restart_cannot_reissue_an_id_the_old_process_already_persisted() {
+        // The counter starts at zero in every process, so on a restart only the
+        // clock separates the ids — and a clock that was stepped back, or read at
+        // the same nanosecond, hands the persisted id straight back out.
+        let frozen = 1_700_000_000_000_000_000_u64;
+        let before = mint_id(&AtomicU64::new(0), 0x1111_2222, frozen);
+        let after = mint_id(&AtomicU64::new(0), 0x3333_4444, frozen);
+
+        assert_ne!(
+            before, after,
+            "the same clock reading in a new process must not repeat an id"
+        );
+    }
+
+    #[test]
+    fn the_per_process_salt_is_drawn_and_not_a_constant() {
+        // What the restart case above rests on. A constant here would make the id
+        // a pure function of the clock again, which is the bug.
+        use std::collections::HashSet;
+
+        let draws: HashSet<u32> = (0..64).map(|_| draw_salt()).collect();
+        assert!(
+            draws.len() > 1,
+            "a salt that never varies is not a salt: {draws:?}"
+        );
+    }
+
+    #[test]
+    fn a_counter_at_its_ceiling_refuses_instead_of_repeating() {
+        // Saturating at `u64::MAX` would hand the same number out forever, which
+        // is the duplicate-id bug this function exists to remove.
+        let last = AtomicU64::new(u64::MAX - 1);
+        let first = mint_number(&last, 5);
+        let second = mint_number(&last, 5);
+
+        assert_eq!(first, Some(u64::MAX), "the last number is still mintable");
+        assert_ne!(first, second, "the ceiling must not repeat a number");
+        assert_eq!(second, None, "an exhausted counter mints nothing");
+        assert_eq!(
+            last.load(Ordering::Relaxed),
+            u64::MAX,
+            "a refused mint must not move the counter"
+        );
+    }
+
+    #[test]
     fn owned_threads_span_the_tl_and_every_sub_task() {
         let mut run = run_with(
             TeamPhase::SubTasks,
@@ -1628,5 +1818,188 @@ mod tests {
         assert!(owned.contains(&"dev-1".to_string()));
         assert!(owned.contains(&"rev-1".to_string()));
         assert_eq!(owned.len(), 3, "no duplicates: {owned:?}");
+    }
+
+    fn spent_sub_task(id: &str, status: SubTaskStatus) -> SubTask {
+        SubTask {
+            id: id.to_string(),
+            rounds_used: 3,
+            ..sub_task(status, true)
+        }
+    }
+
+    #[test]
+    fn a_filtered_revive_takes_the_named_sub_task_and_nothing_else() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Done),
+                spent_sub_task("st-2", SubTaskStatus::Escalated),
+            ],
+        );
+
+        assert!(run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Pending);
+        assert_eq!(run.sub_tasks[0].rounds_used, 0, "a fresh review budget");
+        assert!(!run.sub_tasks[0].digested, "its outcome is owed again");
+        assert_eq!(
+            run.sub_tasks[1].status,
+            SubTaskStatus::Escalated,
+            "an unnamed sub-task stays settled even when it is escalated"
+        );
+        assert_eq!(run.sub_tasks[1].rounds_used, 3);
+        assert!(run.sub_tasks[1].digested);
+    }
+
+    #[test]
+    fn a_named_sub_task_in_flight_is_left_alone() {
+        // Resetting a turn that is still running would throw away work nobody
+        // asked to discard, so the guard lives here rather than in the caller.
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![spent_sub_task("st-1", SubTaskStatus::Implementing)],
+        );
+
+        assert!(!run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Implementing);
+        assert_eq!(run.sub_tasks[0].rounds_used, 3);
+        assert!(run.sub_tasks[0].digested);
+    }
+
+    #[test]
+    fn a_filtered_revive_reopens_the_run_the_same_way_the_unfiltered_one_does() {
+        let mut run = run_with(
+            TeamPhase::MrGate,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Done),
+                spent_sub_task("st-2", SubTaskStatus::Done),
+            ],
+        );
+        run.unresolved = vec!["the retry path is untested".to_string()];
+        run.mr_rounds_used = 2;
+        run.design_review_rounds = 1;
+        run.mr_verdict = Some(WorkflowVerdict::needs_changes(vec!["fix it".to_string()]));
+
+        assert!(run.revive_sub_tasks(Some(&["st-2".to_string()])));
+
+        assert!(run.unresolved.is_empty(), "`finalize` refuses leftovers");
+        assert_eq!(run.mr_rounds_used, 0);
+        assert_eq!(run.design_review_rounds, 0);
+        assert_eq!(run.mr_verdict, None);
+        assert_eq!(
+            run.phase,
+            TeamPhase::SubTasks,
+            "the gate never looks at sub-tasks"
+        );
+        assert_eq!(
+            run.current_sub_task(),
+            Some(1),
+            "the revived sub-task is the one the run picks up"
+        );
+    }
+
+    #[test]
+    fn the_unfiltered_revive_still_takes_every_escalated_sub_task() {
+        let mut run = run_with(
+            TeamPhase::Wrapping,
+            vec![
+                spent_sub_task("st-1", SubTaskStatus::Done),
+                spent_sub_task("st-2", SubTaskStatus::Escalated),
+                spent_sub_task("st-3", SubTaskStatus::Escalated),
+            ],
+        );
+        run.unresolved = vec!["a finding".to_string()];
+        run.mr_rounds_used = 2;
+
+        assert!(run.revive_escalated_sub_tasks());
+
+        assert_eq!(
+            run.sub_tasks[0].status,
+            SubTaskStatus::Done,
+            "not escalated"
+        );
+        for index in [1, 2] {
+            assert_eq!(run.sub_tasks[index].status, SubTaskStatus::Pending);
+            assert_eq!(run.sub_tasks[index].rounds_used, 0);
+            assert!(!run.sub_tasks[index].digested);
+        }
+        assert!(run.unresolved.is_empty());
+        assert_eq!(run.mr_rounds_used, 0);
+        assert_eq!(run.phase, TeamPhase::SubTasks);
+    }
+
+    #[test]
+    fn an_unfiltered_revive_with_nothing_escalated_changes_nothing() {
+        let mut run = run_with(
+            TeamPhase::MrGate,
+            vec![spent_sub_task("st-1", SubTaskStatus::Done)],
+        );
+        run.unresolved = vec!["a finding".to_string()];
+
+        assert!(!run.revive_escalated_sub_tasks());
+
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Done);
+        assert_eq!(run.unresolved.len(), 1, "no rewind without a revival");
+        assert_eq!(run.phase, TeamPhase::MrGate);
+    }
+
+    #[test]
+    fn a_closing_phase_written_over_a_waiting_sub_task_is_pulled_back() {
+        // The driver picks the next phase before its turn and writes it after, so
+        // a revival that lands during the turn arrives before a decision that
+        // knows nothing about it.
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![spent_sub_task("st-1", SubTaskStatus::Done)],
+        );
+        assert!(run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        run.phase = TeamPhase::Wrapping;
+        run.mr_verdict = Some(WorkflowVerdict::approved());
+        run.unresolved = vec!["the retry path is untested".to_string()];
+
+        assert!(run.hold_phase_for_waiting_sub_tasks());
+
+        assert_eq!(run.phase, TeamPhase::SubTasks);
+        assert_eq!(run.current_sub_task(), Some(0));
+        assert_eq!(
+            run.mr_verdict, None,
+            "that verdict judged the diff the rerun is about to change"
+        );
+        assert!(
+            run.unresolved.is_empty(),
+            "and its findings would keep the run from ever reaching Done: {:?}",
+            run.unresolved
+        );
+    }
+
+    #[test]
+    fn a_phase_the_sub_tasks_are_really_done_with_is_left_where_the_driver_put_it() {
+        let mut run = run_with(
+            TeamPhase::Finished,
+            vec![spent_sub_task("st-1", SubTaskStatus::Done)],
+        );
+        run.mr_verdict = Some(WorkflowVerdict::approved());
+
+        assert!(!run.hold_phase_for_waiting_sub_tasks());
+
+        assert_eq!(run.phase, TeamPhase::Finished);
+        assert!(run.mr_verdict.is_some(), "nothing to invalidate");
+    }
+
+    #[test]
+    fn the_phases_before_the_sub_tasks_are_never_pulled_back() {
+        // `Planning` ends by writing the sub-task list, every one of them waiting.
+        // Reading that as a rerun would put the run in a phase it has not reached.
+        let mut run = run_with(
+            TeamPhase::Planning,
+            vec![sub_task(SubTaskStatus::Pending, false)],
+        );
+
+        assert!(!run.hold_phase_for_waiting_sub_tasks());
+
+        assert_eq!(run.phase, TeamPhase::Planning);
     }
 }

@@ -123,6 +123,7 @@ const ACTING_TOOLS: &[&str] = &[
     "respond_to_agent",
     "widen_scope",
     "message_team",
+    "rerun_sub_tasks",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +133,8 @@ pub(crate) enum ParamKind {
     OneOf(&'static [&'static str]),
     /// Free-form object (AskUserQuestion answers keyed by question headers).
     Object,
+    /// List of strings → JSON Schema `array` of `string`.
+    TextList,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +164,7 @@ impl ToolSpec {
                 ParamKind::Text => json!({ "type": "string" }),
                 ParamKind::OneOf(options) => json!({ "type": "string", "enum": options }),
                 ParamKind::Object => json!({ "type": "object" }),
+                ParamKind::TextList => json!({ "type": "array", "items": { "type": "string" } }),
             };
             entry["description"] = Value::String(param.summary.to_string());
             properties.insert(param.name.to_string(), entry);
@@ -444,6 +448,27 @@ an investigation to implement needs this. Omit to keep it.",
         ],
     },
     ToolSpec {
+        name: "rerun_sub_tasks",
+        summary: "Put named sub-tasks back to work with a fresh review budget. \
+The team resumes at the earliest of them.",
+        effect: Effect::Acts,
+        params: &[
+            ToolParam {
+                name: "sub_task_ids",
+                kind: ParamKind::TextList,
+                required: true,
+                summary: "Ids of the sub-tasks to run again, as shown by \
+task_status. An unknown id refuses the whole call.",
+            },
+            ToolParam {
+                name: "run_id",
+                kind: ParamKind::Text,
+                required: false,
+                summary: "Which run. Omit when only one is active.",
+            },
+        ],
+    },
+    ToolSpec {
         name: "pending_questions",
         summary: "What seats are asking, with each question's header and options.",
         effect: Effect::Read,
@@ -523,6 +548,9 @@ dismiss one before you can stage another",
             Some("no task is going; scope can only be widened while one is running")
         }
         "control_run" if facts.active_runs == 0 => Some("no run is going"),
+        "rerun_sub_tasks" if facts.active_runs == 0 => {
+            Some("no task is going; a finished one is reopened with propose_reopen instead")
+        }
         "pending_questions" | "respond_to_agent" if facts.parked_questions == 0 => {
             Some("nothing is waiting on an answer")
         }
@@ -579,6 +607,10 @@ pub(crate) enum ToolCall {
         request_id: String,
         answers: Map<String, Value>,
     },
+    RerunSubTasks {
+        sub_task_ids: Vec<String>,
+        run_id: Option<String>,
+    },
 }
 
 pub(crate) fn spec_for(name: &str) -> Option<&'static ToolSpec> {
@@ -621,6 +653,32 @@ provider, model, effort"
         *slot = Some(text.to_string());
     }
     Ok(agent)
+}
+
+/// A required list-of-strings param, each entry trimmed. Anything else is
+/// refused whole: half a list understood is a call the model did not make.
+fn parse_text_list(tool: &str, param: &str, raw: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(raw) = raw.filter(|raw| !raw.is_null()) else {
+        return Err(format!("{tool}: '{param}' is required"));
+    };
+    let Value::Array(items) = raw else {
+        return Err(format!("{tool}: '{param}' must be a list of strings"));
+    };
+    let mut list = Vec::new();
+    for item in items {
+        let Value::String(text) = item else {
+            return Err(format!("{tool}: '{param}' must be a list of strings"));
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{tool}: '{param}' must not contain a blank entry"));
+        }
+        list.push(trimmed.to_string());
+    }
+    if list.is_empty() {
+        return Err(format!("{tool}: '{param}' must not be empty"));
+    }
+    Ok(list)
 }
 
 /// The task-wide ask plus per-seat overrides, from already-validated args.
@@ -680,7 +738,7 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
     }
 
     let text = |param: &ToolParam| -> Result<Option<String>, String> {
-        if param.kind == ParamKind::Object {
+        if matches!(param.kind, ParamKind::Object | ParamKind::TextList) {
             // Read by the arm that knows the shape; nothing string-like here.
             return Ok(None);
         }
@@ -792,6 +850,10 @@ pub(crate) fn parse_call(name: &str, args: &Value) -> Result<ToolCall, String> {
         "task_status" => Ok(ToolCall::TaskStatus {
             run_id: get("run_id")?,
         }),
+        "rerun_sub_tasks" => Ok(ToolCall::RerunSubTasks {
+            sub_task_ids: parse_text_list(spec.name, "sub_task_ids", object.get("sub_task_ids"))?,
+            run_id: get("run_id")?,
+        }),
         other => Err(format!("no such tool: {other}")),
     }
 }
@@ -860,6 +922,7 @@ that it is acting on a CARD, not on the task",
                         ParamKind::Text => Value::String("x".to_string()),
                         ParamKind::OneOf(options) => Value::String(options[0].to_string()),
                         ParamKind::Object => json!({ "Question": "yes" }),
+                        ParamKind::TextList => json!(["x"]),
                     };
                     (param.name.to_string(), value)
                 })
@@ -1365,6 +1428,54 @@ request, not once",
                 );
             }
         }
+    }
+
+    /// A list param advertised as `"type":"string"` would be a schema that lies:
+    /// the model reads the contract from here, not from prose.
+    #[test]
+    fn rerun_sub_tasks_advertises_a_list_of_strings() {
+        let spec = spec_for("rerun_sub_tasks").expect("rerun_sub_tasks");
+        let schema = spec.input_schema();
+        assert_eq!(schema["properties"]["sub_task_ids"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["sub_task_ids"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(schema["required"], json!(["sub_task_ids"]));
+        assert!(
+            ACTING_TOOLS.contains(&"rerun_sub_tasks"),
+            "it mutates a run with no card"
+        );
+    }
+
+    #[test]
+    fn a_rerun_that_is_not_a_list_of_ids_is_refused_by_name() {
+        for bad in [
+            json!({ "sub_task_ids": "st-1" }),
+            json!({ "sub_task_ids": ["st-1", 7] }),
+            json!({ "sub_task_ids": ["st-1", "  "] }),
+            json!({ "sub_task_ids": [] }),
+            json!({}),
+        ] {
+            let err = parse_call("rerun_sub_tasks", &bad).unwrap_err();
+            assert!(err.contains("sub_task_ids"), "{bad} gave {err}");
+        }
+    }
+
+    #[test]
+    fn a_rerun_carries_every_id_it_was_given() {
+        let call = parse_call(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": [" st-1 ", "st-2"] }),
+        )
+        .expect("parse");
+        assert_eq!(
+            call,
+            ToolCall::RerunSubTasks {
+                sub_task_ids: vec!["st-1".to_string(), "st-2".to_string()],
+                run_id: None,
+            }
+        );
     }
 
     #[test]
