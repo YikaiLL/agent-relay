@@ -29,6 +29,34 @@ export function viewOnlyEligible(session, threadId) {
   );
 }
 
+export function viewOnlyThreadIsWorking(session, threadId) {
+  return Boolean(
+    (session?.thread_activity || []).find((entry) => entry?.thread_id === threadId)
+  );
+}
+
+// `thread_activity` can omit a background thread that is still receiving deltas
+// (Cursor is the usual case). The pin reducer sets `wasWorking` when text
+// arrives; clobbering that with `thread_activity` alone at fetch start drops
+// the working→idle edge `maybeRefreshViewOnly` keys on.
+export function resolveViewOnlyPinWasWorking({ prior, isWorking }) {
+  return Boolean(isWorking || prior?.wasWorking);
+}
+
+// After a non-terminal fetch completes, keep the edge alive until a terminal
+// refresh lands. A fetch started from `shouldRefreshViewedThread` has seen the
+// edge already and may clear the latch on completion.
+export function resolveViewOnlyPinWasWorkingAfterFetch({
+  prior,
+  isWorking,
+  terminal = false,
+}) {
+  if (terminal) {
+    return Boolean(isWorking);
+  }
+  return resolveViewOnlyPinWasWorking({ prior, isWorking });
+}
+
 /// How much of a delta is genuinely new for a pinned entry, given `text_offset`.
 /// Mirrors `resolveDeltaAppend` in shared/transcript-hydration-store.js — same wire
 /// contract, same reconciliation. Returns null to refuse, "" for a pure duplicate.
