@@ -484,6 +484,10 @@ pub struct SubTask {
     pub brief: String,
     pub status: SubTaskStatus,
     pub rounds_used: u32,
+    /// How many times a rerun has revived this. A retry rejects the attempt the
+    /// old session holds, so it never shares one — not even with its group.
+    #[serde(default)]
+    pub reruns: u32,
     /// Checkpoint commit taken when this sub-task started; scopes its review diff
     /// to its OWN changes rather than everything since the run began.
     pub base_commit: String,
@@ -1051,6 +1055,10 @@ impl TeamRun {
                 task.status = SubTaskStatus::Pending;
                 task.rounds_used = 0;
                 task.digested = false;
+                // The session holds the attempt being rejected. Dropped from the
+                // slot but left in `owned_thread_ids`: it still has to be drained.
+                task.dev_thread_id = None;
+                task.reruns += 1;
                 revived = true;
             }
         }
@@ -1821,6 +1829,36 @@ mod tests {
         );
         assert_eq!(run.sub_tasks[1].rounds_used, 3);
         assert!(run.sub_tasks[1].digested);
+    }
+
+    /// A rerun is the user rejecting the attempt, and that attempt is what the
+    /// session holds. Handing the same session back gives the retry the reasoning
+    /// it is meant to escape — and until sessions could be shared, the driver's
+    /// `rounds_used == 0` test happened to be what started a fresh one.
+    #[test]
+    fn a_revived_sub_task_does_not_inherit_the_session_that_failed_it() {
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![spent_sub_task("st-1", SubTaskStatus::Escalated)],
+        );
+        run.sub_tasks[0].dev_thread_id = Some("dev-1".to_string());
+        run.sub_tasks[0].owned_thread_ids = vec!["dev-1".to_string()];
+
+        assert!(run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        assert_eq!(
+            run.sub_tasks[0].dev_thread_id, None,
+            "the retry must start its own session"
+        );
+        assert_eq!(
+            run.sub_tasks[0].reruns, 1,
+            "and say so, so a shared session is not handed to it by the group"
+        );
+        assert_eq!(
+            run.sub_tasks[0].owned_thread_ids,
+            vec!["dev-1".to_string()],
+            "the old thread still has to be drained, so it stays owned"
+        );
     }
 
     fn planned_sub_task(id: &str) -> SubTask {
