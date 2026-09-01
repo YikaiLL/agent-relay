@@ -247,11 +247,17 @@ export function createStreamController(ctx) {
       // The next render must not treat a fresh delta as an observed idle edge
       // when `thread_activity` omits the Orchestrator.
       state.orchestratorDeltaRaisedWorking = true;
+      if (state.orchestratorEntriesLoading) {
+        state.orchestratorDeltaDuringFetch = true;
+      }
     }
     // Same signal, different slot: the Orchestrator's entries are scalars rather
     // than a pin object, so the reducer's `tailGap` is carried here.
     if (next.tailGap) {
       state.orchestratorTailGap = true;
+      if (state.orchestratorEntriesLoading) {
+        state.orchestratorDeltaDuringFetch = true;
+      }
     }
     return true;
   }

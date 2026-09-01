@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { createStreamController } from "./stream.js";
 import {
+  applyOrchestratorLoadFinally,
   nextOrchestratorRefreshObservations,
   nextOrchestratorWasWorking,
   orchestratorTranscriptRefreshDecision,
@@ -473,4 +474,25 @@ test("orchestrator tailGap repair does not start a second fetch while one is in 
 
   maybeRefreshOrchestrator(h.state, orchSession(), loads);
   assert.equal(loads.length, 1, "tail-gap repair must be single-flight while the gap remains");
+});
+
+test("a superseded orchestrator load must not clear tail-gap repair flags", () => {
+  const state = {
+    orchestratorLoadGeneration: 2,
+    orchestratorEntriesLoading: true,
+    orchestratorTailGapRepairing: true,
+    orchestratorTailGap: true,
+    orchestratorEntriesThreadId: ORCH_THREAD,
+    orchestratorWasWorking: false,
+    orchestratorDeltaDuringFetch: false,
+    session: orchSession(),
+  };
+
+  const settled = applyOrchestratorLoadFinally(state, 1, ORCH_THREAD, state.session, {
+    terminal: false,
+  });
+
+  assert.equal(settled, false, "stale generation must not mutate loading/repair state");
+  assert.equal(state.orchestratorEntriesLoading, true);
+  assert.equal(state.orchestratorTailGapRepairing, true);
 });

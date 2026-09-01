@@ -69,8 +69,27 @@ export function nextOrchestratorRefreshObservations(state, orchWorking) {
 export function orchestratorWasWorkingAfterFetch(state, session, threadId, { terminal = false } = {}) {
   const isWorking = Boolean(threadActivityFor(session, threadId).phase);
   return resolveViewOnlyPinWasWorkingAfterFetch({
-    prior: { wasWorking: state.orchestratorWasWorking },
+    prior: {
+      wasWorking: state.orchestratorWasWorking,
+      deltaDuringFetch: state.orchestratorDeltaDuringFetch,
+    },
     isWorking,
     terminal,
   });
+}
+
+export function applyOrchestratorLoadFinally(state, generation, threadId, session, { terminal = false } = {}) {
+  if (generation !== state.orchestratorLoadGeneration) {
+    return false;
+  }
+  state.orchestratorEntriesLoading = false;
+  state.orchestratorTailGapRepairing = false;
+  state.orchestratorDeltaDuringFetch = false;
+  state.orchestratorWasWorking = orchestratorWasWorkingAfterFetch(
+    state,
+    session,
+    threadId,
+    { terminal }
+  );
+  return true;
 }

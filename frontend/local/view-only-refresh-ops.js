@@ -93,7 +93,8 @@ export function createViewOnlyRefreshOps({
       const livePin = pinForGeneration(state, threadId, generation, prior);
       const { page: normalized, ...refreshed } = refreshedPinPage(livePin, page, threadId);
       const exactReview = Boolean(normalized.thread_state?.review_locked ?? review);
-      state.viewOnlyThread = buildViewOnlyPin({
+      const isWorkingNow = viewOnlyThreadIsWorking(session, threadId);
+      const built = buildViewOnlyPin({
         threadId,
         page: {
           ...normalized,
@@ -130,15 +131,17 @@ export function createViewOnlyRefreshOps({
         lastRefreshServerTime: normalized.server_time ?? null,
         wasWorking: resolveViewOnlyPinWasWorkingAfterFetch({
           prior: livePin,
-          isWorking,
+          isWorking: isWorkingNow,
           terminal,
         }),
         historyExtended: refreshed.historyExtended,
       });
+      state.viewOnlyThread = livePin?.tailGap ? { ...built, tailGap: true } : built;
     } catch (error) {
       if (generation !== state.viewOnlyGeneration) return;
       const livePin = pinForGeneration(state, threadId, generation, prior);
-      state.viewOnlyThread = buildViewOnlyPin({
+      const isWorkingNow = viewOnlyThreadIsWorking(session, threadId);
+      const built = buildViewOnlyPin({
         threadId,
         generation,
         review,
@@ -160,7 +163,7 @@ export function createViewOnlyRefreshOps({
         lastRefreshServerTime: livePin?.lastRefreshServerTime ?? null,
         wasWorking: resolveViewOnlyPinWasWorkingAfterFetch({
           prior: livePin,
-          isWorking,
+          isWorking: isWorkingNow,
           terminal,
         }),
         priorEntries: livePin?.entries || [],
@@ -168,6 +171,7 @@ export function createViewOnlyRefreshOps({
         historyExtended: Boolean(livePin?.historyExtended),
         error: true,
       });
+      state.viewOnlyThread = livePin?.tailGap ? { ...built, tailGap: true } : built;
       logLine(`Couldn't load the read-only session view: ${error.message}`);
     }
     if (state.session) renderSession(state.session);

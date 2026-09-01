@@ -25,12 +25,14 @@ function createHarness() {
   };
   const loads = [];
   let pendingResolve = null;
+  let pendingTerminal = false;
 
   const ops = createViewOnlyRefreshOps({
     getState: () => state,
-    fetchTranscriptPage: async (threadId, options = {}) => {
-      const load = { threadId, options, terminal: options.__terminalMarker };
+    fetchTranscriptPage: async (threadId) => {
+      const load = { threadId, terminal: pendingTerminal };
       loads.push(load);
+      pendingTerminal = false;
       return new Promise((resolve) => {
         pendingResolve = (page) => {
           pendingResolve = null;
@@ -57,6 +59,11 @@ function createHarness() {
     isReviewInProgressForThread: () => false,
     isWorkflowInProgressForThread: () => false,
   });
+  const loadViewOnlyTranscript = ops.loadViewOnlyTranscript.bind(ops);
+  ops.loadViewOnlyTranscript = (threadId, options = {}) => {
+    pendingTerminal = options.terminal === true;
+    return loadViewOnlyTranscript(threadId, options);
+  };
 
   const stream = createStreamController({
     state,
@@ -179,4 +186,77 @@ test("tailGap survives fetch start on the loading pin", async () => {
 
   assert.equal(h.state.viewOnlyThread.loading, true);
   assert.equal(h.state.viewOnlyThread.tailGap, true);
+});
+
+test("tailGap raised during an in-flight fetch survives fetch completion", async () => {
+  const h = createHarness();
+  h.state.viewOnlyThread = {
+    threadId: BG_THREAD,
+    entries: [{ item_id: "item-1", kind: "agent_text", text: "Hello", status: "running" }],
+    lastRefreshAt: Date.now(),
+    loading: false,
+  };
+
+  void h.ops.loadViewOnlyTranscript(BG_THREAD);
+  await h.flush();
+  assert.equal(h.state.viewOnlyThread.loading, true);
+
+  h.stream.applySessionStreamEvent("transcript_entry_delta", {
+    thread_id: BG_THREAD,
+    item_id: "item-1",
+    delta: "tail",
+    text_offset: 99,
+  });
+  assert.equal(h.state.viewOnlyThread.tailGap, true);
+
+  h.completePendingFetch();
+  await h.flush();
+
+  assert.equal(
+    h.state.viewOnlyThread.tailGap,
+    true,
+    "a stale page must not clear a gap the reducer raised during the fetch"
+  );
+  assert.ok(h.loads.length >= 1, "the first fetch must settle");
+});
+
+test("a delta during a terminal fetch preserves wasWorking for a second idle refresh", async () => {
+  const h = createHarness();
+  h.state.viewOnlyThread = {
+    threadId: BG_THREAD,
+    entries: [{ item_id: "item-1", kind: "agent_text", text: "Hello", status: "running" }],
+    wasWorking: true,
+    lastRefreshAt: Date.now(),
+    loading: false,
+  };
+
+  void h.ops.loadViewOnlyTranscript(BG_THREAD, { terminal: true });
+  await h.flush();
+  assert.equal(h.loads.length, 1);
+  assert.equal(h.loads[0].terminal, true);
+
+  h.stream.applySessionStreamEvent("transcript_entry_delta", {
+    thread_id: BG_THREAD,
+    item_id: "item-1",
+    delta_kind: "agent_text",
+    turn_id: "turn-1",
+    delta: " more",
+    text_offset: 5,
+  });
+  assert.equal(h.state.viewOnlyThread.wasWorking, true);
+  assert.equal(h.state.viewOnlyThread.deltaDuringFetch, true);
+
+  h.completePendingFetch();
+  await h.flush();
+
+  assert.equal(
+    h.state.viewOnlyThread.wasWorking,
+    true,
+    "a delta during the terminal fetch must not be clobbered at completion"
+  );
+
+  h.ops.maybeRefreshViewOnly(session());
+  await h.flush();
+
+  assert.equal(h.loads.length, 2, "the second idle edge must arm another terminal fetch");
 });

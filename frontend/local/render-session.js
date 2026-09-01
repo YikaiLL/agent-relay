@@ -186,10 +186,10 @@ import {
 import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap, threadActivityFor } from "../shared/thread-activity.js";
 import {
+  applyOrchestratorLoadFinally,
   nextOrchestratorRefreshObservations,
   nextOrchestratorWasWorking,
   orchestratorTranscriptRefreshDecision,
-  orchestratorWasWorkingAfterFetch,
 } from "./orchestrator-transcript-refresh.js";
 import { copyTextToClipboard } from "../shared/clipboard.js";
 import { refreshedPinPage } from "./pin-page.js";
@@ -2581,14 +2581,7 @@ export function createSessionRenderer({
       state.orchestratorEntriesErrorAt = Date.now();
       logLine(`Orchestrator transcript load failed: ${error?.message || error}`);
     } finally {
-      state.orchestratorEntriesLoading = false;
-      state.orchestratorTailGapRepairing = false;
-      state.orchestratorWasWorking = orchestratorWasWorkingAfterFetch(
-        state,
-        state.session,
-        threadId,
-        { terminal }
-      );
+      applyOrchestratorLoadFinally(state, generation, threadId, state.session, { terminal });
     }
   }
 
