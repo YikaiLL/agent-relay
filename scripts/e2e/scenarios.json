@@ -182,6 +182,16 @@
         "transcript-scroll"
       ]
     },
+    "remote-cjk-project-name": {
+      "script": "browser-remote-cjk-project-name-e2e.mjs",
+      "tier": "core",
+      "provider": "stub",
+      "transport": "static-remote",
+      "coverage": [
+        "mobile-header",
+        "cjk-project-name"
+      ]
+    },
     "remote-mobile-bell": {
       "script": "browser-remote-mobile-bell-e2e.mjs",
       "tier": "core",
