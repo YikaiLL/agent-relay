@@ -416,6 +416,9 @@ pub struct RelayState {
     /// into per-request deltas. Never persisted: a restart deliberately
     /// re-baselines rather than billing a resumed thread's whole history.
     pub(crate) codex_usage: crate::usage::CodexUsageTracker,
+    /// The same baselines for Claude, whose `done` payload carries the SDK's
+    /// session-cumulative `modelUsage` and `total_cost_usd`.
+    pub(crate) claude_usage: crate::usage::ClaudeUsageTracker,
     /// Surface ids that are broker peer ids, so peer-presence pruning touches only
     /// those and never a local tab's subscription.
     broker_surface_ids: HashSet<String>,
@@ -595,6 +598,7 @@ impl RelayState {
             watched_threads: HashMap::new(),
             usage_store: crate::usage::store::UsageStore::disabled(),
             codex_usage: crate::usage::CodexUsageTracker::new(),
+            claude_usage: crate::usage::ClaudeUsageTracker::new(),
             broker_surface_ids: HashSet::new(),
             surface_generations: HashMap::new(),
             pending_pairings: HashMap::new(),
@@ -1962,7 +1966,7 @@ impl RelayState {
     /// Terminal runs are included here, unlike `is_thread_team_locked` — that
     /// asks "may the user type here", which stops mattering once a run ends,
     /// whereas "who spent this" never stops being true.
-    fn team_attribution(&self, thread_id: &str) -> TeamAttribution {
+    pub(crate) fn thread_attribution(&self, thread_id: &str) -> TeamAttribution {
         for run in self.team_runs.values() {
             if !run
                 .owned_thread_ids()
@@ -2004,10 +2008,11 @@ impl RelayState {
                 Some("reviewer")
             } else {
                 // A run-owned thread: the design reviewer, an MR-gate reviewer,
-                // or the dev that addresses MR findings. The run is known, the
-                // seat is genuinely ambiguous, and guessing one would put real
-                // spend under the wrong role in the report.
-                None
+                // or the dev that addresses MR findings. Recorded at start where
+                // the seat is known; still `None` rather than a guess when not.
+                run.run_owned_thread_roles
+                    .get(thread_id)
+                    .map(String::as_str)
             };
             return TeamAttribution {
                 team_run_id: Some(run.id.clone()),
@@ -2019,7 +2024,30 @@ impl RelayState {
                 team_id: run.team_id.clone(),
             };
         }
+        // Outside a run, reviewing is still reviewing. `role` is the seat and
+        // `team_run_id` is where it sat; overloading `role` with both would
+        // split "what did review cost me" across two buckets.
+        if self.is_reviewer_thread(thread_id) {
+            return TeamAttribution {
+                role: Some("reviewer".to_string()),
+                ..TeamAttribution::default()
+            };
+        }
         TeamAttribution::default()
+    }
+
+    /// Whether a thread is a reviewer outside any team run — a standalone
+    /// review, a review job, or a workflow step.
+    fn is_reviewer_thread(&self, thread_id: &str) -> bool {
+        self.reviewer_threads.contains_key(thread_id)
+            || self
+                .review_jobs
+                .values()
+                .any(|job| job.reviewer_thread_id.as_deref() == Some(thread_id))
+            || self
+                .workflow_jobs
+                .values()
+                .any(|run| run.step_threads.values().any(|id| id == thread_id))
     }
 
     /// Record one turn's token usage against a thread.
@@ -2064,7 +2092,7 @@ impl RelayState {
                     .and_then(non_empty)
             });
 
-        let attribution = self.team_attribution(thread_id);
+        let attribution = self.thread_attribution(thread_id);
         self.usage_store.record(&crate::usage::store::TokenEvent {
             at: unix_now(),
             provider: provider.to_string(),
@@ -6390,9 +6418,9 @@ mod tests {
 /// Every field is only knowable while the run exists, which is why they are
 /// captured on the row rather than joined at report time.
 #[derive(Debug, Default)]
-struct TeamAttribution {
-    team_run_id: Option<String>,
-    role: Option<String>,
-    sub_task_id: Option<String>,
-    team_id: Option<String>,
+pub(crate) struct TeamAttribution {
+    pub(crate) team_run_id: Option<String>,
+    pub(crate) role: Option<String>,
+    pub(crate) sub_task_id: Option<String>,
+    pub(crate) team_id: Option<String>,
 }

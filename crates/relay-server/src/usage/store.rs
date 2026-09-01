@@ -14,7 +14,7 @@ use super::TokenUsage;
 
 /// Bumped only by adding a numbered migration below. `user_version` is a plain
 /// integer SQLite keeps in the file header, so this needs no table of its own.
-const LEDGER_SCHEMA_VERSION: i64 = 6;
+const LEDGER_SCHEMA_VERSION: i64 = 7;
 
 /// A single billable observation, ready to be written.
 #[derive(Debug, Clone, Default)]
@@ -1431,6 +1431,58 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         }
         conn.execute_batch("PRAGMA user_version = 6;")
             .map_err(|error| format!("stamp user_version 6: {error}"))?;
+    }
+
+    if version < 7 {
+        // Claude rows predating `ClaudeUsageTracker` hold the SDK's
+        // session-cumulative figures; difference them in place, as Codex was.
+        let has_token_event: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'token_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if has_token_event > 0 {
+            conn.execute_batch(
+                "BEGIN;
+             UPDATE token_event AS t
+             SET input            = CASE WHEN t.total < p.total THEN t.input
+                                    ELSE max(0, t.input - p.input) END,
+                 cached_input     = CASE WHEN t.total < p.total THEN t.cached_input
+                                    ELSE max(0, t.cached_input - p.cached_input) END,
+                 cache_write      = CASE WHEN t.total < p.total THEN t.cache_write
+                                    ELSE max(0, t.cache_write - p.cache_write) END,
+                 output           = CASE WHEN t.total < p.total THEN t.output
+                                    ELSE max(0, t.output - p.output) END,
+                 reasoning_output = CASE WHEN t.total < p.total THEN t.reasoning_output
+                                    ELSE max(0, t.reasoning_output - p.reasoning_output) END,
+                 total            = CASE WHEN t.total < p.total THEN t.total
+                                    ELSE max(0, t.total - p.total) END,
+                 cost_usd         = CASE WHEN t.cost_usd IS NULL THEN NULL
+                                    WHEN t.cost_usd < p.cost_usd THEN t.cost_usd
+                                    ELSE t.cost_usd - p.cost_usd END
+             FROM (
+                 SELECT id,
+                        COALESCE(LAG(input)            OVER w, 0) AS input,
+                        COALESCE(LAG(cached_input)     OVER w, 0) AS cached_input,
+                        COALESCE(LAG(cache_write)      OVER w, 0) AS cache_write,
+                        COALESCE(LAG(output)           OVER w, 0) AS output,
+                        COALESCE(LAG(reasoning_output) OVER w, 0) AS reasoning_output,
+                        COALESCE(LAG(total)            OVER w, 0) AS total,
+                        COALESCE(LAG(cost_usd)         OVER w, 0) AS cost_usd
+                 FROM token_event
+                 WHERE provider = 'claude_code'
+                 WINDOW w AS (PARTITION BY thread_id, model ORDER BY at, id)
+             ) AS p
+             WHERE t.id = p.id;
+             COMMIT;",
+            )
+            .map_err(|error| format!("migrate to 7: {error}"))?;
+        }
+        conn.execute_batch("PRAGMA user_version = 7;")
+            .map_err(|error| format!("stamp user_version 7: {error}"))?;
     }
 
     Ok(())

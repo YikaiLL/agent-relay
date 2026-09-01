@@ -1897,17 +1897,14 @@ fn record_claude_turn_usage(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let per_model: Vec<(String, crate::usage::TokenUsage)> = payload
-        .get("model_usage")
-        .and_then(serde_json::Value::as_object)
-        .map(|models| {
-            models
-                .iter()
-                .map(|(model, value)| (model.clone(), crate::usage::claude_model_usage(value)))
-                .filter(|(_, usage)| !usage.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    // `model_usage` and `total_cost_usd` are session-cumulative: bill the delta,
+    // or a ten-turn thread reads as the triangular number of its real spend.
+    let observation = relay.claude_usage.observe(&thread_id, payload);
+    let (per_model, cost_usd) = match observation {
+        Some(observation) => (observation.per_model, observation.cost_usd),
+        None if payload.get("model_usage").is_some() => return,
+        None => (Vec::new(), cost_usd),
+    };
 
     if !per_model.is_empty() {
         let costliest = per_model

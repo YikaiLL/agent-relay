@@ -27,6 +27,63 @@ fn open_in(dir: &TempDir) -> UsageStore {
     UsageStore::open(&dir.path().join("sealwire.db"))
 }
 
+/// Claude rows written before `ClaudeUsageTracker` existed hold the SDK's
+/// session-cumulative figures; summing them bills the triangular number.
+#[test]
+fn the_inherited_cumulative_claude_rows_are_differenced_in_place() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("sealwire.db");
+
+    {
+        let store = open_in(&dir);
+        for turn in 1..=10u64 {
+            store.record(&TokenEvent {
+                at: turn,
+                provider: "claude_code".to_string(),
+                model: Some("claude-opus-5".to_string()),
+                thread_id: "thread-a".to_string(),
+                turn_id: Some(format!("turn-{turn}")),
+                usage: TokenUsage {
+                    input: turn * 1_000,
+                    total: turn * 1_000,
+                    ..TokenUsage::default()
+                },
+                cost_usd: Some(turn as f64 * 0.5),
+                ..TokenEvent::default()
+            });
+        }
+        // Rewind so the rows read as inherited from before the fix.
+        rusqlite::Connection::open(&path)
+            .expect("open")
+            .execute_batch("PRAGMA user_version = 6;")
+            .expect("rewind");
+    }
+
+    let _store = open_in(&dir);
+    let conn = rusqlite::Connection::open(&path).expect("reopen");
+    let (total, input, cost): (u64, u64, f64) = conn
+        .query_row(
+            "SELECT SUM(total), SUM(input), SUM(COALESCE(cost_usd, 0)) FROM token_event",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query");
+
+    assert_eq!(
+        total, 10_000,
+        "ten 1k turns must sum to 10k; {total} means the cumulative rows \
+         were left as-is"
+    );
+    assert_eq!(
+        input, 10_000,
+        "every component is differenced, not just total"
+    );
+    assert!(
+        (cost - 5.0).abs() < 1e-9,
+        "cost is cumulative too: ten $0.50 turns must sum to $5.00, not ${cost}"
+    );
+}
+
 /// **The load-bearing invariant of this whole module.**
 ///
 /// `session.json` fails closed and catastrophically: one bad byte and
@@ -456,7 +513,10 @@ fn migration_five_adds_review_comment_tables() {
     let version_after: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read version");
-    assert_eq!(version_after, 6, "review tables must migrate through v6");
+    assert_eq!(
+        version_after, LEDGER_SCHEMA_VERSION,
+        "review tables must migrate all the way to the current schema"
+    );
 }
 
 #[test]
@@ -485,7 +545,7 @@ fn migration_six_drops_legacy_integer_tick_column() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read version");
-    assert_eq!(version, 6);
+    assert_eq!(version, LEDGER_SCHEMA_VERSION);
 
     let legacy_tick_column: i64 = conn
         .query_row(

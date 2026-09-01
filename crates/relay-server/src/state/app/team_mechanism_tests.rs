@@ -759,3 +759,62 @@ abandoned (interrupted: {interrupts:?})"
         "no seat may still be writing the worktree once the run has settled"
     );
 }
+
+/// A run-owned thread — the design reviewer, the MR-gate reviewer, or the dev
+/// that addresses MR findings — must bill under the seat it was started as.
+#[tokio::test]
+async fn a_run_owned_thread_attributes_to_the_seat_it_was_started_as() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app
+        .start_team_run(team_input(&root))
+        .await
+        .expect("the team should start");
+
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.record_run_thread("mr-reviewer-1");
+            run.record_run_thread_role("mr-reviewer-1", relay_api::team::TeamRole::Reviewer);
+        });
+    }
+
+    let relay = app.relay.read().await;
+    let attribution = relay.thread_attribution("mr-reviewer-1");
+    assert_eq!(
+        attribution.team_run_id.as_deref(),
+        Some(run_id.as_str()),
+        "the run is known"
+    );
+    assert_eq!(
+        attribution.role.as_deref(),
+        Some("reviewer"),
+        "a run-owned seat that billed under no role at all is spend nobody can \
+trace: 38% of one real run landed in that bucket"
+    );
+}
+
+/// A standalone review is reviewing too. Billing it under no role at all puts it
+/// in the same bucket as an ordinary chat session, where nobody can find it.
+#[tokio::test]
+async fn a_standalone_reviewer_thread_bills_under_reviewer_with_no_run() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+
+    {
+        let mut relay = app.relay.write().await;
+        relay.register_reviewer_thread("solo-reviewer-1".to_string(), "parent-1".to_string());
+    }
+
+    let relay = app.relay.read().await;
+    let attribution = relay.thread_attribution("solo-reviewer-1");
+    assert_eq!(
+        attribution.role.as_deref(),
+        Some("reviewer"),
+        "a review outside a run is still a review"
+    );
+    assert_eq!(
+        attribution.team_run_id, None,
+        "and `team_run_id` is what tells it apart from a run's reviewer"
+    );
+}

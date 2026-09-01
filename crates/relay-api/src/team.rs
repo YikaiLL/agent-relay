@@ -28,6 +28,7 @@
 //! The driver advances `phase` in the SAME write that records a step's result, so
 //! a crash re-runs at most the last turn. See `markdown/task-team-design.md` §5.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -650,6 +651,11 @@ pub struct TeamRun {
     /// run's locks are released. Persisted, appended, never pruned while live.
     pub run_owned_thread_ids: Vec<String>,
 
+    /// The seat each run-owned thread was started as. Recorded where the seat is
+    /// still known, so its spend does not land in the report under no role.
+    #[serde(default)]
+    pub run_owned_thread_roles: BTreeMap<String, String>,
+
     /// Instructions left for the team to pick up on its next turn. The driver
     /// drains these; they are notes TO the team, never from it.
     #[serde(default)]
@@ -1190,6 +1196,17 @@ impl TeamRun {
             return;
         }
         self.run_owned_thread_ids.push(thread_id);
+        self.updated_at = unix_now();
+    }
+
+    /// Tag a run-owned thread with the seat it was started as.
+    pub fn record_run_thread_role(&mut self, thread_id: impl Into<String>, role: TeamRole) {
+        let thread_id = thread_id.into();
+        if thread_id.is_empty() {
+            return;
+        }
+        self.run_owned_thread_roles
+            .insert(thread_id, role.as_str().to_string());
         self.updated_at = unix_now();
     }
 

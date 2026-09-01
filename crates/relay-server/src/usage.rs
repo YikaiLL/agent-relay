@@ -198,6 +198,82 @@ pub(crate) struct CodexUsageObservation {
     pub(crate) thread_total: Option<u64>,
 }
 
+/// Turns the Claude SDK result message's session-cumulative `modelUsage` and
+/// `total_cost_usd` into per-turn deltas, as `CodexUsageTracker` does for Codex.
+#[derive(Debug, Default)]
+pub(crate) struct ClaudeUsageTracker {
+    seen: HashMap<String, ClaudeSeenTotals>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ClaudeSeenTotals {
+    per_model: HashMap<String, TokenUsage>,
+    cost_usd: f64,
+}
+
+impl ClaudeUsageTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume one worker `done` payload. `None` means nothing new was spent —
+    /// a re-reported snapshot must not become a second ledger row.
+    pub(crate) fn observe(
+        &mut self,
+        thread_id: &str,
+        payload: &Value,
+    ) -> Option<ClaudeUsageObservation> {
+        let models = payload.get("model_usage").and_then(Value::as_object)?;
+        let seen = self.seen.entry(thread_id.to_string()).or_default();
+
+        let mut per_model = Vec::new();
+        for (model, value) in models {
+            let cumulative = claude_model_usage(value);
+            let previous = seen.per_model.get(model).copied().unwrap_or_default();
+            // Backwards means a different session reusing the thread id: take
+            // the new figure whole rather than saturating a negative to zero.
+            let delta = if cumulative.total < previous.total {
+                cumulative
+            } else {
+                cumulative.saturating_sub_componentwise(&previous)
+            };
+            seen.per_model.insert(model.clone(), cumulative);
+            if !delta.is_empty() {
+                per_model.push((model.clone(), delta));
+            }
+        }
+
+        let cost_usd = payload
+            .get("total_cost_usd")
+            .and_then(Value::as_f64)
+            .map(|cumulative| {
+                let delta = if cumulative < seen.cost_usd {
+                    cumulative
+                } else {
+                    cumulative - seen.cost_usd
+                };
+                seen.cost_usd = cumulative;
+                delta
+            });
+
+        if per_model.is_empty() {
+            return None;
+        }
+        Some(ClaudeUsageObservation {
+            per_model,
+            cost_usd,
+        })
+    }
+}
+
+/// One billable observation drawn from a Claude `done` payload.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClaudeUsageObservation {
+    /// Per-model deltas to bill — never the session-cumulative figures.
+    pub(crate) per_model: Vec<(String, TokenUsage)>,
+    pub(crate) cost_usd: Option<f64>,
+}
+
 pub(crate) mod budget;
 pub(crate) mod pricing;
 pub(crate) mod report;

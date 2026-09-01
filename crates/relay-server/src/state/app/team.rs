@@ -1430,6 +1430,11 @@ over on resume"
             );
             // Seats never leave the run worktree; pin so they share the same resolver.
             relay.set_thread_workspace(&thread_id, Some(workspace.as_str()));
+            // The only place the seat is still known: the driver records a
+            // run-owned thread without one, and the report cannot recover it.
+            relay.update_team_run(run_id, |run| {
+                run.record_run_thread_role(&thread_id, role);
+            });
             // Hide only the reviewer from navigation. Hiding the dev too would put
             // it in `reviewer_thread_ids()`, which `has_working_thread_in_cwd`
             // subtracts — and the dev is the seat that WRITES, so it must stay

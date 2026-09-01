@@ -246,3 +246,68 @@ fn the_context_window_is_carried_through() {
         .expect("billable");
     assert_eq!(observation.context_window, Some(272_000));
 }
+
+/// One Claude worker `done` payload. `model_usage` and `total_cost_usd` are the
+/// SDK result message's SESSION-cumulative figures, not the finished turn's.
+fn claude_done(cumulative_input: u64, cumulative_cost: f64) -> Value {
+    json!({
+        "turn_id": "turn",
+        "model_usage": {
+            "claude-opus-5": {
+                "inputTokens": cumulative_input,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+                "outputTokens": 0,
+            }
+        },
+        "total_cost_usd": cumulative_cost,
+    })
+}
+
+/// The same defect `a_ten_turn_codex_thread_bills_ten_turns_not_fifty_five`
+/// guards, on the Claude path — which has no tracker at all.
+#[test]
+fn a_ten_turn_claude_thread_bills_ten_turns_not_fifty_five() {
+    let mut tracker = ClaudeUsageTracker::new();
+    let mut billed = 0;
+    let mut billed_usd = 0.0f64;
+
+    for turn in 1..=10u64 {
+        let observation = tracker
+            .observe("thread-a", &claude_done(turn * 1_000, turn as f64 * 0.5))
+            .expect("every done carries billable usage");
+        billed += observation
+            .per_model
+            .iter()
+            .map(|(_, usage)| usage.total)
+            .sum::<u64>();
+        billed_usd += observation.cost_usd.unwrap_or(0.0);
+    }
+
+    assert_eq!(
+        billed, 10_000,
+        "ten 1k turns must bill 10k; {billed} means the cumulative \
+         `model_usage` was summed instead of differenced"
+    );
+    assert!(
+        (billed_usd - 5.0).abs() < 1e-9,
+        "cost is cumulative too: ten $0.50 turns must bill $5.00, not ${billed_usd}"
+    );
+}
+
+/// Observed in production: the last four rows of a finished thread are
+/// byte-identical. A re-reported snapshot spent nothing and must bill nothing.
+#[test]
+fn a_repeated_claude_done_payload_bills_nothing() {
+    let mut tracker = ClaudeUsageTracker::new();
+    tracker
+        .observe("thread-b", &claude_done(6_055_693, 8.152))
+        .expect("the first snapshot is billable");
+
+    assert!(
+        tracker
+            .observe("thread-b", &claude_done(6_055_693, 8.152))
+            .is_none(),
+        "an unchanged cumulative snapshot must not become a second ledger row"
+    );
+}
