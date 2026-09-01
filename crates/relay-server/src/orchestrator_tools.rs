@@ -1367,6 +1367,56 @@ request, not once",
         }
     }
 
+    /// A list param advertised as `"type":"string"` would be a schema that lies:
+    /// the model reads the contract from here, not from prose.
+    #[test]
+    fn rerun_sub_tasks_advertises_a_list_of_strings() {
+        let spec = spec_for("rerun_sub_tasks").expect("rerun_sub_tasks");
+        let schema = spec.input_schema();
+        assert_eq!(schema["properties"]["sub_task_ids"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["sub_task_ids"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(schema["required"], json!(["sub_task_ids"]));
+        assert!(
+            ACTING_TOOLS.contains(&"rerun_sub_tasks"),
+            "it mutates a run with no card"
+        );
+    }
+
+    #[test]
+    fn a_rerun_that_is_not_a_list_of_ids_is_refused_by_name() {
+        for bad in [
+            json!({ "sub_task_ids": "st-1" }),
+            json!({ "sub_task_ids": ["st-1", 7] }),
+            json!({ "sub_task_ids": ["st-1", "  "] }),
+            json!({ "sub_task_ids": [] }),
+            json!({}),
+        ] {
+            let err = parse_call("rerun_sub_tasks", &bad).unwrap_err();
+            assert!(err.contains("sub_task_ids"), "{bad} gave {err}");
+        }
+    }
+
+    // RED-STEP-PLACEHOLDER
+    #[cfg(any())]
+    #[test]
+    fn a_rerun_carries_every_id_it_was_given() {
+        let call = parse_call(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": [" st-1 ", "st-2"] }),
+        )
+        .expect("parse");
+        assert_eq!(
+            call,
+            ToolCall::RerunSubTasks {
+                sub_task_ids: vec!["st-1".to_string(), "st-2".to_string()],
+                run_id: None,
+            }
+        );
+    }
+
     #[test]
     fn tool_names_are_unique() {
         let mut names: Vec<_> = TOOLS.iter().map(|tool| tool.name).collect();
