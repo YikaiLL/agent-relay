@@ -7024,6 +7024,10 @@ body.is-resizing-panel {
   font-size: var(--text-md);
   font-weight: var(--weight-strong);
   line-height: var(--leading-tight);
+  /* Flex makes the trigger a real flex item, so it shrinks to this heading's
+   * resolved width instead of overflowing it (a plain block child does not). */
+  display: flex;
+  align-items: center;
 }
 
 /* `.local-frame .chat-heading h1` clips with an ellipsis — written when the
@@ -7133,7 +7137,8 @@ body.is-resizing-panel {
   justify-content: flex-start;
   gap: 6px;
   min-width: 0;
-  max-width: 100%;
+  /* No max-width: 100% — it cycles against the <h1> ancestor it also sizes,
+   * capping the label short of its own content (worst for wide CJK glyphs). */
   border: 0;
   padding: 2px 6px;
   margin-left: -6px;
