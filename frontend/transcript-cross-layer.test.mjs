@@ -15,6 +15,7 @@ import { hydrateTranscript } from "./shared/transcript-hydration.js";
 import {
   buildHydratedTranscriptProgress,
   createClearedTranscriptHydrationPatch,
+  createClearedTranscriptHydrationFetchedRevisionPatch,
   createMergedTranscriptHydrationPagePatch,
   createTranscriptHydrationCompletePatch,
   createTranscriptHydrationRevisionPatch,
@@ -53,6 +54,9 @@ function makeStore() {
     },
     setTranscriptHydrationIdle(state) {
       state.transcriptHydrationStatus = "idle";
+    },
+    clearTranscriptHydrationFetchedRevision(state) {
+      Object.assign(state, createClearedTranscriptHydrationFetchedRevisionPatch());
     },
     // Same shape as the real stores, including the revision each answers for:
     // `fetchedRevision` gates the once-per-revision re-arm, `bodyRevision`
@@ -170,4 +174,136 @@ test("real relay-compacted omitted snapshot hydrates and replaces shells with au
   const markup = renderTranscript(state.session.transcript);
   assert.ok(!markup.includes("data-transcript-pending"), "no loading shells remain after hydration");
   assert.ok(markup.includes("The relay boots with the complete provider"));
+});
+
+test("a turn-end signature change discards an in-flight tail fetch and re-arms at the same revision", async () => {
+  const snapshot = fixture.remote_omitted_snapshot;
+  const REVISION = snapshot.transcript_revision ?? 99;
+  const omittedEntry = snapshot.transcript.find((entry) => entry.item_id === "a-omitted");
+  const olderEntry = snapshot.transcript.find((entry) => entry.item_id !== "a-omitted");
+  const authoritative = fixture.remote_omitted_authoritative_entries.find(
+    (entry) => entry.item_id === "a-omitted"
+  );
+
+  const store = makeStore();
+  const state = {
+    session: {
+      active_thread_id: snapshot.active_thread_id,
+      active_turn_id: "turn-live",
+    },
+    ...createClearedTranscriptHydrationPatch(),
+    transcriptHydrationThreadId: snapshot.active_thread_id,
+    transcriptHydrationEntries: new Map([[olderEntry.item_id, olderEntry]]),
+    transcriptHydrationOrder: [olderEntry.item_id],
+    transcriptHydrationOlderCursor: "older-cursor",
+    transcriptHydrationSignature: `${snapshot.active_thread_id}|prior`,
+    transcriptHydrationStatus: "idle",
+    transcriptHydrationTailReady: true,
+  };
+
+  const midTurnSnapshot = {
+    ...snapshot,
+    active_turn_id: "turn-live",
+    transcript_revision: REVISION,
+    transcript: [olderEntry, omittedEntry],
+  };
+  const turnEndSnapshot = {
+    ...midTurnSnapshot,
+    active_turn_id: null,
+    transcript: [olderEntry, { ...omittedEntry, text: null }],
+  };
+
+  let fetchCalls = 0;
+  let releasePage;
+  const pageGate = new Promise((resolve) => {
+    releasePage = resolve;
+  });
+  const fetchPage = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      await pageGate;
+      return {
+        thread_id: snapshot.active_thread_id,
+        prev_cursor: "older-cursor",
+        entries: [
+          olderEntry,
+          {
+            ...omittedEntry,
+            text: "stale mid-turn body from the first fetch",
+            content_state: "full",
+          },
+        ],
+      };
+    }
+    return {
+      thread_id: snapshot.active_thread_id,
+      prev_cursor: "older-cursor",
+      entries: fixture.remote_omitted_authoritative_entries,
+    };
+  };
+  const onProgress = (hydrated) => {
+    state.session = hydrated;
+  };
+
+  const firstPromise = hydrateTranscript(state, midTurnSnapshot, store, {
+    fetchPage,
+    incompletePageError: "incomplete transcript page",
+    missingTailError: "missing transcript tail",
+    onProgress,
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    state.transcriptHydrationFetchedRevision,
+    REVISION,
+    "mid-turn snapshot arms fetch at revision R"
+  );
+  assert.equal(fetchCalls, 1, "first fetch is in flight");
+
+  const concurrentPromise = hydrateTranscript(state, turnEndSnapshot, store, {
+    fetchPage,
+    incompletePageError: "incomplete transcript page",
+    missingTailError: "missing transcript tail",
+    onProgress,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    fetchCalls,
+    1,
+    "turn-end snapshot reuses the in-flight fetch, it does not start a second one yet"
+  );
+
+  releasePage();
+  await Promise.all([firstPromise, concurrentPromise]);
+
+  assert.equal(
+    state.transcriptHydrationFetchedRevision,
+    null,
+    "discarding a stale page must clear the once-per-revision arm"
+  );
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "a-omitted")?.text,
+    null,
+    "stale mid-turn page must be discarded, not merged"
+  );
+
+  state.transcriptHydrationTailReady = true;
+
+  await hydrateTranscript(state, turnEndSnapshot, store, {
+    fetchPage,
+    incompletePageError: "incomplete transcript page",
+    missingTailError: "missing transcript tail",
+    onProgress,
+  });
+
+  assert.equal(
+    fetchCalls,
+    2,
+    "turn-end must re-arm a second fetch after the stale page is discarded"
+  );
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "a-omitted")?.text,
+    authoritative.text,
+    "the re-armed fetch must land the authoritative turn-end text"
+  );
 });

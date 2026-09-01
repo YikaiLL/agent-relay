@@ -1022,6 +1022,308 @@ test("a DELTA-joined entry must also survive a stale tail-page merge", async () 
 //
 // `prev_cursor == null` answers "have we reached the top of history", which is
 // a different question from "which revision are these bodies from".
+test("a turn-end signature change discards an in-flight tail fetch and re-arms at the same revision", async () => {
+  const REVISION = 42;
+  const olderEntry = {
+    item_id: "item-older",
+    kind: "user_text",
+    text: "start the task",
+    status: "completed",
+    turn_id: "turn-1",
+    tool: null,
+    content_state: "full",
+  };
+  const omittedTail = {
+    item_id: "item-final",
+    kind: "agent_text",
+    text: "The relay boots with ...",
+    status: "completed",
+    turn_id: "turn-final",
+    tool: null,
+    content_state: "omitted",
+  };
+  const state = createState({
+    session: { active_thread_id: "thread-1", active_turn_id: "turn-final" },
+    transcriptHydrationThreadId: "thread-1",
+    transcriptHydrationEntries: new Map([["item-older", olderEntry]]),
+    transcriptHydrationOrder: ["item-older"],
+    transcriptHydrationOlderCursor: "older-cursor",
+    transcriptHydrationSignature: "thread-1|prior",
+    transcriptHydrationStatus: "idle",
+    transcriptHydrationTailReady: true,
+  });
+  const midTurnSnapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: "turn-final",
+    transcript_revision: REVISION,
+    transcript_truncated: true,
+    transcript: [olderEntry, omittedTail],
+  };
+  const turnEndSnapshot = {
+    active_thread_id: "thread-1",
+    active_turn_id: null,
+    transcript_revision: REVISION,
+    transcript_truncated: true,
+    transcript: [olderEntry, { ...omittedTail, text: null }],
+  };
+  const fullText =
+    "The relay boots with the complete provider and transcript state.";
+
+  let tailFetchCalls = 0;
+  let releasePage;
+  const pageGate = new Promise((resolve) => {
+    releasePage = resolve;
+  });
+  const fetchPage = async ({ before }) => {
+    if (before != null) {
+      return { thread_id: "thread-1", prev_cursor: null, entries: [] };
+    }
+    tailFetchCalls += 1;
+    if (tailFetchCalls === 1) {
+      await pageGate;
+      return {
+        thread_id: "thread-1",
+        prev_cursor: "older-cursor",
+        entries: [
+          olderEntry,
+          {
+            item_id: "item-final",
+            kind: "agent_text",
+            text: "mid-turn stale body from the first fetch",
+            status: "completed",
+            turn_id: "turn-final",
+            tool: null,
+          },
+        ],
+      };
+    }
+    return {
+      thread_id: "thread-1",
+      prev_cursor: "older-cursor",
+      entries: [
+        olderEntry,
+        {
+          item_id: "item-final",
+          kind: "agent_text",
+          text: fullText,
+          status: "completed",
+          turn_id: "turn-final",
+          tool: null,
+        },
+      ],
+    };
+  };
+  const onProgress = (next) => {
+    state.session = next;
+  };
+
+  const firstPromise = hydrateLocalTranscript(state, midTurnSnapshot, {
+    fetchPage,
+    onProgress,
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    state.transcriptHydrationFetchedRevision,
+    REVISION,
+    "mid-turn snapshot arms fetch at revision R"
+  );
+  assert.equal(tailFetchCalls, 1, "first tail fetch is in flight");
+
+  const concurrentPromise = hydrateLocalTranscript(state, turnEndSnapshot, {
+    fetchPage,
+    onProgress,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    tailFetchCalls,
+    1,
+    "turn-end snapshot reuses the in-flight fetch, it does not start a second one yet"
+  );
+
+  releasePage();
+  await Promise.all([firstPromise, concurrentPromise]);
+
+  assert.equal(
+    state.transcriptHydrationFetchedRevision,
+    null,
+    "discarding a stale page must clear the once-per-revision arm"
+  );
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "item-final")?.text,
+    null,
+    "stale mid-turn page must be discarded, not merged"
+  );
+
+  // The merge path would have set tailReady after a successful page; after a
+  // signature-mismatch discard the window is still considered ready for render.
+  state.transcriptHydrationTailReady = true;
+
+  await hydrateLocalTranscript(state, turnEndSnapshot, { fetchPage, onProgress });
+
+  assert.equal(
+    tailFetchCalls,
+    2,
+    "turn-end must re-arm a second tail fetch after the stale page is discarded"
+  );
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "item-final")?.text,
+    fullText,
+    "the re-armed fetch must land the authoritative turn-end text"
+  );
+});
+
+test("a stale thread-A tail fetch must not clear thread-B's fetched-revision arm after a switch", async () => {
+  const REVISION_A = 10;
+  const REVISION_B = 20;
+  const omittedA = {
+    item_id: "a-tail",
+    kind: "agent_text",
+    text: "thread A shell...",
+    status: "running",
+    turn_id: "turn-a",
+    tool: null,
+    content_state: "omitted",
+  };
+  const omittedB = {
+    item_id: "b-tail",
+    kind: "agent_text",
+    text: "thread B shell...",
+    status: "running",
+    turn_id: "turn-b",
+    tool: null,
+    content_state: "omitted",
+  };
+  const state = createState({
+    session: { active_thread_id: "thread-A", active_turn_id: "turn-a" },
+    transcriptHydrationThreadId: "thread-A",
+    transcriptHydrationEntries: new Map([["a-tail", { ...omittedA }]]),
+    transcriptHydrationOrder: ["a-tail"],
+    transcriptHydrationOlderCursor: null,
+    transcriptHydrationSignature: "thread-A|prior",
+    transcriptHydrationStatus: "idle",
+    transcriptHydrationTailReady: true,
+  });
+  const snapshotA = {
+    active_thread_id: "thread-A",
+    active_turn_id: "turn-a",
+    transcript_revision: REVISION_A,
+    transcript_truncated: true,
+    transcript: [{ ...omittedA, text: null }],
+  };
+  const snapshotB = {
+    active_thread_id: "thread-B",
+    active_turn_id: "turn-b",
+    transcript_revision: REVISION_B,
+    transcript_truncated: true,
+    transcript: [{ ...omittedB, text: null }],
+  };
+  const fullB = "thread B authoritative body after the switch";
+
+  let releasePageA;
+  let releasePageB;
+  const pageGateA = new Promise((resolve) => {
+    releasePageA = resolve;
+  });
+  const pageGateB = new Promise((resolve) => {
+    releasePageB = resolve;
+  });
+  let tailFetchCallsB = 0;
+  const fetchPage = async ({ threadId, before }) => {
+    if (before != null) {
+      return { thread_id: threadId, prev_cursor: null, entries: [] };
+    }
+    if (threadId === "thread-A") {
+      await pageGateA;
+      return {
+        thread_id: "thread-A",
+        prev_cursor: null,
+        entries: [
+          {
+            item_id: "a-tail",
+            kind: "agent_text",
+            text: "stale thread-A body",
+            status: "completed",
+            turn_id: "turn-a",
+            tool: null,
+          },
+        ],
+      };
+    }
+    tailFetchCallsB += 1;
+    await pageGateB;
+    return {
+      thread_id: "thread-B",
+      prev_cursor: null,
+      entries: [
+        {
+          item_id: "b-tail",
+          kind: "agent_text",
+          text: fullB,
+          status: "completed",
+          turn_id: "turn-b",
+          tool: null,
+        },
+      ],
+    };
+  };
+  const onProgress = (next) => {
+    state.session = next;
+  };
+
+  const promiseA = hydrateLocalTranscript(state, snapshotA, { fetchPage, onProgress });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    state.transcriptHydrationFetchedRevision,
+    REVISION_A,
+    "thread A arms fetch at revision R"
+  );
+
+  switchTranscriptHydrationThread(state, "thread-B");
+  // Session still reflects thread A until B's hydration publishes progress — the
+  // stale page gate keys off session.active_thread_id, not the hydration slot.
+  state.transcriptHydrationEntries = new Map([["b-tail", { ...omittedB }]]);
+  state.transcriptHydrationOrder = ["b-tail"];
+  state.transcriptHydrationOlderCursor = null;
+  state.transcriptHydrationTailReady = true;
+
+  const promiseB = hydrateLocalTranscript(state, snapshotB, { fetchPage, onProgress });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    state.transcriptHydrationFetchedRevision,
+    REVISION_B,
+    "thread B arms fetch at its revision"
+  );
+  assert.equal(tailFetchCallsB, 1, "thread B tail fetch is in flight");
+
+  releasePageA();
+  await promiseA;
+
+  assert.equal(
+    state.transcriptHydrationFetchedRevision,
+    REVISION_B,
+    "thread A's stale discard must not clear thread B's once-per-revision arm"
+  );
+
+  state.session = { active_thread_id: "thread-B", active_turn_id: "turn-b" };
+  releasePageB();
+  await promiseB;
+
+  state.transcriptHydrationTailReady = true;
+  await hydrateLocalTranscript(state, snapshotB, { fetchPage, onProgress });
+
+  assert.equal(
+    tailFetchCallsB,
+    1,
+    "thread B must not get overlapping same-revision tail fetches"
+  );
+  assert.equal(
+    state.session.transcript.find((entry) => entry.item_id === "b-tail")?.text,
+    fullB,
+    "thread B keeps the authoritative body from its own fetch"
+  );
+});
+
 test("hydrating a tail records its revision even when older history remains", async () => {
   const state = createState();
   const snapshot = {
