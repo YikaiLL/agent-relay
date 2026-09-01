@@ -37,6 +37,18 @@ export SEALWIRE_BETA="${SEALWIRE_BETA:-1}"
 
 npm run build
 
+# Drop the stale cargo generations left by previous runs before the build below
+# adds another. cargo never garbage-collects target/: each changed metadata hash
+# writes a fresh `<crate>-<hash>.*` set and leaves every earlier one in place,
+# which is how target/debug reached 94G here. See scripts/prune-cargo-target.mjs.
+# Runs BEFORE cargo so the generation it is about to reuse is the newest one —
+# exactly what the prune keeps — and no rebuild is forced.
+#
+# `|| true` is load-bearing: this sits on the startup path of a dev relay and
+# must never be what stops one from coming up. It also keeps the smoke test
+# green, which runs this script with a stubbed PATH that has no node on it.
+node "$(dirname "$0")/prune-cargo-target.mjs" || true
+
 echo "restart-dev-cloud: starting relay-server at http://${BIND_HOST:-127.0.0.1}:${PORT:-8787}"
 if [ "$SEALWIRE_BETA" = "1" ]; then
   echo "restart-dev-cloud: beta features ON (Tasks unlocked)"

@@ -4,6 +4,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const relayPort = process.env.RELAY_DEV_SERVER_PORT || "8787";
@@ -119,6 +120,20 @@ console.log("[dev:full] Building frontend assets for relay-server and relay-brok
 await runCommand(npmCommand, ["run", "build"], buildEnv);
 logCurrentBuildMeta("Initial frontend build");
 watchFrontendBuildMeta();
+
+// Drop the stale cargo generations left by previous runs before this one adds
+// another. cargo never garbage-collects target/, so without this every restart
+// leaves a full extra copy of every first-party crate behind — that is how
+// target/debug reached 94G here. Runs BEFORE cargo so the generation it is about
+// to reuse is the newest, which is exactly what the prune keeps.
+// Never fatal: a dev loop must still come up if the prune cannot run.
+await runCommand(
+  process.execPath,
+  [fileURLToPath(new URL("prune-cargo-target.mjs", import.meta.url))],
+  buildEnv
+).catch((error) => {
+  console.warn(`[dev:full] target prune skipped: ${error.message}`);
+});
 
 console.log("[dev:full] Starting frontend build watcher, relay-broker, and relay-server...");
 console.log(`[dev:full] Relay:  http://127.0.0.1:${relayPort}`);
