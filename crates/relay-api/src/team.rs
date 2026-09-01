@@ -462,12 +462,14 @@ pub fn mint_sub_task_id() -> String {
 /// `max(now, previous + 1)`, claimed atomically, because two reads of the clock
 /// can land on the same nanosecond.
 fn mint_number(last: &AtomicU64, now: u64) -> u64 {
-    let step = |prev: u64| now.max(prev + 1);
-    match last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
-        Some(step(prev))
-    }) {
-        Ok(prev) | Err(prev) => step(prev),
-    }
+    let mut minted = now;
+    // Contention re-runs the closure, so the value it wrote last is the one this
+    // call actually stored.
+    let _ = last.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        minted = now.max(prev + 1);
+        Some(minted)
+    });
+    minted
 }
 
 /// One TL-authored unit of work.
@@ -1059,14 +1061,19 @@ impl TeamRun {
     /// so an earlier sub-task's id still names its record and can be rerun.
     pub fn replan_sub_tasks(&mut self, planned: Vec<SubTask>) {
         for task in &mut self.sub_tasks {
-            if !task.status.is_terminal() {
-                task.status = SubTaskStatus::Superseded;
-                // `current_sub_task` selects an undigested entry however terminal,
-                // and the TL wrote the replan, so it is owed no report about it.
-                task.digested = true;
-            }
+            task.status = SubTaskStatus::Superseded;
+            // `current_sub_task` selects an undigested entry however terminal, and
+            // the TL wrote the replan, so it is owed no report about it.
+            task.digested = true;
         }
-        self.sub_tasks.extend(planned);
+        for mut task in planned {
+            // A restart resets the mint, so a new id can land on a retained one and
+            // leave that record unreachable by name. One re-mint is the defence.
+            if self.sub_tasks.iter().any(|kept| kept.id == task.id) {
+                task.id = mint_sub_task_id();
+            }
+            self.sub_tasks.push(task);
+        }
         self.updated_at = unix_now();
     }
 
@@ -1789,23 +1796,23 @@ mod tests {
         assert!(run.sub_tasks[1].digested);
     }
 
+    fn planned_sub_task(id: &str) -> SubTask {
+        SubTask {
+            id: id.to_string(),
+            ..sub_task(SubTaskStatus::Pending, false)
+        }
+    }
+
     #[test]
     fn a_replan_retires_what_it_replaces_instead_of_dropping_it() {
+        // A replan is authored from `Planning`, before any of it has been worked,
+        // so everything it replaces is still pending.
         let mut run = run_with(
-            TeamPhase::SubTasks,
-            vec![
-                spent_sub_task("st-1", SubTaskStatus::Done),
-                SubTask {
-                    id: "st-2".to_string(),
-                    ..sub_task(SubTaskStatus::Implementing, false)
-                },
-            ],
+            TeamPhase::Planning,
+            vec![planned_sub_task("st-1"), planned_sub_task("st-2")],
         );
 
-        run.replan_sub_tasks(vec![SubTask {
-            id: "st-3".to_string(),
-            ..sub_task(SubTaskStatus::Pending, false)
-        }]);
+        run.replan_sub_tasks(vec![planned_sub_task("st-3")]);
 
         let ids: Vec<&str> = run.sub_tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(
@@ -1813,16 +1820,42 @@ mod tests {
             ["st-1", "st-2", "st-3"],
             "an id from before the replan must still name its record"
         );
-        assert_eq!(
-            run.sub_tasks[0].status,
-            SubTaskStatus::Done,
-            "one that already settled keeps the outcome it earned"
-        );
+        assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Superseded);
         assert_eq!(run.sub_tasks[1].status, SubTaskStatus::Superseded);
         assert_eq!(
             run.current_sub_task(),
             Some(2),
-            "the retired one must not be picked up again"
+            "a retired one must not be picked up again"
+        );
+    }
+
+    #[test]
+    fn a_replanned_id_landing_on_a_retained_one_is_minted_again() {
+        // A restart resets the mint, so the plan after it can carry an id an
+        // earlier plan already handed out. Two records answering to one id makes
+        // a rerun reach only the first, which is the record nobody asked for.
+        let mut run = run_with(TeamPhase::Planning, vec![planned_sub_task("st-1")]);
+
+        run.replan_sub_tasks(vec![planned_sub_task("st-1")]);
+
+        assert_eq!(run.sub_tasks.len(), 2, "neither record may be dropped");
+        assert_eq!(
+            run.sub_tasks[0].id, "st-1",
+            "the retired one keeps the id the user is holding"
+        );
+        assert_ne!(
+            run.sub_tasks[1].id, "st-1",
+            "the newcomer must not answer to it as well"
+        );
+        assert!(
+            run.sub_tasks[1].id.starts_with("st-"),
+            "the replacement is a real minted id, got {}",
+            run.sub_tasks[1].id
+        );
+        assert_eq!(
+            run.current_sub_task(),
+            Some(1),
+            "and the new plan is what the team goes on to work"
         );
     }
 
