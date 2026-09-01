@@ -213,6 +213,7 @@ export function TaskWelcome({ runs, loading, error, onStartTask, orchReady = fal
 export function OrchestratorPane({
   runs,
   selectedRun = null,
+  seenAt = {},
   loading = false,
   error = null,
   waitingCount = 0,
@@ -246,7 +247,7 @@ export function OrchestratorPane({
   onStop = null,
   enterSubmits = undefined,
 }) {
-  const attention = selectedRun ? teamAttention(selectedRun) : null;
+  const attention = selectedRun ? teamAttention(selectedRun, seenAt) : null;
   const showAttention = selectedRun && attention?.kind === "needs_input";
   const hasTranscript = Array.isArray(transcriptEntries);
   const emptyTranscript = hasTranscript && transcriptEntries.length === 0;
@@ -735,14 +736,20 @@ function orchestratorAttachments({ pending, busy, onRemoveAttachment }) {
 
 
 function OrchestratorAttentionCard({ run, attention, onOpenThread }) {
+  const [tag, state] = {
+    question: ["Needs you", "Paused for a decision"],
+    blocked: ["Needs you", "Paused for a decision"],
+    escalated: ["Finished", "Ran out of rounds"],
+    failed: ["Finished", "Task stopped"],
+  }[attention.reason];
   return h(
     "div",
     { className: "task-orch-card" },
     h(
       "div",
       { className: "task-orch-card-head" },
-      h("span", { className: "task-orch-card-tag" }, "Needs you"),
-      h("span", { className: "task-orch-card-state" }, "Paused for a decision")
+      h("span", { className: "task-orch-card-tag" }, tag),
+      h("span", { className: "task-orch-card-state" }, state)
     ),
     h("h3", { className: "task-orch-card-title" }, run.title || "Untitled task"),
     h("p", { className: "task-orch-card-body" }, attention.text),
@@ -1290,6 +1297,7 @@ export function TaskDetail({
 export function TaskTeamScreen({
   runs,
   selectedRunId,
+  seenAt = {},
   loading = false,
   error = null,
   onOpenTask,
@@ -1335,6 +1343,7 @@ export function TaskTeamScreen({
       h(OrchestratorPane, {
         runs,
         selectedRun: run,
+        seenAt,
         loading,
         error,
         waitingCount,

@@ -2257,6 +2257,7 @@ export function createSessionRenderer({
         // "still loading" apart from "there are no tasks".
         runs: teams,
         selectedRunId: context.teamRunId || null,
+        seenAt,
         changesPanel: taskDiffPanel(context.teamRunId || null),
         // From the live snapshot, so a relay restarted without `--beta` re-blurs
         // a screen the user is already standing on.

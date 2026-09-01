@@ -291,7 +291,7 @@ function normalizeAwaitingRole(role) {
  * task until answered, a block holds the worktree, and a pause is the user's own
  * doing so it comes last.
  */
-export function teamAttention(run) {
+export function teamAttention(run, seenAt = {}) {
   if (!run) return null;
   if (run.awaiting) {
     const who = normalizeAwaitingRole(run.awaiting.role) === "dev" ? "developer" : "team lead";
@@ -307,6 +307,12 @@ export function teamAttention(run) {
       reason: "blocked",
       text: run.error || "A step could not be confirmed stopped. Unblock it to continue.",
     };
+  }
+  if (
+    isTerminalTeamStatus(run.status)
+    && (seenAt?.[run.team_run_id] || 0) >= (run.updated_at || 0)
+  ) {
+    return null;
   }
   if (run.status === "escalated") {
     return {
@@ -401,13 +407,7 @@ export function sortTeamRuns(teams) {
  * settled run that moves afterwards is new information and asks again.
  */
 export function teamNeedsYouNow(run, seenAt = {}) {
-  if (teamAttention(run)?.kind !== "needs_input") {
-    return false;
-  }
-  if (!isTerminalTeamStatus(run?.status)) {
-    return true;
-  }
-  return (seenAt?.[run?.team_run_id] || 0) < (run?.updated_at || 0);
+  return teamAttention(run, seenAt)?.kind === "needs_input";
 }
 
 /** How many tasks are waiting on a person — what the sidebar badge counts. */
