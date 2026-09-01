@@ -544,9 +544,12 @@ answers keyed by the question text above)",
                             run.phase.as_str()
                         );
                         for (index, task) in run.sub_tasks.iter().enumerate() {
+                            // Same shape as the run line above. The id is here
+                            // because tools take it and nothing else shows it.
                             block.push_str(&format!(
-                                "\n  {}. {} ({})",
+                                "\n  {}. {} — {} ({})",
                                 index + 1,
+                                task.id,
                                 task.title,
                                 task.status.as_str()
                             ));
@@ -1715,6 +1718,64 @@ it a turn ago"
             "the result summary is what says HOW it went: {reply}"
         );
         assert!(reply.contains("2 review round"), "{reply}");
+    }
+
+    /// Sub-task ids are the handle every per-sub-task tool takes, and this is
+    /// the only projection a model can read one out of.
+    #[tokio::test]
+    async fn task_status_names_the_id_of_every_sub_task() {
+        use relay_api::team::{SubTask, SubTaskStatus, TaskSpec, TeamRun, TeamRunStatus};
+
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let app = ready_app(&cwd).await;
+
+        {
+            let mut relay = app.relay.write().await;
+            let mut run = TeamRun::new(
+                "run-1".to_string(),
+                TaskSpec {
+                    title: "Add a parser".to_string(),
+                    ..TaskSpec::default()
+                },
+                cwd.clone(),
+                "device-1".to_string(),
+            );
+            run.status = TeamRunStatus::Running;
+            run.sub_tasks = vec![
+                SubTask {
+                    id: "st-17a4f9c2b0".to_string(),
+                    title: "Write the lexer".to_string(),
+                    status: SubTaskStatus::Done,
+                    rounds_used: 2,
+                    result_summary: Some("Handles all three encodings.".to_string()),
+                    ..SubTask::default()
+                },
+                SubTask {
+                    id: "st-17a4f9c2b1".to_string(),
+                    title: "Wire it up".to_string(),
+                    status: SubTaskStatus::Implementing,
+                    ..SubTask::default()
+                },
+            ];
+            relay.insert_team_run(run);
+        }
+
+        let reply = app
+            .call_orchestrator_tool("task_status", &json!({}), Some("device-1".to_string()))
+            .await
+            .expect("task_status");
+
+        for id in ["st-17a4f9c2b0", "st-17a4f9c2b1"] {
+            assert!(
+                reply.contains(id),
+                "{id} is unreadable, so nothing can be aimed at it: {reply}"
+            );
+        }
+        assert!(
+            reply.contains("Write the lexer") && reply.contains("Handles all three encodings."),
+            "the id must join the line, not replace it: {reply}"
+        );
     }
 
     /// Seed a run that is parked on a question, exactly as the driver leaves it.
