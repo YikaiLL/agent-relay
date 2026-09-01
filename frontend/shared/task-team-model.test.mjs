@@ -58,6 +58,16 @@ test("a provider-paused task does not read as waiting on the user", () => {
     "must share the plain pause's `reason` so the banner keeps its neutral " +
       "styling instead of falling back to the urgent default"
   );
+  // The substring checks above all pass on the broken composition too — this
+  // is the one assertion that actually catches it: "stopped the work:" plus a
+  // `pause_reason` that already contains its own colon reads as two colons in
+  // one sentence, and without a period the resume clause runs on with no
+  // sentence break.
+  assert.equal(
+    attention.text,
+    "The provider stopped the work. Claude turn failed: reached the usage limit. You can resume once that clears.",
+    "exact rendered copy — one colon (from pause_reason itself), and a sentence break before the resume clause"
+  );
 });
 
 test("a provider pause with no pause_reason still reads sensibly", () => {

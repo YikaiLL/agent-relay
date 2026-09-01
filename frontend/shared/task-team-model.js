@@ -359,7 +359,7 @@ export function teamAttention(run, seenAt = {}) {
       kind: "paused",
       reason: "paused",
       text: run.pause_reason
-        ? `The provider stopped the work: ${run.pause_reason} You can resume once that clears.`
+        ? `The provider stopped the work. ${run.pause_reason}. You can resume once that clears.`
         : "The provider stopped the work. You can resume once that clears.",
     };
   }
