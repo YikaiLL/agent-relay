@@ -52,14 +52,22 @@ const MOBILE_VIEWPORT = { width: 390, height: 844 };
 
 // Ancestor chain the plan asks us to dump before touching any CSS: the label's
 // own box, then each wrapper up to the header, in case some ancestor (not the
-// label) is the one collapsing to min-content.
+// label) is the one collapsing to min-content. Named so assertNoClip can look
+// entries back up by selector instead of by array position.
+const LABEL_SELECTOR = ".remote-chat-shell .project-switcher-label";
+const TRIGGER_SELECTOR = ".remote-chat-shell .project-switcher-trigger";
+const HEADING_SELECTOR = ".remote-chat-shell h1.project-switcher-heading";
+const TITLE_ROW_SELECTOR = ".remote-chat-shell .chat-heading-title-row";
+const CHAT_HEADING_SELECTOR = ".remote-chat-shell .chat-heading";
+const CHAT_HEADER_SELECTOR = ".remote-chat-shell .chat-header";
+
 const ANCESTOR_SELECTORS = [
-  ".remote-chat-shell .project-switcher-label",
-  ".remote-chat-shell .project-switcher-trigger",
-  ".remote-chat-shell h1.project-switcher-heading",
-  ".remote-chat-shell .chat-heading-title-row",
-  ".remote-chat-shell .chat-heading",
-  ".remote-chat-shell .chat-header",
+  LABEL_SELECTOR,
+  TRIGGER_SELECTOR,
+  HEADING_SELECTOR,
+  TITLE_ROW_SELECTOR,
+  CHAT_HEADING_SELECTOR,
+  CHAT_HEADER_SELECTOR,
 ];
 
 async function dumpAncestorChain(page) {
@@ -73,6 +81,11 @@ async function dumpAncestorChain(page) {
         selector: sel,
         found: true,
         width: Math.round(rect.width * 100) / 100,
+        // left/right (not just width) so assertNoClip can check the trigger's
+        // right edge against a CONTAINER's right edge, not just compare sizes —
+        // two boxes can be the same width while one has drifted past the other.
+        left: Math.round(rect.left * 100) / 100,
+        right: Math.round(rect.right * 100) / 100,
         scrollWidth: el.scrollWidth,
         clientWidth: el.clientWidth,
         whiteSpace: style.whiteSpace,
@@ -83,6 +96,12 @@ async function dumpAncestorChain(page) {
       };
     });
   }, ANCESTOR_SELECTORS);
+}
+
+function findAncestor(ancestorChain, selector) {
+  const entry = ancestorChain.find((candidate) => candidate.selector === selector);
+  assert.ok(entry && entry.found, `expected an ancestor chain entry for ${selector}`);
+  return entry;
 }
 
 async function readLabelMetrics(page) {
@@ -402,7 +421,7 @@ async function collectMeasurements(page, label, projectName) {
 // The "does it actually fit" assertions, split out so callers can collect and
 // save measurements for every project before the first assertion can abort
 // the run.
-function assertNoClip(label, projectName, { metrics, intrinsicWidth }) {
+function assertNoClip(label, projectName, { metrics, intrinsicWidth, ancestorChain }) {
   assert.ok(metrics, `expected the project switcher label to be present (${label})`);
   assert.equal(
     metrics.text,
@@ -421,6 +440,31 @@ function assertNoClip(label, projectName, { metrics, intrinsicWidth }) {
     metrics.width >= intrinsicWidth - 1,
     `expected the ${label} label box (${metrics.width}px) to hold the full intrinsic text width `
       + `(${intrinsicWidth}px measured independently), not collapse to fewer glyphs — got ${JSON.stringify(metrics)}`
+  );
+
+  // Upper bounds. Everything above only checks "did not shrink" — the fix this
+  // test guards removed a max-width, and the regression THAT could plausibly
+  // cause is the opposite direction: a trigger that stretches past its own text
+  // or grows past its container instead of shrinking to fit it.
+  assert.ok(
+    metrics.width <= intrinsicWidth + 2,
+    `expected the ${label} label box (${metrics.width}px) to not stretch past its own intrinsic text width `
+      + `(${intrinsicWidth}px measured independently) — got ${JSON.stringify(metrics)}`
+  );
+
+  const trigger = findAncestor(ancestorChain, TRIGGER_SELECTOR);
+  const chatHeading = findAncestor(ancestorChain, CHAT_HEADING_SELECTOR);
+  const chatHeader = findAncestor(ancestorChain, CHAT_HEADER_SELECTOR);
+  assert.ok(
+    trigger.right <= chatHeading.right + 1,
+    `expected the ${label} trigger's right edge (${trigger.right}px) to stay within .chat-heading's `
+      + `content box (right=${chatHeading.right}px) — a regression here means the trigger grew past its `
+      + `container instead of shrinking to fit it, got ${JSON.stringify({ trigger, chatHeading })}`
+  );
+  assert.ok(
+    trigger.right <= chatHeader.right + 1,
+    `expected the ${label} trigger's right edge (${trigger.right}px) to stay within .chat-header's `
+      + `content box (right=${chatHeader.right}px), got ${JSON.stringify({ trigger, chatHeader })}`
   );
 }
 
