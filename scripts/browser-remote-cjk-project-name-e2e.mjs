@@ -77,6 +77,13 @@ async function dumpAncestorChain(page) {
       if (!el) return { selector: sel, found: false };
       const rect = el.getBoundingClientRect();
       const style = getComputedStyle(el);
+      // getBoundingClientRect().right is the BORDER-box edge. .chat-header has
+      // 16px of right padding at this breakpoint, so that edge sits 16px past
+      // where content is actually allowed to reach — a trigger could overflow
+      // into the padding and a check against the border-box edge would still
+      // pass. contentRight strips padding/border to get the edge that matters.
+      const paddingRight = parseFloat(style.paddingRight) || 0;
+      const borderRightWidth = parseFloat(style.borderRightWidth) || 0;
       return {
         selector: sel,
         found: true,
@@ -86,6 +93,7 @@ async function dumpAncestorChain(page) {
         // two boxes can be the same width while one has drifted past the other.
         left: Math.round(rect.left * 100) / 100,
         right: Math.round(rect.right * 100) / 100,
+        contentRight: Math.round((rect.right - paddingRight - borderRightWidth) * 100) / 100,
         scrollWidth: el.scrollWidth,
         clientWidth: el.clientWidth,
         whiteSpace: style.whiteSpace,
@@ -452,19 +460,23 @@ function assertNoClip(label, projectName, { metrics, intrinsicWidth, ancestorCha
       + `(${intrinsicWidth}px measured independently) — got ${JSON.stringify(metrics)}`
   );
 
+  // Compared against contentRight, not the raw border-box `right` — .chat-header
+  // carries real right padding at this breakpoint, and a check against its
+  // border-box edge would let the trigger overflow straight into that padding
+  // without ever tripping.
   const trigger = findAncestor(ancestorChain, TRIGGER_SELECTOR);
   const chatHeading = findAncestor(ancestorChain, CHAT_HEADING_SELECTOR);
   const chatHeader = findAncestor(ancestorChain, CHAT_HEADER_SELECTOR);
   assert.ok(
-    trigger.right <= chatHeading.right + 1,
+    trigger.right <= chatHeading.contentRight + 1,
     `expected the ${label} trigger's right edge (${trigger.right}px) to stay within .chat-heading's `
-      + `content box (right=${chatHeading.right}px) — a regression here means the trigger grew past its `
-      + `container instead of shrinking to fit it, got ${JSON.stringify({ trigger, chatHeading })}`
+      + `content box (contentRight=${chatHeading.contentRight}px) — a regression here means the trigger `
+      + `grew past its container instead of shrinking to fit it, got ${JSON.stringify({ trigger, chatHeading })}`
   );
   assert.ok(
-    trigger.right <= chatHeader.right + 1,
+    trigger.right <= chatHeader.contentRight + 1,
     `expected the ${label} trigger's right edge (${trigger.right}px) to stay within .chat-header's `
-      + `content box (right=${chatHeader.right}px), got ${JSON.stringify({ trigger, chatHeader })}`
+      + `content box (contentRight=${chatHeader.contentRight}px), got ${JSON.stringify({ trigger, chatHeader })}`
   );
 }
 
