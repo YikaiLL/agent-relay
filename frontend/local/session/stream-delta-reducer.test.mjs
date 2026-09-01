@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createStreamController } from "./stream.js";
+import {
+  nextOrchestratorRefreshObservations,
+  nextOrchestratorWasWorking,
+  orchestratorTranscriptRefreshDecision,
+} from "../orchestrator-transcript-refresh.js";
 
 // Both review rounds found bugs my earlier tests missed because they only exercised the
 // hydration STORE. The defect lived in the reducer that sits on top of it: it reconciled
@@ -340,6 +345,7 @@ test("a streamed delta marks the Orchestrator as mid-turn", () => {
   h.deliver({ thread_id: "orch-1", delta: "ing", text_offset: 4 });
 
   assert.equal(h.state.orchestratorWasWorking, true, "text is arriving, so it is working");
+  assert.equal(h.state.orchestratorDeltaRaisedWorking, true);
 });
 
 test("a delta for another thread does not mark the Orchestrator working", () => {
@@ -348,4 +354,123 @@ test("a delta for another thread does not mark the Orchestrator working", () => 
   h.deliver({ thread_id: "someone-else", delta: "x", text_offset: 4 });
 
   assert.notEqual(h.state.orchestratorWasWorking, true);
+});
+
+const ORCH_THREAD = "orch-1";
+const LIVE_THREAD = "thread-1";
+
+function orchSession({ threadActivity = [] } = {}) {
+  return {
+    active_thread_id: LIVE_THREAD,
+    orchestrator_thread_id: ORCH_THREAD,
+    thread_activity: threadActivity,
+  };
+}
+
+// Drive the same refresh decision renderTaskTeam uses. Deltas land through the
+// stream controller; the Tasks pane applies the policy on the next render.
+function maybeRefreshOrchestrator(state, session, loads) {
+  const orchId = state.orchestratorEntriesThreadId;
+  const decision = orchestratorTranscriptRefreshDecision(state, session, orchId);
+  state.orchestratorWasWorking = nextOrchestratorWasWorking(state, decision.orchWorking);
+  Object.assign(state, nextOrchestratorRefreshObservations(state, decision.orchWorking));
+  if (decision.refresh) {
+    if (decision.repair) {
+      state.orchestratorTailGapRepairing = true;
+    }
+    loads.push({ threadId: orchId, terminal: decision.terminal, repair: decision.repair });
+  }
+}
+
+test("orchestrator idle refresh fires when thread_activity clears after a delta", () => {
+  const h = orchHarness();
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+
+  const loads = [];
+  const workingSession = orchSession({
+    threadActivity: [{ thread_id: ORCH_THREAD, phase: "tool", tool: "Bash" }],
+  });
+  maybeRefreshOrchestrator(h.state, workingSession, loads);
+  assert.equal(loads.length, 0, "no refresh while the orchestrator is still working");
+  assert.equal(h.state.orchestratorWasWorking, true);
+
+  const idleSession = orchSession();
+  maybeRefreshOrchestrator(h.state, idleSession, loads);
+  assert.equal(loads.length, 1, "phase clearing must trigger an authoritative refetch");
+  assert.equal(loads[0].threadId, ORCH_THREAD);
+  assert.equal(loads[0].terminal, true);
+});
+
+test("a fresh orchestrator delta is not mistaken for an observed idle edge", () => {
+  const h = orchHarness();
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+  assert.equal(h.state.orchestratorDeltaRaisedWorking, true);
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+
+  assert.equal(loads.length, 0, "thread_activity omission must not arm a terminal fetch mid-turn");
+  assert.equal(h.state.orchestratorWasWorking, true);
+  assert.equal(h.state.orchestratorDeltaRaisedWorking, false, "the suppression latch is consumed on render");
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1, "a later idle render must still refetch");
+  assert.equal(loads[0].terminal, true);
+});
+
+test("orchestrator idle refresh survives thread_activity omitting the orchestrator during work", () => {
+  const h = orchHarness();
+  h.state.orchestratorEntriesLoading = true;
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+
+  const loads = [];
+  const workingSession = orchSession();
+  maybeRefreshOrchestrator(h.state, workingSession, loads);
+
+  assert.equal(loads.length, 0, "an in-flight page load must not swallow the idle edge");
+  assert.equal(
+    h.state.orchestratorWasWorking,
+    true,
+    "thread_activity must not clobber a delta-raised working latch"
+  );
+
+  h.state.orchestratorEntriesLoading = false;
+  maybeRefreshOrchestrator(h.state, workingSession, loads);
+  assert.equal(loads.length, 1, "the settled working→idle edge must refetch");
+  assert.equal(loads[0].threadId, ORCH_THREAD);
+  assert.equal(loads[0].terminal, true);
+});
+
+test("orchestrator tailGap triggers refresh even while entries are loading", () => {
+  const h = orchHarness();
+  h.state.orchestratorEntriesLoading = true;
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "tail", text_offset: 99 });
+  assert.equal(h.state.orchestratorTailGap, true);
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+
+  assert.equal(loads.length, 1, "a refused delta must not wait behind orchestratorEntriesLoading");
+  assert.equal(loads[0].threadId, ORCH_THREAD);
+  assert.equal(loads[0].repair, true);
+});
+
+test("orchestrator tailGap repair does not start a second fetch while one is in flight", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1);
+  assert.equal(h.state.orchestratorTailGapRepairing, true);
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1, "tail-gap repair must be single-flight while the gap remains");
 });

@@ -242,7 +242,12 @@ export function createStreamController(ctx) {
     // Tasks screen can miss the frame that carried the phase. Dropping it left
     // the working->idle refresh unable to fire, so the last entry stayed
     // rendered as streaming forever.
-    state.orchestratorWasWorking = Boolean(next.wasWorking);
+    if (next.wasWorking) {
+      state.orchestratorWasWorking = true;
+      // The next render must not treat a fresh delta as an observed idle edge
+      // when `thread_activity` omits the Orchestrator.
+      state.orchestratorDeltaRaisedWorking = true;
+    }
     // Same signal, different slot: the Orchestrator's entries are scalars rather
     // than a pin object, so the reducer's `tailGap` is carried here.
     if (next.tailGap) {

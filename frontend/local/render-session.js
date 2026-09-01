@@ -185,7 +185,12 @@ import {
 } from "./react-session-panels.js";
 import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap, threadActivityFor } from "../shared/thread-activity.js";
-import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
+import {
+  nextOrchestratorRefreshObservations,
+  nextOrchestratorWasWorking,
+  orchestratorTranscriptRefreshDecision,
+  orchestratorWasWorkingAfterFetch,
+} from "./orchestrator-transcript-refresh.js";
 import { copyTextToClipboard } from "../shared/clipboard.js";
 import { refreshedPinPage } from "./pin-page.js";
 import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
@@ -2227,21 +2232,18 @@ export function createSessionRenderer({
       state.orchestratorEntriesThreadId = null;
     }
     state.orchestratorWasActiveThread = orchIsActive;
-    const orchWorking = Boolean(orchActivity.phase);
-    const orchNeedsRefresh =
-      Boolean(orchId)
-      && !orchIsActive
-      && shouldRefreshViewedThread({
-        elapsedMs: Date.now() - (state.orchestratorLastRefreshAt || 0),
-        loading: Boolean(state.orchestratorEntriesLoading),
-        needsRepair: Boolean(state.orchestratorTailGap),
-        wasWorking: Boolean(state.orchestratorWasWorking),
-        working: orchWorking,
-      });
-    state.orchestratorWasWorking = orchWorking;
-    if (orchNeedsRefresh) {
+    const orchRefresh = orchestratorTranscriptRefreshDecision(state, session, orchId);
+    state.orchestratorWasWorking = nextOrchestratorWasWorking(state, orchRefresh.orchWorking);
+    Object.assign(state, nextOrchestratorRefreshObservations(state, orchRefresh.orchWorking));
+    if (orchRefresh.refresh) {
+      if (orchRefresh.repair) {
+        state.orchestratorTailGapRepairing = true;
+      }
       state.orchestratorLastRefreshAt = Date.now();
-      void loadOrchestratorTranscript(orchId).then(() => {
+      void loadOrchestratorTranscript(orchId, {
+        terminal: orchRefresh.terminal,
+        repair: orchRefresh.repair,
+      }).then(() => {
         if (state.session) {
           renderTaskTeam(state.session);
         }
@@ -2521,7 +2523,7 @@ export function createSessionRenderer({
     return state.orchestratorEnsurePromise;
   }
 
-  async function loadOrchestratorTranscript(threadId) {
+  async function loadOrchestratorTranscript(threadId, { terminal = false, repair = false } = {}) {
     if (!threadId || typeof fetchTranscriptPage !== "function") {
       state.orchestratorEntries = [];
       state.orchestratorEntriesThreadId = threadId || null;
@@ -2533,6 +2535,9 @@ export function createSessionRenderer({
       return;
     }
     state.orchestratorEntriesLoading = true;
+    if (repair) {
+      state.orchestratorTailGapRepairing = true;
+    }
     // A counter, not just a thread-id compare: two loads for the SAME thread
     // both pass an id check, and then the one that happens to resolve last wins
     // even when it is the older request. `restartOrchestrator` plus the 300ms
@@ -2577,6 +2582,13 @@ export function createSessionRenderer({
       logLine(`Orchestrator transcript load failed: ${error?.message || error}`);
     } finally {
       state.orchestratorEntriesLoading = false;
+      state.orchestratorTailGapRepairing = false;
+      state.orchestratorWasWorking = orchestratorWasWorkingAfterFetch(
+        state,
+        state.session,
+        threadId,
+        { terminal }
+      );
     }
   }
 
