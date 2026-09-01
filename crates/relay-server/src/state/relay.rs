@@ -38,7 +38,7 @@ pub(crate) use self::push::{
     is_acceptable_push_endpoint, load_or_generate_vapid, vapid_key_path, PushAttentionTracker,
     PushDispatcher, PushJob, PushKind, PushSubscription, PushSubscriptionInput,
 };
-pub(crate) use self::runtime::ThreadRuntime;
+pub(crate) use self::runtime::{ThreadRuntime, TurnFailure, TURN_FAILURE_KIND_USAGE_LIMIT};
 pub(crate) use self::transcript::TranscriptRecord;
 
 const REMOTE_ACTION_REPLAY_TTL_SECS: u64 = 600;
@@ -907,6 +907,30 @@ impl RelayState {
 
     pub(crate) fn runtime_for_thread(&self, thread_id: &str) -> Option<&ThreadRuntime> {
         self.runtimes.get(thread_id)
+    }
+
+    /// Record a bridge's sanitized classification of a turn that ended failed.
+    /// Never cleared — callers must match `turn_id`, not presence (see
+    /// [`TurnFailure`]).
+    pub(crate) fn set_last_turn_failure(
+        &mut self,
+        thread_id: &str,
+        turn_id: String,
+        kind: Option<String>,
+        reason: String,
+    ) {
+        if let Some(runtime) = self.runtimes.get_mut(thread_id) {
+            runtime.last_turn_failure = Some(TurnFailure {
+                turn_id,
+                kind,
+                reason,
+            });
+        }
+    }
+
+    pub(crate) fn last_turn_failure(&self, thread_id: &str) -> Option<&TurnFailure> {
+        self.runtime_for_thread(thread_id)
+            .and_then(|runtime| runtime.last_turn_failure.as_ref())
     }
 
     pub(crate) fn thread_turn_revision(&self, thread_id: &str) -> u64 {

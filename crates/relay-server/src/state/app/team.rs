@@ -1508,6 +1508,12 @@ over on resume"
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(self.team_turn_barrier.lock().await);
         }
+        // The id `send_message_to_thread` returns for THIS turn — not `thread_id`,
+        // which promotion can change. Matching a later failure against this (not
+        // merely its presence) is what stops a stale failure left over from an
+        // earlier turn on the same thread from poisoning this one. Assigned exactly
+        // once below; every other path returns before it would be read.
+        let sent_turn_id: Option<String>;
         {
             let _gate = self.team_drive_gate.lock().await;
             if let Err(error) = self.team_turn_preflight(run_id, &thread_id).await {
@@ -1542,6 +1548,10 @@ over on resume"
                     // placeholder by this very (first) turn, and the wait below would
                     // otherwise read the removed runtime as "already finished".
                     thread_id = dispatched.thread_id.clone();
+                    // Kept past the wait below: it is what lets a failed terminal be
+                    // told apart from a stale failure left over from an earlier turn
+                    // on the same thread (see the `last_turn_failure` check below).
+                    sent_turn_id = dispatched.turn_id.clone();
                 }
                 // Both are uncertain starts: `Ok(None)` returned no turn id, and a
                 // provider can begin work before returning `Err`. Drain either way,
@@ -1611,6 +1621,24 @@ over on resume"
         }
 
         self.set_in_flight_thread(run_id, None).await;
+
+        // The turn started, ran, and the thread simply went idle — no stall, no
+        // approval error, so `wait_for_team_step` returned `None`. That is exactly
+        // what a FAILED provider terminal also looks like: the failure landed as a
+        // transcript `Error` entry, not an `AgentText` one, so it is invisible to
+        // `latest_assistant_entry` below and would otherwise read as `Silent`. Ask
+        // the bridge's own record instead of guessing from the transcript, and
+        // match it against the turn WE sent — never mere presence — or a stale
+        // failure from an earlier turn on this thread would poison this one.
+        if let Some(turn_id) = sent_turn_id.as_deref() {
+            let relay = self.relay.read().await;
+            if let Some(failure) = relay.last_turn_failure(&thread_id) {
+                if failure.turn_id == turn_id {
+                    return TeamTurnOutcome::Failed(failure.reason.clone());
+                }
+            }
+        }
+
         match self.latest_assistant_entry(&thread_id).await {
             Some((id, text)) if baseline.as_deref() != Some(id.as_str()) => {
                 TeamTurnOutcome::Replied(text)

@@ -761,6 +761,54 @@ abandoned (interrupted: {interrupts:?})"
     );
 }
 
+/// The root-cause regression this whole task exists to fix: a Dev turn that
+/// STARTS, RUNS, and ends with a FAILED provider terminal must be reported
+/// `Failed`, not `Silent`. The failure lands as a transcript `Error` entry,
+/// never an `AgentText` one, so `latest_assistant_entry` cannot see it —
+/// `team_turn` (state/app/team.rs) must instead read the bridge's own
+/// `last_turn_failure` record (state/relay/runtime.rs), which claude.rs and
+/// codex/rpc.rs write at the same point they already write that Error entry.
+#[tokio::test]
+async fn a_dev_turn_that_ends_failed_is_reported_failed_not_silent() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "Usage limit reached".to_string(),
+            Some("usage_limit".to_string()),
+        ));
+    let observed = std::sync::Arc::new(Mutex::new(None));
+    let app = app.with_team_driver(std::sync::Arc::new(OneDevTurnDriver {
+        observed: observed.clone(),
+    }));
+
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+    wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    let (_sent_to, outcome) = observed
+        .lock()
+        .await
+        .clone()
+        .expect("the driver ran a dev turn");
+    match outcome {
+        relay_api::team::TeamTurnOutcome::Failed(reason) => {
+            assert!(
+                reason.contains("Usage limit reached"),
+                "the failed turn's reason must say the limit was hit: {reason}"
+            );
+        }
+        other => panic!(
+            "a turn that started, ran, and ended with a FAILED terminal must not read as \
+{other:?}"
+        ),
+    }
+}
+
 /// A run-owned thread — the design reviewer, the MR-gate reviewer, or the dev
 /// that addresses MR findings — must bill under the seat it was started as.
 #[tokio::test]

@@ -13,6 +13,33 @@ use super::{
     TranscriptRecord,
 };
 
+/// A terminal, sanitized record of the last failed turn on this thread — never
+/// the raw provider body, only what the bridge already surfaced as `reason`
+/// (see `claude_failed_turn_reason` / `codex_turn_failure_reason`).
+///
+/// `kind` is the same closed classification space as the worker's
+/// `failure_kind` (`claude-worker/sdk-mapping.mjs`) and Codex's mapped
+/// `codexErrorInfo`; `None` for a failure this layer doesn't classify.
+///
+/// Consumers must match `turn_id` against the turn THEY sent, not merely check
+/// presence — this record is never cleared, so an unmatched id would let a
+/// stale failure from an earlier turn poison a later, good one.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnFailure {
+    pub(crate) turn_id: String,
+    // Written now; read starting with the halt-before-review gate this record
+    // exists to feed (not this sub-task's `team_turn`, which uses `reason` only).
+    #[allow(dead_code)]
+    pub(crate) kind: Option<String>,
+    pub(crate) reason: String,
+}
+
+/// The only classified `TurnFailure::kind` today. Both bridges map their own
+/// provider-specific signal onto this one literal (Claude forwards the
+/// worker's `failure_kind` as-is; Codex maps `codexErrorInfo: "usageLimitExceeded"`
+/// onto it in `codex.rs`) — add a new kind only alongside a real classifier.
+pub(crate) const TURN_FAILURE_KIND_USAGE_LIMIT: &str = "usage_limit";
+
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadRuntime {
     pub(crate) summary: Option<ThreadSummaryView>,
@@ -48,6 +75,11 @@ pub(crate) struct ThreadRuntime {
     pub(crate) pending_approvals: HashMap<String, PendingApproval>,
     pub(crate) pending_ask_user_questions: HashMap<String, PendingAskUserQuestion>,
     pub(crate) last_update_at: u64,
+    /// Set by the bridge at the same point it writes the transcript `Error`
+    /// entry (claude.rs/codex/rpc.rs); never cleared afterward — see
+    /// [`TurnFailure`] on why a reader must match `turn_id` rather than
+    /// presence alone.
+    pub(crate) last_turn_failure: Option<TurnFailure>,
 }
 
 impl ThreadRuntime {
@@ -94,6 +126,7 @@ impl ThreadRuntime {
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
             workspace_missing: None,
+            last_turn_failure: None,
         }
     }
 
@@ -132,6 +165,7 @@ impl ThreadRuntime {
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
             workspace_missing: None,
+            last_turn_failure: None,
         }
     }
 
@@ -202,6 +236,7 @@ impl ThreadRuntime {
             pending_ask_user_questions: HashMap::new(),
             last_update_at: now,
             workspace_missing: None,
+            last_turn_failure: None,
         }
     }
 

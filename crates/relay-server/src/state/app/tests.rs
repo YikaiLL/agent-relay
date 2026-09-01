@@ -12356,6 +12356,13 @@ mod review_tests {
         // placeholder id -> the real id its first turn promoted it to, drained by
         // `resolve_started_thread_id` exactly as the Claude bridge does.
         promoted_thread_ids: Arc<Mutex<HashMap<String, String>>>,
+        // (reason, kind), one-shot: the NEXT turn that would otherwise complete
+        // normally instead ends as a FAILED terminal — an `Error` transcript entry
+        // (status "failed", carrying the turn id) and NO assistant message, exactly
+        // the shape claude.rs/codex/rpc.rs leave for a turn that started, ran, and
+        // failed. Distinct from every `fail_*` knob above: those fail before or
+        // during `start_turn`; this fails a turn that already returned `Ok`.
+        fail_completed_turn_with: Arc<Mutex<Option<(String, Option<String>)>>>,
         next_id: Arc<AtomicU64>,
     }
 
@@ -12411,6 +12418,7 @@ mod review_tests {
                 fail_turn_after_promotion: Arc::new(AtomicBool::new(false)),
                 settle_turn_before_start_returns: Arc::new(AtomicBool::new(false)),
                 promoted_thread_ids: Arc::new(Mutex::new(HashMap::new())),
+                fail_completed_turn_with: Arc::new(Mutex::new(None)),
                 next_id: Arc::new(AtomicU64::new(1)),
             }
         }
@@ -12858,6 +12866,9 @@ mod review_tests {
             let emit_assistant = self.emit_assistant.load(Ordering::Relaxed)
                 && !(is_reviewer_diff_turn && self.suppress_reviewer_reply.load(Ordering::Relaxed))
                 && !(is_fix_turn && self.suppress_fix_reply.load(Ordering::Relaxed));
+            // Taken (one-shot) before spawning, like the other fix-turn knobs above:
+            // this turn's outcome is decided synchronously here, not re-checked later.
+            let fail_completed_turn = self.fail_completed_turn_with.lock().await.take();
             // A reviewer turn ends with the verdict the test queued (default needs-changes).
             let scripted = self.scripted_replies.lock().await.pop_front();
             let reply_text = if let Some(scripted) = scripted {
@@ -13045,7 +13056,27 @@ mod review_tests {
                             user_text.clone(),
                             turn.clone(),
                         );
-                        if emit_assistant {
+                        if let Some((reason, kind)) = fail_completed_turn.clone() {
+                            // The shape a REAL failed terminal leaves (see
+                            // claude.rs/codex/rpc.rs): the bridge's own classification,
+                            // recorded BEFORE the durable Error entry — team_turn
+                            // (state/app/team.rs) reads the former, never the latter.
+                            relay.set_last_turn_failure(
+                                &thread_id,
+                                turn.clone(),
+                                kind,
+                                reason.clone(),
+                            );
+                            relay.upsert_transcript_item_for_thread(
+                                &thread_id,
+                                format!("turn-error:{turn}"),
+                                TranscriptEntryKind::Error,
+                                Some(reason),
+                                "failed".to_string(),
+                                Some(turn.clone()),
+                                None,
+                            );
+                        } else if emit_assistant {
                             relay.start_agent_message(assistant_item.clone(), turn.clone());
                             relay.complete_agent_message(
                                 assistant_item.clone(),
@@ -13065,7 +13096,24 @@ mod review_tests {
                             turn.clone(),
                             now,
                         );
-                        if emit_assistant {
+                        if let Some((reason, kind)) = fail_completed_turn.clone() {
+                            relay.set_last_turn_failure(
+                                &thread_id,
+                                turn.clone(),
+                                kind,
+                                reason.clone(),
+                            );
+                            relay.bg_upsert_transcript_item(
+                                &thread_id,
+                                format!("turn-error:{turn}"),
+                                TranscriptEntryKind::Error,
+                                Some(reason),
+                                "failed".to_string(),
+                                Some(turn.clone()),
+                                None,
+                                now,
+                            );
+                        } else if emit_assistant {
                             relay.bg_start_agent_message(
                                 &thread_id,
                                 assistant_item.clone(),
@@ -13096,7 +13144,7 @@ mod review_tests {
                     tool: None,
                     content_state: crate::protocol::TranscriptContentState::Full,
                 });
-                if emit_assistant {
+                if emit_assistant && fail_completed_turn.is_none() {
                     entries.push(TranscriptEntryView {
                         item_id: Some(assistant_item),
                         kind: TranscriptEntryKind::AgentText,

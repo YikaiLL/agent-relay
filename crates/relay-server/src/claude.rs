@@ -1719,6 +1719,17 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     // string (no provider content).
                     if let Some(reason) = claude_failed_turn_reason(&payload) {
                         let turn_id = completed_turn_id.or_else(|| event_turn_id.clone());
+                        // Truthful classification for team_turn (state/app/team.rs): a
+                        // failed terminal must stop reading as Silent. Matched there by
+                        // turn id, so only worth recording when we have one.
+                        if let Some(turn_id) = turn_id.clone() {
+                            relay.set_last_turn_failure(
+                                &tid,
+                                turn_id,
+                                claude_failed_turn_kind(&payload),
+                                reason.clone(),
+                            );
+                        }
                         relay.enqueue_error_push(&tid, reason.clone());
                         relay.upsert_transcript_item_for_thread(
                             &tid,
@@ -1759,6 +1770,16 @@ async fn handle_worker_event(payload: Value, state: &Arc<RwLock<RelayState>>) {
                     // snapshot). See the active-route note above.
                     if let Some(reason) = claude_failed_turn_reason(&payload) {
                         let turn_id = completed_turn_id.or_else(|| event_turn_id.clone());
+                        // See the active-route note above: truthful classification for
+                        // team_turn, matched there by turn id.
+                        if let Some(turn_id) = turn_id.clone() {
+                            relay.set_last_turn_failure(
+                                &thread_id,
+                                turn_id,
+                                claude_failed_turn_kind(&payload),
+                                reason.clone(),
+                            );
+                        }
                         relay.enqueue_error_push(&thread_id, reason.clone());
                         relay.bg_upsert_transcript_item(
                             &thread_id,
@@ -1847,6 +1868,20 @@ fn claude_failed_turn_reason(payload: &Value) -> Option<String> {
             .filter(|reason| !reason.is_empty())
             .unwrap_or_else(|| "Claude turn failed.".to_string()),
     )
+}
+
+/// The worker's own closed `failure_kind` (e.g. `"usage_limit"`), forwarded
+/// verbatim — mirrors `claude_failed_turn_reason`'s guard. `None` covers both
+/// a non-failure and a failure the worker left unclassified.
+fn claude_failed_turn_kind(payload: &Value) -> Option<String> {
+    if !payload
+        .get("failed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    string_at(payload, &["failure_kind"]).filter(|kind| !kind.is_empty())
 }
 
 /// Stable per-turn id for the synthetic failure entry so a re-delivered terminal
