@@ -4662,6 +4662,323 @@ test("a delta for a thread that is neither live nor pinned is still ignored", as
   state.socket = null;
 });
 
+function seedRemoteViewedTerminalRefreshFixture(state, saveRemoteAuth) {
+  seedRemoteAuth(state, saveRemoteAuth, {
+    relayId: "relay-viewed-terminal",
+    brokerUrl: "wss://broker.example.test",
+    brokerChannelId: "room-a",
+    relayPeerId: "relay-1",
+    securityMode: "managed",
+    deviceId: "device-1",
+    deviceLabel: "Primary Phone",
+    payloadSecret: "payload-secret-1",
+    deviceRefreshMode: "cookie",
+    deviceRefreshToken: null,
+    deviceJoinTicket: "device-ws-token",
+    deviceJoinTicketExpiresAt: Math.floor(Date.now() / 1000) + 300,
+    sessionClaim: null,
+    sessionClaimExpiresAt: null,
+  });
+  seedSocketState(state, { socketConnected: true, socketPeerId: "surface-peer-1" });
+  state.pendingActions.clear();
+  seedTranscriptHydrationState(state);
+  state.threads = [
+    { id: "thread-a", cwd: "/tmp/a", status: "active" },
+    { id: "thread-b", cwd: "/tmp/b", status: "active" },
+  ];
+}
+
+function createDeferredTranscriptFetchSocket(handleRemoteBrokerPayload) {
+  const pending = [];
+  let fetchCount = 0;
+
+  return {
+    get fetchCount() {
+      return fetchCount;
+    },
+    socket: {
+      readyState: 1,
+      send(frameText) {
+        const frame = JSON.parse(frameText);
+        if (frame.payload.request?.type !== "fetch_thread_transcript") {
+          return;
+        }
+        fetchCount += 1;
+        const threadId = frame.payload.request.input.thread_id;
+        pending.push(() => {
+          void handleRemoteBrokerPayload({
+            kind: "remote_action_result",
+            action_id: frame.payload.action_id,
+            action: "fetch_thread_transcript",
+            ok: true,
+            snapshot: {},
+            thread_transcript: {
+              thread_id: threadId,
+              entries: [
+                {
+                  item_id: `${threadId}-1`,
+                  kind: "agent_text",
+                  text: "viewed tail",
+                  status: "running",
+                  turn_id: `turn-${threadId}`,
+                  tool: null,
+                },
+              ],
+              prev_cursor: null,
+              revision: fetchCount,
+            },
+          });
+        });
+      },
+    },
+    completeNext() {
+      const resolve = pending.shift();
+      assert.ok(resolve, "expected a pending viewed-thread transcript fetch");
+      resolve();
+    },
+  };
+}
+
+test("maybeRefreshRemoteViewedThread triggers viewRemoteThread when background thread_activity clears", async () => {
+  activeBrowser = installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { applySessionSnapshot, clearSessionRuntime, viewRemoteThread } = await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteViewedTerminalRefreshFixture(state, saveRemoteAuth);
+  const transcriptFetch = createDeferredTranscriptFetchSocket(handleRemoteBrokerPayload);
+  state.socket = transcriptFetch.socket;
+  remoteQueryClient.clear();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 1,
+    transcript_truncated: false,
+  });
+
+  const initialView = viewRemoteThread("thread-b");
+  await nextTick();
+  transcriptFetch.completeNext();
+  assert.equal(await initialView, true);
+  await nextTick();
+  assert.equal(transcriptFetch.fetchCount, 1, "initial view must fetch the background thread");
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    thread_activity: [{ thread_id: "thread-b", phase: "thinking", tool: null }],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 2,
+    transcript_truncated: false,
+  });
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    thread_activity: [],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 3,
+    transcript_truncated: false,
+  });
+
+  await waitFor(() => transcriptFetch.fetchCount >= 2);
+  assert.equal(
+    transcriptFetch.fetchCount,
+    2,
+    "maybeRefreshRemoteViewedThread must refetch when the viewed background thread stops working"
+  );
+
+  transcriptFetch.completeNext();
+  await nextTick();
+  await nextTick();
+  assert.equal(
+    transcriptFetch.fetchCount,
+    2,
+    "completing the terminal refresh must not immediately retrigger another fetch"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+});
+
+test("viewOnlyWasWorking seeds from the viewed thread thread_activity, not the live active_turn_id", async () => {
+  activeBrowser = installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const { applySessionSnapshot, clearSessionRuntime, viewRemoteThread } = await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteViewedTerminalRefreshFixture(state, saveRemoteAuth);
+  const transcriptFetch = createDeferredTranscriptFetchSocket(handleRemoteBrokerPayload);
+  state.socket = transcriptFetch.socket;
+  remoteQueryClient.clear();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: null,
+    current_cwd: "/tmp/a",
+    current_status: "idle",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    thread_activity: [{ thread_id: "thread-b", phase: "tool", tool: "bash" }],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 1,
+    transcript_truncated: false,
+  });
+
+  const initialView = viewRemoteThread("thread-b");
+  await nextTick();
+  transcriptFetch.completeNext();
+  assert.equal(await initialView, true);
+  await nextTick();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: null,
+    current_cwd: "/tmp/a",
+    current_status: "idle",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    thread_activity: [],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 2,
+    transcript_truncated: false,
+  });
+
+  await waitFor(() => transcriptFetch.fetchCount >= 2);
+  assert.equal(
+    transcriptFetch.fetchCount,
+    2,
+    "a viewed background thread that was already working at view time must still get a terminal refresh"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+});
+
+test("a delta during an in-flight terminal viewRemoteThread preserves wasWorking and re-arms refresh", async () => {
+  activeBrowser = installBrowserStubs();
+
+  const { state, saveRemoteAuth } = await import("./state.js");
+  const { handleRemoteBrokerPayload } = await import("./actions.js");
+  const {
+    applySessionSnapshot,
+    applyTranscriptDelta,
+    clearSessionRuntime,
+    viewRemoteThread,
+  } = await import("./session-ops.js");
+  const { remoteQueryClient } = await import("./query-client.js");
+
+  clearSessionRuntime();
+  seedRemoteViewedTerminalRefreshFixture(state, saveRemoteAuth);
+  const transcriptFetch = createDeferredTranscriptFetchSocket(handleRemoteBrokerPayload);
+  state.socket = transcriptFetch.socket;
+  remoteQueryClient.clear();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 1,
+    transcript_truncated: false,
+  });
+
+  const initialView = viewRemoteThread("thread-b");
+  await nextTick();
+  transcriptFetch.completeNext();
+  assert.equal(await initialView, true);
+  await nextTick();
+  assert.equal(transcriptFetch.fetchCount, 1);
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    thread_activity: [{ thread_id: "thread-b", phase: "thinking", tool: null }],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 2,
+    transcript_truncated: false,
+  });
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    thread_activity: [],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 3,
+    transcript_truncated: false,
+  });
+  await nextTick();
+  assert.equal(transcriptFetch.fetchCount, 2, "working→idle must start a terminal refresh");
+
+  applyTranscriptDelta({
+    thread_id: "thread-b",
+    base_revision: 1,
+    revision: 4,
+    item_id: "b-1",
+    turn_id: "turn-b",
+    delta: "still going",
+    delta_kind: "agent_text",
+    text_offset: 0,
+  });
+
+  transcriptFetch.completeNext();
+  await nextTick();
+
+  applySessionSnapshot({
+    active_thread_id: "thread-a",
+    active_turn_id: "turn-a",
+    current_cwd: "/tmp/a",
+    current_status: "active",
+    pending_approvals: [],
+    pending_ask_user_questions: [],
+    thread_activity: [],
+    transcript: [{ item_id: "a-1", kind: "agent_text", text: "live A", turn_id: "turn-a" }],
+    transcript_revision: 5,
+    transcript_truncated: false,
+  });
+
+  await waitFor(() => transcriptFetch.fetchCount >= 3);
+  assert.equal(
+    transcriptFetch.fetchCount,
+    3,
+    "a delta during terminal refresh must preserve wasWorking for the next working→idle edge"
+  );
+
+  clearSessionRuntime();
+  state.socket = null;
+});
+
 // `applySessionSnapshot` ended with a TODO-marked debug line, and building that line
 // read `scrollTop` / `scrollHeight` / `clientHeight` off the live transcript element.
 // Reading `scrollHeight` forces a synchronous layout of the whole transcript subtree,
