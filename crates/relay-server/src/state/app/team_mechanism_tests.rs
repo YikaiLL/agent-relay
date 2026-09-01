@@ -818,3 +818,47 @@ async fn a_standalone_reviewer_thread_bills_under_reviewer_with_no_run() {
         "and `team_run_id` is what tells it apart from a run's reviewer"
     );
 }
+
+/// `role` alone cannot tell the three review prompts apart — design review, the
+/// per-sub-task review, and the MR gate all bill as `reviewer`. The run's phase
+/// at the time the turn STARTED is what names the prompt, and it must be stamped
+/// then: the TL seat is one long session that crosses every phase, so reading
+/// the run's phase when the `done` event lands would label a digest turn with
+/// whatever phase the driver had already advanced to.
+#[tokio::test]
+async fn a_team_turn_stamps_the_phase_it_ran_in_not_the_phase_it_ended_in() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app
+        .start_team_run(team_input(&root))
+        .await
+        .expect("the team should start");
+
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.phase = relay_api::team::TeamPhase::DesignReview;
+            run.record_run_thread("design-reviewer-1");
+            run.record_run_thread_role("design-reviewer-1", relay_api::team::TeamRole::Reviewer);
+        });
+        // What `team_turn` records before driving the seat.
+        relay.note_team_turn_phase(
+            "design-reviewer-1",
+            relay_api::team::TeamPhase::DesignReview,
+        );
+        // The driver moves on while the reviewer's `done` is still in flight.
+        relay.update_team_run(&run_id, |run| {
+            run.phase = relay_api::team::TeamPhase::MrGate;
+        });
+    }
+
+    let relay = app.relay.read().await;
+    let attribution = relay.thread_attribution("design-reviewer-1");
+    assert_eq!(attribution.role.as_deref(), Some("reviewer"));
+    assert_eq!(
+        attribution.phase.as_deref(),
+        Some("design_review"),
+        "the design reviewer's spend must not be filed under the MR gate: they \
+are different prompts and the whole point is to price them apart"
+    );
+}

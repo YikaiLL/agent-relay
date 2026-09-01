@@ -1481,6 +1481,15 @@ over on resume"
             .await
             .map(|(id, _)| id);
 
+        // Before driving, not after: with `role` this names the prompt, and the
+        // TL crosses phases inside one session.
+        {
+            let mut relay = self.relay.write().await;
+            if let Some(phase) = relay.team_run(run_id).map(|run| run.phase) {
+                relay.note_team_turn_phase(&thread_id, phase);
+            }
+        }
+
         // Everything from the preflight to the provider's `start_turn` runs under
         // the drive gate. The boundary check that let this step run is many awaits
         // behind us — a worktree probe, a git checkpoint, a thread start — and a

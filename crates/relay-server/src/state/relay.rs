@@ -419,6 +419,9 @@ pub struct RelayState {
     /// The same baselines for Claude, whose `done` payload carries the SDK's
     /// session-cumulative `modelUsage` and `total_cost_usd`.
     pub(crate) claude_usage: crate::usage::ClaudeUsageTracker,
+    /// The run phase each team seat's turn STARTED in. Stamped at turn start
+    /// because the TL is one session crossing every phase; not persisted.
+    team_turn_phases: HashMap<String, String>,
     /// Surface ids that are broker peer ids, so peer-presence pruning touches only
     /// those and never a local tab's subscription.
     broker_surface_ids: HashSet<String>,
@@ -599,6 +602,7 @@ impl RelayState {
             usage_store: crate::usage::store::UsageStore::disabled(),
             codex_usage: crate::usage::CodexUsageTracker::new(),
             claude_usage: crate::usage::ClaudeUsageTracker::new(),
+            team_turn_phases: HashMap::new(),
             broker_surface_ids: HashSet::new(),
             surface_generations: HashMap::new(),
             pending_pairings: HashMap::new(),
@@ -1966,6 +1970,17 @@ impl RelayState {
     /// Terminal runs are included here, unlike `is_thread_team_locked` — that
     /// asks "may the user type here", which stops mattering once a run ends,
     /// whereas "who spent this" never stops being true.
+    /// Stamp the phase a team seat's turn is starting in, so its spend is filed
+    /// under the prompt that ran rather than whatever the driver advanced to.
+    pub(crate) fn note_team_turn_phase(
+        &mut self,
+        thread_id: &str,
+        phase: relay_api::team::TeamPhase,
+    ) {
+        self.team_turn_phases
+            .insert(thread_id.to_string(), phase.as_str().to_string());
+    }
+
     pub(crate) fn thread_attribution(&self, thread_id: &str) -> TeamAttribution {
         for run in self.team_runs.values() {
             if !run
@@ -2017,6 +2032,13 @@ impl RelayState {
             return TeamAttribution {
                 team_run_id: Some(run.id.clone()),
                 role: role.map(str::to_string),
+                // The stamp, or the run's phase when a resume lost it.
+                phase: Some(
+                    self.team_turn_phases
+                        .get(thread_id)
+                        .cloned()
+                        .unwrap_or_else(|| run.phase.as_str().to_string()),
+                ),
                 sub_task_id,
                 // Copied from the run's pin. Configurable teams (M3) will offer
                 // more than the builtin Default; the join still has to happen
@@ -2103,6 +2125,7 @@ impl RelayState {
             role: attribution.role,
             sub_task_id: attribution.sub_task_id,
             team_id: attribution.team_id,
+            phase: attribution.phase,
             usage,
             cost_usd,
             context_window,
@@ -6421,6 +6444,8 @@ mod tests {
 pub(crate) struct TeamAttribution {
     pub(crate) team_run_id: Option<String>,
     pub(crate) role: Option<String>,
+    /// Which phase the turn ran in — with `role`, this names the prompt.
+    pub(crate) phase: Option<String>,
     pub(crate) sub_task_id: Option<String>,
     pub(crate) team_id: Option<String>,
 }

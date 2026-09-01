@@ -74,6 +74,7 @@ pub(crate) struct UsageReport {
     pub(crate) totals: ReportTotals,
     pub(crate) buckets: Vec<ReportBucket>,
     pub(crate) by_role: Vec<ReportRole>,
+    pub(crate) by_prompt: Vec<ReportPrompt>,
     pub(crate) by_team: Vec<ReportTeam>,
     pub(crate) top_tasks: Vec<ReportTask>,
     pub(crate) cap_hits: Vec<ReportCapHit>,
@@ -165,6 +166,18 @@ pub(crate) struct ReportRole {
     pub(crate) role: Option<String>,
     pub(crate) total: u64,
     pub(crate) share: u64,
+    pub(crate) turns: u64,
+}
+
+/// One `(role, phase)` pair — in the team runner these name a prompt exactly,
+/// which `by_role` alone cannot: three review prompts all bill as `reviewer`.
+#[derive(Debug, Serialize)]
+pub(crate) struct ReportPrompt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
+    pub(crate) total: u64,
     pub(crate) turns: u64,
 }
 
@@ -285,6 +298,16 @@ pub(crate) fn build_report(
         totals: totals_view(store.window_totals(since, until), &group_rows),
         buckets: materialise_buckets(store, since, until, bucket),
         by_role: roles_view(store.by_role(attr_since, attr_until)),
+        by_prompt: store
+            .by_role_phase(attr_since, attr_until)
+            .into_iter()
+            .map(|row| ReportPrompt {
+                role: row.role,
+                phase: row.phase,
+                total: row.total,
+                turns: row.turns,
+            })
+            .collect(),
         by_team: teams_view(store.by_team(attr_since, attr_until)),
         top_tasks: top_tasks(store, attr_since, attr_until, &options.team_runs),
         cap_hits: store

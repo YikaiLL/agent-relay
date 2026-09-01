@@ -14,7 +14,7 @@ use super::TokenUsage;
 
 /// Bumped only by adding a numbered migration below. `user_version` is a plain
 /// integer SQLite keeps in the file header, so this needs no table of its own.
-const LEDGER_SCHEMA_VERSION: i64 = 7;
+const LEDGER_SCHEMA_VERSION: i64 = 8;
 
 /// A single billable observation, ready to be written.
 #[derive(Debug, Clone, Default)]
@@ -43,6 +43,9 @@ pub(crate) struct TokenEvent {
     /// The team the run belonged to. Recorded alongside `team_run_id` because
     /// the run→team mapping is only resolvable while the run exists.
     pub(crate) team_id: Option<String>,
+    /// The run phase the turn ran in. With `role` this names the prompt: the
+    /// three review prompts all bill as `reviewer` and differ only by phase.
+    pub(crate) phase: Option<String>,
 }
 
 /// The ledger handle. Cheap to clone; `None` inside means "degraded".
@@ -129,8 +132,9 @@ impl UsageStore {
             "INSERT INTO token_event (
                  at, provider, model, thread_id, turn_id, team_run_id, role,
                  input, cached_input, cache_write, output, reasoning_output,
-                 total, cost_usd, context_window, failed, sub_task_id, team_id
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                 total, cost_usd, context_window, failed, sub_task_id, team_id,
+                 phase
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 to_sql_time(event.at),
                 event.provider,
@@ -150,6 +154,7 @@ impl UsageStore {
                 i64::from(event.failed),
                 event.sub_task_id,
                 event.team_id,
+                event.phase,
             ],
         );
         if let Err(error) = result {
@@ -330,6 +335,30 @@ impl UsageStore {
                 WindowTotals::default()
             }
         }
+    }
+
+    /// Tokens grouped by `(role, phase)`. Separate from `by_role` on purpose:
+    /// that list is a per-seat view, and splitting it three ways would show the
+    /// reviewer as three same-named rows.
+    pub(crate) fn by_role_phase(&self, since: u64, until: u64) -> Vec<RolePhaseUsage> {
+        self.query(
+            "SELECT role, phase,
+                    SUM(total), COUNT(*)
+             FROM token_event
+             WHERE at >= ?1 AND at < ?2 AND role IS NOT NULL
+             GROUP BY role, phase
+             ORDER BY SUM(total) DESC",
+            since,
+            until,
+            |row| {
+                Ok(RolePhaseUsage {
+                    role: row.get(0)?,
+                    phase: row.get(1)?,
+                    total: row.get::<_, i64>(2)? as u64,
+                    turns: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
     }
 
     /// Tokens grouped by role (nullable roles become their own "unattributed" bucket
@@ -1132,6 +1161,15 @@ pub(crate) struct RoleUsage {
     pub(crate) turns: u64,
 }
 
+/// Tokens for one `(role, phase)` pair — which prompt actually ran.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RolePhaseUsage {
+    pub(crate) role: Option<String>,
+    pub(crate) phase: Option<String>,
+    pub(crate) total: u64,
+    pub(crate) turns: u64,
+}
+
 /// Tokens attributed to one team (`team_id`) inside a window.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TeamUsage {
@@ -1483,6 +1521,30 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         }
         conn.execute_batch("PRAGMA user_version = 7;")
             .map_err(|error| format!("stamp user_version 7: {error}"))?;
+    }
+
+    if version < 8 {
+        // `role` says which seat; `phase` says which of that seat's prompts.
+        let has_token_event: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'token_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if has_token_event > 0 {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE token_event ADD COLUMN phase TEXT;
+                 CREATE INDEX IF NOT EXISTS token_event_role_phase
+                     ON token_event (role, phase) WHERE role IS NOT NULL;
+                 COMMIT;",
+            )
+            .map_err(|error| format!("migrate to 8: {error}"))?;
+        }
+        conn.execute_batch("PRAGMA user_version = 8;")
+            .map_err(|error| format!("stamp user_version 8: {error}"))?;
     }
 
     Ok(())

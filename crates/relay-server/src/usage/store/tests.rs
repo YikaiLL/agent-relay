@@ -27,6 +27,49 @@ fn open_in(dir: &TempDir) -> UsageStore {
     UsageStore::open(&dir.path().join("sealwire.db"))
 }
 
+/// Three reviewer prompts bill under one role. Without the phase on the row
+/// there is no way to price `design_review` against `mr_gate`.
+#[test]
+fn a_row_carries_the_phase_so_the_three_review_prompts_price_apart() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = open_in(&dir);
+    for (phase, total) in [("design_review", 1_000u64), ("mr_gate", 4_000)] {
+        store.record(&TokenEvent {
+            at: 100,
+            provider: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            thread_id: format!("reviewer-{phase}"),
+            role: Some("reviewer".to_string()),
+            team_run_id: Some("run-1".to_string()),
+            phase: Some(phase.to_string()),
+            usage: TokenUsage {
+                total,
+                ..TokenUsage::default()
+            },
+            ..TokenEvent::default()
+        });
+    }
+
+    let conn = Connection::open(dir.path().join("sealwire.db")).expect("open");
+    let mut statement = conn
+        .prepare("SELECT phase, total FROM token_event ORDER BY total")
+        .expect("prepare");
+    let rows: Vec<(Option<String>, u64)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .map(|row| row.expect("row"))
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![
+            (Some("design_review".to_string()), 1_000),
+            (Some("mr_gate".to_string()), 4_000),
+        ],
+        "the design reviewer and the MR gate must be separable on the row"
+    );
+}
+
 /// Claude rows written before `ClaudeUsageTracker` existed hold the SDK's
 /// session-cumulative figures; summing them bills the triangular number.
 #[test]
