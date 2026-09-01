@@ -28,7 +28,9 @@
 //! The driver advances `phase` in the SAME write that records a step's result, so
 //! a crash re-runs at most the last turn. See `markdown/task-team-design.md` §5.
 
+use std::collections::hash_map::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -443,19 +445,37 @@ impl<'de> Deserialize<'de> for SubTaskStatus {
     }
 }
 
-/// A sub-task id nothing else can repeat: `st-<hex>` over a nanosecond clock,
-/// forced upward so two mints inside one nanosecond still differ.
+/// A sub-task id nothing else can repeat: `st-<counter>-<salt>`, the counter a
+/// nanosecond clock forced upward so two mints in one nanosecond still differ.
 ///
-/// Uniqueness only stops one id from naming two different pieces of work. A replan
-/// still replaces the whole list, so a pre-replan sub-task remains unrerunnable.
+/// The salt is what a restart cannot repeat: the counter starts from zero in a new
+/// process, so an equal or stepped-back clock would otherwise reissue a persisted id.
 pub fn mint_sub_task_id() -> String {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
-    let number = mint_number(&LAST, now).expect("sub-task id counter exhausted");
-    format!("st-{number:x}")
+    mint_id(&LAST, process_salt(), now)
+}
+
+fn mint_id(last: &AtomicU64, salt: u32, now: u64) -> String {
+    let number = mint_number(last, now).expect("sub-task id counter exhausted");
+    format!("st-{number:x}-{salt:08x}")
+}
+
+/// Drawn once, so every id this process mints carries the same salt and the
+/// counter alone orders them.
+fn process_salt() -> u32 {
+    static SALT: OnceLock<u32> = OnceLock::new();
+    *SALT.get_or_init(draw_salt)
+}
+
+/// `RandomState` keys come from the OS per process — the one input here that does
+/// not come back the same after a restart.
+fn draw_salt() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish() as u32
 }
 
 /// `max(now, previous + 1)`, claimed atomically; `None` once the counter cannot
@@ -1054,6 +1074,28 @@ impl TeamRun {
         if matches!(self.phase, TeamPhase::MrGate | TeamPhase::Wrapping) {
             self.phase = TeamPhase::SubTasks;
         }
+        self.updated_at = unix_now();
+        true
+    }
+
+    /// Pull the phase back to `SubTasks` while one is waiting, dropping the verdict
+    /// and findings that judged the diff before it. Returns whether it moved.
+    ///
+    /// A driver picks its next phase before a turn and writes it when the turn ends,
+    /// so a revival landing in between is invisible to that decision and buried by it.
+    pub fn hold_phase_for_waiting_sub_tasks(&mut self) -> bool {
+        let closing = matches!(
+            self.phase,
+            TeamPhase::MrGate | TeamPhase::Wrapping | TeamPhase::Finished
+        );
+        if !closing || self.current_sub_task().is_none() {
+            return false;
+        }
+        self.phase = TeamPhase::SubTasks;
+        self.mr_verdict = None;
+        // Leftovers from that same turn would outlive the work that answers them,
+        // and `finalize` refuses to call a run with leftovers Done.
+        self.unresolved.clear();
         self.updated_at = unix_now();
         true
     }
@@ -1672,18 +1714,26 @@ mod tests {
         assert_eq!(unique.len(), ids.len(), "every minted id must be distinct");
 
         let mut previous = 0u64;
+        let mut salts: HashSet<&str> = HashSet::new();
         for id in &ids {
-            let hex = id
+            let (counter, salt) = id
                 .strip_prefix("st-")
-                .unwrap_or_else(|| panic!("id must be `st-<hex>`, got {id}"));
-            let value = u64::from_str_radix(hex, 16)
+                .and_then(|rest| rest.split_once('-'))
+                .unwrap_or_else(|| panic!("id must be `st-<hex>-<hex>`, got {id}"));
+            let value = u64::from_str_radix(counter, 16)
                 .unwrap_or_else(|_| panic!("id must carry a hex number, got {id}"));
             assert!(
                 value > previous,
                 "the sequence must strictly increase: {value} came after {previous}"
             );
             previous = value;
+            salts.insert(salt);
         }
+        assert_eq!(
+            salts.len(),
+            1,
+            "one process, one salt — the counter is what orders these: {salts:?}"
+        );
     }
 
     #[test]
@@ -1706,6 +1756,34 @@ mod tests {
             "the sequence must rise even while the clock stands still"
         );
         assert_eq!(numbers[0], frozen, "the first mint is the clock reading");
+    }
+
+    #[test]
+    fn a_restart_cannot_reissue_an_id_the_old_process_already_persisted() {
+        // The counter starts at zero in every process, so on a restart only the
+        // clock separates the ids — and a clock that was stepped back, or read at
+        // the same nanosecond, hands the persisted id straight back out.
+        let frozen = 1_700_000_000_000_000_000_u64;
+        let before = mint_id(&AtomicU64::new(0), 0x1111_2222, frozen);
+        let after = mint_id(&AtomicU64::new(0), 0x3333_4444, frozen);
+
+        assert_ne!(
+            before, after,
+            "the same clock reading in a new process must not repeat an id"
+        );
+    }
+
+    #[test]
+    fn the_per_process_salt_is_drawn_and_not_a_constant() {
+        // What the restart case above rests on. A constant here would make the id
+        // a pure function of the clock again, which is the bug.
+        use std::collections::HashSet;
+
+        let draws: HashSet<u32> = (0..64).map(|_| draw_salt()).collect();
+        assert!(
+            draws.len() > 1,
+            "a salt that never varies is not a salt: {draws:?}"
+        );
     }
 
     #[test]
@@ -1865,5 +1943,63 @@ mod tests {
         assert_eq!(run.sub_tasks[0].status, SubTaskStatus::Done);
         assert_eq!(run.unresolved.len(), 1, "no rewind without a revival");
         assert_eq!(run.phase, TeamPhase::MrGate);
+    }
+
+    #[test]
+    fn a_closing_phase_written_over_a_waiting_sub_task_is_pulled_back() {
+        // The driver picks the next phase before its turn and writes it after, so
+        // a revival that lands during the turn arrives before a decision that
+        // knows nothing about it.
+        let mut run = run_with(
+            TeamPhase::SubTasks,
+            vec![spent_sub_task("st-1", SubTaskStatus::Done)],
+        );
+        assert!(run.revive_sub_tasks(Some(&["st-1".to_string()])));
+
+        run.phase = TeamPhase::Wrapping;
+        run.mr_verdict = Some(WorkflowVerdict::approved());
+        run.unresolved = vec!["the retry path is untested".to_string()];
+
+        assert!(run.hold_phase_for_waiting_sub_tasks());
+
+        assert_eq!(run.phase, TeamPhase::SubTasks);
+        assert_eq!(run.current_sub_task(), Some(0));
+        assert_eq!(
+            run.mr_verdict, None,
+            "that verdict judged the diff the rerun is about to change"
+        );
+        assert!(
+            run.unresolved.is_empty(),
+            "and its findings would keep the run from ever reaching Done: {:?}",
+            run.unresolved
+        );
+    }
+
+    #[test]
+    fn a_phase_the_sub_tasks_are_really_done_with_is_left_where_the_driver_put_it() {
+        let mut run = run_with(
+            TeamPhase::Finished,
+            vec![spent_sub_task("st-1", SubTaskStatus::Done)],
+        );
+        run.mr_verdict = Some(WorkflowVerdict::approved());
+
+        assert!(!run.hold_phase_for_waiting_sub_tasks());
+
+        assert_eq!(run.phase, TeamPhase::Finished);
+        assert!(run.mr_verdict.is_some(), "nothing to invalidate");
+    }
+
+    #[test]
+    fn the_phases_before_the_sub_tasks_are_never_pulled_back() {
+        // `Planning` ends by writing the sub-task list, every one of them waiting.
+        // Reading that as a rerun would put the run in a phase it has not reached.
+        let mut run = run_with(
+            TeamPhase::Planning,
+            vec![sub_task(SubTaskStatus::Pending, false)],
+        );
+
+        assert!(!run.hold_phase_for_waiting_sub_tasks());
+
+        assert_eq!(run.phase, TeamPhase::Planning);
     }
 }

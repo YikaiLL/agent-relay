@@ -2280,4 +2280,110 @@ it a turn ago"
             "the record is edited, never rebuilt"
         );
     }
+
+    /// A rerun accepted while the whole-diff turn is already running has to
+    /// survive the write that turn makes when it lands. The driver chose
+    /// `Wrapping` before the rerun existed; letting that stale decision through
+    /// is how the tool says "these will run again" and nothing ever does.
+    #[tokio::test]
+    async fn a_rerun_outlives_the_gate_turn_it_interrupted() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.phase = relay_api::team::TeamPhase::MrGate;
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": ["st-1"] }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("rerun_sub_tasks");
+
+        relay_api::TeamPort::update_run(
+            &app,
+            &run_id,
+            Box::new(|run| {
+                run.mr_rounds_used += 1;
+                run.mr_verdict = Some(relay_api::WorkflowVerdict::approved());
+                run.unresolved
+                    .push("the gate ran out of rounds".to_string());
+                run.phase = relay_api::team::TeamPhase::Wrapping;
+            }),
+        )
+        .await;
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.phase,
+            relay_api::team::TeamPhase::SubTasks,
+            "the finishing turn must not bury the sub-task the user just asked for"
+        );
+        assert_eq!(
+            run.current_sub_task(),
+            Some(0),
+            "the team has to actually resume there"
+        );
+        assert!(
+            run.mr_verdict.is_none(),
+            "a verdict on the diff before the rerun must not pass for one on the new work"
+        );
+        assert!(
+            run.unresolved.is_empty(),
+            "leftovers from that gate would stop the run ever finishing: {:?}",
+            run.unresolved
+        );
+    }
+
+    /// The same race one step later: the wrap-up turn ends by declaring the run
+    /// finished, which would strand the rerun in a phase nothing looks at.
+    #[tokio::test]
+    async fn a_rerun_outlives_the_wrap_turn_it_interrupted() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.phase = relay_api::team::TeamPhase::Wrapping;
+                run.sub_tasks.push(settled_sub_task("st-1", "Diagnose it"));
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "rerun_sub_tasks",
+            &json!({ "sub_task_ids": ["st-1"] }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("rerun_sub_tasks");
+
+        relay_api::TeamPort::update_run(
+            &app,
+            &run_id,
+            Box::new(|run| {
+                run.head_commit = Some("deadbee".to_string());
+                run.phase = relay_api::team::TeamPhase::Finished;
+            }),
+        )
+        .await;
+
+        let run = app.team_run_snapshot(&run_id).await.expect("run");
+        assert_eq!(
+            run.phase,
+            relay_api::team::TeamPhase::SubTasks,
+            "a run with work waiting on it is not finished"
+        );
+        assert_eq!(
+            run.head_commit.as_deref(),
+            Some("deadbee"),
+            "everything else the turn recorded still stands"
+        );
+    }
 }

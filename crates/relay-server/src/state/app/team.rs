@@ -2271,6 +2271,9 @@ impl relay_api::TeamPort for AppState {
         relay.update_team_run(run_id, |run| {
             found = true;
             mutation(run);
+            // The driver chose this phase before the turn it is recording. A rerun
+            // accepted meanwhile is younger than that choice and outranks it.
+            run.hold_phase_for_waiting_sub_tasks();
         });
         if found {
             relay.notify();
