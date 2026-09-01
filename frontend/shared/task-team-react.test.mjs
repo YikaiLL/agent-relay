@@ -292,6 +292,57 @@ test("the workspace keeps Orchestrator centre and detail on the right", () => {
   assert.doesNotMatch(html, /All tasks/);
 });
 
+test("an unread terminal report uses finished wording", () => {
+  const escalated = renderToStaticMarkup(
+    h(TaskTeamScreen, {
+      runs: [run({ status: "escalated" })],
+      selectedRunId: "team-1",
+    })
+  );
+  assert.match(escalated, /Finished/);
+  assert.match(escalated, /Ran out of rounds/);
+  assert.doesNotMatch(escalated, /Paused for a decision/);
+
+  for (const status of ["failed", "interrupted"]) {
+    const html = renderToStaticMarkup(
+      h(TaskTeamScreen, { runs: [run({ status })], selectedRunId: "team-1" })
+    );
+    assert.match(html, /Finished/, status);
+    assert.match(html, /Task stopped/, status);
+    assert.doesNotMatch(html, /Paused for a decision/, status);
+  }
+});
+
+test("a read terminal report no longer renders an attention card", () => {
+  const html = renderToStaticMarkup(
+    h(TaskTeamScreen, {
+      runs: [run({ status: "failed", updated_at: 100 })],
+      selectedRunId: "team-1",
+      seenAt: { "team-1": 100 },
+      orchestrator: { entries: [] },
+    })
+  );
+  assert.doesNotMatch(html, /task-orch-card/);
+  assert.doesNotMatch(html, /Task stopped/);
+});
+
+test("questions and blocked tasks keep decision wording", () => {
+  const states = [
+    run({
+      status: "awaiting_user",
+      awaiting: { thread_id: "dev-1", request_id: "ask:1", role: "dev", asked_at: 1 },
+    }),
+    run({ status: "blocked" }),
+  ];
+  for (const state of states) {
+    const html = renderToStaticMarkup(
+      h(TaskTeamScreen, { runs: [state], selectedRunId: "team-1" })
+    );
+    assert.match(html, /Needs you/, state.status);
+    assert.match(html, /Paused for a decision/, state.status);
+  }
+});
+
 test("pending Orchestrator proposals render confirm and dismiss", () => {
   const html = renderToStaticMarkup(
     h(TaskTeamScreen, {
