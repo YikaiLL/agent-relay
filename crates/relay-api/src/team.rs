@@ -675,6 +675,12 @@ pub struct TeamRun {
     #[serde(default)]
     pub reviewer_effort: String,
 
+    /// How many dev sessions the sub-tasks may be spread over, if the user said.
+    /// `None` is a session per sub-task. Clamped where it is read, not here: the
+    /// sub-task count it has to fit inside does not exist until the TL plans.
+    #[serde(default)]
+    pub dev_agents: Option<u32>,
+
     pub max_review_rounds: u32,
     pub max_mr_rounds: u32,
     pub design_review_rounds: u32,

@@ -251,6 +251,8 @@ pub(crate) struct TeamStartRequest {
     pub(crate) tl_effort: String,
     pub(crate) dev_effort: String,
     pub(crate) reviewer_effort: String,
+    /// How many dev sessions the sub-tasks may share. `None` is one each.
+    pub(crate) dev_agents: Option<u32>,
 }
 
 impl AppState {
@@ -328,6 +330,7 @@ locally and trust it before starting a task team there"
         run.tl_effort = input.tl_effort;
         run.dev_effort = input.dev_effort;
         run.reviewer_effort = input.reviewer_effort;
+        run.dev_agents = input.dev_agents;
         // Pin the builtin Default team until configurable teams land. The
         // ledger's `team_id` is only knowable while the run exists, so this
         // has to be set at start — not joined at report time.
@@ -744,6 +747,7 @@ over on resume"
                 tl_effort: asked(input.tl_effort),
                 dev_effort: asked(input.dev_effort),
                 reviewer_effort: asked(input.reviewer_effort),
+                dev_agents: input.dev_agents,
                 tl_provider,
                 dev_provider,
                 reviewer_provider,

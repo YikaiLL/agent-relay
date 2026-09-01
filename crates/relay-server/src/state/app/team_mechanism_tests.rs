@@ -52,6 +52,7 @@ fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
         tl_effort: String::new(),
         dev_effort: String::new(),
         reviewer_effort: String::new(),
+        dev_agents: None,
         tl_provider: "codex".to_string(),
         dev_provider: "codex".to_string(),
         reviewer_provider: "codex".to_string(),

@@ -7,13 +7,44 @@ use super::*;
 use crate::protocol::{
     ConfirmOrchestratorProposalInput, DismissOrchestratorProposalInput, OrchestratorProposalView,
     ProposeOrchestratorTaskInput, ProposeOrchestratorTaskReceipt, ReviseOrchestratorProposalInput,
-    StartTeamInput, StartTeamReceipt,
+    SeatAgentView, StartTeamInput, StartTeamReceipt, TaskSeatAgentsView,
 };
 use relay_api::team::{BUILTIN_TEAM_ID, BUILTIN_TEAM_NAME, BUILTIN_TEAM_VERSION_ID};
 
 pub(crate) const MAX_PENDING_PROPOSALS: usize = 16;
 const MAX_PROPOSAL_TITLE_CHARS: usize = 200;
 const MAX_PROPOSAL_FIELD_CHARS: usize = 8_000;
+
+/// Default seat lineup when a proposal names no per-seat override. What the card
+/// shows is what the run will use — empty seats must not silently fall through to
+/// whichever provider happens to be active in the chat thread.
+pub(crate) fn default_task_seat_agents() -> TaskSeatAgentsView {
+    TaskSeatAgentsView {
+        tl: SeatAgentView {
+            provider: Some("claude_code".to_string()),
+            model: Some("opus[1m]".to_string()),
+            effort: Some("xhigh".to_string()),
+        },
+        dev: SeatAgentView {
+            provider: Some("claude_code".to_string()),
+            model: Some("opus[1m]".to_string()),
+            effort: Some("xhigh".to_string()),
+        },
+        reviewer: SeatAgentView {
+            provider: Some("codex".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("high".to_string()),
+        },
+    }
+}
+
+/// Per-seat overrides laid over [`default_task_seat_agents`]. A caller naming
+/// only the reviewer's effort must not blank the model the default already chose.
+fn merge_task_seat_agents(input: &TaskSeatAgentsView) -> TaskSeatAgentsView {
+    let mut merged = default_task_seat_agents();
+    merged.merge(input);
+    merged
+}
 
 impl AppState {
     /// Hold a task spec for confirmation. Does not start a run.
@@ -66,7 +97,7 @@ impl AppState {
             why,
             // A fresh task IS its definition; only a reopen rewrites one.
             spec_updates: Default::default(),
-            agents: input.agents,
+            agents: merge_task_seat_agents(&input.agents),
             created_at: unix_now(),
         };
 
@@ -195,7 +226,7 @@ impl AppState {
             team_name: String::new(),
             why: None,
             spec_updates: updates.clone(),
-            agents: Default::default(),
+            agents: merge_task_seat_agents(&Default::default()),
             created_at: unix_now(),
         };
 
@@ -270,6 +301,7 @@ impl AppState {
                 // what runs. Dropping these here would start every task on the
                 // relay default while the card said otherwise.
                 tl_provider: proposal.agents.tl.provider.clone(),
+                dev_agents: None,
                 dev_provider: proposal.agents.dev.provider.clone(),
                 reviewer_provider: proposal.agents.reviewer.provider.clone(),
                 tl_model: proposal.agents.tl.model.clone(),
@@ -384,6 +416,18 @@ mod tests {
             .expect("propose");
         assert_eq!(receipt.proposal.title, "Add a parser");
         assert_eq!(receipt.proposal.team_id, BUILTIN_TEAM_ID);
+        assert_eq!(
+            receipt.proposal.agents.tl.provider.as_deref(),
+            Some("claude_code")
+        );
+        assert_eq!(
+            receipt.proposal.agents.dev.model.as_deref(),
+            Some("opus[1m]")
+        );
+        assert_eq!(
+            receipt.proposal.agents.reviewer.effort.as_deref(),
+            Some("high")
+        );
         assert_eq!(
             app.snapshot().await.orchestrator_proposals.len(),
             1,
