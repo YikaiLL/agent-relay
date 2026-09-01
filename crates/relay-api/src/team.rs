@@ -1061,10 +1061,14 @@ impl TeamRun {
     /// so an earlier sub-task's id still names its record and can be rerun.
     pub fn replan_sub_tasks(&mut self, planned: Vec<SubTask>) {
         for task in &mut self.sub_tasks {
-            task.status = SubTaskStatus::Superseded;
-            // `current_sub_task` selects an undigested entry however terminal, and
-            // the TL wrote the replan, so it is owed no report about it.
-            task.digested = true;
+            // Only what never finished. A reopened run replans with the last
+            // cycle's outcomes in the list, and overwriting them loses the record.
+            if !task.status.is_terminal() {
+                task.status = SubTaskStatus::Superseded;
+                // `current_sub_task` selects an undigested entry however terminal,
+                // and the TL wrote the replan, so it is owed no report about it.
+                task.digested = true;
+            }
         }
         for mut task in planned {
             // A restart resets the mint, so a new id can land on a retained one and
@@ -1826,6 +1830,26 @@ mod tests {
             run.current_sub_task(),
             Some(2),
             "a retired one must not be picked up again"
+        );
+    }
+
+    /// A reopened run replans with the last cycle's work still in the list, so
+    /// "everything a replan replaces is still pending" holds only on the first
+    /// plan. Overwriting a finished outcome loses the record the retained entry
+    /// exists to keep — and `finalize` reads those statuses, so a run that has
+    /// been reopened once could never reach `Done` again.
+    #[test]
+    fn a_replan_leaves_what_already_finished_alone() {
+        let mut run = run_with(TeamPhase::Planning, vec![planned_sub_task("st-1")]);
+        run.sub_tasks[0].status = SubTaskStatus::Done;
+        run.sub_tasks[0].digested = true;
+
+        run.replan_sub_tasks(vec![planned_sub_task("st-2")]);
+
+        assert_eq!(
+            run.sub_tasks[0].status,
+            SubTaskStatus::Done,
+            "a sub-task that finished was not superseded by the next plan"
         );
     }
 
