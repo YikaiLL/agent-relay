@@ -37,7 +37,7 @@ use crate::protocol::{
     TeamRunView, TeamSubTaskView, TeamsResponse,
 };
 use crate::state::{
-    TaskSpec, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadSlot, TURN_FAILURE_KIND_USAGE_LIMIT,
+    TaskSpec, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadSlot, TurnFailureKind,
 };
 use relay_api::team::{TeamRole, TeamTurnOutcome};
 use relay_api::TeamPortError;
@@ -1724,7 +1724,7 @@ over on resume"
                     (failure.turn_id == turn_id).then(|| {
                         (
                             failure.reason.clone(),
-                            failure.kind.as_deref() == Some(TURN_FAILURE_KIND_USAGE_LIMIT),
+                            failure.kind.is_some_and(TurnFailureKind::halts_the_run),
                         )
                     })
                 })

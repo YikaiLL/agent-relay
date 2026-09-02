@@ -1081,6 +1081,56 @@ async fn a_dev_turn_that_hits_a_usage_limit_halts_the_run_before_any_review() {
     assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
 }
 
+/// A kind from a worker NEWER than this build. It must decode to "no kind" and
+/// take the ordinary-failure path: every kind that halts settles the run
+/// `Paused` — resumable, and read by the user as "waiting for quota" — so an
+/// unrecognised one must never reach that path on the strength of being unknown.
+#[tokio::test]
+async fn an_unrecognised_failure_kind_fails_the_turn_without_pausing_the_run() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "The provider rejected the request".to_string(),
+            Some("bad_request_v2".to_string()),
+        ));
+
+    let dev_outcome = std::sync::Arc::new(Mutex::new(None));
+    let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let app = app.with_team_driver(std::sync::Arc::new(DevThenReviewDriver {
+        request_stop_before_review: false,
+        reviewer_rounds: 0,
+        dev_outcome: dev_outcome.clone(),
+        reviewer_outcomes: reviewer_outcomes.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.dev_provider = "codex".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    // Reaching `Failed` at all is the assertion: a halt would settle `Paused`
+    // first, and every later mutator — this one included — is then a no-op.
+    let run = wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    match dev_outcome.lock().await.clone() {
+        Some(relay_api::team::TeamTurnOutcome::Failed(reason)) => {
+            assert!(
+                reason.contains("The provider rejected the request"),
+                "the turn still fails, and still says why: {reason}"
+            );
+        }
+        other => panic!("an unclassified failure is still a failed turn: {other:?}"),
+    }
+    assert_eq!(
+        run.pause_kind, None,
+        "an unknown kind must not be read as a provider limit"
+    );
+}
+
 #[tokio::test]
 async fn a_reviewer_turn_is_refused_without_a_landed_dev_turn() {
     let (_repo, root) = init_team_repo().await;

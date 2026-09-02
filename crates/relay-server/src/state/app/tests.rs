@@ -12180,6 +12180,7 @@ mod review_tests {
         TranscriptEntryView, UpdateSessionSettingsInput, WorkflowActionInput,
     };
     use crate::state::security::SecurityProfile;
+    use crate::state::TurnFailureKind;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -13061,10 +13062,12 @@ mod review_tests {
                             // claude.rs/codex/rpc.rs): the bridge's own classification,
                             // recorded BEFORE the durable Error entry — team_turn
                             // (state/app/team.rs) reads the former, never the latter.
+                            // The kind stays a raw wire string here and decodes like a
+                            // bridge, so a test can hand over one no build recognises.
                             relay.set_last_turn_failure(
                                 &thread_id,
                                 turn.clone(),
-                                kind,
+                                kind.as_deref().and_then(TurnFailureKind::from_wire),
                                 reason.clone(),
                             );
                             relay.upsert_transcript_item_for_thread(
@@ -13100,7 +13103,7 @@ mod review_tests {
                             relay.set_last_turn_failure(
                                 &thread_id,
                                 turn.clone(),
-                                kind,
+                                kind.as_deref().and_then(TurnFailureKind::from_wire),
                                 reason.clone(),
                             );
                             relay.bg_upsert_transcript_item(

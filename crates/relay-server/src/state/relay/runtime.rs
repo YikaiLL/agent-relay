@@ -17,28 +17,58 @@ use super::{
 /// the raw provider body, only what the bridge already surfaced as `reason`
 /// (see `claude_failed_turn_reason` / `codex_turn_failure_reason`).
 ///
-/// `kind` is the same closed classification space as the worker's
-/// `failure_kind` (`claude-worker/sdk-mapping.mjs`) and Codex's mapped
-/// `codexErrorInfo`; `None` for a failure this layer doesn't classify.
-///
 /// Consumers must match `turn_id` against the turn THEY sent, not merely check
 /// presence — this record is never cleared, so an unmatched id would let a
 /// stale failure from an earlier turn poison a later, good one.
 #[derive(Debug, Clone)]
 pub(crate) struct TurnFailure {
     pub(crate) turn_id: String,
-    // Written now; read starting with the halt-before-review gate this record
-    // exists to feed (not this sub-task's `team_turn`, which uses `reason` only).
-    #[allow(dead_code)]
-    pub(crate) kind: Option<String>,
+    pub(crate) kind: Option<TurnFailureKind>,
     pub(crate) reason: String,
 }
 
-/// The only classified `TurnFailure::kind` today. Both bridges map their own
-/// provider-specific signal onto this one literal (Claude forwards the
-/// worker's `failure_kind` as-is; Codex maps `codexErrorInfo: "usageLimitExceeded"`
-/// onto it in `codex.rs`) — add a new kind only alongside a real classifier.
-pub(crate) const TURN_FAILURE_KIND_USAGE_LIMIT: &str = "usage_limit";
+/// How a provider said a turn failed — the one classification space both bridges
+/// map onto. `None` means unclassified, which is an ordinary failure.
+///
+/// | provider signal | kind | policy |
+/// |---|---|---|
+/// | Claude worker `done.failure_kind = "usage_limit"` | `UsageLimit` | halt, settle `Paused` |
+/// | Codex `codexErrorInfo: usageLimitExceeded` | `UsageLimit` | halt, settle `Paused` |
+/// | Codex `sessionBudgetExceeded` | none | ordinary failure |
+/// | Codex `serverOverloaded` | none | ordinary failure |
+/// | every other Codex variant (`unauthorized`, `badRequest`, …) | none | ordinary failure |
+/// | an unrecognised kind string from a newer worker | none | ordinary failure |
+///
+/// Those omissions are deliberate. Halting converts a failure into a RESUMABLE
+/// `Paused` run, which is only honest for a block that lifts on a clock: a
+/// session budget needs a bigger budget and an overloaded server needs a retry,
+/// and an auth or request error is not "waiting for quota" at all. Widening this
+/// enum widens that promise, so [`Self::halts_the_run`] is an exhaustive match —
+/// a new variant has to state its policy rather than inherit one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnFailureKind {
+    UsageLimit,
+}
+
+impl TurnFailureKind {
+    /// Decode the wire string the Claude worker sends
+    /// (`claude-worker/sdk-mapping.mjs`). An unrecognised kind degrades to
+    /// `None`: a newer worker's classification must read as an ordinary failure,
+    /// never panic and never halt.
+    pub(crate) fn from_wire(kind: &str) -> Option<Self> {
+        match kind {
+            "usage_limit" => Some(Self::UsageLimit),
+            _ => None,
+        }
+    }
+
+    /// Whether this kind settles the run `Paused` rather than failing it.
+    pub(crate) fn halts_the_run(self) -> bool {
+        match self {
+            Self::UsageLimit => true,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadRuntime {

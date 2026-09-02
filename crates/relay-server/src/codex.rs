@@ -25,7 +25,7 @@ use crate::{
         user_message_transcript_text, ProviderBridge, ProviderForkCapability, ProviderForkRequest,
         ProviderImage, StartThreadRequest, StartThreadResult, ThreadSyncData,
     },
-    state::{ApprovalKind, PendingApproval, RelayState, TURN_FAILURE_KIND_USAGE_LIMIT},
+    state::{ApprovalKind, PendingApproval, RelayState, TurnFailureKind},
 };
 
 mod rpc;
@@ -992,26 +992,25 @@ pub(crate) fn codex_turn_failure_reason(turn: &Value) -> Option<String> {
     Some(label.unwrap_or_else(|| "The turn ended with an error.".to_string()))
 }
 
-/// Map codex's `codexErrorInfo` onto `ThreadRuntime::last_turn_failure`'s
-/// closed `kind` — the same classification space as the worker's
-/// `failure_kind`. Only a genuine usage-limit block is classified today;
-/// every other variant (including `other`) yields `None`, same as
-/// `codex_error_info_label`'s fallback.
-pub(crate) fn codex_error_info_kind(info: &Value) -> Option<String> {
+/// Map codex's `codexErrorInfo` onto the shared [`TurnFailureKind`]. Only a
+/// genuine usage-limit block is classified; every other variant (including
+/// `sessionBudgetExceeded` and `serverOverloaded`) yields `None` and stays an
+/// ordinary failure — the enum's table says why each omission is deliberate.
+pub(crate) fn codex_error_info_kind(info: &Value) -> Option<TurnFailureKind> {
     let variant = match info {
         Value::String(variant) => variant.as_str(),
         Value::Object(map) => map.keys().next()?.as_str(),
         _ => return None,
     };
     match variant {
-        "usageLimitExceeded" => Some(TURN_FAILURE_KIND_USAGE_LIMIT.to_string()),
+        "usageLimitExceeded" => Some(TurnFailureKind::UsageLimit),
         _ => None,
     }
 }
 
 /// Companion to `codex_turn_failure_reason`: the same `turn` object's closed
 /// failure kind, or `None` if unfailed/unclassified.
-pub(crate) fn codex_turn_failure_kind(turn: &Value) -> Option<String> {
+pub(crate) fn codex_turn_failure_kind(turn: &Value) -> Option<TurnFailureKind> {
     let error = value_at(turn, &["error"]).filter(|error| !error.is_null())?;
     value_at(error, &["codexErrorInfo"]).and_then(codex_error_info_kind)
 }

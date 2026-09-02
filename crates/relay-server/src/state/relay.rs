@@ -38,7 +38,7 @@ pub(crate) use self::push::{
     is_acceptable_push_endpoint, load_or_generate_vapid, vapid_key_path, PushAttentionTracker,
     PushDispatcher, PushJob, PushKind, PushSubscription, PushSubscriptionInput,
 };
-pub(crate) use self::runtime::{ThreadRuntime, TurnFailure, TURN_FAILURE_KIND_USAGE_LIMIT};
+pub(crate) use self::runtime::{ThreadRuntime, TurnFailure, TurnFailureKind};
 pub(crate) use self::transcript::TranscriptRecord;
 
 const REMOTE_ACTION_REPLAY_TTL_SECS: u64 = 600;
@@ -916,7 +916,7 @@ impl RelayState {
         &mut self,
         thread_id: &str,
         turn_id: String,
-        kind: Option<String>,
+        kind: Option<TurnFailureKind>,
         reason: String,
     ) {
         if let Some(runtime) = self.runtimes.get_mut(thread_id) {

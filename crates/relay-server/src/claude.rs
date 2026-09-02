@@ -31,7 +31,7 @@ use crate::{
     },
     state::{
         BrokerPendingMessage, PendingApproval, PendingTranscriptDelta, RelayState,
-        TranscriptDeltaKind,
+        TranscriptDeltaKind, TurnFailureKind,
     },
 };
 
@@ -1870,10 +1870,10 @@ fn claude_failed_turn_reason(payload: &Value) -> Option<String> {
     )
 }
 
-/// The worker's own closed `failure_kind` (e.g. `"usage_limit"`), forwarded
-/// verbatim — mirrors `claude_failed_turn_reason`'s guard. `None` covers both
-/// a non-failure and a failure the worker left unclassified.
-fn claude_failed_turn_kind(payload: &Value) -> Option<String> {
+/// The worker's `failure_kind`, decoded through [`TurnFailureKind`] — mirrors
+/// `claude_failed_turn_reason`'s guard. `None` covers a non-failure, a failure
+/// the worker left unclassified, and a kind a newer worker knows and we do not.
+fn claude_failed_turn_kind(payload: &Value) -> Option<TurnFailureKind> {
     if !payload
         .get("failed")
         .and_then(Value::as_bool)
@@ -1881,7 +1881,9 @@ fn claude_failed_turn_kind(payload: &Value) -> Option<String> {
     {
         return None;
     }
-    string_at(payload, &["failure_kind"]).filter(|kind| !kind.is_empty())
+    string_at(payload, &["failure_kind"])
+        .as_deref()
+        .and_then(TurnFailureKind::from_wire)
 }
 
 /// Stable per-turn id for the synthetic failure entry so a re-delivered terminal
