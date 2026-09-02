@@ -496,3 +496,82 @@ test("a superseded orchestrator load must not clear tail-gap repair flags", () =
   assert.equal(state.orchestratorEntriesLoading, true);
   assert.equal(state.orchestratorTailGapRepairing, true);
 });
+
+// The settle is the ONE place that answers "does the hole still exist?", for the
+// same reason the view-only pin decides it in one place
+// (view-only-refresh-ops.js:139-142): the page the server built cannot describe
+// a delta that was refused after it was built. The loader's success branch used
+// to answer it too, unconditionally, and its answer landed first -- so a delta
+// refused mid-fetch had its gap wiped and the hole was never repaired.
+function settleOrchestratorLoad(state, generation, { terminal = false } = {}) {
+  return applyOrchestratorLoadFinally(state, generation, ORCH_THREAD, state.session, {
+    terminal,
+  });
+}
+
+test("a gap raised while an orchestrator fetch is in flight survives the settle", () => {
+  const h = orchHarness();
+  h.state.session = { ...h.state.session, ...orchSession() };
+  h.state.orchestratorLoadGeneration = 1;
+  h.state.orchestratorEntriesLoading = true;
+
+  // Refused after the server built the page, before the promise resolved.
+  h.deliver({ thread_id: ORCH_THREAD, delta: "tail", text_offset: 99 });
+  assert.equal(h.state.orchestratorTailGap, true);
+  assert.equal(h.state.orchestratorDeltaDuringFetch, true);
+
+  settleOrchestratorLoad(h.state, 1, { terminal: true });
+
+  assert.equal(h.state.orchestratorTailGap, true, "the page never covered this delta");
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads.length, 1, "the surviving gap must schedule the repair");
+  assert.equal(loads[0].repair, true);
+});
+
+test("a settled orchestrator load clears a gap no delta re-raised", () => {
+  const state = {
+    orchestratorLoadGeneration: 1,
+    orchestratorEntriesLoading: true,
+    orchestratorTailGapRepairing: true,
+    orchestratorTailGap: true,
+    orchestratorEntriesThreadId: ORCH_THREAD,
+    orchestratorWasWorking: false,
+    orchestratorDeltaDuringFetch: false,
+    session: orchSession(),
+  };
+
+  settleOrchestratorLoad(state, 1, { terminal: true });
+
+  assert.equal(state.orchestratorTailGap, false, "this fetch answered the gap it was sent to repair");
+
+  const loads = [];
+  maybeRefreshOrchestrator(state, orchSession(), loads);
+  assert.equal(loads.length, 0, "an uncleared gap re-fetches on every frame -- there is no throttle");
+});
+
+// `orchestratorDeltaDuringFetch` decides both answers, so the settle has to read
+// it before it clears it. It used to clear first and then call
+// `orchestratorWasWorkingAfterFetch`, which reads that same field -- always false.
+test("the settle reads deltaDuringFetch before clearing it", () => {
+  const state = {
+    orchestratorLoadGeneration: 1,
+    orchestratorEntriesLoading: true,
+    orchestratorTailGapRepairing: false,
+    orchestratorTailGap: false,
+    orchestratorEntriesThreadId: ORCH_THREAD,
+    orchestratorWasWorking: true,
+    orchestratorDeltaDuringFetch: true,
+    session: orchSession(),
+  };
+
+  settleOrchestratorLoad(state, 1, { terminal: true });
+
+  assert.equal(
+    state.orchestratorWasWorking,
+    true,
+    "a delta landed mid-fetch, so this terminal refresh did not observe the idle edge"
+  );
+  assert.equal(state.orchestratorDeltaDuringFetch, false, "and the flag is consumed");
+});

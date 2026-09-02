@@ -2563,8 +2563,8 @@ export function createSessionRenderer({
       state.orchestratorEntriesThreadId = threadId;
       state.orchestratorEntriesError = null;
       state.orchestratorEntriesErrorAt = 0;
-      // Answered: this page is authoritative for the window it covers.
-      state.orchestratorTailGap = false;
+      // The tail gap is NOT answered here: this page was built before a delta
+      // refused mid-flight, so only the `finally` may settle it.
     } catch (error) {
       // A failed load must NOT claim the thread as loaded. It used to set
       // `orchestratorEntriesThreadId = threadId` and `entries = []`, and the

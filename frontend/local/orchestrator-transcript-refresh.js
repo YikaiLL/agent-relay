@@ -78,18 +78,30 @@ export function orchestratorWasWorkingAfterFetch(state, session, threadId, { ter
   });
 }
 
+/**
+ * Settle the flags a completed load owns, success or failure alike.
+ *
+ * Both answers below read `orchestratorDeltaDuringFetch`, so both are resolved
+ * BEFORE any flag is cleared — clearing first made
+ * `orchestratorWasWorkingAfterFetch` read its own erasure.
+ *
+ * The tail gap is settled here and nowhere else. The loader's success branch
+ * cannot answer it: the page it merged was built on the server, so a delta the
+ * reducer refused after that point is a hole the page never covered. Same rule
+ * the view-only pin applies (view-only-refresh-ops.js:139-142) — keep the gap
+ * only when this fetch was in flight for the refusal, otherwise clear it, since
+ * an uncleared gap re-fetches on every frame (there is no throttle).
+ */
 export function applyOrchestratorLoadFinally(state, generation, threadId, session, { terminal = false } = {}) {
   if (generation !== state.orchestratorLoadGeneration) {
     return false;
   }
+  const wasWorking = orchestratorWasWorkingAfterFetch(state, session, threadId, { terminal });
+  const tailGap = Boolean(state.orchestratorTailGap) && Boolean(state.orchestratorDeltaDuringFetch);
   state.orchestratorEntriesLoading = false;
   state.orchestratorTailGapRepairing = false;
   state.orchestratorDeltaDuringFetch = false;
-  state.orchestratorWasWorking = orchestratorWasWorkingAfterFetch(
-    state,
-    session,
-    threadId,
-    { terminal }
-  );
+  state.orchestratorTailGap = tailGap;
+  state.orchestratorWasWorking = wasWorking;
   return true;
 }
