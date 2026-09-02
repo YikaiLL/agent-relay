@@ -18283,6 +18283,65 @@ back to the tree it was born in: {second_cwd}"
     }
 
     #[tokio::test]
+    async fn a_model_this_call_named_is_never_healed_away() {
+        // The healing above is for PERSISTED settings — a value nobody chose for this
+        // turn. A model the caller names is a choice, and `resolve_provider_model`
+        // already refuses to heal those: ids are not globally unique across providers,
+        // and a legitimate override need not appear in its own provider's catalog.
+        // Treating "some other provider publishes this string" as proof of a leak
+        // would silently swap a deliberate override for the provider default.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let codex = providers.get("codex").unwrap();
+        let claude = providers.get("claude_code").unwrap();
+
+        let codex_thread = codex.summary("codex-active", cwd);
+        let claude_thread = claude.summary("claude-bg", cwd);
+        codex
+            .threads
+            .lock()
+            .await
+            .insert(codex_thread.id.clone(), codex_thread.clone());
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(codex_thread.id.clone());
+            relay.current_cwd = cwd.to_string();
+            relay.threads = vec![codex_thread.clone(), claude_thread.clone()];
+        }
+        // Warm codex so the ownership check has the evidence it would act on.
+        app.send_message_to_thread(&codex_thread.id, "warm the catalog", None, None)
+            .await
+            .expect("codex send");
+
+        // The caller names codex's id for this turn. Contrived on purpose: it is the
+        // shape of any unlisted override that happens to collide with another
+        // provider's published id.
+        app.send_message_to_thread(&claude_thread.id, "go", Some("codex-model"), None)
+            .await
+            .expect("claude send");
+
+        let turn_models = claude.turn_models.lock().await.clone();
+        let sent = turn_models
+            .iter()
+            .filter(|(id, _, _)| id == &claude_thread.id)
+            .last()
+            .map(|(_, model, _)| model.clone())
+            .expect("the claude thread should have run a turn");
+        assert_eq!(
+            sent, "codex-model",
+            "a model named for this turn must reach the provider verbatim, not be \
+second-guessed against another provider's catalog ({turn_models:?})"
+        );
+    }
+
+    #[tokio::test]
     async fn a_background_turn_drops_a_model_that_belongs_to_another_provider() {
         // `thread_settings` is persisted, so a model leaked onto a thread by an older
         // build outlives the restart that would clear a runtime. The read paths heal
@@ -18342,57 +18401,6 @@ back to the tree it was born in: {second_cwd}"
             "a foreign model must fall back to the thread's OWN provider, not be \
 forwarded: a Claude turn on a codex id fails and tears down the SDK session \
 ({turn_models:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_foreign_model_is_dropped_even_when_its_own_providers_catalog_is_cold() {
-        // The restart race the sibling test above hides by warming codex first.
-        // Ownership needs positive evidence — "some OTHER provider publishes this id"
-        // — so a codex catalog that has not been loaded yet leaves a persisted
-        // `codex-model` on a Claude thread looking like a legitimate unlisted
-        // override, and it goes out verbatim. Nothing here warms codex.
-        let dir = TempDir::new().expect("tmpdir");
-        let cwd = dir.path().to_str().unwrap();
-        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
-        let claude = providers.get("claude_code").unwrap();
-
-        let claude_thread = claude.summary("claude-bg", cwd);
-        claude
-            .threads
-            .lock()
-            .await
-            .insert(claude_thread.id.clone(), claude_thread.clone());
-        {
-            let mut relay = app.relay.write().await;
-            relay.set_provider_name("claude_code".to_string());
-            relay.current_cwd = cwd.to_string();
-            relay.threads = vec![claude_thread.clone()];
-            // What an older build persisted, and what a restart faithfully restores.
-            relay.remember_thread_settings(
-                &claude_thread.id,
-                "on-request",
-                "workspace-write",
-                "medium",
-                "codex-model",
-            );
-        }
-
-        app.send_message_to_thread(&claude_thread.id, "go", None, None)
-            .await
-            .expect("claude send");
-
-        let turn_models = claude.turn_models.lock().await.clone();
-        let sent = turn_models
-            .iter()
-            .filter(|(id, _, _)| id == &claude_thread.id)
-            .last()
-            .map(|(_, model, _)| model.clone())
-            .expect("the claude thread should have run a turn");
-        assert_eq!(
-            sent, "claude_code-model",
-            "whether a persisted id is foreign cannot depend on whether its owner's \
-catalog happens to be warm — the answer is the same either way ({turn_models:?})"
         );
     }
 

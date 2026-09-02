@@ -1580,6 +1580,7 @@ started ({error}); finishing with round {round}'s findings."
             let relay = self.relay.read().await;
             relay.thread_settings(thread_id)
         };
+        let caller_named_model = model.is_some();
         let target_model = model.map(str::to_string).or_else(|| {
             thread_settings
                 .as_ref()
@@ -1601,12 +1602,17 @@ started ({error}); finishing with round {round}'s findings."
             .await;
         // The read paths drop a leaked id via `resolve_model_for_provider`; this is the
         // path that SENDS one, and `resolve_provider_model` honours a named model
-        // verbatim — so without this an id another provider owns goes out as-is.
+        // verbatim — so without this a PERSISTED id another provider owns goes out
+        // as-is. Only persisted ids: a model this call named is a choice, and
+        // `resolve_provider_model` never heals those. Ids are not unique across
+        // providers and a legitimate override need not be listed, so "someone else
+        // publishes this string" would condemn deliberate overrides too.
         let target_model = match target_model {
             Some(model)
-                if self
-                    .model_belongs_to_another_provider_asking(&provider_name, &model)
-                    .await =>
+                if !caller_named_model
+                    && self
+                        .model_belongs_to_another_provider(&provider_name, &model)
+                        .await =>
             {
                 None
             }
