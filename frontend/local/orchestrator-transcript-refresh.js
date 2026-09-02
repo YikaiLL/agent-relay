@@ -1,6 +1,8 @@
 import { threadActivityFor } from "../shared/thread-activity.js";
 import { shouldRefreshViewedThread } from "../shared/viewed-thread-refresh.js";
+import { refreshedPinPage } from "./pin-page.js";
 import {
+  mergeOlderViewOnlyPage,
   resolveViewOnlyPinWasWorking,
   resolveViewOnlyPinWasWorkingAfterFetch,
 } from "./view-only-thread.js";
@@ -141,4 +143,49 @@ export function applyOrchestratorLoadFinally(state, generation, threadId, sessio
   state.orchestratorTailGap = tailGap;
   state.orchestratorWasWorking = wasWorking;
   return true;
+}
+
+// The entries a load owns, the mirror of the flags above. Here rather than
+// inline in the render module, which cannot be imported without a browser.
+
+// Null when the pane holds another thread's entries: merging a page into those
+// splices two conversations together under one header.
+export function orchestratorRefreshPin(state, threadId) {
+  if (state.orchestratorEntriesThreadId !== threadId) {
+    return null;
+  }
+  return {
+    threadId,
+    entries: state.orchestratorEntries || [],
+    olderCursor: state.orchestratorOlderCursor ?? null,
+    // Without this the merge reads "nobody scrolled up" and answers with the
+    // tail page alone, discarding the history the reader just paged in.
+    historyExtended: Boolean(state.orchestratorHistoryExtended),
+  };
+}
+
+// Split from the pin above because the caller takes the pin before its fetch and
+// applies the result after it.
+export function applyRefreshedOrchestratorPage(state, prior, page, threadId) {
+  const refreshed = refreshedPinPage(prior, page, threadId);
+  state.orchestratorEntries = refreshed.entries;
+  state.orchestratorOlderCursor = refreshed.olderCursor;
+  state.orchestratorHistoryExtended = refreshed.historyExtended;
+  state.orchestratorEntriesThreadId = threadId;
+  return refreshed;
+}
+
+export function applyOlderOrchestratorPage(state, threadId, page) {
+  const merged = mergeOlderViewOnlyPage(
+    {
+      threadId,
+      entries: state.orchestratorEntries || [],
+      olderCursor: state.orchestratorOlderCursor,
+    },
+    page
+  );
+  state.orchestratorEntries = merged.entries;
+  state.orchestratorOlderCursor = merged.olderCursor;
+  state.orchestratorHistoryExtended = merged.historyExtended;
+  return merged;
 }

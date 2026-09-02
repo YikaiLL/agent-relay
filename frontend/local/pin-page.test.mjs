@@ -59,6 +59,26 @@ test("a refresh merges with the pin instead of replacing it", () => {
   );
 });
 
+// Every caller stores what this returns and feeds it back as the next refresh's
+// `prior`, so a field computed and then not returned is a field that survives
+// exactly one refresh.
+test("a refresh reports whether history is still extended", () => {
+  const prior = {
+    threadId: "thread-1",
+    entries: [{ item_id: "old", entry_seq: 1 }, { item_id: "live", entry_seq: 2 }],
+    olderCursor: "cursor-1",
+    historyExtended: true,
+  };
+
+  const refreshed = refreshedPinPage(
+    prior,
+    { thread_id: "thread-1", entries: [{ item_id: "live", entry_seq: 2 }], prev_cursor: "cursor-9" },
+    "thread-1"
+  );
+
+  assert.equal(refreshed.historyExtended, true);
+});
+
 test("a first load with no prior pin just adopts the page", () => {
   const { entries, olderCursor } = refreshedPinPage(
     null,

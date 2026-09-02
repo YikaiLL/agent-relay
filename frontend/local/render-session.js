@@ -168,7 +168,6 @@ import {
   workflowRunsForThread,
 } from "../shared/workflow-state.js";
 import {
-  mergeOlderViewOnlyPage,
   projectViewOnlySession,
   VIEW_ONLY_LOAD_RETRY_BACKOFF_MS,
 } from "./view-only-thread.js";
@@ -186,16 +185,18 @@ import {
 import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap, threadActivityFor } from "../shared/thread-activity.js";
 import {
+  applyOlderOrchestratorPage,
   applyOrchestratorLoadFinally,
+  applyRefreshedOrchestratorPage,
   beginOrchestratorLoad,
   nextOrchestratorRefreshObservations,
   nextOrchestratorWasWorking,
+  orchestratorRefreshPin,
   orchestratorTranscriptRefreshDecision,
   takeDeferredOrchestratorRefresh,
 } from "./orchestrator-transcript-refresh.js";
 import { createViewedThreadRefreshLatch } from "../shared/viewed-thread-refresh.js";
 import { copyTextToClipboard } from "../shared/clipboard.js";
-import { refreshedPinPage } from "./pin-page.js";
 import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
 import { createTranscriptInteractionHandler } from "../shared/transcript-interactions.js";
 import { describeStatusChips } from "../shared/session-status.js";
@@ -2446,6 +2447,7 @@ export function createSessionRenderer({
       // The old thread's entries are not this thread's — keep them and the new
       // conversation would open showing someone else's history.
       state.orchestratorEntries = null;
+      state.orchestratorHistoryExtended = false;
       if (state.session) {
         state.session = { ...state.session, orchestrator_thread_id: threadId };
       }
@@ -2536,6 +2538,7 @@ export function createSessionRenderer({
       if (!threadId || typeof fetchTranscriptPage !== "function") {
         state.orchestratorEntries = [];
         state.orchestratorEntriesThreadId = threadId || null;
+        state.orchestratorHistoryExtended = false;
         return;
       }
       if (state.session?.active_thread_id === threadId) {
@@ -2543,12 +2546,12 @@ export function createSessionRenderer({
         // authoritative answer and the gap is closed by reading it.
         state.orchestratorEntries = state.session.transcript || [];
         state.orchestratorEntriesThreadId = threadId;
+        // These entries replace what was paged in, so no prefix is being held
+        // open any more — a stale flag would keep a later refresh from trimming.
+        state.orchestratorHistoryExtended = false;
         return;
       }
-      const prior =
-        state.orchestratorEntriesThreadId === threadId
-          ? { threadId, entries: state.orchestratorEntries || [], olderCursor: state.orchestratorOlderCursor ?? null }
-          : null;
+      const prior = orchestratorRefreshPin(state, threadId);
       const page = await fetchTranscriptPage(threadId, {});
       if (generation !== state.orchestratorLoadGeneration) {
         return;
@@ -2557,10 +2560,7 @@ export function createSessionRenderer({
       // view-only pin takes and for the same reasons (local/pin-page.js). This
       // used to assign `page.entries` wholesale, discarding every delta that
       // arrived while the fetch was in flight.
-      const refreshed = refreshedPinPage(prior, page, threadId);
-      state.orchestratorEntries = refreshed.entries;
-      state.orchestratorOlderCursor = refreshed.olderCursor;
-      state.orchestratorEntriesThreadId = threadId;
+      applyRefreshedOrchestratorPage(state, prior, page, threadId);
       state.orchestratorEntriesError = null;
       state.orchestratorEntriesErrorAt = 0;
       // The tail gap is NOT answered here: this page was built before a delta
@@ -2652,16 +2652,7 @@ export function createSessionRenderer({
       ) {
         return null;
       }
-      const merged = mergeOlderViewOnlyPage(
-        {
-          threadId,
-          entries: state.orchestratorEntries || [],
-          olderCursor: state.orchestratorOlderCursor,
-        },
-        page
-      );
-      state.orchestratorEntries = merged.entries;
-      state.orchestratorOlderCursor = merged.olderCursor;
+      applyOlderOrchestratorPage(state, threadId, page);
       if (state.session) {
         renderTaskTeam(state.session);
       }
