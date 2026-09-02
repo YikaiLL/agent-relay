@@ -46,7 +46,8 @@ use super::{
     sort_threads_by_recency, thread_status_is_working, unix_now, vapid_key_path,
     BrokerPendingMessage, CachedRemoteActionResult, ClaimChallenge, CompletedRemoteClaim,
     IssuedClaimChallenge, PendingPairingResult, PushDispatcher, PushSubscriptionInput, RelayState,
-    RemoteActionReplayDecision, SecurityProfile, DEFAULT_MODEL, STALE_TURN_PROGRESS_TIMEOUT_SECS,
+    RemoteActionReplayDecision, SecurityProfile, DEFAULT_EFFORT, DEFAULT_MODEL,
+    STALE_TURN_PROGRESS_TIMEOUT_SECS,
 };
 
 /// Drive the server-side push attention tracker once per (debounced) state
@@ -1078,7 +1079,12 @@ in thread {thread_id}: {error}"
         let (provider_name, bridge) = (provider_name.to_string(), bridge.clone());
         let data = bridge.read_thread(thread_id).await?;
         let model = self
-            .resolve_model_for_provider(&provider_name, &bridge, remembered_model, defaults.model)
+            .resolve_model_for_provider(
+                &provider_name,
+                &bridge,
+                remembered_model,
+                PROVIDER_DEFAULT_MODEL.to_string(),
+            )
             .await;
         {
             let relay = self.relay.read().await;
@@ -2270,6 +2276,16 @@ fn clamp_effort_to_model(
     }
     supported.first().cloned().unwrap_or(effort)
 }
+
+/// What a BACKGROUND turn falls back to when neither the caller nor the provider's
+/// catalog names a model. Never `SessionDefaults.model` — that is one relay-wide
+/// last-used value with no provider dimension, so a cold catalog (every catalog,
+/// right after a restart) hands this provider whatever the user last chatted with.
+///
+/// Every bridge resolves this locally: claude_code publishes it as a real catalog
+/// row, `resolve_provider_model` maps it to codex's preferred, and ACP treats it as
+/// "you pick" (`acp.rs::model_change_needed`). No provider owns it, so it cannot leak.
+pub(super) const PROVIDER_DEFAULT_MODEL: &str = "default";
 
 fn resolve_provider_model(
     provider_name: &str,

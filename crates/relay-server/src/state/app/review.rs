@@ -1600,15 +1600,32 @@ started ({error}); finishing with round {round}'s findings."
         let provider_models = self
             .load_provider_model_catalog(&provider_name, &bridge)
             .await;
+        // The read paths drop a leaked id via `resolve_model_for_provider`; this is the
+        // path that SENDS one, and `resolve_provider_model` honours a named model
+        // verbatim — so without this an id another provider owns goes out as-is.
+        let target_model = match target_model {
+            Some(model)
+                if self
+                    .model_belongs_to_another_provider(&provider_name, &model)
+                    .await =>
+            {
+                None
+            }
+            other => other,
+        };
         let model = resolve_provider_model(
             &provider_name,
             &provider_models,
             target_model,
-            defaults.model.clone(),
+            super::PROVIDER_DEFAULT_MODEL.to_string(),
         );
         let effort = target_effort
             .or_else(|| default_effort_for_model(&provider_models, &model))
-            .unwrap_or(defaults.reasoning_effort);
+            .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
+        // Same reason as the model above, and the same last line of defense the
+        // fork/start/team-seat paths already use: codex answers a Claude-only effort
+        // with a 400, which reaches the user as "can't send at all".
+        let effort = clamp_effort_to_model(effort, &model, &provider_models);
 
         // Gate immediately before the provider call, after model-catalog work. The
         // directory can still disappear in the provider call itself; classify that
@@ -1713,7 +1730,7 @@ started ({error}); finishing with round {round}'s findings."
             &provider_name,
             &provider_models,
             reviewer_model.map(str::to_string),
-            defaults.model.clone(),
+            super::PROVIDER_DEFAULT_MODEL.to_string(),
         );
         // An explicit effort override wins; otherwise use the model's default effort,
         // falling back to the session default.
@@ -1721,7 +1738,7 @@ started ({error}); finishing with round {round}'s findings."
             .map(str::to_string)
             .filter(|value| !value.is_empty())
             .or_else(|| default_effort_for_model(&provider_models, &model))
-            .unwrap_or(defaults.reasoning_effort);
+            .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
         // Keep the reviewer read-only where the provider supports it (Codex honors
         // a read-only sandbox); otherwise fall back to a permission-prompting mode
         // and warn, since the review must not mutate the work under review.
@@ -1860,10 +1877,10 @@ started ({error}); finishing with round {round}'s findings."
             .as_ref()
             .map(|s| s.model.clone())
             .filter(|value| !value.is_empty());
-        let effort_value = effort
+        let effort_value = effort.clone().unwrap_or_else(|| DEFAULT_EFFORT.to_string());
+        let model_value = model
             .clone()
-            .unwrap_or_else(|| defaults.reasoning_effort.clone());
-        let model_value = model.clone().unwrap_or_else(|| defaults.model.clone());
+            .unwrap_or_else(|| super::PROVIDER_DEFAULT_MODEL.to_string());
 
         // Always (re)apply the read-only policy to the provider before the turn.
         let workspace = self.drivable_thread(reviewer_thread_id).await?;

@@ -1034,10 +1034,10 @@ the drain window; it may still be running."
             &provider_name,
             &provider_models,
             model_override.map(str::to_string),
-            defaults.model.clone(),
+            super::PROVIDER_DEFAULT_MODEL.to_string(),
         );
         let effort = default_effort_for_model(&provider_models, &model)
-            .unwrap_or_else(|| defaults.reasoning_effort.clone());
+            .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
         // Keep the reviewer read-only where the provider supports it (Codex
         // read-only sandbox; Claude review_read_only) so it can't mutate the
         // artifact under review.

@@ -110,10 +110,10 @@ New task button on the Tasks screen."
             provider_name,
             &provider_models,
             None,
-            defaults.model.clone(),
+            super::PROVIDER_DEFAULT_MODEL.to_string(),
         );
         let effort = default_effort_for_model(&provider_models, &model)
-            .unwrap_or_else(|| defaults.reasoning_effort.clone());
+            .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
         // Never-ask: secretary, not a shell agent prompting on every tool.
         let approval_policy = "never".to_string();
         let sandbox = defaults.sandbox.clone();

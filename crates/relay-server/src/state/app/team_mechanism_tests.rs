@@ -863,3 +863,93 @@ async fn a_team_turn_stamps_the_phase_it_ran_in_not_the_phase_it_ended_in() {
 are different prompts and the whole point is to price them apart"
     );
 }
+
+/// Drives one TL turn, but first loses the seat's runtime and moves the session
+/// mirror to another chat's model — what a relay restart mid-run looks like.
+struct RestartedTlTurnDriver {
+    relay: std::sync::Arc<RwLock<RelayState>>,
+    thread: std::sync::Arc<Mutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl relay_api::TeamDriver for RestartedTlTurnDriver {
+    fn orchestrator_system_prompt(&self) -> String {
+        "test driver".to_string()
+    }
+
+    async fn drive(&self, port: std::sync::Arc<dyn relay_api::TeamPort>, run_id: String) {
+        let thread = port
+            .start_thread(&run_id, relay_api::team::TeamRole::Tl)
+            .await
+            .expect("tl seat thread");
+        let slot = port.record_run_thread(&run_id, &thread).await;
+        {
+            let mut relay = self.relay.write().await;
+            // Runtimes are process-local; the remembered settings are persisted. So a
+            // restart mid-run loses one and keeps the other.
+            relay.runtimes.remove(&thread);
+            // Meanwhile the user is chatting in another provider's session, which is
+            // all `RelayState.model` ever holds: the last thing anyone used.
+            relay.model = "cursor-auto".to_string();
+            relay.reasoning_effort = "none".to_string();
+            // Any background event for the seat rebuilds its runtime before the turn.
+            relay.bg_set_thread_status(&thread, "idle".to_string(), Vec::new(), 0);
+        }
+        let _ = port
+            .turn(
+                &run_id,
+                slot,
+                relay_api::team::TeamRole::Tl,
+                "plan the work",
+            )
+            .await;
+        *self.thread.lock().await = Some(thread);
+        port.settle_run(
+            &run_id,
+            crate::state::TeamRunStatus::Failed,
+            "test driver done",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_tl_turn_after_a_lost_runtime_still_runs_on_the_seats_model() {
+    // The seat is configured `opus[1m]` and every turn before the restart ran on it.
+    // Then the rebuilt runtime took its model from the session mirror — the user's
+    // Cursor chat — and the TL's next turn went out as a model Claude cannot resolve,
+    // which reads as "There's an issue with the selected model" and fails the run.
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex", "claude_code"]).await;
+    let claude = providers.get("claude_code").unwrap().clone();
+    let observed = std::sync::Arc::new(Mutex::new(None));
+    let relay = app.relay.clone();
+    let app = app.with_team_driver(std::sync::Arc::new(RestartedTlTurnDriver {
+        relay,
+        thread: observed.clone(),
+    }));
+
+    let mut input = team_input(&root);
+    input.tl_provider = "claude_code".to_string();
+    input.tl_model = "opus[1m]".to_string();
+    let run_id = app.start_team_run(input).await.expect("start");
+    wait_for_team_status(&app, &run_id, crate::state::TeamRunStatus::Failed).await;
+
+    let thread = observed
+        .lock()
+        .await
+        .clone()
+        .expect("the driver ran a tl turn");
+    let turn_models = claude.turn_models.lock().await.clone();
+    let sent = turn_models
+        .iter()
+        .filter(|(id, _, _)| id == &thread)
+        .last()
+        .map(|(_, model, _)| model.clone())
+        .expect("the tl seat should have run a turn");
+    assert_eq!(
+        sent, "opus[1m]",
+        "a TL turn must run on the seat's own model, never on whatever the user last \
+chatted with: {turn_models:?}"
+    );
+}

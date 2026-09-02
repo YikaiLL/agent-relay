@@ -2935,6 +2935,7 @@ impl RelayState {
         } else {
             self.next_transcript_revision()
         };
+        let remembered = self.thread_settings.get(thread_id).cloned();
         self.runtimes
             .entry(thread_id.to_string())
             .or_insert_with(|| {
@@ -2954,10 +2955,26 @@ impl RelayState {
                 if thread_status_is_working(&runtime.current_status) {
                     runtime.current_status = "idle".to_string();
                 }
-                runtime.model = self.model.clone();
-                runtime.approval_policy = self.approval_policy.clone();
-                runtime.sandbox = self.sandbox.clone();
-                runtime.reasoning_effort = self.reasoning_effort.clone();
+                // The THREAD's own remembered settings, and only then the session
+                // mirror: the mirror is whatever the user last chatted with, so
+                // seeding from it runs this thread's next background turn on another
+                // session's model — across providers, on a model that cannot resolve.
+                let own = |remembered: Option<&String>, session: &str| {
+                    remembered
+                        .filter(|value| !value.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| session.to_string())
+                };
+                runtime.model = own(remembered.as_ref().map(|s| &s.model), &self.model);
+                runtime.approval_policy = own(
+                    remembered.as_ref().map(|s| &s.approval_policy),
+                    &self.approval_policy,
+                );
+                runtime.sandbox = own(remembered.as_ref().map(|s| &s.sandbox), &self.sandbox);
+                runtime.reasoning_effort = own(
+                    remembered.as_ref().map(|s| &s.reasoning_effort),
+                    &self.reasoning_effort,
+                );
                 runtime
             })
     }

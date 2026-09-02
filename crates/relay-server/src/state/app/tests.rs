@@ -12253,6 +12253,9 @@ mod review_tests {
         // assert the model/effort a reviewer turn actually ran with (reuse must keep
         // the reviewer's own model, not the parent's).
         turn_models: Arc<Mutex<Vec<(String, String, String)>>>,
+        // When true, `list_models` errors — a COLD catalog, which is the state
+        // every provider is in right after a relay restart.
+        list_models_fails: Arc<AtomicBool>,
         // When true, a REVIEWER turn (its prompt carries the relay's workspace diff)
         // completes WITHOUT emitting an assistant reply — exercising the read-back
         // guard that must refuse to reuse a thread's PRIOR review as this turn's
@@ -12388,6 +12391,7 @@ mod review_tests {
                 fail_delete_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 fail_read_thread_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 turn_models: Arc::new(Mutex::new(Vec::new())),
+                list_models_fails: Arc::new(AtomicBool::new(false)),
                 suppress_reviewer_reply: Arc::new(AtomicBool::new(false)),
                 scripted_replies: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fail_next_turn_with: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -12517,6 +12521,9 @@ mod review_tests {
         }
 
         async fn list_models(&self) -> Result<Vec<ModelOptionView>, String> {
+            if self.list_models_fails.load(Ordering::Relaxed) {
+                return Err(format!("{} model/list failed (cold)", self.name));
+            }
             Ok(vec![ModelOptionView {
                 model: format!("{}-model", self.name),
                 display_name: format!("{} Model", self.name),
@@ -18272,6 +18279,277 @@ back to the tree it was born in: {second_cwd}"
         assert_eq!(
             claude.turns.lock().await.clone(),
             vec![(claude_thread.id.clone(), "route me".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_background_turn_drops_a_model_that_belongs_to_another_provider() {
+        // `thread_settings` is persisted, so a model leaked onto a thread by an older
+        // build outlives the restart that would clear a runtime. The read paths heal
+        // it (`resolve_model_for_provider`); this is the path that actually SENDS.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let codex = providers.get("codex").unwrap();
+        let claude = providers.get("claude_code").unwrap();
+
+        let codex_thread = codex.summary("codex-active", cwd);
+        let claude_thread = claude.summary("claude-bg", cwd);
+        codex
+            .threads
+            .lock()
+            .await
+            .insert(codex_thread.id.clone(), codex_thread.clone());
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.active_thread_id = Some(codex_thread.id.clone());
+            relay.current_cwd = cwd.to_string();
+            relay.threads = vec![codex_thread.clone(), claude_thread.clone()];
+            // The poisoned state an older build persisted: codex's model on a Claude
+            // thread. Nothing clears it, and the Claude worker never validates the id.
+            relay.remember_thread_settings(
+                &claude_thread.id,
+                "on-request",
+                "workspace-write",
+                "medium",
+                "codex-model",
+            );
+        }
+
+        // Ownership is only decidable once BOTH catalogs are known; this warms codex's.
+        app.send_message_to_thread(&codex_thread.id, "warm the catalog", None, None)
+            .await
+            .expect("codex send");
+        app.send_message_to_thread(&claude_thread.id, "go", None, None)
+            .await
+            .expect("claude send");
+
+        let turn_models = claude.turn_models.lock().await.clone();
+        let sent = turn_models
+            .iter()
+            .filter(|(id, _, _)| id == &claude_thread.id)
+            .last()
+            .map(|(_, model, _)| model.clone())
+            .expect("the claude thread should have run a turn");
+        assert_eq!(
+            sent, "claude_code-model",
+            "a foreign model must fall back to the thread's OWN provider, not be \
+forwarded: a Claude turn on a codex id fails and tears down the SDK session \
+({turn_models:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_catalog_falls_back_to_the_providers_own_default_not_the_global() {
+        // Right after a restart every catalog is cold, and that is exactly when the
+        // ownership guard goes blind too: `resolve_provider_model` reaches the
+        // relay-wide last-used model and the healing block is skipped in the same
+        // breath. Every provider understands the literal "default"; none of them
+        // understands another provider's id.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap();
+        claude.list_models_fails.store(true, Ordering::Relaxed);
+
+        let claude_thread = claude.summary("claude-bg", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.current_cwd = cwd.to_string();
+            relay.threads = vec![claude_thread.clone()];
+            // The user's last chat was on codex; nothing is remembered for this thread.
+            relay.model = "gpt-5.6-sol".to_string();
+        }
+
+        app.send_message_to_thread(&claude_thread.id, "go", None, None)
+            .await
+            .expect("claude send");
+
+        let turn_models = claude.turn_models.lock().await.clone();
+        let sent = turn_models
+            .iter()
+            .filter(|(id, _, _)| id == &claude_thread.id)
+            .last()
+            .map(|(_, model, _)| model.clone())
+            .expect("the claude thread should have run a turn");
+        assert_eq!(
+            sent, "default",
+            "with no catalog to check against, the fallback must be the provider's \
+own default, never the relay-wide last-used model ({turn_models:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_public_send_path_also_refuses_the_global_model_on_a_cold_catalog() {
+        // Same hole as the background path, on the route a PERSON's message takes.
+        // The composer can target a thread that is not the active one, and a thread
+        // with nothing remembered is exactly the one with no model of its own.
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap();
+        claude.list_models_fails.store(true, Ordering::Relaxed);
+
+        let claude_thread = claude.summary("claude-bg", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("codex".to_string());
+            relay.current_cwd = cwd.to_string();
+            relay.threads = vec![claude_thread.clone()];
+            relay.trusted_workspaces.push(cwd.to_string());
+            relay.model = "gpt-5.6-sol".to_string();
+        }
+
+        let snapshot = app
+            .send_message(SendMessageInput {
+                text: "go".to_string(),
+                model: None,
+                effort: None,
+                device_id: Some("device-1".to_string()),
+                thread_id: claude_thread.id.clone(),
+            })
+            .await
+            .expect("send should reach the claude thread");
+        // A fallback that blanks a control is its own bug — the sentinel has to be a
+        // value the settings UI can render, not an empty string.
+        crate::state::assert_settings_invariants(&snapshot, "public send, cold catalog");
+
+        let turn_models = claude.turn_models.lock().await.clone();
+        let sent = turn_models
+            .iter()
+            .filter(|(id, _, _)| id == &claude_thread.id)
+            .last()
+            .map(|(_, model, _)| model.clone())
+            .expect("the claude thread should have run a turn");
+        assert_eq!(
+            sent, "default",
+            "a person's send must not carry the last-used model across providers \
+either ({turn_models:?})"
+        );
+        // This path writes what it resolved back into the thread's PERSISTED
+        // settings, so a blank fallback would not just render as an empty control —
+        // it would outlive the restart, and no later catalog refresh heals a blank.
+        let remembered = app
+            .relay
+            .read()
+            .await
+            .thread_settings(&claude_thread.id)
+            .expect("a send records the thread's settings");
+        assert!(
+            !remembered.reasoning_effort.is_empty(),
+            "a cold catalog must not persist a blank effort onto the thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_catalog_does_not_carry_the_global_effort_across_providers() {
+        // The model's other half, and the same blind spot: with no catalog,
+        // `clamp_effort_to_model` is a documented no-op, so the relay-wide level goes
+        // out unchecked. Claude's "max" is not a level codex has — it answers 400,
+        // which the user reads as "can't send at all".
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["codex", "claude_code"]).await;
+        let codex = providers.get("codex").unwrap();
+        codex.list_models_fails.store(true, Ordering::Relaxed);
+
+        let codex_thread = codex.summary("codex-bg", cwd);
+        codex
+            .threads
+            .lock()
+            .await
+            .insert(codex_thread.id.clone(), codex_thread.clone());
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("claude_code".to_string());
+            relay.current_cwd = cwd.to_string();
+            relay.threads = vec![codex_thread.clone()];
+            // The user was last on Claude at "max" — a Claude-only level.
+            relay.reasoning_effort = "max".to_string();
+        }
+
+        app.send_message_to_thread(&codex_thread.id, "go", None, None)
+            .await
+            .expect("codex send");
+
+        let turn_models = codex.turn_models.lock().await.clone();
+        let sent = turn_models
+            .iter()
+            .filter(|(id, _, _)| id == &codex_thread.id)
+            .last()
+            .map(|(_, _, effort)| effort.clone())
+            .expect("the codex thread should have run a turn");
+        assert_eq!(
+            sent,
+            crate::state::DEFAULT_EFFORT,
+            "with no catalog to clamp against, the effort must fall back to the \
+level every provider has — not be carried over from another one ({turn_models:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_background_turn_clamps_an_effort_the_model_does_not_accept() {
+        // The model's other half. `clamp_effort_to_model` calls itself the last line
+        // of defense, but the send path never called it: codex answers a Claude-only
+        // effort with HTTP 400, which the user sees as "can't send at all".
+        let dir = TempDir::new().expect("tmpdir");
+        let cwd = dir.path().to_str().unwrap();
+        let (app, providers) = build_review_app(cwd, &["claude_code"]).await;
+        let claude = providers.get("claude_code").unwrap();
+
+        let claude_thread = claude.summary("claude-bg", cwd);
+        claude
+            .threads
+            .lock()
+            .await
+            .insert(claude_thread.id.clone(), claude_thread.clone());
+        {
+            let mut relay = app.relay.write().await;
+            relay.set_provider_name("claude_code".to_string());
+            relay.current_cwd = cwd.to_string();
+            relay.threads = vec![claude_thread.clone()];
+            // The catalog supports "medium" only; "xhigh" is another provider's word.
+            relay.remember_thread_settings(
+                &claude_thread.id,
+                "on-request",
+                "workspace-write",
+                "xhigh",
+                "claude_code-model",
+            );
+        }
+
+        app.send_message_to_thread(&claude_thread.id, "go", None, None)
+            .await
+            .expect("claude send");
+
+        let turn_models = claude.turn_models.lock().await.clone();
+        let sent = turn_models
+            .iter()
+            .filter(|(id, _, _)| id == &claude_thread.id)
+            .last()
+            .map(|(_, _, effort)| effort.clone())
+            .expect("the claude thread should have run a turn");
+        assert_eq!(
+            sent, "medium",
+            "an effort the model does not accept must be clamped before it reaches \
+the provider, not forwarded ({turn_models:?})"
         );
     }
 

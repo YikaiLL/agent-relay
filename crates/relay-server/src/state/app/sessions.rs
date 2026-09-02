@@ -683,11 +683,15 @@ impl AppState {
         let provider_models = self
             .load_provider_model_catalog(provider_name, bridge)
             .await;
+        // The thread's own model, else the provider-neutral sentinel — NOT
+        // `defaults.model`. A person can send into a thread that is not the active
+        // one, and a thread with nothing remembered is precisely the one whose
+        // model would otherwise come from whatever they last chatted with.
         let fallback_model = remembered_settings
             .as_ref()
             .map(|settings| settings.model.clone())
             .filter(|model| !model.is_empty())
-            .unwrap_or(defaults.model.clone());
+            .unwrap_or_else(|| super::PROVIDER_DEFAULT_MODEL.to_string());
         let model = resolve_provider_model(
             provider_name,
             &provider_models,
@@ -707,7 +711,7 @@ impl AppState {
                     .filter(|effort| !effort.is_empty())
             })
             .or_else(|| default_effort_for_model(&provider_models, &model))
-            .unwrap_or(defaults.reasoning_effort);
+            .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
         // Last line of defense: never forward an effort the target model rejects
         // (e.g. a stale Claude "max" on a codex thread -> codex 400 -> "can't
         // send at all"). Heals poisoned threads and any client that skipped the

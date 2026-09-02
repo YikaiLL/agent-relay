@@ -111,7 +111,7 @@ impl AppState {
                         &provider_name,
                         &bridge,
                         remembered_model,
-                        defaults.model,
+                        super::PROVIDER_DEFAULT_MODEL.to_string(),
                     )
                     .await;
                 let entries = page.sync.transcript.clone();

@@ -1387,7 +1387,7 @@ over on resume"
             &provider_name,
             &provider_models,
             non_empty(Some(model_override)),
-            defaults.model.clone(),
+            super::PROVIDER_DEFAULT_MODEL.to_string(),
         );
         // A seat that asked for an effort gets it, clamped to what the model
         // actually offers — an unsupported level would otherwise reach the
@@ -1397,7 +1397,7 @@ over on resume"
         let effort = match non_empty(Some(effort_override)) {
             Some(asked) => clamp_effort_to_model(asked, &model, &provider_models),
             None => default_effort_for_model(&provider_models, &model)
-                .unwrap_or_else(|| defaults.reasoning_effort.clone()),
+                .unwrap_or_else(|| DEFAULT_EFFORT.to_string()),
         };
         let (approval_policy, sandbox) = team_thread_settings(
             &provider_name,

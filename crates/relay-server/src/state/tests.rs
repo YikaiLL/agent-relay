@@ -3636,6 +3636,74 @@ fn ensure_runtime_for_thread_does_not_create_a_ghost_working_runtime() {
 }
 
 #[test]
+fn a_lazily_rebuilt_runtime_keeps_the_threads_own_settings() {
+    // Seeding a rebuilt background runtime from the session mirror hands its next
+    // turn whatever the user last chatted with — another provider's model, even.
+    let mut relay = test_state();
+    let mut tl = test_thread("tl-1", "/tmp/project");
+    tl.provider = "claude_code".to_string();
+    tl.source = "claude_code".to_string();
+    relay.register_background_thread(
+        tl,
+        "/tmp/project",
+        "opus[1m]",
+        "on-request",
+        "workspace-write",
+        "xhigh",
+    );
+
+    // The user chats in a Cursor session; the mirror follows that thread instead.
+    relay.model = "default[]".to_string();
+    relay.reasoning_effort = "none".to_string();
+    relay.approval_policy = "never".to_string();
+    relay.sandbox = "danger-full-access".to_string();
+
+    // A REAL restart, not just a dropped runtime: persist, then load into a fresh
+    // relay. `runtimes` is not persisted and `thread_settings` is — that asymmetry
+    // is the whole reason a rebuilt runtime has to look the settings up.
+    let persisted = PersistedRelayState::from_relay(&relay);
+    let mut relay = test_state();
+    relay.model = "default[]".to_string();
+    relay.reasoning_effort = "none".to_string();
+    relay.approval_policy = "never".to_string();
+    relay.sandbox = "danger-full-access".to_string();
+    relay.apply_persisted(&persisted);
+    assert!(
+        !relay.runtimes.contains_key("tl-1"),
+        "a restart must not carry runtimes over, or this proves nothing"
+    );
+
+    let rebuilt = relay.ensure_runtime_for_thread("tl-1");
+    assert_eq!(
+        rebuilt.model, "opus[1m]",
+        "a rebuilt background runtime must keep its own model, not the session's"
+    );
+    assert_eq!(
+        rebuilt.reasoning_effort, "xhigh",
+        "and its own effort — an effort the session's model does not accept is a hard error"
+    );
+    assert_eq!(rebuilt.approval_policy, "on-request");
+    assert_eq!(rebuilt.sandbox, "workspace-write");
+}
+
+#[test]
+fn a_rebuilt_runtime_with_nothing_remembered_still_falls_back_to_the_session() {
+    // No remembered settings: the session mirror is all there is, and it is better
+    // than an empty model that no provider can resolve.
+    let mut relay = test_state();
+    relay.model = "gpt-5-codex".to_string();
+    relay.reasoning_effort = "medium".to_string();
+    relay.approval_policy = "on-request".to_string();
+    relay.sandbox = "workspace-write".to_string();
+
+    let rt = relay.ensure_runtime_for_thread("never-seen");
+    assert_eq!(rt.model, "gpt-5-codex");
+    assert_eq!(rt.reasoning_effort, "medium");
+    assert_eq!(rt.approval_policy, "on-request");
+    assert_eq!(rt.sandbox, "workspace-write");
+}
+
+#[test]
 fn active_idle_thread_can_be_archived() {
     let mut relay = test_state();
     relay.threads = vec![test_thread("thread-1", "/tmp/project")];
