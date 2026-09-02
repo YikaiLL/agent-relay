@@ -847,6 +847,227 @@ trace: 38% of one real run landed in that bucket"
     );
 }
 
+/// The role map is keyed BY the thread id, so a promotion that skipped it
+/// strands the role on a dead thread and the live seat bills under none.
+#[tokio::test]
+async fn a_promoted_run_owned_seat_keeps_the_role_it_was_started_as() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app
+        .start_team_run(team_input(&root))
+        .await
+        .expect("the team should start");
+
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.record_run_thread("claude-pending-mr-dev");
+            run.record_run_thread_role("claude-pending-mr-dev", relay_api::team::TeamRole::Dev);
+        });
+        relay.promote_background_thread("claude-pending-mr-dev", "sess-mr-dev");
+    }
+
+    let relay = app.relay.read().await;
+    let run = relay.team_run(&run_id).cloned().expect("the run is live");
+    assert!(
+        run.run_owned_thread_ids
+            .iter()
+            .any(|id| id == "sess-mr-dev"),
+        "the id itself has always followed the promotion"
+    );
+    assert_eq!(
+        run.run_owned_thread_roles
+            .get("sess-mr-dev")
+            .map(String::as_str),
+        Some("dev"),
+        "the role is keyed by thread id, so it has to be re-keyed with it"
+    );
+    assert!(
+        !run.run_owned_thread_roles
+            .contains_key("claude-pending-mr-dev"),
+        "the dead id must not linger as a second entry"
+    );
+    assert_eq!(
+        relay.thread_attribution("sess-mr-dev").role.as_deref(),
+        Some("dev"),
+        "spend after a promotion must still name the seat that made it"
+    );
+}
+
+/// This seat WRITES, so a drain that missed it would leave files changing after
+/// the run's locks were released.
+#[tokio::test]
+async fn the_mr_revision_dev_is_rekeyed_and_drained_like_every_other_seat() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app
+        .start_team_run(team_input(&root))
+        .await
+        .expect("the team should start");
+
+    {
+        let mut relay = app.relay.write().await;
+        relay.update_team_run(&run_id, |run| {
+            run.mr_dev_thread_id = Some("claude-pending-mr".to_string());
+        });
+        relay.promote_background_thread("claude-pending-mr", "sess-mr");
+    }
+
+    let run = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .cloned()
+        .expect("the run is live");
+    assert_eq!(
+        run.mr_dev_thread_id.as_deref(),
+        Some("sess-mr"),
+        "a seat still holding a promoted-away id reads as idle while it is working"
+    );
+    assert_eq!(
+        run.thread_in_slot(crate::state::TeamThreadSlot::MrDev)
+            .as_deref(),
+        Some("sess-mr"),
+        "the slot re-resolves rather than handing back what it captured"
+    );
+    assert!(
+        run.owned_thread_ids().iter().any(|id| id == "sess-mr"),
+        "the seat that writes must be in the set the drain walks"
+    );
+}
+
+/// A replan supersedes only what never finished, so without the stamp a
+/// reopened run's old and new implementers are indistinguishable.
+#[test]
+fn a_replan_stamps_the_cycle_that_planned_each_sub_task() {
+    let mut run = crate::state::TeamRun::new(
+        "run-1".to_string(),
+        Default::default(),
+        "/tmp/wt".to_string(),
+        "device-1".to_string(),
+    );
+    run.replan_sub_tasks(vec![crate::state::SubTask {
+        id: "a".to_string(),
+        title: "first".to_string(),
+        ..Default::default()
+    }]);
+    run.sub_tasks[0].status = crate::state::SubTaskStatus::Done;
+    run.sub_tasks[0].dev_thread_id = Some("dev-old".to_string());
+
+    run.reopened_count = 1;
+    run.replan_sub_tasks(vec![crate::state::SubTask {
+        id: "b".to_string(),
+        title: "second".to_string(),
+        ..Default::default()
+    }]);
+
+    assert_eq!(
+        run.sub_tasks.len(),
+        2,
+        "a finished sub-task survives the replan that follows a reopen"
+    );
+    assert_eq!(run.sub_tasks[0].cycle, 0);
+    assert_eq!(
+        run.sub_tasks[1].cycle, 1,
+        "the new plan belongs to the cycle that asked for it"
+    );
+}
+
+/// The driver names the session it wants; only the relay can say whether it is
+/// still reachable.
+#[tokio::test]
+async fn a_recorded_seat_is_reused_when_reachable_and_replaced_when_not() {
+    use relay_api::TeamPort as _;
+
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app
+        .start_team_run(team_input(&root))
+        .await
+        .expect("the team should start");
+
+    let started = app
+        .resume_or_start_thread(&run_id, relay_api::team::TeamRole::Dev, &[])
+        .await
+        .expect("a seat starts when nothing is offered");
+
+    assert_eq!(
+        app.resume_or_start_thread(&run_id, relay_api::team::TeamRole::Dev, &[started.clone()])
+            .await
+            .expect("the offered seat is still reachable"),
+        started,
+        "a routable session must be handed straight back, not duplicated"
+    );
+
+    assert_eq!(
+        app.resume_or_start_thread(
+            &run_id,
+            relay_api::team::TeamRole::Dev,
+            &["sess-that-never-existed".to_string(), started.clone()]
+        )
+        .await
+        .expect("the list is walked in order"),
+        started,
+        "a dead first choice must fall through to a live second, not past it"
+    );
+
+    let replaced = app
+        .resume_or_start_thread(
+            &run_id,
+            relay_api::team::TeamRole::Dev,
+            &["sess-that-never-existed".to_string()],
+        )
+        .await
+        .expect("an unroutable seat is replaced rather than fatal");
+    assert_ne!(
+        replaced, "sess-that-never-existed",
+        "a session the relay cannot route to must not be sent a turn"
+    );
+    assert_ne!(replaced, started, "and it must be a genuinely new seat");
+}
+
+/// The thread cache outlives the session behind it: archive one and the route
+/// still resolves, so a route-only check returns a seat whose turn will fail.
+#[tokio::test]
+async fn a_seat_whose_session_is_gone_is_not_reused_just_because_it_still_routes() {
+    use relay_api::TeamPort as _;
+
+    let (_repo, root) = init_team_repo().await;
+    let (app, providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app
+        .start_team_run(team_input(&root))
+        .await
+        .expect("the team should start");
+
+    let seat = app
+        .resume_or_start_thread(&run_id, relay_api::team::TeamRole::Dev, &[])
+        .await
+        .expect("a seat starts");
+
+    // Take the session out from under it, leaving the relay's cache untouched.
+    providers
+        .get("codex")
+        .unwrap()
+        .archive_thread(&seat)
+        .await
+        .expect("the provider drops the session");
+
+    assert!(
+        app.find_thread_provider(&seat).await.is_ok(),
+        "the route still resolves — which is exactly why it is not enough"
+    );
+
+    let replacement = app
+        .resume_or_start_thread(&run_id, relay_api::team::TeamRole::Dev, &[seat.clone()])
+        .await
+        .expect("a seat is still produced");
+    assert_ne!(
+        replacement, seat,
+        "the session is gone, so reusing it would fail the run on its first turn"
+    );
+}
+
 /// A standalone review is reviewing too. Billing it under no role at all puts it
 /// in the same bucket as an ordinary chat session, where nobody can find it.
 #[tokio::test]

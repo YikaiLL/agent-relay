@@ -443,6 +443,16 @@ pub trait TeamPort: Send + Sync {
         run_id: &str,
         role: team::TeamRole,
     ) -> Result<String, TeamPortError>;
+    /// The first of `candidates` that can still take a turn, else a new seat.
+    ///
+    /// Ordered, so a dead first choice falls through to a live second. "Take a
+    /// turn", not "read history" — agents refuse the latter for live sessions.
+    async fn resume_or_start_thread(
+        &self,
+        run_id: &str,
+        role: team::TeamRole,
+        candidates: &[String],
+    ) -> Result<String, TeamPortError>;
     async fn record_run_thread(&self, run_id: &str, thread_id: &str) -> team::TeamThreadSlot;
     async fn turn(
         &self,
