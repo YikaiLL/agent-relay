@@ -423,6 +423,24 @@ export async function confirmOrchestratorProposal(apiFetch, proposalId, deviceId
   return payload.data;
 }
 
+// Edit a staged card without starting it. Absent fields leave the staged value
+// alone, so `updates` carries only what changed.
+export async function reviseOrchestratorProposal(apiFetch, proposalId, updates, deviceId) {
+  const response = await apiFetch(
+    `/api/orchestrator/proposals/${encodeURIComponent(proposalId)}/revise`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...(updates || {}), device_id: deviceId || null }),
+    }
+  );
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || "Failed to update proposal");
+  }
+  return payload.data;
+}
+
 export async function dismissOrchestratorProposal(apiFetch, proposalId, deviceId) {
   const response = await apiFetch(
     `/api/orchestrator/proposals/${encodeURIComponent(proposalId)}/dismiss`,
