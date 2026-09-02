@@ -514,6 +514,10 @@ pub struct RelayState {
     /// Pending Orchestrator proposals (M4 propose/confirm). Persisted so a
     /// restart does not wipe a card the user was about to confirm.
     pub(super) orchestrator_proposals: Vec<crate::protocol::OrchestratorProposalView>,
+    /// Scheduled cards claimed by the watchdog and not yet started: off the list
+    /// above (so nothing shows or fires twice) but still saved, because a crash
+    /// while the worktree is provisioned would otherwise lose the schedule.
+    pub(super) starting_scheduled_proposals: Vec<crate::protocol::OrchestratorProposalView>,
     /// Web Push subscriptions for remote devices, keyed by `device_id` (a device
     /// can have several browser subscriptions; deduped by endpoint). Persisted so
     /// a closed/locked phone keeps receiving pushes across a relay restart.
@@ -631,6 +635,7 @@ impl RelayState {
             orchestrator_system_prompt: None,
             orchestrator_system_prompt_version: None,
             orchestrator_proposals: Vec::new(),
+            starting_scheduled_proposals: Vec::new(),
             push_subscriptions: HashMap::new(),
             push_tx: None,
             push_vapid_public_key: None,

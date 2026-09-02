@@ -298,7 +298,25 @@ impl PersistedRelayState {
             orchestrator_device_id: relay.orchestrator_device_id.clone(),
             orchestrator_system_prompt: relay.orchestrator_system_prompt.clone(),
             orchestrator_system_prompt_version: relay.orchestrator_system_prompt_version,
-            orchestrator_proposals: relay.orchestrator_proposals.clone(),
+            // A claimed card is saved too, still armed: between the claim and the
+            // recorded run it is on neither list, and a restart there would drop
+            // a schedule the user asked for rather than start it late.
+            //
+            // The claimed copy wins an id that is on both lists. While a start is
+            // in flight the truth is "not started yet", and saving the disarmed
+            // original instead would restore a schedule that never fires.
+            orchestrator_proposals: relay
+                .orchestrator_proposals
+                .iter()
+                .filter(|card| {
+                    !relay
+                        .starting_scheduled_proposals
+                        .iter()
+                        .any(|claimed| claimed.id == card.id)
+                })
+                .chain(relay.starting_scheduled_proposals.iter())
+                .cloned()
+                .collect(),
             push_subscriptions: relay.push_subscriptions.clone(),
             projects: relay.projects.clone(),
             thread_project_id: relay.thread_project_id.clone(),

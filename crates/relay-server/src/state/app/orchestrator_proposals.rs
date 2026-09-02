@@ -391,7 +391,7 @@ impl AppState {
         let claimed = {
             let mut relay = self.relay.write().await;
             let mut claimed = Vec::new();
-            let mut changed = false;
+            let mut in_flight = Vec::new();
             for proposal in &mut relay.orchestrator_proposals {
                 let Some(due_at) = proposal.scheduled_start_at else {
                     continue;
@@ -405,11 +405,14 @@ impl AppState {
                 if now < due_at {
                     continue;
                 }
+                // The armed copy, parked before the claim disarms this one: from
+                // here until the run is recorded a save must still find a schedule.
+                in_flight.push(proposal.clone());
                 proposal.auto_start = false;
-                changed = true;
                 claimed.push((proposal.id.clone(), proposal.proposed_by_device_id.clone()));
             }
-            if changed {
+            if !in_flight.is_empty() {
+                relay.starting_scheduled_proposals.append(&mut in_flight);
                 relay.notify();
             }
             claimed
@@ -426,19 +429,23 @@ impl AppState {
                     },
                 )
                 .await;
-            let Err(error) = outcome else {
-                continue;
-            };
-            // The card is back on the list, already disarmed by the claim above.
-            // Say why, so it reads as a card to retry by hand rather than one
-            // that is still waiting for a start that will never come.
             let mut relay = self.relay.write().await;
-            if let Some(proposal) = relay
-                .orchestrator_proposals
-                .iter_mut()
-                .find(|entry| entry.id == proposal_id)
-            {
-                proposal.schedule_error = Some(format!("automatic start failed: {error}"));
+            // Settled either way now — the run is recorded, or `confirm` has put
+            // the card back — so the parked copy has nothing left to protect.
+            relay
+                .starting_scheduled_proposals
+                .retain(|entry| entry.id != proposal_id);
+            if let Err(error) = outcome {
+                // The card is back on the list, already disarmed by the claim above.
+                // Say why, so it reads as a card to retry by hand rather than one
+                // that is still waiting for a start that will never come.
+                if let Some(proposal) = relay
+                    .orchestrator_proposals
+                    .iter_mut()
+                    .find(|entry| entry.id == proposal_id)
+                {
+                    proposal.schedule_error = Some(format!("automatic start failed: {error}"));
+                }
             }
             relay.notify();
         }
@@ -1035,6 +1042,10 @@ mod tests {
             app.snapshot().await.orchestrator_proposals.is_empty(),
             "a started card is spent"
         );
+        assert!(
+            saved_proposals(&app).await.is_empty(),
+            "and spent on disk too, or a restart would start it a second time"
+        );
     }
 
     /// Fire once, as an outcome: two ticks together still produce one run.
@@ -1054,6 +1065,13 @@ mod tests {
         );
 
         assert_eq!(app.teams().await.teams.len(), 1, "two ticks, one run");
+    }
+
+    /// The cards a restart would come back to, which is not the visible list:
+    /// a claimed card is saved while its run is provisioned.
+    async fn saved_proposals(app: &AppState) -> Vec<OrchestratorProposalView> {
+        let relay = app.relay.read().await;
+        crate::state::persistence::PersistedRelayState::from_relay(&relay).orchestrator_proposals
     }
 
     /// Bring a staged card's start time into the past.
@@ -1303,6 +1321,12 @@ mod tests {
             after_first[0].schedule_error.is_some(),
             "and the card must say why it stopped trying"
         );
+        assert_eq!(
+            saved_proposals(&app).await,
+            after_first,
+            "a restart must find that same disarmed card, not the armed copy the \
+claim parked while the start was in flight"
+        );
 
         // The tick 15 seconds later must find nothing to do.
         app.start_due_scheduled_proposals_at(due_at + 15).await;
@@ -1344,6 +1368,99 @@ mod tests {
             1,
             "a card that survived the restart must still start on time"
         );
+    }
+
+    /// Criterion 4 in the window the restart test above cannot see. Between the
+    /// claim and the recorded run the card is off the list while a worktree is
+    /// provisioned, and the persistence task saves on its own schedule: a save
+    /// landing in there must still find the schedule, or a restart loses the task.
+    #[tokio::test]
+    async fn a_save_landing_while_a_scheduled_card_starts_still_holds_the_schedule() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+        let card_id = staged.id.clone();
+
+        // Stands in for the persistence task: every snapshot it could have taken
+        // while the start was in flight, checked as it is taken.
+        let settled = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let app = app.clone();
+            let settled = settled.clone();
+            let card_id = card_id.clone();
+            tokio::spawn(async move {
+                let (mut lost, mut in_flight) = (0_usize, 0_usize);
+                loop {
+                    let done = settled.load(Ordering::SeqCst);
+                    {
+                        let relay = app.relay.read().await;
+                        let saved =
+                            crate::state::persistence::PersistedRelayState::from_relay(&relay);
+                        let armed = saved
+                            .orchestrator_proposals
+                            .iter()
+                            .any(|card| card.id == card_id && card.auto_start);
+                        let recorded = !saved.team_runs.is_empty();
+                        let on_the_list = relay
+                            .orchestrator_proposals
+                            .iter()
+                            .any(|card| card.id == card_id);
+                        if !armed && !recorded {
+                            lost += 1;
+                        }
+                        if armed && !on_the_list {
+                            in_flight += 1;
+                        }
+                    }
+                    if done {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                (lost, in_flight)
+            })
+        };
+
+        app.start_due_scheduled_proposals_at(due_at).await;
+        settled.store(true, Ordering::SeqCst);
+        let (lost, in_flight) = sampler.await.expect("sampler");
+
+        assert_eq!(app.teams().await.teams.len(), 1, "the card did start");
+        assert_eq!(
+            lost, 0,
+            "{lost} snapshots held neither an armed card nor a run — a restart there loses the task"
+        );
+        assert!(
+            in_flight > 0,
+            "no snapshot was taken while the start was in flight, so this proves nothing"
+        );
+    }
+
+    /// The instant the claim opens, too short for the sampler above to be relied
+    /// on: the disarmed original is still on the list while the armed copy is
+    /// already parked. Saving the original there restores a card that never fires.
+    #[tokio::test]
+    async fn a_save_during_the_claim_keeps_the_armed_copy_not_the_disarmed_one() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+
+        // Exactly what the claim leaves behind until `confirm` removes the card.
+        {
+            let mut relay = app.relay.write().await;
+            let armed = relay.orchestrator_proposals[0].clone();
+            relay.orchestrator_proposals[0].auto_start = false;
+            relay.starting_scheduled_proposals.push(armed);
+        }
+
+        let saved = saved_proposals(&app).await;
+        assert_eq!(saved.len(), 1, "one card, not two rows sharing an id");
+        assert_eq!(saved[0].id, staged.id);
+        assert!(saved[0].auto_start, "and it comes back still armed");
     }
 
     #[tokio::test]
