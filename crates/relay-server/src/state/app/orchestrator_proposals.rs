@@ -1070,26 +1070,20 @@ mod tests {
         card.scheduled_start_at = Some(unix_now() - 1);
     }
 
-    /// Wait for the watchdog to do something, bounded. Polls an outcome rather
-    /// than sleeping a fixed span, so it is as fast as the shrunk tick allows.
+    /// Returns the moment a run appears; the ceiling only bounds a stuck one and
+    /// must clear `start_team`'s git worktree, which a 2s budget did not.
     async fn wait_for_a_run(app: &AppState) -> bool {
-        for _ in 0..200 {
+        for _ in 0..600 {
             if !app.teams().await.teams.is_empty() {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
     }
 
-    /// The watchdog's SPAWN SITE, proven through the real loop.
-    ///
-    /// Composed the way `main` composes it, and — the part that makes this a
-    /// regression test rather than a demo — spawned through the same
-    /// `spawn_configured_watchdogs` seam `main` calls, never by reaching for
-    /// the loop directly. Move that spawn into a constructor and this test
-    /// stops seeing a watchdog at all, because the state under test is built
-    /// by `from_parts` and no test can run `AppState::new`.
+    /// The spawned loop itself starts a due card, composed the way `main`
+    /// composes it and through the same seam — nobody calls the sweep here.
     #[tokio::test]
     async fn the_watchdog_spawned_the_way_main_spawns_it_starts_a_due_card() {
         let (_repo, cwd) = init_repo().await;
@@ -1112,35 +1106,38 @@ mod tests {
         );
     }
 
-    /// The same card, driver and beta flag — only the spawn site differs. This
-    /// is the value `AppState::new` would have captured, and it fires nothing,
-    /// which is exactly why the spawn lives in `main` instead.
+    /// Spawn first, configure after — the order that once killed scheduling in
+    /// silence. Fails the moment `team_driver` stops being shared between clones.
     #[tokio::test]
-    async fn a_watchdog_spawned_before_the_driver_lands_never_fires() {
+    async fn a_watchdog_spawned_before_the_driver_lands_still_fires() {
         let (_repo, cwd) = init_repo().await;
         let (built, _project, _outside) = build_app(&cwd).await;
         pair_device(&built, "device-1", Vec::new()).await;
-        // The clone an `AppState::new` spawn would hold: driverless, forever.
+        // The clone an `AppState::new` spawn would have captured.
         let spawned_too_early = built.clone();
+        assert!(
+            !spawned_too_early.has_team_driver(),
+            "the premise: at spawn time this build has no driver at all"
+        );
+
+        // Spawn FIRST, configure after — the order that used to be fatal.
+        spawned_too_early.set_scheduled_proposal_tick_ms(20);
+        spawned_too_early.spawn_configured_watchdogs();
+
         let app = built.with_team_driver(std::sync::Arc::new(IdleTeamDriver));
         app.relay.write().await.trusted_workspaces.push(cwd.clone());
         app.set_beta_features_enabled(true).await;
+        assert!(
+            spawned_too_early.has_team_driver(),
+            "the clone the loop holds must observe a driver installed later"
+        );
 
         let staged = schedule_a_card(&app, 30).await;
         make_due_now(&app, &staged.id).await;
 
-        // Same `Arc`, so the early clone's loop really does tick this fast.
-        app.set_scheduled_proposal_tick_ms(20);
-        spawned_too_early.spawn_configured_watchdogs();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
         assert!(
-            app.teams().await.teams.is_empty(),
-            "a watchdog holding a driverless clone cannot start anything"
-        );
-        assert!(
-            app.snapshot().await.orchestrator_proposals[0].auto_start,
-            "and must leave the card armed for a relay that spawned correctly"
+            wait_for_a_run(&app).await,
+            "a watchdog spawned before the driver must still start a due card"
         );
     }
 
@@ -1257,23 +1254,22 @@ mod tests {
         );
     }
 
-    /// `with_team_driver` returns a NEW `AppState`, and `team_driver` is a plain
-    /// field, so a clone taken before it keeps `None` forever. That is why the
-    /// watchdog is spawned from `main` after configuration rather than inside
-    /// `AppState::new` — if this ever fails, the driver became shared and that
-    /// placement can be revisited.
+    /// `with_team_driver` still returns a new `AppState`, but the driver is in a
+    /// cell every clone shares, so one taken beforehand observes it anyway.
     #[tokio::test]
-    async fn a_clone_taken_before_the_driver_is_installed_never_gets_it() {
+    async fn a_clone_taken_before_the_driver_is_installed_still_gets_it() {
         let (_repo, cwd) = init_repo().await;
         let app = beta_app(&cwd).await;
 
         let cloned_early = app.clone();
+        assert!(!cloned_early.has_team_driver(), "none installed yet");
+
         let configured = app.with_team_driver(std::sync::Arc::new(IdleTeamDriver));
 
         assert!(configured.has_team_driver());
         assert!(
-            !cloned_early.has_team_driver(),
-            "a clone taken before configuration cannot start a team, ever"
+            cloned_early.has_team_driver(),
+            "a clone taken before configuration must observe the driver too"
         );
     }
 

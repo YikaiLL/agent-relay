@@ -103,9 +103,9 @@ pub struct AppState {
     /// which is why the guards below need no `cfg` and the public repo compiles
     /// and runs untouched.
     orchestrators: relay_api::Orchestrators,
-    /// The private task workflow runner and sole product registration point.
-    /// `None` in a public build: task starts refuse before any work begins.
-    team_driver: Option<Arc<dyn relay_api::TeamDriver>>,
+    /// The private workflow runner, `None` in a public build. Clone-shared so
+    /// install order cannot matter; not a `OnceLock` — tests replace it.
+    team_driver: Arc<std::sync::Mutex<Option<Arc<dyn relay_api::TeamDriver>>>>,
     /// Line-comment anchor re-location. Public builds use
     /// [`crate::usage::review_anchors::UnavailableReviewAnchors`].
     review_anchors: Arc<dyn relay_api::ReviewAnchors>,
@@ -362,7 +362,7 @@ impl AppState {
         Self {
             relay,
             orchestrators: relay_api::Orchestrators::default(),
-            team_driver: None,
+            team_driver: Arc::new(std::sync::Mutex::new(None)),
             review_anchors: Arc::new(crate::usage::review_anchors::UnavailableReviewAnchors),
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
@@ -527,7 +527,7 @@ impl AppState {
         let state = Self {
             relay,
             orchestrators: relay_api::Orchestrators::default(),
-            team_driver: None,
+            team_driver: Arc::new(std::sync::Mutex::new(None)),
             review_anchors: Arc::new(crate::usage::review_anchors::UnavailableReviewAnchors),
             providers,
             provider_model_catalogs: Arc::new(RwLock::new(HashMap::new())),
@@ -696,20 +696,8 @@ impl AppState {
         });
     }
 
-    /// Start the background loops that must not run until the state is fully
-    /// configured, and the ONLY place that decides when those loops begin.
-    ///
-    /// `AppState::new` must not spawn them. `with_team_driver` is a builder
-    /// that consumes and returns `Self`, so the driver lands on a value the
-    /// constructor never sees; a loop spawned there holds a clone with
-    /// `team_driver: None` for the process's whole life, and the scheduled-
-    /// proposal sweep declines every card when there is no driver. Scheduling
-    /// would simply never fire, with nothing on screen to say so.
-    ///
-    /// This exists as its own step so `main` and the tests compose startup the
-    /// same way. Move a spawn out of here and into a constructor and
-    /// `the_watchdog_spawned_the_way_main_spawns_it_starts_a_due_card` fails,
-    /// which is the entire point of routing both callers through one seam.
+    /// One place where startup's background loops begin, so `main` and the tests
+    /// compose it alike. Placement is free: the team driver is clone-shared.
     pub(crate) fn spawn_configured_watchdogs(&self) {
         self.spawn_scheduled_proposal_watchdog();
     }
@@ -932,9 +920,12 @@ in thread {thread_id}: {error}"
         &self.orchestrators
     }
 
-    /// Install the private workflow runner. Call once before sharing the state.
-    pub fn with_team_driver(mut self, driver: Arc<dyn relay_api::TeamDriver>) -> Self {
-        self.team_driver = Some(driver);
+    /// Install the private workflow runner. Writes through the shared cell, so
+    /// clones taken before this call see it too.
+    pub fn with_team_driver(self, driver: Arc<dyn relay_api::TeamDriver>) -> Self {
+        if let Ok(mut slot) = self.team_driver.lock() {
+            *slot = Some(driver);
+        }
         self
     }
 
@@ -947,9 +938,15 @@ in thread {thread_id}: {error}"
         self
     }
 
+    /// The installed workflow runner, if this build has one. Cloned out rather
+    /// than borrowed: the guard must not be held across an await.
+    pub(crate) fn team_driver(&self) -> Option<Arc<dyn relay_api::TeamDriver>> {
+        self.team_driver.lock().ok()?.clone()
+    }
+
     /// Whether this build has the private workflow runner.
     pub(crate) fn has_team_driver(&self) -> bool {
-        self.team_driver.is_some()
+        self.team_driver().is_some()
     }
 
     /// Unlock in-development features. Call once at startup, before the state is shared.

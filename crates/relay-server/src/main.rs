@@ -306,9 +306,8 @@ async fn main() {
         info!("beta features are ON for this launch (SEALWIRE_BETA)");
     }
 
-    // Here, not in `AppState::new`: these loops keep a clone, and the team
-    // driver installed above is a plain field that a clone taken earlier would
-    // never see. Tests compose startup through this same call.
+    // One place where startup's background loops begin, so tests compose it the
+    // same way. Placement is free: the team driver is shared between clones.
     state.spawn_configured_watchdogs();
 
     let web_assets = default_web_assets();

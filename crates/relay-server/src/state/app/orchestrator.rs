@@ -201,7 +201,7 @@ New task button on the Tasks screen."
     }
 
     fn orchestrator_persona_from_driver(&self) -> Option<(String, u32)> {
-        let driver = self.team_driver.as_ref()?;
+        let driver = self.team_driver()?;
         let prompt = driver.orchestrator_system_prompt();
         if prompt.trim().is_empty() {
             return None;

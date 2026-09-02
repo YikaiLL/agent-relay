@@ -588,7 +588,7 @@ over on resume"
                 run_id: run_id.clone(),
                 disarmed: false,
             };
-            let Some(driver) = app.team_driver.clone() else {
+            let Some(driver) = app.team_driver() else {
                 app.fail_team_run(
                     &run_id,
                     "this build has no task-team engine, so the run cannot be driven",
