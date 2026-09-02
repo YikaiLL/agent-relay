@@ -12,6 +12,7 @@ import {
   submitAskUserAnswer,
   startTeam,
   teamAction,
+  markTeam,
   TEAM_ACTIONS,
 } from "./api.js";
 
@@ -251,6 +252,29 @@ test("an unknown task action never reaches the network", async () => {
   // broken" rather than "that button is wired wrong".
   const { apiFetch, calls } = makeFetchStub(jsonResponse({ ok: true, data: {} }));
   await assert.rejects(() => teamAction(apiFetch, "delete", { teamRunId: "team-1" }), /Unknown task action/);
+  assert.equal(calls.length, 0);
+});
+
+test("markTeam POSTs the mark route with status in the body", async () => {
+  const receipt = { team_run_id: "team-1", status: "cancelled", message: "ok" };
+  const { apiFetch, calls } = makeFetchStub(jsonResponse({ ok: true, data: receipt }));
+
+  const result = await markTeam(apiFetch, "cancelled", {
+    teamRunId: "team-1",
+    deviceId: "device-a",
+  });
+  assert.deepEqual(result, receipt);
+  assert.equal(calls[0].input, "/api/session/team/mark");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    team_run_id: "team-1",
+    device_id: "device-a",
+    status: "cancelled",
+  });
+});
+
+test("an unknown mark status never reaches the network", async () => {
+  const { apiFetch, calls } = makeFetchStub(jsonResponse({ ok: true, data: {} }));
+  await assert.rejects(() => markTeam(apiFetch, "merged", { teamRunId: "team-1" }), /Unknown task mark status/);
   assert.equal(calls.length, 0);
 });
 

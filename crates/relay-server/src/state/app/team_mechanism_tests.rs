@@ -2013,3 +2013,150 @@ async fn a_landed_dev_turn_and_two_reviewer_rejections_still_escalate() {
         crate::state::SubTaskStatus::Escalated
     );
 }
+
+#[tokio::test]
+async fn a_finished_task_can_be_marked_cancelled_or_done() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+    app.relay.write().await.update_team_run(&run_id, |run| {
+        run.status = crate::state::TeamRunStatus::Escalated;
+        run.phase = relay_api::team::TeamPhase::Finished;
+        run.error = Some("ran out of rounds".into());
+    });
+
+    let error = app
+        .cancel_team_run(Some(run_id.clone()), Some("device-1".to_string()))
+        .await
+        .expect_err("cancel must refuse a terminal run");
+    assert!(
+        error.contains("already finished"),
+        "the old cancel path must stay strict: {error}"
+    );
+
+    let status = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect("mark cancelled");
+    assert_eq!(status, crate::state::TeamRunStatus::Cancelled);
+
+    let status = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Done,
+        )
+        .await
+        .expect("mark done");
+    assert_eq!(status, crate::state::TeamRunStatus::Done);
+    let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert!(run.error.is_none(), "done clears the error");
+}
+
+#[tokio::test]
+async fn a_blocked_task_cannot_be_marked_while_a_turn_is_unconfirmed() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+    app.relay.write().await.update_team_run(&run_id, |run| {
+        run.status = crate::state::TeamRunStatus::Blocked;
+        run.in_flight_thread = Some("thread-mid-start".to_string());
+        run.error = Some("drain unconfirmed".into());
+    });
+
+    let error = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect_err("mark must refuse an unconfirmed blocked run");
+    assert!(
+        error.contains("did not confirm stopping"),
+        "the refusal must name the drain failure: {error}"
+    );
+    let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Blocked);
+}
+
+#[tokio::test]
+async fn mark_quiescent_refuses_when_the_run_is_no_longer_paused_or_terminal() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+    app.relay.write().await.update_team_run(&run_id, |run| {
+        run.status = crate::state::TeamRunStatus::Running;
+    });
+
+    let error = app
+        .mark_quiescent_team_run(&run_id, crate::state::TeamRunStatus::Cancelled)
+        .await
+        .expect_err("mark must not relabel a live run without stopping it");
+    assert!(
+        error.contains("no longer be marked"),
+        "the refusal must name the race loser: {error}"
+    );
+    let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Running);
+}
+
+#[tokio::test]
+async fn mark_refuses_a_run_that_is_being_resolved() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+    app.relay.write().await.update_team_run(&run_id, |run| {
+        run.status = crate::state::TeamRunStatus::Resolving;
+    });
+
+    let error = app
+        .mark_team_run(
+            Some(run_id.clone()),
+            Some("device-1".to_string()),
+            crate::state::TeamRunStatus::Cancelled,
+        )
+        .await
+        .expect_err("mark must refuse a recovery in flight");
+    assert!(
+        error.contains("being resolved"),
+        "the refusal must name the recovery owner: {error}"
+    );
+    let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Resolving);
+}
+
+#[tokio::test]
+async fn reopen_rollback_does_not_clobber_a_concurrent_mark() {
+    let (_repo, root) = init_team_repo().await;
+    let (app, _providers) = build_review_app(&root, &["codex"]).await;
+    let run_id = app.start_team_run(team_input(&root)).await.expect("start");
+
+    app.relay.write().await.update_team_run(&run_id, |run| {
+        run.status = crate::state::TeamRunStatus::Escalated;
+    });
+    let restore = app
+        .relay
+        .read()
+        .await
+        .team_run(&run_id)
+        .cloned()
+        .expect("run");
+
+    app.relay.write().await.update_team_run(&run_id, |run| {
+        run.status = crate::state::TeamRunStatus::Cancelled;
+    });
+
+    app.rollback_reopen_provision(&run_id, &restore).await;
+
+    let run = app.relay.read().await.team_run(&run_id).cloned().unwrap();
+    assert_eq!(run.status, crate::state::TeamRunStatus::Cancelled);
+}

@@ -234,6 +234,27 @@ export async function teamAction(apiFetch, action, { teamRunId, deviceId } = {})
   return payload.data;
 }
 
+/** Relabel a finished task to `done` or `cancelled` without reopening it. */
+export async function markTeam(apiFetch, status, { teamRunId, deviceId } = {}) {
+  if (status !== "done" && status !== "cancelled") {
+    throw new Error(`Unknown task mark status: ${status}`);
+  }
+  const response = await apiFetch("/api/session/team/mark", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      team_run_id: teamRunId || null,
+      device_id: deviceId || null,
+      status,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.error?.message || `Failed to mark the task ${status}`);
+  }
+  return payload.data;
+}
+
 export async function getDevices(apiFetch) {
   const response = await apiFetch("/api/devices", { method: "GET" });
   const payload = await response.json();

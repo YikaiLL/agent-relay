@@ -2502,6 +2502,33 @@ impl RelayState {
         }
     }
 
+    /// Resolve the run a mark action targets.
+    ///
+    /// Unlike [`active_team_run_id`], this reaches terminal runs so a finished
+    /// task can be dismissed without reopening it.
+    pub(crate) fn team_run_id_for_mark(&self, run_id: Option<&str>) -> Result<String, String> {
+        if let Some(run_id) = run_id {
+            return match self.team_runs.get(run_id) {
+                Some(run) => Ok(run.id.clone()),
+                None => Err("there is no task with that id".to_string()),
+            };
+        }
+        let live: Vec<&TeamRun> = self
+            .team_runs
+            .values()
+            .filter(|run| !run.status.is_terminal())
+            .collect();
+        match live.as_slice() {
+            [run] => Ok(run.id.clone()),
+            [] => match self.team_runs.len() {
+                0 => Err("there is no task".to_string()),
+                1 => Ok(self.team_runs.keys().next().expect("len is 1").clone()),
+                _ => Err("team_run_id is required when more than one task exists".to_string()),
+            },
+            _ => Err("team_run_id is required when more than one task is active".to_string()),
+        }
+    }
+
     /// Resolve the run a `Blocked` recovery targets, refusing anything that is not
     /// actually blocked so a recovery cannot drain a healthy run's threads.
     pub(crate) fn blocked_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
@@ -6525,6 +6552,23 @@ mod tests {
             relay.workflow_jobs.len(),
             MAX_WORKFLOW_RUNS + 1,
             "non-terminal runs are never auto-evicted",
+        );
+    }
+
+    #[test]
+    fn team_run_id_for_mark_prefers_the_one_active_run() {
+        let mut relay = test_relay();
+        relay.insert_team_run(team_run_with_status("done-1", TeamRunStatus::Done));
+        relay.insert_team_run(team_run_with_status("live-1", TeamRunStatus::Running));
+        assert_eq!(
+            relay.team_run_id_for_mark(None).expect("active run"),
+            "live-1"
+        );
+        assert_eq!(
+            relay
+                .team_run_id_for_mark(Some("done-1"))
+                .expect("explicit"),
+            "done-1"
         );
     }
 }

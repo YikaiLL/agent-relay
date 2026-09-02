@@ -9,7 +9,7 @@ use super::*;
 use crate::orchestrator_tools::{self, ToolCall, WorkspaceFacts};
 use crate::protocol::{
     ProposeOrchestratorTaskInput, ReviseOrchestratorProposalInput, SeatAgentView,
-    SubmitAskUserAnswerInput, TaskSeatAgentsView, TeamActionInput,
+    SubmitAskUserAnswerInput, TaskSeatAgentsView, TeamActionInput, TeamMarkInput,
 };
 use serde_json::{json, Value};
 
@@ -593,7 +593,23 @@ pending_questions to read it",
                 Ok(lines.join("\n"))
             }
             ToolCall::ControlRun { action, run_id } => {
-                let action = match action.as_str() {
+                let action = action.as_str();
+                if matches!(action, "mark_cancelled" | "mark_done") {
+                    let status = if action == "mark_done" {
+                        "done"
+                    } else {
+                        "cancelled"
+                    };
+                    let receipt = self
+                        .mark_team(TeamMarkInput {
+                            team_run_id: run_id,
+                            device_id,
+                            status: status.to_string(),
+                        })
+                        .await?;
+                    return Ok(receipt.message);
+                }
+                let action = match action {
                     "pause" => TeamAction2::Pause,
                     "resume" => TeamAction2::Resume,
                     "stop" => TeamAction2::Stop,
@@ -940,7 +956,7 @@ mod tests {
 
     /// Every tool is on offer, so CALL time is the only gate left — and a
     /// refusal has to name what is missing. "Not available" reads as a blip the
-    /// model should retry; "no run is going" tells it to go look at the
+    /// model should retry; "nothing has run yet" tells it to go look at the
     /// workspace instead.
     #[tokio::test]
     async fn a_tool_the_workspace_cannot_serve_is_refused_with_the_reason() {
@@ -957,7 +973,7 @@ mod tests {
             .await
             .expect_err("no runs, no control");
         assert!(err.contains("control_run"), "{err}");
-        assert!(err.contains("no run is going"), "{err}");
+        assert!(err.contains("nothing has run yet"), "{err}");
     }
 
     /// End to end through the real tool call: what the model asked for has to

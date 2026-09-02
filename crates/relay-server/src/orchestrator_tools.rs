@@ -463,12 +463,20 @@ an investigation to implement needs this. Omit to keep it.",
     },
     ToolSpec {
         name: "control_run",
-        summary: "Pause, resume, stop, cancel or unblock a run that is already going.",
+        summary: "Pause, resume, stop, cancel, unblock, or relabel a finished run.",
         effect: Effect::Acts,
         params: &[
             ToolParam {
                 name: "action",
-                kind: ParamKind::OneOf(&["pause", "resume", "stop", "cancel", "resolve"]),
+                kind: ParamKind::OneOf(&[
+                    "pause",
+                    "resume",
+                    "stop",
+                    "cancel",
+                    "resolve",
+                    "mark_cancelled",
+                    "mark_done",
+                ]),
                 required: true,
                 summary: "What to do to it.",
             },
@@ -476,7 +484,8 @@ an investigation to implement needs this. Omit to keep it.",
                 name: "run_id",
                 kind: ParamKind::Text,
                 required: false,
-                summary: "Which run. Omit when only one is active.",
+                summary: "Which run. Omit when only one is active; mark_* still \
+reaches finished runs that way.",
             },
         ],
     },
@@ -580,7 +589,7 @@ dismiss one before you can stage another",
         "widen_scope" if facts.active_runs == 0 => {
             Some("no task is going; scope can only be widened while one is running")
         }
-        "control_run" if facts.active_runs == 0 => Some("no run is going"),
+        "control_run" if facts.known_runs == 0 => Some("nothing has run yet"),
         "rerun_sub_tasks" if facts.active_runs == 0 => {
             Some("no task is going; a finished one is reopened with propose_reopen instead")
         }
@@ -1430,13 +1439,24 @@ list built at connect time is exactly when it goes missing: {names:?}"
 
     #[test]
     fn a_finished_run_can_still_be_asked_about() {
-        // task_status follows known_runs; control_run needs active_runs.
         let facts = WorkspaceFacts {
             known_teams: 1,
             known_runs: 2,
             ..Default::default()
         };
         assert!(blocked_reason("task_status", &facts).is_none());
+        assert!(
+            blocked_reason("control_run", &facts).is_none(),
+            "mark_* must reach finished runs"
+        );
+    }
+
+    #[test]
+    fn control_run_is_unavailable_before_anything_has_run() {
+        let facts = WorkspaceFacts {
+            known_teams: 1,
+            ..Default::default()
+        };
         assert!(blocked_reason("control_run", &facts).is_some());
     }
 

@@ -56,12 +56,13 @@ use protocol::{
     ReviewDeleteReceipt, ReviewsResponse, RevokeDeviceReceipt, SendMessageInput, SessionSnapshot,
     SessionSnapshotCompactProfile, StartSessionInput, StartTeamInput, StartTeamReceipt,
     StartWorkflowInput, StartWorkflowReceipt, StopTurnInput, SubmitAskUserAnswerInput,
-    TakeOverInput, TeamActionInput, TeamActionReceipt, TeamFileResponse, TeamsResponse,
-    ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse, ThreadRenameReceipt,
-    ThreadSettingsView, ThreadTranscriptResponse, ThreadWorkspaceInput, ThreadsQuery,
-    ThreadsResponse, TickReviewFileInput, TranscriptDeltaEvent, UpdateSessionSettingsInput,
-    WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt, WorkflowsResponse,
-    WorkspaceDiffResponse, WorkspaceGitContextView, WorkspaceTrustInput, WorkspaceTrustReceipt,
+    TakeOverInput, TeamActionInput, TeamActionReceipt, TeamFileResponse, TeamMarkInput,
+    TeamsResponse, ThreadArchiveReceipt, ThreadDeleteReceipt, ThreadEntryDetailResponse,
+    ThreadRenameReceipt, ThreadSettingsView, ThreadTranscriptResponse, ThreadWorkspaceInput,
+    ThreadsQuery, ThreadsResponse, TickReviewFileInput, TranscriptDeltaEvent,
+    UpdateSessionSettingsInput, WatchThreadsInput, WorkflowActionInput, WorkflowActionReceipt,
+    WorkflowsResponse, WorkspaceDiffResponse, WorkspaceGitContextView, WorkspaceTrustInput,
+    WorkspaceTrustReceipt,
 };
 use provider::ProviderImage;
 use relay_http::{
@@ -441,6 +442,7 @@ fn build_router(context: AppContext, web_assets: WebAssets) -> Router {
         .route("/api/session/team/pause", post(pause_team))
         .route("/api/session/team/stop", post(stop_team))
         .route("/api/session/team/cancel", post(cancel_team))
+        .route("/api/session/team/mark", post(mark_team))
         .route("/api/session/team/resume", post(resume_team))
         .route("/api/session/team/resolve", post(resolve_team))
         .route("/api/session/teams", get(list_teams))
@@ -1704,6 +1706,17 @@ async fn cancel_team(
     Json(input): Json<TeamActionInput>,
 ) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
     team_action(context, headers, uri, TeamAction2::Cancel, input).await
+}
+
+async fn mark_team(
+    State(context): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(input): Json<TeamMarkInput>,
+) -> Result<Json<ApiEnvelope<TeamActionReceipt>>, (StatusCode, Json<ApiError>)> {
+    authorize_api(&context, &headers, &uri)?;
+    let receipt = context.app.mark_team(input).await.map_err(bad_request)?;
+    Ok(Json(ApiEnvelope::ok(receipt)))
 }
 
 async fn resume_team(

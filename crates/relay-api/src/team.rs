@@ -1015,6 +1015,35 @@ impl TeamRun {
         true
     }
 
+    /// Relabel a run to `Done` or `Cancelled` regardless of its current status.
+    ///
+    /// Unlike [`set_status`] and [`cancel`], this is an explicit user/agent
+    /// override: a terminal run can be dismissed or accepted without reopening
+    /// it. Callers that still have a live driver must drain first.
+    pub fn force_mark_status(&mut self, status: TeamRunStatus) -> bool {
+        match status {
+            TeamRunStatus::Done | TeamRunStatus::Cancelled => {}
+            _ => return false,
+        }
+        if self.status == status {
+            return false;
+        }
+        self.pause_requested = false;
+        self.stopping = false;
+        self.awaiting = None;
+        self.in_flight_thread = None;
+        self.pause_reason = None;
+        self.pause_kind = None;
+        if matches!(status, TeamRunStatus::Done) {
+            self.error = None;
+        } else if self.error.is_none() {
+            self.error = Some("the task was marked cancelled".into());
+        }
+        self.status = status;
+        self.updated_at = unix_now();
+        true
+    }
+
     /// `Blocked` -> `Resolving`. Only a blocked run may enter, so two concurrent
     /// recoveries cannot drain the same threads twice.
     pub fn begin_resolving_blocked(&mut self) -> bool {
@@ -1487,6 +1516,20 @@ mod tests {
             !blocked.status.is_terminal(),
             "blocked still owns its locks"
         );
+    }
+
+    #[test]
+    fn force_mark_status_can_relabel_a_terminal_run() {
+        let mut run = run_with(TeamPhase::Finished, vec![]);
+        run.status = TeamRunStatus::Escalated;
+        run.error = Some("ran out of rounds".into());
+
+        assert!(run.force_mark_status(TeamRunStatus::Cancelled));
+        assert_eq!(run.status, TeamRunStatus::Cancelled);
+
+        assert!(run.force_mark_status(TeamRunStatus::Done));
+        assert_eq!(run.status, TeamRunStatus::Done);
+        assert!(run.error.is_none(), "done clears the error");
     }
 
     #[test]

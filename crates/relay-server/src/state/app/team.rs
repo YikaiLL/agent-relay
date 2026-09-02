@@ -34,7 +34,7 @@ pub(crate) const TASKS_LOCKED_MESSAGE: &str =
 
 use crate::protocol::{
     StartTeamInput, StartTeamReceipt, TeamActionInput, TeamActionReceipt, TeamAwaitingView,
-    TeamRunView, TeamSubTaskView, TeamsResponse,
+    TeamMarkInput, TeamRunView, TeamSubTaskView, TeamsResponse,
 };
 use crate::state::{
     TaskSpec, TeamPauseKind, TeamRun, TeamRunStatus, TeamThreadSlot, TurnFailureKind,
@@ -92,6 +92,8 @@ enum TeamStopKind {
     Pause,
     /// Stop now and hand the slot back. TERMINAL.
     Cancel,
+    /// Stop now and record success. TERMINAL.
+    Done,
 }
 
 impl TeamStopKind {
@@ -99,6 +101,7 @@ impl TeamStopKind {
         match self {
             Self::Pause => TeamRunStatus::Paused,
             Self::Cancel => TeamRunStatus::Cancelled,
+            Self::Done => TeamRunStatus::Done,
         }
     }
 
@@ -106,6 +109,7 @@ impl TeamStopKind {
         match self {
             Self::Pause => "stopped by the user",
             Self::Cancel => "the task was cancelled by the user",
+            Self::Done => "the task was marked done by the user",
         }
     }
 }
@@ -413,6 +417,7 @@ locally and trust it before starting a task team there"
         }
 
         let instruction = instruction.to_string();
+        let _gate = self.team_drive_gate.lock().await;
         let restore = {
             let mut relay = self.relay.write().await;
             let Some(before) = relay.team_run(&target).cloned() else {
@@ -450,19 +455,75 @@ locally and trust it before starting a task team there"
             before
         };
 
+        let ticket = match self.claim_team_drive(&target) {
+            Some(ticket) => ticket,
+            None => {
+                self.rollback_reopen_provision(&target, &restore).await;
+                return Err("this task already has a driver".to_string());
+            }
+        };
+
         // Resume owns the claim-then-flip dance; duplicating it here would be a
         // second place for a driver to be spawned twice.
-        match self.resume_team_run(Some(target.clone()), device_id).await {
+        match self.resume_team_run_holding_gate(&target, ticket).await {
             Ok(status) => Ok(status),
             Err(error) => {
-                // Put the finished record back: a refused reopen must not leave
-                // a Done task looking paused with an instruction nobody will read.
-                let mut relay = self.relay.write().await;
-                relay.update_team_run(&target, |run| *run = restore);
-                relay.notify();
+                self.rollback_reopen_provision(&target, &restore).await;
                 Err(error)
             }
         }
+    }
+
+    /// Undo a reopen that never reached a running driver.
+    ///
+    /// A concurrent mark may have settled the run terminal while reopen was in
+    /// flight; that outcome must survive a refused resume.
+    pub(crate) async fn rollback_reopen_provision(&self, target: &str, restore: &TeamRun) {
+        let mut relay = self.relay.write().await;
+        let mut restored = false;
+        relay.update_team_run(target, |run| {
+            if run.status.is_terminal() {
+                return;
+            }
+            if run.status != TeamRunStatus::Paused {
+                return;
+            }
+            *run = restore.clone();
+            restored = true;
+        });
+        if restored {
+            relay.notify();
+        }
+    }
+
+    async fn resume_team_run_holding_gate(
+        &self,
+        run_id: &str,
+        ticket: TeamDriveTicket,
+    ) -> Result<TeamRunStatus, String> {
+        let working = self.working_team_threads(run_id).await;
+        if !working.is_empty() {
+            return Err(format!(
+                "{} is still finishing a turn; try again in a moment",
+                working.join(", ")
+            ));
+        }
+
+        let mut resumed = false;
+        {
+            let mut relay = self.relay.write().await;
+            relay.update_team_run(run_id, |run| resumed = run.resume());
+            if resumed {
+                relay.push_log("info", format!("Task {run_id}: resumed"));
+                relay.notify();
+            }
+        }
+        if !resumed {
+            return Err("this task is no longer paused".to_string());
+        }
+
+        self.spawn_team_driver(run_id.to_string(), ticket);
+        Ok(TeamRunStatus::Running)
     }
 
     pub(crate) async fn resume_team_run(
@@ -507,29 +568,7 @@ locally and trust it before starting a task team there"
         // releases the gate the moment its turn BEGINS, so without the liveness
         // check below a resume would put the driver's turn on top of theirs.
         let _gate = self.team_drive_gate.lock().await;
-        let working = self.working_team_threads(&run_id).await;
-        if !working.is_empty() {
-            return Err(format!(
-                "{} is still finishing a turn; try again in a moment",
-                working.join(", ")
-            ));
-        }
-
-        let mut resumed = false;
-        {
-            let mut relay = self.relay.write().await;
-            relay.update_team_run(&run_id, |run| resumed = run.resume());
-            if resumed {
-                relay.push_log("info", format!("Task {run_id}: resumed"));
-                relay.notify();
-            }
-        }
-        if !resumed {
-            return Err("this task is no longer paused".to_string());
-        }
-
-        self.spawn_team_driver(run_id, ticket);
-        Ok(TeamRunStatus::Running)
+        self.resume_team_run_holding_gate(&run_id, ticket).await
     }
 
     /// Validate every restored `Paused` task once the relay is up.
@@ -815,6 +854,28 @@ over on resume"
         })
     }
 
+    /// Relabel a run to `done` or `cancelled`, including terminal ones.
+    pub async fn mark_team(&self, input: TeamMarkInput) -> Result<TeamActionReceipt, String> {
+        let target = parse_team_mark_status(&input.status)?;
+        let run_id = {
+            let relay = self.relay.read().await;
+            relay.team_run_id_for_mark(input.team_run_id.as_deref())?
+        };
+        let status = self
+            .mark_team_run(Some(run_id.clone()), input.device_id, target)
+            .await?;
+        let message = match status {
+            TeamRunStatus::Done => "Task marked done.".to_string(),
+            TeamRunStatus::Cancelled => "Task marked cancelled.".to_string(),
+            other => format!("Task is {}.", other.as_str()),
+        };
+        Ok(TeamActionReceipt {
+            team_run_id: run_id,
+            status: status.as_str().to_string(),
+            message,
+        })
+    }
+
     /// Every recorded task, newest first.
     pub async fn teams(&self) -> TeamsResponse {
         let relay = self.relay.read().await;
@@ -894,6 +955,175 @@ over on resume"
     ) -> Result<TeamRunStatus, String> {
         self.stop_team_run(run_id, device_id, TeamStopKind::Cancel)
             .await
+    }
+
+    /// Relabel a run to `Done` or `Cancelled`, including ones that already
+    /// finished.
+    ///
+    /// A live run is stopped and drained first; a terminal or settled run is
+    /// relabelled in place so the user or an agent can dismiss it without
+    /// reopening it.
+    pub(crate) async fn mark_team_run(
+        &self,
+        run_id: Option<String>,
+        device_id: Option<String>,
+        target: TeamRunStatus,
+    ) -> Result<TeamRunStatus, String> {
+        if !matches!(target, TeamRunStatus::Done | TeamRunStatus::Cancelled) {
+            return Err(format!(
+                "a task may only be marked done or cancelled, not {}",
+                target.as_str()
+            ));
+        }
+        if !self.beta_features_enabled().await {
+            return Err(TASKS_LOCKED_MESSAGE.to_string());
+        }
+        let (run_id, device_id) = self
+            .authorize_team_mark(run_id.as_deref(), device_id)
+            .await?;
+        let status = self
+            .team_run_snapshot(&run_id)
+            .await
+            .map(|run| run.status)
+            .ok_or_else(|| "there is no task with that id".to_string())?;
+        if status == target {
+            return Ok(target);
+        }
+        if matches!(status, TeamRunStatus::Blocked | TeamRunStatus::Resolving) {
+            if status == TeamRunStatus::Resolving {
+                return Err(
+                    "this task is being resolved; wait for that to finish before marking it"
+                        .to_string(),
+                );
+            }
+            return self.mark_blocked_team_run(&run_id, target).await;
+        }
+        if status.is_terminal() || status == TeamRunStatus::Paused {
+            return self.mark_quiescent_team_run(&run_id, target).await;
+        }
+        let kind = match target {
+            TeamRunStatus::Cancelled => TeamStopKind::Cancel,
+            TeamRunStatus::Done => TeamStopKind::Done,
+            _ => unreachable!("validated above"),
+        };
+        self.stop_team_run(Some(run_id), Some(device_id), kind)
+            .await
+    }
+
+    /// Relabel a terminal or paused run once quiescence is proved.
+    pub(crate) async fn mark_quiescent_team_run(
+        &self,
+        run_id: &str,
+        target: TeamRunStatus,
+    ) -> Result<TeamRunStatus, String> {
+        let _gate = self.team_drive_gate.lock().await;
+        let working = self.working_team_threads(run_id).await;
+        if !working.is_empty() {
+            return Err(format!(
+                "cannot mark this task {}: {} still has a turn in flight",
+                target.as_str(),
+                working.join(", ")
+            ));
+        }
+        self.commit_force_mark(run_id, target, |status| {
+            status.is_terminal() || matches!(status, TeamRunStatus::Paused)
+        })
+        .await
+    }
+
+    /// Drain a blocked recovery before relabelling it.
+    async fn mark_blocked_team_run(
+        &self,
+        run_id: &str,
+        target: TeamRunStatus,
+    ) -> Result<TeamRunStatus, String> {
+        let _gate = self.team_drive_gate.lock().await;
+        let status = self
+            .team_run_snapshot(run_id)
+            .await
+            .map(|run| run.status)
+            .ok_or_else(|| "there is no task with that id".to_string())?;
+        if status != TeamRunStatus::Blocked {
+            return Err(format!(
+                "this task is {}; it can no longer be marked {}",
+                status.as_str(),
+                target.as_str()
+            ));
+        }
+        if !self.drain_team_run(run_id).await {
+            return Err(
+                "this task could not be marked: at least one owned turn did not confirm stopping"
+                    .to_string(),
+            );
+        }
+        self.commit_force_mark(run_id, target, |status| {
+            matches!(status, TeamRunStatus::Blocked)
+        })
+        .await
+    }
+
+    /// Write a forced terminal relabel under the drive gate.
+    async fn commit_force_mark(
+        &self,
+        run_id: &str,
+        target: TeamRunStatus,
+        allowed_from: impl Fn(TeamRunStatus) -> bool,
+    ) -> Result<TeamRunStatus, String> {
+        let mut relay = self.relay.write().await;
+        let mut changed = false;
+        let mut outcome = Err("there is no task with that id".to_string());
+        if relay.team_runs.contains_key(run_id) {
+            relay.update_team_run(run_id, |run| {
+                if run.status == target {
+                    outcome = Ok(target);
+                    return;
+                }
+                if !allowed_from(run.status) {
+                    outcome = Err(format!(
+                        "this task is {}; it can no longer be marked {}",
+                        run.status.as_str(),
+                        target.as_str()
+                    ));
+                    return;
+                }
+                if !run.force_mark_status(target) {
+                    outcome = Err(format!("this task could not be marked {}", target.as_str()));
+                    return;
+                }
+                changed = true;
+                outcome = Ok(target);
+            });
+            if changed {
+                relay.notify();
+            }
+        }
+        drop(relay);
+        if changed {
+            self.release_seats_when_settled(run_id, target);
+        }
+        outcome
+    }
+
+    /// Authorize a mark action. Unlike whole-run stops, this must reach
+    /// terminal runs too, so the id resolver is wider.
+    pub(super) async fn authorize_team_mark(
+        &self,
+        run_id: Option<&str>,
+        device_id: Option<String>,
+    ) -> Result<(String, String), String> {
+        let device_id = require_device_id(device_id)?;
+        let relay = self.relay.read().await;
+        let run_id = relay.team_run_id_for_mark(run_id)?;
+        let cwd = relay
+            .team_run(&run_id)
+            .map(|run| run.cwd.clone())
+            .unwrap_or_default();
+        ensure_path_within_device_scope(
+            &cwd,
+            &relay.device_path_scope(&device_id),
+            &relay.allowed_roots,
+        )?;
+        Ok((run_id, device_id))
     }
 
     /// The shared body of both immediate stops.
@@ -1014,19 +1244,36 @@ over on resume"
 
         {
             let mut relay = self.relay.write().await;
+            let mut settled = false;
             relay.update_team_run(&run_id, |run| {
-                run.resolve_as_paused(
+                settled = run.resolve_as_paused(
                     "recovered by stopping every owned turn",
                     TeamPauseKind::User,
                 );
             });
-            relay.push_log(
-                "info",
-                format!("Task {run_id}: unblocked; owned turns are stopped and it can be resumed"),
-            );
-            relay.notify();
+            if settled {
+                relay.push_log(
+                    "info",
+                    format!(
+                        "Task {run_id}: unblocked; owned turns are stopped and it can be resumed"
+                    ),
+                );
+                relay.notify();
+            }
+            drop(relay);
+            guard.disarm();
+            if !settled {
+                let status = self
+                    .team_run_snapshot(&run_id)
+                    .await
+                    .map(|run| run.status)
+                    .ok_or_else(|| "there is no task with that id".to_string())?;
+                if status.is_terminal() {
+                    return Ok(status);
+                }
+                return Err("this task is no longer resolving".to_string());
+            }
         }
-        guard.disarm();
         // Drain was already confirmed above, so the seats are quiescent — the
         // same condition every other settled path releases under.
         self.release_seats_when_settled(&run_id, TeamRunStatus::Paused);
@@ -1155,7 +1402,10 @@ over on resume"
         // `Cancelled` outright — so neither may be written while a turn is still
         // mutating the tree. That would be a lie the user acts on. A run that
         // cannot prove quiescence is Blocked instead, keeping its locks.
-        if matches!(status, TeamRunStatus::Paused | TeamRunStatus::Cancelled) {
+        if matches!(
+            status,
+            TeamRunStatus::Paused | TeamRunStatus::Cancelled | TeamRunStatus::Done
+        ) {
             let working = self.working_team_threads(run_id).await;
             if !working.is_empty() {
                 self.block_team_run(
@@ -1178,6 +1428,9 @@ over on resume"
             }
             TeamRunStatus::Cancelled => {
                 run.cancel(reason);
+            }
+            TeamRunStatus::Done => {
+                run.force_mark_status(TeamRunStatus::Done);
             }
             other => run.set_status(other),
         });
@@ -2818,4 +3071,12 @@ Treat anything you were not shown as unreviewed.]\n",
         ));
     }
     rendered
+}
+
+fn parse_team_mark_status(raw: &str) -> Result<TeamRunStatus, String> {
+    match raw {
+        "done" => Ok(TeamRunStatus::Done),
+        "cancelled" => Ok(TeamRunStatus::Cancelled),
+        other => Err(format!("status must be done or cancelled, not {other}")),
+    }
 }

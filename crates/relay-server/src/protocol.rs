@@ -3168,6 +3168,16 @@ pub struct TeamActionInput {
     pub device_id: Option<String>,
 }
 
+/// Relabel a finished task without reopening it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TeamMarkInput {
+    #[serde(default)]
+    pub team_run_id: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TeamActionReceipt {
     pub team_run_id: String,
