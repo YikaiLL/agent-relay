@@ -1285,6 +1285,34 @@ mod tests {
         );
     }
 
+    /// A crash that reconciled a live run to `Interrupted` must still be reopenable:
+    /// the branch and sub-task progress are on disk, and "driver lost" is not a
+    /// verdict the user should have to abandon.
+    #[tokio::test]
+    async fn an_interrupted_run_can_be_reopened() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().to_string_lossy().to_string();
+        let (app, run_id) = app_with_a_live_run(&cwd).await;
+        {
+            let mut relay = app.relay.write().await;
+            relay.update_team_run(&run_id, |run| {
+                run.status = relay_api::team::TeamRunStatus::Interrupted;
+                run.error = Some(
+                    "the task team's driver was lost; re-run to continue from the last completed step"
+                        .to_string(),
+                );
+            });
+        }
+
+        app.call_orchestrator_tool(
+            "propose_reopen",
+            &json!({ "text": "Pick up where the crash cut off." }),
+            Some("device-1".to_string()),
+        )
+        .await
+        .expect("propose_reopen on an interrupted run");
+    }
+
     /// A note is the user asking for another go, so it has to buy one. Without
     /// this the note lands in a run whose sub-task already spent its two review
     /// rounds, and there is nothing left that can act on it — which is exactly

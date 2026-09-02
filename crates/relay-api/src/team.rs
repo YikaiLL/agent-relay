@@ -144,6 +144,14 @@ impl TeamRunStatus {
         matches!(self, Self::Paused)
     }
 
+    /// Whether a terminal run may be put back to work on its existing branch.
+    ///
+    /// `Interrupted` qualifies: the worktree and partial progress are on disk,
+    /// and a crash that lost the driver is not a reason to forbid continuing.
+    pub fn is_reopenable(self) -> bool {
+        matches!(self, Self::Done | Self::Escalated | Self::Interrupted)
+    }
+
     /// Whether the run holds its threads and worktree with no driver entitled to
     /// move it. `Paused` waits for the user, `Blocked` for an explicit recovery,
     /// `Resolving` for the recovery already in progress.
@@ -479,8 +487,8 @@ fn mint_number(last: &AtomicU64, now: u64) -> u64 {
 pub struct SubTask {
     pub id: String,
     pub title: String,
-    /// TL-authored and SELF-CONTAINED: the dev gets a fresh session per sub-task,
-    /// so anything not in here (or in the plan file) does not exist to it.
+    /// TL-authored and SELF-CONTAINED: each sub-task brief must stand alone for
+    /// the dev, though sub-tasks may share one session when `dev_agents` is 1.
     pub brief: String,
     pub status: SubTaskStatus,
     pub rounds_used: u32,
@@ -680,8 +688,8 @@ pub struct TeamRun {
     pub reviewer_effort: String,
 
     /// How many dev sessions the sub-tasks may be spread over, if the user said.
-    /// `None` is a session per sub-task. Clamped where it is read, not here: the
-    /// sub-task count it has to fit inside does not exist until the TL plans.
+    /// `None` is one shared session (default). Clamped to `[1, sub_tasks]` once
+    /// the TL has planned; set to the sub-task count for one session each.
     #[serde(default)]
     pub dev_agents: Option<u32>,
 

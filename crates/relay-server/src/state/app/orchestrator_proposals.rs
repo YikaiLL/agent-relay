@@ -301,7 +301,7 @@ impl AppState {
                 // what runs. Dropping these here would start every task on the
                 // relay default while the card said otherwise.
                 tl_provider: proposal.agents.tl.provider.clone(),
-                dev_agents: None,
+                dev_agents: Some(1),
                 dev_provider: proposal.agents.dev.provider.clone(),
                 reviewer_provider: proposal.agents.reviewer.provider.clone(),
                 tl_model: proposal.agents.tl.model.clone(),

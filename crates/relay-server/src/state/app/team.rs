@@ -251,7 +251,7 @@ pub(crate) struct TeamStartRequest {
     pub(crate) tl_effort: String,
     pub(crate) dev_effort: String,
     pub(crate) reviewer_effort: String,
-    /// How many dev sessions the sub-tasks may share. `None` is one each.
+    /// How many dev sessions the sub-tasks may share. `None` is one shared session.
     pub(crate) dev_agents: Option<u32>,
 }
 
@@ -362,9 +362,10 @@ locally and trust it before starting a task team there"
     /// driven, prove nothing else is driving it, and hand the driver its ticket.
     /// Put a finished run back to work with a new instruction.
     ///
-    /// Only a run that FINISHED reopens — a cancelled or failed one is not a
-    /// task to continue, it is one to look at. The phase goes back to intake so
-    /// the team lead re-reads the task (now wider) before doing anything.
+    /// Only a run that FINISHED reopens — including `Interrupted` after a lost
+    /// driver. A cancelled or failed one is not a task to continue, it is one to
+    /// look at. The phase goes back to intake so the team lead re-reads the task
+    /// (now wider) before doing anything.
     pub(crate) async fn reopen_team_run(
         &self,
         run_id: Option<String>,
@@ -405,10 +406,7 @@ locally and trust it before starting a task team there"
             let Some(before) = relay.team_run(&target).cloned() else {
                 return Err("there is no task with that id".to_string());
             };
-            if !matches!(
-                before.status,
-                TeamRunStatus::Done | TeamRunStatus::Escalated
-            ) {
+            if !before.status.is_reopenable() {
                 return Err(format!(
                     "only a finished task can be reopened; this one is {}",
                     before.status.as_str()

@@ -3123,8 +3123,8 @@ pub struct StartTeamInput {
     pub dev_effort: Option<String>,
     #[serde(default)]
     pub reviewer_effort: Option<String>,
-    /// How many dev sessions to spread the sub-tasks over. `None` is one per
-    /// sub-task. Clamped to `[1, sub_tasks]` once the TL has planned.
+    /// How many dev sessions to spread the sub-tasks over. `None` is one shared
+    /// session (default). Set to the sub-task count for one session each.
     #[serde(default)]
     pub dev_agents: Option<u32>,
     #[serde(default)]

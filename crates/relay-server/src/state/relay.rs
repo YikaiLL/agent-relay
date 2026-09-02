@@ -2454,11 +2454,10 @@ impl RelayState {
         }
     }
 
-    /// Resolve the run a reopen targets. Only a run that FINISHED qualifies: a
-    /// cancelled or failed one is something to look at, not to carry on.
+    /// Resolve the run a reopen targets. A terminal run whose work may continue
+    /// qualifies: finished cleanly, escalated, or interrupted after a lost driver.
     pub(crate) fn reopenable_team_run_id(&self, run_id: Option<&str>) -> Result<String, String> {
-        let finished =
-            |run: &TeamRun| matches!(run.status, TeamRunStatus::Done | TeamRunStatus::Escalated);
+        let finished = |run: &TeamRun| run.status.is_reopenable();
         if let Some(run_id) = run_id {
             return match self.team_runs.get(run_id) {
                 Some(run) if finished(run) => Ok(run.id.clone()),
