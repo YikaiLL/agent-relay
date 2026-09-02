@@ -46,15 +46,6 @@ fn merge_task_seat_agents(input: &TaskSeatAgentsView) -> TaskSeatAgentsView {
     merged
 }
 
-/// How late an automatic start may be and still fire.
-///
-/// A tick can be arbitrarily late — the machine was asleep — so lateness alone
-/// must not cancel a start. An hour covers a closed lid over lunch or a laptop
-/// suspended between meetings. Past that, the branch and the reason for the
-/// schedule have moved on, and setting an agent to write code against a
-/// fortnight-old intent is worse than asking again.
-const MAX_SCHEDULE_OVERDUE_SECS: u64 = 60 * 60;
-
 /// Resolve the tool's RELATIVE minutes to an absolute unix second.
 ///
 /// Relative because the orchestrator's prompt never states the current time, so
@@ -387,9 +378,10 @@ impl AppState {
     /// Pure in `now` like [`resolve_scheduled_start_at`]: there is no injectable
     /// clock here, so driving this directly is the only way to choose a time.
     pub(crate) async fn start_due_scheduled_proposals_at(&self, now: u64) {
-        // No runner means EVERY card would fail and be disarmed, throwing away
-        // the user's schedule over a property of the build. Decline instead.
-        if !self.has_team_driver() {
+        // Every reason `confirm` refuses for the BUILD rather than the card:
+        // firing here would disarm every schedule over how the relay was
+        // launched, and a later correct launch would find nothing armed.
+        if !self.has_team_driver() || !self.beta_features_enabled().await {
             return;
         }
         // Claim under the SAME write lock that selects, or two ticks both fire
@@ -407,22 +399,14 @@ impl AppState {
                 if !proposal.auto_start {
                     continue;
                 }
-                // The checked subtraction IS the due test: `None` means the time
-                // has not come. `>=`, never `==` — a machine asleep through the
-                // exact second must still start when it wakes.
-                let Some(overdue_by) = now.checked_sub(due_at) else {
-                    continue;
-                };
-                proposal.auto_start = false;
-                changed = true;
-                if overdue_by > MAX_SCHEDULE_OVERDUE_SECS {
-                    proposal.schedule_error = Some(format!(
-                        "not started automatically: it came due {} minutes ago, \
-too long to start it unattended — confirm it by hand if it is still wanted",
-                        overdue_by / 60
-                    ));
+                // `>=`, never `==`, and no cap on lateness: a machine asleep
+                // through the second — or through a fortnight — must still start
+                // when it wakes, or a restart silently drops the schedule.
+                if now < due_at {
                     continue;
                 }
+                proposal.auto_start = false;
+                changed = true;
                 claimed.push((proposal.id.clone(), proposal.proposed_by_device_id.clone()));
             }
             if changed {
@@ -1072,23 +1056,10 @@ mod tests {
         assert_eq!(app.teams().await.teams.len(), 1, "two ticks, one run");
     }
 
-    /// A tick can be arbitrarily late — the machine was asleep. Late is normal
-    /// and must still fire, or a suspended laptop silently drops the schedule.
+    /// Acceptance criteria 2 and 4: how late the machine was is not the card's
+    /// fault. A restart after a long outage must still honour the schedule.
     #[tokio::test]
-    async fn a_late_but_not_stale_proposal_still_fires() {
-        let (_repo, cwd) = init_repo().await;
-        let app = startable_app(&cwd).await;
-        let staged = schedule_a_card(&app, 30).await;
-        let due_at = staged.scheduled_start_at.expect("a start time");
-
-        app.start_due_scheduled_proposals_at(due_at + MAX_SCHEDULE_OVERDUE_SECS)
-            .await;
-
-        assert_eq!(app.teams().await.teams.len(), 1, "late is still a start");
-    }
-
-    #[tokio::test]
-    async fn an_absurdly_overdue_proposal_is_not_started() {
+    async fn a_proposal_overdue_by_a_fortnight_is_still_started() {
         let (_repo, cwd) = init_repo().await;
         let app = startable_app(&cwd).await;
         let staged = schedule_a_card(&app, 30).await;
@@ -1098,15 +1069,14 @@ mod tests {
         app.start_due_scheduled_proposals_at(due_at + 14 * 24 * 60 * 60)
             .await;
 
-        assert!(
-            app.teams().await.teams.is_empty(),
-            "waking up must not start a two-week-old task"
+        assert_eq!(
+            app.teams().await.teams.len(),
+            1,
+            "a long outage delays a scheduled start; it does not cancel it"
         );
-        let card = &app.snapshot().await.orchestrator_proposals[0];
-        assert!(!card.auto_start, "it is a manual card now");
         assert!(
-            card.schedule_error.is_some(),
-            "and it says why it did not run"
+            app.snapshot().await.orchestrator_proposals.is_empty(),
+            "a started card is spent"
         );
     }
 
@@ -1132,6 +1102,32 @@ mod tests {
         assert_eq!(
             card.schedule_error, None,
             "and must not be blamed for the build having no runner"
+        );
+    }
+
+    /// A private build launched without `SEALWIRE_BETA=1` has a driver and still
+    /// refuses every confirm. Disarming there would destroy the schedule for the
+    /// next, correctly configured, start — the same reason as the driver case.
+    #[tokio::test]
+    async fn a_build_with_beta_off_leaves_scheduled_cards_alone() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+        // Staged while beta was on, restored by a build launched without it.
+        app.set_beta_features_enabled(false).await;
+        assert!(app.has_team_driver(), "the premise of this test");
+
+        app.start_due_scheduled_proposals_at(due_at).await;
+
+        let card = &app.snapshot().await.orchestrator_proposals[0];
+        assert!(
+            card.auto_start,
+            "the card must stay armed for a launch that can actually run it"
+        );
+        assert_eq!(
+            card.schedule_error, None,
+            "and must not be blamed for beta being off"
         );
     }
 
