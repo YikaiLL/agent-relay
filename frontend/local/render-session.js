@@ -187,6 +187,7 @@ import { ThreadGroupList } from "../shared/thread-list-react.js";
 import { buildThreadActivityMap, threadActivityFor } from "../shared/thread-activity.js";
 import {
   applyOrchestratorLoadFinally,
+  beginOrchestratorLoad,
   nextOrchestratorRefreshObservations,
   nextOrchestratorWasWorking,
   orchestratorTranscriptRefreshDecision,
@@ -2236,9 +2237,6 @@ export function createSessionRenderer({
     state.orchestratorWasWorking = nextOrchestratorWasWorking(state, orchRefresh.orchWorking);
     Object.assign(state, nextOrchestratorRefreshObservations(state, orchRefresh.orchWorking));
     if (orchRefresh.refresh) {
-      if (orchRefresh.repair) {
-        state.orchestratorTailGapRepairing = true;
-      }
       state.orchestratorLastRefreshAt = Date.now();
       void loadOrchestratorTranscript(orchId, {
         terminal: orchRefresh.terminal,
@@ -2534,16 +2532,9 @@ export function createSessionRenderer({
       state.orchestratorEntriesThreadId = threadId;
       return;
     }
-    state.orchestratorEntriesLoading = true;
-    if (repair) {
-      state.orchestratorTailGapRepairing = true;
-    }
-    // A counter, not just a thread-id compare: two loads for the SAME thread
-    // both pass an id check, and then the one that happens to resolve last wins
-    // even when it is the older request. `restartOrchestrator` plus the 300ms
-    // tail refresh make that overlap ordinary.
-    const generation = (state.orchestratorLoadGeneration =
-      (state.orchestratorLoadGeneration || 0) + 1);
+    // Past both early returns, so this load will reach the `finally` that
+    // releases what it takes here.
+    const generation = beginOrchestratorLoad(state, { repair });
     const prior =
       state.orchestratorEntriesThreadId === threadId
         ? { threadId, entries: state.orchestratorEntries || [], olderCursor: state.orchestratorOlderCursor ?? null }

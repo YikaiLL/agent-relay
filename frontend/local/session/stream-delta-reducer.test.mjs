@@ -4,6 +4,7 @@ import test from "node:test";
 import { createStreamController } from "./stream.js";
 import {
   applyOrchestratorLoadFinally,
+  beginOrchestratorLoad,
   nextOrchestratorRefreshObservations,
   nextOrchestratorWasWorking,
   orchestratorTranscriptRefreshDecision,
@@ -376,11 +377,23 @@ function maybeRefreshOrchestrator(state, session, loads) {
   state.orchestratorWasWorking = nextOrchestratorWasWorking(state, decision.orchWorking);
   Object.assign(state, nextOrchestratorRefreshObservations(state, decision.orchWorking));
   if (decision.refresh) {
-    if (decision.repair) {
-      state.orchestratorTailGapRepairing = true;
-    }
     loads.push({ threadId: orchId, terminal: decision.terminal, repair: decision.repair });
   }
+}
+
+// The other half of that call site: render-session.js:2526-2546. Only the early
+// returns and the flags are modelled -- a load that answers without fetching
+// never reaches the `finally`, so nothing it left set is ever cleared.
+function loadOrchestratorTranscript(state, threadId, { repair = false } = {}) {
+  if (!threadId) {
+    return null;
+  }
+  if (state.session?.active_thread_id === threadId) {
+    state.orchestratorEntries = state.session.transcript || [];
+    state.orchestratorEntriesThreadId = threadId;
+    return null;
+  }
+  return beginOrchestratorLoad(state, { repair });
 }
 
 test("orchestrator idle refresh fires when thread_activity clears after a delta", () => {
@@ -470,10 +483,41 @@ test("orchestrator tailGap repair does not start a second fetch while one is in 
   const loads = [];
   maybeRefreshOrchestrator(h.state, orchSession(), loads);
   assert.equal(loads.length, 1);
-  assert.equal(h.state.orchestratorTailGapRepairing, true);
+  loadOrchestratorTranscript(h.state, ORCH_THREAD, { repair: true });
+  assert.equal(h.state.orchestratorTailGapRepairing, true, "the fetch that began holds the latch");
 
   maybeRefreshOrchestrator(h.state, orchSession(), loads);
   assert.equal(loads.length, 1, "tail-gap repair must be single-flight while the gap remains");
+});
+
+// The latch has exactly one release, `applyOrchestratorLoadFinally`, and it runs
+// in the loader's `finally`. So a load that returns before the `try` must not
+// have taken the latch -- it would stay set for the life of the page, and
+// `needsTailGapRepair = tailGap && !tailGapRepairing` would be false forever.
+// This early return is reachable: the decision reads the session argument
+// renderTaskTeam was called with, the loader reads `state.session`, and the two
+// disagree while a thread switch is settling.
+test("a repair that answered without fetching must not disable repair forever", () => {
+  const h = orchHarness();
+  h.state.orchestratorTailGap = true;
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads);
+  assert.equal(loads[0].repair, true, "the gap asked for a repair");
+
+  // `state.session` says the Orchestrator is the active thread, so the loader
+  // answers from the live transcript and never fetches.
+  h.state.session = { ...h.state.session, active_thread_id: ORCH_THREAD };
+  const generation = loadOrchestratorTranscript(h.state, ORCH_THREAD, { repair: true });
+  assert.equal(generation, null, "no fetch began, so there is no settle coming");
+
+  // It stops being the active thread again; the hole is still there.
+  h.state.session = { ...h.state.session, active_thread_id: LIVE_THREAD };
+  const later = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), later);
+
+  assert.equal(later.length, 1, "the gap must still be repairable");
+  assert.equal(later[0].repair, true);
 });
 
 test("a superseded orchestrator load must not clear tail-gap repair flags", () => {

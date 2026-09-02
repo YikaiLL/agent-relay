@@ -79,6 +79,27 @@ export function orchestratorWasWorkingAfterFetch(state, session, threadId, { ter
 }
 
 /**
+ * Take the flags a load owns, and answer with its generation.
+ *
+ * The mirror of `applyOrchestratorLoadFinally` below, and deliberately in the
+ * same file: `orchestratorTailGapRepairing` has exactly one release, and it runs
+ * in the loader's `finally`. Set from anywhere that can return before the `try`
+ * — the call site used to — and the latch stays true for the life of the page,
+ * which makes `needsTailGapRepair` false forever and strands every later gap.
+ *
+ * The generation is a counter, not a thread-id compare: two loads for the SAME
+ * thread both pass an id check, and then whichever resolves last wins even when
+ * it is the older request.
+ */
+export function beginOrchestratorLoad(state, { repair = false } = {}) {
+  state.orchestratorEntriesLoading = true;
+  if (repair) {
+    state.orchestratorTailGapRepairing = true;
+  }
+  return (state.orchestratorLoadGeneration = (state.orchestratorLoadGeneration || 0) + 1);
+}
+
+/**
  * Settle the flags a completed load owns, success or failure alike.
  *
  * Both answers below read `orchestratorDeltaDuringFetch`, so both are resolved
