@@ -191,7 +191,9 @@ import {
   nextOrchestratorRefreshObservations,
   nextOrchestratorWasWorking,
   orchestratorTranscriptRefreshDecision,
+  takeDeferredOrchestratorRefresh,
 } from "./orchestrator-transcript-refresh.js";
+import { createViewedThreadRefreshLatch } from "../shared/viewed-thread-refresh.js";
 import { copyTextToClipboard } from "../shared/clipboard.js";
 import { refreshedPinPage } from "./pin-page.js";
 import { attachTranscriptHistoryLoader } from "../shared/transcript-history-loader.js";
@@ -2180,6 +2182,7 @@ export function createSessionRenderer({
   // advancing costs exactly one.
   let orchestratorHistoryLoader = null;
   let orchestratorHistoryScroller = null;
+  const orchestratorRefreshLatch = createViewedThreadRefreshLatch();
 
   function renderTaskTeam(session) {
     if (!taskTeamMount) {
@@ -2236,7 +2239,9 @@ export function createSessionRenderer({
     const orchRefresh = orchestratorTranscriptRefreshDecision(state, session, orchId);
     state.orchestratorWasWorking = nextOrchestratorWasWorking(state, orchRefresh.orchWorking);
     Object.assign(state, nextOrchestratorRefreshObservations(state, orchRefresh.orchWorking));
-    if (orchRefresh.refresh) {
+    if (orchRefresh.defer) {
+      orchestratorRefreshLatch.defer(orchId);
+    } else if (orchRefresh.refresh) {
       state.orchestratorLastRefreshAt = Date.now();
       void loadOrchestratorTranscript(orchId, {
         terminal: orchRefresh.terminal,
@@ -2666,6 +2671,11 @@ export function createSessionRenderer({
       return null;
     } finally {
       state.orchestratorOlderLoading = false;
+      // Hand back the refresh this request made wait. Re-render rather than
+      // calling the loader: the decision has to be retaken, not replayed.
+      if (takeDeferredOrchestratorRefresh(state, orchestratorRefreshLatch) && state.session) {
+        renderTaskTeam(state.session);
+      }
     }
   }
 

@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createStreamController } from "./stream.js";
+import { createViewedThreadRefreshLatch } from "../../shared/viewed-thread-refresh.js";
 import {
   applyOrchestratorLoadFinally,
   beginOrchestratorLoad,
   nextOrchestratorRefreshObservations,
   nextOrchestratorWasWorking,
   orchestratorTranscriptRefreshDecision,
+  takeDeferredOrchestratorRefresh,
 } from "../orchestrator-transcript-refresh.js";
 
 // Both review rounds found bugs my earlier tests missed because they only exercised the
@@ -371,12 +373,14 @@ function orchSession({ threadActivity = [] } = {}) {
 
 // Drive the same refresh decision renderTaskTeam uses. Deltas land through the
 // stream controller; the Tasks pane applies the policy on the next render.
-function maybeRefreshOrchestrator(state, session, loads) {
+function maybeRefreshOrchestrator(state, session, loads, latch = null) {
   const orchId = state.orchestratorEntriesThreadId;
   const decision = orchestratorTranscriptRefreshDecision(state, session, orchId);
   state.orchestratorWasWorking = nextOrchestratorWasWorking(state, decision.orchWorking);
   Object.assign(state, nextOrchestratorRefreshObservations(state, decision.orchWorking));
-  if (decision.refresh) {
+  if (decision.defer) {
+    latch?.defer(orchId);
+  } else if (decision.refresh) {
     loads.push({ threadId: orchId, terminal: decision.terminal, repair: decision.repair });
   }
 }
@@ -693,4 +697,83 @@ test("the settle reads deltaDuringFetch before clearing it", () => {
     "a delta landed mid-fetch, so this terminal refresh did not observe the idle edge"
   );
   assert.equal(state.orchestratorDeltaDuringFetch, false, "and the flag is consumed");
+});
+
+// Scrolling up starts an older-history fetch that validates itself against
+// `orchestratorLoadGeneration`. Any refresh landing mid-flight bumps that
+// counter, so the history page is thrown away on arrival — and nothing asks
+// again, because the sentinel that requested it has already backed off. The user
+// scrolls up and the page simply never comes.
+//
+// The view-only pane solves this by deferring the refresh instead of firing it
+// (`maybeRefreshViewOnly` + the `finally` of `loadOlderViewOnlyTranscript`), and
+// re-running the decision once history settles. Same latch, same policy here.
+test("a repair refresh defers rather than superseding an older-history fetch", () => {
+  const h = orchHarness();
+  const latch = createViewedThreadRefreshLatch();
+  h.state.orchestratorLoadGeneration = 7;
+  h.state.orchestratorOlderLoading = true;
+  h.state.orchestratorTailGap = true;
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+
+  assert.equal(loads.length, 0, "a repair must not fire on top of an in-flight history page");
+  assert.equal(
+    h.state.orchestratorLoadGeneration,
+    7,
+    "and so the generation that page validates against still holds"
+  );
+
+  // The history request settles and hands the deferred decision back.
+  h.state.orchestratorOlderLoading = false;
+  assert.equal(latch.take(), ORCH_THREAD, "the deferred refresh must be remembered");
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+  assert.equal(loads.length, 1, "and then actually run");
+  assert.equal(loads[0].repair, true);
+});
+
+// A repair never reaches `shouldRefreshViewedThread`'s `wasWorking` test, and a
+// terminal refresh never reaches its `needsRepair` test, so neither covers the
+// other -- both have to defer.
+test("a terminal refresh defers rather than superseding an older-history fetch", () => {
+  const h = orchHarness();
+  const latch = createViewedThreadRefreshLatch();
+  h.state.orchestratorOlderLoading = true;
+
+  h.deliver({ thread_id: ORCH_THREAD, delta: "ing", text_offset: 4 });
+  assert.equal(h.state.orchestratorWasWorking, true);
+  // Consume the delta-raised suppression so the next render sees a real edge.
+  maybeRefreshOrchestrator(h.state, orchSession(), [], latch);
+
+  const loads = [];
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+  assert.equal(loads.length, 0, "the idle edge must wait for history, not race it");
+  assert.equal(h.state.orchestratorWasWorking, true, "the edge is not spent by deferring");
+
+  h.state.orchestratorOlderLoading = false;
+  assert.equal(latch.take(), ORCH_THREAD);
+
+  maybeRefreshOrchestrator(h.state, orchSession(), loads, latch);
+  assert.equal(loads.length, 1, "the deferred terminal refresh runs once history settles");
+  assert.equal(loads[0].terminal, true);
+});
+
+test("a deferred refresh for a thread the pane no longer shows is dropped", () => {
+  const h = orchHarness();
+  const latch = createViewedThreadRefreshLatch();
+  h.state.orchestratorOlderLoading = true;
+  h.state.orchestratorTailGap = true;
+
+  maybeRefreshOrchestrator(h.state, orchSession(), [], latch);
+
+  // The pane moved to another Orchestrator thread while history was in flight.
+  h.state.orchestratorEntriesThreadId = "orch-2";
+  assert.equal(
+    takeDeferredOrchestratorRefresh(h.state, latch),
+    null,
+    "the deferred decision belonged to the thread that is gone"
+  );
+  assert.equal(latch.take(), null, "and it is consumed either way");
 });

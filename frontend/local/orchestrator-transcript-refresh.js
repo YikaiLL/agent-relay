@@ -19,7 +19,7 @@ export function orchestratorTranscriptRefreshDecision(state, session, orchId) {
   const orchIsActive = Boolean(orchId && session?.active_thread_id === orchId);
   const orchWorking = Boolean(threadActivityFor(session, orchId).phase);
   if (!orchId || orchIsActive) {
-    return { refresh: false, terminal: false, repair: false, orchWorking };
+    return { refresh: false, defer: false, terminal: false, repair: false, orchWorking };
   }
 
   const lastActivityWorking = Boolean(state.orchestratorLastActivityWorking);
@@ -43,13 +43,29 @@ export function orchestratorTranscriptRefreshDecision(state, session, orchId) {
       working: orchWorking,
     });
 
-  const refresh = needsTailGapRepair || terminalRefresh;
+  // An older-history fetch validates its page against `orchestratorLoadGeneration`,
+  // and every load bumps that counter — so a refresh firing mid-flight throws the
+  // page away, and the sentinel that asked for it has already backed off. Defer
+  // instead; the history request hands the decision back when it settles. This
+  // cannot live in `shouldRefreshViewedThread`: it takes a `historyLoading`
+  // argument and never reads it.
+  const wanted = needsTailGapRepair || terminalRefresh;
+  const defer = wanted && Boolean(state.orchestratorOlderLoading);
+  const refresh = wanted && !defer;
   return {
     refresh,
-    terminal: terminalRefresh && !needsTailGapRepair,
-    repair: needsTailGapRepair,
+    defer,
+    terminal: refresh && terminalRefresh && !needsTailGapRepair,
+    repair: refresh && needsTailGapRepair,
     orchWorking,
   };
+}
+
+// Only re-run the deferred decision if the pane is still showing the thread that
+// deferred it; a thread switch in the meantime makes it someone else's decision.
+export function takeDeferredOrchestratorRefresh(state, latch) {
+  const threadId = latch.take();
+  return threadId && state.orchestratorEntriesThreadId === threadId ? threadId : null;
 }
 
 export function nextOrchestratorWasWorking(state, orchWorking) {
