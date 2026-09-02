@@ -353,6 +353,7 @@ impl AppState {
                 dev_effort: proposal.agents.dev.effort.clone(),
                 reviewer_effort: proposal.agents.reviewer.effort.clone(),
                 device_id: Some(device_id),
+                starting_proposal_id: Some(proposal.id.clone()),
             })
             .await;
 
@@ -1461,6 +1462,50 @@ claim parked while the start was in flight"
         assert_eq!(saved.len(), 1, "one card, not two rows sharing an id");
         assert_eq!(saved[0].id, staged.id);
         assert!(saved[0].auto_start, "and it comes back still armed");
+    }
+
+    /// F1: once `start_team` has recorded the run, a persistence snapshot must
+    /// not still carry the parked schedule as armed — that restores into a
+    /// second start on the next watchdog tick.
+    #[tokio::test]
+    async fn recording_the_run_clears_the_parked_armed_schedule() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+
+        // Exactly the claim's parked state, then the confirm path.
+        {
+            let mut relay = app.relay.write().await;
+            let armed = relay.orchestrator_proposals[0].clone();
+            relay.orchestrator_proposals[0].auto_start = false;
+            relay.starting_scheduled_proposals.push(armed);
+        }
+
+        app.confirm_orchestrator_proposal(
+            &staged.id,
+            ConfirmOrchestratorProposalInput {
+                device_id: Some("device-1".to_string()),
+            },
+        )
+        .await
+        .expect("confirm starts the run");
+
+        {
+            let relay = app.relay.read().await;
+            assert!(
+                relay.starting_scheduled_proposals.is_empty(),
+                "the park must be cleared in the same write that records the run, not after confirm returns — a save in between would persist both"
+            );
+            let saved = crate::state::persistence::PersistedRelayState::from_relay(&relay);
+            assert!(
+                !saved
+                    .orchestrator_proposals
+                    .iter()
+                    .any(|card| card.id == staged.id && card.auto_start),
+                "a restart must not find this schedule still armed beside its run"
+            );
+            assert_eq!(saved.team_runs.len(), 1);
+        }
     }
 
     #[tokio::test]

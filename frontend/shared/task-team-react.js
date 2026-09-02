@@ -1441,6 +1441,7 @@ export function TaskTeamScreen({
         onPropose: orchestrator?.onPropose || null,
         onConfirmProposal: orchestrator?.onConfirmProposal || null,
         onDismissProposal: orchestrator?.onDismissProposal || null,
+        onToggleProposalAutoStart: orchestrator?.onToggleProposalAutoStart || null,
         onReset: orchestrator?.onReset || null,
         resetBusy: Boolean(orchestrator?.resetBusy),
         attachments: orchestrator?.attachments || [],

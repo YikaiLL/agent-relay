@@ -53,6 +53,7 @@ fn team_input(cwd: &str) -> crate::state::app::team::TeamStartRequest {
         dev_effort: String::new(),
         reviewer_effort: String::new(),
         dev_agents: None,
+        starting_proposal_id: None,
         tl_provider: "codex".to_string(),
         dev_provider: "codex".to_string(),
         reviewer_provider: "codex".to_string(),
@@ -1025,8 +1026,12 @@ impl relay_api::TeamDriver for DevThenReviewDriver {
         // `TeamRun` mutator refuses once `is_settled_without_driver()` is true —
         // and otherwise leaves a clean terminal instead of falling to the crash
         // net's `Interrupted`.
-        port.settle_run(&run_id, crate::state::TeamRunStatus::Failed, "test driver done")
-            .await;
+        port.settle_run(
+            &run_id,
+            crate::state::TeamRunStatus::Failed,
+            "test driver done",
+        )
+        .await;
     }
 }
 
@@ -1034,10 +1039,16 @@ impl relay_api::TeamDriver for DevThenReviewDriver {
 async fn a_dev_turn_that_hits_a_usage_limit_halts_the_run_before_any_review() {
     let (_repo, root) = init_team_repo().await;
     let (app, providers) = build_review_app(&root, &["codex"]).await;
-    providers.get("codex").unwrap().fail_completed_turn_with.lock().await.replace((
-        "Usage limit reached".to_string(),
-        Some("usage_limit".to_string()),
-    ));
+    providers
+        .get("codex")
+        .unwrap()
+        .fail_completed_turn_with
+        .lock()
+        .await
+        .replace((
+            "Usage limit reached".to_string(),
+            Some("usage_limit".to_string()),
+        ));
 
     let dev_outcome = std::sync::Arc::new(Mutex::new(None));
     let reviewer_outcomes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1078,7 +1089,10 @@ async fn a_dev_turn_that_hits_a_usage_limit_halts_the_run_before_any_review() {
         "the reviewer thread must never be given a turn after a provider halt"
     );
     assert_eq!(run.sub_tasks[0].rounds_used, 0);
-    assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
 }
 
 /// A kind from a worker NEWER than this build. It must decode to "no kind" and
@@ -1202,7 +1216,10 @@ async fn a_dev_turn_that_exhausts_the_session_budget_halts_the_run_before_any_re
         run.sub_tasks[0].rounds_used, 0,
         "a paused run has spent no review budget"
     );
-    assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
 }
 
 /// `Replied` proves the agent SPOKE, not that it worked. A dev that answers
@@ -1256,8 +1273,14 @@ async fn a_dev_turn_that_replies_but_bills_nothing_leaves_the_gate_shut() {
         ),
         other => panic!("the reviewer must not run against an unchanged branch: {other:?}"),
     }
-    assert_eq!(run.sub_tasks[0].rounds_used, 0, "no review budget was spent");
-    assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
+    assert_eq!(
+        run.sub_tasks[0].rounds_used, 0,
+        "no review budget was spent"
+    );
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
 }
 
 /// The other half: real spend opens the gate, so ordinary work still reviews.
@@ -1452,7 +1475,10 @@ the stop is refused"
     let reviewer_outcomes = reviewer_outcomes.lock().await.clone();
     assert_eq!(reviewer_outcomes.len(), 1);
     assert!(
-        matches!(reviewer_outcomes[0], relay_api::team::TeamTurnOutcome::Failed(_)),
+        matches!(
+            reviewer_outcomes[0],
+            relay_api::team::TeamTurnOutcome::Failed(_)
+        ),
         "a reviewer turn requested while stopping must be refused: {:?}",
         reviewer_outcomes[0]
     );
@@ -1460,7 +1486,10 @@ the stop is refused"
         run.sub_tasks[0].rounds_used, 0,
         "a refused round must never be counted against the review budget"
     );
-    assert_ne!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
+    assert_ne!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
 }
 
 /// Drives a landed Dev turn, then waits to be released before attempting the
@@ -1533,8 +1562,12 @@ impl relay_api::TeamDriver for RaceWindowDriver {
             )
             .await;
         *self.reviewer_outcome.lock().await = Some(reviewer_outcome);
-        port.settle_run(&run_id, crate::state::TeamRunStatus::Failed, "test driver done")
-            .await;
+        port.settle_run(
+            &run_id,
+            crate::state::TeamRunStatus::Failed,
+            "test driver done",
+        )
+        .await;
     }
 }
 
@@ -1656,7 +1689,16 @@ async fn a_landed_dev_turn_and_two_reviewer_rejections_still_escalate() {
         );
     }
     let relay = app.relay.read().await;
-    let run = relay.team_run(&run_id).cloned().expect("run still recorded");
-    assert_eq!(run.sub_tasks[0].rounds_used, crate::state::MAX_SUBTASK_REVIEW_ROUNDS);
-    assert_eq!(run.sub_tasks[0].status, crate::state::SubTaskStatus::Escalated);
+    let run = relay
+        .team_run(&run_id)
+        .cloned()
+        .expect("run still recorded");
+    assert_eq!(
+        run.sub_tasks[0].rounds_used,
+        crate::state::MAX_SUBTASK_REVIEW_ROUNDS
+    );
+    assert_eq!(
+        run.sub_tasks[0].status,
+        crate::state::SubTaskStatus::Escalated
+    );
 }

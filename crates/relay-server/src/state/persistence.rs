@@ -305,6 +305,10 @@ impl PersistedRelayState {
             // The claimed copy wins an id that is on both lists. While a start is
             // in flight the truth is "not started yet", and saving the disarmed
             // original instead would restore a schedule that never fires.
+            //
+            // Once `insert_team_run` lands, `starting_proposal_id` clears this
+            // park in the same write — so a save cannot keep the schedule armed
+            // beside its run (which would double-start on the next tick).
             orchestrator_proposals: relay
                 .orchestrator_proposals
                 .iter()

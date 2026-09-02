@@ -255,6 +255,11 @@ pub(crate) struct TeamStartRequest {
     pub(crate) reviewer_effort: String,
     /// How many dev sessions the sub-tasks may share. `None` is one each.
     pub(crate) dev_agents: Option<u32>,
+    /// When this start came from a scheduled proposal claim, the parked armed
+    /// copy under `starting_scheduled_proposals` must die in the SAME write that
+    /// records the run — otherwise a save between the two restarts into a
+    /// second start.
+    pub(crate) starting_proposal_id: Option<String>,
 }
 
 impl AppState {
@@ -342,6 +347,11 @@ locally and trust it before starting a task team there"
         {
             let mut relay = self.relay.write().await;
             relay.insert_team_run(run);
+            if let Some(proposal_id) = input.starting_proposal_id.as_deref() {
+                relay
+                    .starting_scheduled_proposals
+                    .retain(|entry| entry.id != proposal_id);
+            }
             relay.push_log(
                 "info",
                 format!("Task: started {run_id} in {}", worktree.path),
@@ -750,6 +760,7 @@ over on resume"
                 dev_effort: asked(input.dev_effort),
                 reviewer_effort: asked(input.reviewer_effort),
                 dev_agents: input.dev_agents,
+                starting_proposal_id: input.starting_proposal_id,
                 tl_provider,
                 dev_provider,
                 reviewer_provider,

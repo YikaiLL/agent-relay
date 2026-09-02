@@ -373,6 +373,41 @@ test("pending Orchestrator proposals render confirm and dismiss", () => {
   assert.match(html, /Propose as task/);
 });
 
+test("TaskTeamScreen forwards the auto-start toggle into the proposal card", () => {
+  const html = renderToStaticMarkup(
+    h(TaskTeamScreen, {
+      runs: [run()],
+      selectedRunId: null,
+      orchestrator: {
+        entries: [],
+        proposals: [
+          {
+            id: "orch_prop_1",
+            kind: "start_task",
+            title: "Add a parser",
+            context: "CLI surface",
+            team_name: "Default",
+            auto_start: false,
+            scheduled_start_at: null,
+          },
+        ],
+        onSend: () => {},
+        onPropose: () => {},
+        onConfirmProposal: () => {},
+        onDismissProposal: () => {},
+        onToggleProposalAutoStart: () => {},
+      },
+    })
+  );
+  const toggleTag = html.match(/<button[^>]*>Start automatically<\/button>/)?.[0] || "";
+  assert.match(toggleTag, /Start automatically/);
+  assert.doesNotMatch(
+    toggleTag,
+    /\bdisabled\b/,
+    "without the forwarded handler the real app leaves this permanently disabled"
+  );
+});
+
 test("the Orchestrator composer is live when a send handler is wired", () => {
   const html = renderToStaticMarkup(
     h(TaskTeamScreen, {

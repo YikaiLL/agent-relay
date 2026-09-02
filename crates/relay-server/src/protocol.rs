@@ -3152,6 +3152,10 @@ pub struct StartTeamInput {
     pub dev_agents: Option<u32>,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Internal: clear a parked scheduled claim when the run is recorded.
+    /// Not a client field — `confirm` sets it for the auto-start path.
+    #[serde(default, skip_serializing)]
+    pub starting_proposal_id: Option<String>,
 }
 
 /// Every whole-run action takes the same shape: which run, and who is asking.
