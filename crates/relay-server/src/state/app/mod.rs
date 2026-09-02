@@ -683,6 +683,25 @@ impl AppState {
         });
     }
 
+    /// Fires scheduled proposal cards. The due decision lives in
+    /// `start_due_scheduled_proposals_at`, which takes `now` so tests can
+    /// choose it — this loop only supplies the wall clock.
+    ///
+    /// Call AFTER `with_team_driver`, never from `AppState::new`. The driver is
+    /// a plain field, so the clone this takes would keep the `None` it was
+    /// built with and disarm every card it ever found.
+    pub(crate) fn spawn_scheduled_proposal_watchdog(&self) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                app.start_due_scheduled_proposals_at(unix_now()).await;
+            }
+        });
+    }
+
     async fn stop_stale_turns_at(&self, now: u64) {
         let candidates = {
             let mut relay = self.relay.write().await;

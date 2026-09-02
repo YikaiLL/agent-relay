@@ -306,6 +306,11 @@ async fn main() {
         info!("beta features are ON for this launch (SEALWIRE_BETA)");
     }
 
+    // Here, not in `AppState::new`: the watchdog keeps a clone, and the team
+    // driver installed above is a plain field that a clone taken earlier would
+    // never see.
+    state.spawn_scheduled_proposal_watchdog();
+
     let web_assets = default_web_assets();
     log_web_assets(&web_assets);
     let context = AppContext {

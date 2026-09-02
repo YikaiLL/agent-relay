@@ -46,6 +46,15 @@ fn merge_task_seat_agents(input: &TaskSeatAgentsView) -> TaskSeatAgentsView {
     merged
 }
 
+/// How late an automatic start may be and still fire.
+///
+/// A tick can be arbitrarily late — the machine was asleep — so lateness alone
+/// must not cancel a start. An hour covers a closed lid over lunch or a laptop
+/// suspended between meetings. Past that, the branch and the reason for the
+/// schedule have moved on, and setting an agent to write code against a
+/// fortnight-old intent is worse than asking again.
+const MAX_SCHEDULE_OVERDUE_SECS: u64 = 60 * 60;
+
 /// Resolve the tool's RELATIVE minutes to an absolute unix second.
 ///
 /// Relative because the orchestrator's prompt never states the current time, so
@@ -371,6 +380,84 @@ impl AppState {
         }
 
         receipt
+    }
+
+    /// Start every card whose scheduled time has arrived.
+    ///
+    /// Pure in `now` like [`resolve_scheduled_start_at`]: there is no injectable
+    /// clock here, so driving this directly is the only way to choose a time.
+    pub(crate) async fn start_due_scheduled_proposals_at(&self, now: u64) {
+        // No runner means EVERY card would fail and be disarmed, throwing away
+        // the user's schedule over a property of the build. Decline instead.
+        if !self.has_team_driver() {
+            return;
+        }
+        // Claim under the SAME write lock that selects, or two ticks both fire
+        // one card. Clearing `auto_start` IS the claim, and because `confirm`
+        // restores the card it removed, that cleared flag is also what stops a
+        // failed fire re-arming itself on the next tick.
+        let claimed = {
+            let mut relay = self.relay.write().await;
+            let mut claimed = Vec::new();
+            let mut changed = false;
+            for proposal in &mut relay.orchestrator_proposals {
+                let Some(due_at) = proposal.scheduled_start_at else {
+                    continue;
+                };
+                if !proposal.auto_start {
+                    continue;
+                }
+                // The checked subtraction IS the due test: `None` means the time
+                // has not come. `>=`, never `==` — a machine asleep through the
+                // exact second must still start when it wakes.
+                let Some(overdue_by) = now.checked_sub(due_at) else {
+                    continue;
+                };
+                proposal.auto_start = false;
+                changed = true;
+                if overdue_by > MAX_SCHEDULE_OVERDUE_SECS {
+                    proposal.schedule_error = Some(format!(
+                        "not started automatically: it came due {} minutes ago, \
+too long to start it unattended — confirm it by hand if it is still wanted",
+                        overdue_by / 60
+                    ));
+                    continue;
+                }
+                claimed.push((proposal.id.clone(), proposal.proposed_by_device_id.clone()));
+            }
+            if changed {
+                relay.notify();
+            }
+            claimed
+        };
+
+        for (proposal_id, device_id) in claimed {
+            // The same call the Confirm button makes, so the timer and the
+            // button cannot drift apart.
+            let outcome = self
+                .confirm_orchestrator_proposal(
+                    &proposal_id,
+                    ConfirmOrchestratorProposalInput {
+                        device_id: Some(device_id),
+                    },
+                )
+                .await;
+            let Err(error) = outcome else {
+                continue;
+            };
+            // The card is back on the list, already disarmed by the claim above.
+            // Say why, so it reads as a card to retry by hand rather than one
+            // that is still waiting for a start that will never come.
+            let mut relay = self.relay.write().await;
+            if let Some(proposal) = relay
+                .orchestrator_proposals
+                .iter_mut()
+                .find(|entry| entry.id == proposal_id)
+            {
+                proposal.schedule_error = Some(format!("automatic start failed: {error}"));
+            }
+            relay.notify();
+        }
     }
 
     pub async fn dismiss_orchestrator_proposal(
@@ -840,6 +927,304 @@ mod tests {
             card.schedule_error.as_deref(),
             Some("the workspace was not trusted"),
             "a schedule error must outlive the restart that follows it"
+        );
+    }
+
+    /// Enough of a driver for `start_team` to succeed. The run settles as soon
+    /// as this returns; the watchdog only cares that a run was started at all.
+    struct IdleTeamDriver;
+
+    #[async_trait::async_trait]
+    impl relay_api::TeamDriver for IdleTeamDriver {
+        fn orchestrator_system_prompt(&self) -> String {
+            "test driver".to_string()
+        }
+
+        async fn drive(&self, _port: std::sync::Arc<dyn relay_api::TeamPort>, _run_id: String) {}
+    }
+
+    /// A git repo a team can really start in: `start_team` refuses a workspace
+    /// that is not one, and compares canonical paths.
+    async fn init_repo() -> (TempDir, String) {
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().canonicalize().expect("canonicalize");
+        let git = |args: Vec<&'static str>, at: std::path::PathBuf| async move {
+            let out = tokio::process::Command::new("git")
+                .args(&args)
+                .current_dir(&at)
+                .output()
+                .await
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            git(args, path.clone()).await;
+        }
+        std::fs::write(path.join("seed.txt"), "line1\n").expect("seed");
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "seed"]] {
+            git(args, path.clone()).await;
+        }
+        let cwd = path.to_string_lossy().into_owned();
+        (dir, cwd)
+    }
+
+    /// An app that can genuinely start a run: trusted git workspace + a driver.
+    /// The "nothing started" assertions are only worth anything against one of
+    /// these — on an app that could never start, they would pass regardless.
+    async fn startable_app(cwd: &str) -> AppState {
+        let app = beta_app(cwd)
+            .await
+            .with_team_driver(std::sync::Arc::new(IdleTeamDriver));
+        app.relay
+            .write()
+            .await
+            .trusted_workspaces
+            .push(cwd.to_string());
+        app
+    }
+
+    async fn schedule_a_card(app: &AppState, start_in_minutes: i64) -> OrchestratorProposalView {
+        // Every seat on the only provider these tests have; the default lineup
+        // names real agents that a test relay does not run.
+        let on_fake = SeatAgentView {
+            provider: Some("fake".to_string()),
+            model: None,
+            effort: None,
+        };
+        app.propose_orchestrator_task(ProposeOrchestratorTaskInput {
+            title: "Add a parser".to_string(),
+            device_id: Some("device-1".to_string()),
+            auto_start: Some(true),
+            start_in_minutes: Some(start_in_minutes),
+            agents: TaskSeatAgentsView {
+                tl: on_fake.clone(),
+                dev: on_fake.clone(),
+                reviewer: on_fake,
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("propose")
+        .proposal
+    }
+
+    /// Acceptance criterion 1: a staged schedule starts NOTHING until its time.
+    #[tokio::test]
+    async fn a_proposal_scheduled_in_the_future_is_not_fired() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        // One second short of due, which is the tick that must do nothing.
+        app.start_due_scheduled_proposals_at(due_at - 1).await;
+
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "nothing may run before the card's time"
+        );
+        let card = &app.snapshot().await.orchestrator_proposals[0];
+        assert!(card.auto_start, "and the card keeps waiting, still armed");
+        assert_eq!(card.schedule_error, None);
+    }
+
+    #[tokio::test]
+    async fn a_proposal_whose_time_has_passed_is_started() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        // Exactly due. `>=`, not `==`: the next case proves late still fires.
+        app.start_due_scheduled_proposals_at(due_at).await;
+
+        assert_eq!(
+            app.teams().await.teams.len(),
+            1,
+            "the card's time arrived, so its run must have started"
+        );
+        assert!(
+            app.snapshot().await.orchestrator_proposals.is_empty(),
+            "a started card is spent"
+        );
+    }
+
+    /// Fire once, as an outcome: two ticks together still produce one run.
+    /// Two things stand between them — the disarming claim, and `confirm`
+    /// removing the card under its own lock — and this pins only the result.
+    /// The claim itself is what the retry test below actually exercises.
+    #[tokio::test]
+    async fn two_ticks_at_once_start_the_card_only_once() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        tokio::join!(
+            app.start_due_scheduled_proposals_at(due_at),
+            app.start_due_scheduled_proposals_at(due_at),
+        );
+
+        assert_eq!(app.teams().await.teams.len(), 1, "two ticks, one run");
+    }
+
+    /// A tick can be arbitrarily late — the machine was asleep. Late is normal
+    /// and must still fire, or a suspended laptop silently drops the schedule.
+    #[tokio::test]
+    async fn a_late_but_not_stale_proposal_still_fires() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        app.start_due_scheduled_proposals_at(due_at + MAX_SCHEDULE_OVERDUE_SECS)
+            .await;
+
+        assert_eq!(app.teams().await.teams.len(), 1, "late is still a start");
+    }
+
+    #[tokio::test]
+    async fn an_absurdly_overdue_proposal_is_not_started() {
+        let (_repo, cwd) = init_repo().await;
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        // A fortnight closed lid.
+        app.start_due_scheduled_proposals_at(due_at + 14 * 24 * 60 * 60)
+            .await;
+
+        assert!(
+            app.teams().await.teams.is_empty(),
+            "waking up must not start a two-week-old task"
+        );
+        let card = &app.snapshot().await.orchestrator_proposals[0];
+        assert!(!card.auto_start, "it is a manual card now");
+        assert!(
+            card.schedule_error.is_some(),
+            "and it says why it did not run"
+        );
+    }
+
+    /// A build with no workflow runner cannot start ANY task. Disarming on that
+    /// would throw away every user's schedule over a property of the build, so
+    /// the sweep must decline to run rather than fail each card in turn.
+    #[tokio::test]
+    async fn a_build_without_a_team_driver_leaves_scheduled_cards_alone() {
+        let (_repo, cwd) = init_repo().await;
+        let app = beta_app(&cwd).await;
+        app.relay.write().await.trusted_workspaces.push(cwd.clone());
+        assert!(!app.has_team_driver(), "the premise of this test");
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        app.start_due_scheduled_proposals_at(due_at).await;
+
+        let card = &app.snapshot().await.orchestrator_proposals[0];
+        assert!(
+            card.auto_start,
+            "the card must stay armed for a build that can actually run it"
+        );
+        assert_eq!(
+            card.schedule_error, None,
+            "and must not be blamed for the build having no runner"
+        );
+    }
+
+    /// `with_team_driver` returns a NEW `AppState`, and `team_driver` is a plain
+    /// field, so a clone taken before it keeps `None` forever. That is why the
+    /// watchdog is spawned from `main` after configuration rather than inside
+    /// `AppState::new` — if this ever fails, the driver became shared and that
+    /// placement can be revisited.
+    #[tokio::test]
+    async fn a_clone_taken_before_the_driver_is_installed_never_gets_it() {
+        let (_repo, cwd) = init_repo().await;
+        let app = beta_app(&cwd).await;
+
+        let cloned_early = app.clone();
+        let configured = app.with_team_driver(std::sync::Arc::new(IdleTeamDriver));
+
+        assert!(configured.has_team_driver());
+        assert!(
+            !cloned_early.has_team_driver(),
+            "a clone taken before configuration cannot start a team, ever"
+        );
+    }
+
+    /// The retry loop: `confirm` puts a failed card BACK on the list, so an
+    /// automatic fire that fails would re-arm and try again every 15 seconds.
+    #[tokio::test]
+    async fn a_failed_automatic_start_degrades_to_manual_and_does_not_retry() {
+        let project = TempDir::new().expect("project");
+        let cwd = project
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .to_string_lossy()
+            .to_string();
+        // A driver, a trusted workspace — but not a git repo, so `start_team`
+        // fails for a reason that IS this card's problem. A build-level failure
+        // (no driver) is covered above and must behave differently.
+        let app = startable_app(&cwd).await;
+        let staged = schedule_a_card(&app, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        app.start_due_scheduled_proposals_at(due_at).await;
+
+        let after_first = app.snapshot().await.orchestrator_proposals;
+        assert_eq!(after_first.len(), 1, "a failed start puts the card back");
+        assert!(
+            !after_first[0].auto_start,
+            "but disarmed, or every tick from here retries it forever"
+        );
+        assert!(
+            after_first[0].schedule_error.is_some(),
+            "and the card must say why it stopped trying"
+        );
+
+        // The tick 15 seconds later must find nothing to do.
+        app.start_due_scheduled_proposals_at(due_at + 15).await;
+
+        assert_eq!(
+            app.snapshot().await.orchestrator_proposals,
+            after_first,
+            "a second tick must not touch a card that already failed"
+        );
+        assert!(app.teams().await.teams.is_empty());
+    }
+
+    /// Acceptance criterion 4: the schedule outlives a restart, and still fires.
+    #[tokio::test]
+    async fn a_scheduled_proposal_still_fires_after_a_restart() {
+        let (_repo, cwd) = init_repo().await;
+        let before = startable_app(&cwd).await;
+        let staged = schedule_a_card(&before, 30).await;
+        let due_at = staged.scheduled_start_at.expect("a start time");
+
+        let encoded = {
+            let relay = before.relay.read().await;
+            serde_json::to_string(&crate::state::persistence::PersistedRelayState::from_relay(
+                &relay,
+            ))
+            .expect("encode")
+        };
+        let decoded: crate::state::persistence::PersistedRelayState =
+            serde_json::from_str(&encoded).expect("decode");
+
+        // A different AppState entirely — the relay that comes back from disk.
+        let after = startable_app(&cwd).await;
+        after.relay.write().await.apply_persisted(&decoded);
+
+        after.start_due_scheduled_proposals_at(due_at).await;
+
+        assert_eq!(
+            after.teams().await.teams.len(),
+            1,
+            "a card that survived the restart must still start on time"
         );
     }
 
